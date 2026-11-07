@@ -25,7 +25,7 @@ contextdb ./their.db --write                       # explicit read-write session
 
 Every row below changes or destroys durable data. Run none of them against a store you did not
 create for this task until the operator confirms that exact path. **Sole exception:** an
-ephemeral, task-scoped store you created yourself (`:memory:`, or a file under `$(mktemp -d)`) —
+ephemeral, task-scoped store you created yourself (a file under `$(mktemp -d)`) —
 there, run them freely and without asking.
 
 | Goal | Sanctioned command | Guardrail |
@@ -35,7 +35,7 @@ there, run them freely and without asking.
 | Take a backup before any of the above | `contextdb snapshot export <path> <dest>` | Purge-fenced; the safe prerequisite for `reset`. |
 | Apply declared `RETAIN` windows now instead of waiting for the background cycle | `.maintenance run` (REPL meta-command) | Synchronous; expires rows the table's own DDL already declared expirable. |
 | Erase rows permanently | `contextdb purge <path> --table <t> --force` | Purge-fenced; refuses without `--force` (exit `2`). Only legal on a store that has never connected to a sync hub. |
-| Make a route, sink or schedule actually fire | Run the DDL in a `:memory:` CLI session; inspect with `.events status` | In an ephemeral `:memory:` session the CLI registers default callbacks, so routes deliver and schedules fire observably. On a file-backed store, events queue durably until your own program registers its callbacks (`register_sink` / `register_cron_callback`) — that durable queueing is the contract, not a gap. |
+| Make a route, sink or schedule actually fire | Register host callbacks on the open embedded `Database`; inspect with `.events status` through that host | The CLI registers no callbacks. Matching events queue durably until the host calls `register_sink`; schedules require `register_cron_callback`. CLI declarations and status alone do not prove delivery. |
 
 ### One cargo build at a time, and check the disk first
 
@@ -78,13 +78,13 @@ Task-shaped recipes, copy-paste runnable. Read the one matching what you are doi
 
 | Skill | What it's for | Path |
 |---|---|---|
-| `using-contextdb` | Open a database, define tables, run SQL (including multi-line paste), read `--json`, recover after a refused statement, branch on exit codes. | [`skills/using-contextdb/SKILL.md`](skills/using-contextdb/SKILL.md) |
+| `using-contextdb` | Open a store, run SQL, tune session cache share, count groups, number rows per group, read `--json`, and handle refusals. | [`skills/using-contextdb/SKILL.md`](skills/using-contextdb/SKILL.md) |
 | `querying-the-graph` | Declare a DAG edge table, traverse it with `GRAPH_TABLE`, get cycle inserts refused, enforce `STATE MACHINE` transitions with `PROPAGATE` cascades. | [`skills/querying-the-graph/SKILL.md`](skills/querying-the-graph/SKILL.md) |
-| `running-triggers-and-schedules` | Declare `CREATE EVENT TYPE`/`SINK`/`ROUTE`/`SCHEDULE`, see them fire observably in `:memory:`, and wire `register_sink`/`register_cron_callback` so a file-backed store's durably-queued events actually deliver. | [`skills/running-triggers-and-schedules/SKILL.md`](skills/running-triggers-and-schedules/SKILL.md) |
+| `running-triggers-and-schedules` | Declare `CREATE EVENT TYPE`/`SINK`/`ROUTE`/`SCHEDULE`, inspect durable queueing from the CLI, and wire `register_sink`/`register_cron_callback` in an embedded host for delivery and schedule execution. | [`skills/running-triggers-and-schedules/SKILL.md`](skills/running-triggers-and-schedules/SKILL.md) |
 | `sync` | Stand up a hub, enroll an edge with its ticket, push/pull, change synced columns explicitly, and read the applied / skipped / conflicts counts correctly. | [`skills/sync/SKILL.md`](skills/sync/SKILL.md) |
 | `vector-search` | Embedding columns, `<=>` nearest-neighbour search, schema-declared `USE RANK` policies, and the hybrid graph + vector query. | [`skills/vector-search/SKILL.md`](skills/vector-search/SKILL.md) |
 | `work-fabric` | Hand a job to another machine over the work ledger and move the bytes it needs over the blob plane. Library API — no CLI. | [`skills/work-fabric/SKILL.md`](skills/work-fabric/SKILL.md) |
-| `operating-a-store` | Enforce `RETAIN` windows on demand with `.maintenance run`, permanently erase rows with `purge` (never-connected stores only), back up before a destructive op, and read `pull_pages_read` sync liveness. | [`skills/operating-a-store/SKILL.md`](skills/operating-a-store/SKILL.md) |
+| `operating-a-store` | Enforce retention, declare compaction, erase parents with declared children, verify historical indexes, back up, and inspect sync liveness. | [`skills/operating-a-store/SKILL.md`](skills/operating-a-store/SKILL.md) |
 
 Reference docs, when a skill is not enough:
 
@@ -138,12 +138,11 @@ Describe the capability, then go to the crate that owns it — do not go looking
 | How a read is actually executed and charged against its budgets | Engine crate, `executor/bounded.rs` — the one execution kernel both routes share. Never give a consumer its own execution semantics. |
 | The trusted companion, the claim window, reader holds, published reader identities | Engine crate, `persistence.rs`. |
 | A refusal class or kind a reader can branch on | Core crate, `read_contract.rs` — the shared typed vocabulary. Never define a second refusal type downstream of it. |
-| Vector search: routes, partition layouts, the global top-k merge, generation lifecycle, per-column vector policy | Vector crate (`store.rs`, `hnsw.rs`, `mem.rs`). Raw payload sharing and each column's charge ownership live in `store.rs` / `quantized.rs`; generation persistence and maintenance scheduling stay in the engine crate. |
+| Vector search: routes, partition layouts, the global top-k merge, generation lifecycle, per-column vector policy | Vector crate (`store.rs`, `ivf/`, `mem.rs`). Raw payload sharing and each column's charge ownership live in `store.rs` / `quantized.rs`; generation persistence and maintenance scheduling stay in the engine crate. |
 | Vector generation admission, catalog inventory, journal cleanup or cancellation | Engine `database.rs`, `database/vector_maintenance_inventory.rs`, `database/vector_source_page_admission.rs` and `persistence.rs`. Vector `store.rs` selects resident frontier-live inputs; cold snapshots and delete-only carriers retain their raw-history path. |
-| A graph primitive vector search cannot build on top of the HNSW fork | HNSW crate, as the smallest upstream-shaped change, plus its `upstream-0.3.4.patch` and `MAINTENANCE.md`. Anything composable goes in the vector crate's `hnsw.rs` instead. |
 | A storage primitive (compaction step, read admission, bounded byte-table lookup or cursor) the engine cannot build on top of redb | redb fork crate, same rule: smallest change, patch and `MAINTENANCE.md` updated. Byte-node validation and reject-only windows live in `tree_store/bounded_bytes.rs`; compaction and inventory policy stay in the engine. |
 | A `contextdb-server` flag, exit code, automatic push trigger, or worker poll loop | Server crate (`main.rs`, `exit_codes.rs`, `sync_plugin.rs`, `work_ledger.rs`). |
-| Anything else | [`docs/architecture.md`](docs/architecture.md#crate-map) maps all 11 crates and the dependency direction. |
+| Anything else | [`docs/architecture.md`](docs/architecture.md#crate-map) maps the ten workspace members and the maintained redb dependency fork. |
 
 ### Testing discipline
 
@@ -181,14 +180,13 @@ direction.
 | `contextdb-core` | [`crates/contextdb-core/AGENTS.md`](crates/contextdb-core/AGENTS.md) | Shared types, errors and the read-contract vocabulary; the workspace audits live in its `tests/`. |
 | `contextdb-engine` | [`crates/contextdb-engine/AGENTS.md`](crates/contextdb-engine/AGENTS.md) | Clock-seam discipline: every persisted timestamp goes through `Wallclock::now()`; the test-estate ratchet audit enforces it. |
 | `contextdb-graph` | [`crates/contextdb-graph/AGENTS.md`](crates/contextdb-graph/AGENTS.md) | Adjacency index and bounded BFS; DAG cycle refusal on insert. |
-| `contextdb-hnsw` | [`crates/contextdb-hnsw/AGENTS.md`](crates/contextdb-hnsw/AGENTS.md) | Maintained fork of `hnsw_rs` 0.3.4: the delta stays minimal and additive code lives in `contextdb-vector`; see its `MAINTENANCE.md`. |
 | `contextdb-parser` | [`crates/contextdb-parser/AGENTS.md`](crates/contextdb-parser/AGENTS.md) | Char-boundary discipline: every fixed-width lookahead over input must be boundary-safe, or multi-byte UTF-8 panics the parser. |
 | `contextdb-planner` | [`crates/contextdb-planner/AGENTS.md`](crates/contextdb-planner/AGENTS.md) | Turns the parsed statement into a physical plan. |
 | `contextdb-redb` | [`crates/contextdb-redb/AGENTS.md`](crates/contextdb-redb/AGENTS.md) | Maintained fork of redb 4.1.0, outside the workspace: the delta stays minimal and additive code lives in the engine; see its `MAINTENANCE.md`. |
 | `contextdb-relational` | [`crates/contextdb-relational/AGENTS.md`](crates/contextdb-relational/AGENTS.md) | Row storage, scan, insert, upsert and delete. |
 | `contextdb-server` | [`crates/contextdb-server/AGENTS.md`](crates/contextdb-server/AGENTS.md) | The sync mover: sync semantics are the engine's and re-exported; never a mirror module. |
 | `contextdb-tx` | [`crates/contextdb-tx/AGENTS.md`](crates/contextdb-tx/AGENTS.md) | MVCC transaction manager and deferred-apply write sets. |
-| `contextdb-vector` | [`crates/contextdb-vector/AGENTS.md`](crates/contextdb-vector/AGENTS.md) | Partitioned maintained vector search; most of its tests need `--features test-seams`. |
+| `contextdb-vector` | [`crates/contextdb-vector/AGENTS.md`](crates/contextdb-vector/AGENTS.md) | Partitioned exact vector search; index construction and indexed serving are disabled in this release. Most tests need `--features test-seams`. |
 
 ### Releases
 

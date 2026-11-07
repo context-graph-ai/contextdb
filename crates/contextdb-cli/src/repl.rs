@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex};
 pub enum Session {
     Reading {
         reader: ReadSession,
+        read_memory: contextdb_engine::vector_read_memory::DeclaredReadRoot,
         /// The store this session was pointed at. `.owner status` asks the
         /// path about its owner rather than the session, because it resolves
         /// no route and must answer even when there is no owner to route to.
@@ -39,20 +40,56 @@ pub enum Session {
     Writing {
         database: Arc<Database>,
         reader: ReadSession,
+        read_memory: contextdb_engine::vector_read_memory::DeclaredReadRoot,
     },
 }
 
 impl Session {
     /// Build a writing session over an already-open database, with the bounded
     /// read view its own reads will go through.
-    pub fn writing(database: Arc<Database>, limits: ReadLimits) -> contextdb_core::Result<Self> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn writing(
+        database: Arc<Database>,
+        limits: ReadLimits,
+        read_memory: contextdb_engine::vector_read_memory::DeclaredReadRoot,
+    ) -> contextdb_core::Result<Self> {
         let reader = database.read_session(limits)?;
-        Ok(Self::Writing { database, reader })
+        Ok(Self::Writing {
+            database,
+            reader,
+            read_memory,
+        })
     }
 
     /// Adopt an already-selected read route as a reading session.
-    pub fn reading(reader: ReadSession, path: PathBuf) -> Self {
-        Self::Reading { reader, path }
+    pub fn reading(
+        reader: ReadSession,
+        path: PathBuf,
+        read_memory: contextdb_engine::vector_read_memory::DeclaredReadRoot,
+    ) -> Self {
+        Self::Reading {
+            reader,
+            path,
+            read_memory,
+        }
+    }
+
+    /// Each operation shares the working-set parent declared by this session.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn request_read_memory(
+        &self,
+    ) -> contextdb_core::Result<contextdb_core::read_memory::ReadMemoryOwner> {
+        match self {
+            Self::Reading { read_memory, .. } | Self::Writing { read_memory, .. } => {
+                read_memory.child()
+            }
+        }
     }
 
     /// The bounded view every read in this session goes through, whichever
@@ -316,9 +353,11 @@ pub struct SessionState {
     /// Where a running statement announces itself so an interrupt can reach
     /// it. `None` when nobody is at a terminal to press Ctrl-C.
     interrupts: Option<Arc<RunningStatement>>,
-    /// Whether this session has already said how it reads. The route is chosen
-    /// once and never changes, so saying it twice would suggest it might have.
-    route_reported: bool,
+    /// The last route and file snapshot announced after a store-reading command.
+    reported_read_route: Option<(
+        contextdb_core::read_contract::ReadRoute,
+        Option<contextdb_core::Lsn>,
+    )>,
     /// Whether this session has an open write transaction. The CLI issues
     /// every `BEGIN`/`COMMIT`/`ROLLBACK` itself, so it knows; a cursor may not
     /// open across one, because cursor state must never mix committed and
@@ -446,7 +485,7 @@ fn read_failure_message(
         ReadFailureKind::HeldByWriter => {
             Some("drop --write: a read session reaches the live owner's channel")
         }
-        ReadFailureKind::HeldByReaders => Some("retry once they finish hydrating"),
+        ReadFailureKind::HeldByReaders => Some("retry once they finish"),
         ReadFailureKind::OwnerNotRunning => Some("this session reads the committed file directly"),
         ReadFailureKind::OwnerNotServing => {
             Some("close the writer and rerun, or start it without --no-owner-reads")
@@ -476,9 +515,14 @@ fn read_failure_message(
         ReadFailureKind::CursorInvalidStatement => {
             Some("`.cursor open` takes exactly one read-only SELECT or SHOW VECTOR_PARTITIONS")
         }
-        ReadFailureKind::DirectReadRequiresWriter => {
-            Some("close every holder and rerun with --write")
-        }
+        // A store missing its read-readiness markers is not repaired by a
+        // writable reopen, so that detail points at recreating or restoring it.
+        ReadFailureKind::DirectReadRequiresWriter => Some(match failure.detail() {
+            ReadFailureDetail::ReadinessAbsent { .. } => {
+                "recreate the store or restore it from a backup"
+            }
+            _ => "close every holder and rerun with --write",
+        }),
         ReadFailureKind::InvalidContinuation => Some("start the listing again without --continue"),
         ReadFailureKind::OperationAlreadyCompleted | ReadFailureKind::OwnerLimitExceeded => None,
         // The refusal already names the inspection it could not answer and the
@@ -1059,6 +1103,7 @@ fn process_meta_line(
         let _cmd = parts.next();
         let rest = parts.next().unwrap_or("").trim();
         let outcome = run_sync_command(
+            session_handle,
             sync_client,
             rt,
             rest,
@@ -1068,7 +1113,11 @@ fn process_meta_line(
         if outcome.ok {
             report_success(&outcome.message, &outcome.json, input.output);
         } else {
-            report_failure(outcome.class, &outcome.message, input);
+            if let Some(error @ Error::ReadFailure(_)) = &outcome.error {
+                report_error(error, input);
+            } else {
+                report_failure(outcome.class, &outcome.message, input);
+            }
             session.had_error = true;
         }
     } else if is_trace_command(line) {
@@ -1076,7 +1125,7 @@ fn process_meta_line(
             session.had_error = true;
         }
     } else if is_explain_command(line) {
-        if !handle_explain_command(session_handle, line, input) {
+        if !handle_explain_command(session_handle, line, input, session) {
             session.had_error = true;
         }
     } else {
@@ -1148,6 +1197,7 @@ struct SyncCommandOutcome {
     ok: bool,
     /// Which error family a failure belongs to, for the `--json` envelope.
     class: ErrorClass,
+    error: Option<Error>,
 }
 
 impl SyncCommandOutcome {
@@ -1157,6 +1207,7 @@ impl SyncCommandOutcome {
             json,
             ok: true,
             class: ErrorClass::Sync,
+            error: None,
         }
     }
 
@@ -1166,6 +1217,17 @@ impl SyncCommandOutcome {
             json: serde_json::Value::Null,
             ok: false,
             class,
+            error: None,
+        }
+    }
+
+    fn failed_error(error: Error, message: String) -> Self {
+        Self {
+            message,
+            json: serde_json::Value::Null,
+            ok: false,
+            class: ErrorClass::of(&error),
+            error: Some(error),
         }
     }
 }
@@ -1203,6 +1265,10 @@ impl MetaCommandOutcome {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn handle_meta_command(
     session_handle: &Session,
     sync_client: Option<&SyncClient>,
@@ -1266,15 +1332,22 @@ pub(crate) fn handle_meta_command(
                 session,
             );
         }
+        ".verify" => {
+            // The registry admitted exactly `history <table>`.
+            let table = rest.strip_prefix("history").unwrap_or_default().trim();
+            return answer_metadata(
+                session_handle,
+                MetadataRequest::VerifyHistory {
+                    table: table.to_owned(),
+                },
+                None,
+                input,
+                session,
+            );
+        }
         ".maintenance" => {
             if rest == "status" {
-                return answer_metadata(
-                    session_handle,
-                    MetadataRequest::MaintenanceStatus,
-                    None,
-                    input,
-                    session,
-                );
+                return answer_maintenance_status(session_handle, input, session);
             }
             // Running a cycle and compacting CHANGE the store, so they are the
             // live database's to do; only a writing session ever reaches here,
@@ -1286,7 +1359,10 @@ pub(crate) fn handle_meta_command(
                 return MetaCommandOutcome::failed();
             };
             match rest {
-                "run" => match db.run_maintenance_cycle() {
+                "run" => match session_handle
+                    .request_read_memory()
+                    .and_then(|read_memory| db.run_maintenance_cycle_with_read_memory(read_memory))
+                {
                     Ok(report) => {
                         if input.output.json {
                             json_output::print_document(&json_output::maintenance_report_document(
@@ -1317,7 +1393,8 @@ pub(crate) fn handle_meta_command(
                                  vector_failure_requested_bytes={} vector_failure_available_bytes={} \
                                  vector_failure_current_bytes={} vector_failure_budget_limit_bytes={} \
                                  vector_failure_message={} vector_failure_recovery_action={} \
-                                 vector_failure_recovery_instruction={}",
+                                 vector_failure_recovery_instruction={} \
+                                 auto_compact_fragmentation_before={} compaction_policy={}",
                                 report.pruning.pruned_rows,
                                 report.pruning.rows_deferred_for_readers,
                                 report.currency.pruned_versions,
@@ -1342,6 +1419,11 @@ pub(crate) fn handle_meta_command(
                                 failure_details.map_or("none", |details| details.recovery_action()),
                                 failure_details
                                     .map_or("none", |details| details.recovery_instruction),
+                                report.compaction.fragmentation_before.map_or_else(
+                                    || "unknown".to_string(),
+                                    |ratio| ratio.to_string()
+                                ),
+                                json_output::compaction_policy_text(&report.compaction.policy),
                             );
                         }
                     }
@@ -1359,13 +1441,22 @@ pub(crate) fn handle_meta_command(
                         } else {
                             println!(
                                 "ran={} duration_micros={} bytes_before={} bytes_after={} \
-                                 file_shrank={} fragmentation_before={}",
+                                 file_shrank={} fragmentation_before={} page_slack_ratio={} \
+                                 compaction_policy={}",
                                 report.ran,
                                 report.duration_micros,
                                 render_optional_value(report.bytes_before),
                                 render_optional_value(report.bytes_after),
                                 report.file_shrank,
-                                report.fragmentation_before,
+                                report.fragmentation_before.map_or_else(
+                                    || "unknown".to_string(),
+                                    |ratio| ratio.to_string()
+                                ),
+                                report.page_slack_ratio.map_or_else(
+                                    || "unknown".to_string(),
+                                    |ratio| ratio.to_string()
+                                ),
+                                json_output::compaction_policy_text(&report.policy),
                             );
                         }
                     }
@@ -1401,9 +1492,13 @@ pub(crate) fn handle_meta_command(
             );
         }
         ".sync" => {
-            let outcome = handle_sync_command(sync_client, rt, rest, sync_plugin);
+            let outcome = handle_sync_command(session_handle, sync_client, rt, rest, sync_plugin);
             if !outcome.ok {
-                report_failure(outcome.class, &outcome.message, input);
+                if let Some(error @ Error::ReadFailure(_)) = &outcome.error {
+                    report_error(error, input);
+                } else {
+                    report_failure(outcome.class, &outcome.message, input);
+                }
                 return MetaCommandOutcome::failed();
             }
             report_success(&outcome.message, &outcome.json, input.output);
@@ -1496,22 +1591,19 @@ impl contextdb_engine::ReadProgressObserver for ReadProgressReporter {
     }
 }
 
-/// Say once, at the first store-reading command, HOW this session reads.
-///
-/// Only a session that CHOSE a route has one to report. A writing session is
-/// the owner: it reads its own live state in its own process, with no file-or-
-/// owner decision behind it and therefore nothing to announce. `.help`,
-/// `.trace`, `.quit`, `.exit`, `.sync status` and `.owner status` read no rows,
-/// so none of them reaches here.
+/// Announce a changed route or committed snapshot LSN after a store-reading command.
+/// Writing sessions have no selected file-or-owner route to report.
 fn note_read_route(session_handle: &Session, input: InputContext, session: &mut SessionState) {
-    if session.route_reported {
-        return;
-    }
     let Session::Reading { reader, .. } = session_handle else {
         return;
     };
-    session.route_reported = true;
-    let document = json_output::read_route_notice_document(reader.route(), reader.snapshot_at());
+    let selected = (reader.route(), reader.snapshot_lsn());
+    if session.reported_read_route == Some(selected) {
+        return;
+    }
+    session.reported_read_route = Some(selected);
+    let document =
+        json_output::read_route_notice_document(selected.0, reader.snapshot_at(), selected.1);
     if input.output.json {
         json_output::print_stderr_document(&document);
     } else if let Some(message) = document
@@ -1538,8 +1630,9 @@ fn answer_metadata(
     input: InputContext,
     session: &mut SessionState,
 ) -> MetaCommandOutcome {
+    let answer = session_handle.reader().metadata(request, continuation);
     note_read_route(session_handle, input, session);
-    match session_handle.reader().metadata(request, continuation) {
+    match answer {
         Ok(answer) => {
             publish_metadata(&answer, input);
             MetaCommandOutcome::done()
@@ -1549,6 +1642,79 @@ fn answer_metadata(
             MetaCommandOutcome::failed()
         }
     }
+}
+
+/// `.maintenance status`: the loop's state from the metadata door, plus the
+/// store's storage compaction settings with each value's source
+/// (`SHOW STORAGE_COMPACTION`, a read the same session answers).
+fn answer_maintenance_status(
+    session_handle: &Session,
+    input: InputContext,
+    session: &mut SessionState,
+) -> MetaCommandOutcome {
+    let answer = session_handle
+        .reader()
+        .metadata(MetadataRequest::MaintenanceStatus, None);
+    note_read_route(session_handle, input, session);
+    let answer = match answer {
+        Ok(answer) => answer,
+        Err(error) => {
+            report_error(&error, input);
+            return MetaCommandOutcome::failed();
+        }
+    };
+    let compaction = session_handle
+        .reader()
+        .execute("SHOW STORAGE_COMPACTION", &HashMap::new());
+    note_read_route(session_handle, input, session);
+    let compaction = match compaction {
+        Ok(result) => result,
+        Err(error) => {
+            report_error(&error, input);
+            return MetaCommandOutcome::failed();
+        }
+    };
+    let MetadataBody::MaintenanceStatus { status } = &answer.body else {
+        publish_metadata(&answer, input);
+        return MetaCommandOutcome::done();
+    };
+    let settings: Vec<(String, String, String)> = compaction
+        .rows()
+        .iter()
+        .map(|row| {
+            let text = |value: &contextdb_core::Value| match value {
+                contextdb_core::Value::Text(text) => text.clone(),
+                contextdb_core::Value::Int64(number) => number.to_string(),
+                contextdb_core::Value::Float64(number) => number.to_string(),
+                other => format!("{other:?}"),
+            };
+            (text(&row[0]), text(&row[1]), text(&row[2]))
+        })
+        .collect();
+    if input.output.json {
+        json_output::print_document(&json_output::maintenance_status_with_compaction_document(
+            status, &settings,
+        ));
+    } else {
+        println!(
+            "running={} retention_enabled={} currency_compaction_enabled={} \
+             active_maintenance_loops={} policy={}",
+            status.running,
+            status.retention_enabled,
+            status.currency_compaction_enabled,
+            status.active_maintenance_loops,
+            status.policy,
+        );
+        println!(
+            "storage_compaction {}",
+            settings
+                .iter()
+                .map(|(setting, value, source)| format!("{setting}={value}({source})"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+    MetaCommandOutcome::done()
 }
 
 /// One metadata answer, rendered for whoever is reading.
@@ -1632,6 +1798,18 @@ fn publish_metadata(answer: &contextdb_engine::MetadataAnswer, input: InputConte
                 println!("{physical_plan}");
                 if let Some(index) = index {
                     println!("index: {index}");
+                }
+            }
+        }
+        MetadataBody::VerifyHistory { table, indexes } => {
+            if json {
+                json_output::print_document(&json_output::verify_history_document(table, indexes));
+            } else {
+                for index in indexes {
+                    println!(
+                        "table={table} index={} postings={} versions={} verified=true",
+                        index.index, index.postings, index.versions
+                    );
                 }
             }
         }
@@ -1801,7 +1979,7 @@ fn publish_cursor_page(
     input: InputContext,
     session: &mut SessionState,
 ) -> MetaCommandOutcome {
-    session.cursor = if page.has_more {
+    session.cursor = if page.has_more() {
         CursorSlot::Open(cursor)
     } else {
         CursorSlot::Drained(cursor)
@@ -1809,11 +1987,15 @@ fn publish_cursor_page(
     if input.output.json {
         json_output::print_document(&json_output::cursor_page_document(page));
     } else {
-        for row in &page.rows {
+        for row in page.rows() {
             let cells: Vec<String> = row.iter().map(crate::formatter::render_value).collect();
             println!("{}", cells.join(" | "));
         }
-        println!("({} rows, has_more: {})", page.rows.len(), page.has_more);
+        println!(
+            "({} rows, has_more: {})",
+            page.rows().len(),
+            page.has_more()
+        );
     }
     MetaCommandOutcome::done()
 }
@@ -1861,11 +2043,11 @@ fn cursor_open(
         }
         Err(_) => return refuse_cursor(ReadFailureKind::CursorInvalidStatement, input),
     }
-    note_read_route(session_handle, input, session);
-    match session_handle
+    let opened = session_handle
         .reader()
-        .open_cursor(argument, &HashMap::new())
-    {
+        .open_cursor(argument, &HashMap::new());
+    note_read_route(session_handle, input, session);
+    match opened {
         Ok(cursor) => {
             let page = cursor.first_page().clone();
             session.cursor_statement =
@@ -2081,7 +2263,7 @@ fn help_lines(topic: &str) -> Vec<String> {
             if gloss.is_empty() {
                 shown.to_owned()
             } else {
-                format!("{shown:<22}{gloss}")
+                format!("{shown:<26}{gloss}")
             }
         })
         .collect()
@@ -2099,6 +2281,7 @@ fn command_gloss(spelling: &str) -> &'static str {
         ".explain" => "Show a statement's execution plan; never applies a write.",
         ".events status" => "Bounded, resumable event/sink/route/schedule health.",
         ".maintenance status" => "One complete bounded maintenance-state response.",
+        ".verify history" => "Check every historical index of a table against its row versions.",
         ".cursor open" => "Page a result larger than an ordinary ceiling.",
         ".cursor fetch" => "Next page; omit the count to use the declared page size.",
         ".cursor close" => "Release this session's cursor.",
@@ -2174,7 +2357,16 @@ fn handle_trace_command(line: &str, input: InputContext, trace_enabled: &mut boo
     true
 }
 
-fn handle_explain_command(session_handle: &Session, line: &str, input: InputContext) -> bool {
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn handle_explain_command(
+    session_handle: &Session,
+    line: &str,
+    input: InputContext,
+    session: &mut SessionState,
+) -> bool {
     let rest = line.strip_prefix(".explain").unwrap_or("").trim();
     if rest.is_empty() {
         report_failure(ErrorClass::Usage, "Usage: .explain <sql>", input);
@@ -2197,14 +2389,16 @@ fn handle_explain_command(session_handle: &Session, line: &str, input: InputCont
     let bound_params = HashMap::new();
 
     if path == ExplainPath::RuntimeRead {
-        return match session_handle.reader().execute(rest, &bound_params) {
+        let result = session_handle.reader().execute(rest, &bound_params);
+        note_read_route(session_handle, input, session);
+        return match result {
             Ok(result) => {
                 if input.output.json {
                     json_output::print_document(&json_output::explain_document(&result));
                 } else {
                     print!(
                         "{}",
-                        contextdb_engine::cli_render::render_explain_trace(&result.trace)
+                        contextdb_engine::cli_render::render_explain_trace(result.trace())
                     );
                 }
                 true
@@ -2231,20 +2425,21 @@ fn handle_explain_command(session_handle: &Session, line: &str, input: InputCont
                 index,
                 vector_search,
                 ..
-            } = answer.body
+            } = &answer.body
             else {
                 return Err(Error::ReadSessionNotImplemented);
             };
             Ok(contextdb_engine::ExplainOutput {
-                physical_plan,
-                index_used: index,
+                physical_plan: physical_plan.clone(),
+                index_used: index.clone(),
                 predicates_pushed: Vec::new(),
                 indexes_considered: Vec::new(),
                 sort_elided: false,
-                vector_search,
+                vector_search: vector_search.clone(),
             })
         });
 
+    note_read_route(session_handle, input, session);
     match explained {
         Ok(explained) if path == ExplainPath::PassiveVector => {
             if input.output.json {
@@ -2285,6 +2480,10 @@ enum ExplainPath {
 /// from SQL text or rendered plan prose. Ordinary SELECT/WITH keeps the
 /// shipped executed-trace behavior, while every vector nearest-neighbour
 /// SELECT remains passive and every non-SELECT statement is planned only.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn explain_path(sql: &str) -> contextdb_core::Result<ExplainPath> {
     let statement = contextdb_parser::parse(sql)?;
     Ok(match &statement {
@@ -2320,13 +2519,21 @@ fn report_error(error: &Error, input: InputContext) {
 }
 
 fn handle_sync_command(
+    session_handle: &Session,
     sync_client: Option<&SyncClient>,
     rt: Option<&tokio::runtime::Runtime>,
     args: &str,
     sync_plugin: Option<&SyncPlugin>,
 ) -> SyncCommandOutcome {
     let mut unconfirmed_push = false;
-    run_sync_command(sync_client, rt, args, sync_plugin, &mut unconfirmed_push)
+    run_sync_command(
+        session_handle,
+        sync_client,
+        rt,
+        args,
+        sync_plugin,
+        &mut unconfirmed_push,
+    )
 }
 
 /// The pull-progress rendering DECISION, pulled out of the sleep-driven
@@ -2434,10 +2641,17 @@ impl Drop for PullProgressStopForTest<'_> {
 /// session (plain text piped through a script) gets neither: nobody is
 /// watching stdout as text and nothing parses stderr as JSON there, so
 /// there's nothing to usefully stream.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn pull_with_progress(
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     client: &SyncClient,
     rt: &tokio::runtime::Runtime,
 ) -> Result<contextdb_engine::sync_types::ApplyResult, contextdb_core::Error> {
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let json = json_output_mode();
     let interactive_terminal = std::io::stdin().is_terminal();
     let stream_progress = json || interactive_terminal;
@@ -2510,7 +2724,7 @@ fn pull_with_progress(
             stop: &progress_stop,
             notice: &progress_stop_notice,
         };
-        let result = rt.block_on(client.pull_default());
+        let result = rt.block_on(client.pull_default_with_read_memory(read_memory));
         #[cfg(feature = "test-seams")]
         drop(stop_on_drop);
         #[cfg(not(feature = "test-seams"))]
@@ -2520,6 +2734,7 @@ fn pull_with_progress(
 }
 
 fn run_sync_command(
+    session_handle: &Session,
     sync_client: Option<&SyncClient>,
     rt: Option<&tokio::runtime::Runtime>,
     args: &str,
@@ -2573,6 +2788,17 @@ fn run_sync_command(
         };
     };
 
+    let read_memory = if !matches!(sub, "push" | "pull") {
+        None
+    } else {
+        Some(match session_handle.request_read_memory() {
+            Ok(read_memory) => read_memory,
+            Err(error) => {
+                let message = error.to_string();
+                return SyncCommandOutcome::failed_error(error, message);
+            }
+        })
+    };
     match sub {
         "status" => {
             let connected = rt.block_on(client.ensure_connected()).is_ok();
@@ -2625,7 +2851,9 @@ fn run_sync_command(
                 serde_json::json!({ "sync": document }),
             )
         }
-        "push" => match rt.block_on(client.push()) {
+        "push" => match rt.block_on(
+            client.push_with_read_memory(read_memory.clone().expect("push admitted its reader")),
+        ) {
             Ok(result) => {
                 let mut msg = format!(
                     "Pushed: {} applied, {} skipped, {} conflicts",
@@ -2690,52 +2918,54 @@ fn run_sync_command(
                 ),
             ),
         },
-        "pull" => match pull_with_progress(client, rt) {
-            Ok(result) => {
-                let mut msg = format!(
-                    "Pulled: {} applied, {} skipped, {} conflicts",
-                    result.applied_rows,
-                    result.skipped_rows,
-                    result.conflicts.len()
-                );
-                for conflict in &result.conflicts {
-                    msg.push_str(&format!(
-                        "\n  conflict: {}",
-                        contextdb_engine::cli_render::render_sync_conflict(conflict)
-                    ));
-                }
-                let mut pull_doc = apply_result_json(&result, "applied");
-                if let Some(object) = pull_doc.as_object_mut() {
-                    // Cumulative across every pull this client has issued.
-                    object.insert(
-                        "pull_pages_read".to_string(),
-                        serde_json::json!(client.pull_pages_read()),
+        "pull" => {
+            match pull_with_progress(read_memory.expect("pull admitted its reader"), client, rt) {
+                Ok(result) => {
+                    let mut msg = format!(
+                        "Pulled: {} applied, {} skipped, {} conflicts",
+                        result.applied_rows,
+                        result.skipped_rows,
+                        result.conflicts.len()
                     );
-                    // THIS pull's own page count, distinct from the
-                    // cumulative counter above -- a no-op second pull reads
-                    // 0 here while the cumulative counter holds steady, so
-                    // a caller can tell "this pull did nothing" from "this
-                    // pull did a lot" without diffing two cumulative reads.
-                    object.insert(
-                        "pull_pages_read_this_pull".to_string(),
-                        serde_json::json!(client.pull_pages_read_this_pull()),
-                    );
+                    for conflict in &result.conflicts {
+                        msg.push_str(&format!(
+                            "\n  conflict: {}",
+                            contextdb_engine::cli_render::render_sync_conflict(conflict)
+                        ));
+                    }
+                    let mut pull_doc = apply_result_json(&result, "applied");
+                    if let Some(object) = pull_doc.as_object_mut() {
+                        // Cumulative across every pull this client has issued.
+                        object.insert(
+                            "pull_pages_read".to_string(),
+                            serde_json::json!(client.pull_pages_read()),
+                        );
+                        // THIS pull's own page count, distinct from the
+                        // cumulative counter above -- a no-op second pull reads
+                        // 0 here while the cumulative counter holds steady, so
+                        // a caller can tell "this pull did nothing" from "this
+                        // pull did a lot" without diffing two cumulative reads.
+                        object.insert(
+                            "pull_pages_read_this_pull".to_string(),
+                            serde_json::json!(client.pull_pages_read_this_pull()),
+                        );
+                    }
+                    SyncCommandOutcome::succeeded(msg, serde_json::json!({ "sync_pull": pull_doc }))
                 }
-                SyncCommandOutcome::succeeded(msg, serde_json::json!({ "sync_pull": pull_doc }))
-            }
-            Err(e) => SyncCommandOutcome::failed(
-                ErrorClass::of(&e),
-                format!(
-                    "Pull from sync endpoint {} (tenant {}) failed: {}",
-                    client.endpoint(),
-                    client.tenant_id(),
-                    with_sentence_break(
-                        &e,
-                        "Check the endpoint is reachable, then retry with `.sync reconnect` followed by `.sync pull`.",
-                    )
+                Err(e) => SyncCommandOutcome::failed(
+                    ErrorClass::of(&e),
+                    format!(
+                        "Pull from sync endpoint {} (tenant {}) failed: {}",
+                        client.endpoint(),
+                        client.tenant_id(),
+                        with_sentence_break(
+                            &e,
+                            "Check the endpoint is reachable, then retry with `.sync reconnect` followed by `.sync pull`.",
+                        )
+                    ),
                 ),
-            ),
-        },
+            }
+        }
         "reconnect" => {
             rt.block_on(client.reconnect());
             let connected = rt.block_on(client.is_connected());
@@ -2780,10 +3010,10 @@ fn run_sync_command(
                     ),
                     serde_json::json!({ "sync_destination": { "hub_node_id": node_id } }),
                 ),
-                Err(err) => SyncCommandOutcome::failed(
-                    ErrorClass::of(&err),
-                    format!("Changing destination failed: {err}"),
-                ),
+                Err(err) => {
+                    let message = format!("Changing destination failed: {err}");
+                    SyncCommandOutcome::failed_error(err, message)
+                }
             }
         }
         "auto" => {
@@ -2916,82 +3146,10 @@ fn print_direct_events_status(status: &contextdb_engine::DirectEventsStatus) {
 }
 
 /// Execute a SQL statement and print the result. Returns `true` on success, `false` on error.
-/// After a statement the CLI's own statement-execution path just ran
-/// successfully, register the CLI's own zero-config default for whatever
-/// needs an external callback to do anything observable: `CREATE SINK` gets
-/// a delivery callback so a routed event actually delivers (the engine's
-/// queue-until-registered contract — acceptance `t5_26` — is untouched,
-/// since this registers only AFTER the sink already exists, same as any
-/// other consumer would); `CREATE SCHEDULE` gets a cron callback so a
-/// declared schedule fires. `.events status` already renders the resulting
-/// delivered/queued/fire_count counters, so the default is deliberately a
-/// quiet no-op rather than printing anything itself -- a background
-/// dispatcher thread writing ad hoc lines to stderr at an unpredictable time
-/// would violate the `--json` stderr-is-JSON-Lines-only contract
-/// (`json_stderr_purity_tests.rs`).
-///
-/// This is a CLI-layer convenience, not an engine default: an embedding
-/// consumer (context-graph, vigil) that opens a `Database` directly and
-/// never calls through `feed_line`/`execute_sql` never sees it — only a
-/// session driven through the CLI's real per-line path does. Best-effort:
-/// a parse failure or a registration error must never turn an
-/// already-successful DDL statement into a failure the operator sees.
-/// Ephemeral (`:memory:`) sessions only -- see `Database::is_memory_backed`'s
-/// doc comment. A file-backed store is durable-until-explicitly-registered
-/// on purpose: a CLI script is routinely used to seed schema/data for a
-/// SEPARATE, later process (its own Rust program, possibly principal- or
-/// context-scoped) to open and register the real callback against; eagerly
-/// registering and draining here would consume those durably-queued events
-/// out from under that later, legitimate registration before it ever gets a
-/// chance to run (acceptance `t5_16`/`t5_06`/`t5_13`/`t5_15`/`t5_31` all
-/// depend on this). An interactive/piped `:memory:` session has no later
-/// process to hand off to -- it IS the whole session -- so it gets the
-/// zero-config convenience instead.
-fn register_cli_defaults_for_statement(db: &Database, sql: &str) {
-    if !db.is_memory_backed() {
-        return;
-    }
-    let Ok(statement) = contextdb_parser::parse(sql) else {
-        return;
-    };
-    match statement {
-        contextdb_parser::Statement::CreateSink { name, .. } => {
-            let _ = db.register_sink(&name, None, |_event| Ok(()));
-        }
-        contextdb_parser::Statement::CreateSchedule { callback, .. } => {
-            let _ = db.register_cron_callback(&callback, |_db| Ok(()));
-        }
-        _ => {}
-    }
-}
-
-/// Briefly wait for a sink the CLI's own statement path registered a
-/// callback for to drain to zero queued after a statement, so the operator
-/// sees delivery settle before the next prompt/statement rather than racing
-/// an unpredictable background dispatcher-thread wakeup. Bounded: a sink
-/// that will never drain (an ACL-denied item, a slow external callback that
-/// isn't ours) gives up after the bound instead of hanging the session.
-/// Costs nothing when nothing is queued -- the common case. Ephemeral
-/// (`:memory:`) sessions only, for the same reason
-/// `register_cli_defaults_for_statement` is scoped that way.
-fn settle_cli_registered_sinks(db: &Database) {
-    if !db.is_memory_backed() {
-        return;
-    }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-    loop {
-        let still_settling = db
-            .event_bus_status()
-            .sinks
-            .iter()
-            .any(|sink| sink.callback_registered && sink.metrics.queued > 0);
-        if !still_settling || std::time::Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-}
-
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn execute_sql(
     session_handle: &Session,
     sql: &str,
@@ -3011,11 +3169,14 @@ fn execute_sql(
         return false;
     }
 
-    note_read_route(session_handle, input, session);
     let cancellation = OwnerReadCancellation::new();
     let executed = match session_handle.database() {
         // A write has one door, and it is the live database.
-        Some(database) if writes => database.execute(sql, &HashMap::new()),
+        Some(database) if writes => session_handle
+            .request_read_memory()
+            .and_then(|read_memory| {
+                database.execute_with_read_memory(sql, &HashMap::new(), read_memory)
+            }),
         // Every read takes the bounded door, including a writer's own read
         // inside the transaction it opened itself — reading your own
         // uncommitted rows and staying under a ceiling are not in tension, so
@@ -3033,12 +3194,9 @@ fn execute_sql(
         }
     };
 
+    note_read_route(session_handle, input, session);
     match executed {
         Ok(result) => {
-            if let Some(database) = session_handle.database() {
-                register_cli_defaults_for_statement(database, sql);
-                settle_cli_registered_sinks(database);
-            }
             if let Some(statement) = &statement {
                 session.transaction_open = match statement {
                     contextdb_parser::Statement::Begin => true,
@@ -3048,16 +3206,16 @@ fn execute_sql(
                     _ => session.transaction_open,
                 };
             }
-            if result.columns.is_empty() {
+            if result.columns().is_empty() {
                 if output.json {
                     // A non-query statement: a small JSON status object so the
                     // machine channel stays JSON end to end.
                     println!(
                         "{}",
-                        serde_json::json!({ "rows_affected": result.rows_affected })
+                        serde_json::json!({ "rows_affected": result.rows_affected() })
                     );
                 } else {
-                    println!("ok (rows_affected={})", result.rows_affected);
+                    println!("ok (rows_affected={})", result.rows_affected());
                 }
             } else if output.json {
                 json_output::print_document(&json_output::result_document(&result));
@@ -3073,20 +3231,20 @@ fn execute_sql(
                 // One footer, and it is the last thing a successful ordinary
                 // result prints. There is no other decoration: a result is
                 // complete or it is refused.
-                println!("({} rows)", result.rows.len());
+                println!("({} rows)", result.rows().len());
             }
             if session.trace_enabled {
                 if output.json {
                     // The trace is diagnostics about a result, not the result:
                     // on stdout it would corrupt the JSON Lines stream a
                     // consumer is parsing.
-                    json_output::print_trace(&result.trace, result.trace.rows_examined);
+                    json_output::print_trace(result.trace(), result.trace().rows_examined);
                 } else {
                     println!(
                         "{}",
                         contextdb_engine::cli_render::render_query_trace(
-                            &result.trace,
-                            result.trace.rows_examined
+                            result.trace(),
+                            result.trace().rows_examined
                         )
                     );
                 }
@@ -3128,10 +3286,17 @@ mod tests {
     use contextdb_parser::{Statement, parse};
 
     /// A writing session over a throwaway in-memory database — what these
-    /// fixtures drive, and the mode `:memory:` always has.
+    /// fixtures drive.
     fn writing_session(database: &Arc<Database>) -> Session {
-        Session::writing(Arc::clone(database), ReadLimits::default())
-            .expect("a live database opens its own bounded read view")
+        Session::writing(
+            Arc::clone(database),
+            ReadLimits::default(),
+            contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                ReadLimits::default().memory,
+            )
+            .expect("the declared read limit is admitted"),
+        )
+        .expect("a live database opens its own bounded read view")
     }
 
     /// A scripted, human-output context — what the meta-command tests below
@@ -3286,121 +3451,6 @@ mod tests {
         );
     }
 
-    /// Drive `lines` through the REPL's REAL per-line statement-execution
-    /// path (`feed_line` — what both the interactive and scripted adapters
-    /// call for every line), not raw `db.execute`. Panics if any line makes
-    /// the session quit or if any statement reports an error, since none of
-    /// these fixtures are expected to fail.
-    fn drive_lines(db: &Arc<Database>, lines: &[&str]) {
-        let session_handle = writing_session(db);
-        let mut session = SessionState::default();
-        let mut pending = StatementBuffer::default();
-        for line in lines {
-            let keep_going = feed_line(
-                &session_handle,
-                None,
-                None,
-                line,
-                scripted_input(),
-                None,
-                &mut session,
-                &mut pending,
-            );
-            assert!(keep_going, "line must not end the session: {line}");
-        }
-        assert!(
-            !session.had_error,
-            "every fixture statement must succeed through the real CLI statement path"
-        );
-    }
-
-    #[test]
-    fn cli_statement_flow_registers_a_default_sink_callback_so_a_routed_event_delivers() {
-        // Driven through `feed_line`, the REAL per-line path both the
-        // interactive and scripted adapters call — not raw `db.execute` —
-        // exactly what running these same lines at the `contextdb` prompt
-        // does today. The event fires into the sink's durable queue and
-        // sits there forever; nothing an operator typed makes it observably
-        // deliver. RULED contract (owner, 2026-08-06): when the CLI's own
-        // statement-execution path processes CREATE SINK, the CLI registers
-        // its own default callback — the engine's queue-until-registered
-        // contract (acceptance t5_26) stays intact, and delivery becomes
-        // observable through the CLI alone.
-        let db = Arc::new(Database::open_memory());
-        drive_lines(
-            &db,
-            &[
-                "CREATE TABLE t (id INTEGER PRIMARY KEY);",
-                "CREATE EVENT TYPE t_ins WHEN INSERT ON t;",
-                "CREATE SINK s TYPE callback;",
-                "CREATE ROUTE r EVENT t_ins TO s;",
-                "INSERT INTO t (id) VALUES (1);",
-            ],
-        );
-
-        let metrics = db.sink_metrics("s");
-        assert_eq!(
-            metrics.delivered, 1,
-            "the CLI's real statement-execution path must register a default \
-             delivery callback when it processes CREATE SINK, so a routed event \
-             observably delivers when it fires; today nothing in that path does \
-             this (queued={}, delivered={})",
-            metrics.queued, metrics.delivered
-        );
-    }
-
-    #[test]
-    fn cli_statement_flow_registers_a_cron_callback_so_a_schedule_fires() {
-        // Same story for CREATE SCHEDULE, driven through the real `feed_line`
-        // path. `cron_run_due_now_for_test` synchronously drives any due
-        // schedule (a bounded, sleep-free engine test seam) rather than this
-        // test sleeping to wait for wall-clock time to pass — but it only
-        // bound-waits up to 75ms for an imminently-due schedule
-        // (`wait_for_imminent_cron_due_for_test`), so the interval below is
-        // kept under that bound (a schedule due further out than the wait
-        // window is silently skipped by that one call, independent of
-        // whatever the ALSO-running background tickler thread does). And
-        // because that background tickler can fire the schedule on its own
-        // wall-clock cadence at any time, the assertion reads the schedule's
-        // PERSISTED fire_count via `cron_status()` rather than trusting
-        // `cron_run_due_now_for_test`'s own return value, which only counts
-        // fires from this one call and misses a tickler fire that already
-        // landed first.
-        let db = Arc::new(Database::open_memory());
-        drive_lines(
-            &db,
-            &[
-                "CREATE TABLE cron_log (id INTEGER PRIMARY KEY);",
-                "CREATE SCHEDULE hb EVERY '30 MILLISECONDS' TX (hb_cb);",
-            ],
-        );
-
-        // Each call re-evaluates due state against a FRESH 75ms budget, so a
-        // few attempts absorb ordinary scheduler jitter on a loaded box
-        // without this test ever sleeping itself — every wait is inside the
-        // engine's own bounded seam.
-        let mut fire_count = 0;
-        for _ in 0..5 {
-            let _ = db.cron_run_due_now_for_test();
-            fire_count = db
-                .cron_status()
-                .iter()
-                .find(|schedule| schedule.name == "hb")
-                .expect("schedule hb must be registered after CREATE SCHEDULE")
-                .fire_count;
-            if fire_count > 0 {
-                break;
-            }
-        }
-        assert!(
-            fire_count > 0,
-            "a SCHEDULE declared purely through CLI SQL must be able to fire \
-             observably — the CLI must supply a default callback so an operator \
-             who never writes Rust still sees it run; got persisted fire_count=0 \
-             after 5 attempts"
-        );
-    }
-
     #[test]
     fn test_backslash_dt() {
         let db = Arc::new(Database::open_memory());
@@ -3468,6 +3518,8 @@ mod tests {
     // it believes reached the hub.
     #[test]
     fn b2_sync_not_configured_message() {
+        let db = Arc::new(Database::open_memory());
+        let session = writing_session(&db);
         for (subcmd, expected_ok) in [
             ("status", true),
             ("auto", true),
@@ -3476,7 +3528,7 @@ mod tests {
             ("reconnect", false),
             ("destination", false),
         ] {
-            let result = handle_sync_command(None, None, subcmd, None);
+            let result = handle_sync_command(&session, None, None, subcmd, None);
             assert!(
                 result.message.contains("Sync not configured"),
                 "subcmd '{}' should return 'Sync not configured', got: {}",
@@ -3495,6 +3547,7 @@ mod tests {
     #[test]
     fn b5_sync_invalid_args() {
         let db = Arc::new(Database::open_memory());
+        let session = writing_session(&db);
         let rt = tokio::runtime::Runtime::new().unwrap();
         let client = rt.block_on(async {
             SyncClient::new(
@@ -3502,6 +3555,7 @@ mod tests {
                 "iroh:invalid-test-ticket",
                 contextdb_core::TenantId::from("b5-test"),
             )
+            .expect("construct SyncClient fixture")
         });
 
         for bad_input in [
@@ -3513,7 +3567,8 @@ mod tests {
             "policy table_only",
             "policy t InvalidPolicy",
         ] {
-            let result = handle_sync_command(Some(&client), Some(&rt), bad_input, None).message;
+            let result =
+                handle_sync_command(&session, Some(&client), Some(&rt), bad_input, None).message;
             assert!(
                 !result.contains("not implemented"),
                 "bad input '{}' should not return 'not implemented', got: {}",
@@ -3626,83 +3681,151 @@ mod tests {
             ClientTransport, TransportError, TransportFuture, TransportResult,
             TransportStatusFuture,
         };
+        use contextdb_server::{FabricIdentity, InProcessBroker, SyncServer};
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::Duration;
 
-        // Connects, but every request after connect is unreachable — so the push
-        // batch cannot be sent AND the reconcile status probe cannot confirm it.
-        struct UnreachableAfterConnect {
-            local_node_id: String,
+        // Pass pre-send verification through the authenticated hub. Lose the
+        // first push acknowledgement only after the real hub has handled it,
+        // then make retries and reconciliation unavailable.
+        struct InterruptedAfterSend {
+            inner: Arc<dyn ClientTransport>,
+            interrupted: AtomicBool,
+            refuse_before_send: AtomicBool,
         }
-        impl ClientTransport for UnreachableAfterConnect {
+        impl ClientTransport for InterruptedAfterSend {
             fn peer_node_id(&self) -> Option<String> {
-                Some("unreachable-test-hub".to_string())
+                self.inner.peer_node_id()
             }
 
             fn local_node_id(&self) -> Option<String> {
-                Some(self.local_node_id.clone())
+                self.inner.local_node_id()
             }
 
             fn has_stable_edge_identity(&self) -> bool {
-                true
+                self.inner.has_stable_edge_identity()
             }
 
             fn ensure_connected<'a>(&'a self) -> TransportFuture<'a, ()> {
-                Box::pin(async { Ok(()) })
+                self.inner.ensure_connected()
             }
+
             fn is_connected<'a>(&'a self) -> TransportStatusFuture<'a> {
-                Box::pin(async { true })
+                self.inner.is_connected()
             }
+
             fn request<'a>(
                 &'a self,
-                _subject: &'a str,
-                _bytes: Vec<u8>,
-                _timeout: Duration,
+                subject: &'a str,
+                bytes: Vec<u8>,
+                timeout: Duration,
             ) -> TransportFuture<'a, Vec<u8>> {
-                Box::pin(async {
-                    Err(TransportError::Unreachable(
-                        "dial timed out (test)".to_string(),
-                    ))
+                Box::pin(async move {
+                    if self.refuse_before_send.load(Ordering::SeqCst)
+                        || self.interrupted.load(Ordering::SeqCst)
+                    {
+                        return Err(TransportError::Unreachable(
+                            "fixture transport unavailable".to_string(),
+                        ));
+                    }
+                    self.inner.request(subject, bytes, timeout).await
                 })
             }
+
             fn request_single_reply<'a>(
                 &'a self,
-                _subject: &'a str,
-                _bytes: Vec<u8>,
-                _timeout: Duration,
+                subject: &'a str,
+                bytes: Vec<u8>,
+                timeout: Duration,
             ) -> TransportFuture<'a, Vec<u8>> {
-                Box::pin(async {
-                    Err(TransportError::Unreachable(
-                        "dial timed out (test)".to_string(),
-                    ))
+                Box::pin(async move {
+                    if self.refuse_before_send.load(Ordering::SeqCst)
+                        || self.interrupted.load(Ordering::SeqCst)
+                    {
+                        return Err(TransportError::Unreachable(
+                            "fixture transport unavailable".to_string(),
+                        ));
+                    }
+                    let reply = self
+                        .inner
+                        .request_single_reply(subject, bytes, timeout)
+                        .await?;
+                    if subject == contextdb_server::subjects::push_subject("usr19-exit") {
+                        self.interrupted.store(true, Ordering::SeqCst);
+                        return Err(TransportError::Unreachable(
+                            "push acknowledgement lost (test)".to_string(),
+                        ));
+                    }
+                    Ok(reply)
                 })
             }
-            fn ensure_single_reply_retry_safe(&self, _bytes: &[u8]) -> TransportResult<()> {
-                Ok(())
+
+            fn ensure_single_reply_retry_safe(&self, bytes: &[u8]) -> TransportResult<()> {
+                self.inner.ensure_single_reply_retry_safe(bytes)
             }
         }
 
-        let db = Arc::new(Database::open_memory());
-        db.execute(
-            "CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT)",
-            &HashMap::new(),
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO notes (id, body) VALUES ('n1', 'pending')",
-            &HashMap::new(),
-        )
-        .unwrap();
-
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let edge_identity = Arc::new(contextdb_server::FabricIdentity::generate());
-        let client = SyncClient::with_authenticated_transport_and_identity_for_test(
-            db,
-            Arc::new(UnreachableAfterConnect {
-                local_node_id: edge_identity.node_id(),
-            }),
-            contextdb_core::TenantId::from("usr19-exit"),
-            edge_identity,
+        let fixture = || {
+            let db = Arc::new(Database::open_memory());
+            db.execute(
+                "CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT)",
+                &HashMap::new(),
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO notes (id, body) VALUES ('n1', 'pending')",
+                &HashMap::new(),
+            )
+            .unwrap();
+
+            let broker = InProcessBroker::new();
+            let hub_identity = Arc::new(FabricIdentity::generate());
+            let hub_node_id = hub_identity.node_id();
+            let server = SyncServer::with_authenticated_transport_and_identity_for_test(
+                Arc::new(Database::open_memory()),
+                broker.server_as(&hub_node_id),
+                contextdb_core::TenantId::from("usr19-exit"),
+                hub_node_id,
+                hub_identity,
+            )
+            .expect("construct authenticated hub");
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let task = rt.spawn({
+                let shutdown = shutdown.clone();
+                async move { server.run_until(shutdown).await }
+            });
+            rt.block_on(broker.wait_for_registered_route_for_test(
+                &contextdb_server::subjects::status_subject("usr19-exit"),
+            ));
+            let edge_identity = Arc::new(FabricIdentity::generate());
+            let transport = Arc::new(InterruptedAfterSend {
+                inner: broker.client_as(&edge_identity.node_id()),
+                interrupted: AtomicBool::new(false),
+                refuse_before_send: AtomicBool::new(false),
+            });
+            let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+                db.clone(),
+                transport.clone(),
+                contextdb_core::TenantId::from("usr19-exit"),
+                edge_identity,
+            )
+            .expect("construct SyncClient fixture");
+            (db, client, transport, shutdown, task)
+        };
+        let (_, client, transport, shutdown, task) = fixture();
+
+        // A failed pre-send lookup has transmitted nothing: preserve the plain
+        // transport error rather than claiming an indeterminate push.
+        transport.refuse_before_send.store(true, Ordering::SeqCst);
+        let before_send = rt.block_on(client.push());
+        assert!(
+            matches!(&before_send, Err(Error::SyncError(message))
+                if message.contains("fixture transport unavailable")),
+            "a pre-send failure must preserve the plain transport error, got {before_send:?}"
         );
+        assert!(!transport.interrupted.load(Ordering::SeqCst));
+        transport.refuse_before_send.store(false, Ordering::SeqCst);
 
         // The library surfaces the distinct indeterminate error — never a bare
         // SyncError and never a false Ok.
@@ -3712,11 +3835,24 @@ mod tests {
             "an unconfirmable interrupted push must be SyncPushUnconfirmed, got {push:?}"
         );
 
+        assert!(
+            transport.interrupted.load(Ordering::SeqCst),
+            "the real hub must handle a push before its acknowledgement is lost"
+        );
+        shutdown.store(true, Ordering::SeqCst);
+        rt.block_on(task).expect("stop library fixture hub");
+
+        // Use an independent pending push so a prior landed push cannot be
+        // confirmed by the next attempt's pre-send status lookup.
+        let (db, client, transport, shutdown, task) = fixture();
+        let session = writing_session(&db);
+
         // The CLI render keeps `ok` true (not a plain failure) but raises the
         // unconfirmed flag, so a non-interactive session exits with the distinct
         // code 3.
         let mut unconfirmed_push = false;
         let outcome = run_sync_command(
+            &session,
             Some(&client),
             Some(&rt),
             "push",
@@ -3752,6 +3888,12 @@ mod tests {
         assert_ne!(code, 0, "must not be a clean-success exit");
         assert_ne!(code, 1, "must not be the definitive-failure exit");
         assert_eq!(EXIT_INTERRUPTED_PUSH_UNCONFIRMED, 3);
+        assert!(
+            transport.interrupted.load(Ordering::SeqCst),
+            "the CLI push must also reach the hub before interruption"
+        );
+        shutdown.store(true, Ordering::SeqCst);
+        rt.block_on(task).expect("stop CLI fixture hub");
     }
 
     /// A terminal session showed the human every error as it happened, so

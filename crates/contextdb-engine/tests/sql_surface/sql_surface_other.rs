@@ -1,12 +1,17 @@
-#[cfg_attr(not(feature = "test-seams"), allow(unused_imports))] #[rustfmt::skip]
+#[rustfmt::skip]
 use contextdb_core::{ContextId, Error, Lsn, Principal, RowId, ScopeLabel, Value, VectorIndexRef};
+use contextdb_engine::Database;
+#[cfg(feature = "test-seams")]
 use contextdb_engine::memory_accounting::MemoryAccountant;
-use contextdb_engine::{Database, sync_types as sync};
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types as sync;
 use std::collections::{BTreeSet, HashMap};
-#[cfg_attr(not(feature = "test-seams"), allow(unused_imports))] #[rustfmt::skip]
-use std::sync::{atomic::{AtomicBool, Ordering}, mpsc::{self, TryRecvError}, Arc, Barrier};
+#[rustfmt::skip]
+#[cfg_attr(not(feature = "test-seams"), allow(unused_imports, reason = "KEEP-SEAM: live only under the test-seams feature"))]
+#[cfg_attr(not(feature = "test-seams"), allow(unused_imports, reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_tests.rs"))]
+use std::sync::{atomic::Ordering, mpsc::{self, TryRecvError}, Arc, Barrier};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -45,8 +50,8 @@ fn sql_01b_default_integer_literal_applies_on_omitted_insert() {
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    assert_eq!(result.rows[0][0], Value::Int64(5));
+    assert_eq!(result.rows().len(), 1);
+    assert_eq!(result.rows()[0][0], Value::Int64(5));
 }
 
 #[test]
@@ -73,8 +78,8 @@ fn sql_01c_default_real_literal_applies_on_omitted_insert() {
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    assert_eq!(result.rows[0][0], Value::Float64(0.0));
+    assert_eq!(result.rows().len(), 1);
+    assert_eq!(result.rows()[0][0], Value::Float64(0.0));
 }
 
 #[test]
@@ -110,9 +115,9 @@ fn sql_01d_numeric_defaults_survive_persisted_reopen() {
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    assert_eq!(result.rows[0][0], Value::Float64(0.0));
-    assert_eq!(result.rows[0][1], Value::Int64(5));
+    assert_eq!(result.rows().len(), 1);
+    assert_eq!(result.rows()[0][0], Value::Float64(0.0));
+    assert_eq!(result.rows()[0][1], Value::Int64(5));
 }
 
 #[test]
@@ -146,11 +151,11 @@ fn sql_02_edge_insert_routes_to_graph_once() {
         )
         .unwrap();
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "graph traversal should see exactly one reachable target after duplicate SQL edge inserts"
     );
-    assert_eq!(result.rows[0][0], Value::Uuid(target));
+    assert_eq!(result.rows()[0][0], Value::Uuid(target));
 }
 
 #[test]
@@ -299,8 +304,14 @@ fn sql_05_scenario3_multi_hop_cascade() {
             &params(vec![("id", Value::Uuid(decision_b))]),
         )
         .unwrap();
-    assert_eq!(decision_a_row.rows[0][0], Value::Text("invalidated".into()));
-    assert_eq!(decision_b_row.rows[0][0], Value::Text("invalidated".into()));
+    assert_eq!(
+        decision_a_row.rows()[0][0],
+        Value::Text("invalidated".into())
+    );
+    assert_eq!(
+        decision_b_row.rows()[0][0],
+        Value::Text("invalidated".into())
+    );
 }
 
 #[test]
@@ -359,9 +370,9 @@ fn sql_07_join_double_qualification() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    assert_eq!(result.rows[0][0], Value::Text("employee".into()));
-    assert_eq!(result.rows[0][1], Value::Text("order".into()));
+    assert_eq!(result.rows().len(), 1);
+    assert_eq!(result.rows()[0][0], Value::Text("employee".into()));
+    assert_eq!(result.rows()[0][1], Value::Text("order".into()));
 }
 
 #[test]
@@ -388,7 +399,7 @@ fn sql_08_distinct_not_quadratic() {
     let result = db
         .execute("SELECT DISTINCT tag FROM items", &empty())
         .unwrap();
-    assert_eq!(result.rows.len(), 100);
+    assert_eq!(result.rows().len(), 100);
 }
 
 #[test]
@@ -462,9 +473,9 @@ fn jn_04_cte_graph_join_relational() {
             &params(vec![("root_id", Value::Uuid(eid1))]),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    let name_idx = result.columns.iter().position(|c| c == "name").unwrap();
-    assert_eq!(result.rows[0][name_idx], Value::Text("child".into()));
+    assert_eq!(result.rows().len(), 1);
+    let name_idx = result.columns().iter().position(|c| c == "name").unwrap();
+    assert_eq!(result.rows()[0][name_idx], Value::Text("child".into()));
 }
 
 #[test]
@@ -541,11 +552,11 @@ fn jn_06_cte_filtered_vector_ordering_executes() {
         )
         .expect("CTE-backed vector ordering should execute");
 
-    assert_eq!(result.rows.len(), 2);
-    assert_eq!(result.rows[0][0], Value::Uuid(near));
-    assert_eq!(result.rows[0][1], Value::Text("near".into()));
-    assert_eq!(result.rows[1][0], Value::Uuid(far));
-    assert_eq!(result.rows[1][1], Value::Text("far".into()));
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(result.rows()[0][0], Value::Uuid(near));
+    assert_eq!(result.rows()[0][1], Value::Text("near".into()));
+    assert_eq!(result.rows()[1][0], Value::Uuid(far));
+    assert_eq!(result.rows()[1][1], Value::Text("far".into()));
 }
 
 fn sarg_uuid(n: u128) -> Uuid {
@@ -625,12 +636,12 @@ fn sarg_insert_node(db: &Database, id: Uuid, ctx: Option<Uuid>, kind: Option<&st
 
 fn sarg_uuid_column_set(result: &contextdb_engine::QueryResult, column: &str) -> BTreeSet<Uuid> {
     let idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == column || c.rsplit('.').next() == Some(column))
-        .unwrap_or_else(|| panic!("column {column} not found in {:?}", result.columns));
+        .unwrap_or_else(|| panic!("column {column} not found in {:?}", result.columns()));
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[idx] {
             Value::Uuid(id) => *id,
@@ -741,6 +752,7 @@ fn ga_insert_edge(db: &Database, source: Uuid, target: Uuid, edge_type: &str) {
     .unwrap();
 }
 
+#[cfg(feature = "test-seams")]
 fn ga_insert_edge_with_context(
     db: &Database,
     source: Uuid,
@@ -761,6 +773,7 @@ fn ga_insert_edge_with_context(
     .unwrap();
 }
 
+#[cfg(feature = "test-seams")]
 fn ga_seed_unrelated_edges(db: &Database, base: u128, count: usize, edge_type: &str) {
     for i in 0..count {
         ga_insert_edge(
@@ -776,6 +789,7 @@ fn ga_uuid_set(result: &contextdb_engine::QueryResult, column: &str) -> BTreeSet
     sarg_uuid_column_set(result, column)
 }
 
+#[cfg(feature = "test-seams")]
 fn ga_assert_trace(
     result: &contextdb_engine::QueryResult,
     physical_plan: &str,
@@ -783,24 +797,25 @@ fn ga_assert_trace(
     predicates: &[&str],
     indexes_considered_len: usize,
 ) {
-    assert_eq!(result.trace.physical_plan, physical_plan);
-    assert_eq!(result.trace.index_used.as_deref(), index_used);
+    assert_eq!(result.trace().physical_plan, physical_plan);
+    assert_eq!(result.trace().index_used.as_deref(), index_used);
     let pushed: Vec<&str> = result
-        .trace
+        .trace()
         .predicates_pushed
         .iter()
         .map(|predicate| predicate.as_ref())
         .collect();
     assert_eq!(pushed, predicates);
     assert_eq!(
-        result.trace.indexes_considered.len(),
+        result.trace().indexes_considered.len(),
         indexes_considered_len,
         "unexpected indexes_considered: {:?}",
-        result.trace.indexes_considered
+        result.trace().indexes_considered
     );
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga01_forward_pinned_single_hop_reports_forward_adjacency_probe() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, ", name TEXT", "");
@@ -834,22 +849,23 @@ fn ga01_forward_pinned_single_hop_reports_forward_adjacency_probe() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), targets);
-    assert_eq!(result.rows.len(), targets.len());
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(result.rows().len(), targets.len());
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().index_used.as_deref(), Some("forward_adj"));
     assert!(
         result
-            .trace
+            .trace()
             .predicates_pushed
             .iter()
             .any(|predicate| predicate.as_ref() == "a.id"),
         "expected a.id in predicates_pushed, got {:?}",
-        result.trace.predicates_pushed
+        result.trace().predicates_pushed
     );
     assert_eq!(db.__rows_examined(), 5);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga02_reverse_pinned_single_hop_reports_reverse_adjacency_probe() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, ", name TEXT", "");
@@ -883,13 +899,14 @@ fn ga02_reverse_pinned_single_hop_reports_reverse_adjacency_probe() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "d"), decisions);
-    assert_eq!(result.rows.len(), decisions.len());
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(result.trace.index_used.as_deref(), Some("reverse_adj"));
+    assert_eq!(result.rows().len(), decisions.len());
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().index_used.as_deref(), Some("reverse_adj"));
     assert_eq!(db.__rows_examined(), 4);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga03_both_pinned_positive_applies_target_residual_after_degree_walk() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -911,25 +928,26 @@ fn ga03_both_pinned_positive_applies_target_residual_after_degree_walk() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([y]));
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
     assert!(
         result
-            .trace
+            .trace()
             .predicates_pushed
             .iter()
             .any(|p| p.as_ref() == "a.id")
             && result
-                .trace
+                .trace()
                 .predicates_pushed
                 .iter()
                 .any(|p| p.as_ref() == "b.id"),
         "expected a.id and b.id predicates, got {:?}",
-        result.trace.predicates_pushed
+        result.trace().predicates_pushed
     );
     assert_eq!(db.__rows_examined(), 3);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga04_unpinned_single_hop_reports_honest_edges_scan_rejection() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -952,7 +970,7 @@ fn ga04_unpinned_single_hop_reports_honest_edges_scan_rejection() {
         .unwrap();
 
     let rows: BTreeSet<_> = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match (&row[0], &row[1]) {
             (Value::Uuid(source), Value::Uuid(target)) => (*source, *target),
@@ -960,10 +978,10 @@ fn ga04_unpinned_single_hop_reports_honest_edges_scan_rejection() {
         })
         .collect();
     assert_eq!(rows, BTreeSet::from(pairs));
-    assert_eq!(result.trace.physical_plan, "EdgesScan");
-    assert_eq!(result.trace.index_used, None);
+    assert_eq!(result.trace().physical_plan, "EdgesScan");
+    assert_eq!(result.trace().index_used, None);
     let considered: Vec<(&str, &str)> = result
-        .trace
+        .trace()
         .indexes_considered
         .iter()
         .map(|candidate| (candidate.name.as_str(), candidate.rejected_reason.as_ref()))
@@ -973,6 +991,7 @@ fn ga04_unpinned_single_hop_reports_honest_edges_scan_rejection() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga05_non_id_pinned_start_resolves_through_index_then_probes() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, ", name TEXT", "");
@@ -1022,11 +1041,12 @@ fn ga05_non_id_pinned_start_resolves_through_index_then_probes() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), targets);
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(db.__rows_examined(), 2 + 9);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga06_variable_length_traversal_reports_graph_bfs_without_changing_results() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -1054,11 +1074,12 @@ fn ga06_variable_length_traversal_reports_graph_bfs_without_changing_results() {
         ga_uuid_set(&result, "t"),
         BTreeSet::from([n1, n2, n3, side])
     );
-    assert_eq!(result.trace.physical_plan, "GraphBfs");
+    assert_eq!(result.trace().physical_plan, "GraphBfs");
     assert_eq!(db.__rows_examined(), 4);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga07_pre_insert_snapshot_does_not_see_later_edge() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -1077,13 +1098,14 @@ fn ga07_pre_insert_snapshot_does_not_see_later_edge() {
         )
         .unwrap();
 
-    assert!(result.rows.is_empty());
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert!(result.rows().is_empty());
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().index_used.as_deref(), Some("forward_adj"));
     assert_eq!(db.__rows_examined(), 0);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga08_delete_visibility_respects_pre_and_post_delete_snapshots() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -1115,16 +1137,17 @@ fn ga08_delete_visibility_respects_pre_and_post_delete_snapshots() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&before, "t"), BTreeSet::from([y]));
-    assert_eq!(before.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(before.trace.index_used.as_deref(), Some("forward_adj"));
-    assert!(after.rows.is_empty());
-    assert_eq!(after.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(after.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(before.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(before.trace().index_used.as_deref(), Some("forward_adj"));
+    assert!(after.rows().is_empty());
+    assert_eq!(after.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(after.trace().index_used.as_deref(), Some("forward_adj"));
     assert_eq!(before_examined, 1);
     assert_eq!(db.__rows_examined(), 0);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga09_same_transaction_staged_edge_is_visible_only_inside_transaction() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -1163,13 +1186,16 @@ fn ga09_same_transaction_staged_edge_is_visible_only_inside_transaction() {
         ga_uuid_set(&in_tx, "t"),
         BTreeSet::from([committed, staged])
     );
-    assert_eq!(in_tx.rows.len(), 2);
-    assert_eq!(in_tx.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(in_tx.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(in_tx.rows().len(), 2);
+    assert_eq!(in_tx.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(in_tx.trace().index_used.as_deref(), Some("forward_adj"));
     assert_eq!(in_tx_examined, 2);
     assert_eq!(ga_uuid_set(&outside_tx, "t"), BTreeSet::from([committed]));
-    assert_eq!(outside_tx.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(outside_tx.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(outside_tx.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(
+        outside_tx.trace().index_used.as_deref(),
+        Some("forward_adj")
+    );
     assert_eq!(outside_tx_examined, 1);
 
     let x2 = ga_uuid(810);
@@ -1197,23 +1223,24 @@ fn ga09_same_transaction_staged_edge_is_visible_only_inside_transaction() {
     let delete_outside_examined = db.__rows_examined();
     db.rollback(delete_tx).unwrap();
 
-    assert!(deleted_in_tx.rows.is_empty());
-    assert_eq!(deleted_in_tx.trace.physical_plan, "AdjacencyProbe");
+    assert!(deleted_in_tx.rows().is_empty());
+    assert_eq!(deleted_in_tx.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(
-        deleted_in_tx.trace.index_used.as_deref(),
+        deleted_in_tx.trace().index_used.as_deref(),
         Some("forward_adj")
     );
     assert_eq!(deleted_in_tx_examined, 0);
     assert_eq!(ga_uuid_set(&delete_outside_tx, "t"), BTreeSet::from([y2]));
-    assert_eq!(delete_outside_tx.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(delete_outside_tx.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(
-        delete_outside_tx.trace.index_used.as_deref(),
+        delete_outside_tx.trace().index_used.as_deref(),
         Some("forward_adj")
     );
     assert_eq!(delete_outside_examined, 1);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga10_rolled_back_staged_edge_never_leaks_to_later_read() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -1233,13 +1260,14 @@ fn ga10_rolled_back_staged_edge_never_leaks_to_later_read() {
         )
         .unwrap();
 
-    assert!(result.rows.is_empty());
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert!(result.rows().is_empty());
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().index_used.as_deref(), Some("forward_adj"));
     assert_eq!(db.__rows_examined(), 0);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga11_dag_edge_type_forward_probe_matches_plain_edge_type() {
     let db = Database::open_memory();
     db.execute("CREATE TABLE nodes (id UUID PRIMARY KEY)", &empty())
@@ -1263,12 +1291,13 @@ fn ga11_dag_edge_type_forward_probe_matches_plain_edge_type() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([y]));
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().index_used.as_deref(), Some("forward_adj"));
     assert_eq!(db.__rows_examined(), 1);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga12_forward_probe_trace_tuple_is_exact() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -1291,6 +1320,7 @@ fn ga12_forward_probe_trace_tuple_is_exact() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga13_indexed_subquery_start_feeds_probe_with_combined_accounting() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, ", kind TEXT", "");
@@ -1324,11 +1354,12 @@ fn ga13_indexed_subquery_start_feeds_probe_with_combined_accounting() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), expected);
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(db.__rows_examined(), 3 + 30);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga14_both_pinned_negative_residual_returns_empty_after_degree_walk() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -1349,12 +1380,13 @@ fn ga14_both_pinned_negative_residual_returns_empty_after_degree_walk() {
         )
         .unwrap();
 
-    assert!(result.rows.is_empty());
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert!(result.rows().is_empty());
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(db.__rows_examined(), 4);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga16_empty_start_vertex_still_reports_adjacency_probe() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -1369,12 +1401,13 @@ fn ga16_empty_start_vertex_still_reports_adjacency_probe() {
         )
         .unwrap();
 
-    assert!(result.rows.is_empty());
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert!(result.rows().is_empty());
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(db.__rows_examined(), 0);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga17_non_id_start_with_target_residual_pushes_start_predicate_only() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, ", name TEXT", "");
@@ -1397,29 +1430,30 @@ fn ga17_non_id_start_with_target_residual_pushes_start_predicate_only() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([y]));
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
     assert!(
         result
-            .trace
+            .trace()
             .predicates_pushed
             .iter()
             .any(|p| p.as_ref() == "a.name"),
         "expected a.name in predicates_pushed, got {:?}",
-        result.trace.predicates_pushed
+        result.trace().predicates_pushed
     );
     assert!(
         !result
-            .trace
+            .trace()
             .predicates_pushed
             .iter()
             .any(|p| p.as_ref() == "b.id"),
         "b.id is a target residual and must not be reported as routed start predicate: {:?}",
-        result.trace.predicates_pushed
+        result.trace().predicates_pushed
     );
     assert_eq!(db.__rows_examined(), 1 + 5);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga18_undirected_pinned_single_hop_probes_forward_and_reverse_maps() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -1451,12 +1485,13 @@ fn ga18_undirected_pinned_single_hop_probes_forward_and_reverse_maps() {
     let expected: BTreeSet<_> = forward.union(&reverse).copied().collect();
     let expected: BTreeSet<_> = expected.into_iter().chain([shared]).collect();
     assert_eq!(ga_uuid_set(&result, "t"), expected);
-    assert_eq!(result.rows.len(), expected.len());
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.rows().len(), expected.len());
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(db.__rows_examined(), 3 + 2 + 2);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga19_non_indexed_non_id_start_reports_honest_resolution_scan_plus_probe() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, ", kind TEXT", "");
@@ -1492,8 +1527,8 @@ fn ga19_non_indexed_non_id_start_reports_honest_resolution_scan_plus_probe() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), targets);
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().index_used.as_deref(), Some("forward_adj"));
     assert_eq!(db.__rows_examined(), nodes_count as u64 + 6);
 }
 
@@ -1514,8 +1549,8 @@ fn ga21_start_id_residual_is_resolved_before_probe() {
         )
         .unwrap();
 
-    assert!(result.rows.is_empty());
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert!(result.rows().is_empty());
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
 }
 
 #[test]
@@ -1548,10 +1583,11 @@ fn ga22_start_only_or_filter_resolves_all_matching_starts_before_probe() {
         ga_uuid_set(&result, "t"),
         BTreeSet::from([x_target, y_target])
     );
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga23_context_gated_edge_table_has_auto_lookup_index_for_scoped_probe() {
     let db = Database::open_memory();
     ga_create_graph_tables(
@@ -1600,7 +1636,7 @@ fn ga23_context_gated_edge_table_has_auto_lookup_index_for_scoped_probe() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([target]));
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(scoped.__rows_examined(), 1);
 }
 
@@ -1649,10 +1685,11 @@ fn ga24_start_only_or_filter_resolves_across_node_metadata_tables() {
         ga_uuid_set(&result, "t"),
         BTreeSet::from([named_target, kind_target])
     );
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga25_graph_edge_auto_index_cannot_be_dropped_by_user_or_sync_ddl() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", ", context_id UUID CONTEXT_ID");
@@ -1697,6 +1734,7 @@ fn ga25_graph_edge_auto_index_cannot_be_dropped_by_user_or_sync_ddl() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga26_alter_table_to_edge_shape_installs_graph_edge_auto_index() {
     let db = Database::open_memory();
     db.execute(
@@ -1737,11 +1775,12 @@ fn ga26_alter_table_to_edge_shape_installs_graph_edge_auto_index() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([target]));
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(scoped.__rows_examined(), 1);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga27_unpinned_edge_scan_respects_same_tx_graph_overlay() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -1779,10 +1818,10 @@ fn ga27_unpinned_edge_scan_respects_same_tx_graph_overlay() {
         ga_uuid_set(&in_tx, "t"),
         BTreeSet::from([committed, staged])
     );
-    assert_eq!(in_tx.trace.physical_plan, "EdgesScan");
+    assert_eq!(in_tx.trace().physical_plan, "EdgesScan");
     assert_eq!(in_tx_examined, 2);
     assert_eq!(ga_uuid_set(&outside_tx, "t"), BTreeSet::from([committed]));
-    assert_eq!(outside_tx.trace.physical_plan, "EdgesScan");
+    assert_eq!(outside_tx.trace().physical_plan, "EdgesScan");
     assert_eq!(outside_tx_examined, 1);
 
     ga_insert_edge(&db, deleted_source, deleted_target, "LINKS");
@@ -1815,6 +1854,7 @@ fn ga27_unpinned_edge_scan_respects_same_tx_graph_overlay() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga28_multihop_bfs_respects_same_tx_graph_overlay() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -1854,13 +1894,13 @@ fn ga28_multihop_bfs_respects_same_tx_graph_overlay() {
         ga_uuid_set(&in_tx, "t"),
         BTreeSet::from([middle, staged_leaf])
     );
-    assert_eq!(in_tx.trace.physical_plan, "GraphBfs");
+    assert_eq!(in_tx.trace().physical_plan, "GraphBfs");
     assert_eq!(in_tx_examined, 2);
     assert_eq!(
         ga_uuid_set(&outside_tx, "t"),
         BTreeSet::from([middle, committed_leaf])
     );
-    assert_eq!(outside_tx.trace.physical_plan, "GraphBfs");
+    assert_eq!(outside_tx.trace().physical_plan, "GraphBfs");
     assert_eq!(outside_tx_examined, 2);
 }
 
@@ -1920,10 +1960,11 @@ fn ga29_start_and_filter_resolves_across_node_metadata_tables() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([target]));
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga30_target_metadata_residual_filters_after_degree_walk() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, ", name TEXT", "");
@@ -1945,11 +1986,12 @@ fn ga30_target_metadata_residual_filters_after_degree_walk() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([wanted]));
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(db.__rows_examined(), 2);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga31_unqualified_id_start_filter_still_routes_as_start_pin() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -1972,12 +2014,13 @@ fn ga31_unqualified_id_start_filter_still_routes_as_start_pin() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([target]));
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().index_used.as_deref(), Some("forward_adj"));
     assert_eq!(db.__rows_examined(), 1);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga32_graph_where_sees_same_tx_node_metadata_overlay() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, ", name TEXT", "");
@@ -2027,14 +2070,15 @@ fn ga32_graph_where_sees_same_tx_node_metadata_overlay() {
         ga_uuid_set(&in_tx, "t"),
         BTreeSet::from([updated_target, staged_target])
     );
-    assert_eq!(in_tx.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(in_tx.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(in_tx_examined, 2);
-    assert!(outside_tx.rows.is_empty());
-    assert_eq!(outside_tx.trace.physical_plan, "AdjacencyProbe");
+    assert!(outside_tx.rows().is_empty());
+    assert_eq!(outside_tx.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(outside_tx_examined, 1);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga33_graph_start_subquery_allows_inner_table_aliases() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, ", name TEXT", "");
@@ -2058,7 +2102,7 @@ fn ga33_graph_start_subquery_allows_inner_table_aliases() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([target]));
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(db.__rows_examined(), 1 + 1);
 }
 
@@ -2107,6 +2151,7 @@ fn ga34_graph_where_errors_for_referenced_node_metadata_without_id_index() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga35_public_edge_metadata_survives_unrelated_gated_edge_table() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, ", context_id UUID CONTEXT_ID", "");
@@ -2133,11 +2178,12 @@ fn ga35_public_edge_metadata_survives_unrelated_gated_edge_table() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([target]));
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(scoped.__rows_examined(), 1);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga36_graph_gates_see_same_tx_acl_grants() {
     let db = Database::open_memory();
     db.execute(
@@ -2211,9 +2257,9 @@ fn ga36_graph_gates_see_same_tx_acl_grants() {
     db.rollback(tx).unwrap();
 
     assert_eq!(ga_uuid_set(&in_tx, "t"), BTreeSet::from([target]));
-    assert_eq!(in_tx.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(in_tx.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(in_tx_examined, 1);
-    assert!(outside_tx.rows.is_empty());
+    assert!(outside_tx.rows().is_empty());
 }
 
 #[test]
@@ -2235,8 +2281,8 @@ fn ga37_column_id_residual_does_not_parse_column_as_uuid() {
         )
         .unwrap();
 
-    assert!(result.rows.is_empty());
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert!(result.rows().is_empty());
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
 }
 
 #[test]
@@ -2259,10 +2305,11 @@ fn ga38_start_is_null_filter_falls_back_to_graph_residual_semantics() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([target]));
-    assert_eq!(result.trace.physical_plan, "EdgesScan");
+    assert_eq!(result.trace().physical_plan, "EdgesScan");
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga39_target_only_single_hop_uses_reverse_adjacency_probe() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -2283,8 +2330,8 @@ fn ga39_target_only_single_hop_uses_reverse_adjacency_probe() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "s"), BTreeSet::from([source]));
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(result.trace.index_used.as_deref(), Some("reverse_adj"));
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().index_used.as_deref(), Some("reverse_adj"));
     assert_eq!(db.__rows_examined(), 1);
 }
 
@@ -2367,11 +2414,12 @@ fn ga40_metadata_start_filter_sees_same_tx_acl_grant() {
     db.rollback(tx).unwrap();
 
     assert_eq!(ga_uuid_set(&in_tx, "t"), BTreeSet::from([target]));
-    assert_eq!(in_tx.trace.physical_plan, "AdjacencyProbe");
-    assert!(outside_tx.rows.is_empty());
+    assert_eq!(in_tx.trace().physical_plan, "AdjacencyProbe");
+    assert!(outside_tx.rows().is_empty());
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga41_graph_node_metadata_ignores_non_uuid_id_tables() {
     let db = Database::open_memory();
     db.execute(
@@ -2422,8 +2470,8 @@ fn ga41_graph_node_metadata_ignores_non_uuid_id_tables() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([target]));
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().index_used.as_deref(), Some("forward_adj"));
     assert_eq!(db.__rows_examined(), 1);
 
     let by_metadata = db
@@ -2435,8 +2483,11 @@ fn ga41_graph_node_metadata_ignores_non_uuid_id_tables() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&by_metadata, "t"), BTreeSet::from([target]));
-    assert_eq!(by_metadata.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(by_metadata.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(by_metadata.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(
+        by_metadata.trace().index_used.as_deref(),
+        Some("forward_adj")
+    );
     assert_eq!(
         db.__rows_examined(),
         2,
@@ -2445,6 +2496,7 @@ fn ga41_graph_node_metadata_ignores_non_uuid_id_tables() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga42_graph_edge_insert_routing_requires_uuid_edge_shape() {
     let accountant = Arc::new(MemoryAccountant::with_budget(256 * 1024));
     let db = Database::open_memory_with_accountant(accountant.clone());
@@ -2477,11 +2529,11 @@ fn ga42_graph_edge_insert_routing_requires_uuid_edge_shape() {
         .unwrap();
 
     assert!(
-        result.rows.is_empty(),
+        result.rows().is_empty(),
         "UUID-looking text edge columns must not populate the internal graph"
     );
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().index_used.as_deref(), Some("forward_adj"));
     assert_eq!(db.__rows_examined(), 0);
 
     let tx = db.begin_or_panic();
@@ -3077,18 +3129,18 @@ fn scoped_list_query_continues_to_filter_hidden_rows_silently_across_shapes() {
     let y = scoped
         .execute("SELECT id FROM t WHERE category = 'y'", &empty())
         .unwrap();
-    assert!(y.rows.is_empty());
+    assert!(y.rows().is_empty());
     let limit = scoped
         .execute("SELECT id FROM t LIMIT 1", &empty())
         .unwrap();
-    assert_eq!(limit.rows.len(), 1);
+    assert_eq!(limit.rows().len(), 1);
     assert!(
         sarg_uuid_column_set(&limit, "id").is_subset(&BTreeSet::from([sarg_uuid(1), sarg_uuid(2)]))
     );
     let ordered = scoped
         .execute("SELECT id FROM t ORDER BY id LIMIT 1", &empty())
         .unwrap();
-    assert_eq!(ordered.rows, vec![vec![Value::Uuid(sarg_uuid(1))]]);
+    assert_eq!(ordered.rows(), vec![vec![Value::Uuid(sarg_uuid(1))]]);
 }
 
 #[test]
@@ -3115,7 +3167,7 @@ fn scoped_anchor_read_returns_empty_when_row_does_not_exist() {
             &params(vec![("id", Value::Uuid(sarg_uuid(999)))]),
         )
         .unwrap();
-    assert!(result.rows.is_empty());
+    assert!(result.rows().is_empty());
 }
 
 #[test]
@@ -3184,14 +3236,14 @@ fn update_delete_predicate_against_hidden_only_rows_preserves_rows_affected_zero
             ]),
         )
         .unwrap();
-    assert_eq!(update.rows_affected, 0);
+    assert_eq!(update.rows_affected(), 0);
     let delete = scoped
         .execute(
             "DELETE FROM t WHERE id = $id",
             &params(vec![("id", Value::Uuid(sarg_uuid(2)))]),
         )
         .unwrap();
-    assert_eq!(delete.rows_affected, 0);
+    assert_eq!(delete.rows_affected(), 0);
 }
 
 #[test]
@@ -3216,7 +3268,7 @@ fn admin_handle_anchor_read_under_no_constraints_returns_ok_rows() {
             &params(vec![("id", Value::Uuid(sarg_uuid(2)))]),
         )
         .unwrap();
-    assert_eq!(result.rows, vec![vec![Value::Text("b".to_string())]]);
+    assert_eq!(result.rows(), vec![vec![Value::Text("b".to_string())]]);
 }
 
 #[test]
@@ -3574,7 +3626,7 @@ fn graph_table_at_pinned_snapshot_with_no_pre_pin_edges_returns_ok_empty() {
             snapshot,
         )
         .unwrap();
-    assert!(result.rows.is_empty());
+    assert!(result.rows().is_empty());
 }
 
 #[test]
@@ -3672,6 +3724,7 @@ fn scoped_multi_cte_graph_table_with_cross_scope_anchor_parameter_reports_typed_
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn anchor_read_of_sync_replicated_row_under_scoped_handle_reports_typed_violation() {
     let db = Database::open_memory();
     db.execute(
@@ -3752,6 +3805,7 @@ fn anchor_read_of_sync_replicated_row_under_scoped_handle_reports_typed_violatio
 // its content happens to be byte-identical to what the receiver cannot look
 // at.
 #[test]
+#[cfg(feature = "test-seams")]
 fn scoped_sync_apply_skips_hidden_rows_and_applies_allowed_rows() {
     let db = Database::open_memory();
     db.execute(
@@ -3828,7 +3882,10 @@ fn scoped_sync_apply_skips_hidden_rows_and_applies_allowed_rows() {
             &params(vec![("id", Value::Uuid(visible_id))]),
         )
         .unwrap();
-    assert_eq!(visible.rows, vec![vec![Value::Text("visible".to_string())]]);
+    assert_eq!(
+        visible.rows(),
+        vec![vec![Value::Text("visible".to_string())]]
+    );
     let hidden = db
         .execute(
             "SELECT data FROM t WHERE id = $id",
@@ -3836,7 +3893,7 @@ fn scoped_sync_apply_skips_hidden_rows_and_applies_allowed_rows() {
         )
         .unwrap();
     assert!(
-        hidden.rows.is_empty(),
+        hidden.rows().is_empty(),
         "hidden incoming sync row must not be stored by the scoped receiver"
     );
 }
@@ -3851,6 +3908,7 @@ fn scoped_sync_apply_skips_hidden_rows_and_applies_allowed_rows() {
 /// access-scope reason, proving the two refusal classes stay genuinely
 /// distinct.
 #[test]
+#[cfg(feature = "test-seams")]
 fn scoped_sync_apply_genuine_divergence_within_visible_scope_still_conflicts() {
     let db = Database::open_memory();
     db.execute(
@@ -3934,13 +3992,14 @@ fn scoped_sync_apply_genuine_divergence_within_visible_scope_still_conflicts() {
         )
         .unwrap();
     assert_eq!(
-        local.rows,
+        local.rows(),
         vec![vec![Value::Text("local-version".to_string())]],
         "ServerWins keeps the receiver's own value through the genuine conflict"
     );
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn scoped_sync_apply_skips_hidden_graph_edges_and_applies_allowed_edges() {
     let db = Database::open_memory();
     db.execute(
@@ -4042,12 +4101,13 @@ fn scoped_sync_apply_skips_hidden_graph_edges_and_applies_allowed_edges() {
         )
         .unwrap();
     assert!(
-        hidden.rows.is_empty(),
+        hidden.rows().is_empty(),
         "hidden incoming graph endpoint must not be stored by the scoped receiver"
     );
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_apply_replays_same_lsn_non_vector_delete_before_replacement_insert() {
     let db = Database::open_memory();
     db.execute(
@@ -4102,12 +4162,13 @@ fn sync_apply_replays_same_lsn_non_vector_delete_before_replacement_insert() {
         .execute("SELECT id, success FROM outcomes", &empty())
         .unwrap();
     assert_eq!(
-        rows.rows,
+        rows.rows(),
         vec![vec![Value::Uuid(new_id), Value::Bool(true)]]
     );
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_edge_wins_replaces_committed_unique_conflict_with_incoming_row() {
     let db = Database::open_memory();
     db.execute(
@@ -4152,7 +4213,7 @@ fn sync_edge_wins_replaces_committed_unique_conflict_with_incoming_row() {
         .execute("SELECT id, success FROM outcomes", &empty())
         .unwrap();
     assert_eq!(
-        rows.rows,
+        rows.rows(),
         vec![vec![Value::Uuid(incoming_id), Value::Bool(true)]]
     );
 }
@@ -4198,6 +4259,10 @@ fn typed_error_display_messages_describe_hidden_by_scope_with_actionable_phrasin
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn scoped_anchor_read_with_degenerate_input_returns_error_or_empty_no_panic() {
     let db = Database::open_memory();
     db.execute(
@@ -4223,10 +4288,14 @@ fn scoped_anchor_read_with_degenerate_input_returns_error_or_empty_no_panic() {
     }))
     .expect("wrong typed parameter query must not panic")
     .unwrap();
-    assert!(wrong_type.rows.is_empty());
+    assert!(wrong_type.rows().is_empty());
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn trigger_written_cross_context_row_anchor_read_under_scoped_handle_reports_typed_violation() {
     let db = Database::open_memory();
     db.execute(
@@ -4250,7 +4319,7 @@ fn trigger_written_cross_context_row_anchor_read_under_scoped_handle_reports_typ
             .get("id")
             .and_then(Value::as_uuid)
             .copied()
-            .ok_or_else(|| Error::Other("obs id missing".to_string()))?;
+            .ok_or_else(|| Error::Other("obs id missing".into()))?;
         let target_ctx = if id == sarg_uuid(21) { ctx_b } else { ctx_c };
         db_handle.insert_row(
             ctx.tx,
@@ -4285,6 +4354,10 @@ fn trigger_written_cross_context_row_anchor_read_under_scoped_handle_reports_typ
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn trigger_callback_cannot_insert_or_update_a_null_primary_key() {
     let db = Database::open_memory();
     db.execute(
@@ -4332,7 +4405,7 @@ fn trigger_callback_cannot_insert_or_update_a_null_primary_key() {
                     &params(vec![("item_id", Value::Uuid(item_id))]),
                 )?;
             }
-            _ => return Err(Error::Other("unknown callback action".to_string())),
+            _ => return Err(Error::Other("unknown callback action".into())),
         }
         Ok(())
     })
@@ -4355,7 +4428,8 @@ fn trigger_callback_cannot_insert_or_update_a_null_primary_key() {
     let rows = db
         .execute("SELECT * FROM callback_target", &empty())
         .unwrap()
-        .rows;
+        .rows()
+        .to_vec();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0], Value::Uuid(tenant_id));
     assert_eq!(rows[0][2], Value::Text("kept".to_string()));
@@ -4365,9 +4439,9 @@ fn trigger_callback_cannot_insert_or_update_a_null_primary_key() {
 fn dual_01_select_without_from() {
     let db = Database::open_memory();
     let result = db.execute("SELECT NOW()", &empty()).unwrap();
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
     assert!(
-        matches!(result.rows[0][0], Value::Timestamp(_)),
+        matches!(result.rows()[0][0], Value::Timestamp(_)),
         "SELECT NOW() without FROM should return timestamp"
     );
 }
@@ -4397,7 +4471,7 @@ fn err_01_triple_not_evaluates_correctly() {
         )
         .unwrap();
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         0,
         "triple NOT of true = false, so 0 rows"
     );
@@ -4426,9 +4500,9 @@ fn cmt_01_line_comment() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    let val_idx = result.columns.iter().position(|c| c == "val").unwrap();
-    assert_eq!(result.rows[0][val_idx], Value::Text("hello".into()));
+    assert_eq!(result.rows().len(), 1);
+    let val_idx = result.columns().iter().position(|c| c == "val").unwrap();
+    assert_eq!(result.rows()[0][val_idx], Value::Text("hello".into()));
 }
 
 // ---------------------------------------------------------------------------
@@ -4454,9 +4528,9 @@ fn cmt_02_block_comment() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    let val_idx = result.columns.iter().position(|c| c == "val").unwrap();
-    assert_eq!(result.rows[0][val_idx], Value::Text("hello".into()));
+    assert_eq!(result.rows().len(), 1);
+    let val_idx = result.columns().iter().position(|c| c == "val").unwrap();
+    assert_eq!(result.rows()[0][val_idx], Value::Text("hello".into()));
 }
 
 // ---------------------------------------------------------------------------
@@ -4562,8 +4636,8 @@ fn upd_03_update_embedding_changes_vector_recall_immediately() {
             &params(vec![("query", Value::Vector(vec![1.0, 0.0, 0.0]))]),
         )
         .unwrap();
-    assert_eq!(before.rows.len(), 1);
-    assert_eq!(before.rows[0][0], Value::Uuid(id_a));
+    assert_eq!(before.rows().len(), 1);
+    assert_eq!(before.rows()[0][0], Value::Uuid(id_a));
 
     db.execute(
         "UPDATE observations SET embedding = $embedding WHERE id = $id",
@@ -4580,9 +4654,9 @@ fn upd_03_update_embedding_changes_vector_recall_immediately() {
             &params(vec![("query", Value::Vector(vec![1.0, 0.0, 0.0]))]),
         )
         .unwrap();
-    assert_eq!(after.rows.len(), 2);
-    assert_eq!(after.rows[0][0], Value::Uuid(id_b));
-    assert_eq!(after.rows[1][0], Value::Uuid(id_a));
+    assert_eq!(after.rows().len(), 2);
+    assert_eq!(after.rows()[0][0], Value::Uuid(id_b));
+    assert_eq!(after.rows()[1][0], Value::Uuid(id_a));
 }
 
 #[test]
@@ -4622,8 +4696,8 @@ fn upd_04_stale_conditional_update_in_explicit_tx_commits_as_noop_atomically() {
             &stale_predicate,
         )
         .unwrap();
-    assert_eq!(a.rows_affected, 1);
-    assert_eq!(b.rows_affected, 1);
+    assert_eq!(a.rows_affected(), 1);
+    assert_eq!(b.rows_affected(), 1);
 
     db.commit(tx_a).expect("first conditional update commits");
     db.commit(tx_b)
@@ -4700,14 +4774,14 @@ fn upd_05_row_condition_guard_in_explicit_tx_fails_commit_atomically() {
         )
         .unwrap();
     assert_eq!(
-        audit_rows.rows.len(),
+        audit_rows.rows().len(),
         0,
         "guarded side effects must roll back with the stale transaction"
     );
 }
 
 #[test]
-fn cdb061_row_guard_treats_missing_nullable_columns_as_null_at_claim_and_commit() {
+fn row_guard_treats_missing_nullable_columns_as_null_at_claim_and_commit() {
     let db = Database::open_memory();
     let old_id = Uuid::new_v4();
     let stored_null_id = Uuid::new_v4();
@@ -4791,7 +4865,7 @@ fn cdb061_row_guard_treats_missing_nullable_columns_as_null_at_claim_and_commit(
     assert!(
         db.execute("SELECT id FROM claim_audit", &empty())
             .unwrap()
-            .rows
+            .rows()
             .is_empty(),
         "the refused stale claim rolls its side effect back"
     );
@@ -4879,13 +4953,13 @@ fn cte_01_outer_where_filters_cte_rows() {
         .unwrap();
 
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "outer WHERE on CTE should keep only sensor-prefixed active rows"
     );
-    let name_idx = result.columns.iter().position(|c| c == "name").unwrap();
+    let name_idx = result.columns().iter().position(|c| c == "name").unwrap();
     let names: Vec<_> = result
-        .rows
+        .rows()
         .iter()
         .map(|row| row[name_idx].clone())
         .collect();
@@ -4909,17 +4983,21 @@ fn cte_02_outer_where_comparison_filters_cte_rows() {
         .unwrap();
 
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "outer WHERE on CTE should keep only rows above the reading threshold"
     );
-    let name_idx = result.columns.iter().position(|c| c == "name").unwrap();
-    let reading_idx = result.columns.iter().position(|c| c == "reading").unwrap();
+    let name_idx = result.columns().iter().position(|c| c == "name").unwrap();
+    let reading_idx = result
+        .columns()
+        .iter()
+        .position(|c| c == "reading")
+        .unwrap();
     assert_eq!(
-        result.rows[0][name_idx],
+        result.rows()[0][name_idx],
         Value::Text("widget-east".to_string())
     );
-    assert_eq!(result.rows[0][reading_idx], Value::Float64(99.0));
+    assert_eq!(result.rows()[0][reading_idx], Value::Float64(99.0));
 }
 
 #[test]
@@ -5038,9 +5116,9 @@ fn prop_01_fk_propagate_fires_on_update() {
             &params(vec![("id", Value::Uuid(decision_id))]),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
     assert_eq!(
-        result.rows[0][0],
+        result.rows()[0][0],
         Value::Text("invalidated".to_string()),
         "child decision should be invalidated after parent UPDATE archives intention"
     );
@@ -5094,18 +5172,18 @@ fn prop_02_fk_propagate_cascades_multiple_children() {
     let result = db
         .execute("SELECT id, status FROM decisions ORDER BY id", &empty())
         .unwrap();
-    assert_eq!(result.rows.len(), 2);
-    let id_idx = result.columns.iter().position(|c| c == "id").unwrap();
-    let status_idx = result.columns.iter().position(|c| c == "status").unwrap();
+    assert_eq!(result.rows().len(), 2);
+    let id_idx = result.columns().iter().position(|c| c == "id").unwrap();
+    let status_idx = result.columns().iter().position(|c| c == "status").unwrap();
 
-    assert_eq!(result.rows[0][id_idx], Value::Uuid(decision_a));
+    assert_eq!(result.rows()[0][id_idx], Value::Uuid(decision_a));
     assert_eq!(
-        result.rows[0][status_idx],
+        result.rows()[0][status_idx],
         Value::Text("invalidated".to_string())
     );
-    assert_eq!(result.rows[1][id_idx], Value::Uuid(decision_b));
+    assert_eq!(result.rows()[1][id_idx], Value::Uuid(decision_b));
     assert_eq!(
-        result.rows[1][status_idx],
+        result.rows()[1][status_idx],
         Value::Text("invalidated".to_string())
     );
 }
@@ -5131,6 +5209,7 @@ fn ddl_name(change: &contextdb_engine::sync_types::DdlChange) -> String {
 
 #[test]
 fn sql_15_ddl_dml_lsn_causal_ordering() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
     let db = Arc::new(Database::open_memory());
     db.execute(
         "CREATE TABLE shared (id UUID PRIMARY KEY, val TEXT)",
@@ -5141,26 +5220,25 @@ fn sql_15_ddl_dml_lsn_causal_ordering() {
     let workers = 4;
     let iterations = 40;
     let barrier = Arc::new(Barrier::new(workers + 1));
-    let done = Arc::new(AtomicBool::new(false));
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel::<()>();
     let expected_tables: Vec<String> = (0..workers)
         .flat_map(|worker| (0..iterations).map(move |i| format!("lsn_race_{worker}_{i}")))
         .collect();
     let poller_expected = Arc::new(expected_tables.clone());
     let poller_db = db.clone();
-    let poller_done = done.clone();
     let poller_barrier = barrier.clone();
 
     let poller = thread::spawn(move || {
+        let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
         let mut watermark = Lsn(0);
         let mut seen_creates = std::collections::HashSet::new();
         let mut row_before_create = Vec::new();
-        let mut idle_after_done_since = None;
         poller_barrier.wait();
 
-        loop {
-            let expected_len = poller_expected.len();
-            let changes = poller_db.changes_since(watermark);
-            let before_seen = seen_creates.len();
+        while progress_rx.recv().is_ok() {
+            let changes = poller_db
+                .changes_since(watermark)
+                .expect("read the declared changes");
             if !changes.ddl.is_empty() || !changes.rows.is_empty() {
                 for ddl in &changes.ddl {
                     if matches!(
@@ -5178,24 +5256,6 @@ fn sql_15_ddl_dml_lsn_causal_ordering() {
                 if let Some(lsn) = changes.max_lsn() {
                     watermark = lsn;
                 }
-            } else {
-                thread::yield_now();
-            }
-
-            if poller_done.load(Ordering::SeqCst) && seen_creates.len() >= expected_len {
-                break;
-            }
-            if poller_done.load(Ordering::SeqCst) {
-                if seen_creates.len() == before_seen {
-                    idle_after_done_since.get_or_insert_with(Instant::now);
-                } else {
-                    idle_after_done_since = None;
-                }
-                if idle_after_done_since
-                    .is_some_and(|started| started.elapsed() > Duration::from_secs(3))
-                {
-                    break;
-                }
             }
         }
 
@@ -5207,7 +5267,9 @@ fn sql_15_ddl_dml_lsn_causal_ordering() {
     for worker in 0..workers {
         let db = db.clone();
         let barrier = barrier.clone();
+        let progress_tx = progress_tx.clone();
         handles.push(thread::spawn(move || {
+            let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
             barrier.wait();
             for i in 0..iterations {
                 let table = format!("lsn_race_{worker}_{i}");
@@ -5216,24 +5278,27 @@ fn sql_15_ddl_dml_lsn_causal_ordering() {
                     &empty(),
                 )
                 .unwrap();
+                progress_tx.send(()).unwrap();
                 db.execute(
                     &format!("INSERT INTO {table} (id, val) VALUES ($id, 'data')"),
                     &params(vec![("id", Value::Uuid(Uuid::new_v4()))]),
                 )
                 .unwrap();
+                progress_tx.send(()).unwrap();
                 db.execute(
                     "INSERT INTO shared (id, val) VALUES ($id, 'shared')",
                     &params(vec![("id", Value::Uuid(Uuid::new_v4()))]),
                 )
                 .unwrap();
+                progress_tx.send(()).unwrap();
             }
         }));
     }
 
+    drop(progress_tx);
     for handle in handles {
         handle.join().unwrap();
     }
-    done.store(true, Ordering::SeqCst);
     let (row_before_create, seen_creates, expected) = poller.join().unwrap();
 
     assert!(
@@ -5251,6 +5316,7 @@ fn sql_15_ddl_dml_lsn_causal_ordering() {
 
 #[test]
 fn sql_16_ddl_lsn_no_duplicates_under_contention() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
     let db = Arc::new(Database::open_memory());
     db.execute(
         "CREATE TABLE shared (id UUID PRIMARY KEY, val TEXT)",
@@ -5261,25 +5327,24 @@ fn sql_16_ddl_lsn_no_duplicates_under_contention() {
     let workers = 4;
     let iterations = 25;
     let barrier = Arc::new(Barrier::new(workers + 1));
-    let done = Arc::new(AtomicBool::new(false));
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel::<()>();
     let expected_columns: Vec<String> = (0..workers)
         .flat_map(|worker| (0..iterations).map(move |i| format!("c_{worker}_{i}")))
         .collect();
     let poller_expected = Arc::new(expected_columns.clone());
     let poller_db = db.clone();
-    let poller_done = done.clone();
     let poller_barrier = barrier.clone();
 
     let poller = thread::spawn(move || {
+        let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
         let mut watermark = Lsn(0);
         let mut seen_columns = std::collections::HashSet::new();
-        let mut idle_after_done_since = None;
         poller_barrier.wait();
 
-        loop {
-            let expected_len = poller_expected.len();
-            let changes = poller_db.changes_since(watermark);
-            let before_seen = seen_columns.len();
+        while progress_rx.recv().is_ok() {
+            let changes = poller_db
+                .changes_since(watermark)
+                .expect("read the declared changes");
             if !changes.ddl.is_empty() || !changes.rows.is_empty() {
                 for ddl in &changes.ddl {
                     if let contextdb_engine::sync_types::DdlChange::AlterTable {
@@ -5297,24 +5362,6 @@ fn sql_16_ddl_lsn_no_duplicates_under_contention() {
                 if let Some(lsn) = changes.max_lsn() {
                     watermark = lsn;
                 }
-            } else {
-                thread::yield_now();
-            }
-
-            if poller_done.load(Ordering::SeqCst) && seen_columns.len() >= expected_len {
-                break;
-            }
-            if poller_done.load(Ordering::SeqCst) {
-                if seen_columns.len() == before_seen {
-                    idle_after_done_since.get_or_insert_with(Instant::now);
-                } else {
-                    idle_after_done_since = None;
-                }
-                if idle_after_done_since
-                    .is_some_and(|started| started.elapsed() > Duration::from_secs(3))
-                {
-                    break;
-                }
             }
         }
 
@@ -5326,7 +5373,9 @@ fn sql_16_ddl_lsn_no_duplicates_under_contention() {
     for worker in 0..workers {
         let db = db.clone();
         let barrier = barrier.clone();
+        let progress_tx = progress_tx.clone();
         handles.push(thread::spawn(move || {
+            let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
             barrier.wait();
             for i in 0..iterations {
                 let col = format!("c_{worker}_{i}");
@@ -5335,19 +5384,21 @@ fn sql_16_ddl_lsn_no_duplicates_under_contention() {
                     &params(vec![("id", Value::Uuid(Uuid::new_v4()))]),
                 )
                 .unwrap();
+                progress_tx.send(()).unwrap();
                 db.execute(
                     &format!("ALTER TABLE shared ADD COLUMN {col} TEXT"),
                     &empty(),
                 )
                 .unwrap();
+                progress_tx.send(()).unwrap();
             }
         }));
     }
 
+    drop(progress_tx);
     for handle in handles {
         handle.join().unwrap();
     }
-    done.store(true, Ordering::SeqCst);
     let (seen_columns, expected_columns, expected) = poller.join().unwrap();
 
     assert_eq!(expected_columns.len(), expected);
@@ -5361,6 +5412,7 @@ fn sql_16_ddl_lsn_no_duplicates_under_contention() {
 
 #[test]
 fn sql_17_sync_watermark_does_not_skip_ddl() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
     let db = Arc::new(Database::open_memory());
     db.execute(
         "CREATE TABLE shared (id UUID PRIMARY KEY, val TEXT)",
@@ -5369,23 +5421,22 @@ fn sql_17_sync_watermark_does_not_skip_ddl() {
     .unwrap();
 
     let barrier = Arc::new(Barrier::new(3));
-    let done = Arc::new(AtomicBool::new(false));
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel::<()>();
     let expected_tables: Vec<String> = (0..120).map(|i| format!("watermark_race_{i}")).collect();
 
     let poller_db = db.clone();
-    let poller_done = done.clone();
     let poller_expected = Arc::new(expected_tables.clone());
     let poller_barrier = barrier.clone();
     let poller = thread::spawn(move || {
+        let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
         let mut watermark = Lsn(0);
         let mut seen_tables = std::collections::HashSet::new();
-        let mut idle_after_done_since = None;
         poller_barrier.wait();
 
-        loop {
-            let expected_len = poller_expected.len();
-            let changes = poller_db.changes_since(watermark);
-            let before_seen = seen_tables.len();
+        while progress_rx.recv().is_ok() {
+            let changes = poller_db
+                .changes_since(watermark)
+                .expect("read the declared changes");
             if !changes.ddl.is_empty() || !changes.rows.is_empty() {
                 for ddl in &changes.ddl {
                     if matches!(
@@ -5398,24 +5449,6 @@ fn sql_17_sync_watermark_does_not_skip_ddl() {
                 if let Some(lsn) = changes.max_lsn() {
                     watermark = lsn;
                 }
-            } else {
-                thread::yield_now();
-            }
-
-            if poller_done.load(Ordering::SeqCst) && seen_tables.len() >= expected_len {
-                break;
-            }
-            if poller_done.load(Ordering::SeqCst) {
-                if seen_tables.len() == before_seen {
-                    idle_after_done_since.get_or_insert_with(Instant::now);
-                } else {
-                    idle_after_done_since = None;
-                }
-                if idle_after_done_since
-                    .is_some_and(|started| started.elapsed() > Duration::from_secs(3))
-                {
-                    break;
-                }
             }
         }
 
@@ -5425,7 +5458,9 @@ fn sql_17_sync_watermark_does_not_skip_ddl() {
 
     let ddl_db = db.clone();
     let ddl_barrier = barrier.clone();
+    let ddl_progress = progress_tx.clone();
     let ddl_thread = thread::spawn(move || {
+        let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
         ddl_barrier.wait();
         for i in 0..120 {
             let table = format!("watermark_race_{i}");
@@ -5435,12 +5470,15 @@ fn sql_17_sync_watermark_does_not_skip_ddl() {
                     &empty(),
                 )
                 .unwrap();
+            ddl_progress.send(()).unwrap();
         }
     });
 
     let dml_db = db.clone();
     let dml_barrier = barrier.clone();
+    let dml_progress = progress_tx.clone();
     let dml_thread = thread::spawn(move || {
+        let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
         dml_barrier.wait();
         for _ in 0..400 {
             dml_db
@@ -5449,12 +5487,13 @@ fn sql_17_sync_watermark_does_not_skip_ddl() {
                     &params(vec![("id", Value::Uuid(Uuid::new_v4()))]),
                 )
                 .unwrap();
+            dml_progress.send(()).unwrap();
         }
     });
 
+    drop(progress_tx);
     ddl_thread.join().unwrap();
     dml_thread.join().unwrap();
-    done.store(true, Ordering::SeqCst);
     let (seen_tables, expected) = poller.join().unwrap();
 
     for table in expected {
@@ -5477,16 +5516,16 @@ fn disk_02_show_disk_limit_parses() {
     let db = Database::open_memory();
     let result = db.execute("SHOW DISK_LIMIT", &empty()).unwrap();
     assert_eq!(
-        result.columns,
+        result.columns(),
         vec!["limit", "used", "available", "startup_ceiling"]
     );
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
 }
 
 #[test]
 fn disk_03_disk_limit_noop_for_memory() {
     let db = Database::open_memory();
-    db.execute("SET DISK_LIMIT '1M'", &empty()).unwrap();
+    db.execute("SET DISK_LIMIT '64M'", &empty()).unwrap();
     db.execute(
         "CREATE TABLE items (id UUID PRIMARY KEY, payload TEXT)",
         &empty(),
@@ -5507,17 +5546,18 @@ fn disk_03_disk_limit_noop_for_memory() {
 
     let result = db.execute("SHOW DISK_LIMIT", &empty()).unwrap();
     assert_eq!(
-        result.columns,
+        result.columns(),
         vec!["limit", "used", "available", "startup_ceiling"]
     );
     assert!(
-        match &result.rows[0][0] {
+        match &result.rows()[0][0] {
             Value::Null => true,
             Value::Text(s) if s == "none" => true,
+            Value::Int64(limit) if *limit == 67_108_864 => true,
             _ => false,
         },
         "in-memory SHOW DISK_LIMIT must report no active limit: {:?}",
-        result.rows[0]
+        result.rows()[0]
     );
 }
 
@@ -5583,9 +5623,9 @@ fn disk_05_disk_limit_persists_across_reopen() {
             .unwrap();
         let before = db.execute("SHOW DISK_LIMIT", &empty()).unwrap();
         assert!(
-            before.rows[0].contains(&Value::Int64(configured_limit_bytes)),
+            before.rows()[0].contains(&Value::Int64(configured_limit_bytes)),
             "SHOW DISK_LIMIT must reflect configured limit before reopen: {:?}",
-            before.rows
+            before.rows()
         );
         db.close().unwrap();
         configured_limit_bytes
@@ -5594,9 +5634,9 @@ fn disk_05_disk_limit_persists_across_reopen() {
     let reopened = Database::open(&db_path).unwrap();
     let after = reopened.execute("SHOW DISK_LIMIT", &empty()).unwrap();
     assert!(
-        after.rows[0].contains(&Value::Int64(configured_limit_bytes)),
+        after.rows()[0].contains(&Value::Int64(configured_limit_bytes)),
         "SHOW DISK_LIMIT must reflect persisted limit after reopen: {:?}",
-        after.rows
+        after.rows()
     );
 
     let payload = "x".repeat(16 * 1024);
@@ -5624,6 +5664,7 @@ fn disk_05_disk_limit_persists_across_reopen() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn disk_06_sync_pull_rejected_when_over_disk_budget() {
     let edge_tmp = TempDir::new().expect("edge tempdir");
     let server_tmp = TempDir::new().expect("server tempdir");
@@ -5646,7 +5687,9 @@ fn disk_06_sync_pull_rejected_when_over_disk_budget() {
         )
         .unwrap();
     }
-    let changes = edge.changes_since(Lsn(0));
+    let changes = edge
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
 
     let server = Database::open(&server_path).unwrap();
     server
@@ -5694,7 +5737,7 @@ fn disk_06_sync_pull_rejected_when_over_disk_budget() {
     let count = server
         .execute("SELECT COUNT(*) FROM items", &empty())
         .unwrap()
-        .rows[0][0]
+        .rows()[0][0]
         .clone();
     assert_eq!(
         count,
@@ -5733,17 +5776,21 @@ fn sql_09_vector_text_coercion() {
     let rows = db
         .execute("SELECT id, embedding FROM docs ORDER BY id", &empty())
         .unwrap();
-    let id_idx = rows.columns.iter().position(|c| c == "id").unwrap();
-    let embedding_idx = rows.columns.iter().position(|c| c == "embedding").unwrap();
+    let id_idx = rows.columns().iter().position(|c| c == "id").unwrap();
+    let embedding_idx = rows
+        .columns()
+        .iter()
+        .position(|c| c == "embedding")
+        .unwrap();
 
-    assert_eq!(rows.rows.len(), 2);
-    assert_eq!(rows.rows[0][id_idx], Value::Uuid(id_a));
-    assert!(matches!(rows.rows[0][embedding_idx], Value::Vector(_)));
-    assert_eq!(rows.rows[1][id_idx], Value::Uuid(id_b));
+    assert_eq!(rows.rows().len(), 2);
+    assert_eq!(rows.rows()[0][id_idx], Value::Uuid(id_a));
+    assert!(matches!(rows.rows()[0][embedding_idx], Value::Vector(_)));
+    assert_eq!(rows.rows()[1][id_idx], Value::Uuid(id_b));
     assert!(
-        matches!(rows.rows[1][embedding_idx], Value::Vector(_)),
+        matches!(rows.rows()[1][embedding_idx], Value::Vector(_)),
         "quoted vector literal should be coerced to Value::Vector, got {:?}",
-        rows.rows[1][embedding_idx]
+        rows.rows()[1][embedding_idx]
     );
 
     let search = db
@@ -5752,9 +5799,9 @@ fn sql_09_vector_text_coercion() {
             &params(vec![("query", Value::Vector(vec![0.4, 0.5, 0.6]))]),
         )
         .unwrap();
-    let search_id_idx = search.columns.iter().position(|c| c == "id").unwrap();
+    let search_id_idx = search.columns().iter().position(|c| c == "id").unwrap();
     let ids: Vec<Value> = search
-        .rows
+        .rows()
         .iter()
         .map(|r| r[search_id_idx].clone())
         .collect();
@@ -5806,12 +5853,13 @@ fn sql_10_edge_dedup_no_relational_leak() {
         .unwrap();
 
     assert_eq!(
-        count.rows[0][0],
+        count.rows()[0][0],
         Value::Int64(1),
         "duplicate logical edge should not leave a second relational row"
     );
     assert_eq!(
-        second.rows_affected, 0,
+        second.rows_affected(),
+        0,
         "deduped second edge insert should report zero affected rows"
     );
 }
@@ -5841,9 +5889,9 @@ fn sql_11_upsert_set_clause_values() {
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(out.rows.len(), 1);
+    assert_eq!(out.rows().len(), 1);
     assert_eq!(
-        out.rows[0][0],
+        out.rows()[0][0],
         Value::Text("from-update".to_string()),
         "upsert should apply SET clause values, not the INSERT value map"
     );
@@ -5871,11 +5919,12 @@ fn sql_13_null_in_nullable_uuid() {
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(out.rows.len(), 1);
-    assert_eq!(out.rows[0][0], Value::Null);
+    assert_eq!(out.rows().len(), 1);
+    assert_eq!(out.rows()[0][0], Value::Null);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn integrity_01_text_memory_estimate_not_pathologically_high() {
     // The PK's auto index now permanently reserves the exact-probe filter at CREATE TABLE
     // time (the fixed charge is defined in `crates/contextdb-core/src/table_meta.rs`);
@@ -5915,6 +5964,7 @@ fn integrity_01_text_memory_estimate_not_pathologically_high() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn integrity_02_upsert_noop_does_not_leak_memory() {
     // The PK's auto index now permanently reserves the exact-probe filter at CREATE TABLE
     // time (crates/contextdb-relational/src/store.rs:388, contract in
@@ -5951,9 +6001,22 @@ fn integrity_02_upsert_noop_does_not_leak_memory() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn integrity_03_retain_pruning_releases_memory() {
-    let accountant = Arc::new(MemoryAccountant::with_budget(256 * 1024));
-    let db = Database::open_memory_with_accountant(accountant.clone());
+    let now = Arc::new(std::sync::atomic::AtomicU64::new(1_000_000));
+    let _clock = {
+        let now = Arc::clone(&now);
+        contextdb_core::Wallclock::test_clock_guard(move || now.load(Ordering::SeqCst))
+    };
+    let db = Database::open_with_options(
+        ":memory:",
+        contextdb_engine::DatabaseOpenOptions {
+            memory_limit: Some(256 * 1024),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let accountant = db.accountant();
     db.execute(
         "CREATE TABLE obs (id UUID PRIMARY KEY, data TEXT) RETAIN 1 SECONDS",
         &empty(),
@@ -5972,8 +6035,8 @@ fn integrity_03_retain_pruning_releases_memory() {
     let used_after_insert = accountant.usage().used;
     assert!(used_after_insert > baseline);
 
-    std::thread::sleep(Duration::from_millis(1100));
-    let pruned = db.run_pruning_cycle();
+    now.store(1_001_100, Ordering::SeqCst);
+    let pruned = db.run_pruning_cycle().unwrap();
     assert_eq!(pruned, 1, "expired row must be pruned");
 
     let used_after_prune = accountant.usage().used;
@@ -5984,12 +6047,13 @@ fn integrity_03_retain_pruning_releases_memory() {
     assert_eq!(
         db.execute("SELECT COUNT(*) FROM obs", &empty())
             .unwrap()
-            .rows[0][0],
+            .rows()[0][0],
         Value::Int64(0)
     );
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn integrity_04_edge_delete_releases_memory() {
     // Deleting an edge tombstones it: the entry stays whole in both adjacency
     // maps, so the store is still holding it and is still charged for it. The
@@ -6046,7 +6110,7 @@ fn integrity_04_edge_delete_releases_memory() {
     // equal `used_after_insert` plus exactly this commit's own retained change-log charge,
     // computed the same way the commit path computes it (no slack).
     let expected_delete_commit_charge =
-        db.__change_log_commit_charge_since_for_test(pre_delete_lsn, 1);
+        db.__change_log_commit_charge_since_for_test(pre_delete_lsn);
     let expected_after_delete = used_after_insert + expected_delete_commit_charge;
     let used_after_delete = accountant.usage().used;
     assert_eq!(
@@ -6075,6 +6139,7 @@ fn integrity_04_edge_delete_releases_memory() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn integrity_05_drop_table_releases_edge_memory() {
     let accountant = Arc::new(MemoryAccountant::with_budget(256 * 1024));
     let db = Database::open_memory_with_accountant(accountant.clone());
@@ -6198,7 +6263,8 @@ fn integrity_08_upsert_insert_indexes_vector() {
             &params(vec![("query", Value::Vector(vec![0.0, 1.0, 0.0]))]),
         )
         .unwrap()
-        .rows;
+        .rows()
+        .to_vec();
     assert_eq!(
         result.len(),
         1,
@@ -6232,19 +6298,24 @@ fn integrity_09_drop_table_removes_vectors() {
         .expect("row must exist")
         .row_id;
     assert!(
-        db.live_vector_entry(row_id, db.snapshot()).is_some(),
+        db.live_vector_entry(row_id, db.snapshot())
+            .expect("read the actual fixture observation")
+            .is_some(),
         "vector must exist before DROP TABLE"
     );
 
     db.execute("DROP TABLE docs", &empty()).unwrap();
 
     assert!(
-        db.live_vector_entry(row_id, db.snapshot()).is_none(),
+        db.live_vector_entry(row_id, db.snapshot())
+            .expect("read the actual fixture observation")
+            .is_none(),
         "DROP TABLE must remove vector entries for dropped rows"
     );
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn integrity_10_failed_insert_does_not_leak_memory() {
     // Two exact-only automatic indexes here -- the PRIMARY KEY and the UNIQUE constraint on
     // `name` -- each now permanently reserve the exact-probe filter at CREATE TABLE time
@@ -6316,11 +6387,11 @@ fn test_coerce_uuid_name_based_still_works_post_catchall_removal() {
     let result = db
         .execute("SELECT * FROM t", &empty)
         .expect("SELECT * FROM t must succeed");
-    assert_eq!(result.rows.len(), 1, "exactly one row expected");
-    let row_vals = &result.rows[0];
+    assert_eq!(result.rows().len(), 1, "exactly one row expected");
+    let row_vals = &result.rows()[0];
     let col_idx = |name: &str| {
         result
-            .columns
+            .columns()
             .iter()
             .position(|c| c == name)
             .unwrap_or_else(|| panic!("column {name:?} must exist in result"))
@@ -6387,17 +6458,17 @@ fn where_txid_bound_int64_returns_rows() {
         .expect("SELECT with bound Int64 must succeed on TXID column");
 
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "exactly one row must match x > 100 (only TxId(200))",
     );
     let x_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "x")
         .expect("result must have column \"x\"");
     assert_eq!(
-        result.rows[0][x_idx],
+        result.rows()[0][x_idx],
         Value::TxId(TxId(200)),
         "the one matching row must be Value::TxId(TxId(200))",
     );
@@ -6441,17 +6512,17 @@ fn where_txid_negative_literal_below_all() {
         .expect("COUNT(*) with negative bound must succeed on TXID column");
 
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "COUNT(*) result must have exactly one row",
     );
     let c_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "c")
         .expect("result must have the aliased count column \"c\"");
     assert_eq!(
-        result.rows[0][c_idx],
+        result.rows()[0][c_idx],
         Value::Int64(3),
         "COUNT(*) of TxIds > -1 must equal 3 (all three rows match)",
     );
@@ -6493,12 +6564,12 @@ fn where_txid_text_literal_returns_no_rows() {
         .execute("SELECT x FROM t", &empty)
         .expect("SELECT x FROM t (no filter) must succeed");
     assert_eq!(
-        unfiltered.rows.len(),
+        unfiltered.rows().len(),
         1,
         "positive control: exactly one row must be present after insert",
     );
     assert_eq!(
-        unfiltered.rows[0][0],
+        unfiltered.rows()[0][0],
         Value::TxId(TxId(42)),
         "positive control: the stored x column must be Value::TxId(TxId(42))",
     );
@@ -6510,10 +6581,10 @@ fn where_txid_text_literal_returns_no_rows() {
         .expect("SELECT with Text bound on TXID column must not error — just return empty");
 
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         0,
         "no rows must be returned — Text must never coerce to TxId; got rows: {:?}",
-        result.rows,
+        result.rows(),
     );
 }
 
@@ -6588,11 +6659,11 @@ fn orderby_txid_asc_desc() {
         .execute("SELECT x FROM t ORDER BY x ASC", &empty)
         .expect("SELECT ... ORDER BY x ASC must succeed");
     let x_idx = asc
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "x")
         .expect("asc result must have column \"x\"");
-    let asc_vals: Vec<Value> = asc.rows.iter().map(|r| r[x_idx].clone()).collect();
+    let asc_vals: Vec<Value> = asc.rows().iter().map(|r| r[x_idx].clone()).collect();
     assert_eq!(
         asc_vals,
         vec![
@@ -6609,11 +6680,11 @@ fn orderby_txid_asc_desc() {
         .execute("SELECT x FROM t ORDER BY x DESC", &empty)
         .expect("SELECT ... ORDER BY x DESC must succeed");
     let x_idx_d = desc
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "x")
         .expect("desc result must have column \"x\"");
-    let desc_vals: Vec<Value> = desc.rows.iter().map(|r| r[x_idx_d].clone()).collect();
+    let desc_vals: Vec<Value> = desc.rows().iter().map(|r| r[x_idx_d].clone()).collect();
     assert_eq!(
         desc_vals,
         vec![
@@ -6628,6 +6699,7 @@ fn orderby_txid_asc_desc() {
 
 #[cfg(feature = "test-seams")]
 const PER_INDEX_SQL_ROWS: usize = 1024;
+#[cfg(feature = "test-seams")]
 const PER_INDEX_SQL_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(feature = "test-seams")]
@@ -6647,8 +6719,8 @@ fn per_index_top_id(db: &Database, table: &str, column: &str, query: Vec<f32>) -
     let result = db
         .execute(&sql, &params(vec![("query", Value::Vector(query))]))
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    match result.rows[0][0] {
+    assert_eq!(result.rows().len(), 1);
+    match result.rows()[0][0] {
         Value::Uuid(id) => id,
         ref other => panic!("expected UUID id, got {other:?}"),
     }
@@ -6682,6 +6754,7 @@ fn seed_two_vector_evidence(db: &Database) -> Vec<Uuid> {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn multi_ref_tx_mid_apply_state_invisible_post_commit_state_visible() {
     let db = Arc::new(Database::open_memory());
     db.execute(
@@ -6727,14 +6800,14 @@ fn multi_ref_tx_mid_apply_state_invisible_post_commit_state_visible() {
     assert_eq!(
         db.execute("SELECT id FROM table_text", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         0
     );
     assert_eq!(
         db.execute("SELECT id FROM table_face", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         0
     );
@@ -6744,7 +6817,7 @@ fn multi_ref_tx_mid_apply_state_invisible_post_commit_state_visible() {
             &params(vec![("query", Value::Vector(per_index_axis3(0)))])
         )
         .unwrap()
-        .rows
+        .rows()
         .len(),
         0
     );
@@ -6754,7 +6827,7 @@ fn multi_ref_tx_mid_apply_state_invisible_post_commit_state_visible() {
             &params(vec![("query", Value::Vector(per_index_axis3(1)))])
         )
         .unwrap()
-        .rows
+        .rows()
         .len(),
         0
     );
@@ -6808,14 +6881,14 @@ fn multi_ref_tx_abort_leaves_no_vectors_visible() {
     assert_eq!(
         db.execute("SELECT id FROM table_text", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         0
     );
     assert_eq!(
         db.execute("SELECT id FROM table_face", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         0
     );
@@ -6825,7 +6898,7 @@ fn multi_ref_tx_abort_leaves_no_vectors_visible() {
             &params(vec![("query", Value::Vector(per_index_axis3(0)))])
         )
         .unwrap()
-        .rows
+        .rows()
         .len(),
         0
     );
@@ -6901,6 +6974,80 @@ fn concurrent_distinct_table_sql_updates_yield_correct_vector_recall() {
 }
 
 #[cfg(feature = "test-seams")]
+struct PauseNativeBuild {
+    index: VectorIndexRef,
+    reached: mpsc::Sender<()>,
+    release: std::sync::Mutex<mpsc::Receiver<()>>,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "test-seams")]
+impl contextdb_engine::vector_ivf_observations::NativeIvfSealObserver for PauseNativeBuild {
+    fn observe(&self, _event: contextdb_engine::vector_ivf_observations::NativeIvfSealEvent<'_>) {}
+
+    fn before_boundary(
+        &self,
+        boundary: contextdb_engine::vector_ivf_observations::NativeIvfFaultBoundary<'_>,
+    ) -> contextdb_core::Result<()> {
+        if let contextdb_engine::vector_ivf_observations::NativeIvfFaultBoundary::BeforeScopeWrite {
+            scope,
+            ..
+        } = boundary
+            && *scope.index == self.index
+            && self.armed.swap(false, Ordering::SeqCst)
+        {
+            self.reached.send(()).unwrap();
+            let _ = self.release.lock().unwrap().recv();
+        }
+        Ok(())
+    }
+}
+
+/// A maintenance cycle held inside the clustered build of one index, at the
+/// first native scope write, until `release` is sent.
+#[cfg(feature = "test-seams")]
+struct PausedNativeBuild {
+    release: mpsc::Sender<()>,
+    done: mpsc::Receiver<contextdb_core::Result<contextdb_engine::MaintenanceReport>>,
+}
+
+#[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn pause_native_build(db: &Arc<Database>, index: &VectorIndexRef) -> PausedNativeBuild {
+    let (reached_tx, reached_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let pause = Arc::new(PauseNativeBuild {
+        index: index.clone(),
+        reached: reached_tx,
+        release: std::sync::Mutex::new(release_rx),
+        armed: std::sync::atomic::AtomicBool::new(true),
+    });
+    let db = db.clone();
+    thread::spawn(move || {
+        done_tx
+            .send(
+                contextdb_engine::vector_ivf_observations::with_native_ivf_seal_observer_for_test(
+                    pause,
+                    || db.run_maintenance_cycle(),
+                ),
+            )
+            .unwrap();
+    });
+    assert!(
+        reached_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT).is_ok(),
+        "the maintenance cycle reaches the clustered build of the paused index"
+    );
+    PausedNativeBuild {
+        release: release_tx,
+        done: done_rx,
+    }
+}
+
+#[cfg(feature = "test-seams")]
 #[test]
 fn same_table_vision_sql_update_and_search_completes_while_text_build_paused() {
     let db = Arc::new(Database::open_memory());
@@ -6908,19 +7055,7 @@ fn same_table_vision_sql_update_and_search_completes_while_text_build_paused() {
     let ids = seed_two_vector_evidence(&db);
     let text_ref = VectorIndexRef::new("evidence", "vector_text");
     let vision_ref = VectorIndexRef::new("evidence", "vector_vision");
-    let vector_store = db.vector_store_for_test();
-    let text_partition = contextdb_vector::VectorPartitionRef::new(
-        text_ref.clone(),
-        contextdb_core::VectorPartitionKey::unpartitioned(),
-    );
-    let text_pause =
-        vector_store.arm_maintenance_progress_pause_for_test(&text_partition, PER_INDEX_SQL_ROWS);
-    let (done_text_tx, done_text_rx) = mpsc::channel();
-    let db_text = db.clone();
-    thread::spawn(move || {
-        done_text_tx.send(db_text.run_maintenance_cycle()).unwrap();
-    });
-    assert!(text_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+    let text_build = pause_native_build(&db, &text_ref);
 
     let target_id = ids[3];
     let (done_vision_tx, done_vision_rx) = mpsc::channel();
@@ -6945,10 +7080,12 @@ fn same_table_vision_sql_update_and_search_completes_while_text_build_paused() {
             .unwrap();
     });
     let vision_first = done_vision_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
-    let vision_hnsw_before_release = vector_store.has_hnsw_index_for(&vision_ref);
-    let text_still_paused = done_text_rx.try_recv();
-    text_pause.release();
-    done_text_rx
+    let vision_indexed_before_release =
+        db.__debug_vector_indexed_available_for_test(vision_ref.clone());
+    let text_still_paused = text_build.done.try_recv();
+    text_build.release.send(()).unwrap();
+    text_build
+        .done
         .recv_timeout(PER_INDEX_SQL_TIMEOUT)
         .unwrap()
         .unwrap();
@@ -6959,43 +7096,26 @@ fn same_table_vision_sql_update_and_search_completes_while_text_build_paused() {
 
     assert_eq!(vision_id, target_id);
     assert!(
-        !vision_hnsw_before_release,
-        "the concurrent query must not build the sibling graph"
+        !vision_indexed_before_release,
+        "the concurrent query must not build the sibling index"
     );
     assert!(matches!(text_still_paused, Err(TryRecvError::Empty)));
-    assert!(vector_store.has_hnsw_index_for(&text_ref));
+    assert!(db.__debug_vector_indexed_available_for_test(text_ref));
     assert!(
-        vector_store.has_hnsw_index_for(&vision_ref),
-        "after the paused text build resumes, the same wake services the needy sibling graph"
+        db.__debug_vector_indexed_available_for_test(vision_ref),
+        "after the paused text build resumes, the same wake services the needy sibling index"
     );
 }
 
 #[cfg(feature = "test-seams")]
 #[test]
 fn alter_table_drop_vector_column_waits_for_inflight_build_then_removes_index() {
-    use contextdb_vector::test_seam::PauseWindow;
-
     let db = Arc::new(Database::open_memory());
     db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
     seed_two_vector_evidence(&db);
     let text_ref = VectorIndexRef::new("evidence", "vector_text");
-    let vector_store = db.vector_store_for_test();
-    let text_partition = contextdb_vector::VectorPartitionRef::new(
-        text_ref.clone(),
-        contextdb_core::VectorPartitionKey::unpartitioned(),
-    );
-    let build_pause =
-        vector_store.arm_maintenance_progress_pause_for_test(&text_partition, PER_INDEX_SQL_ROWS);
-    let (done_build_tx, done_build_rx) = mpsc::channel();
-    let db_build = db.clone();
-    thread::spawn(move || {
-        done_build_tx
-            .send(db_build.run_maintenance_cycle())
-            .unwrap();
-    });
-    assert!(build_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+    let text_build = pause_native_build(&db, &text_ref);
 
-    let ddl_pause = vector_store.arm_maintenance_pause_for_test(&text_ref, PauseWindow::Ddl);
     let (started_drop_tx, started_drop_rx) = mpsc::channel();
     let (done_drop_tx, done_drop_rx) = mpsc::channel();
     let db_drop = db.clone();
@@ -7005,21 +7125,13 @@ fn alter_table_drop_vector_column_waits_for_inflight_build_then_removes_index() 
         done_drop_tx.send(result).unwrap();
     });
     assert!(started_drop_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT).is_ok());
-    assert!(matches!(done_drop_rx.try_recv(), Err(TryRecvError::Empty)));
-    build_pause.release();
-    let build_result = done_build_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
     // Table-changing SQL cannot retire a vector state while maintenance owns
-    // that same state. It reaches the DDL pause only after maintenance exits.
-    assert!(ddl_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
-    let ref_present_during_pause = vector_store
-        .index_infos()
-        .iter()
-        .any(|info| info.index == text_ref);
+    // that same state.
     assert!(matches!(done_drop_rx.try_recv(), Err(TryRecvError::Empty)));
-    ddl_pause.release();
+    text_build.release.send(()).unwrap();
+    let build_result = text_build.done.recv_timeout(PER_INDEX_SQL_TIMEOUT);
     let drop_result = done_drop_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
 
-    assert!(ref_present_during_pause);
     assert!(
         db.execute("SELECT vector_text FROM evidence LIMIT 1", &empty())
             .is_err()
@@ -7030,36 +7142,19 @@ fn alter_table_drop_vector_column_waits_for_inflight_build_then_removes_index() 
         per_index_top_id(&db, "evidence", "vector_vision", per_index_axis3(1)),
         Uuid::from_u128(10_000)
     );
-    assert!(!vector_store.has_hnsw_index_for(&text_ref));
+    assert!(!db.__debug_vector_indexed_available_for_test(text_ref));
 }
 
 #[cfg(feature = "test-seams")]
 #[test]
 fn alter_table_rename_vector_column_waits_for_inflight_build_then_moves_index() {
-    use contextdb_vector::test_seam::PauseWindow;
-
     let db = Arc::new(Database::open_memory());
     db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
     seed_two_vector_evidence(&db);
     let old_ref = VectorIndexRef::new("evidence", "vector_text");
     let new_ref = VectorIndexRef::new("evidence", "vector_text_v2");
-    let vector_store = db.vector_store_for_test();
-    let old_partition = contextdb_vector::VectorPartitionRef::new(
-        old_ref.clone(),
-        contextdb_core::VectorPartitionKey::unpartitioned(),
-    );
-    let build_pause =
-        vector_store.arm_maintenance_progress_pause_for_test(&old_partition, PER_INDEX_SQL_ROWS);
-    let (done_build_tx, done_build_rx) = mpsc::channel();
-    let db_build = db.clone();
-    thread::spawn(move || {
-        done_build_tx
-            .send(db_build.run_maintenance_cycle())
-            .unwrap();
-    });
-    assert!(build_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+    let old_build = pause_native_build(&db, &old_ref);
 
-    let ddl_pause = vector_store.arm_maintenance_pause_for_test(&old_ref, PauseWindow::Ddl);
     let (started_rename_tx, started_rename_rx) = mpsc::channel();
     let (done_rename_tx, done_rename_rx) = mpsc::channel();
     let db_rename = db.clone();
@@ -7080,23 +7175,10 @@ fn alter_table_rename_vector_column_waits_for_inflight_build_then_moves_index() 
         done_rename_rx.try_recv(),
         Err(TryRecvError::Empty)
     ));
-    build_pause.release();
-    let build_result = done_build_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
-    // The rename cannot enter this DDL pause until the maintenance-owned
-    // traversal releases the old vector state.
-    assert!(ddl_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
-    let old_ref_present_during_pause = vector_store
-        .index_infos()
-        .iter()
-        .any(|info| info.index == old_ref);
-    assert!(matches!(
-        done_rename_rx.try_recv(),
-        Err(TryRecvError::Empty)
-    ));
-    ddl_pause.release();
+    old_build.release.send(()).unwrap();
+    let build_result = old_build.done.recv_timeout(PER_INDEX_SQL_TIMEOUT);
     let rename_result = done_rename_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
 
-    assert!(old_ref_present_during_pause);
     assert!(
         db.execute(
             "SELECT id FROM evidence ORDER BY vector_text <=> $query LIMIT 1",
@@ -7110,11 +7192,12 @@ fn alter_table_rename_vector_column_waits_for_inflight_build_then_moves_index() 
         per_index_top_id(&db, "evidence", "vector_text_v2", per_index_axis3(0)),
         Uuid::from_u128(10_000)
     );
-    assert!(!vector_store.has_hnsw_index_for(&old_ref));
-    assert!(vector_store.has_hnsw_index_for(&new_ref));
+    assert!(!db.__debug_vector_indexed_available_for_test(old_ref));
+    assert!(db.__debug_vector_indexed_available_for_test(new_ref));
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_alter_table_drop_vector_column_removes_receiver_index() {
     let origin = Database::open_memory();
     let receiver = Database::open_memory();
@@ -7148,15 +7231,21 @@ fn sync_alter_table_drop_vector_column_removes_receiver_index() {
         .unwrap();
     receiver
         .apply_changes(
-            origin.changes_since(watermark),
+            origin
+                .changes_since(watermark)
+                .expect("read the declared changes"),
             &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
         )
         .unwrap();
 
     let indexes = receiver.execute("SHOW VECTOR_INDEXES", &empty()).unwrap();
-    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let column_idx = indexes
+        .columns()
+        .iter()
+        .position(|c| c == "column")
+        .unwrap();
     let columns = indexes
-        .rows
+        .rows()
         .iter()
         .map(|row| row[column_idx].clone())
         .collect::<Vec<_>>();
@@ -7177,6 +7266,7 @@ fn sync_alter_table_drop_vector_column_removes_receiver_index() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_alter_table_rename_vector_column_moves_receiver_index() {
     let origin = Database::open_memory();
     let receiver = Database::open_memory();
@@ -7211,15 +7301,21 @@ fn sync_alter_table_rename_vector_column_moves_receiver_index() {
         .unwrap();
     receiver
         .apply_changes(
-            origin.changes_since(watermark),
+            origin
+                .changes_since(watermark)
+                .expect("read the declared changes"),
             &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
         )
         .unwrap();
 
     let indexes = receiver.execute("SHOW VECTOR_INDEXES", &empty()).unwrap();
-    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let column_idx = indexes
+        .columns()
+        .iter()
+        .position(|c| c == "column")
+        .unwrap();
     let columns = indexes
-        .rows
+        .rows()
         .iter()
         .map(|row| row[column_idx].clone())
         .collect::<Vec<_>>();
@@ -7240,6 +7336,7 @@ fn sync_alter_table_rename_vector_column_moves_receiver_index() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn commit_rejects_staged_vector_insert_after_same_ref_sync_shape_change() {
     let db = Database::open_memory();
     db.execute(
@@ -7296,7 +7393,7 @@ fn commit_rejects_staged_vector_insert_after_same_ref_sync_shape_change() {
             "SELECT id FROM evidence ORDER BY embedding <=> $query LIMIT 1",
             &params(vec![("query", Value::Vector(vec![1.0_f32, 0.0, 0.0, 0.0]))]),
         ),
-        Ok(result) if result.rows.is_empty()
+        Ok(result) if result.rows().is_empty()
     ));
 }
 
@@ -7343,7 +7440,7 @@ fn commit_rejects_staged_vector_insert_after_same_ref_drop_readd_same_shape() {
             "SELECT id FROM evidence ORDER BY embedding <=> $query LIMIT 1",
             &params(vec![("query", Value::Vector(per_index_axis3(0)))]),
         ),
-        Ok(result) if result.rows.is_empty()
+        Ok(result) if result.rows().is_empty()
     ));
 }
 
@@ -7406,10 +7503,11 @@ fn commit_rejects_commit_time_vector_exclusion_after_same_ref_drop_readd_same_sh
             &params(vec![("query", Value::Vector(per_index_axis3(1)))]),
         )
         .unwrap();
-    assert_eq!(result.rows, vec![vec![Value::Uuid(id)]]);
+    assert_eq!(result.rows(), vec![vec![Value::Uuid(id)]]);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn commit_rejects_staged_vector_update_after_same_ref_sync_shape_change() {
     let db = Database::open_memory();
     let id = Uuid::from_u128(45);
@@ -7473,6 +7571,7 @@ fn commit_rejects_staged_vector_update_after_same_ref_sync_shape_change() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_alter_table_shape_change_accepts_following_vector_payload() {
     let receiver = Database::open_memory();
     let id = Uuid::from_u128(46);
@@ -7532,10 +7631,11 @@ fn sync_alter_table_shape_change_accepts_following_vector_payload() {
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(row.rows[0][0], Value::Text("kept".to_string()));
+    assert_eq!(row.rows()[0][0], Value::Text("kept".to_string()));
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_vector_delta_restores_owner_row_in_vector_lsn_group() {
     let sender = Database::open_memory();
     let receiver = Database::open_memory();
@@ -7575,7 +7675,9 @@ fn sync_vector_delta_restores_owner_row_in_vector_lsn_group() {
     sender.commit(tx).unwrap();
     let vector_lsn = sender.current_lsn();
 
-    let changes = sender.changes_since(row_lsn);
+    let changes = sender
+        .changes_since(row_lsn)
+        .expect("read the declared changes");
     assert_eq!(changes.rows.len(), 1);
     assert_eq!(changes.vectors.len(), 1);
     assert_eq!(
@@ -7596,7 +7698,7 @@ fn sync_vector_delta_restores_owner_row_in_vector_lsn_group() {
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(row.rows[0][0], Value::Text("vector owner".to_string()));
+    assert_eq!(row.rows()[0][0], Value::Text("vector owner".to_string()));
     assert_eq!(
         per_index_top_id(&receiver, "evidence", "embedding", per_index_axis3(1)),
         id
@@ -7604,6 +7706,97 @@ fn sync_vector_delta_restores_owner_row_in_vector_lsn_group() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
+fn sync_vector_delta_sends_the_independent_vector_not_the_row_body() {
+    let sender = Database::open_memory();
+    let receiver = Database::open_memory();
+    let id = Uuid::from_u128(4702);
+    let index = VectorIndexRef::new("evidence", "embedding");
+    let independent = per_index_axis3(1);
+
+    for db in [&sender, &receiver] {
+        db.execute(
+            "CREATE TABLE evidence (id UUID PRIMARY KEY, note TEXT, embedding VECTOR(3))",
+            &empty(),
+        )
+        .unwrap();
+    }
+
+    let tx = sender.begin().unwrap();
+    let row_id = sender
+        .insert_row(
+            tx,
+            "evidence",
+            params(vec![
+                ("id", Value::Uuid(id)),
+                ("note", Value::Text("vector owner".to_string())),
+                ("embedding", Value::Vector(per_index_axis3(0))),
+            ]),
+        )
+        .unwrap();
+    sender.commit(tx).unwrap();
+    let row_lsn = sender.current_lsn();
+
+    let tx = sender.begin().unwrap();
+    sender
+        .insert_vector(tx, index.clone(), row_id, independent.clone())
+        .unwrap();
+    sender.commit(tx).unwrap();
+    let vector_lsn = sender.current_lsn();
+
+    let written = |changes: &sync::ChangeSet| {
+        changes
+            .vectors
+            .iter()
+            .filter(|vector| !vector.vector.is_empty())
+            .map(|vector| (vector.row_id, vector.vector.clone(), vector.lsn))
+            .collect::<Vec<_>>()
+    };
+    let expected = vec![(row_id, independent.clone(), vector_lsn)];
+
+    let changes = sender
+        .changes_since(row_lsn)
+        .expect("read the declared changes");
+    assert_eq!(
+        written(&changes),
+        expected,
+        "the change carries the vector it selected, not the row body's inline value"
+    );
+    assert!(
+        changes
+            .rows
+            .iter()
+            .any(|row| !row.deleted && row.lsn == vector_lsn),
+        "the owner row travels in the vector's LSN group"
+    );
+
+    let (bounded, _) = sender
+        .changes_since_with_arrivals(row_lsn)
+        .expect("read the bounded changes");
+    assert_eq!(
+        written(&bounded),
+        expected,
+        "bounded extraction selects the same vector"
+    );
+
+    receiver
+        .apply_changes(
+            changes,
+            &sync::ConflictPolicies::uniform(sync::ConflictPolicy::InsertIfNotExists),
+        )
+        .unwrap();
+    let hits = receiver
+        .query_vector(index, &independent, 1, None, receiver.snapshot())
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(
+        hits[0].1 > 0.99,
+        "the receiver's index holds the independent vector: {hits:?}"
+    );
+}
+
+#[test]
+#[cfg(feature = "test-seams")]
 fn sync_partial_vector_shape_alter_does_not_drop_omitted_side_columns() {
     let receiver = Database::open_memory();
     let id = Uuid::from_u128(47);
@@ -7652,7 +7845,7 @@ fn sync_partial_vector_shape_alter_does_not_drop_omitted_side_columns() {
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(row.rows[0][0], Value::Text("kept".to_string()));
+    assert_eq!(row.rows()[0][0], Value::Text("kept".to_string()));
     assert!(matches!(
         receiver.execute(
             "SELECT id FROM evidence ORDER BY embedding <=> $query LIMIT 1",
@@ -7686,6 +7879,7 @@ fn sync_partial_vector_shape_alter_does_not_drop_omitted_side_columns() {
 // `sync_vector_rename_persists_row_image_across_reopen` above.
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_partial_alter_restating_primary_key_still_preserves_omitted_side_column() {
     let tmp = TempDir::new().unwrap();
     let author_path = tmp.path().join("author.db");
@@ -7747,7 +7941,7 @@ fn sync_partial_alter_restating_primary_key_still_preserves_omitted_side_column(
                     )
                 });
             assert_eq!(
-                row.rows[0][0],
+                row.rows()[0][0],
                 Value::Text("kept".to_string()),
                 "{label}: the omitted side column must keep its row value even though the \
                  primary key was restated"
@@ -7773,7 +7967,7 @@ fn sync_partial_alter_restating_primary_key_still_preserves_omitted_side_column(
                 panic!("{label} after restart: note column must still be selectable; observed error: {e:?}")
             });
         assert_eq!(
-            row.rows[0][0],
+            row.rows()[0][0],
             Value::Text("kept".to_string()),
             "{label} after restart: the preserved column must still hold its value"
         );
@@ -7781,6 +7975,7 @@ fn sync_partial_alter_restating_primary_key_still_preserves_omitted_side_column(
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_explicit_drop_column_removes_data_and_names_the_drop_as_the_authors_operation() {
     let tmp = TempDir::new().unwrap();
     let author_path = tmp.path().join("author.db");
@@ -7808,7 +8003,9 @@ fn sync_explicit_drop_column_removes_data_and_names_the_drop_as_the_authors_oper
             .execute("ALTER TABLE evidence DROP COLUMN note", &empty())
             .unwrap();
 
-        let changes = author.changes_since(watermark);
+        let changes = author
+            .changes_since(watermark)
+            .expect("read the declared changes");
         let constraints = changes
             .ddl
             .iter()
@@ -7879,7 +8076,7 @@ fn sync_explicit_drop_column_removes_data_and_names_the_drop_as_the_authors_oper
             )
             .unwrap();
         assert_eq!(
-            row.rows.len(),
+            row.rows().len(),
             1,
             "{label} after restart: the row itself must survive the column drop"
         );
@@ -7887,6 +8084,7 @@ fn sync_explicit_drop_column_removes_data_and_names_the_drop_as_the_authors_oper
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_explicit_vector_rename_moves_vectors_and_names_the_rename_as_the_authors_operation() {
     let tmp = TempDir::new().unwrap();
     let author_path = tmp.path().join("author.db");
@@ -7917,7 +8115,9 @@ fn sync_explicit_vector_rename_moves_vectors_and_names_the_rename_as_the_authors
             )
             .unwrap();
 
-        let changes = author.changes_since(watermark);
+        let changes = author
+            .changes_since(watermark)
+            .expect("read the declared changes");
         let constraints = changes
             .ddl
             .iter()
@@ -7956,7 +8156,7 @@ fn sync_explicit_vector_rename_moves_vectors_and_names_the_rename_as_the_authors
                 )
                 .unwrap();
             assert_eq!(
-                row.rows[0][0],
+                row.rows()[0][0],
                 Value::Text("kept".to_string()),
                 "{label}: the side column must be untouched by the rename"
             );
@@ -7992,6 +8192,7 @@ fn sync_explicit_vector_rename_moves_vectors_and_names_the_rename_as_the_authors
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_partial_alter_omitting_a_matching_type_column_is_not_treated_as_a_rename() {
     let tmp = TempDir::new().unwrap();
     let author_path = tmp.path().join("author.db");
@@ -8055,7 +8256,7 @@ fn sync_partial_alter_omitting_a_matching_type_column_is_not_treated_as_a_rename
                     )
                 });
             assert_eq!(
-                note_row.rows[0][0],
+                note_row.rows()[0][0],
                 Value::Text("kept".to_string()),
                 "{label}: `note` must keep its original row value"
             );
@@ -8066,7 +8267,7 @@ fn sync_partial_alter_omitting_a_matching_type_column_is_not_treated_as_a_rename
                 )
                 .unwrap();
             assert_ne!(
-                memo_row.rows[0][0],
+                memo_row.rows()[0][0],
                 Value::Text("kept".to_string()),
                 "{label}: the newly declared column `memo` must not silently inherit `note`'s \
                  value as though a rename had been recorded"
@@ -8094,7 +8295,7 @@ fn sync_partial_alter_omitting_a_matching_type_column_is_not_treated_as_a_rename
                 )
             });
         assert_eq!(
-            note_row.rows[0][0],
+            note_row.rows()[0][0],
             Value::Text("kept".to_string()),
             "{label} after restart: the preserved column must still hold its value"
         );
@@ -8102,6 +8303,7 @@ fn sync_partial_alter_omitting_a_matching_type_column_is_not_treated_as_a_rename
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_additive_vector_alter_with_existing_non_vector_columns_keeps_old_vector_index() {
     let receiver = Database::open_memory();
     let id = Uuid::from_u128(48);
@@ -8150,9 +8352,13 @@ fn sync_additive_vector_alter_with_existing_non_vector_columns_keeps_old_vector_
         id
     );
     let indexes = receiver.execute("SHOW VECTOR_INDEXES", &empty()).unwrap();
-    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let column_idx = indexes
+        .columns()
+        .iter()
+        .position(|c| c == "column")
+        .unwrap();
     let columns = indexes
-        .rows
+        .rows()
         .iter()
         .map(|row| row[column_idx].clone())
         .collect::<Vec<_>>();
@@ -8161,6 +8367,7 @@ fn sync_additive_vector_alter_with_existing_non_vector_columns_keeps_old_vector_
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_additive_non_vector_alter_does_not_drop_omitted_vector_index() {
     let receiver = Database::open_memory();
     let id = Uuid::from_u128(4801);
@@ -8214,10 +8421,11 @@ fn sync_additive_non_vector_alter_does_not_drop_omitted_vector_index() {
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(row.rows[0][0], Value::Null);
+    assert_eq!(row.rows()[0][0], Value::Null);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_vector_rename_persists_row_image_across_reopen() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("receiver.db");
@@ -8255,7 +8463,9 @@ fn sync_vector_rename_persists_row_image_across_reopen() {
             .unwrap();
         receiver
             .apply_changes(
-                origin.changes_since(watermark),
+                origin
+                    .changes_since(watermark)
+                    .expect("read the declared changes"),
                 &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
             )
             .unwrap();
@@ -8269,8 +8479,8 @@ fn sync_vector_rename_persists_row_image_across_reopen() {
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(row.rows[0][0], Value::Text("kept".to_string()));
-    assert_eq!(row.rows[0][1], Value::Vector(vision));
+    assert_eq!(row.rows()[0][0], Value::Text("kept".to_string()));
+    assert_eq!(row.rows()[0][1], Value::Vector(vision));
     assert!(matches!(
         reopened.execute(
             "SELECT id FROM evidence ORDER BY vector_vision <=> $query LIMIT 1",
@@ -8282,6 +8492,7 @@ fn sync_vector_rename_persists_row_image_across_reopen() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_single_vector_column_rename_moves_receiver_index() {
     let origin = Database::open_memory();
     let receiver = Database::open_memory();
@@ -8309,7 +8520,9 @@ fn sync_single_vector_column_rename_moves_receiver_index() {
         .unwrap();
     receiver
         .apply_changes(
-            origin.changes_since(watermark),
+            origin
+                .changes_since(watermark)
+                .expect("read the declared changes"),
             &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
         )
         .unwrap();
@@ -8319,9 +8532,13 @@ fn sync_single_vector_column_rename_moves_receiver_index() {
         id
     );
     let indexes = receiver.execute("SHOW VECTOR_INDEXES", &empty()).unwrap();
-    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let column_idx = indexes
+        .columns()
+        .iter()
+        .position(|c| c == "column")
+        .unwrap();
     let columns = indexes
-        .rows
+        .rows()
         .iter()
         .map(|row| row[column_idx].clone())
         .collect::<Vec<_>>();
@@ -8338,6 +8555,7 @@ fn sync_single_vector_column_rename_moves_receiver_index() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_additive_same_shape_vector_alter_does_not_rename_omitted_vector_index() {
     let receiver = Database::open_memory();
     let id = Uuid::from_u128(51);
@@ -8386,9 +8604,13 @@ fn sync_additive_same_shape_vector_alter_does_not_rename_omitted_vector_index() 
         id
     );
     let indexes = receiver.execute("SHOW VECTOR_INDEXES", &empty()).unwrap();
-    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let column_idx = indexes
+        .columns()
+        .iter()
+        .position(|c| c == "column")
+        .unwrap();
     let columns = indexes
-        .rows
+        .rows()
         .iter()
         .map(|row| row[column_idx].clone())
         .collect::<Vec<_>>();
@@ -8400,37 +8622,20 @@ fn sync_additive_same_shape_vector_alter_does_not_rename_omitted_vector_index() 
             &params(vec![("query", Value::Vector(per_index_axis3(0)))]),
         )
         .unwrap();
-    assert!(added_search.rows.is_empty());
+    assert!(added_search.rows().is_empty());
 }
 
 #[cfg(feature = "test-seams")]
 #[test]
+#[ignore = "the vector index route is switched off in this release"]
 fn drop_table_waits_for_inflight_vector_builds_then_removes_all_indexes() {
-    use contextdb_vector::test_seam::PauseWindow;
-
     let db = Arc::new(Database::open_memory());
     db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
     seed_two_vector_evidence(&db);
     let text_ref = VectorIndexRef::new("evidence", "vector_text");
     let vision_ref = VectorIndexRef::new("evidence", "vector_vision");
-    let table_ref = VectorIndexRef::new("evidence", "*");
-    let vector_store = db.vector_store_for_test();
-    let text_partition = contextdb_vector::VectorPartitionRef::new(
-        text_ref.clone(),
-        contextdb_core::VectorPartitionKey::unpartitioned(),
-    );
-    let build_pause =
-        vector_store.arm_maintenance_progress_pause_for_test(&text_partition, PER_INDEX_SQL_ROWS);
-    let (done_build_tx, done_build_rx) = mpsc::channel();
-    let db_build = db.clone();
-    thread::spawn(move || {
-        done_build_tx
-            .send(db_build.run_maintenance_cycle())
-            .unwrap();
-    });
-    assert!(build_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+    let text_build = pause_native_build(&db, &text_ref);
 
-    let ddl_pause = vector_store.arm_maintenance_pause_for_test(&table_ref, PauseWindow::Ddl);
     let (started_drop_tx, started_drop_rx) = mpsc::channel();
     let (done_drop_tx, done_drop_rx) = mpsc::channel();
     let db_drop = db.clone();
@@ -8440,15 +8645,11 @@ fn drop_table_waits_for_inflight_vector_builds_then_removes_all_indexes() {
         done_drop_tx.send(result).unwrap();
     });
     assert!(started_drop_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT).is_ok());
-    assert!(matches!(done_drop_rx.try_recv(), Err(TryRecvError::Empty)));
-    build_pause.release();
-    let _ = done_build_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
     // DROP TABLE cannot retire a vector state while maintenance owns that
-    // same state. The table-level DDL pause is reachable only after the
-    // maintenance batch releases it; no query is allowed to start the build.
-    assert!(ddl_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+    // same state; no query is allowed to start the build.
     assert!(matches!(done_drop_rx.try_recv(), Err(TryRecvError::Empty)));
-    ddl_pause.release();
+    text_build.release.send(()).unwrap();
+    let _ = text_build.done.recv_timeout(PER_INDEX_SQL_TIMEOUT);
     let drop_result = done_drop_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
 
     drop_result.unwrap().unwrap();
@@ -8456,8 +8657,8 @@ fn drop_table_waits_for_inflight_vector_builds_then_removes_all_indexes() {
         db.execute("SELECT id FROM evidence LIMIT 1", &empty())
             .is_err()
     );
-    assert!(!vector_store.has_hnsw_index_for(&text_ref));
-    assert!(!vector_store.has_hnsw_index_for(&vision_ref));
+    assert!(!db.__debug_vector_indexed_available_for_test(text_ref));
+    assert!(!db.__debug_vector_indexed_available_for_test(vision_ref));
 }
 
 // ============================================================
@@ -8530,7 +8731,23 @@ fn prv_seed_docs(db: &Database) -> PrvFixture {
     f
 }
 
-fn prv_seed_hnsw_docs(db: &Database, rows: usize) -> PrvFixture {
+fn prv_used_indexed_route(result: &contextdb_engine::QueryResult) -> bool {
+    result
+        .trace()
+        .vector_search
+        .as_ref()
+        .is_some_and(|disclosure| {
+            matches!(
+                disclosure.route,
+                Some(
+                    contextdb_engine::VectorSearchRoute::Indexed
+                        | contextdb_engine::VectorSearchRoute::FilteredIndexed
+                )
+            )
+        })
+}
+
+fn prv_seed_indexed_docs(db: &Database, rows: usize) -> PrvFixture {
     let f = prv_seed_docs(db);
     for idx in 4..rows {
         let id = Uuid::from_u128(0x7200_0000_0000_0000_0000_0000_0000_0000 + idx as u128);
@@ -8538,7 +8755,7 @@ fn prv_seed_hnsw_docs(db: &Database, rows: usize) -> PrvFixture {
         prv_insert_doc(
             db,
             id,
-            &format!("hnsw-{idx}"),
+            &format!("indexed-{idx}"),
             vec![
                 angle.sin().abs(),
                 angle.cos().abs(),
@@ -8583,15 +8800,15 @@ fn prv_expect_query_err(
 
 fn prv_column(result: &contextdb_engine::QueryResult, name: &str) -> usize {
     result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == name || column.rsplit('.').next() == Some(name))
-        .unwrap_or_else(|| panic!("column {name} not found in {:?}", result.columns))
+        .unwrap_or_else(|| panic!("column {name} not found in {:?}", result.columns()))
 }
 
 fn prv_uuid_at(result: &contextdb_engine::QueryResult, row: usize, column: &str) -> Uuid {
     let idx = prv_column(result, column);
-    match result.rows.get(row).and_then(|values| values.get(idx)) {
+    match result.rows().get(row).and_then(|values| values.get(idx)) {
         Some(Value::Uuid(id)) => *id,
         other => panic!("expected UUID in row {row} column {column}, got {other:?}"),
     }
@@ -8599,7 +8816,7 @@ fn prv_uuid_at(result: &contextdb_engine::QueryResult, row: usize, column: &str)
 
 fn prv_score_at(result: &contextdb_engine::QueryResult, row: usize) -> f64 {
     let idx = prv_column(result, "score");
-    match result.rows.get(row).and_then(|values| values.get(idx)) {
+    match result.rows().get(row).and_then(|values| values.get(idx)) {
         Some(Value::Float64(score)) => *score,
         other => panic!("expected score in row {row}, got {other:?}"),
     }
@@ -8610,15 +8827,17 @@ fn prv_assert_same_signature(
     persisted: &contextdb_engine::QueryResult,
 ) {
     assert_eq!(
-        persisted.trace.physical_plan, literal.trace.physical_plan,
+        persisted.trace().physical_plan,
+        literal.trace().physical_plan,
         "persisted ROW_VECTOR query must match literal-vector plan label"
     );
     assert_eq!(
-        persisted.trace.index_used, literal.trace.index_used,
+        persisted.trace().index_used,
+        literal.trace().index_used,
         "persisted ROW_VECTOR query must match literal-vector index trace"
     );
-    assert_eq!(persisted.rows.len(), literal.rows.len());
-    for idx in 0..literal.rows.len() {
+    assert_eq!(persisted.rows().len(), literal.rows().len());
+    for idx in 0..literal.rows().len() {
         assert_eq!(
             prv_uuid_at(persisted, idx, "id"),
             prv_uuid_at(literal, idx, "id"),
@@ -8736,7 +8955,7 @@ fn prv_assert_result_has_no_vector_payload(
     result: &contextdb_engine::QueryResult,
     source_vec: &[f32],
 ) {
-    for row in &result.rows {
+    for row in result.rows() {
         for value in row {
             assert!(
                 !matches!(value, Value::Vector(_)),
@@ -8747,14 +8966,10 @@ fn prv_assert_result_has_no_vector_payload(
     prv_assert_no_source_vector_leak_in_debug(&format!("{result:?}"), source_vec);
 }
 
-fn prv_memory_usage_tuple(db: &Database) -> (Option<usize>, usize, Option<usize>, Option<usize>) {
+#[cfg(feature = "test-seams")]
+fn prv_memory_usage_tuple(db: &Database) -> (Option<usize>, usize, Option<usize>) {
     let usage = db.accountant().usage();
-    (
-        usage.limit,
-        usage.used,
-        usage.available,
-        usage.startup_ceiling,
-    )
+    (usage.limit, usage.used, usage.startup_ceiling)
 }
 
 fn prv_seed_rank_policy_docs(db: &Database, rows: usize) -> PrvFixture {
@@ -8830,21 +9045,30 @@ fn prv_seed_rank_policy_docs(db: &Database, rows: usize) -> PrvFixture {
 
 fn prv_06_child_process() {
     let db_path = std::env::var("CONTEXTDB_PRV06_DB").unwrap();
-    let barrier_dir = std::path::PathBuf::from(std::env::var("CONTEXTDB_PRV06_BARRIER").unwrap());
+    use std::io::{Read, Write};
+    #[cfg(unix)]
+    let mut barrier = std::os::unix::net::UnixStream::connect(
+        std::env::var_os("CONTEXTDB_PRV06_BARRIER").unwrap(),
+    )
+    .expect("parent barrier never delivered");
+    #[cfg(not(unix))]
+    let mut barrier =
+        std::net::TcpStream::connect(std::env::var("CONTEXTDB_PRV06_BARRIER").unwrap())
+            .expect("parent barrier never delivered");
+    barrier
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    barrier
+        .set_write_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
     let query_id = Uuid::parse_str(&std::env::var("CONTEXTDB_PRV06_QUERY_ID").unwrap()).unwrap();
     let f = prv_fixture();
     let db = Database::open(&db_path).unwrap();
     for phase in 0..3 {
-        let go = barrier_dir.join(format!("phase-{phase}.go"));
-        let done = barrier_dir.join(format!("phase-{phase}.done"));
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !go.exists() {
-            assert!(
-                Instant::now() < deadline,
-                "child timed out waiting for barrier {go:?}"
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
+        let mut go = [0u8; 1];
+        barrier
+            .read_exact(&mut go)
+            .expect("phase start never delivered");
         match phase {
             1 => {
                 prv_update_doc_embedding(&db, f.source, f.mid_vec.clone());
@@ -8868,23 +9092,7 @@ fn prv_06_child_process() {
             "child process ROW_VECTOR query",
         );
         let top = prv_uuid_at(&result, 0, "id");
-        let tmp_done = done.with_extension("tmp");
-        std::fs::write(&tmp_done, top.to_string()).unwrap();
-        std::fs::rename(tmp_done, done).unwrap();
-    }
-}
-
-fn prv_wait_for_file(path: &std::path::Path) -> String {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Ok(value) = std::fs::read_to_string(path) {
-            return value;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for barrier file {path:?}"
-        );
-        thread::sleep(Duration::from_millis(10));
+        writeln!(barrier, "{top}").expect("phase result never delivered");
     }
 }
 
@@ -8899,10 +9107,10 @@ fn prv_01_parser_accepts_row_vector_as_cosine_distance_rhs() {
         ),
         "well-formed persisted row vector RHS",
     );
-    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.rows().len(), 2);
     assert_eq!(prv_uuid_at(&result, 0, "id"), f.source);
     assert_eq!(
-        result.trace.query_vector_source,
+        result.trace().query_vector_source,
         Some(VectorIndexRef::new("docs", "embedding"))
     );
 }
@@ -9066,42 +9274,42 @@ fn prv_03_row_vector_query_matches_literal_vector_parity_for_trace_and_results()
         "persisted row vector parity query",
     );
     prv_assert_same_signature(&literal, &persisted);
-    assert_eq!(literal.trace.query_vector_source, None);
+    assert_eq!(literal.trace().query_vector_source, None);
     assert_eq!(
-        persisted.trace.query_vector_source,
+        persisted.trace().query_vector_source,
         Some(VectorIndexRef::new("docs", "embedding"))
     );
 
-    let hnsw_db = Database::open_memory();
-    let hnsw_f = prv_seed_hnsw_docs(&hnsw_db, 1024);
+    let indexed_db = Database::open_memory();
+    let indexed_f = prv_seed_indexed_docs(&indexed_db, 1024);
     // The query's explain reports the actual route per partition. The first
-    // maintained graph for a column is built only by a maintenance cycle
+    // maintained index for a column is built only by a maintenance cycle
     // (`docs/query-language.md` INDEXED section); before one
-    // runs, AUTO's exact fallback is truthfully labelled exact, not HNSW. Drive one cycle so
-    // this fixture's 1,024-row partition has a maintained graph before asserting the HNSW
-    // label below.
-    hnsw_db.run_maintenance_cycle().unwrap();
-    let hnsw_literal = hnsw_db
+    // runs, AUTO's exact fallback is truthfully labelled exact, not indexed. Drive one cycle so
+    // this fixture's 1,024-row partition has a maintained index before asserting the indexed
+    // route below.
+    indexed_db.run_maintenance_cycle().unwrap();
+    let indexed_literal = indexed_db
         .execute(
             &prv_literal_query(""),
-            &params(vec![("query", Value::Vector(hnsw_f.source_vec.clone()))]),
+            &params(vec![("query", Value::Vector(indexed_f.source_vec.clone()))]),
         )
         .unwrap();
     assert!(
-        hnsw_literal.trace.physical_plan.contains("HNSWSearch"),
-        "literal-vector HNSW oracle must use the HNSW path, got {:?}",
-        hnsw_literal.trace
+        prv_used_indexed_route(&indexed_literal),
+        "literal-vector indexed oracle must use the indexed path, got {:?}",
+        indexed_literal.trace()
     );
-    let hnsw_persisted = prv_expect_query_ok(
-        hnsw_db.execute(
+    let indexed_persisted = prv_expect_query_ok(
+        indexed_db.execute(
             &prv_row_vector_query(""),
-            &params(vec![("query_id", Value::Uuid(hnsw_f.source))]),
+            &params(vec![("query_id", Value::Uuid(indexed_f.source))]),
         ),
-        "persisted row vector HNSW parity query",
+        "persisted row vector indexed parity query",
     );
-    prv_assert_same_signature(&hnsw_literal, &hnsw_persisted);
+    prv_assert_same_signature(&indexed_literal, &indexed_persisted);
     assert_eq!(
-        hnsw_persisted.trace.query_vector_source,
+        indexed_persisted.trace().query_vector_source,
         Some(VectorIndexRef::new("docs", "embedding"))
     );
 }
@@ -9117,7 +9325,7 @@ fn prv_04_row_vector_query_returns_rows_score_trace_without_vector_bytes() {
         ),
         "persisted row vector byte non-exposure query",
     );
-    assert!(persisted.columns.iter().any(|column| column == "score"));
+    assert!(persisted.columns().iter().any(|column| column == "score"));
     assert_eq!(prv_uuid_at(&persisted, 0, "id"), f.near);
     prv_assert_result_has_no_vector_payload(&persisted, &f.source_vec);
 }
@@ -9136,18 +9344,19 @@ fn prv_05_row_vector_query_respects_candidate_filter() {
         ),
         "candidate-filtered persisted row vector query",
     );
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
     assert_eq!(prv_uuid_at(&result, 0, "id"), f.mid);
     assert!(
-        result.trace.physical_plan.contains("VectorSearch")
-            || result.trace.physical_plan.contains("HNSWSearch"),
+        result.trace().physical_plan.contains("VectorSearch"),
         "trace must show candidate plan feeding vector search, got {:?}",
-        result.trace
+        result.trace()
     );
 }
 
 #[test]
 fn prv_06_row_vector_query_uses_one_snapshot_after_reopen_and_fresh_process() {
+    use std::io::{BufRead, Write};
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
     if std::env::var_os("CONTEXTDB_PRV06_CHILD").is_some() {
         prv_06_child_process();
         return;
@@ -9225,8 +9434,20 @@ fn prv_06_row_vector_query_uses_one_snapshot_after_reopen_and_fresh_process() {
     assert_eq!(prv_uuid_at(&post_commit, 0, "id"), f.far);
     drop(db);
 
-    let barrier = tmp.path().join("prv06-barrier");
-    std::fs::create_dir(&barrier).unwrap();
+    #[cfg(unix)]
+    let (listener, barrier) = {
+        let path = tmp.path().join("prv06.sock");
+        (
+            std::os::unix::net::UnixListener::bind(&path).unwrap(),
+            path.into_os_string(),
+        )
+    };
+    #[cfg(not(unix))]
+    let (listener, barrier) = {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address: std::ffi::OsString = listener.local_addr().unwrap().to_string().into();
+        (listener, address)
+    };
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
         .arg(crate::child_test_filter(
@@ -9240,16 +9461,68 @@ fn prv_06_row_vector_query_uses_one_snapshot_after_reopen_and_fresh_process() {
         .spawn()
         .unwrap();
 
-    std::fs::write(barrier.join("phase-0.go"), b"go").unwrap();
-    let phase0 = prv_wait_for_file(&barrier.join("phase-0.done"));
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+    let acceptor = thread::spawn(move || {
+        let _ = accepted_tx.send(listener.accept().map(|(stream, _)| stream));
+    });
+    let mut barrier = match accepted_rx.recv_timeout(Duration::from_secs(60)) {
+        Ok(Ok(stream)) => stream,
+        _ => {
+            let _ = child.kill();
+            let _ = child.wait();
+            #[cfg(unix)]
+            let _ = std::os::unix::net::UnixStream::connect(&barrier);
+            #[cfg(not(unix))]
+            let _ = std::net::TcpStream::connect(barrier.to_string_lossy().as_ref());
+            let _ = acceptor.join();
+            panic!("child barrier connection never delivered");
+        }
+    };
+    acceptor.join().unwrap();
+    barrier
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    barrier
+        .set_write_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    let mut replies = std::io::BufReader::new(barrier.try_clone().unwrap());
+    barrier
+        .write_all(b"g")
+        .expect("phase 0 start never delivered");
+    let mut phase0 = String::new();
+    if replies
+        .read_line(&mut phase0)
+        .expect("phase 0 result never delivered")
+        == 0
+    {
+        panic!("phase 0 result never delivered");
+    }
     assert_eq!(phase0.trim(), f.far.to_string());
 
-    std::fs::write(barrier.join("phase-1.go"), b"go").unwrap();
-    let phase1 = prv_wait_for_file(&barrier.join("phase-1.done"));
+    barrier
+        .write_all(b"g")
+        .expect("phase 1 start never delivered");
+    let mut phase1 = String::new();
+    if replies
+        .read_line(&mut phase1)
+        .expect("phase 1 result never delivered")
+        == 0
+    {
+        panic!("phase 1 result never delivered");
+    }
     assert_eq!(phase1.trim(), f.near.to_string());
 
-    std::fs::write(barrier.join("phase-2.go"), b"go").unwrap();
-    let phase2 = prv_wait_for_file(&barrier.join("phase-2.done"));
+    barrier
+        .write_all(b"g")
+        .expect("phase 2 start never delivered");
+    let mut phase2 = String::new();
+    if replies
+        .read_line(&mut phase2)
+        .expect("phase 2 result never delivered")
+        == 0
+    {
+        panic!("phase 2 result never delivered");
+    }
     assert_eq!(phase2.trim(), f.mid.to_string());
     assert!(child.wait().unwrap().success());
 }
@@ -9358,12 +9631,14 @@ fn prv_07_row_vector_query_rejects_missing_or_wrong_index_source_with_distinct_v
     prv_assert_no_source_vector_leak_in_debug(&rendered_dim, &[1.0, 0.0, 0.0, 0.0]);
 }
 
+#[cfg(feature = "test-seams")]
 struct PrvPluginCounters {
     pre_commit: std::sync::atomic::AtomicUsize,
     post_commit: std::sync::atomic::AtomicUsize,
     commit_failed: std::sync::atomic::AtomicUsize,
 }
 
+#[cfg(feature = "test-seams")]
 impl contextdb_engine::plugin::DatabasePlugin for PrvPluginCounters {
     fn pre_commit(
         &self,
@@ -9393,6 +9668,11 @@ impl contextdb_engine::plugin::DatabasePlugin for PrvPluginCounters {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn prv_08_row_vector_query_is_read_only_no_trigger_no_plugin_no_reindex_no_sync() {
     let counters = Arc::new(PrvPluginCounters {
         pre_commit: std::sync::atomic::AtomicUsize::new(0),
@@ -9401,7 +9681,7 @@ fn prv_08_row_vector_query_is_read_only_no_trigger_no_plugin_no_reindex_no_sync(
     });
     let db = Database::open_memory_with_plugin(counters.clone()).unwrap();
     db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
-    let f = prv_seed_hnsw_docs(&db, 1024);
+    let f = prv_seed_indexed_docs(&db, 1024);
     db.execute("CREATE TRIGGER prv08_tr ON docs WHEN UPDATE", &empty())
         .unwrap();
     db.execute(
@@ -9426,12 +9706,12 @@ fn prv_08_row_vector_query_is_read_only_no_trigger_no_plugin_no_reindex_no_sync(
     db.complete_initialization().unwrap();
     let index = VectorIndexRef::new("docs", "embedding");
     db.run_maintenance_cycle()
-        .expect("caller-driven maintenance builds the graph before the read-only probe");
-    let before_hnsw_len = db.__debug_vector_hnsw_len(index.clone());
-    let before_hnsw_stats = db.__debug_vector_hnsw_stats(index.clone());
+        .expect("caller-driven maintenance builds the index before the read-only probe");
+    let before_index_generation = db.__debug_vector_index_generation_for_test(index.clone());
     assert!(
-        before_hnsw_len.is_some() && before_hnsw_stats.is_some(),
-        "read-only probe must exercise an already-built HNSW graph"
+        before_index_generation.is_some()
+            && db.__debug_vector_indexed_available_for_test(index.clone()),
+        "read-only probe must exercise an already-built clustered index"
     );
     let sink_deliveries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let sink_deliveries_for_callback = sink_deliveries.clone();
@@ -9448,7 +9728,7 @@ fn prv_08_row_vector_query_is_read_only_no_trigger_no_plugin_no_reindex_no_sync(
     let before_failed = counters.commit_failed.load(Ordering::SeqCst);
     let before_watermark = db.committed_watermark();
     let before_lsn = db.current_lsn();
-    let before_sink = db.sink_metrics_for_test("prv08_sink");
+    let before_sink = db.sink_metrics("prv08_sink");
 
     let result = prv_expect_query_ok(
         db.execute(
@@ -9469,12 +9749,30 @@ fn prv_08_row_vector_query_is_read_only_no_trigger_no_plugin_no_reindex_no_sync(
     assert_eq!(counters.commit_failed.load(Ordering::SeqCst), before_failed);
     assert_eq!(db.committed_watermark(), before_watermark);
     assert_eq!(db.current_lsn(), before_lsn);
-    assert_eq!(db.sink_metrics_for_test("prv08_sink"), before_sink);
-    assert_eq!(db.__debug_vector_hnsw_len(index.clone()), before_hnsw_len);
-    assert_eq!(db.__debug_vector_hnsw_stats(index), before_hnsw_stats);
-    assert!(db.changes_since(before_lsn).rows.is_empty());
-    assert!(db.changes_since(before_lsn).vectors.is_empty());
-    assert!(db.changes_since(before_lsn).ddl.is_empty());
+    assert_eq!(db.sink_metrics("prv08_sink"), before_sink);
+    assert_eq!(
+        db.__debug_vector_index_generation_for_test(index),
+        before_index_generation,
+        "the read-only probe publishes no new index generation"
+    );
+    assert!(
+        db.changes_since(before_lsn)
+            .expect("read the declared changes")
+            .rows
+            .is_empty()
+    );
+    assert!(
+        db.changes_since(before_lsn)
+            .expect("read the declared changes")
+            .vectors
+            .is_empty()
+    );
+    assert!(
+        db.changes_since(before_lsn)
+            .expect("read the declared changes")
+            .ddl
+            .is_empty()
+    );
 }
 
 #[test]
@@ -9487,8 +9785,8 @@ fn prv_09_existing_literal_and_parameter_cosine_distance_unchanged() {
             &params(vec![("query", Value::Vector(f.source_vec.clone()))]),
         )
         .unwrap();
-    assert_eq!(parameter.trace.physical_plan, "Scan -> VectorSearch");
-    assert_eq!(parameter.trace.query_vector_source, None);
+    assert_eq!(parameter.trace().physical_plan, "Scan -> VectorSearch");
+    assert_eq!(parameter.trace().query_vector_source, None);
     assert_eq!(prv_uuid_at(&parameter, 0, "id"), f.source);
     assert_eq!(prv_uuid_at(&parameter, 1, "id"), f.near);
 
@@ -9498,14 +9796,14 @@ fn prv_09_existing_literal_and_parameter_cosine_distance_unchanged() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(literal.trace.physical_plan, "Scan -> VectorSearch");
-    assert_eq!(literal.trace.query_vector_source, None);
+    assert_eq!(literal.trace().physical_plan, "Scan -> VectorSearch");
+    assert_eq!(literal.trace().query_vector_source, None);
     assert_eq!(prv_uuid_at(&literal, 0, "id"), f.source);
     assert_eq!(prv_uuid_at(&literal, 1, "id"), f.near);
 }
 
 #[test]
-fn prv_10_row_vector_composes_with_use_rank_and_emits_hnsw_label_when_active() {
+fn prv_10_row_vector_composes_with_use_rank_and_emits_indexed_route_when_active() {
     let small_db = Database::open_memory();
     let small_f = prv_seed_rank_policy_docs(&small_db, 4);
     let small_literal = small_db
@@ -9515,10 +9813,9 @@ fn prv_10_row_vector_composes_with_use_rank_and_emits_hnsw_label_when_active() {
         )
         .unwrap();
     assert!(
-        small_literal.trace.physical_plan.contains("VectorSearch")
-            && !small_literal.trace.physical_plan.contains("HNSWSearch"),
-        "small literal USE RANK query must exercise the non-HNSW path, got {:?}",
-        small_literal.trace
+        small_literal.trace().physical_plan.contains("VectorSearch"),
+        "small literal USE RANK query must exercise the non-indexed path, got {:?}",
+        small_literal.trace()
     );
     let small_persisted = prv_expect_query_ok(
         small_db.execute(
@@ -9529,45 +9826,61 @@ fn prv_10_row_vector_composes_with_use_rank_and_emits_hnsw_label_when_active() {
     );
     prv_assert_same_signature(&small_literal, &small_persisted);
     assert_eq!(
-        small_persisted.trace.query_vector_source,
+        small_persisted.trace().query_vector_source,
         Some(VectorIndexRef::new("docs", "embedding"))
     );
+}
 
+/// The successful indexed-route arm of prv_10; the non-indexed parity and
+/// source disclosure stay active there.
+#[test]
+#[ignore = "the vector index route is switched off in this release"]
+fn prv_10_row_vector_with_use_rank_emits_the_indexed_route() {
     let db = Database::open_memory();
     let f = prv_seed_rank_policy_docs(&db, 1024);
     // The query's explain reports the actual route per partition. The first
-    // maintained graph for a column is built only by a maintenance cycle
-    // (`docs/query-language.md` INDEXED section); before
-    // one runs, AUTO's exact fallback is truthfully labelled exact rather than HNSW. Drive one
-    // cycle so this fixture's 1,024-row partition has a maintained graph before asserting the
-    // HNSW label.
-    db.run_maintenance_cycle().unwrap();
+    // maintained index for a column is built only by a maintenance cycle
+    // (`docs/query-language.md` INDEXED section), so drive one before asserting the indexed route.
+    // AUTO may still truthfully compare a small three-dimensional layout exactly when that is
+    // cheaper than an index walk, so the large queries ask for the maintained route with
+    // `USE VECTOR INDEXED`, placed after the vector ordering and before `USE RANK`.
+    for _ in 0..2_100 {
+        if db
+            .run_maintenance_cycle()
+            .unwrap()
+            .vector
+            .remaining_partitions
+            == 0
+        {
+            break;
+        }
+    }
     let literal = db
         .execute(
-            "SELECT id, score FROM docs ORDER BY embedding <=> $query USE RANK weighted LIMIT 3",
+            "SELECT id, score FROM docs ORDER BY embedding <=> $query USE VECTOR INDEXED USE RANK weighted LIMIT 3",
             &params(vec![("query", Value::Vector(f.source_vec.clone()))]),
         )
         .unwrap();
     assert!(
-        literal.trace.physical_plan.contains("HNSWSearch"),
-        "literal USE RANK query must report actual HNSW path before ROW_VECTOR parity is accepted, got {:?}",
-        literal.trace
+        prv_used_indexed_route(&literal),
+        "literal USE RANK query must report the actual indexed route before ROW_VECTOR parity is accepted, got {:?}",
+        literal.trace()
     );
     let persisted = prv_expect_query_ok(
         db.execute(
-            "SELECT id, score FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) USE RANK weighted LIMIT 3",
+            "SELECT id, score FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) USE VECTOR INDEXED USE RANK weighted LIMIT 3",
             &params(vec![("query_id", Value::Uuid(f.source))]),
         ),
         "USE RANK persisted row vector query",
     );
     prv_assert_same_signature(&literal, &persisted);
     assert!(
-        persisted.trace.physical_plan.contains("HNSWSearch"),
-        "persisted USE RANK query must report actual HNSW path, got {:?}",
-        persisted.trace
+        prv_used_indexed_route(&persisted),
+        "persisted USE RANK query must report the actual indexed route, got {:?}",
+        persisted.trace()
     );
     assert_eq!(
-        persisted.trace.query_vector_source,
+        persisted.trace().query_vector_source,
         Some(VectorIndexRef::new("docs", "embedding"))
     );
 }
@@ -9711,7 +10024,7 @@ fn prv_18_row_vector_query_keeps_target_vector_on_non_vector_tx_update() {
     assert_eq!(prv_uuid_at(&persisted, 0, "id"), f.near);
     let label_idx = prv_column(&persisted, "label");
     assert_eq!(
-        persisted.rows[0].get(label_idx),
+        persisted.rows()[0].get(label_idx),
         Some(&Value::Text("near-updated".to_string())),
         "vector search must preserve the committed vector while materializing the staged row"
     );
@@ -9753,7 +10066,7 @@ fn prv_19_row_vector_query_candidate_filter_uses_active_tx_row_overlay() {
     assert_eq!(prv_uuid_at(&newly_matching, 0, "id"), f.near);
     let label_idx = prv_column(&newly_matching, "label");
     assert_eq!(
-        newly_matching.rows[0].get(label_idx),
+        newly_matching.rows()[0].get(label_idx),
         Some(&Value::Text("eligible".to_string()))
     );
 
@@ -9775,7 +10088,7 @@ fn prv_19_row_vector_query_candidate_filter_uses_active_tx_row_overlay() {
         "in-transaction ROW_VECTOR query with staged candidate no longer matching filter",
     );
     assert!(
-        stopped_matching.rows.is_empty(),
+        stopped_matching.rows().is_empty(),
         "candidate bitmap must exclude the pre-update row image once the active tx changed the non-indexed filter column: {stopped_matching:?}"
     );
     db.commit(tx).unwrap();
@@ -9864,6 +10177,7 @@ fn prv_21_row_vector_query_treats_vector_null_update_as_null_cell() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn prv_22_row_vector_query_removes_null_target_vectors_and_accounts_overlay() {
     let accountant = Arc::new(MemoryAccountant::with_budget(4 * 1024 * 1024));
     let db = Database::open_memory_with_accountant(accountant.clone());
@@ -9906,19 +10220,10 @@ fn prv_22_row_vector_query_removes_null_target_vectors_and_accounts_overlay() {
     let vector_search_bytes = 3usize
         .saturating_mul(f.source_vec.len())
         .saturating_mul(std::mem::size_of::<f32>());
-    // Candidate-route preflight now reserves the score slots needed to prove
-    // this unindexed filter can still use exact work. Leave enough room for
-    // that transient check while keeping less than one overlay entry, so the
-    // active-transaction overlay remains the reservation the budget refuses.
+    // The statement overlay owns the active transaction's relational row
+    // before vector scoring. Leave 180 bytes after the source-vector working
+    // set so its 224-byte row-copy admission is the exact refusal boundary.
     const SLACK_BEFORE_OVERLAY: usize = 192;
-    let one_overlay_entry_bytes = std::mem::size_of::<contextdb_core::VectorEntry>()
-        .saturating_add(std::mem::size_of::<(RowId, Vec<f32>)>())
-        .saturating_add(f.source_vec.len() * std::mem::size_of::<f32>())
-        .saturating_add(64);
-    assert!(
-        SLACK_BEFORE_OVERLAY < one_overlay_entry_bytes,
-        "the fixture must still make the overlay reservation exceed its remaining headroom"
-    );
     accountant
         .set_budget(Some(
             before_budget_probe
@@ -9934,19 +10239,42 @@ fn prv_22_row_vector_query_removes_null_target_vectors_and_accounts_overlay() {
         ),
         "active transaction vector overlay should respect MEMORY_LIMIT",
     );
-    assert!(
-        matches!(
-            budget_err,
-            Error::MemoryBudgetExceeded { ref operation, .. }
-                if operation.starts_with("active_tx_vector_overlay@docs.embedding")
+    match budget_err {
+        Error::MemoryBudgetExceeded {
+            subsystem,
+            operation,
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            hint,
+        } => {
+            assert_eq!(
+                (subsystem.as_ref(), operation.as_ref()),
+                ("relational", "statement_overlay")
+            );
+            assert_eq!((requested_bytes, available_bytes), (224, 180));
+            assert_eq!(
+                budget_limit_bytes,
+                before_budget_probe + vector_search_bytes + SLACK_BEFORE_OVERLAY
+            );
+            assert!(!hint.is_empty());
+        }
+        other => panic!(
+            "the statement overlay must refuse before cloning its row/vector state: {other:?}"
         ),
-        "active tx exact overlay must be memory-accounted before cloning vectors: {budget_err:?}"
-    );
+    }
     assert_eq!(
         accountant.usage().used,
         before_budget_probe,
         "failed overlay reservation must release the vector-search working set"
     );
+    accountant.set_budget(Some(4 * 1024 * 1024)).unwrap();
+    let recovered = prv_expect_query_ok(db.execute_in_tx(tx,
+        "SELECT id, score FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+        &params(vec![("query_id", Value::Uuid(f.source))])), "same transaction remains readable after overlay refusal");
+    prv_assert_same_signature(&recovered, &persisted);
+    assert_eq!(accountant.usage().used, before_budget_probe);
+    db.rollback(tx).unwrap();
 }
 
 #[test]
@@ -10121,11 +10449,12 @@ fn prv_26_row_vector_use_rank_overfetch_includes_active_tx_vector_inserts() {
 }
 
 #[test]
-fn prv_27_row_vector_explain_does_not_materialize_hnsw() {
+#[cfg(feature = "test-seams")]
+fn prv_27_row_vector_explain_does_not_materialize_the_index() {
     let db = Database::open_memory();
-    let f = prv_seed_hnsw_docs(&db, 1000);
+    let f = prv_seed_indexed_docs(&db, 1000);
     let index = VectorIndexRef::new("docs", "embedding");
-    assert_eq!(db.__debug_vector_hnsw_len(index.clone()), None);
+    assert!(!db.__debug_vector_indexed_available_for_test(index.clone()));
 
     let explain = db
         .explain(&format!(
@@ -10134,23 +10463,23 @@ fn prv_27_row_vector_explain_does_not_materialize_hnsw() {
         ))
         .unwrap();
     assert!(
-        explain.contains("VectorSearch") || explain.contains("HNSWSearch"),
-        "EXPLAIN must still describe the vector operator without building HNSW: {explain}"
+        explain.contains("VectorSearch"),
+        "EXPLAIN must still describe the vector operator without building the index: {explain}"
     );
-    assert_eq!(
-        db.__debug_vector_hnsw_len(index),
-        None,
-        "EXPLAIN must be read-only and must not lazily materialize HNSW state"
+    assert!(
+        !db.__debug_vector_indexed_available_for_test(index),
+        "EXPLAIN must be read-only and must not lazily materialize the clustered index"
     );
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn prv_28_row_vector_explain_matches_filtered_runtime_strategy_without_building() {
     let covering_db = Database::open_memory();
     covering_db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
-    let f = prv_seed_hnsw_docs(&covering_db, 1000);
+    let f = prv_seed_indexed_docs(&covering_db, 1000);
     let index = VectorIndexRef::new("docs", "embedding");
-    assert_eq!(covering_db.__debug_vector_hnsw_len(index.clone()), None);
+    assert!(!covering_db.__debug_vector_indexed_available_for_test(index.clone()));
 
     let covering_explain = covering_db
         .explain(
@@ -10162,13 +10491,12 @@ fn prv_28_row_vector_explain_matches_filtered_runtime_strategy_without_building(
         covering_explain.contains("VectorSearch")
             && covering_explain.contains("strategy=BruteForce")
             && covering_explain.contains("route=exact")
-            && covering_explain.contains("fallback=filtered_route_exact"),
-        "filtered EXPLAIN must describe the read-only exact fallback without inventing a graph: {covering_explain}"
+            && covering_explain.contains("fallback=no vector index ships in this release; AUTO_INDEX_AT and CALIBRATION_SAMPLES have no effect"),
+        "filtered EXPLAIN must describe the read-only exact fallback without inventing an index: {covering_explain}"
     );
-    assert_eq!(
-        covering_db.__debug_vector_hnsw_len(index.clone()),
-        None,
-        "covering EXPLAIN must derive strategy without building HNSW"
+    assert!(
+        !covering_db.__debug_vector_indexed_available_for_test(index.clone()),
+        "covering EXPLAIN must derive strategy without building the index"
     );
 
     let covering_result = covering_db
@@ -10179,14 +10507,16 @@ fn prv_28_row_vector_explain_matches_filtered_runtime_strategy_without_building(
         )
         .unwrap();
     assert!(
-        covering_result.trace.physical_plan.contains("VectorSearch")
-            && !covering_result.trace.physical_plan.contains("HNSWSearch"),
-        "a query cannot build HNSW and must use the same exact fallback EXPLAIN predicted: {:?}",
-        covering_result.trace.physical_plan
+        covering_result
+            .trace()
+            .physical_plan
+            .contains("VectorSearch"),
+        "a query cannot build the index and must use the same exact fallback EXPLAIN predicted: {:?}",
+        covering_result.trace().physical_plan
     );
     assert!(
         covering_result
-            .rows
+            .rows()
             .iter()
             .all(|row| row.first() != Some(&Value::Uuid(f.source))),
         "the exact fallback must preserve the candidate filter"
@@ -10194,12 +10524,9 @@ fn prv_28_row_vector_explain_matches_filtered_runtime_strategy_without_building(
 
     let fallback_db = Database::open_memory();
     fallback_db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
-    let fallback = prv_seed_hnsw_docs(&fallback_db, 5001);
+    let fallback = prv_seed_indexed_docs(&fallback_db, 5001);
     let fallback_index = VectorIndexRef::new("docs", "embedding");
-    assert_eq!(
-        fallback_db.__debug_vector_hnsw_len(fallback_index.clone()),
-        None
-    );
+    assert!(!fallback_db.__debug_vector_indexed_available_for_test(fallback_index.clone()));
 
     let fallback_explain = fallback_db
         .explain(
@@ -10210,12 +10537,11 @@ fn prv_28_row_vector_explain_matches_filtered_runtime_strategy_without_building(
     assert!(
         fallback_explain.contains("VectorSearch")
             && fallback_explain.contains("strategy=BruteForce"),
-        "filtered EXPLAIN must match runtime fallback when the effective search width cannot cover the graph: {fallback_explain}"
+        "filtered EXPLAIN must match runtime fallback when the effective search width cannot cover the index: {fallback_explain}"
     );
-    assert_eq!(
-        fallback_db.__debug_vector_hnsw_len(fallback_index.clone()),
-        None,
-        "fallback EXPLAIN must not build HNSW"
+    assert!(
+        !fallback_db.__debug_vector_indexed_available_for_test(fallback_index.clone()),
+        "fallback EXPLAIN must not build the index"
     );
 
     let fallback_result = fallback_db
@@ -10226,14 +10552,16 @@ fn prv_28_row_vector_explain_matches_filtered_runtime_strategy_without_building(
         )
         .unwrap();
     assert!(
-        fallback_result.trace.physical_plan.contains("VectorSearch")
-            && !fallback_result.trace.physical_plan.contains("HNSWSearch"),
-        "a caller-driven query cannot build HNSW and must use the exact fallback: {:?}",
-        fallback_result.trace.physical_plan
+        fallback_result
+            .trace()
+            .physical_plan
+            .contains("VectorSearch"),
+        "a caller-driven query cannot build the index and must use the exact fallback: {:?}",
+        fallback_result.trace().physical_plan
     );
     assert!(
         fallback_result
-            .rows
+            .rows()
             .iter()
             .all(|row| row.first() != Some(&Value::Uuid(fallback.source))),
         "fallback path must preserve the candidate filter"
@@ -10252,8 +10580,9 @@ fn prv_28b_filtered_indexed_explain_names_specific_or_generic_recovery() {
         )
         .unwrap();
     assert!(
-        simple.contains("recovery=CREATE INDEX docs_label_idx ON docs (label)"),
-        "a simple filtered scan must retain its directly executable CREATE INDEX recovery: {simple}"
+        simple.contains("refusal=indexed_route_unavailable")
+            && simple.contains("recovery=no vector index ships in this release; use EXACT or AUTO"),
+        "a filtered INDEXED explain reports the release refusal before any filter recovery: {simple}"
     );
 
     let compound = db
@@ -10265,11 +10594,10 @@ fn prv_28b_filtered_indexed_explain_names_specific_or_generic_recovery() {
         ))
         .unwrap();
     assert!(
-        compound.contains("refusal=filtered_route_unavailable")
-            && compound.contains(
-                "recovery=use EXACT or rewrite the filter with a supporting relational index"
-            ),
-        "a compound filtered plan with no derivable index must name the exact-or-rewrite recovery: {compound}"
+        compound.contains("refusal=indexed_route_unavailable")
+            && compound
+                .contains("recovery=no vector index ships in this release; use EXACT or AUTO"),
+        "a compound filtered INDEXED explain reports the release refusal before any filter recovery: {compound}"
     );
     assert!(
         !compound.contains("recovery=none"),
@@ -10340,7 +10668,7 @@ fn prv_14_row_vector_query_renders_in_explain_without_vector_bytes() {
     }
     let explain = explain_result.unwrap();
     assert!(
-        explain.contains("VectorSearch") || explain.contains("HNSWSearch"),
+        explain.contains("VectorSearch"),
         "EXPLAIN must render the selected vector path, got {explain}"
     );
     assert!(explain.contains("docs"));
@@ -10361,6 +10689,7 @@ fn prv_14_row_vector_query_renders_in_explain_without_vector_bytes() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn prv_15_row_vector_query_does_not_deadlock_under_concurrent_writers() {
     // Seam-interleaved rounds, not a wall-clock race: each round parks one
     // UPDATE writer INSIDE its commit (after the relational apply, before
@@ -10458,12 +10787,12 @@ fn prv_15_row_vector_query_does_not_deadlock_under_concurrent_writers() {
             )
             .unwrap();
         assert_eq!(
-            read.rows.len(),
+            read.rows().len(),
             1,
             "round {round}: row-vector read must complete with exactly one row while a writer is parked mid-commit"
         );
         assert_eq!(
-            read.rows[0][0],
+            read.rows()[0][0],
             Value::Uuid(doc),
             "round {round}: row-vector read must resolve the one doc row while a writer is parked mid-commit"
         );
@@ -10494,7 +10823,7 @@ fn prv_15_row_vector_query_does_not_deadlock_under_concurrent_writers() {
             )
             .unwrap();
         assert_eq!(
-            readback.rows[0][0],
+            readback.rows()[0][0],
             Value::Vector(new_vector),
             "round {round}: the committed vector must be visible immediately after the writer is released"
         );
@@ -10512,6 +10841,7 @@ fn prv_15_row_vector_query_does_not_deadlock_under_concurrent_writers() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn prv_16_row_vector_query_releases_accountant_on_every_error_path() {
     let db = Database::open_memory();
     let f = prv_seed_docs(&db);
@@ -10746,13 +11076,14 @@ const VECTOR_WRITE_DOOR_DDL: &str =
 
 /// The values a caller binds by mistake where an embedding belongs, paired
 /// with the name the refusal has to report for each.
+#[allow(clippy::useless_conversion)] // Preserve the existing test expression and its assertion contract.
 fn non_embedding_bindings() -> Vec<(&'static str, Value, &'static str)> {
     vec![
         ("an integer", Value::Int64(7), "Int64"),
         ("a boolean", Value::Bool(true), "Bool"),
         (
             "a json object",
-            Value::Json(serde_json::json!({"embedding": "later"})),
+            Value::Json(serde_json::json!({"embedding": "later"}).into()),
             "Json",
         ),
     ]
@@ -10818,9 +11149,9 @@ fn inserting_a_scalar_where_an_embedding_belongs_stores_nothing() {
             .execute("SELECT id FROM evidence", &empty())
             .expect("the table still reads");
         assert!(
-            rows.rows.is_empty(),
+            rows.rows().is_empty(),
             "the refused INSERT of {label} left a row behind: {:?}",
-            rows.rows,
+            rows.rows(),
         );
 
         let search = db
@@ -10830,9 +11161,9 @@ fn inserting_a_scalar_where_an_embedding_belongs_stores_nothing() {
             )
             .expect("the neighbour search still answers");
         assert!(
-            search.rows.is_empty(),
+            search.rows().is_empty(),
             "the refused INSERT of {label} left a searchable embedding behind: {:?}",
-            search.rows,
+            search.rows(),
         );
     }
 }
@@ -10865,12 +11196,12 @@ fn a_vector_column_still_takes_an_embedding_and_its_text_form() {
         .execute("SELECT id, embedding FROM evidence ORDER BY note", &empty())
         .expect("both rows read back");
     let embedding_idx = rows
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "embedding")
         .expect("the embedding column is projected");
-    assert_eq!(rows.rows.len(), 2, "both accepted rows are stored");
-    for row in &rows.rows {
+    assert_eq!(rows.rows().len(), 2, "both accepted rows are stored");
+    for row in rows.rows() {
         assert!(
             matches!(row[embedding_idx], Value::Vector(_)),
             "an accepted embedding is stored as an embedding, got {:?}",
@@ -10925,9 +11256,9 @@ fn updating_an_embedding_with_a_scalar_leaves_the_stored_embedding_alone() {
                 &params(vec![("id", Value::Uuid(near))]),
             )
             .expect("the row still reads");
-        assert_eq!(rows.rows.len(), 1, "the refused UPDATE kept the row");
+        assert_eq!(rows.rows().len(), 1, "the refused UPDATE kept the row");
         assert_eq!(
-            rows.rows[0][0],
+            rows.rows()[0][0],
             Value::Vector(stored.clone()),
             "the refused UPDATE of {label} rewrote the stored embedding",
         );
@@ -10939,12 +11270,12 @@ fn updating_an_embedding_with_a_scalar_leaves_the_stored_embedding_alone() {
             )
             .expect("the neighbour search still answers");
         assert_eq!(
-            search.rows.len(),
+            search.rows().len(),
             1,
             "the neighbour search still answers after refusing {label}",
         );
         assert_eq!(
-            search.rows[0][0],
+            search.rows()[0][0],
             Value::Uuid(near),
             "the refused UPDATE of {label} moved the row in the neighbour search",
         );

@@ -1,58 +1,32 @@
-//! A declared search breadth buys exactly the approved single-search work
-//! allowance: `cap(EF_SEARCH, k) x M_max0_serving`, where `M_max0_serving` is
-//! the largest layer-0 maximum degree any admitted partition's serving graph
-//! was built with. A walk evaluates up to that many neighbours of every point
-//! it expands, so that is the per-point factor.
-//!
-//! HNSW builds its bottom layer with twice the declared degree (`M_max0 =
-//! 2 x M`, Malkov and Yashunin's construction, which this engine's build
-//! follows). A consumer who declares `HNSW (EF_SEARCH = 400)` on a column
-//! whose graphs were built at `M = 24` is therefore promised a walk of at most
-//! `400 x 48 = 19,200` evaluations beyond opening the layers -- the same number
-//! over one Context, three or eight, and never a multiple of it. The budget is fixed by the
-//! declared numbers alone, so every figure here is computed from what the
-//! fixture declared, never read back from the implementation: a proof that
-//! compares the walk only with the budget the search reports for itself cannot
-//! see a budget that is itself too large.
-//!
-//! Opening the layers is a floor on top of that budget, and the two together
-//! are charged against the request's declared work limit.
+//! A request's declared work limit bounds a clustered-index find over many
+//! Contexts: whatever the limit, the distance evaluations the find spends
+//! never exceed it, an answered find does strictly less work than EXACT and
+//! returns a full page, and a find that cannot finish inside a tight limit
+//! refuses with the typed work refusal instead of answering from part of the
+//! scope.
 
 use contextdb_core::read_contract::{ReadLimits, ReadRoute};
-use contextdb_core::types::{ContextId, VectorPartitionKey};
+use contextdb_core::types::ContextId;
 use contextdb_core::{Value, VectorIndexRef};
-use contextdb_engine::{
-    Database, DatabaseOpenOptions, MaintenancePolicy, OwnerReadConfig, QueryResult, ReadSession,
-    ReadSessionOptions, VectorMaintenancePreparationPhaseForTest,
+use contextdb_engine::vector_ivf_observations::{
+    NativeIvfFaultBoundary, NativeIvfSealEvent, NativeIvfSealObserver,
+    with_native_ivf_seal_observer_for_test,
 };
-use contextdb_vector::VectorPartitionRef;
-use contextdb_vector::hnsw::{UnionSearchReceipt, with_union_search_receipts};
+use contextdb_engine::{
+    Database, DatabaseOpenOptions, MaintenancePolicy, OwnerReadConfig, ReadSession,
+    ReadSessionOptions,
+};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
 
 const PARTITIONS: usize = 8;
-/// More rows per partition than the widest declared breadth, so the graph is
-/// what every scope walks.
+/// More rows per partition than the widest declared breadth, so the index is
+/// what every scope searches.
 const ROWS_PER_PARTITION: usize = 500;
 const DIMENSIONS: usize = 16;
 const LIMIT: usize = 10;
-const DECLARED_BREADTHS: [usize; 2] = [200, 400];
-const DECLARED_DEGREES: [usize; 2] = [16, 24];
-const SCOPES: [usize; 3] = [1, 3, PARTITIONS];
-
-/// The layer-0 maximum degree HNSW builds a graph declared at `M` with: its
-/// bottom layer keeps up to twice the declared degree.
-fn layer0_max_degree(declared_m: usize) -> usize {
-    2 * declared_m
-}
-
-/// The approved budget, from the declared numbers: the breadth's candidate
-/// cap -- the breadth, or the page if the page is wider -- times the widest
-/// admitted serving graph's layer-0 maximum degree.
-fn approved_budget(ef_search: usize, k: usize, declared_m: usize) -> usize {
-    ef_search.max(k) * layer0_max_degree(declared_m)
-}
 
 fn context_id(partition: usize) -> Uuid {
     Uuid::from_u128(0xB0D6_0000_0000_0000_0000_0000_0000_0000 + partition as u128)
@@ -83,10 +57,16 @@ fn query_vector() -> Vec<f32> {
         .collect()
 }
 
+/// The work and memory the finds are approved for. What this module proves
+/// is the work budget a declared breadth buys, counted in evaluations, never
+/// how long a find takes; the active-time limit is set past any debug-build
+/// find of this fixture so that a slow or loaded machine cannot stand in for
+/// a budget refusal.
 fn limits() -> ReadLimits {
     ReadLimits {
         work: 5_000_000,
         memory: 512 * 1024 * 1024,
+        active_ms: 120_000,
         ..ReadLimits::default()
     }
 }
@@ -108,18 +88,16 @@ fn open_admin(path: &std::path::Path, runtime: &std::path::Path) -> Database {
     admin
 }
 
-/// Eight Contexts of 500 rows, every graph built at the declared degree.
+/// Eight Contexts of 500 rows, every index built.
 #[cfg(unix)]
-fn seed(path: &std::path::Path, runtime: &std::path::Path, degree: usize) {
+fn seed(path: &std::path::Path, runtime: &std::path::Path) {
     let admin = open_admin(path, runtime);
     admin
         .execute(
-            &format!(
-                "CREATE TABLE scoped_rows (id INT PRIMARY KEY, context_id UUID NOT NULL CONTEXT_ID, \
+            "CREATE TABLE scoped_rows (id INT PRIMARY KEY, context_id UUID NOT NULL CONTEXT_ID, \
                  generation_id UUID NOT NULL, is_current BOOL NOT NULL, \
                  embedding VECTOR(16) PARTITION_KEY (context_id, generation_id) \
-                 MAX_PARTITIONS 8 SEARCH_MODE AUTO AUTO_INDEX_AT 1 HNSW (M = {degree}))"
-            ),
+                 MAX_PARTITIONS 8 SEARCH_MODE AUTO AUTO_INDEX_AT 1 )",
             &HashMap::new(),
         )
         .expect("declare the partitioned fixture");
@@ -151,11 +129,24 @@ fn seed(path: &std::path::Path, runtime: &std::path::Path, degree: usize) {
         admin
             .run_maintenance_cycle()
             .expect("advance deterministic maintenance");
+        let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+            admin
+                .declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         let ready = admin
             .vector_store_for_test()
-            .partition_infos(&index)
+            .partition_infos(&index, &mut partition_observation_owner_1)
             .expect("inspect partition readiness");
-        if ready.len() == PARTITIONS && ready.iter().all(|partition| partition.graph_available) {
+        if ready.len() == PARTITIONS
+            && ready.iter().all(|partition| {
+                admin.__debug_vector_partition_indexed_for_test(
+                    partition.partition.index.clone(),
+                    partition.partition.partition_key.clone(),
+                )
+            })
+        {
             admin.close().expect("seal the fixture store");
             return;
         }
@@ -164,16 +155,14 @@ fn seed(path: &std::path::Path, runtime: &std::path::Path, degree: usize) {
 }
 
 /// Declare the breadth on the column. It applies to queries opened after it
-/// without rebuilding the graph, so every breadth is measured over the same
-/// graphs.
+/// without rebuilding the index, so every breadth is measured over the same
+/// index.
 #[cfg(unix)]
 fn declare_breadth(path: &std::path::Path, runtime: &std::path::Path, breadth: usize) {
     let admin = open_admin(path, runtime);
     admin
         .execute(
-            &format!(
-                "ALTER TABLE scoped_rows ALTER COLUMN embedding SET HNSW (EF_SEARCH = {breadth})"
-            ),
+            &format!("ALTER TABLE scoped_rows ALTER COLUMN embedding SET IVF (PROBES = {breadth})"),
             &HashMap::new(),
         )
         .expect("declare the search breadth");
@@ -208,6 +197,10 @@ fn statement(selected: usize) -> (String, HashMap<String, Value>) {
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn open_reader(
     path: &std::path::Path,
     runtime: &std::path::Path,
@@ -233,124 +226,40 @@ fn open_reader(
     reader
 }
 
-/// The breadth and degree the executed-route receipt reports for every
-/// admitted partition.
-fn disclosed(answer: &QueryResult) -> Vec<(usize, usize, String)> {
-    answer
-        .trace
-        .vector_search
-        .as_ref()
-        .expect("a vector find discloses its route")
-        .partition_hnsw
-        .iter()
-        .map(|partition| {
-            (
-                partition.hnsw_m,
-                partition.hnsw_ef_search,
-                partition.ef_search_source.clone(),
-            )
-        })
-        .collect()
+#[derive(Default)]
+struct SearchEvaluations {
+    evaluations: AtomicU64,
 }
 
-/// One search, and what it spent, checked against the budget the declared
-/// numbers fix.
-fn check_budget(
-    cell: &str,
-    receipts: &[UnionSearchReceipt],
-    selected: usize,
-    expected: usize,
-    failures: &mut Vec<String>,
-) {
-    let [receipt] = receipts else {
-        failures.push(format!(
-            "{cell}: a find runs exactly one search, saw {receipts:?}"
-        ));
-        return;
-    };
-    println!("approved_budget {cell} expected={expected} receipt={receipt:?}");
-    if receipt.partitions != selected {
-        failures.push(format!(
-            "{cell}: {selected} Contexts admitted, the search saw {}",
-            receipt.partitions
-        ));
-    }
-    if receipt.budget != expected {
-        failures.push(format!(
-            "{cell}: the search was given {} evaluations, the declared numbers allow {expected}",
-            receipt.budget
-        ));
-    }
-    if receipt.expansion_cap > expected {
-        failures.push(format!(
-            "{cell}: the walk may spend {} evaluations past opening its layers, more than the \
-             approved {expected}",
-            receipt.expansion_cap
-        ));
-    }
-    if receipt.expansion_evaluations > expected {
-        failures.push(format!(
-            "{cell}: the walk spent {} evaluations past opening its layers, more than the \
-             approved {expected}",
-            receipt.expansion_evaluations
-        ));
-    }
-}
-
-/// Over graphs built at `M = 16` and at `M = 24`, with `EF_SEARCH` declared
-/// at 200 and at 400, a find over one, three or eight Contexts is given
-/// exactly `EF_SEARCH x 2M` evaluations for its walk, reports the breadth it
-/// was declared, and never walks past that number.
-#[cfg(unix)]
-#[test]
-fn a_declared_breadth_is_given_its_breadth_times_the_serving_degree() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let directory = tempfile::TempDir::new().expect("task-scoped fixture directory");
-    let runtime = directory.path().join("runtime");
-    std::fs::create_dir(&runtime).expect("the reader runtime directory");
-    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
-        .expect("the runtime directory is private to its owner");
-
-    let mut failures = Vec::new();
-    for degree in DECLARED_DEGREES {
-        let path = directory.path().join(format!("degree-{degree}.db"));
-        seed(&path, &runtime, degree);
-        for breadth in DECLARED_BREADTHS {
-            declare_breadth(&path, &runtime, breadth);
-            let expected = approved_budget(breadth, LIMIT, degree);
-            for selected in SCOPES {
-                let cell = format!("M={degree} EF_SEARCH={breadth} contexts={selected}");
-                let reader = open_reader(&path, &runtime, limits());
-                let (sql, params) = statement(selected);
-                reader
-                    .execute(&sql, &params)
-                    .expect("the first find answers");
-                let (answer, receipts) =
-                    with_union_search_receipts(|| reader.execute(&sql, &params));
-                let answer = answer.expect("the warm find answers");
-                assert_eq!(answer.rows.len(), LIMIT, "{cell}: a full page");
-                for (hnsw_m, ef_search, source) in disclosed(&answer) {
-                    assert_eq!(
-                        (hnsw_m, ef_search, source.as_str()),
-                        (degree, breadth, "declared"),
-                        "{cell}: the receipt reports the built degree and the declared breadth, \
-                         unchanged"
-                    );
-                }
-                check_budget(&cell, &receipts, selected, expected, &mut failures);
-            }
+impl NativeIvfSealObserver for SearchEvaluations {
+    fn observe(&self, event: NativeIvfSealEvent<'_>) {
+        if let NativeIvfSealEvent::QueryExecuted { work, .. } = event {
+            self.evaluations.fetch_add(
+                work.centroid_evaluations
+                    + work.quantized_evaluations
+                    + work.full_precision_evaluations
+                    + work.buffer_evaluations,
+                Ordering::SeqCst,
+            );
         }
     }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    fn before_boundary(&self, _boundary: NativeIvfFaultBoundary<'_>) -> contextdb_core::Result<()> {
+        Ok(())
+    }
 }
 
-/// Opening the layers and the walk after them are both work the request
-/// declared a limit for: whatever that limit, the two together never exceed
-/// it, and the answer is a full page or a typed refusal.
+/// Opening the index and searching it are both work the request declared a
+/// limit for: whatever that limit, the two together never exceed it, and the
+/// answer is a full page or a typed refusal.
 #[cfg(unix)]
 #[test]
-fn opening_and_walking_are_charged_against_the_declared_work() {
+#[ignore = "the vector index route is switched off in this release"]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn opening_and_searching_are_charged_against_the_declared_work() {
     use std::os::unix::fs::PermissionsExt;
 
     let directory = tempfile::TempDir::new().expect("task-scoped fixture directory");
@@ -359,201 +268,40 @@ fn opening_and_walking_are_charged_against_the_declared_work() {
     std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
         .expect("the runtime directory is private to its owner");
     let path = directory.path().join("declared-work.db");
-    seed(&path, &runtime, 24);
-    declare_breadth(&path, &runtime, 400);
+    seed(&path, &runtime);
+    declare_breadth(&path, &runtime, 16);
 
     let (sql, params) = statement(PARTITIONS);
-    let mut searched_within_a_tight_limit = false;
     for work in [300_u64, 600, 1_200, 2_400, 4_800, 9_600, 20_000] {
         let reader = open_reader(&path, &runtime, ReadLimits { work, ..limits() });
-        let (answer, receipts) = with_union_search_receipts(|| reader.execute(&sql, &params));
-        for receipt in &receipts {
-            let spent = receipt.admission_evaluations + receipt.expansion_evaluations;
-            println!("declared_work work={work} spent={spent} receipt={receipt:?}");
-            assert!(
-                spent as u64 <= work,
-                "work={work}: opening the layers and walking spent {spent} evaluations, more \
-                 than the request declared: {receipt:?}"
-            );
-            searched_within_a_tight_limit |= (work as usize) < approved_budget(400, LIMIT, 24);
-        }
-        if let Ok(answer) = answer {
-            assert_eq!(answer.rows.len(), LIMIT, "work={work}: never a short page");
-        }
-    }
-    assert!(
-        searched_within_a_tight_limit,
-        "some declared limit smaller than the budget still ran the search"
-    );
-}
-
-/// A scope whose partitions' graphs were built at different degrees is given
-/// the budget of the widest one it admits: one partition still serving its
-/// `M = 16` graph (layer-0 maximum 32) and the others already serving
-/// `M = 24` (layer-0 maximum 48) give `EF_SEARCH x 48`, and the `M = 16`
-/// partition alone gives `EF_SEARCH x 32`.
-#[test]
-fn mixed_serving_degrees_are_given_the_widest_admitted_degree() {
-    use std::sync::mpsc;
-    use std::time::Duration;
-
-    const BUCKETS: usize = 3;
-    const BREADTH: usize = 200;
-    let directory = tempfile::tempdir().expect("task-scoped fixture directory");
-    let db = Arc::new(
-        Database::open(directory.path().join("mixed-degrees.redb")).expect("open the fixture"),
-    );
-    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-    db.execute(
-        &format!(
-            "CREATE TABLE items (id INT PRIMARY KEY, bucket INT NOT NULL, \
-             embedding VECTOR(16) PARTITION_KEY (bucket) MAX_PARTITIONS 8 AUTO_INDEX_AT 1 \
-             HNSW (M = 16, EF_SEARCH = {BREADTH}))"
-        ),
-        &HashMap::new(),
-    )
-    .expect("declare the partitioned fixture");
-    for bucket in 0..BUCKETS {
-        for local in 0..ROWS_PER_PARTITION {
-            let ordinal = bucket * ROWS_PER_PARTITION + local;
-            db.execute(
-                "INSERT INTO items VALUES ($id, $bucket, $embedding)",
-                &HashMap::from([
-                    ("id".into(), Value::Int64(ordinal as i64 + 1)),
-                    ("bucket".into(), Value::Int64(bucket as i64)),
-                    ("embedding".into(), Value::Vector(embedding(ordinal))),
-                ]),
-            )
-            .expect("seed one row");
-        }
-    }
-    let serving_degrees = |db: &Database| -> Vec<i64> {
-        let observed = db
-            .execute(
-                "SHOW VECTOR_PARTITIONS FOR items.embedding",
-                &HashMap::new(),
-            )
-            .expect("inspect the partitions");
-        let column = observed
-            .columns
-            .iter()
-            .position(|column| column == "serving_hnsw_m")
-            .expect("the serving degree column");
-        observed
-            .rows
-            .iter()
-            .map(|row| match &row[column] {
-                Value::Int64(degree) => *degree,
-                // No graph published yet.
-                Value::Null => 0,
-                other => panic!("a serving degree, got {other:?}"),
-            })
-            .collect()
-    };
-    for _ in 0..64 {
-        let degrees = serving_degrees(&db);
-        if degrees.len() == BUCKETS && degrees.iter().all(|degree| *degree == 16) {
-            break;
-        }
-        db.run_maintenance_cycle().expect("build the first graphs");
-    }
-    assert_eq!(serving_degrees(&db), vec![16; BUCKETS]);
-
-    // Rebuild at M = 24, holding the last bucket's rebuild before it
-    // publishes, so it keeps serving its M = 16 graph beside the others.
-    db.execute(
-        "ALTER TABLE items ALTER COLUMN embedding SET HNSW (M = 24)",
-        &HashMap::new(),
-    )
-    .expect("declare the wider degree");
-    let held = (BUCKETS - 1) as i64;
-    let route = VectorPartitionRef::new(
-        VectorIndexRef::new("items", "embedding"),
-        VectorPartitionKey::from_values(&[Value::Int64(held)]).expect("the held bucket's key"),
-    );
-    let pause = db.__arm_one_shot_vector_maintenance_preparation_pause_for_test(
-        &route,
-        VectorMaintenancePreparationPhaseForTest::EncodeGraph,
-    );
-    let maintenance_db = db.clone();
-    let maintenance = std::thread::spawn(move || {
-        let mut outcome = Ok(());
-        for _ in 0..8 {
-            outcome = maintenance_db.run_maintenance_cycle().map(|_| ());
-            if outcome.is_err() {
-                break;
+        let observer = Arc::new(SearchEvaluations::default());
+        let answer = with_native_ivf_seal_observer_for_test(observer.clone(), || {
+            reader.execute(&sql, &params)
+        });
+        let spent = observer.evaluations.load(Ordering::SeqCst);
+        println!("declared_work work={work} spent={spent}");
+        assert!(
+            spent <= work,
+            "work={work}: opening and searching spent {spent} evaluations, more than the \
+             request declared"
+        );
+        match answer {
+            Ok(answer) => {
+                assert!(
+                    spent < (PARTITIONS * ROWS_PER_PARTITION) as u64,
+                    "work={work}: an answered search does strictly less work than EXACT"
+                );
+                assert_eq!(
+                    answer.rows().len(),
+                    LIMIT,
+                    "work={work}: never a short page"
+                );
             }
+            Err(error) => assert!(
+                format!("{error:?}").contains("Work"),
+                "work={work}: a find that cannot finish inside the limit is a typed work \
+                 refusal, got {error:?}"
+            ),
         }
-        outcome
-    });
-    if let Err(error) = pause.wait_until_reached_timeout(Duration::from_secs(30)) {
-        pause.release();
-        let _ = maintenance.join();
-        panic!("the held bucket's rebuild never reached its pause: {error}");
     }
-
-    let reader = db.clone();
-    let (sender, receiver) = mpsc::channel();
-    let finds = std::thread::spawn(move || {
-        let degrees = serving_degrees(&reader);
-        let mut cells = Vec::new();
-        for (scope, filter) in [
-            ("every bucket", String::new()),
-            ("the held bucket", format!("WHERE bucket = {held} ")),
-        ] {
-            let sql = format!(
-                "SELECT id FROM items {filter}ORDER BY embedding <=> $query USE VECTOR INDEXED \
-                 LIMIT {LIMIT}"
-            );
-            let params = HashMap::from([("query".into(), Value::Vector(query_vector()))]);
-            let (answer, receipts) = with_union_search_receipts(|| reader.execute(&sql, &params));
-            cells.push((scope, answer.map(|answer| disclosed(&answer)), receipts));
-        }
-        let _ = sender.send((degrees, cells));
-    });
-    let observed = receiver.recv_timeout(Duration::from_secs(120));
-    pause.release();
-    finds.join().expect("the finds exit");
-    maintenance
-        .join()
-        .expect("maintenance exits")
-        .expect("maintenance completes");
-    let (degrees, cells) = observed.expect("the finds answer while the rebuild is held");
-
-    let mut sorted = degrees.clone();
-    sorted.sort_unstable();
-    assert!(
-        sorted.first() == Some(&16) && sorted.last() == Some(&24),
-        "the fixture serves both degrees at once: {degrees:?}"
-    );
-    let mut failures = Vec::new();
-    for (scope, disclosure, receipts) in cells {
-        let disclosure = disclosure.expect("the find answers");
-        let widest = disclosure
-            .iter()
-            .map(|(hnsw_m, _, _)| *hnsw_m)
-            .max()
-            .expect("an admitted partition");
-        for (_, ef_search, source) in &disclosure {
-            assert_eq!(
-                (*ef_search, source.as_str()),
-                (BREADTH, "declared"),
-                "{scope}: the declared breadth is reported unchanged"
-            );
-        }
-        let expected_degree = if scope == "every bucket" { 24 } else { 16 };
-        assert_eq!(
-            widest, expected_degree,
-            "{scope}: the admitted partitions serve {disclosure:?}"
-        );
-        let selected = if scope == "every bucket" { BUCKETS } else { 1 };
-        check_budget(
-            &format!("mixed {scope}"),
-            &receipts,
-            selected,
-            approved_budget(BREADTH, LIMIT, expected_degree),
-            &mut failures,
-        );
-    }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

@@ -88,6 +88,7 @@ fn a_local_drop_leaves_the_other_tables_history_readable_and_whole() {
         })
         .expect("the history of a store with a dropped table answers")
         .body
+        .clone()
     {
         DirectMetadataBody::ImageState {
             state: DirectImageState::ChangeLog(changes),

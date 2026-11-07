@@ -1,3 +1,7 @@
+#[cfg(unix)]
+#[path = "read/an_already_serving_owner_is_selected_before_open_returns.rs"]
+mod an_already_serving_owner_is_selected_before_open_returns;
+
 /// Harness filter for a child process of this test binary: `--exact` needs
 /// the module-qualified test name.
 pub(crate) fn child_test_filter(module_path: &str, fn_name: &str) -> String {
@@ -10,26 +14,58 @@ pub(crate) fn child_test_filter(module_path: &str, fn_name: &str) -> String {
 #[cfg(unix)]
 #[path = "read/a_budget_refusal_is_never_reported_as_a_corrupt_store.rs"]
 mod a_budget_refusal_is_never_reported_as_a_corrupt_store;
+// A crashed store opens for a reader only where the boot it crashed on can be
+// identified (Linux); elsewhere the reader is told the store needs its writer.
+#[cfg(target_os = "linux")]
+#[path = "read/a_crashed_writers_store_opens_for_a_reader.rs"]
+mod a_crashed_writers_store_opens_for_a_reader;
 #[path = "read/a_damaged_edge_tombstone_keeps_its_typed_diagnosis.rs"]
 mod a_damaged_edge_tombstone_keeps_its_typed_diagnosis;
+#[cfg(unix)]
+#[path = "read/a_finished_read_leaves_no_runtime_files.rs"]
+mod a_finished_read_leaves_no_runtime_files;
+#[cfg(unix)]
+#[path = "read/a_finished_reader_removes_its_own_registration_record.rs"]
+mod a_finished_reader_removes_its_own_registration_record;
+#[path = "read/a_live_read_charge_is_the_reads_own.rs"]
+mod a_live_read_charge_is_the_reads_own;
 #[path = "read/a_local_drop_leaves_the_remaining_history_readable.rs"]
 mod a_local_drop_leaves_the_remaining_history_readable;
 #[cfg(unix)]
 #[path = "read/a_read_only_consumer_opens_a_read_only_store.rs"]
 mod a_read_only_consumer_opens_a_read_only_store;
 #[cfg(unix)]
+#[path = "read/a_reader_arriving_while_a_writer_opens_is_served.rs"]
+mod a_reader_arriving_while_a_writer_opens_is_served;
+#[cfg(unix)]
+#[path = "read/a_reader_session_spans_writer_reopens.rs"]
+mod a_reader_session_spans_writer_reopens;
+#[cfg(unix)]
 #[path = "read/a_received_table_replacement_retires_every_content_identity.rs"]
 mod a_received_table_replacement_retires_every_content_identity;
+#[cfg(unix)]
+#[path = "read/a_reopened_session_keeps_its_selected_route_and_time.rs"]
+mod a_reopened_session_keeps_its_selected_route_and_time;
 #[path = "read/a_reopened_store_never_reuses_a_committed_transaction.rs"]
 mod a_reopened_store_never_reuses_a_committed_transaction;
 #[cfg(unix)]
+#[path = "read/a_session_follows_the_stores_writers.rs"]
+mod a_session_follows_the_stores_writers;
+#[cfg(unix)]
+#[path = "read/a_session_on_a_companionless_copy_never_reads_backward.rs"]
+mod a_session_on_a_companionless_copy_never_reads_backward;
+#[cfg(unix)]
+#[path = "read/a_session_reselecting_after_a_reopen_is_served_when_the_new_writer_wins.rs"]
+mod a_session_reselecting_after_a_reopen_is_served_when_the_new_writer_wins;
+#[cfg(unix)]
 #[path = "read/a_statement_on_the_file_route_costs_what_the_statement_costs.rs"]
 mod a_statement_on_the_file_route_costs_what_the_statement_costs;
+#[path = "read/an_erasure_invalidates_exactly_the_snapshots_older_than_it.rs"]
+mod an_erasure_invalidates_exactly_the_snapshots_older_than_it;
 #[cfg(unix)]
 #[cfg(unix)]
 #[path = "read/an_undeclared_count_answers_exactly_on_every_route.rs"]
 mod an_undeclared_count_answers_exactly_on_every_route;
-#[cfg(unix)]
 #[path = "read/authoritative_purge_reader_publication.rs"]
 mod authoritative_purge_reader_publication;
 #[path = "read/completed_read_totals_reach_an_out_of_crate_observer.rs"]
@@ -37,6 +73,9 @@ mod completed_read_totals_reach_an_out_of_crate_observer;
 #[cfg(unix)]
 #[path = "read/content_identity_independent_contract.rs"]
 mod content_identity_independent_contract;
+#[cfg(unix)]
+#[path = "read/continuation_support.rs"]
+mod continuation_support;
 #[path = "read/cursor_admission_defers_to_waiting_schema_change.rs"]
 mod cursor_admission_defers_to_waiting_schema_change;
 #[path = "read/cursor_idle_registration_expiry.rs"]
@@ -64,6 +103,9 @@ mod existing_only_open_contract_tests;
 mod graceful_owner_drop_completes_accepted_read;
 #[path = "read/history_answer_is_complete_and_in_author_order.rs"]
 mod history_answer_is_complete_and_in_author_order;
+#[cfg(unix)]
+#[path = "read/json_decode_admission_contract.rs"]
+mod json_decode_admission_contract;
 #[cfg(unix)]
 #[path = "read/ledger_job_state_through_a_read_session_matches_the_writable_answer.rs"]
 mod ledger_job_state_through_a_read_session_matches_the_writable_answer;
@@ -95,8 +137,6 @@ mod read_only_open_loads_only_the_working_set;
 mod read_persistence_coordination_contract_tests;
 #[path = "read/read_progress_reporting.rs"]
 mod read_progress_reporting;
-#[path = "read/read_registration_stays_answerable_under_a_removal_pass.rs"]
-mod read_registration_stays_answerable_under_a_removal_pass;
 #[cfg(unix)]
 #[path = "read/read_schema_carries_the_scope_label_form.rs"]
 mod read_schema_carries_the_scope_label_form;
@@ -146,14 +186,53 @@ mod writer_ordered_rows_use_exact_versions;
 mod writing_handle_bounded_read_transaction_boundaries;
 
 #[cfg(unix)]
+#[path = "read/a_small_read_limit_under_a_larger_session_ceiling_still_opens.rs"]
+mod a_small_read_limit_under_a_larger_session_ceiling_still_opens;
+#[cfg(unix)]
+#[path = "read/read_cache_share_statements.rs"]
+mod read_cache_share_statements;
+#[cfg(unix)]
 #[path = "read/reader_continuity_contract.rs"]
 mod reader_continuity_contract;
 #[cfg(unix)]
 #[path = "read/reader_operation_expiry_contract.rs"]
 mod reader_operation_expiry_contract;
 #[cfg(unix)]
+#[path = "read/reader_page_cache_follows_the_declared_budget.rs"]
+mod reader_page_cache_follows_the_declared_budget;
+#[cfg(unix)]
 #[path = "read/reader_proof_support.rs"]
 mod reader_proof_support;
 #[cfg(unix)]
 #[path = "read/working_set_bounded_contract.rs"]
 mod working_set_bounded_contract;
+
+#[path = "read/content_size_independent_contract.rs"]
+mod content_size_independent_contract;
+
+#[cfg(target_os = "linux")]
+#[path = "read/a_reselected_reader_keeps_its_deadline_driver.rs"]
+mod a_reselected_reader_keeps_its_deadline_driver;
+#[path = "read/read_cache_share_inspection.rs"]
+mod read_cache_share_inspection;
+
+#[path = "read/a_file_session_observes_a_writer_that_already_closed.rs"]
+mod a_file_session_observes_a_writer_that_already_closed;
+
+#[cfg(unix)]
+#[path = "read/a_companionless_reader_adopts_an_unchanged_first_writer.rs"]
+mod a_companionless_reader_adopts_an_unchanged_first_writer;
+
+#[cfg(unix)]
+#[path = "read/an_erased_reader_keeps_its_erasure_answer_when_asking_for_its_owner.rs"]
+mod an_erased_reader_keeps_its_erasure_answer_when_asking_for_its_owner;
+#[path = "read/read_cache_share_cancelled_statement.rs"]
+mod read_cache_share_cancelled_statement;
+
+#[cfg(unix)]
+#[path = "read/turnover_routing_expiry_preserves_saved_reads.rs"]
+mod turnover_routing_expiry_preserves_saved_reads;
+
+#[cfg(unix)]
+#[path = "read/graph_cancel_drain_guard.rs"]
+mod graph_cancel_drain_guard;

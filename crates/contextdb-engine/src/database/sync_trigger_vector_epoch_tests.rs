@@ -32,6 +32,13 @@ fn declare_including_sync_trigger(db: &Database) {
 
 /// The callback writes a derived row into the SAME transaction the sync apply
 /// is using — the sanctioned in-transaction callback path.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn register_deriving_callback(db: &Database) {
     db.register_trigger_callback("conflict_detection_on_outcomes", |handle, ctx| {
         let outcome_id = ctx
@@ -99,7 +106,13 @@ fn incoming_unit(with_outcome: bool) -> (ChangeSet, Uuid, Uuid) {
             .expect("author the trigger-bearing outcome");
     }
     source.commit(tx).expect("commit the source transaction");
-    (source.changes_since(before), digest_id, outcome_id)
+    (
+        source
+            .changes_since(before)
+            .expect("read the declared changes"),
+        digest_id,
+        outcome_id,
+    )
 }
 
 fn live_vector_count(db: &Database) -> usize {
@@ -108,14 +121,14 @@ fn live_vector_count(db: &Database) -> usize {
         &HashMap::new(),
     )
     .expect("query digest vectors")
-    .rows
+    .rows()
     .len()
 }
 
 fn row_count(db: &Database, table: &str) -> usize {
     db.execute(&format!("SELECT id FROM {table}"), &HashMap::new())
         .unwrap_or_else(|err| panic!("query {table}: {err}"))
-        .rows
+        .rows()
         .len()
 }
 

@@ -307,6 +307,10 @@ operation_deadline_test!(
 
 #[test]
 #[cfg(target_os = "linux")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn production_connect_waits_on_real_backlog_io_and_expires_without_releasing_the_listener() {
     use contextdb_engine::local_transport::UnixLocalCarrier;
     use std::future::Future;
@@ -398,6 +402,10 @@ fn production_connect_waits_on_real_backlog_io_and_expires_without_releasing_the
 
 #[test]
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn production_response_read_stalls_on_real_carrier_io_until_the_exact_manual_boundary() {
     use contextdb_core::read_contract::ReadLimits;
     use contextdb_engine::local_transport::{
@@ -493,6 +501,10 @@ fn production_response_read_stalls_on_real_carrier_io_until_the_exact_manual_bou
 
 #[test]
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn production_route_retry_uses_real_failed_connects_and_its_named_manual_deadline() {
     use contextdb_engine::local_transport::UnixLocalCarrier;
 

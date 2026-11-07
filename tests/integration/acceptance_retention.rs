@@ -20,7 +20,7 @@ fn a_rt1_create_table_retain_parses() {
     db.execute("INSERT INTO logs (id, msg) VALUES (1, 'hello')", &p())
         .unwrap();
     let result = db.execute("SELECT * FROM logs", &p()).unwrap();
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -51,9 +51,10 @@ fn a_rt2_rows_disappear_after_ttl() {
     mock_now.fetch_add(2_000, AtomicOrdering::SeqCst);
     db.execute("INSERT INTO logs (id, msg) VALUES (2, 'new')", &p())
         .unwrap();
-    db.run_pruning_cycle();
+    db.run_pruning_cycle()
+        .expect("prune expired log while preserving the new row");
     let result = db.execute("SELECT * FROM logs", &p()).unwrap();
-    assert_eq!(result.rows.len(), 1, "only the new row survives");
+    assert_eq!(result.rows().len(), 1, "only the new row survives");
 }
 
 // ---------------------------------------------------------------------------
@@ -81,9 +82,10 @@ fn a_rt3_alter_table_set_retain() {
         .unwrap();
     // Advance 2 s past the row's stamped time — beyond the 1 s TTL.
     mock_now.fetch_add(2_000, AtomicOrdering::SeqCst);
-    db.run_pruning_cycle();
+    db.run_pruning_cycle()
+        .expect("prune expired log after adding retention");
     assert_eq!(
-        db.execute("SELECT * FROM logs", &p()).unwrap().rows.len(),
+        db.execute("SELECT * FROM logs", &p()).unwrap().rows().len(),
         0,
     );
 }
@@ -115,9 +117,10 @@ fn a_rt4_alter_table_drop_retain() {
         .unwrap();
     // Advance 2 s past the row's stamped time — the DROP means it must survive anyway.
     mock_now.fetch_add(2_000, AtomicOrdering::SeqCst);
-    db.run_pruning_cycle();
+    db.run_pruning_cycle()
+        .expect("run pruning after dropping log retention");
     assert_eq!(
-        db.execute("SELECT * FROM logs", &p()).unwrap().rows.len(),
+        db.execute("SELECT * FROM logs", &p()).unwrap().rows().len(),
         1,
         "row must survive after DROP RETAIN"
     );
@@ -144,9 +147,10 @@ fn a_rt5_expires_column_override() {
         &p(),
     )
     .unwrap();
-    db.run_pruning_cycle();
+    db.run_pruning_cycle()
+        .expect("prune expired log using the expiry override");
     let result = db.execute("SELECT * FROM logs", &p()).unwrap();
-    assert_eq!(result.rows.len(), 1, "only the future row survives");
+    assert_eq!(result.rows().len(), 1, "only the future row survives");
 }
 
 // ---------------------------------------------------------------------------

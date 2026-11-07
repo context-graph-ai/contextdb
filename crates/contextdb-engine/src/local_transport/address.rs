@@ -7,6 +7,10 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 /// Resolve a store pathname and derive its fixed-length local-channel key.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn derive_channel_address(store_path: &Path) -> Result<ChannelAddress, LocalTransportError> {
     let resolved = std::fs::canonicalize(store_path)
         .map_err(|error| LocalTransportError::FilesystemInspection(error.to_string()))?;
@@ -97,6 +101,10 @@ mod macos_channel_basename_tests {
 
 /// Place one local channel below its validated runtime directory, never below
 /// the inspected store.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn channel_socket_path(
     runtime_directory: &Path,
     address: ChannelAddress,
@@ -133,6 +141,13 @@ pub fn channel_socket_path(
 pub struct ChannelKernelAddress {
     /// Held for as long as the address is: the address names this descriptor,
     /// so closing it would unname the address.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     held_directory: Option<std::os::fd::OwnedFd>,
     address: PathBuf,
 }
@@ -140,6 +155,10 @@ pub struct ChannelKernelAddress {
 #[cfg(unix)]
 impl ChannelKernelAddress {
     /// Resolve the address to hand the kernel for a channel at this pathname.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn resolve(path: &Path) -> Result<Self, LocalTransportError> {
         if validate_socket_path_length(path).is_ok() {
             return Ok(Self {
@@ -159,11 +178,22 @@ impl ChannelKernelAddress {
     /// channel's own pathname. A caller cannot tell from the address alone,
     /// and the difference is the whole point: it is what an over-long
     /// pathname costs, and what an ordinary one does not.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_deep_runtime_directory.rs"
+        )
+    )]
     pub fn holds_its_directory(&self) -> bool {
         self.held_directory.is_some()
     }
 
     #[cfg(target_os = "linux")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn through_a_held_directory(path: &Path) -> Result<Self, LocalTransportError> {
         use std::os::fd::AsRawFd;
 
@@ -185,6 +215,10 @@ impl ChannelKernelAddress {
         })
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     #[cfg(not(target_os = "linux"))]
     fn through_a_held_directory(path: &Path) -> Result<Self, LocalTransportError> {
         let _ = path;
@@ -197,6 +231,10 @@ impl ChannelKernelAddress {
 }
 
 #[cfg(all(unix, target_os = "linux"))]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn split_channel_pathname(path: &Path) -> Result<(&Path, &std::ffi::OsStr), LocalTransportError> {
     let directory = path.parent().ok_or_else(|| {
         LocalTransportError::FilesystemInspection(

@@ -22,8 +22,8 @@ class InventoryControls(unittest.TestCase):
         jobs = i.pr_jobs(i.ROOT)
         self.assertEqual(len(jobs), 26)
         rows = [row for _, items in jobs for row in items]
-        self.assertEqual(len(rows), 33)
-        self.assertEqual(len({row[0] for row in rows}), 33)
+        self.assertEqual(len(rows), 32)
+        self.assertEqual(len({row[0] for row in rows}), 32)
         path = i.ROOT / 'scripts/ci-integration-targets.json'
         original = json.loads(path.read_text()); read = Path.read_text
         bundle = next(row for row in original['pr_jobs'] if row['shard'] == 'bundle-transactions-relational')
@@ -99,13 +99,38 @@ for suffix in ['profile','tests','targets.json','time']:
         self.assertEqual(lines['contextdb-engine-test-seams-4'], ['acceptance'])
         self.assertEqual(lines['contextdb-engine-test-seams-13'], ['acceptance_long_running'])
         self.assertEqual(lines['contextdb-engine-test-seams-14'], ['acceptance_sync'])
-        self.assertEqual(lines['contextdb-engine-test-seams-5'], ['sync', *moved])
+        self.assertEqual(lines['contextdb-engine-test-seams-5'], ['sync', *moved, 'tied_index_probes_stay_inside_the_read_limits',
+                         'writecost_cycle_bound', 'writecost_reclaim'])
         for target in moved:
             replacement = original.replace(' ' + target, '', 1)
             with self.subTest(target=target), patch.object(
                     Path, 'read_text', lambda p, *a, **kw: replacement if p == path else read(p, *a, **kw)):
                 with self.assertRaises(ValueError):
                     i.inventory(i.ROOT)
+
+    def test_shard_runner_never_stops_at_the_first_failing_target(self):
+        path = i.ROOT / 'scripts/ci-test-shard.sh'
+        original = path.read_text(); read = Path.read_text
+        self.assertEqual(original.count('cargo test --locked --no-fail-fast '), 3)
+        for count in (1, 2, 3):
+            replacement = original.replace('cargo test --locked --no-fail-fast ', 'cargo test --locked ', count)
+            with self.subTest(removed=count), patch.object(
+                    Path, 'read_text', lambda p, *a, **kw: replacement if p == path else read(p, *a, **kw)):
+                with self.assertRaisesRegex(ValueError, 'first failing target'):
+                    i.inventory(i.ROOT)
+
+    def test_redb_featured_targets_have_one_exact_owner(self):
+        path = i.ROOT / 'scripts/ci-integration.py'
+        original = path.read_text(); read = Path.read_text
+        for target, features in [('named_root_capture_contract', 'contextdb-internal,test-seams'), ('reclaim_step_contract', 'contextdb-internal,test-seams'), ('open_table_registry_allocations', 'contextdb-internal,test-seams'), ('admission_reads_are_bounded_by_the_format', 'contextdb-internal,test-seams'), ('growth_after_compaction_contract', 'contextdb-internal'), ('cache_residency', 'contextdb-internal')]:
+            entry = repr((target, features)) + ','
+            for replacement in (
+                    original.replace(entry, ''), original.replace(entry, entry + entry),
+                    original.replace(entry, repr((target, 'test-seams')) + ',')):
+                with self.subTest(target=target), patch.object(
+                        Path, 'read_text', lambda p, *a, **kw: replacement if p == path else read(p, *a, **kw)):
+                    with self.assertRaisesRegex(ValueError, 'redb featured target'):
+                        i.inventory(i.ROOT)
 
     def test_actual_inventory(self):
         i.inventory(i.ROOT)
@@ -132,11 +157,11 @@ for suffix in ['profile','tests','targets.json','time']:
                                                'custody_schema_replay_work_limited_to_affected_tables',
                                                'custody_schema_replay_identical_schema_does_no_artifact_work'],
         }
-        self.assertEqual(len(shards), 17)
+        self.assertEqual(len(shards), 16)
         read = Path.read_text
         _, rows = i.inventory(i.ROOT)
         self.assertEqual(sum(crate == 'contextdb-engine' and features == 'test-seams,iroh'
-                             for _, crate, features in rows), 17)
+                             for _, crate, features in rows), 16)
         for shard, targets in expected.items():
             self.assertEqual(shards[shard], targets)
             for target in targets:
@@ -146,35 +171,30 @@ for suffix in ['profile','tests','targets.json','time']:
                             Path, 'read_text', lambda p, *a, **kw: replacement if p == path else read(p, *a, **kw)):
                         with self.assertRaises(ValueError):
                             i.inventory(i.ROOT)
+        proportional = 'custody_schema_replay_is_proportional_to_affected_tables'
         for target in [target for targets in expected.values() for target in targets]:
-            fixture = i.ROOT / 'crates/contextdb-engine/tests' / (target + '.rs')
-            source = fixture.read_text()
-            full = target != 'custody_schema_replay_bounded_contract'
-            for rows in ([5_000, 1] if full else [5_000, 10_000]):
-                replacement = source.replace('const UNRELATED_RESIDENT_ROWS: i64 = '
-                                             + ('10_000' if full else '1') + ';',
-                                             f'const UNRELATED_RESIDENT_ROWS: i64 = {rows};')
-                with self.subTest(target=target, rows=rows), patch.object(
+            if target == proportional:
+                # No constant here: the frozen 10,000 rows are literals in the shared module.
+                fixture = i.ROOT / 'crates/contextdb-engine/tests/schema/schema_replay_is_proportional_to_affected_tables.rs'
+                source = fixture.read_text()
+                shrunk = ['for id in 0..10_000 {', 'Vec::with_capacity(10_000)',
+                          'rows.len(),\n        10_000,']
+                replacements = [(literal, source.replace(literal, literal.replace('10_000', '5_000'))) for literal in shrunk]
+            else:
+                fixture = i.ROOT / 'crates/contextdb-engine/tests' / (target + '.rs')
+                source = fixture.read_text()
+                full = target != 'custody_schema_replay_bounded_contract'
+                replacements = [(str(rows), source.replace(
+                    'const UNRELATED_RESIDENT_ROWS: i64 = ' + ('10_000' if full else '1') + ';',
+                    f'const UNRELATED_RESIDENT_ROWS: i64 = {rows};'))
+                    for rows in ([5_000, 1] if full else [5_000, 10_000])]
+            for label, replacement in replacements:
+                # A replacement that changes nothing would pass for the wrong reason.
+                self.assertNotEqual(replacement, source, (target, label))
+                with self.subTest(target=target, change=label), patch.object(
                         Path, 'read_text', lambda p, *a, **kw: replacement if p == fixture else read(p, *a, **kw)):
                     with self.assertRaisesRegex(ValueError, 'schema replay frozen fixture mismatch'):
                         i.inventory(i.ROOT)
-
-    def test_vector_corpus_targets_remain_once_in_partitioned_ordinary_shards(self):
-        path = i.ROOT / 'scripts/ci-shard-targets.txt'; original = path.read_text(); read = Path.read_text
-        targets = ['vector_graph_recall_5000_anisotropic_per_context',
-                   'vector_graph_recall_5001_topic_clusters_per_context',
-                   'vector_graph_recall_50000_isotropic_per_context',
-                   'vector_graph_recall_50001_anisotropic_per_context']
-        _, rows = i.inventory(i.ROOT)
-        self.assertEqual(sum(crate == 'contextdb-engine' and features == 'test-seams,iroh'
-                             for _, crate, features in rows), 17)
-        for target in targets:
-            self.assertEqual(original.split().count(target), 1)
-            for replacement in [original.replace(' ' + target, '', 1),
-                                original.replace(' ' + target, ' ' + target + ' ' + target, 1)]:
-                with self.subTest(target=target), patch.object(
-                        Path, 'read_text', lambda p, *a, **kw: replacement if p == path else read(p, *a, **kw)):
-                    with self.assertRaises(ValueError): i.inventory(i.ROOT)
 
     def test_target_durations_keep_final_parent_summary_and_thread_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -236,21 +256,21 @@ for suffix in ['profile','tests','targets.json','time']:
                                  ('tests/real.rs', 'target/debug/deps/real-123', 'FAILED'))
 
     def test_suite_leaves_no_source_artifacts(self):
-        self.assertNotEqual(os.environ.get('CI_INVENTORY_ARTIFACT_CHILD'), '1',
-                            'artifact-cleanliness child must not re-enter its parent control')
         def source_files():
             return {p.relative_to(i.ROOT): p.read_bytes()
                     for p in (i.ROOT / 'scripts').rglob('*') if p.is_file()}
         before = source_files()
         names = [name for name in unittest.defaultTestLoader.getTestCaseNames(type(self))
                  if name != 'test_suite_leaves_no_source_artifacts']
-        env = dict(os.environ)
-        env.pop('PYTHONDONTWRITEBYTECODE', None)
-        env['CI_INVENTORY_ARTIFACT_CHILD'] = '1'
-        run = subprocess.run([sys.executable, '-B', str(Path(__file__).resolve()),
-                              *['InventoryControls.' + name for name in names]],
-                             env=env, capture_output=True, text=True, timeout=90)
-        self.assertEqual(run.returncode, 0, run.stderr)
+        # Drive the same controls without a second interpreter or an elapsed-time
+        # deadline. TestResult retains every nested failure and error.
+        suite = unittest.TestSuite(type(self)(name) for name in names)
+        result = unittest.TestResult()
+        with patch.dict(os.environ):
+            os.environ.pop('PYTHONDONTWRITEBYTECODE', None)
+            suite.run(result)
+        self.assertEqual(result.testsRun, len(names))
+        self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
         self.assertEqual(source_files(), before)
 
     def test_receipt_read_errors_still_propagate(self):
@@ -259,11 +279,12 @@ for suffix in ['profile','tests','targets.json','time']:
                 i.timing_receipt([Path(tmp) / 'missing.log'], '1')
 
     def test_real_runner_records_parallel_and_serial_modes(self):
-        for features, mode, inherited, cargo_status, parser_status, expected_status in [
-                ("", "default-parallel", None, 0, 0, 0), ("", "3", "3", 0, 0, 0),
-                ("test-seams", "1", "3", 0, 0, 0),
-                ("", "3", "3", 7, 0, 7), ("", "3", "3", 0, 9, 2),
-                ("", "3", "3", 7, 9, 7)]:
+        for crate, features, mode, inherited, cargo_status, parser_status, expected_status in [
+                ("contextdb-core", "", "default-parallel", None, 0, 0, 0), ("contextdb-core", "", "3", "3", 0, 0, 0),
+                ("contextdb-engine", "", "1", "3", 0, 0, 0),
+                ("contextdb-core", "test-seams", "1", "3", 0, 0, 0),
+                ("contextdb-core", "", "3", "3", 7, 0, 7), ("contextdb-core", "", "3", "3", 0, 9, 2),
+                ("contextdb-core", "", "3", "3", 7, 9, 7)]:
             with self.subTest(features=features, cargo_status=cargo_status, parser_status=parser_status), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 cargo = root / 'cargo'
@@ -277,6 +298,16 @@ for suffix in ['profile','tests','targets.json','time']:
                                  "echo 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1901.00s'\n"
                                  f"exit {cargo_status}\n")
                 cargo.chmod(0o755)
+                # Source provenance and toolchain discovery are not the thread-mode
+                # contract. Keep the real runner and receipt parser, but make these
+                # external commands immediate and independent of checkout size.
+                git = root / 'git'
+                git.write_text('#!/bin/sh\ncase "$1" in rev-parse) echo fixture-head;; '
+                               'status|diff) :;; *) exit 2;; esac\n')
+                git.chmod(0o755)
+                rustc = root / 'rustc'
+                rustc.write_text('#!/bin/sh\necho "rustc synthetic"\n')
+                rustc.chmod(0o755)
                 python = root / 'python3'
                 python.write_text('#!/bin/bash\n'
                                   f'if [[ "$2" == --timings && {parser_status} != 0 ]]; '
@@ -285,25 +316,195 @@ for suffix in ['profile','tests','targets.json','time']:
                 python.chmod(0o755)
                 env = dict(os.environ, PATH=str(root) + ':' + os.environ['PATH'],
                            CARGO_TARGET_DIR=str(root / 'target'), CALLS=str(root / 'calls'),
-                           CI_CRATE='contextdb-core', CI_SHARD='contextdb-core', CI_FEATURES=features)
+                           CI_CRATE=crate, CI_SHARD=crate, CI_FEATURES=features)
                 env.pop('RUST_TEST_THREADS', None)
                 if inherited is not None:
                     env['RUST_TEST_THREADS'] = inherited
                 run = subprocess.run(['bash', 'scripts/ci-test-shard.sh'], cwd=i.ROOT, env=env,
-                                     capture_output=True, text=True, timeout=15)
+                                     capture_output=True, text=True)
                 self.assertEqual(run.returncode, expected_status, run.stderr)
-                receipts = root / 'target/ci-shard-out/contextdb-core'
-                profile = (receipts / 'contextdb-core.profile').read_text()
+                receipts = root / 'target/ci-shard-out' / crate
+                profile = (receipts / (crate + '.profile')).read_text()
                 self.assertIn('test_threads=' + mode, profile)
-                self.assertIn(f'exit={expected_status}', (receipts / 'contextdb-core.time').read_text())
+                self.assertIn(f'exit={expected_status}', (receipts / (crate + '.time')).read_text())
                 if expected_status:
                     continue
-                rows = json.loads((receipts / 'contextdb-core.targets.json').read_text())['targets']
+                rows = json.loads((receipts / (crate + '.targets.json')).read_text())['targets']
                 self.assertEqual(len(rows), 2)
                 self.assertEqual({row['test_threads'] for row in rows}, {mode, '1'})
                 calls = (root / 'calls').read_text().splitlines()
-                self.assertEqual(len(calls), 3)
-                self.assertEqual('--test-threads=1' in calls[0], bool(features))
+                self.assertEqual(len(calls), 4 if crate == 'contextdb-engine' else 3)
+                self.assertEqual('--test-threads=1' in calls[-3], crate == 'contextdb-engine' or bool(features))
+                self.assertIn('--no-fail-fast', calls[-3].split())
+
+
+class MaintenanceJourneyRunner(unittest.TestCase):
+    def test_shard_runs_the_journey_once_under_its_own_limit(self):
+        case = ('paged_initial_replacement_and_reclamation_progress_under_writes::'
+                'paged_initial_replacement_and_reclamation_progress_under_writes')
+        for test_exit, matched, expected in [(0, 1, 0), (124, 1, 124), (0, 0, 2)]:
+            with self.subTest(test_exit=test_exit), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                cargo = root/'cargo'
+                cargo.write_text('''#!/usr/bin/env python3
+import os,sys,json
+args=sys.argv[1:]
+if args==['--version']: print('cargo synthetic'); sys.exit(0)
+with open(os.environ['CALLS'],'a') as out: out.write(json.dumps(args)+'\\n')
+if args[0]=='build' or '--no-run' in args: sys.exit(0)
+print('     Running tests/engine_seams.rs (target/debug/deps/engine_seams-123)')
+print('running 1 test')
+case=os.environ['MAINTENANCE_CASE']
+matched=os.environ['MATCHED'] if case in args and '--skip' not in args else '1'
+print('test result: ok. '+matched+' passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s')
+sys.exit(int(os.environ['TEST_EXIT']) if case in args and '--skip' not in args else 0)
+''')
+                cargo.chmod(0o755)
+                timeout = root/'timeout'
+                timeout.write_text('''#!/usr/bin/env python3
+import os,sys,json
+args=sys.argv[1:]
+with open(os.environ['DEADLINES'],'a') as out: out.write(json.dumps(args)+'\\n')
+if args[0] in ['30m','300m']: args=args[1:]
+elif args[:2]==['--kill-after=5s','600s']: args=args[2:]
+else: sys.exit(98)
+os.execvp(args[0],args)
+''')
+                timeout.chmod(0o755)
+                # Cleanup is irrelevant to routing and must not delete real directories here.
+                cleanup = root/'rm'; cleanup.write_text('#!/bin/sh\nexit 0\n'); cleanup.chmod(0o755)
+                env = dict(os.environ, PATH=str(root)+':'+os.environ['PATH'],
+                           CARGO_TARGET_DIR=str(root/'target'), CALLS=str(root/'calls'),
+                           DEADLINES=str(root/'deadlines'), MAINTENANCE_CASE=case,
+                           TEST_EXIT=str(test_exit), MATCHED=str(matched), CI_CRATE='contextdb-engine',
+                           CI_SHARD='contextdb-engine-test-seams-7', CI_FEATURES='test-seams,iroh',
+                           CI_BUNDLE='', CI_GATE_MODE='full')
+                run = subprocess.run(['/bin/bash', 'scripts/ci-test-shard.sh'], cwd=i.ROOT,
+                                     env=env, capture_output=True, text=True, timeout=30)
+                self.assertEqual(run.returncode, expected, run.stderr)
+                calls = [json.loads(line) for line in (root/'calls').read_text().splitlines()]
+                runs = [args for args in calls if args[0]=='test' and '--no-run' not in args]
+                self.assertEqual(len(runs), 2)
+                ordinary, journey = runs
+                self.assertIn('--skip', ordinary)
+                self.assertEqual(ordinary[ordinary.index('--skip')+1], case)
+                self.assertEqual(journey.count(case), 1)
+                self.assertNotIn('--skip', journey)
+                deadlines = [json.loads(line) for line in (root/'deadlines').read_text().splitlines()]
+                timed = [args for args in deadlines if args[:2]==['--kill-after=5s','600s']]
+                self.assertEqual(len(timed), 1)
+                self.assertIn(case, timed[0])
+                receipt = root/'target/ci-shard-out/contextdb-engine-test-seams-7'
+                self.assertIn('exit='+str(expected), (receipt/'contextdb-engine-test-seams-7.time').read_text())
+                self.assertEqual((receipt/'maintenance.exit').read_text().strip(), str(expected))
+
+    def test_rc2_step_routes_the_journey_through_the_same_limit(self):
+        import textwrap
+        workflow = (i.ROOT/'.github/workflows/rc2-tests.yml').read_text()
+        body = workflow.split('        id: run\n        run: |\n', 1)[1].split('      - name:', 1)[0]
+        body = textwrap.dedent(body)
+        for key, value in [('standalone', ''), ('crate', 'contextdb-engine'),
+                           ('features', 'test-seams,iroh'), ('shard', 'contextdb-engine-test-seams')]:
+            body = body.replace('${{ matrix.'+key+' }}', value)
+        case = ('paged_initial_replacement_and_reclamation_progress_under_writes::'
+                'paged_initial_replacement_and_reclamation_progress_under_writes')
+        for test_exit in [0, 124]:
+            with self.subTest(test_exit=test_exit), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root/'scripts').symlink_to(i.ROOT/'scripts', target_is_directory=True)
+                cargo = root/'cargo'
+                cargo.write_text('''#!/usr/bin/env python3
+import os,sys,json
+args=sys.argv[1:]
+with open(os.environ['CALLS'],'a') as out: out.write(json.dumps(args)+'\\n')
+print('test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s')
+sys.exit(int(os.environ['TEST_EXIT']) if os.environ['MAINTENANCE_CASE'] in args and '--skip' not in args else 0)
+''')
+                cargo.chmod(0o755)
+                timeout = root/'timeout'
+                timeout.write_text('''#!/usr/bin/env python3
+import os,sys,json
+args=sys.argv[1:]
+with open(os.environ['DEADLINES'],'a') as out: out.write(json.dumps(args)+'\\n')
+if args[0]=='30m': args=args[1:]
+elif args[:2]==['--kill-after=5s','600s']: args=args[2:]
+else: sys.exit(98)
+os.execvp(args[0],args)
+''')
+                timeout.chmod(0o755)
+                env = dict(os.environ, PATH=str(root)+':'+os.environ['PATH'],
+                           CALLS=str(root/'calls'), DEADLINES=str(root/'deadlines'),
+                           BASH_ENV='/dev/null', TEST_EXIT=str(test_exit), MAINTENANCE_CASE=case)
+                run = subprocess.run(['/bin/bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', body],
+                                     cwd=root, env=env, capture_output=True, text=True, timeout=15)
+                self.assertEqual(run.returncode, test_exit, run.stderr)
+                calls = [json.loads(line) for line in (root/'calls').read_text().splitlines()]
+                self.assertEqual(len(calls), 4)
+                self.assertIn('--skip', calls[0])
+                self.assertIn('--no-run', calls[1])
+                self.assertIn(case, calls[2])
+                self.assertIn('--exact', calls[2])
+                self.assertIn('--benches', calls[3])
+                self.assertTrue((root/'deadlines').exists(), run.stdout+run.stderr+'\n'+str(calls))
+                deadlines = [json.loads(line) for line in (root/'deadlines').read_text().splitlines()]
+                self.assertEqual(deadlines[1][:2], ['--kill-after=5s', '600s'])
+                receipt = root/'shard-out/contextdb-engine-test-seams-maintenance/maintenance.exit'
+                self.assertEqual(receipt.read_text().strip(), str(test_exit))
+
+    def test_compile_is_outside_deadline_and_failures_are_preserved(self):
+        runner = i.ROOT / 'scripts/ci-maintenance-journey.sh'
+        case = ('paged_initial_replacement_and_reclamation_progress_under_writes::'
+                'paged_initial_replacement_and_reclamation_progress_under_writes')
+        for build_exit, test_exit, expected, count, matched in [(0, 0, 0, 2, 1),
+                                                               (42, 0, 42, 1, 1),
+                                                               (0, 124, 124, 2, 1),
+                                                               (0, 7, 7, 2, 1),
+                                                               (0, 0, 2, 2, 0)]:
+            with self.subTest(build_exit=build_exit, test_exit=test_exit), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                cargo = root / 'cargo'
+                cargo.write_text('''#!/usr/bin/env python3
+import os,sys,json
+with open(os.environ['CARGO_CALLS'],'a') as out:
+    out.write(json.dumps(sys.argv[1:])+'\\n')
+if '--no-run' not in sys.argv:
+    print('test result: ok. '+os.environ['MATCHED']+' passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s')
+sys.exit(int(os.environ['BUILD_EXIT'] if '--no-run' in sys.argv else os.environ['TEST_EXIT']))
+''')
+                cargo.chmod(0o755)
+                timeout = root / 'timeout'
+                timeout.write_text('''#!/usr/bin/env python3
+import os,sys,json
+args=sys.argv[1:]
+with open(os.environ['TIMEOUT_CALLS'],'a') as out:
+    out.write(json.dumps(args)+'\\n')
+if args[0]=='30m': args=args[1:]
+elif args[:2]==['--kill-after=5s','600s']: args=args[2:]
+else: sys.exit(98)
+os.execvp(args[0],args)
+''')
+                timeout.chmod(0o755)
+                env = dict(os.environ, PATH=str(root)+':'+os.environ['PATH'],
+                           CARGO_CALLS=str(root/'cargo-calls'), TIMEOUT_CALLS=str(root/'timeouts'),
+                           BUILD_EXIT=str(build_exit), TEST_EXIT=str(test_exit), MATCHED=str(matched))
+                result = subprocess.run(['bash', str(runner), str(root/'receipts'),
+                                         '-p', 'contextdb-engine', '--features', 'test-seams,iroh'],
+                                        env=env, capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertEqual((root/'receipts/maintenance.exit').read_text().strip(), str(expected))
+                calls = [json.loads(line) for line in (root/'cargo-calls').read_text().splitlines()]
+                deadlines = [json.loads(line) for line in (root/'timeouts').read_text().splitlines()]
+                self.assertEqual(len(calls), count)
+                self.assertIn('--no-run', calls[0])
+                self.assertEqual(deadlines[0][0], '30m')
+                if count == 2:
+                    self.assertNotIn('--no-run', calls[1])
+                    self.assertIn(case, calls[1])
+                    self.assertEqual(calls[1][-2:], ['--exact', '--test-threads=1'])
+                    self.assertEqual(deadlines[1][:2], ['--kill-after=5s', '600s'])
+                    self.assertTrue((root/'receipts/maintenance.log').exists())
+                else:
+                    self.assertFalse((root/'receipts/maintenance.log').exists())
 
 
 if __name__ == '__main__':

@@ -133,7 +133,7 @@ fn a_tight_budget_refuses_by_memory_while_damaged_bytes_still_report_corruption(
         session(&path, ROOMY_SESSION_BYTES)
             .execute(SCAN, &HashMap::new())
             .expect("a sound store answers under a ceiling that fits the proof walk")
-            .rows
+            .rows()
             .len(),
         ROWS as usize
     );
@@ -153,7 +153,7 @@ fn a_tight_budget_refuses_by_memory_while_damaged_bytes_still_report_corruption(
     let tight = session(&path, tight_budget);
     let refusal = tight
         .execute(SCAN, &HashMap::new())
-        .map(|answer| format!("{} rows", answer.rows.len()))
+        .map(|answer| format!("{} rows", answer.rows().len()))
         .expect_err("the declared ceiling cannot hold the proof this read needs");
     assert!(
         matches!(&refusal, Error::MemoryBudgetExceeded { .. }),
@@ -164,7 +164,7 @@ fn a_tight_budget_refuses_by_memory_while_damaged_bytes_still_report_corruption(
     damage_one_committed_row_body(&path);
     let damaged = session(&path, ROOMY_SESSION_BYTES)
         .execute(SCAN, &HashMap::new())
-        .map(|answer| format!("{} rows", answer.rows.len()))
+        .map(|answer| format!("{} rows", answer.rows().len()))
         .expect_err("a body that does not authenticate is never answered");
     assert!(
         matches!(damaged, Error::StoreCorrupted { .. }),

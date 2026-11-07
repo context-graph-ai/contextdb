@@ -32,7 +32,7 @@ fn file_db(name: &str) -> (TempDir, PathBuf, Database) {
 fn row_count(db: &Database, table: &str) -> usize {
     db.execute(&format!("SELECT * FROM {table}"), &p())
         .unwrap()
-        .rows
+        .rows()
         .len()
 }
 
@@ -43,7 +43,7 @@ fn persisted_row_count(path: &Path, table: &str) -> usize {
 
 fn persisted_rows(path: &Path, sql: &str) -> Vec<Vec<Value>> {
     let db = Database::open(path).unwrap();
-    db.execute(sql, &p()).unwrap().rows
+    db.execute(sql, &p()).unwrap().rows().to_vec()
 }
 
 fn create_parent_child(db: &Database) {
@@ -67,6 +67,10 @@ fn insert_parent(db: &Database, a: i64, b: i64) {
     .unwrap();
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn insert_child(db: &Database, id: i64, c1: &str, c2: &str) -> Result<(), Error> {
     db.execute(
         &format!("INSERT INTO child (id, c1, c2, note) VALUES ({id}, {c1}, {c2}, 'c')"),
@@ -129,6 +133,7 @@ fn cfk(child: &[&str], parent_table: &str, parent: &[&str]) -> CompositeForeignK
         child_columns: child.iter().map(|s| s.to_string()).collect(),
         parent_table: parent_table.to_string(),
         parent_columns: parent.iter().map(|s| s.to_string()).collect(),
+        follows_parent_purge: false,
     }
 }
 
@@ -347,6 +352,7 @@ fn ddl_estimated_bytes_grows_with_each_descriptor_kind() {
         references: Some(ForeignKeyReference {
             table: "p".into(),
             column: "a".into(),
+            follows_parent_purge: false,
         }),
         expires: false,
         immutable: false,
@@ -359,13 +365,18 @@ fn ddl_estimated_bytes_grows_with_each_descriptor_kind() {
         max_partitions: None,
         search_mode: contextdb_core::VectorSearchMode::Auto,
         auto_index_at: None,
-        hnsw_m: None,
-        hnsw_ef_construction: None,
-        hnsw_ef_search: None,
+        flat_below: None,
+        auto_expansion_ceiling: None,
         vector_policy_revision: contextdb_core::DEFAULT_VECTOR_POLICY_REVISION,
         consolidation_change_percent: None,
         consolidation_tombstone_percent: None,
         consolidation_disabled: false,
+        search_target_accuracy_hundredths: None,
+        search_expected_vectors: None,
+        ivf_lists: None,
+        ivf_probes: None,
+        ivf_refine_factor_hundredths: None,
+        vector_engine_policy: Default::default(),
     });
     assert!(with_single_fk.estimated_bytes() > base.estimated_bytes());
 
@@ -530,7 +541,8 @@ fn cfk_update_rejects_missing_parent() {
     let rows = db
         .execute("SELECT c1, c2 FROM child WHERE id = 1", &p())
         .unwrap()
-        .rows;
+        .rows()
+        .to_vec();
     assert_eq!(rows, vec![vec![Value::Int64(1), Value::Int64(2)]]);
     db.close().unwrap();
     assert_eq!(
@@ -579,6 +591,10 @@ fn cfk_delete_parent_no_children_commits() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn cfk_delete_race_serializes_with_barrier() {
     let (_tmp, path, db) = file_db("delete-race.db");
     create_parent_child(&db);
@@ -714,7 +730,8 @@ fn cfk_parent_rewrite_new_tuple_child_matches_new() {
     let rows = db
         .execute("SELECT c1, c2 FROM child WHERE id = 1", &p())
         .unwrap()
-        .rows;
+        .rows()
+        .to_vec();
     assert_eq!(rows, vec![vec![Value::Int64(3), Value::Int64(4)]]);
     db.close().unwrap();
     assert_eq!(
@@ -828,14 +845,14 @@ fn cfk_batch_uses_indexed_tuple_probes() {
         reopened
             .execute("SELECT c1, c2 FROM child WHERE id = 0", &p())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1), Value::Int64(2)]]
     );
     assert_eq!(
         reopened
             .execute("SELECT c1, c2 FROM child WHERE id = 999", &p())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1), Value::Int64(2)]]
     );
 }
@@ -903,7 +920,12 @@ fn ddl_sync_reopen_round_trip_composite_fk_descriptor_present_on_follower() {
     }
     let origin = Database::open(&path).unwrap();
     let follower = db();
-    let apply_result = follower.apply_changes(origin.changes_since(Lsn(0)), &apply_policy());
+    let apply_result = follower.apply_changes(
+        origin
+            .changes_since(Lsn(0))
+            .expect("read the declared changes"),
+        &apply_policy(),
+    );
     assert!(
         apply_result.is_ok(),
         "full-snapshot DDL apply must preserve valid parent UNIQUE syntax and order: {apply_result:?}"
@@ -927,7 +949,7 @@ fn ddl_sync_round_trip_single_column_fk_structured_payload_present() {
             &p(),
         )
         .unwrap();
-    let ddl = origin.ddl_log_since(Lsn(0));
+    let ddl = origin.ddl_log_since(Lsn(0)).unwrap();
     let create = ddl
         .iter()
         .find(|d| matches!(d, DdlChange::CreateTable { name, .. } if name == "c"))
@@ -940,6 +962,7 @@ fn ddl_sync_round_trip_single_column_fk_structured_payload_present() {
                     child_column: "p_id".into(),
                     parent_table: "p".into(),
                     parent_column: "id".into(),
+                    follows_parent_purge: false,
                 }],
                 "single-column FK must be structured exactly"
             )
@@ -948,7 +971,12 @@ fn ddl_sync_round_trip_single_column_fk_structured_payload_present() {
     }
     let follower = db();
     follower
-        .apply_changes(origin.changes_since(Lsn(0)), &apply_policy())
+        .apply_changes(
+            origin
+                .changes_since(Lsn(0))
+                .expect("read the declared changes"),
+            &apply_policy(),
+        )
         .unwrap();
     let c_meta = follower.table_meta("c").unwrap();
     let p_id = c_meta
@@ -961,6 +989,7 @@ fn ddl_sync_round_trip_single_column_fk_structured_payload_present() {
         Some(ForeignKeyReference {
             table: "p".into(),
             column: "id".into(),
+            follows_parent_purge: false,
         }),
         "follower metadata must reconstruct the single-column FK"
     );
@@ -972,7 +1001,7 @@ fn ddl_sync_round_trip_composite_unique_structured_payload_present() {
     origin
         .execute("CREATE TABLE p (a INTEGER, b INTEGER, UNIQUE(a, b))", &p())
         .unwrap();
-    let create = origin.ddl_log_since(Lsn(0)).pop().unwrap();
+    let create = origin.ddl_log_since(Lsn(0)).unwrap().pop().unwrap();
     match create {
         DdlChange::CreateTable {
             composite_unique, ..
@@ -984,7 +1013,12 @@ fn ddl_sync_round_trip_composite_unique_structured_payload_present() {
     }
     let follower = db();
     follower
-        .apply_changes(origin.changes_since(Lsn(0)), &apply_policy())
+        .apply_changes(
+            origin
+                .changes_since(Lsn(0))
+                .expect("read the declared changes"),
+            &apply_policy(),
+        )
         .unwrap();
     assert_eq!(
         follower.table_meta("p").unwrap().unique_constraints,
@@ -1009,7 +1043,12 @@ fn ddl_sync_follower_enforces_composite_fk_on_local_writes() {
         )
         .unwrap();
     let follower = db();
-    let apply_result = follower.apply_changes(origin.changes_since(Lsn(0)), &apply_policy());
+    let apply_result = follower.apply_changes(
+        origin
+            .changes_since(Lsn(0))
+            .expect("read the declared changes"),
+        &apply_policy(),
+    );
     assert!(
         apply_result.is_ok(),
         "structured DDL sync must apply before follower local validation: {apply_result:?}"
@@ -1144,7 +1183,7 @@ fn ddl_sync_skipped_parent_row_does_not_satisfy_composite_fk_child() {
         receiver
             .execute("SELECT a, b FROM parent WHERE id = 1", &p())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1), Value::Int64(1)]],
         "server_wins parent conflict must leave the local parent unchanged"
     );
@@ -1213,6 +1252,7 @@ fn ddl_sync_child_before_parent_same_batch_uses_applied_parent_projection() {
     );
     assert_eq!(row_count(&receiver, "parent"), 1);
     assert_eq!(row_count(&receiver, "child"), 1);
+    assert_composite_parent_projection_prices_keys_not_payloads();
 }
 
 #[test]
@@ -1347,7 +1387,7 @@ fn ddl_sync_future_parent_update_away_does_not_satisfy_composite_fk_child() {
         receiver
             .execute("SELECT a, b FROM parent WHERE id = 1", &p())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(9), Value::Int64(9)]],
         "parent update should still apply after child is bounded as a conflict"
     );
@@ -1426,7 +1466,7 @@ fn ddl_sync_parent_update_rejected_by_immutable_does_not_satisfy_composite_fk_ch
         receiver
             .execute("SELECT a, b, frozen FROM parent WHERE id = 1", &p())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![
             Value::Int64(1),
             Value::Int64(2),
@@ -1529,7 +1569,7 @@ fn ddl_sync_parent_update_rejected_by_projected_unique_does_not_satisfy_composit
         receiver
             .execute("SELECT a, b, u FROM parent WHERE id = 1", &p())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![
             Value::Int64(1),
             Value::Int64(2),
@@ -1541,7 +1581,7 @@ fn ddl_sync_parent_update_rejected_by_projected_unique_does_not_satisfy_composit
         receiver
             .execute("SELECT a, b, u FROM parent WHERE id = 2", &p())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![
             Value::Int64(5),
             Value::Int64(5),
@@ -1709,6 +1749,7 @@ fn ddl_sync_wire_round_trip_byte_shape_preserves_structured_constraints() {
             child_column: "p_id".into(),
             parent_table: "p".into(),
             parent_column: "id".into(),
+            follows_parent_purge: false,
         }],
         composite_foreign_keys: vec![cfk(&["c1", "c2"], "p", &["a", "b"])],
         composite_unique: vec![vec!["c1".into(), "c2".into()]],
@@ -1730,6 +1771,7 @@ fn ddl_sync_wire_round_trip_byte_shape_preserves_structured_constraints() {
             child_column: "p_id".into(),
             parent_table: "p".into(),
             parent_column: "id".into(),
+            follows_parent_purge: false,
         }],
         composite_foreign_keys: vec![cfk(&["c1", "c2"], "p", &["a", "b"])],
         composite_unique: vec![vec!["c1".into(), "c2".into()]],
@@ -1747,7 +1789,11 @@ fn ddl_sync_wire_round_trip_byte_shape_preserves_structured_constraints() {
     // short record, not a declaration without keys: both codecs refuse it, so
     // no reader can turn a missing field into "this table has no foreign key".
     #[derive(serde::Serialize)]
-    #[allow(dead_code, clippy::enum_variant_names)]
+    #[allow(clippy::enum_variant_names)]
+    #[allow(
+        dead_code,
+        reason = "WIRE-FIELD: encoded by both codecs; its variant order is the short-record encoding the test refuses"
+    )]
     enum ShortDdlChange {
         CreateTable {
             name: String,
@@ -1918,7 +1964,7 @@ fn cfk_retention_eviction_of_parent_with_children_rejects() {
     assert_eq!(persisted_row_count(&checked_path, "parent"), 1);
     assert_eq!(persisted_row_count(&checked_path, "child"), 1);
     assert_eq!(
-        legacy.run_pruning_cycle(),
+        legacy.run_pruning_cycle().unwrap(),
         0,
         "compatibility pruning path must count only actual prunes"
     );
@@ -2010,6 +2056,7 @@ fn ddl_sync_round_trip_distinguishes_pk_covered_from_unique_covered_fk() {
     origin.execute("CREATE TABLE child (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER, FOREIGN KEY (x) REFERENCES pk_parent(id), FOREIGN KEY (x, y) REFERENCES uq_parent(a, b))", &p()).unwrap();
     let create_child = origin
         .ddl_log_since(Lsn(0))
+        .unwrap()
         .into_iter()
         .find(|change| matches!(change, DdlChange::CreateTable { name, .. } if name == "child"))
         .expect("child DDL");
@@ -2032,7 +2079,12 @@ fn ddl_sync_round_trip_distinguishes_pk_covered_from_unique_covered_fk() {
     let origin = Database::open(&path).unwrap();
     let follower = db();
     follower
-        .apply_changes(origin.changes_since(Lsn(0)), &apply_policy())
+        .apply_changes(
+            origin
+                .changes_since(Lsn(0))
+                .expect("read the declared changes"),
+            &apply_policy(),
+        )
         .unwrap();
     assert_eq!(
         follower.table_meta("child").unwrap().composite_foreign_keys,
@@ -2092,4 +2144,112 @@ fn protocol_version_bumps_for_structured_constraint_wire() {
     let encoded = encode(MessageType::PullRequest, &()).unwrap();
     let decoded = decode(&encoded).unwrap();
     assert_eq!(decoded.version, 7);
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn assert_composite_parent_projection_prices_keys_not_payloads() {
+    let mut peaks = HashMap::new();
+    for key_bytes in [8usize, 1024] {
+        for payload_bytes in [32usize, 262_144] {
+            let receiver = db();
+            receiver.execute(
+                "CREATE TABLE projected_parent (id INTEGER PRIMARY KEY, tenant TEXT, ordinal INTEGER, payload TEXT, UNIQUE(tenant, ordinal))",
+                &p(),
+            ).unwrap();
+            receiver.execute(
+                "CREATE TABLE projected_child (id INTEGER PRIMARY KEY, tenant TEXT, ordinal INTEGER, payload TEXT, FOREIGN KEY (tenant, ordinal) REFERENCES projected_parent(tenant, ordinal))",
+                &p(),
+            ).unwrap();
+            let key = "k".repeat(key_bytes);
+            let make_row = |table: &str, id: i64, ordinal: i64| RowChange {
+                table: table.into(),
+                natural_key: NaturalKey::single("id".into(), Value::Int64(id)),
+                values: HashMap::from([
+                    ("id".into(), Value::Int64(id)),
+                    ("tenant".into(), Value::Text(key.clone())),
+                    ("ordinal".into(), Value::Int64(ordinal)),
+                    ("payload".into(), Value::Text("x".repeat(payload_bytes))),
+                ]),
+                deleted: false,
+                lsn: Lsn(10),
+                created_at: None,
+            };
+            let (result, work) = contextdb_engine::writer_query_test_seams::observe(|| {
+                receiver.apply_changes(
+                    ChangeSet {
+                        rows: vec![
+                            make_row("projected_child", 1, 7),
+                            make_row("projected_child", 2, 8),
+                            make_row("projected_parent", 1, 7),
+                        ],
+                        ..Default::default()
+                    },
+                    &apply_policy(),
+                )
+            });
+            let result = result.expect("complete the parent-key-projected batch");
+            assert_eq!(
+                result.conflicts.len(),
+                1,
+                "a partial composite-key match remains an orphan conflict"
+            );
+            assert_eq!(
+                receiver
+                    .execute(
+                        "SELECT id, tenant, ordinal FROM projected_parent ORDER BY id",
+                        &p(),
+                    )
+                    .unwrap()
+                    .rows(),
+                vec![vec![
+                    Value::Int64(1),
+                    Value::Text(key.clone()),
+                    Value::Int64(7)
+                ]]
+            );
+            assert_eq!(
+                receiver
+                    .execute(
+                        "SELECT id, tenant, ordinal FROM projected_child ORDER BY id",
+                        &p(),
+                    )
+                    .unwrap()
+                    .rows(),
+                vec![vec![
+                    Value::Int64(1),
+                    Value::Text(key.clone()),
+                    Value::Int64(7)
+                ]]
+            );
+            assert_eq!(
+                work.sync_parent_key_projection_bytes, 0,
+                "the actual writer projection reservation releases after complete apply"
+            );
+            assert!(
+                work.sync_parent_key_projection_peak_bytes > 0,
+                "the incoming parent keys have an actual retained writer credit"
+            );
+            peaks.insert(
+                (key_bytes, payload_bytes),
+                work.sync_parent_key_projection_peak_bytes,
+            );
+        }
+        assert_eq!(
+            peaks[&(key_bytes, 32)],
+            peaks[&(key_bytes, 262_144)],
+            "unrelated parent and child payloads do not enter the retained FK key projection"
+        );
+    }
+    let short = Value::Text("k".repeat(8)).estimated_bytes();
+    let long = Value::Text("k".repeat(1024)).estimated_bytes();
+    for payload_bytes in [32usize, 262_144] {
+        assert_eq!(
+            peaks[&(1024, payload_bytes)] - peaks[&(8, payload_bytes)],
+            long - short,
+            "one incoming parent retains one copy of its composite TEXT key, without payload or row multipliers"
+        );
+    }
 }

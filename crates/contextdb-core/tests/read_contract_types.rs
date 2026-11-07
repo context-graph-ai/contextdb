@@ -765,7 +765,7 @@ fn local_owner_identity_values_are_distinct_strong_types() {
 
 #[test]
 fn breadcrumb_is_addressed_by_the_database_hash_and_uses_process_start_identity() {
-    let runtime_seed = rand::random::<[u8; 32]>();
+    let runtime_seed = [0x42; 32];
     let addresses =
         [0x00, 0x3c, 0xa5, 0xff].map(|mask| ChannelAddress(runtime_seed.map(|byte| byte ^ mask)));
     let locations = addresses.map(ReaderBreadcrumbLocation::for_database_path_hash);
@@ -1058,7 +1058,9 @@ impl OwnerRequestHandler for EchoHandler {
         _cancel: &OwnerReadCancellation,
     ) -> contextdb_core::Result<Vec<u8>> {
         if request == b"fail" {
-            Err(Error::Other("custom owner handler failed".to_owned()))
+            Err(Error::Other(
+                "custom owner handler failed".to_owned().into(),
+            ))
         } else {
             Ok(request.to_vec())
         }
@@ -1268,7 +1270,7 @@ fn stable_read_failure_vocabulary_round_trips_every_legal_shape() {
     let owner_route_unsupported = ReadFailure::new(
         ReadFailureKind::OwnerRouteUnsupported,
         ReadFailureDetail::OwnerRouteUnsupported(OwnerRouteUnsupportedDetail {
-            inspection: "image_state".to_owned(),
+            inspection: "image_state".to_owned().into(),
         }),
     )
     .expect("the unsupported-inspection detail matches its refusal kind");
@@ -1332,7 +1334,7 @@ fn stable_read_failure_vocabulary_round_trips_every_legal_shape() {
         (
             ReadFailureKind::OwnerNotServing,
             ReadFailureDetail::OwnerRouteUnsupported(OwnerRouteUnsupportedDetail {
-                inspection: "image_state".to_owned(),
+                inspection: "image_state".to_owned().into(),
             }),
         ),
         // A route that refuses an inspection always knows which one it was
@@ -1536,33 +1538,100 @@ fn core_error_carries_read_failure_without_losing_its_structured_kind() {
 
 #[test]
 fn cursor_page_validation_requires_only_column_row_coherence() {
-    let empty = CursorPage {
-        columns: vec!["id".to_owned()],
-        rows: vec![],
-        has_more: false,
-    };
+    use contextdb_core::read_contract::CursorPageStorage;
+    use contextdb_core::read_memory::{ReadCredit, ReadMemoryOwner};
+
+    #[derive(Debug)]
+    struct Page {
+        columns: Vec<String>,
+        rows: Vec<Vec<contextdb_core::Value>>,
+        has_more: bool,
+        _payload: ReadCredit,
+    }
+    impl CursorPageStorage for Page {
+        fn columns(&self) -> &[String] {
+            &self.columns
+        }
+        fn rows(&self) -> &[Vec<contextdb_core::Value>] {
+            &self.rows
+        }
+        fn has_more(&self) -> bool {
+            self.has_more
+        }
+    }
+    // Use the production publication route available with default features.
+    // Every carrier and retained payload keeps this store's original reader.
+    fn page(
+        owner: ReadMemoryOwner,
+        columns: Vec<String>,
+        rows: Vec<Vec<contextdb_core::Value>>,
+        has_more: bool,
+    ) -> CursorPage {
+        let payload_bytes = columns.capacity() * std::mem::size_of::<String>()
+            + columns.iter().map(String::capacity).sum::<usize>()
+            + rows.capacity() * std::mem::size_of::<Vec<contextdb_core::Value>>()
+            + rows
+                .iter()
+                .map(|row| {
+                    row.capacity() * std::mem::size_of::<contextdb_core::Value>()
+                        + row
+                            .iter()
+                            .map(|value| match value {
+                                contextdb_core::Value::Text(text) => text.capacity(),
+                                _ => 0,
+                            })
+                            .sum::<usize>()
+                })
+                .sum::<usize>();
+        let payload = ReadCredit::try_new_owned(
+            owner.clone(),
+            payload_bytes,
+            "reader",
+            "cursor_page_fixture",
+            "Release the retained test page.",
+        )
+        .expect("admit the actual retained fixture buffers");
+        CursorPage::try_prepare::<Page>(owner)
+            .expect("admit the exact immutable carrier layout")
+            .publish(Page {
+                columns,
+                rows,
+                has_more,
+                _payload: payload,
+            })
+    }
+    let store_dir = tempfile::tempdir().expect("create the scratch store directory");
+    let db = contextdb_engine::Database::open(store_dir.path().join("reader.db"))
+        .expect("open a scratch store");
+    let owner = db
+        .declared_reader_memory()
+        .expect("use the store's declared reader");
+    let empty = page(owner.clone(), vec!["id".to_owned()], vec![], false);
     assert_eq!(empty.validate(), Ok(()));
 
-    let populated = CursorPage {
-        columns: vec!["id".to_owned(), "payload".to_owned()],
-        rows: vec![
+    let populated = page(
+        owner.clone(),
+        vec!["id".to_owned(), "payload".to_owned()],
+        vec![
             vec![
                 contextdb_core::Value::Int64(1),
                 contextdb_core::Value::Text("first".to_owned()),
             ],
             vec![contextdb_core::Value::Int64(2), contextdb_core::Value::Null],
         ],
-        has_more: true,
-    };
+        true,
+    );
     assert_eq!(populated.validate(), Ok(()));
 
-    let wrong_arity = CursorPage {
-        rows: vec![
-            populated.rows[0].clone(),
+    let wrong_arity = page(
+        owner,
+        populated.columns().to_vec(),
+        vec![
+            populated.rows()[0].clone(),
             vec![contextdb_core::Value::Int64(2)],
         ],
-        ..populated.clone()
-    };
+        populated.has_more(),
+    );
     assert_eq!(
         wrong_arity.validate(),
         Err(ReadContractViolation::CursorRowArityMismatch {
@@ -1661,5 +1730,25 @@ fn metadata_page_validation_handles_empty_pages_for_every_vocabulary() {
             ..non_progressing
         };
         assert_eq!(exhausted.validate(), Ok(()));
+    }
+}
+
+#[test]
+fn a_readiness_absent_detail_belongs_to_direct_read_requires_writer_alone() {
+    let detail = ReadFailureDetail::ReadinessAbsent {
+        reason: "the relational index readiness table is absent".to_owned(),
+    };
+    let failure = ReadFailure::new(ReadFailureKind::DirectReadRequiresWriter, detail.clone())
+        .expect("the refusal that reports absent readiness accepts its detail");
+    assert_read_failure_round_trip(failure, ReadFailureKind::DirectReadRequiresWriter.class());
+    for kind in ReadFailureKind::ALL {
+        if kind == ReadFailureKind::DirectReadRequiresWriter {
+            continue;
+        }
+        assert_eq!(
+            ReadFailure::new(kind, detail.clone()),
+            Err(ReadFailureConstructionError::KindDetailMismatch),
+            "{kind:?} does not report absent readiness"
+        );
     }
 }

@@ -22,6 +22,10 @@ fi
 [[ -x "$server" ]] || { printf 'FAIL installed contextdb server is missing\n' >&2; exit 2; }
 command -v python3 >/dev/null 2>&1 || { printf 'FAIL installed smoke requires python3 for JSON receipt validation\n' >&2; exit 2; }
 
+# The transport fixture has a 64 MiB row; snapshot/key observers must admit
+# that row and its decoded copies independently of the sync path's budgets.
+snapshot_read_memory=$((512 * 1024 * 1024))
+
 work="$(mktemp -d)"
 hub_pid=""
 
@@ -116,8 +120,8 @@ kill_hub_at_checkpoint() {
 snapshot_state() {
   local db="$1"
   local artifact="$2"
-  "$cli" snapshot export "$db" "$artifact" --json >/dev/null
-  "$cli" inspect sync-apply-state "$artifact" --json
+  "$cli" --read-memory "$snapshot_read_memory" snapshot export "$db" "$artifact" --json >/dev/null
+  "$cli" --read-memory "$snapshot_read_memory" inspect sync-apply-state "$artifact" --json
 }
 
 normalize_sync_apply_state() {
@@ -146,14 +150,14 @@ hub_progress() {
 
 parent_key_state() {
   local artifact="$1"
-  "$cli" inspect key "$artifact" --table smoke_parents \
+  "$cli" --read-memory "$snapshot_read_memory" inspect key "$artifact" --table smoke_parents \
     --key-json '{"column":"id","value":{"Uuid":"11111111-1111-4111-8111-111111111111"},"rest":[]}' \
     --json
 }
 
 child_key_state() {
   local artifact="$1"
-  "$cli" inspect key "$artifact" --table smoke_children \
+  "$cli" --read-memory "$snapshot_read_memory" inspect key "$artifact" --table smoke_children \
     --key-json '{"column":"id","value":{"Uuid":"22222222-2222-4222-8222-222222222222"},"rest":[]}' \
     --json
 }

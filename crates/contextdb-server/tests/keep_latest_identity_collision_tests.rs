@@ -100,7 +100,7 @@ fn outcomes(db: &Database) -> Vec<(String, String)> {
         )
         .expect("outcome scan");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match (&row[0], &row[1]) {
             (Value::Text(id), Value::Text(notes)) => (id.clone(), notes.clone()),
@@ -134,7 +134,8 @@ fn start_hub(broker: &InProcessBroker, tenant: &str) -> RunningHub {
             TenantId::from(tenant),
             hub_node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -160,6 +161,7 @@ fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, tenant: &str) -> Sy
         TenantId::from(tenant),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 async fn drain_push(client: &SyncClient) {

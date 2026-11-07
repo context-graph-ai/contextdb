@@ -14,8 +14,8 @@
 //! anything that changes behavior -- an operator reads what a server will do
 //! from the command that started it, not from the shell around it.
 
-use crate::common::{ensure_release_binaries, output_string, server_bin, temp_db_file};
-use std::process::{Command, Stdio};
+use crate::common::{ensure_release_binaries, output_string, server_command, temp_db_file};
+use std::process::Stdio;
 use tempfile::TempDir;
 
 /// Every read ceiling and timeout the file-backed writer exposes, which the
@@ -38,7 +38,7 @@ const OWNER_READ_FLAGS: [&str; 13] = [
 
 fn server_help() -> String {
     ensure_release_binaries();
-    let output = Command::new(server_bin())
+    let output = server_command()
         .arg("--help")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -97,13 +97,13 @@ fn s02_no_owner_read_behaviour_flag_has_an_environment_alias() {
     );
 }
 
-/// A memory store has no file to serve from and no channel to place, so
-/// naming a read setting alongside one is an invalid invocation rather than a
-/// value that quietly does nothing.
+/// `:memory:` names no database file, so an invocation that names it is
+/// refused as a usage error, whatever read setting accompanies it, rather than
+/// quietly doing nothing.
 #[test]
 fn s03_a_memory_store_with_an_owner_read_flag_is_refused_at_startup() {
     ensure_release_binaries();
-    let output = Command::new(server_bin())
+    let output = server_command()
         .args([
             "--db-path",
             ":memory:",
@@ -143,7 +143,7 @@ fn s04_an_unusable_runtime_directory_leaves_the_server_running_and_says_so_once(
     let unusable = tmp.path().join("not-a-directory");
     std::fs::write(&unusable, b"this is a file, not a directory\n").expect("place a file there");
 
-    let output = Command::new(server_bin())
+    let output = server_command()
         .args([
             "--db-path",
             db_path.to_str().expect("utf-8 db path"),
@@ -187,7 +187,7 @@ fn s05_a_file_backed_server_serves_owner_reads_by_default() {
     let runtime_dir = tmp.path().join("s05-runtime");
     std::fs::create_dir(&runtime_dir).expect("create the runtime root");
 
-    let output = Command::new(server_bin())
+    let output = server_command()
         .args([
             "--db-path",
             db_path.to_str().expect("utf-8 db path"),
@@ -222,7 +222,7 @@ fn s06_no_owner_reads_is_reported_as_serving_disabled() {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = temp_db_file(&tmp, "s06.db");
 
-    let output = Command::new(server_bin())
+    let output = server_command()
         .args([
             "--db-path",
             db_path.to_str().expect("utf-8 db path"),

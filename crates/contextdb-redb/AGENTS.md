@@ -1,56 +1,24 @@
 # contextdb-redb — Agent Rules
 
-Repo-wide rules are in the [root `AGENTS.md`](../../AGENTS.md). This crate is ContextDB's
-maintained fork of the upstream redb 4.1.0 package: the single-file, crash-safe B-tree store under
-every file-backed database.
+Purpose: provide the maintained redb 4.1.0 B-tree storage dependency beneath file-backed stores.
+Read the [root rules](../../AGENTS.md) and binding [MAINTENANCE.md](MAINTENANCE.md).
 
-## Owns, and must not own
+## Owns / must not own
 
-Owns: redb's storage engine, plus the retained delta upstream lacks — bounded resumable
-compaction (`compact_step` with `CompactionCursor`/`CompactionProgress`, relocating a finite page
-batch that yields to a waiting writer), live-reader observations, a retained statistics snapshot
-(`storage_statistics_snapshot`), thread-scoped read admission and backend-read observation
-(`read_admission.rs`: `with_read_memory_admission`, `with_read_page_charge`, `ReadPageCharge`,
-`observe_backend_reads`), a graceful
-read-only handoff that publishes a clean committed header while the writer still owns the file
-(`Database::prepare_read_only_handoff`), and per-table root fingerprints read without faulting
-payload pages (`table_root_fingerprint`) with a same-transaction callback after a relocation batch
-(`compact_step_with_hook`) so the engine can bind a moved root before commit.
-The `contextdb-internal` byte-table seam adds lazy bounded lookup, prefix/value-prefix iteration
-and a root-pinned `BoundedByteCursor` / `BoundedByteHandle` (`tree_store/bounded_bytes.rs`). It can
-reject an unrelated oversized singleton through charged windows; a possible match uses ordinary
-complete-page admission and decoding. Retained roots keep complete checksum verification.
-<!-- enforced by: crates/contextdb-redb/src/tree_store/bounded_bytes.rs::absent_lookup_and_prefix_neighbor_reject_without_materializing_the_extent, crates/contextdb-redb/src/tree_store/bounded_bytes.rs::retained_root_inspection_keeps_full_checksum_admission -->
-
-Must not own: any ContextDB policy — thresholds, batch sizes, intervals, memory limits, table
-layouts. The engine decides those (`persistence.rs` calls `compact_step` with its own 64-page
-batch). **The delta against upstream stays minimal**, and the five upstream integration targets
-(`backward_compatibility`, `basic_tests`, `integration_tests`, `multimap_tests`,
-`multithreading_tests`) stay byte-identical to upstream. What ContextDB builds on top of redb is
-additive code and lives in the engine, not here.
-
-Deferred-free cleanup uses separate extent and entry budgets: one unit per allocated extent
-reclaimed and one per free-list entry visited, shared across both free trees. Each tree receives
-an initial fair share; unused capacity can pass to the other tree. The engine sets
-each budget to 64 per durable commit. On idle owner close, eligible backlog drains through
-repeated commits that retain those per-commit caps. An extent can span multiple physical pages,
-so the engine's append-time and memory acceptance gates still apply to this cleanup.
-The `test-seams` fault at an eligible cleanup commit simulates a storage I/O
-failure after the pending free lists have been checked, so engine close tests
-can prove the error reaches the caller without publishing a partial commit.
-
-[`MAINTENANCE.md`](MAINTENANCE.md) is binding: the exact upstream package, checksum and revision,
-every changed source file and why, the complete delta ([`upstream-4.1.0.patch`](upstream-4.1.0.patch))
-with the command that regenerates it, the upgrade procedure, and the upstream proposals. A change
-to `src/` updates the patch and that table in the same commit.
+Owns bounded compaction, retained-root primitives, page admission and allocator paging. Engine
+owns all ContextDB thresholds, schedules, layouts and memory policy; additive orchestration
+belongs there. Keep the fork delta minimal, the five upstream integration targets byte-identical,
+and update `upstream-4.1.0.patch` plus MAINTENANCE's source table for every source change.
 
 ## Seams
 
-- **Library name** stays `redb`; the engine depends on package `contextdb-redb`, published first.
-- **Outside the workspace** (`exclude` in the root `Cargo.toml`): it builds and tests from its own
-  manifest and its own upstream `Cargo.lock`, so `cargo test --workspace` never covers it.
-- **Above:** only `contextdb-engine` (`persistence.rs`, `read_image_memory.rs`,
-  `vector_observations.rs`). The `test-seams` feature exposes `write_wait_observer` to engine tests.
+Library name `redb`, package `contextdb-redb`, excluded from the workspace: use its own locked
+manifest. Engine is the consumer; core supplies errors/accounting. The `contextdb-internal`
+feature exposes `compact_step`/`compact_step_with_hook`, root fingerprints, external retained
+snapshots and bounded byte-table cursors. Native views keep the paired committed id/root and
+admitted retention guard. Never add test-observation changes to the fork for an engine defect.
+Allocator bitmaps use bounded windows and same-directory scratch; engine funds their envelope.
+Deferred-free cleanup has separate extent/entry budgets; engine sets them and drives close drain.
 
 ## Invariants and their guards
 
@@ -70,6 +38,10 @@ to `src/` updates the patch and that table in the same commit.
 | Bounded cursor handles keep their captured root across abort, commit and reopen; retained roots use complete checksum admission | `src/tree_store/bounded_bytes.rs::tests::cursor_handles_pin_the_old_root_across_abort_commit_reopen_and_integrity`, `src/tree_store/bounded_bytes.rs::tests::cursor_retained_root_keeps_full_checksum_admission` |
 | Singleton insert-before, insert-after with a small separator, and neighboring deletion preserve the old giant value without faulting it; a giant separator keeps ordinary extent admission | `src/tree_store/bounded_bytes.rs::tests::value_prefix_rejection_and_insert_before_preserve_abort_reopen_and_pinned_reader`, `src/tree_store/bounded_bytes.rs::tests::small_separator_splits_both_orders_without_faulting_the_giant_value`, `src/tree_store/bounded_bytes.rs::tests::insert_after_separator_window_refuses_before_read_and_releases_its_owner`, `src/tree_store/bounded_bytes.rs::tests::insert_after_giant_separator_uses_ordinary_extent_admission`, `src/tree_store/bounded_bytes.rs::tests::deleting_a_partial_leaf_does_not_fault_its_large_singleton_neighbor` |
 | An externally registered root remains readable when a writer grows the file after the reader captures its header | `src/db.rs` → `test::external_reader_keeps_its_root_when_writer_grows_after_header_read` (requires `contextdb-internal`); `crates/contextdb-engine/tests/read/cursor_survives_writer_handover.rs` → `cursor_opened_before_writer_handover_finishes_its_snapshot` |
+| Allocator open work is a fixed number of region decodes however many regions the file has | `tests/allocator_residency_contract.rs` → `allocator_open_decodes_a_fixed_number_of_regions` |
+| Dirty allocator windows stay bounded inside one transaction, and spilled state survives non-durable then durable commits, aborts, retained readers and registered external snapshots | `tests/allocator_residency_contract.rs` → `allocator_windows_bound_dirty_regions_in_one_transaction`, `allocator_nondurable_then_durable_commit_preserves_spilled_rows`, `allocator_abort_repair_and_retained_reader_preserve_exact_rows`, `allocator_spill_preserves_registered_external_snapshot` |
+| A scratch failure at any point refuses publication and the next open repairs from the durable root; a backend without scratch keeps the in-memory allocator | `tests/allocator_residency_contract.rs` → `allocator_scratch_failure_prevents_publication_and_repairs_on_reopen`, `allocator_nth_scratch_faults_refuse_publication_and_repair`, `allocator_backend_without_scratch_keeps_its_in_memory_fallback` |
+| Compaction in one-page batches keeps every root, and a refused first batch does fixed work before admission | `tests/allocator_residency_contract.rs` → `allocator_one_page_compaction_batches_finish_and_preserve_roots`, `allocator_compaction_rejection_has_fixed_pre_admission_work` |
 | Files written by older redb releases still open | `tests/backward_compatibility.rs` (upstream suite) |
 | The fork's `Cargo.lock` is unchanged by packaging | no Rust test — checked by `scripts/verify-packaged-engine.sh` |
 | Recorded `upstream-4.1.0.patch` hunks produce the maintained source lines they name | `crates/contextdb-core/tests/redb_fork_patch_matches_its_sources.rs::the_redb_fork_patch_produces_the_sources_it_names` |
@@ -79,20 +51,15 @@ to `src/` updates the patch and that table in the same commit.
 
 | Change | Where it lands |
 |---|---|
-| When to compact, batch size, thresholds, handle recycling | Engine crate, `persistence.rs` — never here |
-| Page ownership and admission lifetime | `read_admission.rs`, `tree_store/page_store/cached_file.rs` (`PageMemory`, `CachedPage`, `ChargedPage`); limits and budget policy stay in the engine. |
-| Reject-only byte-table inspection, opaque cursors and complete-node layout validation | `tree_store/bounded_bytes.rs`, exported through `table.rs`, `transactions.rs` and `lib.rs` behind `contextdb-internal`; windows in `page_store/cached_file.rs` / `page_manager.rs`. Inventory policy stays in the engine. |
-| Commit work and write observation | `commit_work.rs`, `table_write_observer.rs`, `transactions.rs`, `transaction_tracker.rs`; engine policy stays in `persistence.rs`. |
-| Table mutation or storage key layout | `table.rs`, `multimap_table.rs`, `tree_store/`; update `MAINTENANCE.md` and the fork patch for any fork delta. |
-| Engine-facing retained-root reader entry points | `src/db.rs`: `Builder::open_read_only_external_with_backend`, `ReadOnlyDatabase::begin_external_read`, `Database::begin_external_read_nonblocking`, and `Builder::create_with_backend_and_external_snapshots` behind non-default `contextdb-internal` (`Cargo.toml`); the engine owns authenticated registration and root lifetime. See `MAINTENANCE.md` for the retained fork delta. |
-| A storage primitive the engine cannot build from outside | Here, as the smallest upstream-shaped change, plus the patch and MAINTENANCE.md row |
-| An upstream upgrade | MAINTENANCE.md: start from the new package and its unmodified tests and lockfile, rebase the delta, bump this package and the engine dependency together |
-| Exporting fork primitives and testing backend region opening | `src/lib.rs`, `src/open_with_backend_region_override_tests.rs`; backend behavior remains in `src/db.rs`. |
+| Compaction policy, admission limits, batch size | Engine persistence; never here. |
+| Bounded byte lookup/cursor and layout validation | `tree_store/bounded_bytes.rs`, exported through `table.rs`, `transactions.rs`, `lib.rs`. |
+| Page lifetime and charge | `read_admission.rs`, `tree_store/page_store/cached_file.rs`; refund after physical free. |
+| Allocator windows / scratch | `tree_store/page_store/{allocator_pager,bitmap,buddy_allocator,region,page_manager}.rs`, `file_backend/`, `db.rs`. |
+| Retained-root readers / commit hooks | `db.rs`, `transactions.rs`, `transaction_tracker.rs`, `commit_work.rs`, `table_write_observer.rs`. |
+| Upstream upgrade or any source delta | Follow MAINTENANCE.md; regenerate the patch and retain upstream tests/lockfile. |
 
 ## Fast tests
 
-```bash
-cargo test --manifest-path crates/contextdb-redb/Cargo.toml --locked
-cargo test --manifest-path crates/contextdb-redb/Cargo.toml --locked --features contextdb-internal
-cargo test -p contextdb-engine --features test-seams --test engine_seams
-```
+`cargo test --manifest-path crates/contextdb-redb/Cargo.toml --locked --features contextdb-internal`
+
+`cargo test -p contextdb-engine --features test-seams --test engine_seams`

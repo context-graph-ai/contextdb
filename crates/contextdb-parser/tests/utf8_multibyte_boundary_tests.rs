@@ -239,6 +239,10 @@ impl ScanContext {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn parse_never_panics_across_a_generated_utf8_width_and_offset_matrix() {
     // Pre-fix, most of this matrix panics — silence the default panic hook's
     // per-case backtrace spam for the duration of this test only.
@@ -287,6 +291,10 @@ fn parse_never_panics_across_a_generated_utf8_width_and_offset_matrix() {
 // asserted to be a typed `Err`, not just "no panic".
 // ============================================================================
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn assert_never_panics_and_is_err(sql: &str) {
     let outcome = std::panic::catch_unwind(|| parse(sql));
     let result = outcome.unwrap_or_else(|_| panic!("parse() panicked on malformed input {sql:?}"));

@@ -1,10 +1,27 @@
-use contextdb_core::{Direction, RowId, SnapshotId, Value, VectorIndexRef};
+use contextdb_core::Direction;
+#[cfg(feature = "test-seams")]
+use contextdb_core::RowId;
+#[cfg(feature = "test-seams")]
+use contextdb_core::SnapshotId;
+use contextdb_core::Value;
+use contextdb_core::VectorIndexRef;
 use contextdb_engine::Database;
+#[cfg(feature = "test-seams")]
 use contextdb_engine::memory_accounting::MemoryAccountant;
-use contextdb_engine::sync_types::{
-    ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange, EdgeChange, NaturalKey, RowChange,
-    VectorChange,
-};
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::ChangeSet;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::DdlChange;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::EdgeChange;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::NaturalKey;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::RowChange;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::VectorChange;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -18,6 +35,7 @@ fn empty() -> HashMap<String, Value> {
 
 /// RED — t21_01
 #[test]
+#[cfg(feature = "test-seams")]
 fn t21_01_concurrent_reader_never_sees_torn_three_paradigm_commit() {
     use contextdb_core::RowId;
     use std::sync::mpsc;
@@ -122,6 +140,7 @@ fn t21_01_concurrent_reader_never_sees_torn_three_paradigm_commit() {
         > 0;
     let raw_phase_has_new_vec = db
         .live_vector_entry(target_row_id, raw_phase_snapshot)
+        .expect("read the actual fixture observation")
         .is_some_and(|entry| entry.vector == vec![0.0, 1.0, 0.0]);
     assert_eq!(
         (
@@ -146,6 +165,7 @@ fn t21_01_concurrent_reader_never_sees_torn_three_paradigm_commit() {
     let has_edge = db.edge_count(src_id, "LINKS", snap).unwrap_or(0) > 0;
     let has_new_vec = db
         .live_vector_entry(target_row_id, snap)
+        .expect("read the actual fixture observation")
         .is_some_and(|entry| entry.vector == vec![0.0, 1.0, 0.0]);
     assert_eq!(
         (has_renamed, has_edge, has_new_vec),
@@ -175,6 +195,7 @@ fn t21_01_concurrent_reader_never_sees_torn_three_paradigm_commit() {
     );
     assert_eq!(
         db.live_vector_entry(target_row_id, snap)
+            .expect("read the actual fixture observation")
             .expect("target row has live vector after commit")
             .vector,
         vec![0.0, 1.0, 0.0],
@@ -564,10 +585,19 @@ fn t21_05_subscriber_observes_consistent_snapshot_after_event() {
     );
 
     let index = VectorIndexRef::new("entities", "embedding");
-    let mutate_existing = db.begin_or_panic();
-    db.delete_edge(mutate_existing, source_id, target_id, "LINKS")
-        .unwrap();
-    db.commit(mutate_existing).unwrap();
+    // The original edge is a row of the SQL edges table, so it is removed as
+    // that row: deleting the row removes its relational binding and its graph
+    // edge together.
+    assert_eq!(
+        db.execute(
+            "DELETE FROM edges WHERE id = $eid",
+            &HashMap::from([("eid".to_string(), Value::Uuid(Uuid::from_u128(750)))]),
+        )
+        .unwrap()
+        .rows_affected(),
+        1,
+        "the original edge row is deleted through SQL"
+    );
     let mut mutate_target = HashMap::new();
     mutate_target.insert("target".into(), Value::Uuid(target_id));
     mutate_target.insert("vcurrent".into(), Value::Vector(vec![0.0, 0.0, 1.0]));
@@ -604,6 +634,7 @@ fn t21_05_subscriber_observes_consistent_snapshot_after_event() {
         .row_id;
     let current_live = db
         .live_vector_entry(later_target_row_id, db.snapshot())
+        .expect("read the actual fixture observation")
         .expect("current snapshot must have the later vector entry");
     assert_eq!(
         current_live.vector,
@@ -619,6 +650,7 @@ fn t21_05_subscriber_observes_consistent_snapshot_after_event() {
         .row_id;
     let current_mutated_target = db
         .live_vector_entry(current_target_row_id, db.snapshot())
+        .expect("read the actual fixture observation")
         .expect("current snapshot must have the target's later vector");
     assert_eq!(
         current_mutated_target.vector,
@@ -669,6 +701,7 @@ fn t21_05_subscriber_observes_consistent_snapshot_after_event() {
     );
     let live = db
         .live_vector_entry(target_row_id, snap)
+        .expect("read the actual fixture observation")
         .expect("target row must have a live vector at event LSN");
     assert_eq!(
         live.vector,
@@ -676,7 +709,9 @@ fn t21_05_subscriber_observes_consistent_snapshot_after_event() {
         "vector index not visible at event LSN"
     );
     assert!(
-        db.live_vector_entry(later_target_row_id, snap).is_none(),
+        db.live_vector_entry(later_target_row_id, snap)
+            .expect("read the actual fixture observation")
+            .is_none(),
         "later vector entry leaked into the event-rooted snapshot"
     );
     let historical_vector = db
@@ -1050,9 +1085,9 @@ fn t21_10_snapshot_at_lsn_survives_reopen_after_later_mutations() {
             snap,
         )
         .unwrap();
-    assert_eq!(indexed_historical.trace.physical_plan, "IndexScan");
+    assert_eq!(indexed_historical.trace().physical_plan, "IndexScan");
     assert_eq!(
-        indexed_historical.rows,
+        indexed_historical.rows(),
         vec![vec![
             Value::Text("event-target".to_string()),
             Value::Vector(vec![0.0, 1.0, 0.0])
@@ -1073,6 +1108,7 @@ fn t21_10_snapshot_at_lsn_survives_reopen_after_later_mutations() {
     assert_eq!(
         reopened
             .live_vector_entry(target_row_id, snap)
+            .expect("read the actual fixture observation")
             .expect("event-time vector must survive reopen")
             .vector,
         vec![0.0, 1.0, 0.0]
@@ -1159,9 +1195,9 @@ fn t21_11_snapshot_at_lsn_preserves_reinserted_graph_edge_after_reopen() {
 }
 
 #[test]
-fn t21_12_reconstructed_commit_index_is_backfilled_before_new_commits() {
+fn t21_12_missing_commit_directory_refuses_without_repair() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let path = tmp.path().join("commit-index-backfill.db");
+    let path = tmp.path().join("missing-commit-directory.db");
     let old_id = Uuid::from_u128(0x2116);
     let new_id = Uuid::from_u128(0x2117);
 
@@ -1186,13 +1222,6 @@ fn t21_12_reconstructed_commit_index_is_backfilled_before_new_commits() {
         lsn
     };
 
-    let redb_db = redb::Database::open(&path).unwrap();
-    let write_txn = redb_db.begin_write().unwrap();
-    let commit_index: redb::TableDefinition<u64, u64> = redb::TableDefinition::new("commit_index");
-    let _ = write_txn.delete_table(commit_index);
-    write_txn.commit().unwrap();
-    drop(redb_db);
-
     {
         let db = Database::open(&path).unwrap();
         db.execute(
@@ -1211,15 +1240,86 @@ fn t21_12_reconstructed_commit_index_is_backfilled_before_new_commits() {
         old_rows
             .iter()
             .any(|row| matches!(row.values.get("id"), Some(Value::Uuid(id)) if *id == old_id)),
-        "reopened snapshot_at(old_lsn) must still resolve through the backfilled commit index"
+        "reopened snapshot_at(old_lsn) must still resolve through the intact commit directory"
     );
     assert!(
         !old_rows
             .iter()
             .any(|row| matches!(row.values.get("id"), Some(Value::Uuid(id)) if *id == new_id)),
-        "old snapshot must not floor to the later commit-index entry after backfill"
+        "old snapshot must not floor to the later commit-index entry after later publication"
     );
     reopened.close().unwrap();
+
+    // The commit directory is authoritative; its committed root cannot be
+    // reconstructed from row history when the entire directory is missing.
+    let redb_db = redb::Database::open(&path).unwrap();
+    let write = redb_db.begin_write().unwrap();
+    assert!(
+        write
+            .delete_table(redb::TableDefinition::<u64, u64>::new("commit_index"))
+            .unwrap()
+    );
+    write.commit().unwrap();
+    drop(redb_db);
+
+    type DurableState = (Vec<(Vec<u8>, Vec<u8>)>, Vec<(String, Vec<u8>)>);
+
+    fn durable_state(path: &std::path::Path) -> DurableState {
+        use redb::{ReadableDatabase, ReadableTable};
+        let db = redb::Database::open(path).unwrap();
+        let read = db.begin_read().unwrap();
+        assert!(matches!(
+            read.open_table(redb::TableDefinition::<u64, u64>::new("commit_index")),
+            Err(redb::TableError::TableDoesNotExist(_))
+        ));
+        let rows = read
+            .open_table(redb::TableDefinition::<&[u8], &[u8]>::new("rel_items"))
+            .unwrap()
+            .iter()
+            .unwrap()
+            .map(|entry| {
+                let (key, value) = entry.unwrap();
+                (key.value().to_vec(), value.value().to_vec())
+            })
+            .collect();
+        let recovery = read
+            .open_table(redb::TableDefinition::<&str, &[u8]>::new("writer_recovery"))
+            .unwrap()
+            .iter()
+            .unwrap()
+            .map(|entry| {
+                let (key, value) = entry.unwrap();
+                (key.value().to_owned(), value.value().to_vec())
+            })
+            .collect();
+        (rows, recovery)
+    }
+    let damaged = durable_state(&path);
+    let is_directory_refusal = |error: &contextdb_core::Error| {
+        matches!(error,
+        contextdb_core::Error::StoreCorrupted { path, reason }
+        if path == "writer_recovery" && reason == "commit directory differs from its committed root")
+    };
+    assert!(!is_directory_refusal(
+        &contextdb_core::Error::StoreCorrupted {
+            path: "rel_items".to_owned().into(),
+            reason: "commit directory differs from its committed root"
+                .to_owned()
+                .into(),
+        }
+    ));
+    for _ in 0..2 {
+        let error = match Database::open(&path) {
+            Err(error) => error,
+            Ok(_) => panic!("a missing authoritative directory must refuse before publication"),
+        };
+        assert!(is_directory_refusal(&error), "{error:?}");
+        assert_eq!(
+            durable_state(&path),
+            damaged,
+            "refused open must preserve row and recovery bytes and keep the directory missing"
+        );
+    }
 }
 
 #[test]
@@ -1280,6 +1380,7 @@ fn t21_13_same_tx_graph_delete_then_reinsert_keeps_new_edge() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t21_14_mixed_sync_edge_error_rolls_back_rows() {
     let db = Database::open_memory();
     db.execute(
@@ -1338,6 +1439,7 @@ fn t21_14_mixed_sync_edge_error_rolls_back_rows() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t21_16_mixed_sync_vector_error_rolls_back_rows() {
     let db = Database::open_memory();
     db.execute(
@@ -1393,72 +1495,20 @@ fn t21_16_mixed_sync_vector_error_rolls_back_rows() {
 }
 
 #[test]
-fn t21_15_current_commit_index_damage_is_repaired_on_reopen() {
-    assert_current_commit_index_repair(false);
+fn t21_15_current_commit_index_damage_refuses_reopen() {
+    assert_current_commit_index_integrity_refusal(false);
 }
 
 #[test]
-fn current_nonmonotonic_transaction_ids_are_repaired_on_reopen() {
-    assert_current_commit_index_repair(true);
+fn current_nonmonotonic_transaction_ids_refuse_reopen() {
+    assert_current_commit_index_integrity_refusal(true);
 }
 
-fn assert_current_commit_index_repair(disorder_ids: bool) {
-    use redb::ReadableTable;
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    struct PersistedVersionedRow {
-        row_id: contextdb_core::RowId,
-        values: HashMap<String, PersistedValue>,
-        created_tx: contextdb_core::TxId,
-        deleted_tx: Option<contextdb_core::TxId>,
-        lsn: contextdb_core::Lsn,
-        created_at: Option<contextdb_core::Wallclock>,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    enum PersistedValue {
-        Plain(Value),
-        Vector(PersistedVector),
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    enum PersistedVector {
-        F32(Vec<f32>),
-        SQ8 {
-            min: f32,
-            max: f32,
-            len: u32,
-            payload: Vec<u8>,
-        },
-        SQ4 {
-            min: f32,
-            max: f32,
-            len: u32,
-            payload: Vec<u8>,
-        },
-    }
-
-    fn encode<T: Serialize>(value: &T) -> Vec<u8> {
-        bincode::serde::encode_to_vec(value, bincode::config::standard()).unwrap()
-    }
-
-    fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> T {
-        bincode::serde::decode_from_slice(bytes, bincode::config::standard())
-            .unwrap()
-            .0
-    }
-
-    fn row_key(row: &PersistedVersionedRow) -> Vec<u8> {
-        let mut key = Vec::with_capacity(24);
-        key.extend_from_slice(&row.row_id.0.to_be_bytes());
-        key.extend_from_slice(&row.created_tx.0.to_be_bytes());
-        key.extend_from_slice(&row.lsn.0.to_be_bytes());
-        key
-    }
+fn assert_current_commit_index_integrity_refusal(disorder_ids: bool) {
+    use redb::{ReadableDatabase, ReadableTable};
 
     let tmp = tempfile::TempDir::new().unwrap();
-    let path = tmp.path().join("current-commit-index-repair.db");
+    let path = tmp.path().join("current-commit-index-integrity.db");
     let first_id = Uuid::from_u128(0x2121);
     let second_id = Uuid::from_u128(0x2122);
     let versioned_id = Uuid::from_u128(0x2123);
@@ -1498,117 +1548,69 @@ fn assert_current_commit_index_repair(disorder_ids: bool) {
         (first_lsn, second_lsn, before_lsn, after_lsn)
     };
 
-    let redb_db = redb::Database::open(&path).unwrap();
-    let write_txn = redb_db.begin_write().unwrap();
-    if disorder_ids {
-        let rel_items: redb::TableDefinition<&[u8], &[u8]> =
-            redb::TableDefinition::new("rel_items");
-        let mut rows = Vec::new();
-        {
-            let table = write_txn.open_table(rel_items).unwrap();
-            for entry in table.iter().unwrap() {
-                let (_, value) = entry.unwrap();
-                let mut row: PersistedVersionedRow = decode(value.value());
-                match row.values.get("label") {
-                    Some(PersistedValue::Plain(Value::Text(label))) if label == "first" => {
-                        row.created_tx = contextdb_core::TxId(2);
-                    }
-                    Some(PersistedValue::Plain(Value::Text(label))) if label == "second" => {
-                        row.created_tx = contextdb_core::TxId(1);
-                    }
-                    Some(PersistedValue::Plain(Value::Text(label))) if label == "before" => {
-                        row.created_tx = contextdb_core::TxId(4);
-                        row.deleted_tx = Some(contextdb_core::TxId(3));
-                    }
-                    Some(PersistedValue::Plain(Value::Text(label))) if label == "after" => {
-                        row.created_tx = contextdb_core::TxId(3);
-                    }
-                    _ => {}
-                }
-                rows.push(row);
-            }
-        }
-        write_txn.delete_table(rel_items).unwrap();
-        {
-            let mut table = write_txn.open_table(rel_items).unwrap();
-            for row in &rows {
-                table
-                    .insert(row_key(row).as_slice(), encode(row).as_slice())
-                    .unwrap();
-            }
-        }
-    }
-    let commit_index: redb::TableDefinition<u64, u64> = redb::TableDefinition::new("commit_index");
-    let mut index = write_txn.open_table(commit_index).unwrap();
-    for lsn in [first_lsn, second_lsn, before_lsn, after_lsn] {
-        assert!(
-            index.remove(lsn.0).unwrap().is_some(),
-            "fixture must remove the current commit-index entry at {lsn:?}"
-        );
-    }
-    drop(index);
-    write_txn.commit().unwrap();
-    drop(redb_db);
-
-    let repaired = Database::open(&path).unwrap();
-    let first_rows = repaired
-        .scan("items", repaired.snapshot_at(first_lsn))
+    // Intact history must still preserve every snapshot and later update.
+    let healthy = Database::open(&path).unwrap();
+    let first_rows = healthy
+        .scan("items", healthy.snapshot_at(first_lsn))
         .unwrap();
     assert!(
         first_rows
             .iter()
             .any(|row| matches!(row.values.get("id"), Some(Value::Uuid(id)) if *id == first_id)),
-        "first LSN snapshot must still see the first row after commit-index repair"
+        "first LSN snapshot must still see the first row on an intact commit directory"
     );
     assert!(
         !first_rows
             .iter()
             .any(|row| matches!(row.values.get("id"), Some(Value::Uuid(id)) if *id == second_id)),
-        "first LSN snapshot must not leak the later row after commit-index repair"
+        "first LSN snapshot must not leak the later row on an intact commit directory"
     );
-    let second_rows = repaired
-        .scan("items", repaired.snapshot_at(second_lsn))
+    let second_rows = healthy
+        .scan("items", healthy.snapshot_at(second_lsn))
         .unwrap();
     assert_eq!(second_rows.len(), 2);
-    let before_lookup = repaired
+    let before_lookup = healthy
         .execute_at_snapshot(
             "SELECT label FROM items WHERE id = $id",
             &HashMap::from([("id".to_string(), Value::Uuid(versioned_id))]),
-            repaired.snapshot_at(before_lsn),
+            healthy.snapshot_at(before_lsn),
         )
         .unwrap();
-    assert_eq!(before_lookup.rows, vec![vec![Value::Text("before".into())]]);
-    let after_lookup = repaired
-        .execute_at_snapshot(
-            "SELECT label FROM items WHERE id = $id",
-            &HashMap::from([("id".to_string(), Value::Uuid(versioned_id))]),
-            repaired.snapshot_at(after_lsn),
-        )
-        .unwrap();
-    assert_eq!(after_lookup.rows, vec![vec![Value::Text("after".into())]]);
     assert_eq!(
-        repaired
+        before_lookup.rows(),
+        vec![vec![Value::Text("before".into())]]
+    );
+    let after_lookup = healthy
+        .execute_at_snapshot(
+            "SELECT label FROM items WHERE id = $id",
+            &HashMap::from([("id".to_string(), Value::Uuid(versioned_id))]),
+            healthy.snapshot_at(after_lsn),
+        )
+        .unwrap();
+    assert_eq!(after_lookup.rows(), vec![vec![Value::Text("after".into())]]);
+    assert_eq!(
+        healthy
             .execute(
                 "UPDATE items SET label = 'final' WHERE id = $id",
                 &HashMap::from([("id".to_string(), Value::Uuid(versioned_id))]),
             )
             .unwrap()
-            .rows_affected,
+            .rows_affected(),
         1,
-        "post-repair update must target the current live row version"
+        "healthy-store update must target the current live row version"
     );
     assert_eq!(
-        repaired
+        healthy
             .execute(
                 "SELECT label FROM items WHERE id = $id",
                 &HashMap::from([("id".to_string(), Value::Uuid(versioned_id))]),
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("final".into())]],
-        "post-repair point read must see the updated live version"
+        "healthy-store point read must see the updated live version"
     );
-    repaired.close().unwrap();
+    healthy.close().unwrap();
 
     let reopened = Database::open(&path).unwrap();
     assert_eq!(
@@ -1617,7 +1619,7 @@ fn assert_current_commit_index_repair(disorder_ids: bool) {
             .unwrap()
             .len(),
         2,
-        "commit-index repair must remain durable after a second reopen"
+        "intact snapshot history must remain durable after a second reopen"
     );
     assert_eq!(
         reopened
@@ -1626,11 +1628,157 @@ fn assert_current_commit_index_repair(disorder_ids: bool) {
                 &HashMap::from([("id".to_string(), Value::Uuid(versioned_id))]),
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("final".into())]],
-        "the post-repair update must remain durable after a second reopen"
+        "the healthy-store update must remain durable after a second reopen"
     );
     reopened.close().unwrap();
+
+    // A refused open must not rewrite commit history, row identities or the
+    // recovery records that authenticate the directory.
+    #[derive(Debug, PartialEq, Eq)]
+    struct DurableState {
+        commits: Vec<(u64, u64)>,
+        rows: Vec<(Vec<u8>, Vec<u8>)>,
+        recovery: Vec<(String, Vec<u8>)>,
+    }
+    fn durable_state(path: &std::path::Path) -> DurableState {
+        let db = redb::Database::open(path).unwrap();
+        let read = db.begin_read().unwrap();
+        let commits = read
+            .open_table(redb::TableDefinition::<u64, u64>::new("commit_index"))
+            .unwrap()
+            .iter()
+            .unwrap()
+            .map(|entry| {
+                let (key, value) = entry.unwrap();
+                (key.value(), value.value())
+            })
+            .collect();
+        let rows = read
+            .open_table(redb::TableDefinition::<&[u8], &[u8]>::new("rel_items"))
+            .unwrap()
+            .iter()
+            .unwrap()
+            .map(|entry| {
+                let (key, value) = entry.unwrap();
+                (key.value().to_vec(), value.value().to_vec())
+            })
+            .collect();
+        let recovery = read
+            .open_table(redb::TableDefinition::<&str, &[u8]>::new("writer_recovery"))
+            .unwrap()
+            .iter()
+            .unwrap()
+            .map(|entry| {
+                let (key, value) = entry.unwrap();
+                (key.value().to_owned(), value.value().to_vec())
+            })
+            .collect();
+        DurableState {
+            commits,
+            rows,
+            recovery,
+        }
+    }
+
+    // The damage is planted strictly inside the commit directory: its first and
+    // last entries, which open authenticates separately, stay as committed, and
+    // no row or recovery record is touched, so the only disagreement open can
+    // find is the directory differing from its committed root.
+    let intact = durable_state(&path);
+    let entry = |lsn: contextdb_core::Lsn| {
+        *intact
+            .commits
+            .iter()
+            .find(|(key, _)| *key == lsn.0)
+            .unwrap_or_else(|| panic!("the intact directory records {lsn:?}"))
+    };
+    let (interior_early, interior_late) = (entry(second_lsn), entry(before_lsn));
+    let (directory_first, directory_last) = (
+        *intact
+            .commits
+            .first()
+            .expect("an intact directory has a first entry"),
+        *intact
+            .commits
+            .last()
+            .expect("an intact directory has a last entry"),
+    );
+    assert!(
+        directory_first.0 < interior_early.0
+            && interior_late.0 < directory_last.0
+            && interior_early.1 < interior_late.1,
+        "the planted entries are interior and committed in order: first {directory_first:?}, \
+         planted {interior_early:?} and {interior_late:?}, last {directory_last:?}"
+    );
+    let redb_db = redb::Database::open(&path).unwrap();
+    let write_txn = redb_db.begin_write().unwrap();
+    {
+        let commit_index: redb::TableDefinition<u64, u64> =
+            redb::TableDefinition::new("commit_index");
+        let mut index = write_txn.open_table(commit_index).unwrap();
+        if disorder_ids {
+            // The later commit now names the earlier transaction and the
+            // earlier commit the later one.
+            index.insert(interior_early.0, interior_late.1).unwrap();
+            index.insert(interior_late.0, interior_early.1).unwrap();
+        } else {
+            for (lsn, _) in [interior_early, interior_late] {
+                assert!(
+                    index.remove(lsn).unwrap().is_some(),
+                    "fixture must remove the interior commit-index entry at LSN {lsn}"
+                );
+            }
+        }
+    }
+    write_txn.commit().unwrap();
+    drop(redb_db);
+
+    let damaged = durable_state(&path);
+    let expected_commits: Vec<(u64, u64)> = intact
+        .commits
+        .iter()
+        .filter_map(|&(lsn, tx)| {
+            if lsn == interior_early.0 {
+                disorder_ids.then_some((lsn, interior_late.1))
+            } else if lsn == interior_late.0 {
+                disorder_ids.then_some((lsn, interior_early.1))
+            } else {
+                Some((lsn, tx))
+            }
+        })
+        .collect();
+    assert_eq!(
+        damaged.commits, expected_commits,
+        "only the two interior entries are damaged; the first and last entries are as committed"
+    );
+    assert_eq!(
+        damaged.rows, intact.rows,
+        "the fixture leaves every row record exactly as committed"
+    );
+    assert_eq!(
+        damaged.recovery, intact.recovery,
+        "the fixture leaves every recovery record exactly as committed"
+    );
+    for _ in 0..2 {
+        let error = match Database::open(&path) {
+            Err(error) => error,
+            Ok(_) => panic!(
+                "missing required commit-directory records must refuse open before serving any history"
+            ),
+        };
+        assert!(
+            matches!(error, contextdb_core::Error::StoreCorrupted { ref path, ref reason }
+                if path == "writer_recovery" && reason == "commit directory differs from its committed root"),
+            "required commit-directory damage must retain its typed integrity refusal: {error:?}"
+        );
+        assert_eq!(
+            durable_state(&path),
+            damaged,
+            "refused open must neither rebuild the directory nor rewrite row/recovery records"
+        );
+    }
 }
 
 #[test]
@@ -1677,6 +1825,7 @@ fn t21_17_fk_validation_uses_same_tx_final_state() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t21_18_mixed_sync_ddl_vector_error_does_not_apply_ddl() {
     let db = Database::open_memory();
     db.execute(
@@ -1728,6 +1877,7 @@ fn t21_18_mixed_sync_ddl_vector_error_does_not_apply_ddl() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t21_19_mixed_sync_ddl_edge_error_does_not_apply_ddl() {
     let db = Database::open_memory();
     let id = Uuid::from_u128(0x2119);
@@ -1775,6 +1925,7 @@ fn t21_19_mixed_sync_ddl_edge_error_does_not_apply_ddl() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t21_20_sync_drop_table_removes_vector_state_and_persists() {
     let tmp = tempfile::TempDir::new().unwrap();
     let path = tmp.path().join("sync-drop-vector.db");
@@ -1876,6 +2027,7 @@ fn t21_20_sync_drop_table_removes_vector_state_and_persists() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t21_21_mixed_sync_ddl_vector_memory_error_does_not_apply_ddl() {
     let accountant = Arc::new(MemoryAccountant::with_budget(1300));
     let db = Database::open_memory_with_accountant(accountant);

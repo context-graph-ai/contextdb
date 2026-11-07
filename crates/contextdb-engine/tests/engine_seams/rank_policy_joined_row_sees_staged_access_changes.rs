@@ -168,7 +168,7 @@ fn visible_grants(db: &Database, acl: Uuid) -> usize {
         &params(vec![("acl", Value::Uuid(acl))]),
     )
     .expect("read the grants this handle can see")
-    .rows
+    .rows()
     .len()
 }
 
@@ -178,7 +178,7 @@ fn ranked_query() -> HashMap<String, Value> {
 
 fn ids(result: &contextdb_engine::QueryResult) -> Vec<Uuid> {
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.first() {
             Some(Value::Uuid(id)) => *id,

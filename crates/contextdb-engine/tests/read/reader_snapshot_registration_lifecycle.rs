@@ -7,7 +7,7 @@ use contextdb_core::Error;
 use contextdb_engine::persistence::read_persistence_test_scaffold::{
     ReaderRegistrationLockPhase, WriterReaderSnapshotRegistryObservation,
     observe_writer_reader_snapshots_for_test, pause_reader_registration_lock_for_test,
-    pause_reader_snapshot_registry_scan_for_test,
+    pause_reader_snapshot_registry_scan_for_test, registration_attempt_counts_for_test,
 };
 use contextdb_engine::{Database, ReadSession};
 use std::collections::HashMap;
@@ -56,6 +56,10 @@ fn seed_page_fixture(path: &PathBuf) {
     db.close().expect("close page fixture writer");
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn captured_writer_registry(path: &PathBuf) -> (Database, WriterReaderSnapshotRegistryObservation) {
     let observed = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&observed);
@@ -162,7 +166,7 @@ fn file_session_registration_survives_alias_and_replacement_and_releases_with_it
         .execute("SELECT value FROM items ORDER BY id", &HashMap::new())
         .expect("fixed file session still answers its original hydrated snapshot");
     assert_eq!(
-        result.rows,
+        result.rows(),
         vec![vec![contextdb_core::Value::Text("original".into())]]
     );
     let cursor = session
@@ -254,8 +258,8 @@ fn exact_external_page_retention_is_shared_once_and_released_with_the_last_sessi
         .execute("SELECT value FROM page_items WHERE id = 0", &HashMap::new())
         .expect("first session reads its original snapshot after writer commit");
     assert!(matches!(
-        original.rows.as_slice(),
-        [row] if matches!(row.as_slice(), [contextdb_core::Value::Text(value)] if value.starts_with("snapshot-0-"))
+        original.rows(),
+        [row] if matches!(row.as_slice(), [contextdb_core::Value::Text(value)] if value.starts_with("writer-visible-"))
     ));
 
     for generation in 4..20i64 {
@@ -321,61 +325,150 @@ fn exact_external_page_retention_is_shared_once_and_released_with_the_last_sessi
 
 #[test]
 fn projected_allocator_growth_respects_disk_limit_with_a_live_retained_reader() {
+    // Row timestamps enter authenticated manifest keys and therefore chunk boundaries.
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let root = tempfile::tempdir().expect("scratch directory");
     let path = root.path().join("allocator-reservation.redb");
-    seed_page_fixture(&path);
-    let reader = ReadSession::open(&path).expect("open retained pre-writer snapshot");
-    let writer = Database::open(&path).expect("writer overtakes retained reader");
+    fn prepared(path: &std::path::PathBuf) -> (ReadSession, Database) {
+        seed_page_fixture(path);
+        let reader = ReadSession::open(path).expect("open retained pre-writer snapshot");
+        let writer = Database::open(path).expect("writer overtakes retained reader");
 
-    writer
-        .execute(
-            "UPDATE page_items SET value = $value WHERE id = 0",
-            &HashMap::from([(
-                "value".into(),
-                contextdb_core::Value::Text(format!("writer-{}", "w".repeat(8192))),
-            )]),
-        )
-        .expect("retire pages reachable by the reader");
-    writer
-        .execute(
-            "CREATE TABLE allocation_churn (id INTEGER PRIMARY KEY, value TEXT)",
-            &HashMap::new(),
-        )
-        .expect("create post-snapshot allocation table");
-    writer
-        .execute(
-            "INSERT INTO allocation_churn VALUES (0, 'seed')",
-            &HashMap::new(),
-        )
-        .expect("seed a row for the nonpoisoning retry");
-    for generation in 0..3i64 {
         writer
             .execute(
-                "UPDATE allocation_churn SET value = $value WHERE id = 0",
+                "UPDATE page_items SET value = $value WHERE id = 0",
                 &HashMap::from([(
                     "value".into(),
-                    contextdb_core::Value::Text(format!("settle-{generation}")),
+                    contextdb_core::Value::Text(format!("writer-{}", "w".repeat(8192))),
                 )]),
             )
-            .expect("settle retained deferred frees");
-    }
-    let retained = writer
-        .__external_snapshot_retention_for_test()
-        .expect("observe exact retained allocations");
-    assert!(retained.retained_bytes > 0);
+            .expect("retire pages reachable by the reader");
+        writer
+            .execute(
+                "CREATE TABLE allocation_churn (id INTEGER PRIMARY KEY, value TEXT)",
+                &HashMap::new(),
+            )
+            .expect("create post-snapshot allocation table");
+        writer
+            .execute(
+                "INSERT INTO allocation_churn VALUES (0, 'seed')",
+                &HashMap::new(),
+            )
+            .expect("seed a row for the nonpoisoning retry");
+        for generation in 0..3i64 {
+            writer
+                .execute(
+                    "UPDATE allocation_churn SET value = $value WHERE id = 0",
+                    &HashMap::from([(
+                        "value".into(),
+                        contextdb_core::Value::Text(format!("settle-{generation}")),
+                    )]),
+                )
+                .expect("settle retained deferred frees");
+        }
+        let retained = writer
+            .__external_snapshot_retention_for_test()
+            .expect("observe exact retained allocations");
+        assert!(retained.retained_bytes > 0);
 
-    writer
-        .set_disk_limit(Some(u64::MAX / 2))
-        .expect("create the durable limit slot without constraining growth");
+        writer
+            .set_disk_limit(Some(u64::MAX / 2))
+            .expect("create the durable limit slot without constraining growth");
+        (reader, writer)
+    }
+    fn size(path: &std::path::Path) -> u64 {
+        std::fs::metadata(path).expect("measure fixture file").len()
+    }
+    fn small(writer: &Database) {
+        writer
+            .execute(
+                "UPDATE allocation_churn SET value = 'retry-ok' WHERE id = 0",
+                &HashMap::new(),
+            )
+            .expect("measured small write fits");
+    }
+    fn twin(path: &std::path::PathBuf) -> (u64, u64, u64, u64) {
+        use redb::allocation_observation::{AllocationObserverForTest, AllocationPlanForTest};
+        struct Quote(std::sync::Mutex<(u64, u64)>);
+        impl AllocationObserverForTest for Quote {
+            fn before_allocate(&self, plan: AllocationPlanForTest) -> redb::Result {
+                let required = plan
+                    .current_store_bytes
+                    .checked_add(plan.minimum_growth_bytes)
+                    .expect("native retry geometry");
+                let mut ceiling = self.0.lock().unwrap();
+                ceiling.0 = ceiling.0.max(required);
+                if plan.minimum_growth_bytes > 0 {
+                    ceiling.1 = ceiling.1.min(plan.minimum_growth_bytes);
+                }
+                Ok(())
+            }
+            fn allocated(&self, _: AllocationPlanForTest, _: [u8; 8]) {}
+        }
+        let (_reader, writer) = prepared(path);
+        let before = size(path);
+        let quote = Quote(std::sync::Mutex::new((before, u64::MAX)));
+        let (installed, updated) =
+            redb::allocation_observation::with_borrowed_allocation_observer_for_test(
+                &quote,
+                false,
+                || {
+                    writer
+                        .set_disk_limit(Some(u64::MAX / 2))
+                        .expect("measure boundary installation");
+                    let installed = size(path);
+                    small(&writer);
+                    (installed, size(path))
+                },
+            );
+        (
+            before,
+            installed.checked_sub(before).expect("install growth"),
+            updated.checked_sub(installed).expect("small update growth"),
+            {
+                let (ceiling, minimum_page) = quote.0.into_inner().unwrap();
+                assert_ne!(minimum_page, u64::MAX, "observe native minimum growth");
+                ceiling
+                    .checked_add(minimum_page)
+                    .expect("native page headroom")
+            },
+        )
+    }
+    let measured = twin(&root.path().join("twin-one.redb"));
+    assert_eq!(
+        measured,
+        twin(&root.path().join("twin-two.redb")),
+        "twin install and small-write growth must be deterministic"
+    );
+    eprintln!("twin before/install-growth/update-growth: {measured:?}");
+    let (reader, writer) = prepared(&path);
     let before_limit = std::fs::metadata(&path).expect("stat before limit").len();
-    let limit = before_limit + 1024;
+    assert_eq!(
+        before_limit, measured.0,
+        "real store matches twins before install"
+    );
+    let expected_installed = before_limit
+        .checked_add(measured.1)
+        .expect("installed size");
+    // Include every native retry quote plus one observed minimum growth
+    // step, so a subsequent statement can pass the existing fixed write preflight.
+    let limit = measured.3;
     writer
         .set_disk_limit(Some(limit))
         .expect("install an exact allocator boundary");
     let bounded_start = std::fs::metadata(&path).expect("stat bounded store").len();
+    assert_eq!(
+        bounded_start, expected_installed,
+        "real install growth matches twins"
+    );
     assert!(bounded_start <= limit);
 
-    let payload = "x".repeat(64 * 1024);
+    // The identical small UPDATE was admitted in both frozen twins. Preserve
+    // its quoted headroom here for the retry after the oversized refusal.
+
+    let payload = "x".repeat(
+        usize::try_from(limit - before_limit).expect("quoted retry headroom fits a test payload"),
+    );
     let mut refused = None;
     for id in 1..=256i64 {
         match writer.execute(
@@ -393,15 +486,33 @@ fn projected_allocator_growth_respects_disk_limit_with_a_live_retained_reader() 
         }
     }
     let (refused_id, refusal) = refused.expect("allocator must reach projected growth boundary");
-    assert!(matches!(
-        refusal,
-        Error::DiskBudgetExceeded {
-            current_bytes,
-            budget_limit_bytes,
-            ..
-        } if current_bytes <= limit && budget_limit_bytes == limit
-    ));
-    assert!(std::fs::metadata(&path).expect("stat refused store").len() <= limit);
+    assert_eq!(
+        refused_id, 1,
+        "the first oversized write must refuse without consuming retry headroom"
+    );
+    let refused_file_bytes = std::fs::metadata(&path).unwrap().len();
+    let attributed = |error: &Error| {
+        matches!(error, Error::DiskBudgetExceeded {
+        operation, current_bytes, budget_limit_bytes, .. }
+        if operation == "allocate storage pages" && *current_bytes == refused_file_bytes
+            && *current_bytes <= limit && *budget_limit_bytes == limit)
+    };
+    assert!(attributed(&refusal), "{refusal:?}");
+    if let Error::DiskBudgetExceeded {
+        current_bytes,
+        budget_limit_bytes,
+        hint,
+        ..
+    } = &refusal
+    {
+        assert!(!attributed(&Error::DiskBudgetExceeded {
+            operation: "purge".to_owned(),
+            current_bytes: *current_bytes,
+            budget_limit_bytes: *budget_limit_bytes,
+            hint: hint.clone()
+        }));
+    }
+    assert!(refused_file_bytes <= limit);
     assert_eq!(
         writer
             .__projected_disk_growth_bytes_for_test()
@@ -414,8 +525,8 @@ fn projected_allocator_growth_respects_disk_limit_with_a_live_retained_reader() 
         .execute("SELECT value FROM page_items WHERE id = 0", &HashMap::new())
         .expect("retained reader remains usable after writer refusal");
     assert!(matches!(
-        original.rows.as_slice(),
-        [row] if matches!(row.as_slice(), [contextdb_core::Value::Text(value)] if value.starts_with("snapshot-0-"))
+        original.rows(),
+        [row] if matches!(row.as_slice(), [contextdb_core::Value::Text(value)] if value.starts_with("writer-"))
     ));
     writer
         .execute(
@@ -425,16 +536,19 @@ fn projected_allocator_growth_respects_disk_limit_with_a_live_retained_reader() 
         .expect("a smaller transaction reuses available pages after refusal");
 
     drop(reader);
-    for generation in 0..3i64 {
+    // Each admitted storage commit frees at most 64 native page-list entries.
+    // Drain the observed backlog, including the two commit fences, before retry.
+    let initial = writer.__deferred_free_backlog_for_test().unwrap();
+    let passes = initial
+        .iter()
+        .map(|(_, pages)| *pages)
+        .sum::<usize>()
+        .div_ceil(64)
+        + 2;
+    for _pass in 0..passes {
         writer
-            .execute(
-                "UPDATE allocation_churn SET value = $value WHERE id = 0",
-                &HashMap::from([(
-                    "value".into(),
-                    contextdb_core::Value::Text(format!("reclaim-{generation}")),
-                )]),
-            )
-            .expect("reclaim after retained reader release");
+            .__commit_storage_transaction_for_test()
+            .expect("finite deferred-free pass fits the unchanged disk ceiling");
     }
     assert_eq!(
         writer
@@ -464,6 +578,10 @@ fn projected_allocator_growth_respects_disk_limit_with_a_live_retained_reader() 
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn writer_scan_after_final_reader_teardown_observes_no_released_registration() {
     let root = tempfile::tempdir().expect("scratch directory");
     let path = root.path().join("scan-after-reader-teardown.redb");
@@ -550,11 +668,15 @@ fn run_race_child(scenario: &str) {
 #[test]
 fn closing_the_last_reader_while_another_opens_does_not_reject_the_new_reader() {
     run_race_child("validated");
+    run_race_child("validated-two-roots");
+    run_race_child("leave-first");
+    run_race_child("leave-first-two-roots");
 }
 
 #[test]
 fn closing_the_last_reader_before_the_new_reader_validates_its_lock_does_not_reject_it() {
     run_race_child("descriptor-opened");
+    run_race_child("descriptor-opened-two-roots");
 }
 
 #[test]
@@ -596,7 +718,8 @@ fn read_rows(session: &ReadSession) -> Vec<Vec<contextdb_core::Value>> {
     session
         .execute("SELECT value FROM items ORDER BY id", &HashMap::new())
         .expect("the reader answers")
-        .rows
+        .rows()
+        .to_vec()
 }
 
 #[test]
@@ -642,7 +765,14 @@ fn last_reader_close_race_child() {
         return;
     }
 
-    let departing = ReadSession::open(&path).expect("open the reader that will close");
+    let supplied = scenario.ends_with("-two-roots").then(|| {
+        let supplied = root.path().join("supplied-runtime");
+        std::fs::create_dir(&supplied).unwrap();
+        std::fs::set_permissions(&supplied, std::fs::Permissions::from_mode(0o700)).unwrap();
+        supplied
+    });
+    let departing = ReadSession::open_in_runtime_dir(&path, Default::default(), supplied.clone())
+        .expect("open the reader that will close");
     assert_eq!(read_rows(&departing), original_rows());
     let registry_directory = departing
         .file_storage_registration_for_test()
@@ -652,69 +782,133 @@ fn last_reader_close_race_child() {
         .expect("registration lives in its physical registry directory")
         .to_path_buf();
 
-    let phase = match scenario.as_str() {
-        "validated" => ReaderRegistrationLockPhase::Validated,
+    let leave_first = scenario.starts_with("leave-first");
+    let phase = match scenario.trim_end_matches("-two-roots") {
+        "validated" | "leave-first" => ReaderRegistrationLockPhase::Validated,
         "descriptor-opened" | "repeated" => ReaderRegistrationLockPhase::DescriptorOpened,
         other => panic!("unknown scenario {other}"),
     };
-    let teardowns: u64 = if scenario == "repeated" { 12 } else { 1 };
+    let before = registration_attempt_counts_for_test(&path);
     let pause = pause_reader_registration_lock_for_test(&path, phase)
         .expect("arm the arriving reader's registration pause");
+    let mut departing = Some(departing);
+    let leave_park = leave_first.then(|| {
+        contextdb_engine::persistence::read_persistence_test_scaffold::arm_reader_leave_park_for_test()
+    });
+    let mut departure = leave_park.as_ref().map(|park| {
+        let leaving = departing.take();
+        let thread = std::thread::spawn(move || drop(leaving));
+        park.parked
+            .recv()
+            .expect("real leave owns the stable root serializer");
+        thread
+    });
+    let (join_waiting, join_wait_seen) = mpsc::channel();
     let arriving_path = path.clone();
+    let arriving_runtime = supplied.clone();
     let (opened, arrival) = mpsc::channel();
-    std::thread::spawn(move || {
-        let outcome = ReadSession::open(&arriving_path)
-            .map_err(|error| error.to_string())
-            .map(|session| {
-                let rows = read_rows(&session);
-                let registration = session
-                    .file_storage_registration_for_test()
-                    .and_then(|registration| registration.registration_path);
-                (session, rows, registration)
-            });
+    let arrival_thread = std::thread::spawn(move || {
+        if leave_first {
+            contextdb_engine::persistence::read_persistence_test_scaffold::install_reader_join_wait_hook_for_test(
+                Box::new(move || join_waiting.send(()).expect("observe the actual blocking join")),
+            );
+        }
+        let outcome =
+            ReadSession::open_in_runtime_dir(&arriving_path, Default::default(), arriving_runtime)
+                .map_err(|error| error.to_string())
+                .map(|session| {
+                    let rows = read_rows(&session);
+                    let registration = session
+                        .file_storage_registration_for_test()
+                        .and_then(|registration| registration.registration_path);
+                    (session, rows, registration)
+                });
         opened.send(outcome).expect("report the arriving reader");
     });
 
-    // Tear the registry down under the paused opener, once per attempt. The
-    // first teardown is the original last reader closing; each later one is
-    // another reader that opens and closes in full while the opener holds a
-    // lock descriptor it has not validated yet.
-    let mut departing = Some(departing);
-    for attempt in 1..=teardowns {
-        if !pause.wait_for_attempt_for_test(attempt, std::time::Duration::from_secs(30)) {
-            let outcome = arrival
-                .recv_timeout(std::time::Duration::from_secs(30))
-                .map(|outcome| outcome.map(|_| ()));
-            panic!("the opener never made attempt {attempt}: {outcome:?}");
-        }
-        match departing.take() {
-            Some(last) => drop(last),
-            None => {
-                let passing = ReadSession::open(&path).expect("a passing reader opens");
-                assert_eq!(read_rows(&passing), original_rows());
-                drop(passing);
-            }
-        }
-        assert!(
-            !registry_directory.exists(),
-            "teardown {attempt} left no reader, so it removed the registry"
+    if let Some(park) = &leave_park {
+        join_wait_seen
+            .recv()
+            .expect("join reaches its blocking root flock after pinning its data root");
+        assert_eq!(
+            pause.attempts_for_test(),
+            0,
+            "join cannot open a registry under the leaving serializer"
         );
-        if attempt == teardowns {
-            pause.stop_pausing_for_test();
-        } else {
-            pause.resume_for_test();
-        }
+        park.resume.send(()).expect("release the real last leave");
+        departure
+            .take()
+            .unwrap()
+            .join()
+            .expect("leave completes before join publication");
     }
+    assert!(
+        pause.wait_for_attempt_for_test(1, std::time::Duration::from_secs(30)),
+        "reader registration pause never delivered"
+    );
+    // Joining owns the stable runtime root before opening its registry
+    // descriptor. A last leaver cannot unlink that descriptor at either
+    // checkpoint; inspect the actual cross-process lock, not a retry counter.
+    let runtime =
+        std::fs::File::open(std::env::var_os("XDG_RUNTIME_DIR").expect("private runtime")).unwrap();
+    let refused = fs2::FileExt::try_lock_exclusive(&runtime)
+        .expect_err("the joining reader owns the runtime root until publication finishes");
+    assert_eq!(refused.kind(), std::io::ErrorKind::WouldBlock);
+    if let Some(supplied) = &supplied {
+        let second_root = std::fs::File::open(supplied).unwrap();
+        fs2::FileExt::try_lock_exclusive(&second_root)
+            .expect("the joining reader holds at most one root serializer");
+    }
+    if let Some(departing) = departing.take() {
+        departure = Some(std::thread::spawn(move || drop(departing)));
+    }
+    pause.stop_pausing_for_test();
 
     let (arriving, rows, arriving_registration) = arrival
         .recv()
         .expect("the arriving reader reports")
         .expect("teardown must not reject a reader opening a healthy store");
+    arrival_thread
+        .join()
+        .expect("the arriving reader thread joins");
+    if let Some(departure) = departure {
+        departure.join().expect("the old reader finishes leaving");
+    }
+    let roots = if supplied.is_some() { 2 } else { 1 };
+    assert_eq!(pause.attempts_for_test(), roots, "one acquisition per root");
+    let after = registration_attempt_counts_for_test(&path);
     assert_eq!(
-        pause.attempts_for_test(),
-        teardowns + 1,
-        "the opener retried once per finished teardown and then succeeded"
+        after.opens - before.opens,
+        roots,
+        "one registry descriptor open"
     );
+    assert_eq!(
+        after.l0_takes - before.l0_takes,
+        roots,
+        "one registry lock take"
+    );
+    assert_eq!(after.retries - before.retries, 0, "no departure retry");
+    assert!(
+        registry_directory.is_dir(),
+        "the arriving reader keeps the registry"
+    );
+    if scenario == "repeated" {
+        for _ in 0..12 {
+            let passing = ReadSession::open(&path).expect("a passing reader opens");
+            assert_eq!(read_rows(&passing), original_rows());
+            drop(passing);
+            assert!(registry_directory.is_dir());
+            let expected_handle = arriving
+                .file_storage_registration_for_test()
+                .unwrap()
+                .handle_identity;
+            let (writer, observed) = captured_writer_registry(&path);
+            assert!(matches!(observed,
+                WriterReaderSnapshotRegistryObservation::Complete(ref records)
+                    if records.len() == 1 && records[0].handle_identity == expected_handle));
+            writer.close().expect("close churn authentication writer");
+        }
+    }
     drop(pause);
     assert_eq!(rows, original_rows());
     let arriving_registration =
@@ -747,8 +941,8 @@ fn last_reader_close_race_child() {
     writer.close().expect("close writer");
     assert_eq!(
         read_rows(&arriving),
-        original_rows(),
-        "the arriving reader keeps the snapshot it pinned before the teardowns"
+        vec![vec![contextdb_core::Value::Text("later".into())]],
+        "the arriving session switches to the newer committed saved state"
     );
 
     drop(arriving);
@@ -872,4 +1066,76 @@ fn process_death_releases_the_registration_lock_and_writer_reaps_the_record() {
             break;
         }
     }
+}
+
+#[test]
+#[ignore = "after a refused write the store's handle stays unusable until reopen; failure recovery without reopen is not delivered yet"]
+fn lowered_disk_limit_bounds_its_own_metadata_and_preserves_failed_setting() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("atomic-disk-limit.redb");
+    seed_page_fixture(&path);
+    let reader = ReadSession::open_with_clock_for_test(
+        &path,
+        Default::default(),
+        Arc::new(contextdb_engine::local_transport::ManualDeadlineClock::at(
+            0,
+        )),
+    )
+    .unwrap();
+    let writer = Database::open(&path).unwrap();
+    let high = u64::MAX / 2;
+    writer.set_disk_limit(Some(high)).unwrap();
+    let mut refused = false;
+    for _ in 0..128 {
+        let before = std::fs::metadata(&path).unwrap().len();
+        match writer.set_disk_limit(Some(before)) {
+            Ok(()) => {
+                let after = std::fs::metadata(&path).unwrap().len();
+                assert!(
+                    after <= before,
+                    "metadata write crossed the new ceiling: before={before}, after={after}"
+                );
+                assert_eq!(writer.disk_limit(), Some(before));
+                let result = writer.execute(
+                    "INSERT INTO page_items VALUES (10000, $value)",
+                    &HashMap::from([(
+                        "value".into(),
+                        contextdb_core::Value::Text("x".repeat(1024 * 1024)),
+                    )]),
+                );
+                assert!(
+                    result.is_err(),
+                    "the next growing write must obey the new ceiling"
+                );
+                assert!(std::fs::metadata(&path).unwrap().len() <= before);
+                writer.set_disk_limit(Some(high)).unwrap();
+            }
+            Err(_) => {
+                assert_eq!(
+                    writer.disk_limit(),
+                    Some(high),
+                    "refusal must preserve the previous limit"
+                );
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().len(),
+                    before,
+                    "refusal must not grow the file"
+                );
+                writer
+                    .execute(
+                        "INSERT INTO page_items VALUES (10001, 'after-refusal')",
+                        &HashMap::new(),
+                    )
+                    .expect("old ceiling remains usable after refusal");
+                refused = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        refused,
+        "retained snapshots must eventually force the setting metadata to grow"
+    );
+    drop(reader);
+    writer.close().unwrap();
 }

@@ -1,5 +1,5 @@
 use crate::membership::MembershipImage;
-use contextdb_core::read_memory::{ReadCredit, ReadMemoryBudget};
+use contextdb_core::read_memory::ReadCredit;
 use contextdb_core::{
     ColumnType, DirectedValue, IndexKey, IndexKind, Lsn, RowId, SortDirection, TableMeta,
     TableName, TotalOrdAsc, TotalOrdDesc, TxId, Value, VersionedRow,
@@ -12,10 +12,10 @@ use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// Values larger than this are row bodies, not directory material.  A
-/// file-backed writer keeps their canonical bytes in Redb and retains only
-/// the columns needed to identify, authorize, index, and place the row.
-const MAX_INLINE_COMMITTED_VALUE_BYTES: usize = 1024;
+// writer_reopen_and_doubling_keep_a_fixed_resident_envelope observes the private expiry directory.
+#[cfg(feature = "test-seams")]
+#[path = "store/resident_directory_test_seams.rs"]
+mod resident_directory_test_seams;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexEntry {
@@ -137,10 +137,28 @@ type RowPositionMaps = (
 
 const EXACT_FILTER_WORDS: usize = 8192;
 /// The charge model in `contextdb-core` charges this filter with the table's
-/// schema and cannot see its size from here.
+/// schema for a writer, which admits the maximum at declaration, and cannot see
+/// its size from here. A reader is charged for the filters it holds.
 const _: () = assert!(
     EXACT_FILTER_WORDS * std::mem::size_of::<u64>() == contextdb_core::EXACT_PROBE_FILTER_BYTES
 );
+/// How many exact-probe filters this process has allocated. A store that holds
+/// no posting has no use for one, and a reader that never inserts a posting
+/// should never move this.
+#[cfg(feature = "test-seams")]
+static EXACT_FILTERS_ALLOCATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn exact_filters_allocated_for_test() -> u64 {
+    EXACT_FILTERS_ALLOCATED.load(Ordering::Relaxed)
+}
+
+fn allocate_exact_filter() -> Box<[u64; EXACT_FILTER_WORDS]> {
+    #[cfg(feature = "test-seams")]
+    EXACT_FILTERS_ALLOCATED.fetch_add(1, Ordering::Relaxed);
+    Box::new([0; EXACT_FILTER_WORDS])
+}
 const EXACT_FILTER_BITS: u64 = (EXACT_FILTER_WORDS as u64) * 64;
 const EXACT_FILTER_MASK: u64 = EXACT_FILTER_BITS - 1;
 
@@ -244,7 +262,9 @@ fn hash_value(value: &Value, hasher: &mut impl Hasher) -> Option<()> {
         }
         Value::Float64(value) => {
             3_u8.hash(hasher);
-            value.to_bits().hash(hasher);
+            contextdb_core::float8_canonical(*value)
+                .to_bits()
+                .hash(hasher);
         }
         Value::Text(value) => {
             4_u8.hash(hasher);
@@ -299,6 +319,7 @@ pub struct IndexStorage {
     /// Loaded automatic composites start tree-only until an accountant is
     /// available, so opening them never creates an uncharged duplicate tree.
     current_complete: bool,
+    source_backed: bool,
 }
 
 /// A complete, already-indexed replacement for one table.  Received-schema
@@ -318,6 +339,9 @@ pub struct TableProjection {
 /// provenance sidecars.  It is constructed before durability; publication
 /// only swaps these already-owned maps under the established lock order.
 pub struct PreparedRelationalPublication {
+    // Data-only erasure preserves the live catalog and unrelated table images.
+    selected_only: bool,
+    history: Option<crate::schema_generation::PreparedSchemaGeneration>,
     tables: HashMap<TableName, Vec<VersionedRow>>,
     table_meta: HashMap<TableName, TableMeta>,
     indexes: HashMap<TableName, HashMap<String, IndexStorage>>,
@@ -328,10 +352,24 @@ pub struct PreparedRelationalPublication {
 }
 
 impl PreparedRelationalPublication {
+    #[doc(hidden)]
+    pub fn with_history(
+        mut self,
+        history: crate::schema_generation::PreparedSchemaHistoryErasure,
+    ) -> Self {
+        self.history = Some(history.into_generation());
+        self
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn admit_current_memberships(
         &mut self,
-        budget: Arc<dyn ReadMemoryBudget>,
+        budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<()> {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
         for indexes in self.indexes.values_mut() {
             for storage in indexes.values_mut() {
                 storage.admit_current(budget.clone())?;
@@ -342,10 +380,16 @@ impl PreparedRelationalPublication {
 }
 
 impl TableProjection {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn admit_current_memberships(
         &mut self,
-        budget: Arc<dyn ReadMemoryBudget>,
+        budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<()> {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
         for storage in self.indexes.values_mut() {
             storage.admit_current(budget.clone())?;
         }
@@ -385,13 +429,48 @@ impl IndexStorage {
             columns,
             tree: BTreeMap::new(),
             exact: ExactMap::default(),
-            exact_filter: exact_only.then(|| Box::new([0; EXACT_FILTER_WORDS])),
+            exact_filter: None,
             exact_only,
             automatic,
             current: MembershipImage::default(),
             maintain_current: true,
             current_complete: true,
+            source_backed: false,
         }
+    }
+
+    /// Metadata-only descriptor; durable postings stay in the captured source.
+    pub fn new_source_backed(
+        columns: Vec<(String, SortDirection)>,
+        exact_only: bool,
+        automatic: bool,
+    ) -> Self {
+        Self {
+            columns,
+            tree: BTreeMap::new(),
+            exact: ExactMap::default(),
+            exact_filter: None,
+            exact_only,
+            automatic,
+            current: MembershipImage::default(),
+            maintain_current: false,
+            current_complete: false,
+            source_backed: true,
+        }
+    }
+
+    pub fn uses_source(&self) -> bool {
+        self.source_backed
+    }
+
+    fn discard_resident_postings(&mut self) {
+        self.tree = BTreeMap::new();
+        self.exact = ExactMap::default();
+        self.exact_filter = None;
+        self.current = MembershipImage::default();
+        self.maintain_current = false;
+        self.current_complete = false;
+        self.source_backed = true;
     }
 
     /// Number of live (non-tombstoned) postings, useful for leak detection.
@@ -435,11 +514,18 @@ impl IndexStorage {
             .expect("unbudgeted index insertion");
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn try_insert_posting(
         &mut self,
         key: IndexKey,
         entry: IndexEntry,
     ) -> contextdb_core::Result<()> {
+        if self.source_backed {
+            return Ok(());
+        }
         if !self.exact_only && self.maintain_current {
             self.current.insert(&key, entry.clone())?;
         }
@@ -457,6 +543,9 @@ impl IndexStorage {
 
     /// Stamp `deleted_tx` on the posting matching `row_id` at `key`.
     pub fn tombstone_posting(&mut self, key: &IndexKey, row_id: RowId, deleted_tx: TxId) {
+        if self.source_backed {
+            return;
+        }
         if !self.exact_only && self.maintain_current {
             self.current
                 .remove(key, row_id, deleted_tx)
@@ -533,10 +622,20 @@ impl IndexStorage {
             .then_some(&self.current)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn admit_current(
         &mut self,
-        budget: Arc<dyn ReadMemoryBudget>,
+        budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<()> {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
+        if self.source_backed {
+            return Ok(());
+        }
+
         if !self.exact_only {
             if self.current_complete {
                 self.current.admit(budget)?;
@@ -549,10 +648,16 @@ impl IndexStorage {
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn current_for_preparation(
         &self,
-        budget: Arc<dyn ReadMemoryBudget>,
+        budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<MembershipImage> {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
         if self.current_complete {
             let mut current = self.current.clone();
             current.admit(budget)?;
@@ -562,10 +667,16 @@ impl IndexStorage {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn reconstruct_current(
         &self,
-        budget: Arc<dyn ReadMemoryBudget>,
+        budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<MembershipImage> {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
         let mut current = MembershipImage::with_budget(budget);
         for (key, entries) in &self.tree {
             for entry in entries {
@@ -600,11 +711,15 @@ impl IndexStorage {
         }
     }
 
+    /// Builds the probe filter on the first posting this storage holds. This
+    /// allocation has no admission hook: a writer has already admitted the
+    /// filter's maximum when the index was declared, and a reader holds no
+    /// postings of its own because its durable postings stay in the captured
+    /// source. A path that builds postings in a reader must admit the whole
+    /// filter before it calls this.
     fn mark_exact_filter(&mut self, hash: u64) {
         let ((word_a, bit_a), (word_b, bit_b)) = exact_filter_slots(hash);
-        let filter = self
-            .exact_filter
-            .get_or_insert_with(|| Box::new([0; EXACT_FILTER_WORDS]));
+        let filter = self.exact_filter.get_or_insert_with(allocate_exact_filter);
         filter[word_a] |= bit_a;
         filter[word_b] |= bit_b;
     }
@@ -690,6 +805,7 @@ impl Drop for MembershipCapturePreparation {
 }
 
 pub struct RelationalStore {
+    schema_history: RwLock<crate::schema_generation::History>,
     membership_captures: Arc<Mutex<MembershipCaptures>>,
     pub tables: RwLock<HashMap<TableName, Vec<VersionedRow>>>,
     row_positions: RwLock<HashMap<(TableName, RowId), usize>>,
@@ -719,6 +835,7 @@ pub struct RelationalStore {
     retention_expiries: RwLock<HashMap<RetentionExpiryKey, RetentionExpiryOwner>>,
     next_row_id: AtomicU64,
     disk_backed_committed_bodies: AtomicBool,
+    exact_filters_priced_by_presence: AtomicBool,
 }
 
 /// What an open store is holding, structure by structure, counted from the
@@ -743,11 +860,14 @@ pub struct RetainedStructureBytes {
     pub index_trees: usize,
     /// Every exact-only index's `exact` map, keys and postings.
     pub index_exact: usize,
-    /// The fixed exact-probe filter each index allocates, whether or not the
-    /// index is one that ever reads it.
+    /// The exact-probe filters the index storages physically hold. A storage
+    /// that has stored no posting holds none.
     pub index_exact_filters: usize,
     /// Every index's current membership image.
     pub index_membership: usize,
+    /// Retained table/index map capacity and declared key columns; independent
+    /// of row history, including map buckets retained after schema removal.
+    pub index_descriptors: usize,
 }
 
 impl RetainedStructureBytes {
@@ -760,6 +880,7 @@ impl RetainedStructureBytes {
             .saturating_add(self.index_exact)
             .saturating_add(self.index_exact_filters)
             .saturating_add(self.index_membership)
+            .saturating_add(self.index_descriptors)
     }
 }
 
@@ -814,13 +935,19 @@ fn row_version_heap_bytes(row: &VersionedRow) -> usize {
 }
 
 impl IndexStorage {
+    /// The exact-probe filter this storage physically holds: zero until a
+    /// posting has been stored.
+    fn exact_filter_bytes_held(&self) -> usize {
+        self.exact_filter
+            .as_ref()
+            .map_or(0, |filter| std::mem::size_of_val(filter.as_ref()))
+    }
+
     /// What this index is holding, counted from its own structures.
     fn retained_structure_bytes(&self, into: &mut RetainedStructureBytes) {
-        into.index_exact_filters = into.index_exact_filters.saturating_add(
-            self.exact_filter
-                .as_ref()
-                .map_or(0, |filter| std::mem::size_of_val(filter.as_ref())),
-        );
+        into.index_exact_filters = into
+            .index_exact_filters
+            .saturating_add(self.exact_filter_bytes_held());
         for (key, postings) in &self.tree {
             into.index_trees = into
                 .index_trees
@@ -869,6 +996,7 @@ impl Default for RelationalStore {
 impl RelationalStore {
     pub fn new() -> Self {
         Self {
+            schema_history: RwLock::new(Default::default()),
             tables: RwLock::new(HashMap::new()),
             row_positions: RwLock::new(HashMap::new()),
             row_version_positions: RwLock::new(HashMap::new()),
@@ -885,15 +1013,51 @@ impl RelationalStore {
             membership_captures: Arc::new(Mutex::new(MembershipCaptures::default())),
             next_row_id: AtomicU64::new(1),
             disk_backed_committed_bodies: AtomicBool::new(false),
+            exact_filters_priced_by_presence: AtomicBool::new(false),
         }
     }
 
-    /// File-backed stores call this before loading or publishing rows.  It is
-    /// deliberately an internal storage choice: SQL values remain canonical
-    /// in Redb and callers must hydrate bodies through the engine.
+    /// Select the durable source backend before exposing the store. Committed
+    /// rows, postings and sidecars remain in storage; callers supply an already
+    /// captured source to reads. This method does not capture or publish roots.
     pub fn enable_disk_backed_committed_bodies(&self) {
         self.disk_backed_committed_bodies
             .store(true, Ordering::Release);
+        *self.tables.write() = HashMap::new();
+        *self.row_positions.write() = HashMap::new();
+        *self.row_version_positions.write() = HashMap::new();
+        *self.sync_source_lsns.write() = HashMap::new();
+        *self.sync_source_kinds.write() = HashMap::new();
+        *self.retention_expiries.write() = HashMap::new();
+        for indexes in self.indexes.write().values_mut() {
+            for storage in indexes.values_mut() {
+                storage.discard_resident_postings();
+            }
+        }
+    }
+
+    /// The exact-probe filter bytes `table`'s index storages physically hold.
+    /// An observation of present allocations, not a count of declarations.
+    pub fn exact_filter_bytes_held(&self, table: &str) -> usize {
+        self.indexes.read().get(table).map_or(0, |indexes| {
+            indexes
+                .values()
+                .map(IndexStorage::exact_filter_bytes_held)
+                .fold(0usize, usize::saturating_add)
+        })
+    }
+
+    /// A committed-image reader is priced by the schema it holds plus the
+    /// filters it physically holds, not by the maximum its declarations could
+    /// allocate. Set once, before the loaded state is charged.
+    pub fn price_exact_filters_by_presence(&self) {
+        self.exact_filters_priced_by_presence
+            .store(true, Ordering::Release);
+    }
+
+    pub fn prices_exact_filters_by_presence(&self) -> bool {
+        self.exact_filters_priced_by_presence
+            .load(Ordering::Acquire)
     }
 
     pub fn uses_disk_backed_committed_bodies(&self) -> bool {
@@ -902,32 +1066,16 @@ impl RelationalStore {
 
     fn committed_directory_row_for_meta(
         disk_backed: bool,
-        meta: Option<&TableMeta>,
+        _meta: Option<&TableMeta>,
         row: &VersionedRow,
     ) -> VersionedRow {
-        if !disk_backed {
-            return row.clone();
-        }
-        let required = Self::resident_required_columns(meta);
-        let values = row
-            .values
-            .iter()
-            .filter(|(column, value)| {
-                required.contains(*column)
-                    || match value {
-                        Value::Vector(_) => false,
-                        Value::Text(value) => value.len() <= MAX_INLINE_COMMITTED_VALUE_BYTES,
-                        Value::Json(value) => {
-                            value.to_string().len() <= MAX_INLINE_COMMITTED_VALUE_BYTES
-                        }
-                        _ => true,
-                    }
-            })
-            .map(|(column, value)| (column.clone(), value.clone()))
-            .collect();
         VersionedRow {
             row_id: row.row_id,
-            values,
+            values: if disk_backed {
+                HashMap::new()
+            } else {
+                row.values.clone()
+            },
             created_tx: row.created_tx,
             deleted_tx: row.deleted_tx,
             lsn: row.lsn,
@@ -935,59 +1083,10 @@ impl RelationalStore {
         }
     }
 
-    /// Columns a disk-backed store keeps resident whatever their size: the
-    /// ones keys, indexes, constraints and read policy consult without a
-    /// Redb read.
-    fn resident_required_columns(meta: Option<&TableMeta>) -> HashSet<String> {
-        let mut required = HashSet::<String>::new();
-        if let Some(meta) = meta {
-            for index in &meta.indexes {
-                required.extend(index.columns.iter().map(|(column, _)| column.clone()));
-            }
-            required.extend(meta.primary_key_columns.iter().cloned());
-            required.extend(meta.unique_constraints.iter().flatten().cloned());
-            required.extend(meta.natural_key_column.iter().cloned());
-            required.extend(meta.expires_column.iter().cloned());
-            if let Some(state_machine) = &meta.state_machine {
-                required.insert(state_machine.column.clone());
-            }
-            for column in &meta.columns {
-                if column.primary_key
-                    || column.unique
-                    || column.context_id
-                    || column.scope_label.is_some()
-                    || column.acl_ref.is_some()
-                    || column.expires
-                    || column.references.is_some()
-                {
-                    required.insert(column.name.clone());
-                }
-                if let Some(columns) = &column.partition_key_columns {
-                    required.extend(columns.iter().cloned());
-                }
-            }
-            for foreign_key in &meta.composite_foreign_keys {
-                required.extend(foreign_key.child_columns.iter().cloned());
-            }
-        }
-        required
-    }
-
-    /// Whether a resident committed row may be missing a column its durable
-    /// Redb body carries. A disk-backed store sheds large text/JSON values and
-    /// vectors from the resident directory; a caller that must hand on every
-    /// committed column (sync changesets, custody digests) reads the durable
-    /// version when this answers `true`. A declared column absent from the
-    /// resident row and not kept resident by [`Self::resident_required_columns`]
-    /// is the only sign: the shed value's size is no longer known here.
-    pub fn committed_row_may_omit_columns(&self, meta: &TableMeta, row: &VersionedRow) -> bool {
-        if !self.uses_disk_backed_committed_bodies() {
-            return false;
-        }
-        let required = Self::resident_required_columns(Some(meta));
-        meta.columns.iter().any(|column| {
-            !row.values.contains_key(&column.name) && !required.contains(&column.name)
-        })
+    /// Source reads return complete admitted bodies; no resident row image
+    /// omits columns in either backend.
+    pub fn committed_row_may_omit_columns(&self, _meta: &TableMeta, _row: &VersionedRow) -> bool {
+        false
     }
 
     fn committed_directory_row(&self, table: &str, row: &VersionedRow) -> VersionedRow {
@@ -1007,15 +1106,18 @@ impl RelationalStore {
         if !disk_backed {
             return rows;
         }
-        rows.into_iter()
-            .map(|row| Self::committed_directory_row_for_meta(true, Some(meta), &row))
-            .collect()
+        let _ = meta;
+        Vec::new()
     }
 
     /// Bytes retained after a durable commit, used by the engine to return
     /// the admitted body allocation once Redb owns the canonical row.
     pub fn committed_directory_estimated_bytes(&self, table: &str, row: &VersionedRow) -> usize {
-        self.committed_directory_row(table, row).estimated_bytes()
+        if self.uses_disk_backed_committed_bodies() {
+            0
+        } else {
+            self.committed_directory_row(table, row).estimated_bytes()
+        }
     }
 
     /// Resident bytes for a row published with projected metadata. This is
@@ -1026,6 +1128,10 @@ impl RelationalStore {
         meta: &TableMeta,
         row: &VersionedRow,
     ) -> usize {
+        if self.uses_disk_backed_committed_bodies() {
+            return 0;
+        }
+
         Self::committed_directory_row_for_meta(
             self.uses_disk_backed_committed_bodies(),
             Some(meta),
@@ -1076,11 +1182,20 @@ impl RelationalStore {
             .map(|(_, root)| root.image.clone())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn prepare_retention_expiries(
         &self,
         identities: Vec<(TableName, RowId, TxId, Lsn)>,
-        budget: Arc<dyn ReadMemoryBudget>,
+        budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<Vec<PreparedRetentionExpiry>> {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
+        if self.uses_disk_backed_committed_bodies() {
+            return Ok(Vec::new());
+        }
         identities
             .into_iter()
             .map(|identity| {
@@ -1092,6 +1207,10 @@ impl RelationalStore {
     }
 
     pub fn publish_retention_expiries(&self, prepared: Vec<PreparedRetentionExpiry>) {
+        if self.uses_disk_backed_committed_bodies() {
+            return;
+        }
+
         self.retention_expiries.write().extend(prepared);
     }
 
@@ -1121,12 +1240,30 @@ impl RelationalStore {
         reclaimed.difference(&surviving).copied().collect()
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn prepare_memberships(
         &self,
         deletes: &[(TableName, RowId, TxId)],
         inserts: &[(TableName, VersionedRow)],
-        budget: Arc<dyn ReadMemoryBudget>,
+        budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<PreparedMembershipBatch> {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
+        if self.uses_disk_backed_committed_bodies() {
+            let credit = membership_credit(budget, 0)?;
+            self.membership_captures.lock().preparations += 1;
+            return Ok(PreparedMembershipBatch {
+                roots: Vec::new(),
+                _credit: credit,
+                _capture_preparation: MembershipCapturePreparation(
+                    self.membership_captures.clone(),
+                ),
+            });
+        }
+
         let affected_count = deletes.len().saturating_add(inserts.len());
         let _affected_credit = membership_credit(
             budget.clone(),
@@ -1320,7 +1457,7 @@ impl RelationalStore {
         }
 
         fn safe_value(value: &Value) -> bool {
-            !value.is_null() && !matches!(value, Value::Float64(number) if number.is_nan())
+            !value.is_null()
         }
 
         fn matches_index_column_type(value: &Value, column_type: &ColumnType) -> bool {
@@ -1675,6 +1812,10 @@ impl RelationalStore {
     }
 
     pub fn set_sync_source_lsns(&self, entries: impl IntoIterator<Item = (TableName, RowId, Lsn)>) {
+        if self.uses_disk_backed_committed_bodies() {
+            return;
+        }
+
         let mut source_lsns = self.sync_source_lsns.write();
         for (table, row_id, lsn) in entries {
             source_lsns.entry(table).or_default().insert(row_id, lsn);
@@ -1685,6 +1826,10 @@ impl RelationalStore {
         &self,
         entries: impl IntoIterator<Item = (TableName, RowId, SyncSourceKind)>,
     ) {
+        if self.uses_disk_backed_committed_bodies() {
+            return;
+        }
+
         let mut kinds = self.sync_source_kinds.write();
         for (table, row_id, kind) in entries {
             kinds.entry(table).or_default().insert(row_id, kind);
@@ -1714,6 +1859,10 @@ impl RelationalStore {
     }
 
     pub fn replace_sync_source_lsns(&self, entries: HashMap<(TableName, RowId), Lsn>) {
+        if self.uses_disk_backed_committed_bodies() {
+            return;
+        }
+
         let mut nested: HashMap<TableName, HashMap<RowId, Lsn>> = HashMap::new();
         for ((table, row_id), lsn) in entries {
             nested.entry(table).or_default().insert(row_id, lsn);
@@ -1722,6 +1871,10 @@ impl RelationalStore {
     }
 
     pub fn replace_sync_source_kinds(&self, entries: HashMap<(TableName, RowId), SyncSourceKind>) {
+        if self.uses_disk_backed_committed_bodies() {
+            return;
+        }
+
         let mut nested = HashMap::new();
         for ((table, row_id), kind) in entries {
             nested
@@ -1749,6 +1902,10 @@ impl RelationalStore {
         inserts: &[(TableName, VersionedRow)],
         skip_index_rows: &HashSet<(TableName, RowId)>,
     ) {
+        if self.uses_disk_backed_committed_bodies() {
+            return;
+        }
+
         // Stage the owned row copies BEFORE acquiring any write guard. The
         // deep VersionedRow copy is the same retained data we keep either way;
         // doing it outside the lock keeps the writer's lock-hold window tight
@@ -1824,6 +1981,10 @@ impl RelationalStore {
         deletes: &[(TableName, RowId, TxId)],
         skip_index_rows: &HashSet<(TableName, RowId)>,
     ) {
+        if self.uses_disk_backed_committed_bodies() {
+            return;
+        }
+
         let mut indexes = self.indexes.write();
         let mut tables = self.tables.write();
         let row_positions = self.row_positions.read();
@@ -1876,17 +2037,31 @@ impl RelationalStore {
         deletes: &[(TableName, RowId, TxId)],
         inserts: &[(TableName, VersionedRow)],
     ) {
+        if self.uses_disk_backed_committed_bodies() {
+            return;
+        }
+
         let skip_index_rows = self.same_index_key_replacements(deletes, inserts);
         self.apply_deletes_ref_skipping_indexes(deletes, &skip_index_rows);
         self.apply_inserts_ref_skipping_indexes(inserts, &skip_index_rows);
     }
 
     pub fn create_table(&self, name: &str, meta: TableMeta) {
-        self.tables.write().entry(name.to_string()).or_default();
+        if !self.uses_disk_backed_committed_bodies() {
+            self.tables.write().entry(name.to_string()).or_default();
+        }
         self.table_meta.write().insert(name.to_string(), meta);
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn insert_loaded_row(&self, name: &str, row: VersionedRow) -> contextdb_core::Result<()> {
+        if self.uses_disk_backed_committed_bodies() {
+            return Ok(());
+        }
+
         // Row-load during Database::open: populate every index (user-declared
         // + auto) so the rebuild stays in lockstep. Rows arrive in row_id
         // ascending order, satisfying I18.
@@ -2111,6 +2286,10 @@ impl RelationalStore {
             .cloned()
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn with_live_row(
         &self,
         table: &str,
@@ -2312,21 +2491,121 @@ impl RelationalStore {
         self.next_row_id.store(next_row_id.0, Ordering::SeqCst);
     }
 
+    #[doc(hidden)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn prepare_schema_generation(
+        &self,
+        names: impl Iterator<Item = impl AsRef<str>>,
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> contextdb_core::Result<crate::schema_generation::PreparedSchemaGeneration> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
+        let tables = self.tables.read();
+        let metadata = self.table_meta.read();
+        self.schema_history.read().prepare(
+            names.filter_map(|name| {
+                let (name, meta) = metadata.get_key_value(name.as_ref())?;
+                Some((name.as_str(), meta, tables.get(name)?.as_slice()))
+            }),
+            owner,
+        )
+    }
+
+    #[doc(hidden)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn prepare_schema_history_erasure(
+        &self,
+        keys: impl IntoIterator<Item = (RowId, Lsn)>,
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> contextdb_core::Result<crate::schema_generation::PreparedSchemaHistoryErasure> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
+        self.schema_history.read().prepare_erasure(keys, owner)
+    }
+
+    #[doc(hidden)]
+    pub fn publish_schema_history_erasure(
+        &self,
+        prepared: crate::schema_generation::PreparedSchemaHistoryErasure,
+    ) {
+        self.schema_history.write().publish_erasure(prepared);
+    }
+
+    #[doc(hidden)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn visit_authored_history(
+        &self,
+        consume: impl FnMut(&str, &TableMeta, &VersionedRow) -> contextdb_core::Result<()>,
+    ) -> contextdb_core::Result<()> {
+        self.schema_history.read().visit_all(consume)
+    }
+
+    #[doc(hidden)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn visit_authored_row_versions(
+        &self,
+        table: &str,
+        row: RowId,
+        consume: impl FnMut(&VersionedRow) -> contextdb_core::Result<()>,
+    ) -> contextdb_core::Result<()> {
+        self.schema_history.read().visit_row(table, row, consume)
+    }
+
+    #[doc(hidden)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn with_authored_row<T>(
+        &self,
+        table: &str,
+        row: RowId,
+        lsn: Lsn,
+        consume: impl FnOnce(Option<(&TableMeta, &VersionedRow)>) -> contextdb_core::Result<T>,
+    ) -> contextdb_core::Result<T> {
+        self.schema_history
+            .read()
+            .with_row(table, row, lsn, consume)
+    }
+
     pub fn drop_table(&self, name: &str) {
+        self.drop_table_with_generation(name, None);
+    }
+
+    #[doc(hidden)]
+    pub fn drop_table_with_generation(
+        &self,
+        name: &str,
+        history: Option<crate::schema_generation::PreparedSchemaGeneration>,
+    ) {
+        let mut indexes = self.indexes.write();
+        let mut tables = self.tables.write();
+        let mut metadata = self.table_meta.write();
+        let mut positions = self.row_positions.write();
+        let mut versions = self.row_version_positions.write();
+        if let Some(history) = history {
+            self.schema_history.write().publish(history, &mut tables);
+        }
+        indexes.remove(name);
+        tables.remove(name);
+        metadata.remove(name);
+        positions.retain(|(table, _), _| table != name);
+        versions.retain(|(table, _), _| table != name);
         self.retention_expiries
             .write()
             .retain(|(table, _, _), _| table != name);
-        self.table_meta.write().remove(name);
-        // Drop all indexes whose key-table matches; releases BTreeMap storage.
-        let mut indexes = self.indexes.write();
-        indexes.remove(name);
-        self.tables.write().remove(name);
-        self.row_positions
-            .write()
-            .retain(|(table, _), _| table != name);
-        self.row_version_positions
-            .write()
-            .retain(|(table, _), _| table != name);
         self.sync_source_lsns.write().remove(name);
         self.sync_source_kinds.write().remove(name);
     }
@@ -2344,7 +2623,14 @@ impl RelationalStore {
             .write()
             .entry(table.to_string())
             .or_default()
-            .insert(name.to_string(), IndexStorage::new(columns));
+            .insert(
+                name.to_string(),
+                if self.uses_disk_backed_committed_bodies() {
+                    IndexStorage::new_source_backed(columns, false, false)
+                } else {
+                    IndexStorage::new(columns)
+                },
+            );
     }
 
     pub fn create_index_storage_with_budget(
@@ -2352,10 +2638,17 @@ impl RelationalStore {
         table: &str,
         name: &str,
         columns: Vec<(String, SortDirection)>,
-        budget: Arc<dyn ReadMemoryBudget>,
+        budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) {
-        let mut storage = IndexStorage::new(columns);
-        storage.current = MembershipImage::with_budget(budget);
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
+        let storage = if self.uses_disk_backed_committed_bodies() {
+            IndexStorage::new_source_backed(columns, false, false)
+        } else {
+            let mut storage = IndexStorage::new(columns);
+            storage.current = MembershipImage::with_budget(budget);
+            storage
+        };
         self.indexes
             .write()
             .entry(table.to_owned())
@@ -2381,8 +2674,10 @@ impl RelationalStore {
         table: &str,
         name: &str,
         columns: Vec<(String, SortDirection)>,
-        budget: Arc<dyn ReadMemoryBudget>,
+        budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
         self.create_auto_index_storage_inner(table, name, columns, Some(budget));
     }
 
@@ -2391,7 +2686,7 @@ impl RelationalStore {
         table: &str,
         name: &str,
         columns: Vec<(String, SortDirection)>,
-        budget: Option<Arc<dyn ReadMemoryBudget>>,
+        budget: Option<contextdb_core::read_memory::ReadMemoryOwner>,
     ) {
         let exact_only = columns.len() == 1;
         let mut indexes = self.indexes.write();
@@ -2407,8 +2702,12 @@ impl RelationalStore {
             }
             return;
         }
-        let mut storage = IndexStorage::new_automatic(columns);
-        if !exact_only {
+        let mut storage = if self.uses_disk_backed_committed_bodies() {
+            IndexStorage::new_source_backed(columns, exact_only, true)
+        } else {
+            IndexStorage::new_automatic(columns)
+        };
+        if !exact_only && !self.uses_disk_backed_committed_bodies() {
             if let Some(budget) = budget {
                 storage.current = MembershipImage::with_budget(budget);
             } else {
@@ -2443,6 +2742,10 @@ impl RelationalStore {
     }
 
     fn rebuild_index_inner(&self, table: &str, name: &str, preserve_current: bool) {
+        if self.uses_disk_backed_committed_bodies() {
+            return;
+        }
+
         let mut indexes = self.indexes.write();
         let Some(table_indexes) = indexes.get_mut(table) else {
             return;
@@ -2492,18 +2795,28 @@ impl RelationalStore {
         Self::projected_index_storage_inner(meta, rows, None).expect("unbudgeted index projection")
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn projected_index_storage_with_budget(
         meta: &TableMeta,
         rows: &[VersionedRow],
-        budget: Arc<dyn ReadMemoryBudget>,
+        budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<HashMap<String, IndexStorage>> {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
         Self::projected_index_storage_inner(meta, rows, Some(budget))
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn projected_index_storage_inner(
         meta: &TableMeta,
         rows: &[VersionedRow],
-        budget: Option<Arc<dyn ReadMemoryBudget>>,
+        budget: Option<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<HashMap<String, IndexStorage>> {
         let mut indexes = HashMap::new();
         let mut automatic_columns = Vec::<Vec<(String, SortDirection)>>::new();
@@ -2576,6 +2889,30 @@ impl RelationalStore {
         projection
     }
 
+    /// Schema preparation for durable stores never builds resident postings.
+    pub fn projected_source_index_storage(meta: &TableMeta) -> HashMap<String, IndexStorage> {
+        let mut indexes = HashMap::new();
+        for declaration in &meta.indexes {
+            let automatic = declaration.kind == IndexKind::Auto;
+            if automatic
+                && indexes.values().any(|storage: &IndexStorage| {
+                    storage.automatic && storage.columns == declaration.columns
+                })
+            {
+                continue;
+            }
+            indexes.insert(
+                declaration.name.clone(),
+                IndexStorage::new_source_backed(
+                    declaration.columns.clone(),
+                    automatic && declaration.columns.len() == 1,
+                    automatic,
+                ),
+            );
+        }
+        indexes
+    }
+
     fn position_maps_for_tables(tables: &HashMap<TableName, Vec<VersionedRow>>) -> RowPositionMaps {
         let capacity = tables.values().map(Vec::len).sum();
         let mut positions = HashMap::with_capacity(capacity);
@@ -2599,6 +2936,31 @@ impl RelationalStore {
         projections: Vec<TableProjection>,
         dropped_tables: impl IntoIterator<Item = String>,
     ) -> PreparedRelationalPublication {
+        if self.uses_disk_backed_committed_bodies() {
+            let mut table_meta = self.table_meta.read().clone();
+            for table in dropped_tables {
+                table_meta.remove(&table);
+            }
+            for projection in projections {
+                table_meta.insert(projection.table, projection.meta);
+            }
+            let indexes = table_meta
+                .iter()
+                .map(|(table, meta)| (table.clone(), Self::projected_source_index_storage(meta)))
+                .collect();
+            return PreparedRelationalPublication {
+                selected_only: false,
+                history: None,
+                tables: HashMap::new(),
+                table_meta,
+                indexes,
+                row_positions: HashMap::new(),
+                row_version_positions: HashMap::new(),
+                sync_source_lsns: HashMap::new(),
+                sync_source_kinds: HashMap::new(),
+            };
+        }
+
         let mut tables = self.tables.read().clone();
         let mut table_meta = self.table_meta.read().clone();
         let mut source_lsns = self.sync_source_lsns.read().clone();
@@ -2642,6 +3004,8 @@ impl RelationalStore {
         }
         let (row_positions, row_version_positions) = Self::position_maps_for_tables(&tables);
         PreparedRelationalPublication {
+            selected_only: false,
+            history: None,
             tables,
             table_meta,
             indexes,
@@ -2650,6 +3014,113 @@ impl RelationalStore {
             sync_source_lsns: source_lsns,
             sync_source_kinds: source_kinds,
         }
+    }
+
+    /// Prepare data-only erasure without cloning or replacing declarations.
+    /// The caller holds the commit gate until this delta is published. All
+    /// derived maps and any destination growth are prepared before durability.
+    #[doc(hidden)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn prepare_erasure_publication(
+        &self,
+        replacements: Vec<(String, Vec<VersionedRow>)>,
+        erased: impl Fn(&str, &RowId) -> bool,
+    ) -> contextdb_core::Result<PreparedRelationalPublication> {
+        let source_backed = self.uses_disk_backed_committed_bodies();
+        let mut publication = PreparedRelationalPublication {
+            selected_only: true,
+            history: None,
+            tables: HashMap::new(),
+            table_meta: HashMap::new(),
+            indexes: HashMap::new(),
+            row_positions: HashMap::new(),
+            row_version_positions: HashMap::new(),
+            sync_source_lsns: HashMap::new(),
+            sync_source_kinds: HashMap::new(),
+        };
+        // Match the publication lock order while borrowing the catalog.
+        let live_indexes = self.indexes.read();
+        let live_tables = self.tables.read();
+        let catalog = self.table_meta.read();
+        for (table, rows) in replacements {
+            let Some(meta) = catalog.get(&table) else {
+                continue;
+            };
+            if source_backed {
+                // Source-backed row/index directories were not changed by
+                // erasing durable rows. Keep their exact existing identities.
+                continue;
+            }
+            // Erasure replaces existing slots only; it never creates a table.
+            if !live_tables.contains_key(&table) {
+                return Err(contextdb_core::Error::TableNotFound(table));
+            }
+            let indexes = Self::projected_index_storage(meta, &rows);
+            if !indexes.is_empty() && !live_indexes.contains_key(&table) {
+                return Err(contextdb_core::Error::TableNotFound(table));
+            }
+            Self::rebuild_position_maps_for_table(
+                &table,
+                &rows,
+                &mut publication.row_positions,
+                &mut publication.row_version_positions,
+            );
+            let live_lsns = self.sync_source_lsns.read();
+            let live_kinds = self.sync_source_kinds.read();
+            let mut lsns = HashMap::new();
+            let mut kinds = HashMap::new();
+            if let Some(by_row) = live_lsns.get(&table) {
+                for (row, lsn) in by_row {
+                    if !erased(&table, row)
+                        && let Some(kind) =
+                            live_kinds.get(&table).and_then(|by_row| by_row.get(row))
+                    {
+                        lsns.insert(*row, *lsn);
+                        kinds.insert(*row, *kind);
+                    }
+                }
+            }
+            publication.sync_source_lsns.insert(table.clone(), lsns);
+            publication.sync_source_kinds.insert(table.clone(), kinds);
+            if live_indexes.contains_key(&table) {
+                publication.indexes.insert(table.clone(), indexes);
+            }
+            publication.tables.insert(table, rows);
+        }
+        drop(catalog);
+        drop(live_tables);
+        drop(live_indexes);
+        // Erasure introduces no row identity or sidecar. Validate every
+        // destination before commit; publication only replaces existing slots.
+        let positions = self.row_positions.read();
+        let versions = self.row_version_positions.read();
+        let lsns = self.sync_source_lsns.read();
+        let kinds = self.sync_source_kinds.read();
+        if publication
+            .row_positions
+            .keys()
+            .any(|key| !positions.contains_key(key))
+            || publication
+                .row_version_positions
+                .keys()
+                .any(|key| !versions.contains_key(key))
+            || publication
+                .sync_source_lsns
+                .iter()
+                .any(|(table, sources)| !sources.is_empty() && !lsns.contains_key(table))
+            || publication
+                .sync_source_kinds
+                .iter()
+                .any(|(table, sources)| !sources.is_empty() && !kinds.contains_key(table))
+        {
+            return Err(contextdb_core::Error::Other(
+                "erasure publication lost an existing directory".into(),
+            ));
+        }
+        Ok(publication)
     }
 
     /// Infallibly publish a fully prebuilt received-schema replacement.  Do
@@ -2663,6 +3134,68 @@ impl RelationalStore {
         let mut version_positions = self.row_version_positions.write();
         let mut source_lsns = self.sync_source_lsns.write();
         let mut source_kinds = self.sync_source_kinds.write();
+        if let Some(history) = publication.history {
+            self.schema_history.write().publish(history, &mut tables);
+        }
+        if publication.selected_only {
+            // A source-backed erasure changes only durable rows and the
+            // prepared history root; no resident directories are replaced.
+            if publication.tables.is_empty() {
+                return;
+            }
+            // Keep every lock through the complete union of affected tables.
+            positions.retain(|key, _| {
+                !publication.tables.contains_key(&key.0)
+                    || publication.row_positions.contains_key(key)
+            });
+            version_positions.retain(|key, _| {
+                !publication.tables.contains_key(&key.0)
+                    || publication.row_version_positions.contains_key(key)
+            });
+            self.retention_expiries
+                .write()
+                .retain(|(table, row, created), _| {
+                    publication.tables.get(table).is_none_or(|rows| {
+                        rows.iter()
+                            .any(|entry| entry.row_id == *row && entry.created_tx == *created)
+                    })
+                });
+            for (table, rows) in publication.tables {
+                *tables.get_mut(&table).expect("prepared erasure table") = rows;
+            }
+            for (table, replacement) in publication.indexes {
+                *indexes.get_mut(&table).expect("prepared erasure indexes") = replacement;
+            }
+            for (key, position) in publication.row_positions {
+                *positions
+                    .get_mut(&key)
+                    .expect("prepared erasure row position") = position;
+            }
+            for (key, replacement) in publication.row_version_positions {
+                *version_positions
+                    .get_mut(&key)
+                    .expect("prepared erasure version positions") = replacement;
+            }
+            for (table, replacement) in publication.sync_source_lsns {
+                if replacement.is_empty() {
+                    source_lsns.remove(&table);
+                } else {
+                    *source_lsns
+                        .get_mut(&table)
+                        .expect("prepared erasure source LSNs") = replacement;
+                }
+            }
+            for (table, replacement) in publication.sync_source_kinds {
+                if replacement.is_empty() {
+                    source_kinds.remove(&table);
+                } else {
+                    *source_kinds
+                        .get_mut(&table)
+                        .expect("prepared erasure source kinds") = replacement;
+                }
+            }
+            return;
+        }
         *indexes = publication.indexes;
         *tables = publication.tables;
         self.retention_expiries
@@ -2680,11 +3213,45 @@ impl RelationalStore {
         *source_kinds = publication.sync_source_kinds;
     }
 
+    fn publish_source_projections(
+        &self,
+        projections: Vec<TableProjection>,
+        dropped: &HashSet<String>,
+    ) {
+        let mut all_indexes = self.indexes.write();
+        let mut table_meta = self.table_meta.write();
+        for table in dropped {
+            all_indexes.remove(table);
+            table_meta.remove(table);
+        }
+        for mut projection in projections {
+            for storage in projection.indexes.values_mut() {
+                storage.discard_resident_postings();
+            }
+            table_meta.insert(projection.table.clone(), projection.meta);
+            all_indexes.insert(projection.table, projection.indexes);
+        }
+    }
+
     /// Publish complete replacements for every affected table.  This method
     /// has no validation or allocation path: callers prepare the complete
     /// projections before Redb commits, so once durability succeeds this is
     /// only lock-ordered memory replacement.
     pub fn publish_table_projections(&self, projections: Vec<TableProjection>) {
+        self.publish_table_projections_with_generation(projections, None)
+    }
+
+    #[doc(hidden)]
+    pub fn publish_table_projections_with_generation(
+        &self,
+        projections: Vec<TableProjection>,
+        history: Option<crate::schema_generation::PreparedSchemaGeneration>,
+    ) {
+        if self.uses_disk_backed_committed_bodies() {
+            self.publish_source_projections(projections, &HashSet::new());
+            return;
+        }
+
         if projections.is_empty() {
             return;
         }
@@ -2697,6 +3264,9 @@ impl RelationalStore {
         let mut table_meta = self.table_meta.write();
         let mut positions = self.row_positions.write();
         let mut version_positions = self.row_version_positions.write();
+        if let Some(history) = history {
+            self.schema_history.write().publish(history, &mut tables);
+        }
         for projection in projections {
             let table = projection.table;
             let rows = Self::compact_projection_rows(
@@ -2729,6 +3299,21 @@ impl RelationalStore {
         projections: Vec<TableProjection>,
         dropped: &std::collections::HashSet<String>,
     ) {
+        self.publish_received_table_projections_with_generation(projections, dropped, None)
+    }
+
+    #[doc(hidden)]
+    pub fn publish_received_table_projections_with_generation(
+        &self,
+        projections: Vec<TableProjection>,
+        dropped: &std::collections::HashSet<String>,
+        history: Option<crate::schema_generation::PreparedSchemaGeneration>,
+    ) {
+        if self.uses_disk_backed_committed_bodies() {
+            self.publish_source_projections(projections, dropped);
+            return;
+        }
+
         if projections.is_empty() && dropped.is_empty() {
             return;
         }
@@ -2737,6 +3322,9 @@ impl RelationalStore {
         let mut table_meta = self.table_meta.write();
         let mut positions = self.row_positions.write();
         let mut version_positions = self.row_version_positions.write();
+        if let Some(history) = history {
+            self.schema_history.write().publish(history, &mut tables);
+        }
         let mut source_lsns = self.sync_source_lsns.write();
         let mut source_kinds = self.sync_source_kinds.write();
         for table in dropped {
@@ -2803,6 +3391,33 @@ impl RelationalStore {
         rows: Vec<VersionedRow>,
         indexes: HashMap<String, IndexStorage>,
     ) -> bool {
+        self.publish_table_projection_with_generation(table, meta, rows, indexes, None)
+    }
+
+    #[doc(hidden)]
+    pub fn publish_table_projection_with_generation(
+        &self,
+        table: &str,
+        meta: TableMeta,
+        rows: Vec<VersionedRow>,
+        indexes: HashMap<String, IndexStorage>,
+        history: Option<crate::schema_generation::PreparedSchemaGeneration>,
+    ) -> bool {
+        if self.uses_disk_backed_committed_bodies() {
+            let mut all_indexes = self.indexes.write();
+            let mut table_meta = self.table_meta.write();
+            if !table_meta.contains_key(table) {
+                return false;
+            }
+            let mut indexes = indexes;
+            for storage in indexes.values_mut() {
+                storage.discard_resident_postings();
+            }
+            table_meta.insert(table.to_owned(), meta);
+            all_indexes.insert(table.to_owned(), indexes);
+            return true;
+        }
+
         // This is the same lock order as apply_inserts/apply_deletes. Holding
         // all of them through replacement keeps row lookup maps aligned with
         // the rows an index posting names.
@@ -2811,6 +3426,9 @@ impl RelationalStore {
         let mut table_meta = self.table_meta.write();
         let mut positions = self.row_positions.write();
         let mut version_positions = self.row_version_positions.write();
+        if let Some(history) = history {
+            self.schema_history.write().publish(history, &mut tables);
+        }
         if !table_meta.contains_key(table) {
             return false;
         }
@@ -3014,17 +3632,48 @@ impl RelationalStore {
         self.table_meta
             .read()
             .get(table)
-            .and_then(|m| m.state_machine.as_ref())
+            .is_none_or(|meta| Self::validate_state_transition_for_meta(meta, column, from, to))
+    }
+
+    /// Validate against the metadata owned by the caller's committed image.
+    pub fn validate_state_transition_for_meta(
+        meta: &TableMeta,
+        column: &str,
+        from: &str,
+        to: &str,
+    ) -> bool {
+        meta.state_machine
+            .as_ref()
             .filter(|sm| sm.column == column)
             .is_none_or(|sm| {
                 sm.transitions
                     .get(from)
-                    .is_some_and(|targets| targets.iter().any(|t| t == to))
+                    .is_some_and(|targets| targets.iter().any(|target| target == to))
             })
     }
 
+    /// Borrow one captured catalog's names while an internal metadata reader
+    /// counts and admits its projection. No owning name escapes this borrow.
+    #[doc(hidden)]
+    pub fn with_table_name_view<R>(
+        &self,
+        consume: impl FnOnce(&mut dyn ExactSizeIterator<Item = &str>) -> R,
+    ) -> R {
+        if self.uses_disk_backed_committed_bodies() {
+            let tables = self.table_meta.read();
+            consume(&mut tables.keys().map(String::as_str))
+        } else {
+            let tables = self.tables.read();
+            consume(&mut tables.keys().map(String::as_str))
+        }
+    }
+
     pub fn table_names(&self) -> Vec<String> {
-        let mut names: Vec<_> = self.tables.read().keys().cloned().collect();
+        let mut names: Vec<_> = if self.uses_disk_backed_committed_bodies() {
+            self.table_meta.read().keys().cloned().collect()
+        } else {
+            self.tables.read().keys().cloned().collect()
+        };
         names.sort();
         names
     }
@@ -3128,8 +3777,38 @@ impl RelationalStore {
                     },
                 ));
         }
-        for indexes in self.indexes.read().values() {
-            for index in indexes.values() {
+        let all_indexes = self.indexes.read();
+        if self.uses_disk_backed_committed_bodies() {
+            bytes.index_descriptors = hash_table_bytes::<TableName, HashMap<String, IndexStorage>>(
+                all_indexes.capacity(),
+            );
+        }
+        for (table, indexes) in all_indexes.iter() {
+            if self.uses_disk_backed_committed_bodies() {
+                bytes.index_descriptors = bytes
+                    .index_descriptors
+                    .saturating_add(table.capacity())
+                    .saturating_add(hash_table_bytes::<String, IndexStorage>(indexes.capacity()));
+            }
+            for (name, index) in indexes {
+                if index.source_backed {
+                    bytes.index_descriptors = bytes
+                        .index_descriptors
+                        .saturating_add(name.capacity())
+                        .saturating_add(
+                            index
+                                .columns
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<(String, SortDirection)>()),
+                        )
+                        .saturating_add(
+                            index
+                                .columns
+                                .iter()
+                                .map(|(name, _)| name.capacity())
+                                .sum::<usize>(),
+                        );
+                }
                 index.retained_structure_bytes(&mut bytes);
             }
         }
@@ -3181,6 +3860,18 @@ impl RelationalStore {
         self.table_meta.read().get(name).cloned()
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn ensure_table_exists(&self, table: &str) -> contextdb_core::Result<()> {
+        if self.table_meta.read().contains_key(table) {
+            Ok(())
+        } else {
+            Err(contextdb_core::Error::TableNotFound(table.to_string()))
+        }
+    }
+
     pub fn table_has_state_machine(&self, name: &str) -> Option<bool> {
         self.table_meta
             .read()
@@ -3189,11 +3880,17 @@ impl RelationalStore {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn membership_key_credit(
     columns: &[(String, SortDirection)],
     values: &HashMap<String, Value>,
-    budget: Arc<dyn ReadMemoryBudget>,
+    budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<ReadCredit> {
+    let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
     let bytes = columns
         .iter()
         .fold(std::mem::size_of::<IndexKey>(), |bytes, (column, _)| {
@@ -3204,10 +3901,16 @@ fn membership_key_credit(
     membership_credit(budget, bytes)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn membership_credit(
-    budget: Arc<dyn ReadMemoryBudget>,
+    budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     bytes: usize,
 ) -> contextdb_core::Result<ReadCredit> {
+    let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
     ReadCredit::try_new(
         budget,
         bytes,
@@ -3247,6 +3950,30 @@ pub fn index_key_from_values(columns: &[(String, SortDirection)], values: &[Valu
         .collect()
 }
 
+impl RelationalStore {
+    /// Resolve an already admitted identity in rows held by the caller without
+    /// allocating another table key. This companion shares the ordered version
+    /// probe and snapshot predicate of `visible_version_position`.
+    #[doc(hidden)]
+    pub fn visible_version_position_with_key(
+        &self,
+        rows: &[VersionedRow],
+        key: &(TableName, RowId),
+        snapshot: contextdb_core::SnapshotId,
+    ) -> Option<usize> {
+        let version_positions = self.row_version_positions.read();
+        let positions = version_positions.get(key)?;
+        let candidate_count = positions.partition_point(|position| {
+            rows.get(*position)
+                .is_some_and(|row| row.row_id == key.1 && row.created_tx.0 <= snapshot.0)
+        });
+        let position = *positions.get(candidate_count.checked_sub(1)?)?;
+        rows.get(position)
+            .filter(|row| row.row_id == key.1 && row.visible_at(snapshot))
+            .map(|_| position)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3261,6 +3988,29 @@ mod tests {
             lsn: Lsn(created_tx.0),
             created_at: None,
         }
+    }
+
+    #[test]
+    fn a_new_exact_index_storage_holds_no_filter_until_its_first_posting() {
+        let mut storage =
+            IndexStorage::new_automatic(vec![("label".to_string(), SortDirection::Asc)]);
+        assert!(storage.exact_only(), "a single-column index is exact-only");
+        assert_eq!(
+            storage.exact_filter_bytes_held(),
+            0,
+            "a fresh exact-only storage allocates no probe filter"
+        );
+        assert!(
+            !storage.exact_filter_may_contain(7),
+            "with no filter nothing can be found"
+        );
+        storage.mark_exact_filter(7);
+        assert_eq!(
+            storage.exact_filter_bytes_held(),
+            contextdb_core::EXACT_PROBE_FILTER_BYTES,
+            "the first posting builds the filter at its full size"
+        );
+        assert!(storage.exact_filter_may_contain(7));
     }
 
     #[test]

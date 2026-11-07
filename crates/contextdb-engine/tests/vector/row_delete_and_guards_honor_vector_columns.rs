@@ -70,7 +70,10 @@ fn stored(vector: &[f32], quantization: Option<VectorQuantization>) -> Vec<f32> 
 }
 
 fn seeded(path: &std::path::Path) -> Database {
-    let database = Database::open(path).expect("create the store");
+    seed_database(Database::open(path).expect("create the store"))
+}
+
+fn seed_database(database: Database) -> Database {
     database
         .execute(
             &format!(
@@ -117,7 +120,7 @@ fn searched_ids(database: &Database, column: &str, query: &[f32]) -> Vec<Uuid> {
             &params(vec![("query", Value::Vector(query.to_vec()))]),
         )
         .expect("a vector search is served")
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.first() {
             Some(Value::Uuid(id)) => *id,
@@ -131,7 +134,7 @@ fn vector_counts(database: &Database) -> HashMap<String, i64> {
     database
         .execute("SHOW VECTOR_INDEXES", &empty())
         .expect("the store describes its vector indexes")
-        .rows
+        .rows()
         .iter()
         .map(|row| {
             let column = match row.get(1) {
@@ -175,7 +178,7 @@ fn a_row_deleted_through_the_row_api_takes_its_vectors_with_it() {
                 &params(vec![("id", Value::Uuid(doomed))]),
             )
             .expect("a keyed read is served")
-            .rows
+            .rows()
             .iter()
             .any(|_| true),
         "the deleted row is gone from an ordinary read"
@@ -203,14 +206,14 @@ fn a_row_deleted_through_the_row_api_takes_its_vectors_with_it() {
              {before}"
         );
     }
-    assert!(
+    assert_eq!(
         database
             .accountant()
             .usage()
             .used
-            .saturating_sub(database.__durable_writer_charged_bytes_for_test())
-            < held_before,
-        "and the store releases what the deleted row's vectors were costing it"
+            .saturating_sub(database.__durable_writer_charged_bytes_for_test()),
+        held_before,
+        "closed vector bodies stay charged for snapshot readers; durable membership has no resident reverse directory to release"
     );
 
     // The row that was not deleted is untouched.
@@ -344,7 +347,7 @@ fn a_quantized_vector_guard_commits_when_unchanged_and_refuses_a_competing_repla
         )
         .expect("read the row after the refused transaction");
     assert_eq!(
-        label.rows,
+        label.rows(),
         vec![vec![Value::Text("unchanged-claim".to_owned())]],
         "the typed conflict rolls the guarded overlay back instead of retrying it unconditionally"
     );
@@ -401,43 +404,51 @@ fn a_non_vector_guard_commit_loads_no_unrelated_vector_body() {
     );
     drop(commit_work);
 
-    let vector_guarded = database
-        .begin()
-        .expect("begin the positive vector-access control");
-    assert!(
+    let positive_control = |database: &Database, expected_decodes| {
+        let vector_guarded = database
+            .begin()
+            .expect("begin the positive vector-access control");
+        assert!(
+            database
+                .guard_row_conditions_in_tx(
+                    vector_guarded,
+                    "points",
+                    "id",
+                    &Value::Uuid(subject),
+                    &[(
+                        "compact".to_owned(),
+                        Value::Vector(stored(&doomed_vector(), Some(VectorQuantization::SQ8))),
+                    )],
+                )
+                .expect("the resident vector guard is admitted")
+        );
         database
-            .guard_row_conditions_in_tx(
+            .execute_in_tx(
                 vector_guarded,
-                "points",
-                "id",
-                &Value::Uuid(subject),
-                &[(
-                    "compact".to_owned(),
-                    Value::Vector(stored(&doomed_vector(), Some(VectorQuantization::SQ8))),
-                )],
+                "UPDATE points SET label = 'vector-claimed' WHERE id = $id",
+                &params(vec![("id", Value::Uuid(subject))]),
             )
-            .expect("the resident vector guard is admitted")
-    );
-    database
-        .execute_in_tx(
-            vector_guarded,
-            "UPDATE points SET label = 'vector-claimed' WHERE id = $id",
-            &params(vec![("id", Value::Uuid(subject))]),
-        )
-        .expect("stage the vector-guarded update");
-    let vector_commit_work = ReadWorkObservationScope::enter(ReadWorkPhase::Commit);
-    database
-        .commit(vector_guarded)
-        .expect("the unchanged resident vector validates");
-    assert!(
-        vector_commit_work.counters().vector_body_accesses > 0,
-        "the positive control must prove the access counter observes resident vector loads"
-    );
-    assert_eq!(
-        vector_commit_work.counters().decoded_vectors,
-        0,
-        "the positive control stays resident, proving decoded-only accounting is insufficient"
-    );
-    drop(vector_commit_work);
+            .expect("stage the vector-guarded update");
+        let vector_commit_work = ReadWorkObservationScope::enter(ReadWorkPhase::Commit);
+        database
+            .commit(vector_guarded)
+            .expect("the unchanged resident vector validates");
+        assert!(
+            vector_commit_work.counters().vector_body_accesses > 0,
+            "the positive control must prove the access counter observes resident vector loads"
+        );
+        assert_eq!(
+            vector_commit_work.counters().decoded_vectors,
+            expected_decodes,
+            "the durable control decodes only its selected body; the resident control decodes none"
+        );
+        drop(vector_commit_work);
+    };
+    positive_control(&database, 1);
+    let resident = seed_database(Database::open_memory());
+    positive_control(&resident, 0);
+    resident
+        .close()
+        .expect("close the resident positive control");
     database.close().expect("close the guard-work fixture");
 }

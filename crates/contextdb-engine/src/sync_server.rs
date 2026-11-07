@@ -3,10 +3,12 @@
 use crate::composite_store::ApplyPhasePause;
 #[cfg(feature = "test-seams")]
 use crate::database::ApplyPhasePauseGuard;
+#[cfg(test)]
+use crate::protocol::decode;
 use crate::protocol::{
     DependencyCompletePullResponse, MessageType, PullRequest, PullResponse, PushRequest,
     PushResponse, SchemaRecoveryPage, SchemaRecoveryRequest, SyncStatusResponse, WirePurgeChange,
-    WirePushError, decode, encode_for_version, row_payload_bytes,
+    WirePushError, row_payload_bytes,
 };
 use crate::subjects::{pull_subject, push_subject, status_subject};
 use crate::sync_client::refuse_keyless_tables_with_no_identity_fallback;
@@ -15,9 +17,7 @@ use crate::transport::{
     HandlerRegistration, IncomingRequest, LineageSigner, RequestHandler, Responder,
     ServerTransport, TransportError,
 };
-use contextdb_core::{
-    AtomicLsn, ColumnType, Incarnation, Lsn, TableMeta, TenantId, VectorSearchMode,
-};
+use contextdb_core::{AtomicLsn, Error, Incarnation, Lsn, TableMeta, TenantId};
 use contextdb_engine::sync_types::{
     ChangeSet, DdlChange, DurableSchemaSyncHoldback, NaturalKey, SchemaSyncCapability,
     SchemaSyncHoldback, SyncAdoption, SyncDirection,
@@ -139,15 +139,22 @@ struct PerEdgeAppliedPushWatermarks {
 impl PerEdgeAppliedPushWatermarks {
     /// What this hub holds from this life of `node_id`, `Lsn(0)` when it holds
     /// nothing.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn load(
         &self,
         db: &Database,
         tenant_id: &TenantId,
         node_id: &str,
         incarnation: Incarnation,
-    ) -> Lsn {
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<Lsn, Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut cache = self.cache.lock().unwrap_or_else(|err| err.into_inner());
-        Self::load_locked(&mut cache, db, tenant_id, node_id, incarnation)
+        Self::load_locked(&mut cache, db, tenant_id, node_id, incarnation, read_memory)
     }
 
     /// The engine has already committed this authenticated receipt in the
@@ -161,39 +168,39 @@ impl PerEdgeAppliedPushWatermarks {
             .or_insert(candidate);
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn load_locked(
         cache: &mut HashMap<(String, Incarnation), Lsn>,
         db: &Database,
         tenant_id: &TenantId,
         node_id: &str,
         incarnation: Incarnation,
-    ) -> Lsn {
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<Lsn, Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(known) = cache.get(&(node_id.to_string(), incarnation)) {
-            return *known;
+            return Ok(*known);
         }
         let stored = db
-            .persisted_sync_applied_push_watermark_for_node_incarnation(
+            .persisted_sync_applied_push_watermark_for_node_incarnation_with_read_memory(
                 tenant_id,
                 node_id,
                 incarnation,
-            )
-            .unwrap_or_else(|err| {
-                tracing::warn!(
-                    %tenant_id,
-                    %node_id,
-                    %incarnation,
-                    error = %err,
-                    "failed to load per-edge applied-push watermark"
-                );
-                None
-            })
+                read_memory,
+            )?
             .unwrap_or(Lsn(0));
         cache.insert((node_id.to_string(), incarnation), stored);
-        stored
+        Ok(stored)
     }
 }
 
 struct PushApplyWork {
+    read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+
     db: Arc<Database>,
     local_node_id: Option<String>,
     peer_node_id: Option<String>,
@@ -237,6 +244,63 @@ struct PushHandlerState {
     completed_apply_before_reply_pause: Arc<ApplyPhasePause>,
 }
 
+crate::transport::peer_endpoint_available! {
+const SYNC_RECEIVE_HINT: &str =
+    "Raise the hub's MEMORY_LIMIT to accept this pushed unit, or push a smaller unit.";
+}
+
+crate::transport::peer_endpoint_available! {
+/// Funds assembling a complete oversized push from the hub's writer budget.
+struct HubAssemblyAdmission {
+    accountant: crate::memory_accounting::AccountantHandle,
+}
+}
+
+crate::transport::peer_endpoint_available! {
+impl crate::transport::LargeRequestAdmission for HubAssemblyAdmission {
+    fn preflight(&self, bytes: usize) -> Result<(), Error> {
+        let usage = self.accountant.usage();
+        match usage.limit {
+            Some(limit) if bytes > limit => Err(Error::MemoryBudgetExceeded {
+                subsystem: ("sync_receive".to_string()).into(),
+                operation: ("assemble_pushed_unit".to_string()).into(),
+                requested_bytes: bytes,
+                available_bytes: usage.available.unwrap_or(0),
+                budget_limit_bytes: limit,
+                hint: (SYNC_RECEIVE_HINT.to_string()).into(),
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    fn admit(&self, bytes: usize) -> Result<Box<dyn crate::transport::AssemblyCredit>, Error> {
+        Ok(Box::new(HubAssemblyCredit(
+            crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                self.accountant.clone(),
+                bytes,
+                "sync_receive",
+                "assemble_pushed_unit",
+                SYNC_RECEIVE_HINT,
+            )?,
+        )))
+    }
+}
+}
+
+crate::transport::peer_endpoint_available! {
+struct HubAssemblyCredit(crate::memory_accounting::OwnedMemoryReservation);
+}
+
+crate::transport::peer_endpoint_available! {
+impl crate::transport::AssemblyCredit for HubAssemblyCredit {
+    fn shrink_to(&mut self, bytes: usize) {
+        let release = self.0.bytes().saturating_sub(bytes);
+        // Releasing part of a held charge cannot exceed what it holds.
+        let _ = self.0.try_shrink(release);
+    }
+}
+}
+
 async fn maybe_wait_for_test_push_barrier(row_count: usize) {
     let Some(min_rows) = std::env::var("CONTEXTDB_TEST_PUSH_BARRIER_MIN_ROWS")
         .ok()
@@ -265,9 +329,12 @@ async fn maybe_wait_for_test_push_barrier(row_count: usize) {
 }
 
 pub struct SyncServer {
+    read_budget_provider: crate::vector_read_memory::ReadRequestProvider,
     db: Arc<Database>,
     transport: Arc<dyn ServerTransport>,
     lineage_signer: Option<LineageSigner>,
+    // Standing server identity; this Arc is not allocated from a request invoice.
+    lineage_identity: Option<Arc<crate::identity::FabricIdentity>>,
     local_node_id: Option<String>,
     tenant_id: TenantId,
     /// Highest edge-LSN applied from pushes for this tenant. `Lsn(0)`
@@ -287,32 +354,78 @@ pub struct SyncServer {
     peer_schema_capabilities: PeerSchemaCapabilities,
     #[cfg(feature = "test-seams")]
     completed_apply_before_reply_pause: Arc<ApplyPhasePause>,
+    /// Native delivery installation prepared by `native_stop`, taken by the
+    /// one `run_until_stopped` driven by that stop handle.
+    native_delivery: std::sync::Mutex<Option<crate::transport::ReadBoundStreamInstallation>>,
+    delivery_route_counts: Arc<DeliveryRouteCounts>,
 }
 
 impl SyncServer {
     crate::transport::peer_endpoint_available! {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn new(
         db: Arc<Database>,
         endpoint: &crate::transport::PeerEndpoint,
         tenant_id: TenantId,
-    ) -> Self {
+    ) -> Result<Self, Error> {
+        let read_budget_provider = db.declared_read_request_provider();
+        Self::new_with_read_budget_provider_handle(db, endpoint, tenant_id, read_budget_provider)
+    }
+
+    }
+
+    crate::transport::peer_endpoint_available! {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    pub fn new_with_read_budget_provider(
+        db: Arc<Database>,
+        endpoint: &crate::transport::PeerEndpoint,
+        tenant_id: TenantId,
+        read_budget_provider: Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
+    ) -> Result<Self, Error> {
+        Self::new_with_read_budget_provider_handle(db, endpoint, tenant_id, read_budget_provider.into())
+    }
+    }
+
+    crate::transport::peer_endpoint_available! {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    fn new_with_read_budget_provider_handle(
+        db: Arc<Database>,
+        endpoint: &crate::transport::PeerEndpoint,
+        tenant_id: TenantId,
+        read_budget_provider: crate::vector_read_memory::ReadRequestProvider,
+    ) -> Result<Self, Error> {
+        // Receiving a pushed unit is the hub's write working memory: its
+        // writer budget funds reassembling an oversized request.
+        endpoint.install_large_request_admission(Arc::new(HubAssemblyAdmission {
+            accountant: db.writer_accountant_handle(),
+        }));
         Self::build(
             db,
             endpoint.transport(),
             Some(endpoint.lineage_signer()),
+            Some(endpoint.lineage_identity()),
             tenant_id,
             Some(endpoint.node_id()),
+            read_budget_provider,
         )
     }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn build(
         db: Arc<Database>,
         transport: Arc<dyn ServerTransport>,
         lineage_signer: Option<LineageSigner>,
+        lineage_identity: Option<Arc<crate::identity::FabricIdentity>>,
         tenant_id: TenantId,
         local_node_id: Option<String>,
-    ) -> Self {
+        read_budget_provider: impl Into<crate::vector_read_memory::ReadRequestProvider>,
+    ) -> Result<Self, Error> {
+        let read_budget_provider: crate::vector_read_memory::ReadRequestProvider =
+            read_budget_provider.into();
         assert!(
             !tenant_id.as_str().is_empty()
                 && tenant_id
@@ -321,32 +434,28 @@ impl SyncServer {
                     .all(|c| c.is_alphanumeric() || c == '-' || c == '_'),
             "tenant_id must be non-empty and alphanumeric (hyphens and underscores allowed): {tenant_id}"
         );
+        // A hub serves from its writer store; a sealed read image is not one.
+        if db.is_sealed_read_image() {
+            return Err(Error::ReadFailure(
+                contextdb_core::read_contract::ReadFailure::owner_route_unsupported(
+                    "sync/hub_on_sealed_image".into(),
+                ),
+            ));
+        }
         // Declarations belong to the served tenant and authenticated hub.
         if let (Some(node), Some(signer)) = (&local_node_id, &lineage_signer) {
             db.set_custody_runtime(tenant_id.clone(), node.clone(), signer.clone());
         }
         db.enable_sync_relay_mode();
+        let read_memory = read_budget_provider.request_budget()?;
         let applied_push_watermark = db
-            .persisted_sync_applied_push_watermark(&tenant_id)
-            .unwrap_or_else(|err| {
-                tracing::warn!(
-                    %tenant_id,
-                    error = %err,
-                    "failed to load persisted applied-push watermark"
-                );
-                None
-            })
+            .persisted_sync_applied_push_watermark_with_read_memory(
+                &tenant_id,
+                read_memory.clone(),
+            )?
             .unwrap_or(Lsn(0));
         let schema_sync_holdbacks = db
-            .persisted_inbound_schema_sync_holdbacks(&tenant_id)
-            .unwrap_or_else(|err| {
-                tracing::warn!(
-                    %tenant_id,
-                    error = %err,
-                    "failed to load persisted schema compatibility holdbacks"
-                );
-                Vec::new()
-            })
+            .persisted_inbound_schema_sync_holdbacks(&tenant_id, read_memory.clone())?
             .into_iter()
             .map(|state| {
                 (
@@ -360,10 +469,12 @@ impl SyncServer {
                 )
             })
             .collect();
-        Self {
+        Ok(Self {
+            read_budget_provider,
             db,
             transport,
             lineage_signer,
+            lineage_identity,
             local_node_id,
             tenant_id,
             applied_push_watermark: Arc::new(AtomicLsn::new(applied_push_watermark)),
@@ -373,7 +484,9 @@ impl SyncServer {
             peer_schema_capabilities: PeerSchemaCapabilities::default(),
             #[cfg(feature = "test-seams")]
             completed_apply_before_reply_pause: Arc::new(ApplyPhasePause::new()),
-        }
+            native_delivery: std::sync::Mutex::new(None),
+            delivery_route_counts: Arc::new(DeliveryRouteCounts::default()),
+        })
     }
 
     /// Test-only authenticated transport injection. This is deliberately not
@@ -381,27 +494,158 @@ impl SyncServer {
     /// owns its transport and reads ordinary arbitration from declarations.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn with_authenticated_transport_for_test(
         db: Arc<Database>,
         transport: Arc<dyn crate::transport::ServerTransport>,
         tenant_id: TenantId,
-    ) -> Self {
-        Self::build(db, transport, None, tenant_id, None)
+    ) -> Result<Self, Error> {
+        let read_budget_provider = db.declared_read_request_provider();
+        Self::with_authenticated_transport_for_test_with_read_budget_provider_handle(
+            db,
+            transport,
+            tenant_id,
+            read_budget_provider,
+        )
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
+    pub fn with_authenticated_transport_for_test_with_read_budget_provider(
+        db: Arc<Database>,
+        transport: Arc<dyn crate::transport::ServerTransport>,
+        tenant_id: TenantId,
+        read_budget_provider: Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
+    ) -> Result<Self, Error> {
+        Self::with_authenticated_transport_for_test_with_read_budget_provider_handle(
+            db,
+            transport,
+            tenant_id,
+            read_budget_provider.into(),
+        )
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
+    fn with_authenticated_transport_for_test_with_read_budget_provider_handle(
+        db: Arc<Database>,
+        transport: Arc<dyn crate::transport::ServerTransport>,
+        tenant_id: TenantId,
+        read_budget_provider: crate::vector_read_memory::ReadRequestProvider,
+    ) -> Result<Self, Error> {
+        Self::build(
+            db,
+            transport,
+            None,
+            None,
+            tenant_id,
+            None,
+            read_budget_provider,
+        )
     }
 
     /// Test-only construction with a fabric key matching the hub identity
     /// advertised by the injected transport.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn with_authenticated_transport_and_identity_for_test(
         db: Arc<Database>,
         transport: Arc<dyn crate::transport::ServerTransport>,
         tenant_id: TenantId,
         local_node_id: String,
         identity: Arc<crate::identity::FabricIdentity>,
-    ) -> Self {
+    ) -> Result<Self, Error> {
+        let read_budget_provider = db.declared_read_request_provider();
+        Self::with_authenticated_transport_and_identity_for_test_with_read_budget_provider_handle(
+            db,
+            transport,
+            tenant_id,
+            local_node_id,
+            identity,
+            read_budget_provider,
+        )
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
+    pub fn with_authenticated_transport_and_identity_for_test_with_read_budget_provider(
+        db: Arc<Database>,
+        transport: Arc<dyn crate::transport::ServerTransport>,
+        tenant_id: TenantId,
+        local_node_id: String,
+        identity: Arc<crate::identity::FabricIdentity>,
+        read_budget_provider: impl Into<crate::vector_read_memory::ReadRequestProvider>,
+    ) -> Result<Self, Error> {
+        Self::with_authenticated_transport_and_identity_for_test_with_read_budget_provider_handle(
+            db,
+            transport,
+            tenant_id,
+            local_node_id,
+            identity,
+            read_budget_provider.into(),
+        )
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
+    fn with_authenticated_transport_and_identity_for_test_with_read_budget_provider_handle(
+        db: Arc<Database>,
+        transport: Arc<dyn crate::transport::ServerTransport>,
+        tenant_id: TenantId,
+        local_node_id: String,
+        identity: Arc<crate::identity::FabricIdentity>,
+        read_budget_provider: crate::vector_read_memory::ReadRequestProvider,
+    ) -> Result<Self, Error> {
+        let lineage_identity = identity.clone();
         let signer: LineageSigner = Arc::new(move |bytes| Ok(identity.sign_lineage(bytes)));
-        Self::build(db, transport, Some(signer), tenant_id, Some(local_node_id))
+        Self::build(
+            db,
+            transport,
+            Some(signer),
+            Some(lineage_identity),
+            tenant_id,
+            Some(local_node_id),
+            read_budget_provider,
+        )
     }
 
     pub fn db(&self) -> &Database {
@@ -479,6 +723,50 @@ impl SyncServer {
         apply_tasks.wait_idle().await;
     }
 
+    /// Stop-handle sibling. When `stop` came from [`Self::native_stop`], the
+    /// delivery subject is served by its native installation and the status,
+    /// pull, push and binding subjects stay on their Legacy handlers beside it.
+    /// Any other stop handle serves every subject on the transport's Legacy branch.
+    #[doc(hidden)]
+    pub async fn run_until_stopped(&self, stop: crate::transport::NativeStop) {
+        let apply_tasks = Arc::new(ApplyTracker::new());
+        let in_flight_push_applies: InFlightPushApplies =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let apply_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_PUSH_APPLIES));
+        let mut handlers =
+            self.handlers(apply_tasks.clone(), in_flight_push_applies, apply_permits);
+        let prepared = self
+            .native_delivery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .filter(|installation| {
+                installation
+                    .native_routes()
+                    .is_some_and(|routes| stop.is_funded_by(&routes.installation_owner()))
+            });
+        let installation = match prepared {
+            Some(installation) => {
+                let delivery = crate::subjects::delivery_outcomes_subject(self.tenant_id.as_str());
+                handlers.retain(|handler| handler.subject != delivery);
+                installation
+            }
+            None => crate::transport::ReadBoundStreamInstallation::empty(),
+        };
+        match self
+            .transport
+            .serve_native_installation(handlers, installation, stop)
+        {
+            Ok(serving) => {
+                if let Err(err) = serving.await {
+                    tracing::error!(error = %err, "sync server transport loop failed");
+                }
+            }
+            Err(err) => tracing::error!(error = %err, "sync server transport installation failed"),
+        }
+        apply_tasks.wait_idle().await;
+    }
+
     fn handlers(
         &self,
         apply_tasks: ApplyTasks,
@@ -523,6 +811,10 @@ impl SyncServer {
                 let schema_sync_holdbacks = schema_sync_holdbacks.clone();
                 let peer_schema_capabilities = peer_schema_capabilities.clone();
                 Box::pin(async move {
+                    // Serving a pull is the hub's own sync work: the rows a page
+                    // carries are funded by the writer budget (MEMORY_LIMIT),
+                    // never by a caller's per-request read limit.
+                    let read_memory = db.engine_sync_read_memory().map_err(to_transport_error)?;
                     handle_pull(
                         db,
                         lineage_signer,
@@ -532,6 +824,7 @@ impl SyncServer {
                         schema_sync_holdbacks,
                         peer_schema_capabilities,
                         req,
+                        read_memory,
                     )
                     .await
                     .map_err(to_transport_error)
@@ -541,17 +834,22 @@ impl SyncServer {
 
         let status_handler = {
             let local_node_id = self.local_node_id.clone();
+            let read_budget_provider = self.read_budget_provider.clone();
             let db = self.db.clone();
             let tenant_id = self.tenant_id.clone();
             let applied_push_watermark = self.applied_push_watermark.clone();
             let per_edge_watermarks = self.per_edge_watermarks.clone();
             Arc::new(move |req: IncomingRequest| {
+                let read_budget_provider = read_budget_provider.clone();
                 let db = db.clone();
                 let tenant_id = tenant_id.clone();
                 let applied_push_watermark = applied_push_watermark.clone();
                 let per_edge_watermarks = per_edge_watermarks.clone();
                 let local_node_id = local_node_id.clone();
                 Box::pin(async move {
+                    let read_memory = read_budget_provider
+                        .request_budget()
+                        .map_err(to_transport_error)?;
                     handle_status(
                         db,
                         local_node_id,
@@ -559,6 +857,7 @@ impl SyncServer {
                         applied_push_watermark,
                         per_edge_watermarks,
                         req,
+                        read_memory,
                     )
                     .await
                     .map_err(to_transport_error)
@@ -573,16 +872,31 @@ impl SyncServer {
             let db = self.db.clone();
             let hub = self.local_node_id.clone();
             let signer = self.lineage_signer.clone();
+            let read_budget_provider = self.read_budget_provider.clone();
             Arc::new(move |req: IncomingRequest| {
                 let (tenant, db, hub, signer) =
                     (tenant.clone(), db.clone(), hub.clone(), signer.clone());
+                let read_budget_provider = read_budget_provider.clone();
                 Box::pin(async move {
+                    let read_memory = read_budget_provider
+                        .request_budget()
+                        .map_err(to_transport_error)?;
+                    let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
+                        db.bounded_read_accountant(),
+                        read_memory.clone(),
+                        "reader",
+                        "decode_sync_request",
+                        "Reduce the request or raise the declared reader memory limit.",
+                    );
+                    let mut vector_copy_owner =
+                        crate::vector_read_memory::admission(read_memory.clone());
                     use crate::protocol::*;
                     let envelope =
-                        decode(&req.bytes).map_err(|e| TransportError::Other(e.to_string()))?;
-                    let request: BindApplicationTablePolicyRequest =
-                        rmp_serde::from_slice(&envelope.payload)
-                            .map_err(|e| TransportError::Other(e.to_string()))?;
+                        crate::sync_client::decode_sync_envelope(&decoded_memory, &req.bytes, None)
+                            .map_err(to_transport_error)?;
+                    let request: BindApplicationTablePolicyRequest = decoded_memory
+                        .decode_msgpack(&envelope.payload)
+                        .map_err(to_transport_error)?;
                     if envelope.message_type != MessageType::BindApplicationTablePolicyRequest
                         || request.format != 1
                         || request.tenant_id != tenant.as_str()
@@ -611,6 +925,8 @@ impl SyncServer {
                             expectation: request.expectation,
                         },
                         &signer,
+                        &mut vector_copy_owner,
+                        read_memory.clone(),
                     );
                     let response = match result {
                         Ok(packet) => {
@@ -655,60 +971,28 @@ impl SyncServer {
         };
         let outcomes_handler = {
             let db = self.db.clone();
+            let read_budget_provider = self.read_budget_provider.clone();
             let tenant = self.tenant_id.clone();
             let hub = self.local_node_id.clone();
+            let legacy_fetches = self.delivery_route_counts.clone();
             Arc::new(move |req: IncomingRequest| {
                 let db = db.clone();
+                let read_budget_provider = read_budget_provider.clone();
                 let tenant = tenant.clone();
                 let hub = hub.clone();
+                legacy_fetches.legacy.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async move {
-                    use crate::protocol::*;
-                    let envelope =
-                        decode(&req.bytes).map_err(|e| TransportError::Other(e.to_string()))?;
-                    let request: FetchDeliveryOutcomesRequest =
-                        rmp_serde::from_slice(&envelope.payload)
-                            .map_err(|e| TransportError::Other(e.to_string()))?;
-                    if envelope.message_type != MessageType::FetchDeliveryOutcomesRequest
-                        || request.format != 1
-                        || request.tenant_id != tenant.as_str()
-                    {
-                        return Err(TransportError::Other(
-                            "invalid authenticated outcome request".into(),
-                        ));
-                    }
-                    let hub = hub.ok_or_else(|| {
-                        TransportError::Other("authenticated hub required".into())
-                    })?;
-                    let edge = req.node_id.ok_or_else(|| {
-                        TransportError::Other("authenticated edge required".into())
-                    })?;
-                    let outcomes = crate::custody::delivery::fetch(
+                    let read_memory = read_budget_provider
+                        .request_budget()
+                        .map_err(to_transport_error)?;
+                    let bytes = legacy_delivery_reply(
                         &db,
                         &tenant,
-                        &hub,
-                        &edge,
-                        request.edge_incarnation,
-                        request.since.as_deref(),
-                    )
-                    .map_err(|e| TransportError::Other(e.to_string()))?;
-                    let response = FetchDeliveryOutcomesResponse {
-                        format: 1,
-                        request_nonce: request.request_nonce,
-                        hub_node_id: hub,
-                        hub_incarnation: db
-                            .existing_sync_incarnation(&tenant)
-                            .map_err(|e| TransportError::Other(e.to_string()))?
-                            .ok_or_else(|| {
-                                TransportError::Other("hub authority is not initialized".into())
-                            })?,
-                        tenant_id: tenant.as_str().into(),
-                        edge_node_id: edge,
-                        edge_incarnation: request.edge_incarnation,
-                        result: Some(DeliveryOutcomePage { outcomes }),
-                        error: None,
-                    };
-                    let bytes = encode_named(MessageType::FetchDeliveryOutcomesResponse, &response)
-                        .map_err(|e| TransportError::Other(e.to_string()))?;
+                        hub,
+                        read_memory,
+                        &req.bytes,
+                        req.node_id,
+                    )?;
                     (req.responder)(bytes).await
                 }) as crate::transport::TransportFuture<'static, ()>
             }) as RequestHandler
@@ -717,15 +1001,27 @@ impl SyncServer {
         #[cfg(feature = "test-seams")]
         let fixture_binding_handler = {
             let db = self.db.clone();
+            let read_budget_provider = self.read_budget_provider.clone();
             let tenant_id = self.tenant_id.clone();
             let local_node_id = self.local_node_id.clone();
             let signer = self.lineage_signer.clone();
             Arc::new(move |req: IncomingRequest| {
                 let db = db.clone();
+                let read_budget_provider = read_budget_provider.clone();
                 let tenant_id = tenant_id.clone();
                 let local_node_id = local_node_id.clone();
                 let signer = signer.clone();
                 Box::pin(async move {
+                    let read_memory = read_budget_provider
+                        .request_budget()
+                        .map_err(to_transport_error)?;
+                    let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
+                        db.bounded_read_accountant(),
+                        read_memory.clone(),
+                        "reader",
+                        "decode_sync_request",
+                        "Reduce the request or raise the declared reader memory limit.",
+                    );
                     let edge_node_id = req.node_id.clone().ok_or_else(|| {
                         TransportError::Other(
                             "fixture binding requires an authenticated edge".to_string(),
@@ -741,8 +1037,9 @@ impl SyncServer {
                             "fixture binding requires the hub signing key".to_string(),
                         )
                     })?;
-                    let request = rmp_serde::from_slice(&req.bytes)
-                        .map_err(|error| TransportError::Other(error.to_string()))?;
+                    let request = decoded_memory
+                        .decode_msgpack(&req.bytes)
+                        .map_err(to_transport_error)?;
                     let record = crate::custody::fixtures::issue_fixture_binding(
                         &db,
                         tenant_id,
@@ -762,15 +1059,27 @@ impl SyncServer {
         #[cfg(feature = "test-seams")]
         let fixture_outcome_handler = {
             let db = self.db.clone();
+            let read_budget_provider = self.read_budget_provider.clone();
             let tenant_id = self.tenant_id.clone();
             let local_node_id = self.local_node_id.clone();
             let signer = self.lineage_signer.clone();
             Arc::new(move |req: IncomingRequest| {
                 let db = db.clone();
+                let read_budget_provider = read_budget_provider.clone();
                 let tenant_id = tenant_id.clone();
                 let local_node_id = local_node_id.clone();
                 let signer = signer.clone();
                 Box::pin(async move {
+                    let read_memory = read_budget_provider
+                        .request_budget()
+                        .map_err(to_transport_error)?;
+                    let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
+                        db.bounded_read_accountant(),
+                        read_memory.clone(),
+                        "reader",
+                        "decode_sync_request",
+                        "Reduce the request or raise the declared reader memory limit.",
+                    );
                     let edge_node_id = req.node_id.clone().ok_or_else(|| {
                         TransportError::Other(
                             "fixture outcome requires an authenticated edge".to_string(),
@@ -786,8 +1095,11 @@ impl SyncServer {
                             "fixture outcome requires the hub signing key".to_string(),
                         )
                     })?;
-                    let request = rmp_serde::from_slice(&req.bytes)
-                        .map_err(|error| TransportError::Other(error.to_string()))?;
+                    let request = decoded_memory
+                        .decode_msgpack(&req.bytes)
+                        .map_err(to_transport_error)?;
+                    let mut vector_copy_owner =
+                        crate::vector_read_memory::admission(read_memory.clone());
                     let record = crate::custody::fixtures::issue_fixture_outcome(
                         &db,
                         tenant_id,
@@ -795,6 +1107,8 @@ impl SyncServer {
                         edge_node_id,
                         request,
                         &signer,
+                        &mut vector_copy_owner,
+                        read_memory.clone(),
                     )
                     .map_err(|e| e.to_string());
                     let response = rmp_serde::to_vec_named(&record)
@@ -807,15 +1121,27 @@ impl SyncServer {
         #[cfg(feature = "test-seams")]
         let fixture_outcome_batch_handler = {
             let db = self.db.clone();
+            let read_budget_provider = self.read_budget_provider.clone();
             let tenant_id = self.tenant_id.clone();
             let local_node_id = self.local_node_id.clone();
             let signer = self.lineage_signer.clone();
             Arc::new(move |req: IncomingRequest| {
                 let db = db.clone();
+                let read_budget_provider = read_budget_provider.clone();
                 let tenant_id = tenant_id.clone();
                 let local_node_id = local_node_id.clone();
                 let signer = signer.clone();
                 Box::pin(async move {
+                    let read_memory = read_budget_provider
+                        .request_budget()
+                        .map_err(to_transport_error)?;
+                    let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
+                        db.bounded_read_accountant(),
+                        read_memory.clone(),
+                        "reader",
+                        "decode_sync_request",
+                        "Reduce the request or raise the declared reader memory limit.",
+                    );
                     let edge_node_id = req.node_id.clone().ok_or_else(|| {
                         TransportError::Other(
                             "fixture outcome requires an authenticated edge".to_string(),
@@ -831,8 +1157,12 @@ impl SyncServer {
                             "fixture outcome requires the hub signing key".to_string(),
                         )
                     })?;
-                    let request = rmp_serde::from_slice(&req.bytes)
-                        .map_err(|error| TransportError::Other(error.to_string()))?;
+                    let request = decoded_memory
+                        .decode_msgpack(&req.bytes)
+                        .map_err(to_transport_error)?;
+                    let mut retained_vector_copy =
+                        crate::vector_read_memory::admission(read_memory.clone());
+                    let vector_copy_owner = &mut retained_vector_copy;
                     let record = crate::custody::preparation::commit_terminal_batch(
                         &db,
                         tenant_id,
@@ -840,6 +1170,8 @@ impl SyncServer {
                         edge_node_id,
                         request,
                         &signer,
+                        vector_copy_owner,
+                        read_memory.clone(),
                     )
                     .map_err(|e| e.to_string());
                     let response = rmp_serde::to_vec_named(&record)
@@ -854,7 +1186,13 @@ impl SyncServer {
         // `record_contact`; push records after the admission decision so a
         // database write cannot strand a retry outside its leader's fanout.
         // An unauthenticated request records nothing.
-        #[allow(unused_mut)]
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                unused_mut,
+                reason = "KEEP-SEAM: the test-seams build pushes its seam handlers onto this list"
+            )
+        )]
         let mut handlers = vec![
             HandlerRegistration {
                 subject: crate::subjects::binding_subject(self.tenant_id.as_str()),
@@ -904,13 +1242,22 @@ impl SyncServer {
     /// record afterward in `handle_push` to preserve duplicate-response fanout.
     fn record_contact(&self, inner: RequestHandler) -> RequestHandler {
         let db = self.db.clone();
+        let read_budget_provider = self.read_budget_provider.clone();
         Arc::new(move |req: IncomingRequest| {
             let db = db.clone();
             let inner = inner.clone();
+            let read_budget_provider = read_budget_provider.clone();
             Box::pin(async move {
+                let read_memory = read_budget_provider
+                    .request_budget()
+                    .map_err(to_transport_error)?;
                 if let Some(node_id) = req.node_id.clone()
-                    && let Err(err) =
-                        crate::sync_system_tables::record_node_contact(&db, &node_id, hub_now_ms())
+                    && let Err(err) = crate::sync_system_tables::record_node_contact(
+                        &db,
+                        &node_id,
+                        hub_now_ms(),
+                        read_memory.clone(),
+                    )
                 {
                     tracing::warn!(%node_id, error = %err, "failed to record node last-contact");
                 }
@@ -942,24 +1289,51 @@ async fn handle_status(
     applied_push_watermark: Arc<AtomicLsn>,
     per_edge_watermarks: Arc<PerEdgeAppliedPushWatermarks>,
     req: IncomingRequest,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<()> {
-    let envelope = decode_for_server(&req.bytes)?;
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+    let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
+        db.bounded_read_accountant(),
+        read_memory.clone(),
+        "reader",
+        "decode_sync_response",
+        "Reduce the sync response or raise the declared reader memory limit.",
+    );
+
+    let mut retained_vector_copy = crate::vector_read_memory::admission(read_memory.clone());
+    let vector_copy_owner = &mut retained_vector_copy;
+
+    let envelope = crate::sync_client::decode_sync_envelope(&decoded_memory, &req.bytes, None)?;
     let protocol_version = envelope.version;
     if !matches!(envelope.message_type, MessageType::StatusRequest) {
         return Err(contextdb_core::Error::SyncError(
-            "unexpected message type on status subject".to_string(),
+            ("unexpected message type on status subject".to_string()).into(),
         ));
     }
     let request: crate::custody::incarnation::StatusProbe =
-        rmp_serde::from_slice(&envelope.payload)
-            .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+        decoded_memory.decode_msgpack(&envelope.payload)?;
 
     let applied = match req.node_id.as_deref() {
-        Some(node_id) => per_edge_watermarks.load(&db, &tenant_id, node_id, request.incarnation),
+        Some(node_id) => per_edge_watermarks.load(
+            &db,
+            &tenant_id,
+            node_id,
+            request.incarnation,
+            read_memory.clone(),
+        )?,
         None => applied_push_watermark.load(Ordering::SeqCst),
     };
     if let (Some(runtime), Some(edge)) = (db.custody_runtime(), req.node_id.as_deref()) {
-        crate::custody::incarnation::check(&db, &tenant_id, &runtime.node, edge, &request)?;
+        crate::custody::incarnation::check(
+            &db,
+            &tenant_id,
+            &runtime.node,
+            edge,
+            &request,
+            vector_copy_owner,
+            read_memory.clone(),
+        )?;
     }
     let (edge, hub) = match (req.node_id.as_deref(), local_node_id.as_deref()) {
         (Some(edge), Some(hub)) => (edge, hub),
@@ -975,10 +1349,11 @@ async fn handle_status(
         request.incarnation,
         hub,
         &request.refused_schema_unit_digests,
+        read_memory.clone(),
     )?;
     // An empty exact lookup initializes a fresh hub's life as well. Observe it
     // after the lookup so the acknowledgment and its scope describe one image.
-    let hub_incarnation = db.existing_sync_incarnation(&tenant_id)?;
+    let hub_incarnation = db.existing_sync_incarnation(&tenant_id, read_memory.clone())?;
     let response = SyncStatusResponse {
         applied_push_watermark: Some(applied),
         server_current_lsn: Some(db.current_lsn()),
@@ -986,18 +1361,26 @@ async fn handle_status(
         refused_schema_units,
         refused_schema_unit_digests_ack: Some(request.refused_schema_unit_digests),
     };
-    let payload = encode_for_version(protocol_version, MessageType::StatusResponse, &response)
-        .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
-    drop(refusal_lease);
+    let (payload, _encoded_credit) = crate::protocol::encode_for_version_with_read_owner(
+        protocol_version,
+        MessageType::StatusResponse,
+        &response,
+        read_memory.clone(),
+    )?;
     (req.responder)(payload)
         .await
-        .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+        .map_err(|e| contextdb_core::Error::SyncError((e.to_string()).into()))?;
+    drop(refusal_lease);
     Ok(())
 }
 
 /// Select only exact signed units from this request, in this authenticated
 /// pushing peer's tenant and store lives. Historical refusals never describe
 /// a later correction, even if it touches the same table.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn refused_outcomes_for_request(
     db: &Database,
     tenant: &TenantId,
@@ -1005,10 +1388,13 @@ fn refused_outcomes_for_request(
     incarnation: Incarnation,
     hub: &str,
     context: Option<&crate::protocol::ReceivedDdlContext>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<(
     Vec<crate::protocol::RefusedSchemaUnitOutcome>,
-    Vec<Arc<crate::read_image_memory::ImageMemory>>,
+    Vec<crate::read_image_memory::ImageMemoryHandle>,
 )> {
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let Some(context) = context else {
         return Ok((Vec::new(), Vec::new()));
     };
@@ -1028,7 +1414,7 @@ fn refused_outcomes_for_request(
     for (identity, authors) in groups {
         let authors = authors.iter().collect::<Vec<_>>();
         let digest = crate::protocol::authored_schema_unit_digest(&authors)
-            .map_err(|error| contextdb_core::Error::SyncError(error.to_string()))?;
+            .map_err(|error| contextdb_core::Error::SyncError((error.to_string()).into()))?;
         digests.insert((identity, digest));
     }
     let mut outcomes = Vec::new();
@@ -1038,8 +1424,14 @@ fn refused_outcomes_for_request(
         .map(|(_, digest)| *digest)
         .collect::<Vec<_>>();
     for batch in requested.chunks(128) {
-        let (page, lease) =
-            db.refused_schema_unit_outcomes_for_digests(tenant, peer, incarnation, hub, batch)?;
+        let (page, lease) = db.refused_schema_unit_outcomes_for_digests(
+            tenant,
+            peer,
+            incarnation,
+            hub,
+            batch,
+            read_memory.clone(),
+        )?;
         outcomes.extend(page.into_iter().filter(|outcome| {
             digests.contains(&(
                 (
@@ -1055,23 +1447,113 @@ fn refused_outcomes_for_request(
     Ok((outcomes, leases))
 }
 
+/// The protocol version a push request names, read without decoding its
+/// payload, so a refusal can answer in the sender's version.
+fn push_request_version(bytes: &[u8]) -> u8 {
+    #[allow(
+        dead_code,
+        reason = "WIRE-FIELD: decoded from stored bytes; its fields fix the encoded `EnvelopeHead` format"
+    )]
+    #[derive(serde::Deserialize)]
+    struct EnvelopeHead {
+        version: u8,
+        message_type: serde::de::IgnoredAny,
+        payload: serde::de::IgnoredAny,
+    }
+    rmp_serde::from_slice::<EnvelopeHead>(bytes)
+        .map(|head| head.version)
+        .unwrap_or(crate::protocol::PROTOCOL_VERSION)
+}
+
+/// Answer a push the hub's writer budget cannot fund with its typed refusal.
+/// Nothing was applied, so the sender keeps the unit pending and may retry.
+async fn refuse_push_for_memory(
+    responder: crate::transport::Responder,
+    protocol_version: u8,
+    error: contextdb_core::Error,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+) -> contextdb_core::Result<()> {
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+    let contextdb_core::Error::MemoryBudgetExceeded {
+        subsystem,
+        operation,
+        requested_bytes,
+        available_bytes,
+        budget_limit_bytes,
+        hint,
+    } = error
+    else {
+        return Err(error);
+    };
+    let response = PushResponse {
+        result: None,
+        error: None,
+        application_error: Some(WirePushError::MemoryBudgetExceeded {
+            subsystem: subsystem.into_owned(),
+            operation: operation.into_owned(),
+            requested_bytes: requested_bytes as u64,
+            available_bytes: available_bytes as u64,
+            budget_limit_bytes: budget_limit_bytes as u64,
+            hint: hint.into_owned(),
+        }),
+        // No outcomes accompany a refused push.
+        ..Default::default()
+    };
+    publish_push_response(responder, response, protocol_version, read_memory).await
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 async fn handle_push(
     state: Arc<PushHandlerState>,
     req: IncomingRequest,
 ) -> contextdb_core::Result<()> {
-    let envelope = decode_for_server(&req.bytes)?;
+    // Receiving, decoding, validating and committing a pushed unit is the
+    // hub's write working memory: its writer budget (MEMORY_LIMIT) funds it,
+    // never the per-request read budget that serves status and pulls.
+    let read_memory = state.db.engine_sync_read_memory()?;
+    let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
+        state.db.bounded_read_accountant(),
+        read_memory.clone(),
+        "sync_receive",
+        "decode_pushed_unit",
+        "Raise the hub's MEMORY_LIMIT to accept this pushed unit, or push a smaller unit.",
+    );
+
+    let mut retained_vector_copy = crate::vector_read_memory::admission(read_memory.clone());
+    let vector_copy_owner = &mut retained_vector_copy;
+
+    let envelope = match crate::sync_client::decode_sync_envelope(&decoded_memory, &req.bytes, None)
+    {
+        Ok(envelope) => envelope,
+        Err(error @ contextdb_core::Error::MemoryBudgetExceeded { .. }) => {
+            let version = push_request_version(&req.bytes);
+            return refuse_push_for_memory(req.responder, version, error, read_memory).await;
+        }
+        Err(error) => return Err(error),
+    };
     let protocol_version = envelope.version;
     let dependency_complete = match envelope.message_type {
         MessageType::PushRequest => false,
         MessageType::DependencyCompletePushRequest => true,
         _ => {
             return Err(contextdb_core::Error::SyncError(
-                "unexpected message type on push subject".to_string(),
+                ("unexpected message type on push subject".to_string()).into(),
             ));
         }
     };
-    let request: PushRequest = rmp_serde::from_slice(&envelope.payload)
-        .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+    let request: PushRequest = match decoded_memory.decode_msgpack(&envelope.payload) {
+        Ok(request) => request,
+        Err(error @ contextdb_core::Error::MemoryBudgetExceeded { .. }) => {
+            drop(envelope);
+            return refuse_push_for_memory(req.responder, protocol_version, error, read_memory)
+                .await;
+        }
+        Err(error) => return Err(error),
+    };
     let Some(authenticated_peer) = req.node_id.clone() else {
         let response = PushResponse {
             result: None,
@@ -1082,13 +1564,20 @@ async fn handle_push(
             // Ordinary replies carry the outcome lane.
             ..Default::default()
         };
-        publish_push_response(req.responder, response, protocol_version).await?;
+        publish_push_response(
+            req.responder,
+            response,
+            protocol_version,
+            read_memory.clone(),
+        )
+        .await?;
         return Ok(());
     };
     if !request.changeset.purges.is_empty() {
         let hub_node_id = state.local_node_id.clone().ok_or_else(|| {
             contextdb_core::Error::SyncError(
-                "authenticated sync push requires the hub's authenticated identity".to_string(),
+                ("authenticated sync push requires the hub's authenticated identity".to_string())
+                    .into(),
             )
         })?;
         let response = PushResponse {
@@ -1098,7 +1587,13 @@ async fn handle_push(
             // No outcomes accompany a failed push.
             ..Default::default()
         };
-        publish_push_response(req.responder, response, protocol_version).await?;
+        publish_push_response(
+            req.responder,
+            response,
+            protocol_version,
+            read_memory.clone(),
+        )
+        .await?;
         return Ok(());
     }
     let custody = !request.changeset.manifests.is_empty()
@@ -1121,6 +1616,7 @@ async fn handle_push(
         request_key.clone(),
         req.responder,
         protocol_version,
+        read_memory.clone(),
     )
     .await?;
 
@@ -1130,15 +1626,19 @@ async fn handle_push(
     let contact_ms = hub_now_ms();
     let mut fused_contact_ms = None;
     if matches!(admission, PushAdmission::Leader) && !custody && !request.changeset.ddl.is_empty() {
-        match crate::sync_system_tables::ensure_node_contacts_schema(&state.db) {
+        match crate::sync_system_tables::ensure_node_contacts_schema(&state.db, read_memory.clone())
+        {
             Ok(()) => fused_contact_ms = Some(contact_ms),
             Err(err) => {
                 tracing::warn!(%authenticated_peer, error = %err, "failed to prepare node last-contact");
             }
         }
-    } else if let Err(err) =
-        crate::sync_system_tables::record_node_contact(&state.db, &authenticated_peer, contact_ms)
-    {
+    } else if let Err(err) = crate::sync_system_tables::record_node_contact(
+        &state.db,
+        &authenticated_peer,
+        contact_ms,
+        read_memory.clone(),
+    ) {
         tracing::warn!(%authenticated_peer, error = %err, "failed to record node last-contact");
     }
     if !matches!(admission, PushAdmission::Leader) {
@@ -1166,8 +1666,10 @@ async fn handle_push(
             },
         };
         let changeset = ChangeSet::try_from(wire)
-            .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+            .map_err(|e| contextdb_core::Error::SyncError((e.to_string()).into()))?;
         return spawn_apply_and_reply(PushApplyWork {
+            read_memory: (read_memory.clone()),
+
             db: state.db.clone(),
             local_node_id: state.local_node_id.clone(),
             peer_node_id: Some(authenticated_peer),
@@ -1202,7 +1704,13 @@ async fn handle_push(
     // outcome packets instead of dropping them from the response.
     match state
         .db
-        .replay_released_policy_data(&state.tenant_id, &authenticated_peer, incarnation)
+        .replay_released_policy_data(
+            &state.tenant_id,
+            &authenticated_peer,
+            incarnation,
+            vector_copy_owner,
+            read_memory.clone(),
+        )
         .and_then(|_| state.db.replay_sync_push_outcome(&outcome_key))
         .and_then(|result| {
             result
@@ -1222,6 +1730,7 @@ async fn handle_push(
                             incarnation,
                             hub,
                             context.as_ref(),
+                            read_memory.clone(),
                         )?,
                         None => (Vec::new(), Vec::new()),
                     };
@@ -1235,6 +1744,7 @@ async fn handle_push(
                     &state.db,
                     &authenticated_peer,
                     contact_ms,
+                    read_memory.clone(),
                 )
             {
                 tracing::warn!(%authenticated_peer, error = %err, "failed to record replay node last-contact");
@@ -1247,10 +1757,13 @@ async fn handle_push(
                     error: None,
                     application_error: None,
                     refused_schema_units,
-                    hub_incarnation: state.db.existing_sync_incarnation(&state.tenant_id)?,
+                    hub_incarnation: state
+                        .db
+                        .existing_sync_incarnation(&state.tenant_id, read_memory.clone())?,
                     ..Default::default()
                 },
                 protocol_version,
+                read_memory.clone(),
             )
             .await;
             drop(refusal_leases);
@@ -1262,6 +1775,7 @@ async fn handle_push(
                     &state.db,
                     &authenticated_peer,
                     contact_ms,
+                    read_memory.clone(),
                 )
             {
                 tracing::warn!(%authenticated_peer, error = %contact_err, "failed to record rejected replay node last-contact");
@@ -1276,6 +1790,7 @@ async fn handle_push(
                     ..Default::default()
                 },
                 protocol_version,
+                read_memory.clone(),
             )
             .await;
             return Ok(());
@@ -1293,7 +1808,7 @@ async fn handle_push(
         )
         .map_err(crate::protocol::received_ddl_error)?;
         let changeset = ChangeSet::try_from(request.changeset)
-            .map_err(|err| contextdb_core::Error::SyncError(err.to_string()))?;
+            .map_err(|err| contextdb_core::Error::SyncError((err.to_string()).into()))?;
         if let Some(source_lsn) = changeset.max_lsn() {
             let hub = state.local_node_id.as_deref().ok_or_else(|| {
                 contextdb_core::Error::SyncError(
@@ -1314,6 +1829,7 @@ async fn handle_push(
                 hub,
                 &lineages,
                 ddl_context.as_ref(),
+                read_memory.clone(),
             )?;
         }
         // Data held behind a transaction this hub refused names a table it
@@ -1337,6 +1853,7 @@ async fn handle_push(
                 &lineages,
                 &authenticated_peer,
                 incarnation,
+                read_memory.clone(),
             )?;
             if !changeset.rows.is_empty() && conflicts.len() == changeset.rows.len() {
                 return Ok::<_, contextdb_core::Error>((
@@ -1356,12 +1873,14 @@ async fn handle_push(
                 &authenticated_peer,
                 incarnation,
                 received_ddl,
+                read_memory.clone(),
             )?;
             state.db.reject_accepted_lineage_replays_with_received_ddl(
                 &state.tenant_id,
                 changeset,
                 &lineages,
                 received_ddl,
+                read_memory.clone(),
             )
         } else {
             state.db.validate_incoming_push_lineages(
@@ -1370,10 +1889,14 @@ async fn handle_push(
                 &lineages,
                 &authenticated_peer,
                 incarnation,
+                read_memory.clone(),
             )?;
-            state
-                .db
-                .reject_accepted_lineage_replays(&state.tenant_id, changeset, &lineages)
+            state.db.reject_accepted_lineage_replays(
+                &state.tenant_id,
+                changeset,
+                &lineages,
+                read_memory.clone(),
+            )
         };
         match checked {
             Ok(changeset) => Ok((changeset, ddl_context, None, held_conflicts)),
@@ -1399,11 +1922,14 @@ async fn handle_push(
                     &state.db,
                     &authenticated_peer,
                     contact_ms,
+                    read_memory.clone(),
                 )
             {
                 tracing::warn!(%authenticated_peer, error = %err, "failed to record non-schema node last-contact");
             }
             spawn_apply_and_reply(PushApplyWork {
+                read_memory: (read_memory.clone()),
+
                 db: state.db.clone(),
                 local_node_id: state.local_node_id.clone(),
                 peer_node_id: req.node_id.clone(),
@@ -1440,6 +1966,7 @@ async fn handle_push(
                     &state.db,
                     &authenticated_peer,
                     contact_ms,
+                    read_memory.clone(),
                 )
             {
                 tracing::warn!(%authenticated_peer, error = %contact_err, "failed to record rejected schema node last-contact");
@@ -1470,6 +1997,7 @@ async fn handle_push(
                 request_key,
                 response,
                 protocol_version,
+                read_memory.clone(),
             )
             .await;
         }
@@ -1489,17 +2017,63 @@ async fn handle_pull(
     schema_sync_holdbacks: SchemaSyncHoldbackStates,
     peer_schema_capabilities: PeerSchemaCapabilities,
     req: IncomingRequest,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<()> {
-    let envelope = decode_for_server(&req.bytes)?;
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let owner = db.operation_read_owner(read_memory.clone())?;
+    owner
+        .scope_future(handle_pull_in_memory_scope(
+            db,
+            lineage_signer,
+            receipts,
+            tenant_id,
+            local_node_id,
+            schema_sync_holdbacks,
+            peer_schema_capabilities,
+            req,
+            read_memory,
+        ))
+        .await
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[allow(clippy::too_many_arguments)]
+async fn handle_pull_in_memory_scope(
+    db: Arc<Database>,
+    lineage_signer: Option<LineageSigner>,
+    receipts: Arc<TransferLedger>,
+    tenant_id: TenantId,
+    local_node_id: Option<String>,
+    schema_sync_holdbacks: SchemaSyncHoldbackStates,
+    peer_schema_capabilities: PeerSchemaCapabilities,
+    req: IncomingRequest,
+    read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+) -> contextdb_core::Result<()> {
+    let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
+        db.bounded_read_accountant(),
+        read_memory.clone(),
+        "reader",
+        "decode_sync_response",
+        "Reduce the sync response or raise the declared reader memory limit.",
+    );
+
+    let mut selection_credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+
+    let mut retained_vector_copy = crate::vector_read_memory::admission(read_memory.clone());
+    let vector_copy_owner = &mut retained_vector_copy;
+
+    let envelope = crate::sync_client::decode_sync_envelope(&decoded_memory, &req.bytes, None)?;
     let protocol_version = envelope.version;
     if !matches!(envelope.message_type, MessageType::PullRequest) {
         return Err(contextdb_core::Error::SyncError(
-            "unexpected message type on pull subject".to_string(),
+            ("unexpected message type on pull subject".to_string()).into(),
         ));
     }
 
-    let request: PullRequest = rmp_serde::from_slice(&envelope.payload)
-        .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+    let request: PullRequest = decoded_memory.decode_msgpack(&envelope.payload)?;
     let peer_node_id = req.node_id.clone();
     let capabilities = peer_schema_capabilities.resolve(peer_node_id.as_deref(), protocol_version);
     let mut prior_holdback = peer_node_id.as_deref().and_then(|peer| {
@@ -1533,24 +2107,26 @@ async fn handle_pull(
         && let Some(state) = prior_holdback.as_ref()
     {
         if state.held_through != *target_lsn {
-            return Err(contextdb_core::Error::SyncError(format!(
+            return Err(contextdb_core::Error::SyncError((format!(
                 "schema-recovery acknowledgement targets source frontier {}, but the sender is holding frontier {}",
                 target_lsn.0, state.held_through.0
-            )));
+            )).into()));
         }
         let peer = peer_node_id.as_deref().ok_or_else(|| {
             contextdb_core::Error::SyncError(
-                "schema-recovery acknowledgement requires an authenticated receiver".to_string(),
+                ("schema-recovery acknowledgement requires an authenticated receiver".to_string())
+                    .into(),
             )
         })?;
-        let (recovered_tables, remaining_capabilities) =
-            holdback_for_capabilities(&db, state, capabilities);
+        let CapabilityHoldbackSplit {
+            recoverable: recovered_tables,
+            remaining: remaining_capabilities,
+        } = holdback_for_capabilities(&db, state, capabilities, read_memory.clone())?;
         if recovered_tables.is_empty() {
             if state.compatible_through < *target_lsn {
-                return Err(contextdb_core::Error::SyncError(
+                return Err(contextdb_core::Error::SyncError((
                     "schema-recovery acknowledgement names no capability this protocol can recover"
-                        .to_string(),
-                ));
+                        .to_string()).into()));
             }
             // A final reply can be lost after the partial-upgrade state
             // commits. Repeating that exact acknowledgement is harmless.
@@ -1592,9 +2168,12 @@ async fn handle_pull(
     let recovering_tables = prior_holdback
         .as_ref()
         .map(|state| {
-            let (recoverable, _) = holdback_for_capabilities(&db, state, capabilities);
-            recoverable
+            Ok::<_, contextdb_core::Error>(
+                holdback_for_capabilities(&db, state, capabilities, read_memory.clone())?
+                    .recoverable,
+            )
         })
+        .transpose()?
         .filter(|tables| !tables.is_empty());
     let recovery_target = recovering_tables
         .as_ref()
@@ -1610,16 +2189,20 @@ async fn handle_pull(
                 after_lsn,
             }) => {
                 if *requested_target != target_lsn || *after_lsn > target_lsn {
-                    return Err(contextdb_core::Error::SyncError(format!(
-                        "schema-recovery continuation does not match held frontier {}",
-                        target_lsn.0
-                    )));
+                    return Err(contextdb_core::Error::SyncError(
+                        (format!(
+                            "schema-recovery continuation does not match held frontier {}",
+                            target_lsn.0
+                        ))
+                        .into(),
+                    ));
                 }
                 *after_lsn
             }
             Some(SchemaRecoveryRequest::Acknowledge { .. }) => {
                 return Err(contextdb_core::Error::SyncError(
-                    "schema-recovery acknowledgement did not clear its held image".to_string(),
+                    ("schema-recovery acknowledgement did not clear its held image".to_string())
+                        .into(),
                 ));
             }
         }
@@ -1629,7 +2212,8 @@ async fn handle_pull(
             Some(SchemaRecoveryRequest::Continue { .. })
         ) {
             return Err(contextdb_core::Error::SyncError(
-                "schema-recovery continuation has no held table on this sender".to_string(),
+                ("schema-recovery continuation has no held table on this sender".to_string())
+                    .into(),
             ));
         }
         request.since_lsn
@@ -1649,6 +2233,7 @@ async fn handle_pull(
     // evidence on one published schema.  The lease is released before the
     // response is encoded or handed to the transport below.
     let schema_read = db.enter_outbound_sync_schema_read();
+    let pull_history = db.enter_resident_pull_history(read_memory.clone())?;
 
     // Refuse pull if the hub has keyless tables that would sync. The changeset
     // cannot represent their rows (which lack a natural key), so silently omitting
@@ -1660,20 +2245,44 @@ async fn handle_pull(
     // declaration cannot serve. Hidden progress is private and schema-bound;
     // the public cursor still advances only for deliverable content.
     let hidden_scan = if protocol_version == crate::protocol::PROTOCOL_VERSION {
-        db.custody_pull_scan(&tenant_id, req.node_id.as_deref(), effective_since)?
+        db.custody_pull_scan(
+            &tenant_id,
+            req.node_id.as_deref(),
+            effective_since,
+            read_memory.clone(),
+        )?
     } else {
         None
     };
     let scan_since = hidden_scan
         .as_ref()
         .map_or(effective_since, |scan| scan.since);
-    let (mut changes, arrivals, ddl_provenance_source) =
-        db.checked_changes_since_with_arrivals(scan_since)?;
-    let mut purge_items = db.authoritative_purge_delivery_items_since(scan_since)?;
+    // One page of history, never the whole tail: selection stops at the
+    // reader's declared page bytes, between source-LSN groups, so its memory
+    // does not grow with what lies behind the cursor.
+    let page_through = std::cell::Cell::new(None);
+    let page_purge_items = std::cell::RefCell::new(Vec::new());
+    let page_bytes = usize::try_from(db.owner_read_config().limits.limits.cursor_page_bytes)
+        .unwrap_or(usize::MAX);
+    let (mut changes, arrivals, ddl_provenance_source) = db.checked_changes_since_with_arrivals(
+        scan_since,
+        vector_copy_owner,
+        read_memory.clone(),
+        &mut selection_credit,
+        Some(crate::database::PullPageRequest {
+            bytes: page_bytes,
+            through: &page_through,
+            purge_items: &page_purge_items,
+        }),
+    )?;
+    let page_through = page_through.get();
+    // Purge-delivery items are selected with the page's own groups, sought from
+    // the cursor; none past the page is read.
+    let mut purge_items = page_purge_items.into_inner();
     let consumed_hidden_frontier = hidden_scan.as_ref().and_then(|_| changes.max_lsn());
     if let Some(scan) = hidden_scan {
         changes = changes.filter_by_direction_history(
-            &db.sync_direction_history(),
+            &db.try_sync_direction_history_for_changes(&changes, read_memory.clone())?,
             &[
                 SyncDirection::Push,
                 SyncDirection::Pull,
@@ -1692,12 +2301,13 @@ async fn handle_pull(
             .as_ref()
             .expect("recovery tables come from a schema holdback")
             .compatible_through;
-        let held_groups = changes.ddl_lsn_groups_for_tables(anchor_tables);
+        let mut held_groups = changes.ddl_lsn_groups_for_tables(anchor_tables);
+        db.expand_connected_positions(&mut held_groups, vector_copy_owner, read_memory.clone())?;
         let mut tables = changes.tables_in_ddl_lsn_groups(&held_groups);
         tables.extend(anchor_tables.iter().cloned());
         changes = changes
             .for_schema_recovery_with_ddl_groups(&tables, &held_groups, compatible_through)
-            .through_lsn(target);
+            .through_lsn(db.connected_delivery_ceiling(target, read_memory.clone())?);
         purge_items.retain(|item| tables.contains(&item.table) && item.frontier <= target);
     }
 
@@ -1705,9 +2315,12 @@ async fn handle_pull(
     if !capabilities.supports_all() && recovering_tables.is_none() {
         next_holdback.recovery_after = None;
         next_holdback.compatible_through = next_holdback.compatible_through.max(request.since_lsn);
-        for (table, capabilities) in
-            unsupported_schema_capabilities_in_changes(&db, &changes, capabilities)
-        {
+        for (table, capabilities) in unsupported_schema_capabilities_in_changes(
+            &db,
+            &changes,
+            capabilities,
+            read_memory.clone(),
+        )? {
             next_holdback.capabilities.remove(&table);
             if !capabilities.is_empty() {
                 next_holdback.capabilities.insert(table, capabilities);
@@ -1718,7 +2331,8 @@ async fn handle_pull(
             .keys()
             .cloned()
             .collect::<HashSet<_>>();
-        let held_groups = changes.ddl_lsn_groups_for_tables(&capability_tables);
+        let mut held_groups = changes.ddl_lsn_groups_for_tables(&capability_tables);
+        db.expand_connected_positions(&mut held_groups, vector_copy_owner, read_memory.clone())?;
         let mut held_tables = changes.tables_in_ddl_lsn_groups(&held_groups);
         held_tables.extend(capability_tables);
         if !held_tables.is_empty() {
@@ -1755,15 +2369,18 @@ async fn handle_pull(
     let mut has_more = false;
     if let Some(max_entries) = request.max_entries {
         let max = max_entries as usize;
-        let change_groups = changes
-            .clone()
-            .split_by_data_lsn()
+        let change_groups = db
+            .connected_delivery_groups(changes.clone(), vector_copy_owner, read_memory.clone())?
             .into_iter()
+            .map(|(group, _)| group)
             .filter(|group| group.data_entry_count() > 0 || !group.ddl.is_empty())
             .collect::<Vec<_>>();
         let mut groups = BTreeMap::<Lsn, (Vec<ChangeSet>, Vec<_>)>::new();
         for group in change_groups {
-            let frontier = group.max_lsn().unwrap_or_else(|| db.current_lsn());
+            let frontier = db.connected_history_end(
+                group.max_lsn().unwrap_or_else(|| db.current_lsn()),
+                read_memory.clone(),
+            )?;
             groups.entry(frontier).or_default().0.push(group);
         }
         for item in purge_items {
@@ -1774,7 +2391,7 @@ async fn handle_pull(
             .map(|(change_groups, purges)| {
                 change_groups
                     .iter()
-                    .map(|group| group.data_entry_count().max(group.ddl.len()).max(1))
+                    .map(source_group_entry_count)
                     .sum::<usize>()
                     .saturating_add(purges.len())
             })
@@ -1787,7 +2404,7 @@ async fn handle_pull(
             for (change_groups, purges) in groups.values() {
                 let group_entries = change_groups
                     .iter()
-                    .map(|group| group.data_entry_count().max(group.ddl.len()).max(1))
+                    .map(source_group_entry_count)
                     .sum::<usize>()
                     .saturating_add(purges.len());
                 if selected_frontiers != 0 && selected_entries + group_entries > max {
@@ -1826,7 +2443,7 @@ async fn handle_pull(
         // the cursor request the replayable synthetic current snapshot.
         let synthetic_retired_generation = if ddl_provenance_source.is_synthetic_snapshot() {
             purge_items.iter().try_fold(false, |found, item| {
-                db.authoritative_purge_targets_retired_generation(item)
+                db.authoritative_purge_targets_retired_generation(item, read_memory.clone())
                     .map(|retired| found || retired)
             })?
         } else {
@@ -1837,7 +2454,11 @@ async fn handle_pull(
             purge_items.retain(|item| item.frontier == purge_frontier);
             has_more = true;
         }
-        let groups = changes.clone().split_by_data_lsn();
+        let groups = db
+            .connected_delivery_groups(changes.clone(), vector_copy_owner, read_memory.clone())?
+            .into_iter()
+            .map(|(group, _)| group)
+            .collect::<Vec<_>>();
         if groups.iter().any(|group| {
             group
                 .max_lsn()
@@ -1859,12 +2480,37 @@ async fn handle_pull(
     }
     let mut bootstrap_batches = changes.clone().split_at_trigger_bootstrap_barriers();
     if bootstrap_batches.len() > 1 {
-        changes = bootstrap_batches.remove(0);
+        let first_end = db.connected_history_end(
+            bootstrap_batches[0].max_lsn().unwrap_or(effective_since),
+            read_memory.clone(),
+        )?;
+        let mut complete = Vec::new();
+        while !bootstrap_batches.is_empty() {
+            let next_start = bootstrap_batches[0]
+                .rows
+                .iter()
+                .map(|row| row.lsn)
+                .chain(bootstrap_batches[0].edges.iter().map(|edge| edge.lsn))
+                .chain(bootstrap_batches[0].vectors.iter().map(|vector| vector.lsn))
+                .chain(bootstrap_batches[0].ddl_lsn.iter().copied())
+                .min()
+                .unwrap_or(first_end);
+            if !complete.is_empty() && next_start > first_end {
+                break;
+            }
+            complete.push(bootstrap_batches.remove(0));
+        }
+        changes = merge_changeset_groups(complete);
         if let Some(frontier) = changes.max_lsn() {
             purge_items.retain(|item| item.frontier <= frontier);
         } else {
             purge_items.clear();
         }
+        has_more = true;
+    }
+    // Whether page shaping above ended this page before the selection's end.
+    let shaped = has_more;
+    if page_through.is_some() {
         has_more = true;
     }
     // Always carry the consumed frontier as the cursor whenever anything is
@@ -1885,6 +2531,16 @@ async fn handle_pull(
                 Some(db.current_lsn())
             }
         });
+    cursor = cursor
+        .map(|lsn| db.connected_history_end(lsn, read_memory.clone()))
+        .transpose()?;
+    // A selection that stopped at the page budget ends this page at its last
+    // complete group. The cursor names that group even when hub bookkeeping or
+    // filtering left none of its rows on the wire, so the next page starts
+    // after it instead of selecting it again.
+    if !shaped && let Some(through) = page_through {
+        cursor = cursor.into_iter().chain(Some(through)).max();
+    }
     let consumed_bookkeeping_frontier = consumed_bookkeeping_frontier.filter(|_| !has_more);
     if !has_more {
         let bounded_hidden_frontier = consumed_hidden_frontier
@@ -1916,7 +2572,7 @@ async fn handle_pull(
     // filtering excludes `SYNC OFF` rows without stranding the edge's pull
     // watermark.
     let changes = changes.filter_by_direction_history(
-        &db.sync_direction_history(),
+        &db.try_sync_direction_history_for_changes(&changes, read_memory.clone())?,
         &[
             SyncDirection::Push,
             SyncDirection::Pull,
@@ -1947,7 +2603,12 @@ async fn handle_pull(
             .max()
             .or(cursor.filter(|_| changes.is_empty() && purge_items.is_empty()));
     }
-    let units = db.dependency_complete_outbound_units(changes, effective_since)?;
+    let units = db.dependency_complete_outbound_units(
+        changes,
+        effective_since,
+        vector_copy_owner,
+        read_memory.clone(),
+    )?;
     let mut ordinary = ChangeSet::default();
     let mut dependency_units = Vec::new();
     for unit in units {
@@ -1980,8 +2641,9 @@ async fn handle_pull(
     // a client holding a source-bound cursor cannot validate the identity if
     // the response carries no source. Missing source identity is not idempotent
     // with the stored cursor binding.
-    let source = db.sync_incarnation(&tenant_id)?;
-    let local_incarnation = db.sync_incarnation(&tenant_id)?;
+    let source = db.sync_incarnation_with_read_memory(&tenant_id, read_memory.clone())?;
+    let local_incarnation =
+        db.sync_incarnation_with_read_memory(&tenant_id, read_memory.clone())?;
     let served_row_count = ordinary.rows.len()
         + dependency_units
             .iter()
@@ -1992,13 +2654,15 @@ async fn handle_pull(
     } else {
         Some(local_node_id.as_deref().ok_or_else(|| {
             contextdb_core::Error::SyncError(
-                "authenticated sync pull requires the hub's authenticated identity".to_string(),
+                ("authenticated sync pull requires the hub's authenticated identity".to_string())
+                    .into(),
             )
         })?)
     };
     let signer = lineage_signer.as_ref().ok_or_else(|| {
         contextdb_core::Error::SyncError(
-            "authenticated sync pull requires the hub transport's creator signer".to_string(),
+            ("authenticated sync pull requires the hub transport's creator signer".to_string())
+                .into(),
         )
     })?;
     let ordinary_lineages = authenticated_local_node
@@ -2009,6 +2673,7 @@ async fn handle_pull(
                 node_id,
                 local_incarnation,
                 signer.as_ref(),
+                read_memory.clone(),
             )
         })
         .transpose()?
@@ -2024,8 +2689,9 @@ async fn handle_pull(
             .as_deref()
             .ok_or_else(|| {
                 contextdb_core::Error::SyncError(
-                    "serving authenticated schema requires the hub's authenticated identity"
-                        .to_string(),
+                    ("serving authenticated schema requires the hub's authenticated identity"
+                        .to_string())
+                    .into(),
                 )
             })
             .map(Some)
@@ -2039,6 +2705,7 @@ async fn handle_pull(
             node_id,
             local_incarnation,
             signer.as_ref(),
+            read_memory.clone(),
         )?,
     };
     let mut ordinary_changeset =
@@ -2077,6 +2744,7 @@ async fn handle_pull(
                         node_id,
                         local_incarnation,
                         signer.as_ref(),
+                        read_memory.clone(),
                     )
                 })
                 .transpose()?
@@ -2090,6 +2758,7 @@ async fn handle_pull(
                     node_id,
                     local_incarnation,
                     signer.as_ref(),
+                    read_memory.clone(),
                 )?,
             };
             let wire = crate::protocol::wire_changeset_with_arrivals_lineages_and_ddl_provenance(
@@ -2105,10 +2774,11 @@ async fn handle_pull(
     let (message_type, payload) = if dependency_units.is_empty() {
         (
             MessageType::PullResponse,
-            encode_for_version(
+            crate::protocol::encode_for_version_with_read_owner(
                 protocol_version,
                 MessageType::PullResponse,
                 &ordinary_response,
+                read_memory.clone(),
             ),
         )
     } else {
@@ -2118,15 +2788,16 @@ async fn handle_pull(
         };
         (
             MessageType::DependencyCompletePullResponse,
-            encode_for_version(
+            crate::protocol::encode_for_version_with_read_owner(
                 protocol_version,
                 MessageType::DependencyCompletePullResponse,
                 &response,
+                read_memory.clone(),
             ),
         )
     };
     let _ = message_type;
-    let payload = payload.map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+    let (payload, _encoded_credit) = payload?;
     if let Some(peer) = peer_node_id.as_deref() {
         let mut states = schema_sync_holdbacks
             .lock()
@@ -2152,14 +2823,11 @@ async fn handle_pull(
             state.recovery_after = recovery_after;
         }
     }
+    drop(pull_history);
     (req.responder)(payload)
         .await
-        .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+        .map_err(|e| contextdb_core::Error::SyncError((e.to_string()).into()))?;
     Ok(())
-}
-
-fn decode_for_server(data: &[u8]) -> contextdb_core::Result<crate::protocol::Envelope> {
-    decode(data).map_err(|error| contextdb_core::Error::SyncError(error.to_string()))
 }
 
 const fn schema_capability_minimum_protocol(_capability: SchemaSyncCapability) -> u8 {
@@ -2183,7 +2851,6 @@ impl SchemaCapabilities {
             SchemaSyncCapability::VectorPartitioning,
             SchemaSyncCapability::VectorSearchMode,
             SchemaSyncCapability::VectorAutoIndexAt,
-            SchemaSyncCapability::VectorHnswPolicy,
             SchemaSyncCapability::MaintainedIndexCounts,
         ]
         .into_iter()
@@ -2228,29 +2895,43 @@ impl PeerSchemaCapabilities {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn unsupported_schema_capabilities_for_table(
     db: &Database,
     table: &str,
     capabilities: SchemaCapabilities,
-) -> BTreeSet<SchemaSyncCapability> {
-    let mut declared = db.authored_schema_capabilities(table);
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+) -> contextdb_core::Result<BTreeSet<SchemaSyncCapability>> {
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+    let mut declared = db.authored_schema_capabilities(table, read_memory.clone())?;
     if let Some(meta) = db.table_meta(table) {
         declared.extend(schema_capabilities_in_meta(&meta));
     }
-    declared
+    Ok(declared
         .into_iter()
         .filter(|capability| !capabilities.supports(*capability))
-        .collect()
+        .collect())
 }
 
 /// Include the vocabulary of immutable authored history, even when a later
 /// ALTER or DROP removed it from the current schema. A peer must be able to
 /// replay the entire source vector before this table can leave holdback.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn unsupported_schema_capabilities_in_changes(
     db: &Database,
     changes: &ChangeSet,
     capabilities: SchemaCapabilities,
-) -> BTreeMap<String, BTreeSet<SchemaSyncCapability>> {
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+) -> contextdb_core::Result<BTreeMap<String, BTreeSet<SchemaSyncCapability>>> {
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut tables = HashSet::new();
     tables.extend(changes.rows.iter().map(|row| row.table.clone()));
     tables.extend(
@@ -2270,75 +2951,66 @@ pub(crate) fn unsupported_schema_capabilities_in_changes(
     tables
         .into_iter()
         .map(|table| {
-            let unsupported = unsupported_schema_capabilities_for_table(db, &table, capabilities);
-            (table, unsupported)
+            let unsupported = unsupported_schema_capabilities_for_table(
+                db,
+                &table,
+                capabilities,
+                read_memory.clone(),
+            )?;
+            Ok((table, unsupported))
         })
         .collect()
 }
 
+/// A held-back peer's tables split by whether the receiver's current
+/// capabilities can now read them.
+struct CapabilityHoldbackSplit {
+    /// Tables whose every held capability the receiver now supports.
+    recoverable: HashSet<String>,
+    /// Tables that still need the listed capabilities.
+    remaining: BTreeMap<String, BTreeSet<SchemaSyncCapability>>,
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn holdback_for_capabilities(
     db: &Database,
     state: &PeerSchemaSyncHoldbackState,
     capabilities: SchemaCapabilities,
-) -> (
-    HashSet<String>,
-    BTreeMap<String, BTreeSet<SchemaSyncCapability>>,
-) {
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+) -> contextdb_core::Result<CapabilityHoldbackSplit> {
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut recoverable = HashSet::new();
     let mut remaining = BTreeMap::new();
     for table in state.capabilities.keys() {
-        let unsupported = unsupported_schema_capabilities_for_table(db, table, capabilities);
+        let unsupported = unsupported_schema_capabilities_for_table(
+            db,
+            table,
+            capabilities,
+            read_memory.clone(),
+        )?;
         if unsupported.is_empty() {
             recoverable.insert(table.clone());
         } else {
             remaining.insert(table.clone(), unsupported);
         }
     }
-    (recoverable, remaining)
+    Ok(CapabilityHoldbackSplit {
+        recoverable,
+        remaining,
+    })
 }
 
 fn schema_capabilities_in_meta(meta: &TableMeta) -> BTreeSet<SchemaSyncCapability> {
-    let mut capabilities = schema_capabilities_in_columns(&meta.columns);
+    let mut capabilities = crate::sync_types::schema_capabilities_in_columns(&meta.columns);
     // `MAINTAIN COUNT` is protocol-7 vocabulary. A peer that cannot read the
     // word is told this table and this capability and keeps syncing every
     // other table, rather than meeting a parse error it would read as damage.
     if meta.maintained_counts.is_some() {
         capabilities.insert(SchemaSyncCapability::MaintainedIndexCounts);
-    }
-    capabilities
-}
-
-pub(crate) fn schema_capabilities_in_columns(
-    columns: &[contextdb_core::ColumnDef],
-) -> BTreeSet<SchemaSyncCapability> {
-    let mut capabilities = BTreeSet::new();
-    for column in columns {
-        if !matches!(column.column_type, ColumnType::Vector(_)) {
-            continue;
-        }
-        if column
-            .partition_key_columns
-            .as_ref()
-            .is_some_and(|columns| !columns.is_empty())
-            || column.max_partitions.is_some()
-        {
-            capabilities.insert(SchemaSyncCapability::VectorPartitioning);
-        }
-        if column.search_mode != VectorSearchMode::Auto {
-            capabilities.insert(SchemaSyncCapability::VectorSearchMode);
-        }
-        if column.auto_index_at.is_some() {
-            capabilities.insert(SchemaSyncCapability::VectorAutoIndexAt);
-        }
-        if column.hnsw_m.is_some()
-            || column.hnsw_ef_construction.is_some()
-            || column.hnsw_ef_search.is_some()
-            || column.consolidation_change_percent.is_some()
-            || column.consolidation_tombstone_percent.is_some()
-            || column.consolidation_disabled
-        {
-            capabilities.insert(SchemaSyncCapability::VectorHnswPolicy);
-        }
     }
     capabilities
 }
@@ -2371,8 +3043,14 @@ fn drop_rows_past_retention_window(db: &Database, changes: ChangeSet) -> ChangeS
     changes
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()> {
     let PushApplyWork {
+        read_memory,
+
         db,
         local_node_id,
         peer_node_id,
@@ -2414,9 +3092,16 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
         let applying_node_id = peer_node_id.clone();
         let contact_fallback_db = db.clone();
         let contact_fallback_node = peer_node_id.clone();
+        let apply_read_memory = read_memory.clone();
+        let fallback_read_memory = read_memory.clone();
         let (response, committed, leases) = match apply_permits.acquire_owned().await {
             Ok(_permit) => {
                 match tokio::task::spawn_blocking(move || {
+                    let read_memory = apply_read_memory;
+                    let mut retained_vector_copy =
+                        crate::vector_read_memory::admission(read_memory.clone());
+                    let vector_copy_owner = &mut retained_vector_copy;
+
                     // A push has no cursor to re-adopt against — a hub never
                     // detects "my own source changed," only a pulling client
                     // does (see `SyncClient::pull`). Every push apply is the
@@ -2436,7 +3121,7 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                                 new_lsn: db.current_lsn(),
                             },
                             Vec::new(),
-                            db.existing_sync_incarnation(&tenant_id)?,
+                            db.existing_sync_incarnation(&tenant_id, read_memory.clone())?,
                             (Vec::new(), Vec::new()),
                         ));
                     }
@@ -2459,6 +3144,8 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                             changeset,
                             &arrivals,
                             &lineages,
+                            vector_copy_owner,
+                            read_memory.clone(),
                         )?;
                         outcomes = committed;
                         result
@@ -2466,10 +3153,9 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                         let (Some(node_id), Some(max_lsn)) =
                             (applying_node_id.as_deref(), push_max_lsn)
                         else {
-                            return Err(contextdb_core::Error::SyncError(
+                            return Err(contextdb_core::Error::SyncError((
                                 "authenticated terminal push refusal lacks an edge receipt identity"
-                                    .to_string(),
-                            ));
+                                    .to_string()).into()));
                         };
                         db.commit_terminal_sync_refusals_with_receipt(
                             contextdb_engine::database::SyncApplyReceipt {
@@ -2483,6 +3169,8 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                             row_count,
                             conflicts,
                             &outcome_key,
+                            vector_copy_owner,
+                            read_memory.clone(),
                         )?
                     } else if let (Some(node_id), Some(max_lsn)) =
                         (applying_node_id.as_deref(), push_max_lsn)
@@ -2504,6 +3192,8 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                             &lineages,
                             received_ddl.as_ref(),
                             Some(&outcome_key),
+                            vector_copy_owner,
+                            read_memory.clone(),
                         )?
                     } else {
                         db.apply_authenticated_received_changes_with_lineages_as_hub_push(
@@ -2515,14 +3205,21 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                             &lineages,
                             received_ddl.as_ref(),
                             dependency_complete,
+                            vector_copy_owner,
+                            read_memory.clone(),
                         )?
                     };
                     result.conflicts.extend(held_conflicts);
                     if let Some(node) = applying_node_id.as_deref() {
                         // The correction and its release fact have committed. Replay
                         // retained authenticated payloads outside the schema apply locks.
-                        let replayed =
-                            db.replay_released_policy_data(&tenant_id, node, incarnation)?;
+                        let replayed = db.replay_released_policy_data(
+                            &tenant_id,
+                            node,
+                            incarnation,
+                            vector_copy_owner,
+                            read_memory.clone(),
+                        )?;
                         // A concurrently re-established hold is still pending;
                         // the author must not clear that table's diagnostic.
                         result
@@ -2543,6 +3240,7 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                                 incarnation,
                                 hub,
                                 refused_context.as_ref(),
+                                read_memory.clone(),
                             )?,
                             _ => (Vec::new(), Vec::new()),
                         };
@@ -2556,10 +3254,11 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                         // and status must not claim it was applied either.
                         let held = match (receipted, applying_node_id.as_deref()) {
                             (true, Some(node_id)) => db
-                                .persisted_sync_applied_push_watermark_for_node_incarnation(
+                                .persisted_sync_applied_push_watermark_for_node_incarnation_with_read_memory(
                                     &tenant_id,
                                     node_id,
                                     incarnation,
+                                    read_memory.clone(),
                                 )?
                                 .map_or(Lsn(0), |durable| durable.min(max_lsn)),
                             _ => max_lsn,
@@ -2572,7 +3271,7 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                     Ok::<_, contextdb_core::Error>((
                         result,
                         outcomes,
-                        db.existing_sync_incarnation(&tenant_id)?,
+                        db.existing_sync_incarnation(&tenant_id, read_memory.clone())?,
                         refused_schema_units,
                     ))
                 })
@@ -2666,10 +3365,16 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
         {
             let fallback_node_id = node_id.clone();
             let fallback = tokio::task::spawn_blocking(move || {
+                let read_memory = fallback_read_memory;
+                let mut retained_vector_copy =
+                    crate::vector_read_memory::admission(read_memory.clone());
+                let _vector_copy_owner = &mut retained_vector_copy;
+
                 crate::sync_system_tables::record_node_contact(
                     &contact_fallback_db,
                     &fallback_node_id,
                     contact_ms,
+                    read_memory.clone(),
                 )
             })
             .await;
@@ -2707,6 +3412,7 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
             request_key,
             response,
             protocol_version,
+            read_memory.clone(),
         )
         .await;
         drop(leases);
@@ -2721,7 +3427,10 @@ async fn admit_push_request(
     request_key: PushRequestKey,
     responder: Responder,
     protocol_version: u8,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<PushAdmission> {
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut in_flight = in_flight_push_applies.lock().await;
     if let Some(responders) = in_flight.get_mut(&request_key) {
         if responders.len() >= MAX_REPLIES_PER_IN_FLIGHT_PUSH {
@@ -2733,7 +3442,8 @@ async fn admit_push_request(
                 // Ordinary replies carry the outcome lane.
                 ..Default::default()
             };
-            publish_push_response(responder, response, protocol_version).await?;
+            publish_push_response(responder, response, protocol_version, read_memory.clone())
+                .await?;
             return Ok(PushAdmission::Rejected);
         }
         responders.push(responder);
@@ -2748,7 +3458,7 @@ async fn admit_push_request(
             // Ordinary replies carry the outcome lane.
             ..Default::default()
         };
-        publish_push_response(responder, response, protocol_version).await?;
+        publish_push_response(responder, response, protocol_version, read_memory.clone()).await?;
         return Ok(PushAdmission::Rejected);
     }
     in_flight.insert(request_key, vec![responder]);
@@ -2763,7 +3473,10 @@ async fn publish_in_flight_push_response(
     request_key: PushRequestKey,
     response: PushResponse,
     protocol_version: u8,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) {
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     loop {
         let responders = {
             let mut in_flight = in_flight_push_applies.lock().await;
@@ -2778,8 +3491,13 @@ async fn publish_in_flight_push_response(
         };
 
         for responder in responders {
-            if let Err(err) =
-                publish_push_response(responder, response.clone(), protocol_version).await
+            if let Err(err) = publish_push_response(
+                responder,
+                response.clone(),
+                protocol_version,
+                read_memory.clone(),
+            )
+            .await
             {
                 tracing::error!(error = %err, "failed to publish push response");
             }
@@ -2791,12 +3509,19 @@ async fn publish_push_response(
     responder: Responder,
     response: PushResponse,
     protocol_version: u8,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<()> {
-    let payload = encode_for_version(protocol_version, MessageType::PushResponse, &response)
-        .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+    let (payload, _encoded_credit) = crate::protocol::encode_for_version_with_read_owner(
+        protocol_version,
+        MessageType::PushResponse,
+        &response,
+        read_memory,
+    )?;
     responder(payload)
         .await
-        .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+        .map_err(|e| contextdb_core::Error::SyncError((e.to_string()).into()))?;
     Ok(())
 }
 
@@ -2804,6 +3529,29 @@ pub(crate) fn without_hub_local_bookkeeping(changes: ChangeSet) -> ChangeSet {
     changes.without_tables(&HashSet::from([
         crate::sync_system_tables::WORK_NODE_CONTACTS_TABLE.to_string(),
     ]))
+}
+
+// Grouping workspace is admitted by connected_delivery_groups before page
+// shaping. Preserve the existing per-source-transaction entry count while
+// treating a connected acceptance as indivisible.
+fn source_group_entry_count(changes: &ChangeSet) -> usize {
+    let mut counts = BTreeMap::<Lsn, (usize, usize)>::new();
+    for lsn in changes
+        .rows
+        .iter()
+        .map(|row| row.lsn)
+        .chain(changes.edges.iter().map(|edge| edge.lsn))
+        .chain(changes.vectors.iter().map(|vector| vector.lsn))
+    {
+        counts.entry(lsn).or_default().0 += 1;
+    }
+    for lsn in &changes.ddl_lsn {
+        counts.entry(*lsn).or_default().1 += 1;
+    }
+    counts
+        .into_values()
+        .map(|(data, ddl)| data.max(ddl).max(1))
+        .sum()
 }
 
 fn merge_changeset_groups(groups: Vec<ChangeSet>) -> ChangeSet {
@@ -2817,6 +3565,10 @@ fn merge_changeset_groups(groups: Vec<ChangeSet>) -> ChangeSet {
     }
     merged
 }
+#[cfg(all(test, feature = "test-seams"))]
+mod native_delivery_tests;
+#[cfg(all(test, feature = "test-seams"))]
+mod pull_page_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2825,8 +3577,9 @@ mod tests {
     #[tokio::test]
     async fn identical_pushes_from_distinct_authenticated_edges_deliver_independently() {
         let tasks = Arc::new(ApplyTracker::new());
+        let db = Arc::new(Database::open_memory());
         let state = Arc::new(PushHandlerState {
-            db: Arc::new(Database::open_memory()),
+            db,
             local_node_id: Some("1".repeat(64)),
             receipts: Arc::new(TransferLedger::new()),
             tenant_id: TenantId::from("independent-edges"),
@@ -2891,5 +3644,258 @@ mod tests {
             rmp_serde::from_slice(&decode(&second).expect("second envelope").payload)
                 .expect("second response");
         assert!(second.result.is_some(), "{second:?}");
+    }
+}
+
+/// The Legacy delivery answer: decode, fetch through the custody cache, encode.
+/// Shared by the ordinary route and by the native installation's Legacy arm,
+/// so a host-provided Legacy reader keeps exactly today's reply bytes.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn legacy_delivery_reply(
+    db: &Database,
+    tenant: &TenantId,
+    hub: Option<String>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    bytes: &[u8],
+    node_id: Option<String>,
+) -> Result<Vec<u8>, TransportError> {
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+    let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
+        db.bounded_read_accountant(),
+        read_memory.clone(),
+        "reader",
+        "decode_sync_request",
+        "Reduce the request or raise the declared reader memory limit.",
+    );
+    use crate::protocol::*;
+    let envelope = crate::sync_client::decode_sync_envelope(&decoded_memory, bytes, None)
+        .map_err(to_transport_error)?;
+    let request: FetchDeliveryOutcomesRequest = decoded_memory
+        .decode_msgpack(&envelope.payload)
+        .map_err(to_transport_error)?;
+    if envelope.message_type != MessageType::FetchDeliveryOutcomesRequest
+        || request.format != 1
+        || request.tenant_id != tenant.as_str()
+    {
+        return Err(TransportError::Other(
+            "invalid authenticated outcome request".into(),
+        ));
+    }
+    let hub = hub.ok_or_else(|| TransportError::Other("authenticated hub required".into()))?;
+    let edge =
+        node_id.ok_or_else(|| TransportError::Other("authenticated edge required".into()))?;
+    let outcomes = crate::custody::delivery::fetch(
+        db,
+        tenant,
+        &hub,
+        &edge,
+        request.edge_incarnation,
+        request.since.as_deref(),
+        read_memory.clone(),
+    )
+    .map_err(|e| TransportError::Other(e.to_string()))?;
+    let response = FetchDeliveryOutcomesResponse {
+        format: 1,
+        request_nonce: request.request_nonce,
+        hub_node_id: hub,
+        hub_incarnation: db
+            .existing_sync_incarnation(tenant, read_memory.clone())
+            .map_err(|e| TransportError::Other(e.to_string()))?
+            .ok_or_else(|| TransportError::Other("hub authority is not initialized".into()))?,
+        tenant_id: tenant.as_str().into(),
+        edge_node_id: edge,
+        edge_incarnation: request.edge_incarnation,
+        // The Legacy fetch answers the whole continuation in one page.
+        result: Some(DeliveryOutcomePage {
+            outcomes,
+            more: false,
+        }),
+        error: None,
+    };
+    encode_named(MessageType::FetchDeliveryOutcomesResponse, &response)
+        .map_err(|e| TransportError::Other(e.to_string()))
+}
+
+/// Explicit-owner Legacy arm of the native delivery route. The installation's
+/// begin_request supplies the exact capability; this arm never reacquires it,
+/// and its reply is admitted on that same reader before the responder sees it.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn legacy_delivery_arm(
+    db: Arc<Database>,
+    tenant: TenantId,
+    hub: Option<String>,
+    counts: Arc<DeliveryRouteCounts>,
+) -> impl Fn(
+    crate::transport::ReadBoundIncomingRequest,
+    crate::vector_read_memory::RequestReadOwner,
+) -> crate::transport::WireResult<crate::transport::DispatchedWireFuture<'static, ()>>
++ Send
++ Sync
++ 'static {
+    move |request, selected| {
+        let read_memory = match selected.into_route() {
+            crate::vector_read_memory::RequestReadRoute::Legacy(reader) => reader,
+            crate::vector_read_memory::RequestReadRoute::Native(_) => {
+                return Err(TransportError::NoResponder.into());
+            }
+        };
+        counts.legacy.fetch_add(1, Ordering::SeqCst);
+        let owner = contextdb_core::read_memory::ReadMemoryOwner::from(read_memory.clone());
+        let db = db.clone();
+        let tenant = tenant.clone();
+        let hub = hub.clone();
+        crate::transport::admit_wire_future(owner.clone(), async move {
+            let crate::transport::ReadBoundIncomingRequest {
+                body,
+                responder,
+                node_id,
+            } = request;
+            let bytes = body
+                .native_contiguous_bytes()
+                .ok_or(TransportError::NoResponder)?;
+            let reply = legacy_delivery_reply(&db, &tenant, hub, read_memory, bytes, node_id)?;
+            drop(body);
+            responder
+                .try_finish(crate::transport::BoundedWireBody::from_legacy_reply(
+                    reply, owner,
+                )?)?
+                .await
+        })
+        .map(crate::transport::DispatchedWireFuture::native)
+    }
+}
+
+/// Standing count of which delivery arm actually served each request.
+#[derive(Debug, Default)]
+struct DeliveryRouteCounts {
+    native: AtomicUsize,
+    legacy: AtomicUsize,
+}
+
+impl SyncServer {
+    /// Prepare this hub's native delivery installation and the stop handle that
+    /// must drive it. The installation, its route and the stop control are paid
+    /// by one native child of the declared reader.
+    ///
+    /// Scope: native delivery serves file-backed hubs only, because it selects
+    /// custody from the durable committed root. An in-memory hub, or a hub
+    /// without a fabric identity, gets a stop handle and keeps delivery and
+    /// every other subject on its Legacy handler, unchanged; bounded delivery
+    /// is not claimed for in-memory hubs.
+    #[doc(hidden)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn native_stop(
+        &self,
+        flag: Arc<AtomicBool>,
+    ) -> crate::transport::WireResult<crate::transport::NativeStop> {
+        let receipt = match self
+            .db
+            .declared_read_request_provider()
+            .request_budget_owner()?
+            .into_route()
+        {
+            crate::vector_read_memory::RequestReadRoute::Native(receipt) => receipt,
+            crate::vector_read_memory::RequestReadRoute::Legacy(_) => {
+                return Err(TransportError::NoResponder.into());
+            }
+        };
+        let (route, reason) = self.delivery_route();
+        let route: &str = route;
+        tracing::info!(
+            tenant = %self.tenant_id.as_str(),
+            route,
+            reason,
+            "sync delivery route chosen for this hub"
+        );
+        // Native custody selection reads the durable committed root. A memory
+        // store has none, so its delivery stays on the Legacy handler.
+        let (Some(hub), Some(identity), "native") =
+            (&self.local_node_id, &self.lineage_identity, route)
+        else {
+            return crate::transport::NativeStop::try_new(flag, &receipt.into_owner());
+        };
+        let config = self.db.owner_read_config();
+        let on_native = {
+            let counts = self.delivery_route_counts.clone();
+            move || {
+                counts.native.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+        let installation = crate::transport::install_native_delivery_route(
+            receipt,
+            self.read_budget_provider.clone(),
+            &crate::subjects::delivery_outcomes_subject(self.tenant_id.as_str()),
+            self.tenant_id.as_str(),
+            hub,
+            self.db.clone(),
+            identity.clone(),
+            crate::read_session::read_clock(),
+            config.limits.limits,
+            config.timeouts,
+            on_native,
+            legacy_delivery_arm(
+                self.db.clone(),
+                self.tenant_id.clone(),
+                self.local_node_id.clone(),
+                self.delivery_route_counts.clone(),
+            ),
+        )?;
+        let owner = installation
+            .native_routes()
+            .ok_or(TransportError::NoResponder)?
+            .installation_owner();
+        let stop = crate::transport::NativeStop::try_new(flag, &owner)?;
+        *self
+            .native_delivery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(installation);
+        Ok(stop)
+    }
+
+    /// Which route serves this hub's delivery requests, and why.
+    fn delivery_route(&self) -> (&'static str, &'static str) {
+        if self.local_node_id.is_none() || self.lineage_identity.is_none() {
+            ("legacy", "the hub has no fabric identity")
+        } else if crate::subjects::delivery_outcomes_subject(self.tenant_id.as_str()).len()
+            > crate::transport::MAX_NATIVE_SUBJECT_BYTES
+        {
+            (
+                "legacy",
+                "the delivery subject is longer than the native subject bound (256 bytes)",
+            )
+        } else {
+            (
+                "native",
+                "a file-backed hub selects custody from its durable committed root",
+            )
+        }
+    }
+
+    /// The route and reason `native_stop` logs for this hub.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn delivery_route_for_test(&self) -> (&'static str, &'static str) {
+        self.delivery_route()
+    }
+
+    /// Requests served by the native delivery arm and by either Legacy delivery
+    /// path since construction, in that order.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn delivery_route_counts_for_test(&self) -> (usize, usize) {
+        (
+            self.delivery_route_counts.native.load(Ordering::SeqCst),
+            self.delivery_route_counts.legacy.load(Ordering::SeqCst),
+        )
     }
 }

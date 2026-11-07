@@ -155,9 +155,13 @@ fn parity_fixture() -> ParityFixture {
     }
 }
 
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn payloads(result: QueryResult) -> BTreeSet<String> {
     result
-        .rows
+        .rows()
         .into_iter()
         .map(|row| match row.as_slice() {
             [Value::Text(payload)] => payload.clone(),
@@ -176,6 +180,10 @@ fn owner(fixture: &ParityFixture) -> Database {
 
 /// Route 3: the store is closed, so the session selects the direct file
 /// backend and answers from the committed image.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn direct_payloads(fixture: &ParityFixture, table: &str) -> BTreeSet<String> {
     let runtime_root = secure_runtime_root(&fixture.directory, &format!("direct-{table}"));
     let session = ReadSession::with_runtime_directory_for_test(&runtime_root, || {

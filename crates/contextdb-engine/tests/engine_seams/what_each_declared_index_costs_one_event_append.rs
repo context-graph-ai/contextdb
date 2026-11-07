@@ -103,7 +103,7 @@ fn report(label: &str, postings: &[IndexPostingTouch], counts: &[IndexPrefixCoun
 
 #[test]
 fn what_each_declared_index_costs_one_event_append() {
-    // 1. Silence. The default the owner ruled on 2026-09-19.
+    // 1. Silence. The default writes no undeclared index.
     let (silent_postings, silent_counts) = one_append_under("silent", |_| {});
     report("no declaration", &silent_postings, &silent_counts);
     assert_eq!(

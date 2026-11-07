@@ -184,7 +184,7 @@ fn writer_recycle_baseline_cost_diagnostic() {
         assert_eq!(
             db.execute("SELECT COUNT(*) FROM recordings", &HashMap::new())
                 .unwrap()
-                .rows
+                .rows()
                 .len(),
             1,
             "repeat {repeat}: the store remains usable after the measured recycle"

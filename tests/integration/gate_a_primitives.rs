@@ -141,7 +141,7 @@ fn rt1_composite_store_ddl_round_trip_parse() {
     )
     .unwrap();
 
-    let ddl = db.ddl_log_since(Lsn(0));
+    let ddl = db.ddl_log_since(Lsn(0)).unwrap();
     assert_eq!(ddl.len(), 3);
 
     for change in ddl {
@@ -327,8 +327,8 @@ fn a2_03_insert_via_sql() {
     let result = db
         .execute("SELECT * FROM entities", &HashMap::new())
         .expect("select entities");
-    assert_eq!(result.rows.len(), 1);
-    let row = &result.rows[0];
+    assert_eq!(result.rows().len(), 1);
+    let row = &result.rows()[0];
     assert!(row.contains(&Value::Uuid(id)));
     assert!(row.contains(&Value::Text("sql insert".to_string())));
 }
@@ -364,8 +364,8 @@ fn a2_04_select_with_where_clause() {
             &HashMap::new(),
         )
         .expect("select with where");
-    assert_eq!(result.rows.len(), 2);
-    for row in result.rows {
+    assert_eq!(result.rows().len(), 2);
+    for row in result.rows() {
         assert!(row.contains(&Value::Text("server".to_string())));
     }
 }
@@ -441,9 +441,9 @@ fn a2_06_update_modifies_row() {
             &make_params(vec![("id", Value::Uuid(id))]),
         )
         .expect("select");
-    assert_eq!(selected.rows.len(), 1);
-    assert!(selected.rows[0].contains(&Value::Text("new".to_string())));
-    assert!(!selected.rows[0].contains(&Value::Text("old".to_string())));
+    assert_eq!(selected.rows().len(), 1);
+    assert!(selected.rows()[0].contains(&Value::Text("new".to_string())));
+    assert!(!selected.rows()[0].contains(&Value::Text("old".to_string())));
 }
 
 #[test]
@@ -1298,7 +1298,7 @@ fn a4_08_vector_search_via_sql() {
             &make_params(vec![("q", Value::Vector(v))]),
         )
         .expect("vector select");
-    assert_eq!(out.rows.len(), 3);
+    assert_eq!(out.rows().len(), 3);
 
     let explain = db
         .explain("SELECT * FROM observations ORDER BY embedding <=> $q LIMIT 3")
@@ -1381,8 +1381,8 @@ fn a4_10_float32_precision_roundtrip() {
 }
 
 #[test]
-fn a4_11_hnsw_recall_threshold() {
-    // Use a dedicated table with a higher-dimensional vector to get good HNSW recall.
+fn a4_11_indexed_recall_threshold() {
+    // Use a dedicated table with a higher-dimensional vector to get good index recall.
     let db = setup_ontology_db();
     let dim = 32usize;
     let n = 1_500u64;
@@ -1395,7 +1395,7 @@ fn a4_11_hnsw_recall_threshold() {
     )
     .expect("create table");
 
-    // Insert enough vectors to trigger HNSW (threshold = 1000).
+    // Insert enough vectors to trigger index (threshold = 1000).
     let tx = db.begin_or_panic();
     let mut all_vectors = Vec::with_capacity(n as usize);
     for i in 0..n {
@@ -1475,12 +1475,12 @@ fn a4_11_hnsw_recall_threshold() {
     let avg_recall = total_recall / queries as f64;
     assert!(
         avg_recall >= 0.95,
-        "avg HNSW recall@{k} was {avg_recall}, expected >= 0.95"
+        "avg index recall@{k} was {avg_recall}, expected >= 0.95"
     );
 }
 
 #[test]
-fn a4_12_hnsw_with_mvcc_visibility() {
+fn a4_12_indexed_with_mvcc_visibility() {
     let db = setup_ontology_db();
     let dim = 32usize;
 
@@ -1621,14 +1621,14 @@ fn a4_13_vector_search_with_context_prefilter() {
             &make_params(vec![("q", Value::Vector(vec![1.0, 0.0]))]),
         )
         .expect("query");
-    assert_eq!(out.rows.len(), 3);
+    assert_eq!(out.rows().len(), 3);
     // SELECT * must return user columns (no internal row_id), verify context_id directly
     let ctx_idx = out
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "context_id")
         .expect("context_id column must exist in output");
-    for row in &out.rows {
+    for row in out.rows() {
         assert_eq!(
             row[ctx_idx],
             Value::Text("ctx1".to_string()),
@@ -2544,7 +2544,10 @@ fn a7_02_window_function_rejected() {
         "SELECT ROW_NUMBER() OVER (PARTITION BY x) FROM t",
         &HashMap::new(),
     );
-    assert!(matches!(result, Err(Error::WindowFunctionNotSupported)));
+    assert!(matches!(
+        result,
+        Err(Error::WindowFunctionNotSupported { form: _ })
+    ));
 }
 
 #[test]
@@ -2672,8 +2675,8 @@ fn a7_10_graph_table_cte_chain_with_later_match_stays_graph_query() {
         "multi-CTE graph query should not be rejected as full-text search: {result:?}"
     );
     let result = result.expect("graph query should succeed");
-    assert_eq!(result.rows.len(), 1);
-    assert_eq!(result.rows[0][0], Value::Uuid(c));
+    assert_eq!(result.rows().len(), 1);
+    assert_eq!(result.rows()[0][0], Value::Uuid(c));
 }
 
 #[test]

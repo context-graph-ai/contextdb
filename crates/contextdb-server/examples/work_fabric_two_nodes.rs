@@ -26,7 +26,8 @@ fn start_hub(
             contextdb_core::TenantId::from(TENANT),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct sync server"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -47,7 +48,8 @@ fn edge(broker: &InProcessBroker) -> (Arc<Database>, SyncClient) {
         broker.client_as(&node_id),
         contextdb_core::TenantId::from(TENANT),
         identity,
-    );
+    )
+    .expect("construct sync client");
     (db, client)
 }
 

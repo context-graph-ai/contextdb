@@ -243,7 +243,7 @@ fn read_under(what: &str, limits: ReadLimits, expected_limit: ReadFailureLimit) 
         .execute(ONE_HOP, &hub_params())
         .expect("the session reads its own staged work");
     assert_eq!(
-        staged.rows.len(),
+        staged.rows().len(),
         STAGED_EDGES as usize,
         "the fixture is only adversarial if the transaction really staged {STAGED_EDGES} edges \
          and removed every committed one"
@@ -271,7 +271,7 @@ fn read_under(what: &str, limits: ReadLimits, expected_limit: ReadFailureLimit) 
     match outcome {
         Ok(answered) => {
             assert_eq!(
-                answered.rows.len(),
+                answered.rows().len(),
                 STAGED_EDGES as usize,
                 "an answer is the whole answer or it is a refusal, never a quiet truncation"
             );
@@ -424,7 +424,7 @@ fn a_cursor_over_staged_work_is_refused_while_the_transaction_is_open() {
         .execute(ONE_HOP, &hub_params())
         .expect("the same walk answers in one call inside the transaction");
     assert_eq!(
-        answered.rows.len(),
+        answered.rows().len(),
         STAGED_EDGES as usize,
         "the walk the cursor was refused is a walk the store can answer"
     );
@@ -441,7 +441,7 @@ fn paging_through_a_walk_delivers_every_row_the_walk_has() {
     let expected_rows = database
         .execute(ONE_HOP, &hub_params())
         .expect("the executor answers the walk")
-        .rows
+        .rows()
         .len();
 
     let session = database
@@ -458,16 +458,16 @@ fn paging_through_a_walk_delivers_every_row_the_walk_has() {
     // it is part of what opening a cursor gives you, not something a later
     // fetch re-delivers. A reader that starts counting at the first `fetch`
     // discards it and mistakes its own omission for lost rows.
-    let mut delivered = cursor.first_page().rows.len();
+    let mut delivered = cursor.first_page().rows().len();
     let mut pages = 1_usize;
-    let mut has_more = cursor.first_page().has_more;
+    let mut has_more = cursor.first_page().has_more();
     let mut stopped_by = None;
     while has_more {
         match cursor.fetch(NonZeroUsize::new(PAGE_ROWS as usize)) {
             Ok(page) => {
-                delivered += page.rows.len();
+                delivered += page.rows().len();
                 pages += 1;
-                has_more = page.has_more;
+                has_more = page.has_more();
             }
             Err(error) => {
                 stopped_by = Some(error.to_string());
@@ -504,7 +504,7 @@ fn paging_through_a_walk_costs_what_walking_it_once_costs() {
     let expected_rows = database
         .execute(ONE_HOP, &hub_params())
         .expect("the executor answers the walk")
-        .rows
+        .rows()
         .len();
 
     let single_refusal = std::cell::RefCell::new(None::<String>);
@@ -538,13 +538,13 @@ fn paging_through_a_walk_costs_what_walking_it_once_costs() {
                 }
             };
             // The page the cursor produced when it opened counts too.
-            let mut delivered = cursor.first_page().rows.len();
-            let mut has_more = cursor.first_page().has_more;
+            let mut delivered = cursor.first_page().rows().len();
+            let mut has_more = cursor.first_page().has_more();
             while has_more {
                 match cursor.fetch(NonZeroUsize::new(PAGE_ROWS as usize)) {
                     Ok(page) => {
-                        delivered += page.rows.len();
-                        has_more = page.has_more;
+                        delivered += page.rows().len();
+                        has_more = page.has_more();
                     }
                     Err(error) => {
                         *last_refusal.borrow_mut() = Some(error.to_string());

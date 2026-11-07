@@ -78,7 +78,7 @@ fn t20_02_declared_self_edge_accepted() {
             &[("id".to_string(), Value::Uuid(id))].into_iter().collect(),
         )
         .unwrap();
-    assert_eq!(outcome.rows_affected, 1);
+    assert_eq!(outcome.rows_affected(), 1);
 }
 
 #[test]
@@ -93,14 +93,14 @@ fn t20_03_declared_transition_progresses() {
             &[("id".to_string(), Value::Uuid(id))].into_iter().collect(),
         )
         .unwrap();
-    assert_eq!(outcome.rows_affected, 1);
+    assert_eq!(outcome.rows_affected(), 1);
     let row = db
         .execute(
             "SELECT status FROM invalidations WHERE id = $id",
             &[("id".to_string(), Value::Uuid(id))].into_iter().collect(),
         )
         .unwrap();
-    assert_eq!(row.rows[0][0], Value::Text("acknowledged".to_string()));
+    assert_eq!(row.rows()[0][0], Value::Text("acknowledged".to_string()));
 }
 
 #[test]
@@ -137,7 +137,7 @@ fn t20_05_upsert_insert_path_unaffected() {
             &[("id".to_string(), Value::Uuid(id))].into_iter().collect(),
         )
         .unwrap();
-    assert_eq!(outcome.rows_affected, 1);
+    assert_eq!(outcome.rows_affected(), 1);
 }
 
 #[test]
@@ -162,5 +162,5 @@ fn t20_06_non_state_machine_self_update_unaffected() {
             &[("id".to_string(), Value::Uuid(id))].into_iter().collect(),
         )
         .unwrap();
-    assert_eq!(outcome.rows_affected, 1);
+    assert_eq!(outcome.rows_affected(), 1);
 }

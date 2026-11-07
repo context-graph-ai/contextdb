@@ -11,6 +11,10 @@ fn params(values: impl IntoIterator<Item = (&'static str, Value)>) -> HashMap<St
 }
 
 fn vector_ids(reader: &ReadSession, scope: &str, mode: &str) -> Vec<Uuid> {
+    assert!(matches!(reader.execute(
+        "SELECT id FROM compact_vectors ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 10",
+        &params([("query", Value::Vector(vec![1.0, 0.0, 0.0]))]),
+    ), Err(contextdb_core::Error::VectorIndexedRouteUnavailable { .. })));
     let result = reader
         .execute(
             &format!(
@@ -23,10 +27,10 @@ fn vector_ids(reader: &ReadSession, scope: &str, mode: &str) -> Vec<Uuid> {
             ]),
         )
         .unwrap_or_else(|error| panic!("{mode} search in {scope}: {error}"));
-    if mode == "INDEXED" {
+    if mode == "AUTO" {
         assert_eq!(
-            result.trace.vector_search.as_ref().unwrap().resolved_mode,
-            VectorSearchMode::Indexed
+            result.trace().vector_search.as_ref().unwrap().resolved_mode,
+            VectorSearchMode::Exact
         );
     }
     ids(&result)
@@ -34,7 +38,7 @@ fn vector_ids(reader: &ReadSession, scope: &str, mode: &str) -> Vec<Uuid> {
 
 fn ids(result: &QueryResult) -> Vec<Uuid> {
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.first() {
             Some(Value::Uuid(id)) => *id,
@@ -53,7 +57,7 @@ fn committed_vector_update_then_compact_publishes_one_generation_to_new_readers(
     db.execute(
         "CREATE TABLE compact_vectors (id UUID PRIMARY KEY, scope TEXT NOT NULL, \
          embedding VECTOR(3) PARTITION_KEY (scope) MAX_PARTITIONS 2 \
-         SEARCH_MODE INDEXED AUTO_INDEX_AT 1) SYNC OFF",
+         SEARCH_MODE EXACT) SYNC OFF",
         &HashMap::new(),
     )
     .unwrap();
@@ -73,27 +77,32 @@ fn committed_vector_update_then_compact_publishes_one_generation_to_new_readers(
         )
         .unwrap();
     }
-    for _ in 0..8 {
-        let status = db.vector_store_for_test().hnsw_maintenance_status();
-        if status.ready_partitions == 2 && status.remaining_partitions == 0 {
-            break;
-        }
-        db.run_maintenance_cycle().unwrap();
-    }
-    assert_eq!(
-        db.vector_store_for_test()
-            .hnsw_maintenance_status()
-            .ready_partitions,
-        2
-    );
+    let report = db.run_maintenance_cycle().unwrap().vector;
+    assert_eq!(report.ready_partitions, 0);
+    assert_eq!(report.remaining_partitions, 0);
     db.close().unwrap();
 
-    let old = ReadSession::open(&path).unwrap();
+    let old = ReadSession::open_with_options(
+        &path,
+        contextdb_engine::ReadSessionOptions {
+            limits: contextdb_core::read_contract::ReadLimits {
+                cursor_page_rows: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let old_snapshot = old.file_snapshot_for_test().unwrap();
     let old_alpha = vec![first, moved, deleted];
     assert_eq!(vector_ids(&old, "alpha", "EXACT"), old_alpha);
-    assert_eq!(vector_ids(&old, "alpha", "INDEXED"), old_alpha);
+    assert_eq!(vector_ids(&old, "alpha", "AUTO"), old_alpha);
 
+    let pinned = ["EXACT", "AUTO"].map(|mode| old.open_cursor(
+        &format!("SELECT id FROM compact_vectors WHERE scope = $scope ORDER BY embedding <=> $query USE VECTOR {mode} LIMIT 10"),
+        &params([("scope", Value::Text("alpha".into())), ("query", Value::Vector(vec![1.0, 0.0, 0.0]))]),
+    ).unwrap());
+    assert!(pinned.iter().all(|cursor| cursor.first_page().has_more()));
     let writer = Database::open(&path).unwrap();
     writer.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     let tx = writer.begin().unwrap();
@@ -115,7 +124,7 @@ fn committed_vector_update_then_compact_publishes_one_generation_to_new_readers(
                 &params([("id", Value::Uuid(rolled_back))]),
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Vector(vec![0.0, 1.0, 0.0])]],
         "rollback publishes neither a vector body nor membership",
     );
@@ -146,29 +155,35 @@ fn committed_vector_update_then_compact_publishes_one_generation_to_new_readers(
     assert!(writer.compact_now().unwrap().ran);
     writer.close().unwrap();
 
-    assert_eq!(vector_ids(&old, "alpha", "EXACT"), old_alpha);
-    assert_eq!(vector_ids(&old, "alpha", "INDEXED"), old_alpha);
+    for cursor in pinned {
+        let rows = super::reader_proof_support::drain_cursor_rows(cursor);
+        let ids = rows
+            .iter()
+            .map(|row| match row[0] {
+                Value::Uuid(id) => id,
+                _ => panic!("UUID id"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, old_alpha);
+    }
     assert_eq!(old.file_snapshot_for_test(), Some(old_snapshot));
 
     let fresh = ReadSession::open(&path).unwrap();
     assert_ne!(fresh.file_snapshot_for_test(), Some(old_snapshot));
     assert_eq!(vector_ids(&fresh, "alpha", "EXACT"), vec![first]);
-    assert_eq!(vector_ids(&fresh, "alpha", "INDEXED"), vec![first]);
+    assert_eq!(vector_ids(&fresh, "alpha", "AUTO"), vec![first]);
     assert_eq!(
         vector_ids(&fresh, "beta", "EXACT"),
         vec![moved, rolled_back]
     );
-    assert_eq!(
-        vector_ids(&fresh, "beta", "INDEXED"),
-        vec![moved, rolled_back]
-    );
+    assert_eq!(vector_ids(&fresh, "beta", "AUTO"), vec![moved, rolled_back]);
     drop(fresh);
     drop(old);
 
     let restarted = ReadSession::open(&path).unwrap();
-    assert_eq!(vector_ids(&restarted, "alpha", "INDEXED"), vec![first]);
+    assert_eq!(vector_ids(&restarted, "alpha", "AUTO"), vec![first]);
     assert_eq!(
-        vector_ids(&restarted, "beta", "INDEXED"),
+        vector_ids(&restarted, "beta", "AUTO"),
         vec![moved, rolled_back]
     );
 }

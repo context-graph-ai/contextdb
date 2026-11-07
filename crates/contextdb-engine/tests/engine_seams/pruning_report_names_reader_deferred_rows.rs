@@ -126,7 +126,7 @@ fn a_pass_that_defers_rows_for_a_registered_reader_reports_the_deferred_count() 
     let mut opened = bounded::open_cursor(Arc::clone(&db), &request(paged_limits(2), &clock))
         .expect("open a bounded cursor over the retained table");
     assert!(
-        opened.first_page.has_more,
+        opened.first_page.has_more(),
         "{journey}: the fixture must leave the cursor suspended, so its snapshot stays registered"
     );
 

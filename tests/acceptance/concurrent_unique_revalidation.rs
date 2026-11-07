@@ -24,7 +24,7 @@ fn open_db() -> (tempfile::TempDir, Database) {
 fn row_count(db: &Database, table: &str) -> usize {
     db.execute(&format!("SELECT id FROM {table}"), &empty())
         .expect("count rows")
-        .rows
+        .rows()
         .len()
 }
 
@@ -38,7 +38,7 @@ fn assert_unique_collision_outcomes(
     assert_eq!(
         outcomes
             .iter()
-            .filter(|r| matches!(r, Ok(qr) if qr.rows_affected == 1))
+            .filter(|r| matches!(r, Ok(qr) if qr.rows_affected() == 1))
             .count(),
         expected_winners,
         "winners must report rows_affected=1, got {outcomes:?}"
@@ -84,7 +84,7 @@ fn t15_01_concurrent_single_column_unique_insert_keeps_one_winner() {
                 .collect(),
             )
             .unwrap();
-        assert_eq!(staged.rows_affected, 1);
+        assert_eq!(staged.rows_affected(), 1);
     }
     let outcomes = [db.commit(tx_a), db.commit(tx_b)];
     assert_eq!(outcomes.iter().filter(|r| r.is_ok()).count(), 1);
@@ -107,6 +107,10 @@ fn t15_01_concurrent_single_column_unique_insert_keeps_one_winner() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t15_02_concurrent_composite_unique_insert_collapses_to_one_row() {
     let (_dir, db) = open_db();
     let db = &db;
@@ -145,6 +149,10 @@ fn t15_02_concurrent_composite_unique_insert_collapses_to_one_row() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t15_03_concurrent_pk_collision_six_threads_keeps_one_winner() {
     let (_dir, db) = open_db();
     let db = &db;
@@ -221,6 +229,10 @@ fn t15_04_immutable_unique_sequential_duplicate_insert_rejects() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t15_05_immutable_unique_concurrent_insert_one_winner() {
     let (_dir, db) = open_db();
     let db = &db;
@@ -283,7 +295,7 @@ fn t15_06_non_immutable_sequential_duplicate_insert_returns_zero_affected() {
             &row(id),
         )
         .unwrap();
-    assert_eq!(first.rows_affected, 1);
+    assert_eq!(first.rows_affected(), 1);
     let second = db
         .execute(
             "INSERT INTO entities (id, name) VALUES ($id, $name)",
@@ -291,7 +303,8 @@ fn t15_06_non_immutable_sequential_duplicate_insert_returns_zero_affected() {
         )
         .unwrap();
     assert_eq!(
-        second.rows_affected, 0,
+        second.rows_affected(),
+        0,
         "non-IMMUTABLE duplicate-insert keeps the no-op semantic"
     );
     assert_eq!(row_count(db, "entities"), 1);
@@ -324,20 +337,20 @@ fn t15_07_concurrent_upserts_same_natural_key_collapse_to_one_row() {
                 .collect(),
             )
             .unwrap();
-        assert_eq!(staged.rows_affected, 1);
+        assert_eq!(staged.rows_affected(), 1);
     }
     db.commit(insert_tx).expect("first UPSERT inserts");
     db.commit(update_tx).expect("second UPSERT updates");
     assert_eq!(row_count(db, "entities"), 1);
-    let rows = db
+    let rows_answer = db
         .execute(
             "SELECT label FROM entities WHERE name = $name",
             &[("name".to_string(), Value::Text("alice".into()))]
                 .into_iter()
                 .collect(),
         )
-        .unwrap()
-        .rows;
+        .unwrap();
+    let rows = rows_answer.rows();
     assert_eq!(rows[0][0], Value::Text("update-second".into()));
 }
 
@@ -368,21 +381,21 @@ fn t15_12_commit_time_upsert_update_expr_reads_conflict_row() {
                 .collect(),
             )
             .unwrap();
-        assert_eq!(staged.rows_affected, 1);
+        assert_eq!(staged.rows_affected(), 1);
     }
 
     db.commit(insert_tx).expect("first UPSERT inserts");
     db.commit(update_tx)
         .expect("second UPSERT updates from committed row");
-    let rows = db
+    let rows_answer = db
         .execute(
             "SELECT label FROM entities WHERE name = $name",
             &[("name".to_string(), Value::Text("alice".into()))]
                 .into_iter()
                 .collect(),
         )
-        .unwrap()
-        .rows;
+        .unwrap();
+    let rows = rows_answer.rows();
     assert_eq!(rows, vec![vec![Value::Text("insert-first".into())]]);
 }
 
@@ -413,7 +426,7 @@ fn t15_13_commit_time_upsert_rejects_immutable_update_column() {
                 .collect(),
             )
             .unwrap();
-        assert_eq!(staged.rows_affected, 1);
+        assert_eq!(staged.rows_affected(), 1);
     }
 
     db.commit(insert_tx).expect("first UPSERT inserts");
@@ -487,10 +500,10 @@ fn t15_14_commit_time_upsert_rejects_staged_unique_post_image_collision() {
         ),
         "expected UniqueViolation(entities.slug), got {err:?}"
     );
-    let dup_rows = db
+    let dup_rows_answer = db
         .execute("SELECT id FROM entities WHERE slug = 'dup'", &empty())
-        .unwrap()
-        .rows;
+        .unwrap();
+    let dup_rows = dup_rows_answer.rows();
     assert!(dup_rows.is_empty(), "failed tx must not partially apply");
 }
 
@@ -525,15 +538,15 @@ fn t15_15_composite_on_conflict_matches_full_natural_key() {
             .collect(),
         )
         .unwrap();
-    assert_eq!(result.rows_affected, 1);
+    assert_eq!(result.rows_affected(), 1);
 
-    let rows = db
+    let rows_answer = db
         .execute(
             "SELECT content_hash, label FROM memories WHERE source_id = 'source-a' ORDER BY content_hash",
             &empty(),
         )
-        .unwrap()
-        .rows;
+        .unwrap();
+    let rows = rows_answer.rows();
     assert_eq!(
         rows,
         vec![
@@ -597,10 +610,10 @@ fn t15_16_commit_time_upsert_preserves_later_same_tx_update() {
     db.commit(winner_tx).expect("winner commits first");
     db.commit(upsert_tx)
         .expect("deferred UPSERT preserves later same-tx update");
-    let rows = db
+    let rows_answer = db
         .execute("SELECT label FROM entities WHERE name = 'alice'", &empty())
-        .unwrap()
-        .rows;
+        .unwrap();
+    let rows = rows_answer.rows();
     assert_eq!(rows, vec![vec![Value::Text("same-tx-latest".into())]]);
     assert_eq!(row_count(db, "entities"), 1);
 }
@@ -657,15 +670,15 @@ fn t15_17_commit_time_upsert_triggers_state_propagation() {
 
     db.commit(upsert_tx)
         .expect("deferred UPSERT propagates archived state");
-    let rows = db
+    let rows_answer = db
         .execute(
             "SELECT status FROM decisions WHERE id = $id",
             &[("id".to_string(), Value::Uuid(child_id))]
                 .into_iter()
                 .collect(),
         )
-        .unwrap()
-        .rows;
+        .unwrap();
+    let rows = rows_answer.rows();
     assert_eq!(rows, vec![vec![Value::Text("invalidated".into())]]);
 }
 
@@ -739,15 +752,15 @@ fn t15_18_conditional_vector_noop_keeps_commit_time_upsert_vector() {
 
     db.commit(tx)
         .expect("stale conditional update becomes no-op without dropping UPSERT vector");
-    let conditional_rows = db
+    let conditional_rows_answer = db
         .execute(
             "SELECT status FROM docs WHERE id = $id",
             &[("id".to_string(), Value::Uuid(conditional_id))]
                 .into_iter()
                 .collect(),
         )
-        .unwrap()
-        .rows;
+        .unwrap();
+    let conditional_rows = conditional_rows_answer.rows();
     assert_eq!(conditional_rows, vec![vec![Value::Text("closed".into())]]);
 
     let upsert_row = db
@@ -852,10 +865,10 @@ fn t15_19_commit_time_upsert_rechecks_unique_after_propagation_shifts_inserts() 
         ),
         "expected UniqueViolation(nodes.alias), got {err:?}"
     );
-    let rows = db
+    let rows_answer = db
         .execute("SELECT slug FROM nodes WHERE alias = 'taken'", &empty())
-        .unwrap()
-        .rows;
+        .unwrap();
+    let rows = rows_answer.rows();
     assert_eq!(
         rows,
         vec![vec![Value::Text("holder".into())]],
@@ -864,6 +877,10 @@ fn t15_19_commit_time_upsert_rechecks_unique_after_propagation_shifts_inserts() 
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t15_09_concurrent_delete_and_insert_same_unique_key_serialize() {
     // REGRESSION GUARD: delete-vs-reinsert may serialize as either "delete
     // wins" or "replacement wins", but it must never leave two live rows for
@@ -920,15 +937,15 @@ fn t15_09_concurrent_delete_and_insert_same_unique_key_serialize() {
 
     // Either outcome is acceptable; what MUST NOT happen is two live rows with
     // name='alice' simultaneously.
-    let alice_rows = db
+    let alice_rows_answer = db
         .execute(
             "SELECT id FROM entities WHERE name = $name",
             &[("name".to_string(), Value::Text("alice".into()))]
                 .into_iter()
                 .collect(),
         )
-        .unwrap()
-        .rows;
+        .unwrap();
+    let alice_rows = alice_rows_answer.rows();
     assert!(
         alice_rows.len() <= 1,
         "UNIQUE index must hold at most one live entry for name='alice', got {}",
@@ -975,7 +992,7 @@ fn t15_10_concurrent_insert_with_fk_and_unique_constraints_serialize() {
                 .collect(),
             )
             .unwrap();
-        assert_eq!(staged.rows_affected, 1);
+        assert_eq!(staged.rows_affected(), 1);
     }
     let outcomes = [db.commit(tx_a), db.commit(tx_b)];
     assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
@@ -1023,7 +1040,7 @@ fn t15_11_rejected_tx_produces_no_subscription_event() {
                 .collect(),
             )
             .unwrap();
-        assert_eq!(staged.rows_affected, 1);
+        assert_eq!(staged.rows_affected(), 1);
     }
     db.commit(tx_a).expect("first staged insert commits");
     assert!(
@@ -1050,6 +1067,10 @@ fn t15_11_rejected_tx_produces_no_subscription_event() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t15_08_non_conflicting_concurrent_inserts_both_commit() {
     // REGRESSION GUARD: the validator must not spuriously reject non-overlapping inserts.
     let (_dir, db) = open_db();

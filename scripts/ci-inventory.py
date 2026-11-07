@@ -2,6 +2,7 @@
 """Fail closed when PR shards do not cover every workspace package and redb."""
 from pathlib import Path
 import re
+import ast
 import json
 import sys
 sys.dont_write_bytecode = True
@@ -115,8 +116,20 @@ fi'''
                     'if [[ "$status" == 0 && "$run_extras" == true ]]; then']:
         if script.count(snippet) != 1:
             raise ValueError("shard runner lost split-shard target selection")
+    for snippet in ['aggregate_names=()',
+                    'if [[ "$item" == custody || "$item" == vector || ( "$item" == custody_schema_replay_bounded_contract && "${CI_GATE_MODE:-full}" == full ) ]]; then',
+                    'for aggregate_name in "${aggregate_names[@]}"; do',
+                    'aggregate-skips "$aggregate_name" --aggregate-features "$features"',
+                    '--test "$aggregate_name" -- "${aggregate_flags[@]}"']:
+        if script.count(snippet) != 1:
+            raise ValueError("shard runner lost isolated aggregate coverage")
     if script.count('--timings "$thread_mode" "${logs[@]}"') != 1:
         raise ValueError("shard runner lost per-target timing receipts")
+    # Every test run keeps going past a failing target, so a red shard reports all of its reds.
+    if (script.count('cargo test --locked "${args[@]}" "${targets[@]}"') != 0
+            or script.count('cargo test --locked --no-fail-fast "${args[@]}" "${targets[@]}"') != 2
+            or script.count('cargo test --locked --no-fail-fast "${args[@]}" --test "$aggregate_name"') != 1):
+        raise ValueError("shard runner stops at the first failing target (--no-fail-fast missing)")
     for command in ['--examples --no-run', '--doc -- --test-threads=1']:
         if f'cargo test --locked "${{args[@]}}" {command}' not in script:
             raise ValueError(f"shard runner lost target class: {command}")
@@ -141,7 +154,8 @@ def split_shard_contract(root, rows, documents, paths, workspace):
     moved = ['bounded_in_subquery_stays_inside_the_read_limits',
              'bounded_read_of_staged_graph_work_stays_within_its_limits',
              'local_transport', 'owner_read', 'reader_release', 'sql_surface',
-             'staged_predecode_row', 'text_memory_charge_measurement']
+             'staged_predecode_row', 'text_memory_charge_measurement',
+             'tied_index_probes_stay_inside_the_read_limits', 'writecost_cycle_bound', 'writecost_reclaim']
     expected_shards = {
         'contextdb-engine-test-seams-4': ['acceptance'],
         'contextdb-engine-test-seams-13': ['acceptance_long_running'],
@@ -151,8 +165,6 @@ def split_shard_contract(root, rows, documents, paths, workspace):
             'vector_a_find_decodes_only_the_rows_it_returns', 'custody_delivery_manifest'],
         'contextdb-engine-test-seams-16': [
             'vector_a_find_over_many_contexts_spends_one_search_budget'],
-        'contextdb-engine-test-seams-17': [
-            'vector_one_search_covers_every_layer_on_both_routes'],
         'contextdb-engine-test-seams-15': ['sync_schema_transactions'],
     }
     for shard, targets in expected_shards.items():
@@ -195,8 +207,19 @@ def integration_target_contract(root):
     spec = importlib.util.spec_from_file_location("integration", root / "scripts/ci-integration.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    module.load_manifest(root)
+    rows = module.load_manifest(root)
     module.workflow_contract(root)
+    # Independent of the runner's own contract: an engine-tests command that runs several
+    # targets keeps going past a failing one, so a red slice reports all of its reds.
+    for row in rows:
+        if row['kind'] != 'engine-tests':
+            continue
+        for command in module.commands(row, root, mode='full'):
+            options = command[:command.index('--')] if '--' in command else command
+            if (command[:2] == ['cargo', 'test'] and '--no-run' not in command
+                    and options.count('--test') + options.count('--lib') > 1
+                    and '--no-fail-fast' not in options):
+                raise ValueError('integration runner stops at the first failing target: ' + row['id'])
 
 
 def redb_target_contract(root):
@@ -242,7 +265,6 @@ def schema_replay_fixture_contract(root):
     """Freeze full resident fixtures independently of the bounded root."""
     tests = root / "crates/contextdb-engine/tests"
     for target, rows in {
-            "custody_schema_replay_is_proportional_to_affected_tables": 10_000,
             "custody_schema_replay_work_limited_to_affected_tables": 10_000,
             "custody_schema_replay_identical_schema_does_no_artifact_work": 10_000,
             "custody_schema_replay_bounded_contract": 1}.items():
@@ -251,13 +273,22 @@ def schema_replay_fixture_contract(root):
                                   text, re.MULTILINE)
         if len(declarations) != 1 or int(declarations[0].replace("_", "")) != rows:
             raise ValueError(f"schema replay frozen fixture mismatch: {target}: expected {rows}")
+    # The proportional fixture declares no row-count constant: its shared module holds the
+    # 10,000 resident rows as literals, which is where the frozen size has to be checked.
+    target = "custody_schema_replay_is_proportional_to_affected_tables"
+    text = (tests / "schema/schema_replay_is_proportional_to_affected_tables.rs").read_text()
+    for literal in (r"^    for id in 0\.\.10_000 \{$",
+                    r"^    let mut rows = Vec::with_capacity\(10_000\);$",
+                    r"^        rows\.len\(\),\n        10_000,$"):
+        if len(re.findall(literal, text, re.MULTILINE)) != 1:
+            raise ValueError(f"schema replay frozen fixture mismatch: {target}: expected 10000")
 
 
 
 # Scheduling only: each tuple retains its own command and receipt identity.
 BUNDLES = {
     'bundle-transactions-relational': ['contextdb-tx', 'contextdb-tx-test-seams', 'contextdb-relational'],
-    'bundle-vector-index-graph': ['contextdb-vector', 'contextdb-vector-test-seams', 'contextdb-hnsw', 'contextdb-graph'],
+    'bundle-vector-index-graph': ['contextdb-vector', 'contextdb-vector-test-seams', 'contextdb-graph'],
     'bundle-parser-planner-redb': ['contextdb-parser', 'contextdb-planner', 'contextdb-redb'],
 }
 def pr_jobs(root):
@@ -297,8 +328,7 @@ def pr_jobs(root):
             'contextdb-engine-test-seams-4', 'contextdb-engine-test-seams-13',
             'contextdb-engine-test-seams-14'},
         'contextdb-engine-test-seams-11': {
-            'contextdb-engine-test-seams-11', 'contextdb-engine-test-seams-16',
-            'contextdb-engine-test-seams-17'},
+            'contextdb-engine-test-seams-11', 'contextdb-engine-test-seams-16'},
     }
     for parent, parts in expected_parts.items():
         if {shard for shard, bound in parents.items() if bound == parent} != parts:
@@ -306,11 +336,24 @@ def pr_jobs(root):
     if any(parent not in expected_parts and parent != shard
            for shard, parent in parents.items()):
         raise ValueError('unreviewed PR cache parent binding')
-    if len(set(parents.values())) != 22:
+    if len(set(parents.values())) != 23:
         raise ValueError('logical PR job inventory changed')
     if {name for name, _ in jobs if name.startswith('bundle-')} != set(BUNDLES):
         raise ValueError('missing PR bundle')
     return jobs
+
+
+def redb_featured_contract(root):
+    expected = [('named_root_capture_contract', 'contextdb-internal,test-seams'), ('reclaim_step_contract', 'contextdb-internal,test-seams'), ('open_table_registry_allocations', 'contextdb-internal,test-seams'), ('admission_reads_are_bounded_by_the_format', 'contextdb-internal,test-seams'), ('growth_after_compaction_contract', 'contextdb-internal'), ('cache_residency', 'contextdb-internal'), ('page_window_contract', 'contextdb-internal,test-seams'), ('startup_settle_releases_the_replaced_cache_index', 'contextdb-internal,test-seams'), ('allocator_residency_contract', 'contextdb-internal,test-seams')]
+    source = (root / 'scripts/ci-integration.py').read_text()
+    declarations = [node for node in ast.parse(source).body if isinstance(node, ast.Assign)
+                    and any(isinstance(name, ast.Name) and name.id == 'REDB_FEATURED_TARGETS'
+                            for name in node.targets)]
+    if len(declarations) != 1 or ast.literal_eval(declarations[0].value) != expected:
+        raise ValueError('redb featured target ownership missing, duplicated or wrongly featured')
+    if source.count('for name, features in REDB_FEATURED_TARGETS]') != 1:
+        raise ValueError('redb featured targets lost their isolated commands')
+    return {name: set(features.split(',')) for name, features in expected}
 
 
 def inventory(root):
@@ -370,9 +413,17 @@ def inventory(root):
                                       documents, paths, workspace)
                 for shard, crate, features in rows}
     extended = feature_closure("contextdb-engine", EXTENDED_FEATURES, documents, paths, workspace)
+    redb_featured = redb_featured_contract(root)
+    registered_redb = target_inventory(documents['contextdb-redb'], paths['contextdb-redb'], 'test')
+    if not set(redb_featured) <= set(registered_redb):
+        raise ValueError('redb featured target registration missing')
     for package, doc in documents.items():
         for kind in ("test", "example"):
             for target, required in target_inventory(doc, paths[package], kind).items():
+                if package == "contextdb-redb" and kind == "test" and target in redb_featured:
+                    if required != redb_featured[target]:
+                        raise ValueError("redb featured target registration changed: " + target)
+                    continue
                 if required & EXTENDED_ONLY:
                     if package != "contextdb-engine" or not required <= extended:
                         raise ValueError(f"uncovered extended {package} {kind} {target}: "

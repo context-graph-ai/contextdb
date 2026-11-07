@@ -4,6 +4,57 @@
 
 use std::path::Path;
 
+// Compare identifiers and punctuation so formatting cannot change a guard,
+// while an ordinal such as 10 cannot match the required token 0.
+fn source_tokens(source: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut word_start = None;
+    for (offset, ch) in source.char_indices() {
+        if ch.is_alphanumeric() || ch == '_' {
+            if word_start.is_none() {
+                word_start = Some(offset);
+            }
+            continue;
+        }
+        if let Some(start) = word_start.take() {
+            tokens.push(&source[start..offset]);
+        }
+        if !ch.is_whitespace() {
+            tokens.push(&source[offset..offset + ch.len_utf8()]);
+        }
+    }
+    if let Some(start) = word_start {
+        tokens.push(&source[start..]);
+    }
+    let mut normalized = Vec::with_capacity(tokens.len());
+    for (index, &token) in tokens.iter().enumerate() {
+        // A call's optional trailing comma can change when rustfmt wraps it.
+        if token != "," || tokens.get(index + 1) != Some(&")") {
+            normalized.push(token);
+        }
+    }
+    normalized
+}
+
+fn source_token_matches(source: &str, expected: &[&str]) -> usize {
+    let source = source_tokens(source);
+    let mut wanted = Vec::new();
+    for &part in expected {
+        wanted.extend(source_tokens(part));
+    }
+    if wanted.is_empty() {
+        return 0;
+    }
+    source
+        .windows(wanted.len())
+        .filter(|window| *window == wanted.as_slice())
+        .count()
+}
+
+fn source_has_tokens(source: &str, expected: &[&str]) -> bool {
+    source_token_matches(source, expected) != 0
+}
+
 fn assert_exact_mirror(engine: &Path, server: &Path) {
     let canonical = std::fs::read(engine).expect("read canonical sync source");
     let mirror = std::fs::read(server).expect("read server-path sync audit mirror");
@@ -41,22 +92,24 @@ fn server_sync_sources_are_exact_engine_audit_mirrors() {
 fn combined_schema_commit_keeps_event_bus_and_trigger_sidecar_ordinals_aligned() {
     let event_bus = include_str!("../../src/database/event_bus.rs");
     let trigger = include_str!("../../src/database/trigger.rs");
-    let database = include_str!("../../src/database.rs");
-    let persistence = include_str!("../../src/persistence.rs");
+    let database = include_str!("../../src/database/commit_and_row_writes.rs");
+    let persistence = include_str!("../../src/persistence/redb_flush.rs");
 
     assert!(
-        event_bus.contains("self.ddl_generation_sidecar_values(lsn, ddl, 0)?"),
+        event_bus.contains("self.ddl_generation_sidecar_values(lsn, ddl, 0, read_memory.clone())?"),
         "staged event-bus DDL must carry its leading immutable sidecars"
     );
     assert!(
         trigger.contains("start_ordinal: u32")
-            && trigger.contains("self.ddl_generation_sidecar_values(lsn, ddl, start_ordinal)?"),
+            && trigger.contains(
+                "self.ddl_generation_sidecar_values(lsn, ddl, start_ordinal, read_memory.clone())?"
+            ),
         "staged trigger DDL must receive the preceding event-bus ordinal count"
     );
     assert!(
         database.contains("let trigger_ddl_start =\n                                self.stage_event_bus_ddl_for_commit")
             && database.contains(
-                "self.stage_trigger_ddl_for_commit(lsn, trigger_ddl, trigger_ddl_start)?;"
+                "self.stage_trigger_ddl_for_commit(lsn, trigger_ddl, trigger_ddl_start, read_memory.clone())?;"
             ),
         "the transaction coordinator must pass the staged event-bus count to triggers"
     );
@@ -66,9 +119,33 @@ fn combined_schema_commit_keeps_event_bus_and_trigger_sidecar_ordinals_aligned()
         "the durable DDL log must retain the event-bus-then-trigger order"
     );
     assert!(
-        event_bus.contains("publish_in_memory_ddl_generation_sidecars(")
-            && trigger.contains("staged.persistence.start_ordinal")
-            && trigger.contains("publish_in_memory_ddl_generation_sidecars("),
+        source_has_tokens(
+            event_bus,
+            &[
+                "self.prepare_staged_memory_schema_history(",
+                "lsn, 0, ddl, &persistence.generation_sidecars, )?",
+            ],
+        ) && source_has_tokens(
+            trigger,
+            &[
+                "self.prepare_staged_memory_schema_history(",
+                "lsn, start_ordinal, ddl, &persistence.generation_sidecars, )?",
+            ],
+        ) && source_has_tokens(
+            event_bus,
+            &["self.publish_memory_schema_history(staged.memory_history);"],
+        ) && source_has_tokens(
+            trigger,
+            &["self.publish_memory_schema_history(staged.memory_history);"],
+        ) && source_has_tokens(
+            database,
+            &[
+                "if pending_sink_queue_mutation.borrow().is_some() {",
+                "self.publish_staged_event_bus_ddl_commit_under_queue_mutation_lease(lsn,);",
+                "} else { self.publish_staged_event_bus_ddl_commit(lsn); }",
+                "self.publish_staged_trigger_ddl_commit(lsn);",
+            ],
+        ),
         "in-memory staged DDL must publish the same event-bus-first sidecar sequence"
     );
 }
@@ -92,7 +169,8 @@ fn local_schema_authoring_persists_one_projected_ddl_batch_before_memory_publish
     );
     assert!(
         database.contains("including any CASCADEd index drops")
-            && database.contains("ddl_generation_sidecar_values(lsn, ddl, 0)?"),
+            && database
+                .contains("ddl_generation_sidecar_values(lsn, ddl, 0, read_memory.clone())?"),
         "the projected durable batch must assign one same-LSN sidecar sequence"
     );
 }
@@ -101,7 +179,7 @@ fn local_schema_authoring_persists_one_projected_ddl_batch_before_memory_publish
 fn local_schema_authoring_never_publishes_a_metadata_only_index_or_uses_a_vanished_index_as_empty()
 {
     let executor = include_str!("../../src/executor.rs");
-    let database = include_str!("../../src/database.rs");
+    let database = include_str!("../../src/database/maintenance_and_limits.rs");
     let relational = include_str!("../../../contextdb-relational/src/store.rs");
 
     assert!(
@@ -113,16 +191,31 @@ fn local_schema_authoring_never_publishes_a_metadata_only_index_or_uses_a_vanish
         "a projected table must build its postings first, then publish rows, metadata, and indexes together"
     );
     assert!(
-        database.contains("RelationalStore::projected_index_storage_with_budget(meta, rows, self.accountant.clone())")
-            && database
-                .contains("store.publish_table_projection(name, meta, rows, projected_indexes)"),
+        source_has_tokens(
+            database,
+            &[
+                "RelationalStore::projected_index_storage_with_budget(",
+                "meta, rows, self.finalization.accountant.read_budget()?, )",
+            ],
+        ) && source_has_tokens(
+            database,
+            &[
+                "if !store.publish_table_projection_with_generation(",
+                "name, meta, rows, projected_indexes, memory_swap.history.take(), )",
+            ],
+        ),
         "the durable local-DDL publisher must use the coherent relational projection path"
     );
     assert!(
-        executor
-            .matches("let rows = scan_rows_for_select(db, table, snapshot, tx)?;")
-            .count()
-            >= 2,
+        source_token_matches(
+            executor,
+            &[
+                "let rows = scan_rows_for_select_statement(",
+                "db, table, snapshot, tx,",
+                "(access_mode == IndexScanAccessMode::Select).then_some(residual_filter).flatten(),",
+                "params, vector_copy_owner, read_memory.clone(), )?;",
+            ],
+        ) >= 2,
         "both index-presence race windows must fall back to the normal full scan, not return empty rows"
     );
 }
@@ -140,7 +233,7 @@ fn local_structural_ddl_revalidates_the_complete_schema_under_the_allocation_loc
         "foreign-key-sensitive local DDL must compare the complete metadata map before publishing"
     );
     assert!(
-        executor.contains("let table_generation = db.next_table_generation_for_create(&p.name)?;")
+        executor.contains("db.next_table_generation_for_create(&p.name, read_memory.clone())?;")
             && executor.contains("A generation belongs to the CREATE that actually won"),
         "CREATE must allocate its generation only after its schema baseline still matches"
     );
@@ -174,56 +267,319 @@ fn statement_schema_publication_gate_spans_planning_execution_and_nested_reads()
     );
 }
 
+// Follow Database calls by their parsed signatures, rather than choosing a
+// projected/selected helper spelling. This is a bounded structural guard for
+// the extraction coordinator; the sync behavior tests cover the data itself.
+fn extraction_methods(source: &str) -> std::collections::BTreeMap<String, syn::ImplItemFn> {
+    let syntax = syn::parse_file(source).expect("parse extraction source");
+    let mut methods = std::collections::BTreeMap::new();
+    for item in syntax.items {
+        if let syn::Item::Impl(item) = item {
+            for member in item.items {
+                if let syn::ImplItem::Fn(method) = member {
+                    methods.insert(method.sig.ident.to_string(), method);
+                }
+            }
+        }
+    }
+    methods
+}
+
+fn extraction_type_has(ty: &syn::Type, name: &str) -> bool {
+    use syn::visit::Visit;
+    struct Find<'a> {
+        name: &'a str,
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for Find<'_> {
+        fn visit_path_segment(&mut self, segment: &'ast syn::PathSegment) {
+            self.found |= segment.ident == self.name;
+            syn::visit::visit_path_segment(self, segment);
+        }
+    }
+    let mut find = Find { name, found: false };
+    find.visit_type(ty);
+    find.found
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ExtractionStep {
+    Pending,
+    Base,
+    Reconcile,
+    Arrivals,
+}
+
+struct ExtractionTrace<'a> {
+    methods: &'a std::collections::BTreeMap<String, syn::ImplItemFn>,
+    stack: Vec<String>,
+    guards: Vec<String>,
+    steps: Vec<ExtractionStep>,
+}
+impl ExtractionTrace<'_> {
+    fn walk(&mut self, name: &str) {
+        use syn::visit::Visit;
+        assert!(
+            self.stack.len() < 16,
+            "extraction helper depth exceeds audited boundary"
+        );
+        assert!(
+            !self.stack.iter().any(|parent| parent == name),
+            "recursive extraction helper: {name}"
+        );
+        let method = self
+            .methods
+            .get(name)
+            .unwrap_or_else(|| panic!("missing extraction method {name}"));
+        self.stack.push(name.to_owned());
+        self.visit_block(&method.block);
+        self.stack.pop();
+    }
+
+    fn call(&mut self, name: &str) {
+        let Some(method) = self.methods.get(name) else {
+            return;
+        };
+        let syn::ReturnType::Type(_, output) = &method.sig.output else {
+            return;
+        };
+        let pending_input = method.sig.inputs.iter().any(|input| {
+            matches!(input, syn::FnArg::Typed(arg) if extraction_type_has(&arg.ty, "DurablePendingDelete"))
+        });
+        let step = if extraction_type_has(output, "DurablePendingDelete") {
+            Some(ExtractionStep::Pending)
+        } else if extraction_type_has(output, "ChangeSet")
+            && extraction_type_has(output, "DdlProvenanceSource")
+            && !extraction_type_has(output, "HashMap")
+        {
+            Some(ExtractionStep::Base)
+        } else if pending_input && extraction_type_has(output, "ChangeSet") {
+            Some(ExtractionStep::Reconcile)
+        } else if name == "sync_arrivals_for_changes_within" {
+            Some(ExtractionStep::Arrivals)
+        } else {
+            None
+        };
+        if let Some(step) = step {
+            assert!(
+                !self.guards.is_empty(),
+                "{step:?} must execute under a retained schema-reading operation; helper path {:?}",
+                self.stack
+            );
+            self.steps.push(step);
+        } else if extraction_type_has(output, "ChangeSet") {
+            // Coordinator wrappers may move or be renamed. Follow their body,
+            // not a hardcoded projected/selected alternative list.
+            self.walk(name);
+        }
+    }
+}
+impl<'ast> syn::visit::Visit<'ast> for ExtractionTrace<'_> {
+    fn visit_block(&mut self, block: &'ast syn::Block) {
+        let retained = self.guards.len();
+        syn::visit::visit_block(self, block);
+        self.guards.truncate(retained);
+    }
+
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        syn::visit::visit_local(self, local);
+        if let Some(init) = &local.init {
+            let expr = match init.expr.as_ref() {
+                syn::Expr::Try(expr) => expr.expr.as_ref(),
+                expr => expr,
+            };
+            if let syn::Expr::MethodCall(call) = expr
+                && call.method == "open_operation"
+                && let syn::Pat::Ident(binding) = &local.pat
+            {
+                self.guards.push(binding.ident.to_string());
+            }
+        }
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        // Arguments execute before the called helper.
+        syn::visit::visit_expr_method_call(self, call);
+        if matches!(call.receiver.as_ref(), syn::Expr::Path(path) if path.path.is_ident("self")) {
+            self.call(&call.method.to_string());
+        }
+    }
+
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        syn::visit::visit_expr_call(self, call);
+        if let syn::Expr::Path(path) = call.func.as_ref() {
+            if path.path.is_ident("drop") {
+                for arg in &call.args {
+                    if let syn::Expr::Path(arg) = arg {
+                        self.guards.retain(|name| !arg.path.is_ident(name.as_str()));
+                    }
+                }
+            } else if path
+                .path
+                .segments
+                .first()
+                .is_some_and(|part| part.ident == "Self")
+            {
+                self.call(&path.path.segments.last().unwrap().ident.to_string());
+            }
+        }
+    }
+}
+
 #[test]
 fn outbound_changeset_extraction_holds_the_schema_gate_before_commit_sampling() {
-    let database = include_str!("../../src/database.rs");
-    let checked_start = database
-        .find("pub(crate) fn checked_changes_since_with_arrivals")
-        .expect("checked outbound extraction");
-    let checked_tail = &database[checked_start..];
-    let checked_end = checked_tail
-        .find("\n    pub(crate) fn sync_arrivals_for_changes")
-        .expect("end of checked outbound extraction");
-    let checked = &checked_tail[..checked_end];
-
-    let base_start = database
-        .find("fn changes_since_base(&self, since_lsn: Lsn)")
-        .expect("commit-locked outbound base extraction");
-    let base_tail = &database[base_start..];
-    let base_end = base_tail
-        .find("\n    pub(crate) fn ordinary_dependency_complete_outbound_units")
-        .expect("end of commit-locked outbound base extraction");
-    let base = &base_tail[..base_end];
-    assert!(
-        base.contains("self.enter_schema_publication_gate(false)")
-            && base.contains("let _operation = self.assert_open_operation();"),
-        "outbound base extraction must retain its schema gate before sampling committed changes"
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let source = |name: &str| {
+        std::fs::read_to_string(source_root.join(name)).expect("read extraction source")
+    };
+    let database = source("database.rs");
+    let mut methods = extraction_methods(&database);
+    methods.extend(extraction_methods(&source("database/row_lineage.rs")));
+    methods.extend(extraction_methods(&source("database/sync_outbound.rs")));
+    // Prove that the primitive used by the trace really acquires the read
+    // side and stores that same lease in its returned operation guard.
+    use syn::visit::Visit;
+    #[derive(Default)]
+    struct SchemaOperationProof {
+        leases: Vec<String>,
+        retained: bool,
+    }
+    impl<'ast> Visit<'ast> for SchemaOperationProof {
+        fn visit_local(&mut self, local: &'ast syn::Local) {
+            syn::visit::visit_local(self, local);
+            if let (syn::Pat::Ident(binding), Some(init)) = (&local.pat, &local.init)
+                && let syn::Expr::MethodCall(call) = init.expr.as_ref()
+                && call.method == "enter_schema_publication_gate"
+                && matches!(call.args.first(), Some(syn::Expr::Lit(lit)) if matches!(&lit.lit, syn::Lit::Bool(value) if !value.value))
+            {
+                self.leases.push(binding.ident.to_string());
+            }
+        }
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            syn::visit::visit_expr_call(self, call);
+            if matches!(call.func.as_ref(), syn::Expr::Path(path) if path.path.is_ident("drop")) {
+                for arg in &call.args {
+                    if let syn::Expr::Path(path) = arg {
+                        self.leases
+                            .retain(|lease| !path.path.is_ident(lease.as_str()));
+                    }
+                }
+            }
+        }
+        fn visit_expr_struct(&mut self, value: &'ast syn::ExprStruct) {
+            if value.path.is_ident("DatabaseOperationGuard") {
+                for field in &value.fields {
+                    if matches!(&field.member, syn::Member::Named(name) if name == "_schema_publication")
+                        && let syn::Expr::Call(call) = &field.expr
+                        && matches!(call.func.as_ref(), syn::Expr::Path(path) if path.path.is_ident("Some"))
+                    {
+                        self.retained |= call.args.iter().any(|arg| matches!(arg, syn::Expr::Path(path) if self.leases.iter().any(|lease| path.path.is_ident(lease.as_str()))));
+                    }
+                }
+            }
+            syn::visit::visit_expr_struct(self, value);
+        }
+    }
+    let mut proof = SchemaOperationProof::default();
+    proof.visit_block(
+        &methods
+            .get("open_operation")
+            .expect("public operation primitive")
+            .block,
     );
     assert!(
-        database
-            .matches("let _schema_publication = self.enter_schema_publication_gate(false);")
-            .count()
-            >= 4,
-        "public changes, arrival-bearing changes, checked sync extraction, and EXPLAIN must retain a schema read guard"
+        proof.retained,
+        "open_operation must retain its acquired schema read lease"
     );
-    let guard = checked
-        .find("self.enter_schema_publication_gate(false)")
-        .expect("checked extraction schema guard");
-    let pending = checked
-        .find("self.durable_pending_deletes_since(since_lsn)?")
-        .expect("durable pending-delete obligations");
-    let base = checked
-        .find("self.changes_since_base(since_lsn)")
-        .expect("commit-locked base extraction");
-    let reconcile = checked
-        .find("Self::reconcile_durable_pending_deletes(base, pending)")
-        .expect("durable pending-delete reconciliation");
-    let arrivals = checked
-        .find("self.sync_arrivals_for_changes(&changes)")
-        .expect("sync arrivals");
-    assert!(
-        guard < pending && pending < base && base < reconcile && reconcile < arrivals,
-        "checked extraction must keep pending-delete obligations and arrivals in one ordered schema-gate scope"
+    for root in [
+        "changes_since_with_read_memory",
+        "changes_since_with_arrivals_with_read_memory",
+        "checked_changes_since_with_arrivals",
+    ] {
+        let mut trace = ExtractionTrace {
+            methods: &methods,
+            stack: Vec::new(),
+            guards: Vec::new(),
+            steps: Vec::new(),
+        };
+        trace.walk(root);
+        if root == "changes_since_with_read_memory" {
+            assert_eq!(
+                trace.steps,
+                [
+                    ExtractionStep::Base,
+                    ExtractionStep::Pending,
+                    ExtractionStep::Reconcile
+                ],
+                "{root}"
+            );
+        } else {
+            assert_eq!(
+                trace.steps,
+                [
+                    ExtractionStep::Pending,
+                    ExtractionStep::Base,
+                    ExtractionStep::Reconcile,
+                    ExtractionStep::Arrivals
+                ],
+                "{root}"
+            );
+        }
+    }
+    // Inspect the actual pending-push call site to discover its extraction
+    // entry point. A wrapper rename must not silently remove pending coverage.
+    struct PendingEntry {
+        calls: Vec<String>,
+    }
+    impl<'ast> Visit<'ast> for PendingEntry {
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if matches!(call.receiver.as_ref(), syn::Expr::Field(field) if matches!(&field.member, syn::Member::Named(name) if name == "db"))
+            {
+                self.calls.push(call.method.to_string());
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+    }
+    let client = extraction_methods(&source("sync_client.rs"));
+    let pending = client
+        .get("pending_push_changes")
+        .expect("pending push extraction");
+    let mut entry = PendingEntry { calls: Vec::new() };
+    entry.visit_block(&pending.block);
+    let mut found = 0;
+    for name in entry.calls {
+        let Some(method) = methods.get(&name) else {
+            continue;
+        };
+        let syn::ReturnType::Type(_, output) = &method.sig.output else {
+            continue;
+        };
+        if extraction_type_has(output, "ChangeSet")
+            && extraction_type_has(output, "DdlProvenanceSource")
+        {
+            let mut trace = ExtractionTrace {
+                methods: &methods,
+                stack: Vec::new(),
+                guards: Vec::new(),
+                steps: Vec::new(),
+            };
+            trace.walk(&name);
+            assert_eq!(
+                trace.steps,
+                [
+                    ExtractionStep::Pending,
+                    ExtractionStep::Base,
+                    ExtractionStep::Reconcile,
+                    ExtractionStep::Arrivals
+                ],
+                "pending push via {name}"
+            );
+            found += 1;
+        }
+    }
+    assert_eq!(
+        found, 1,
+        "pending push must call one audited extraction coordinator"
     );
 }
 
@@ -249,7 +605,7 @@ fn direct_public_reads_inherit_the_schema_publication_gate_from_open_operation()
 
 #[test]
 fn outbound_wire_evidence_is_prepared_before_the_schema_lease_is_released() {
-    let database = include_str!("../../src/database.rs");
+    let database = include_str!("../../src/database/maintenance_and_limits.rs");
     let client = include_str!("../../src/sync_client.rs");
     let server = include_str!("../../src/sync_server.rs");
 
@@ -263,7 +619,7 @@ fn outbound_wire_evidence_is_prepared_before_the_schema_lease_is_released() {
         .find("let schema_read = self.db.enter_outbound_sync_schema_read();")
         .expect("push enters outbound schema lease");
     let client_extract = client[client_enter..]
-        .find("checked_changes_since_with_arrivals(since)?")
+        .find("checked_changes_since_with_arrivals(")
         .map(|offset| client_enter + offset)
         .expect("push extracts under lease");
     let client_provenance = client[client_extract..]
@@ -275,7 +631,7 @@ fn outbound_wire_evidence_is_prepared_before_the_schema_lease_is_released() {
         .map(|offset| client_provenance + offset)
         .expect("push drops lease");
     let client_await = client[client_drop..]
-        .find(".request_push(encoded, protocol_version, retry_safety)")
+        .find(".request_push(encoded, protocol_version, retry_safety, unit_memory.clone())")
         .map(|offset| client_drop + offset)
         .expect("push awaits transport after lease");
     assert!(
@@ -290,7 +646,7 @@ fn outbound_wire_evidence_is_prepared_before_the_schema_lease_is_released() {
         .find("let schema_read = db.enter_outbound_sync_schema_read();")
         .expect("pull enters outbound schema lease");
     let server_extract = server[server_enter..]
-        .find("db.checked_changes_since_with_arrivals(scan_since)?")
+        .find("db.checked_changes_since_with_arrivals(")
         .map(|offset| server_enter + offset)
         .expect("pull extracts under lease");
     let server_provenance = server[server_extract..]

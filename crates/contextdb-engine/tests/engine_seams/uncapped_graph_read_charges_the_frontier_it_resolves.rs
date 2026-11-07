@@ -103,6 +103,10 @@ fn insert_node(database: &Database, id: Uuid, name: &str) {
 
 /// Run `sql` with the store limited to what it is already holding plus
 /// `headroom`, then lift the limit again.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn under_headroom(
     database: &Database,
     accountant: &MemoryAccountant,
@@ -183,7 +187,7 @@ fn a_traversal_that_resolves_no_start_is_not_refused_for_a_frontier_it_never_bui
         )
     });
     assert!(
-        rows.rows.is_empty(),
+        rows.rows().is_empty(),
         "a traversal whose filter matches no start answers no rows"
     );
 }

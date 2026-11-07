@@ -1,4 +1,3 @@
-#![allow(dead_code)] // Existing compatibility and test seam shape.
 //! Counterexamples for the durable ordering and proof-accounting invariants.
 
 use super::*;
@@ -316,33 +315,6 @@ fn export_admits_its_destination_proof_through_the_owning_accountant() {
     db.close().unwrap();
 }
 
-fn vector_fixture(path: &std::path::Path) -> Database {
-    let db = Database::open(path).unwrap();
-    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-    db.execute(
-        "CREATE TABLE points (id INTEGER PRIMARY KEY, bucket INTEGER NOT NULL, v VECTOR(3) SEARCH_MODE INDEXED HNSW (M = 8, EF_CONSTRUCTION = 32))",
-        &HashMap::new(),
-    )
-    .unwrap();
-    db.execute(
-        "CREATE INDEX points_bucket ON points (bucket ASC)",
-        &HashMap::new(),
-    )
-    .unwrap();
-    for id in 0..24i64 {
-        db.execute(
-            "INSERT INTO points VALUES ($id, $bucket, '[1,0,0]')",
-            &HashMap::from([
-                ("id".into(), Value::Int64(id)),
-                ("bucket".into(), Value::Int64(id % 2)),
-            ]),
-        )
-        .unwrap();
-    }
-    db.run_maintenance_cycle().unwrap();
-    db
-}
-
 /// Counterexample 5: when the authenticated run cannot be built, the identity
 /// route must not answer from the physical index alone. A posting removed
 /// behind the proof's back is a missing row nobody reports.
@@ -377,6 +349,13 @@ fn identity_cursor(reverse: bool) -> contextdb_relational::mem::BoundedOrderedRo
     cursor
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn pull_identity(
     load: &ReadPersistenceLoad,
     cursor: &mut contextdb_relational::mem::BoundedOrderedRowCursor,
@@ -392,6 +371,22 @@ fn pull_identity(
             .map(|tx| tx.0)
             .unwrap(),
     );
+    let persistence_fixture_parent_1 =
+        crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+            load.source
+                .verified_ordered_runs
+                .memory
+                .accountant
+                .usage()
+                .limit
+                .map(|bytes| bytes as u64)
+                .unwrap_or(u64::MAX),
+        )
+        .expect("admit the declared fixture root");
+    let persistence_fixture_reader_1 = persistence_fixture_parent_1
+        .child()
+        .expect("admit the persistence fixture reader child");
+
     load.source
         .bounded_relational_ordered_next(
             "postings",
@@ -402,6 +397,7 @@ fn pull_identity(
             &mut || Ok(()),
             &mut || Ok(()),
             &mut |_| Ok(()),
+            persistence_fixture_reader_1,
         )
         .map(|row| row.map(|row| row.row_id))
 }
@@ -522,6 +518,13 @@ mod transition_observation {
     /// Run `transition` on another thread and sample the accountant at both
     /// observation points from this one. `probe` is the number of bytes only a
     /// limit above `floor` could admit.
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn observe_transition(
         database: &Database,
         floor: usize,
@@ -580,6 +583,13 @@ mod transition_observation {
 /// durable write that records it, so a concurrent operation can consume
 /// capacity that never commits.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_widening_transition_never_publishes_capacity_its_durable_write_has_not_committed() {
     use crate::database::memory_limit_transition_seam::TransitionPhase;
     let root = tempfile::tempdir().unwrap();
@@ -624,6 +634,13 @@ fn a_widening_transition_never_publishes_capacity_its_durable_write_has_not_comm
 /// then publishes it, so a concurrent operation keeps allocating under the
 /// larger limit after the smaller one is already the durable truth.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_narrowing_transition_never_leaves_the_old_capacity_published_after_its_durable_write() {
     use crate::database::memory_limit_transition_seam::TransitionPhase;
     let root = tempfile::tempdir().unwrap();
@@ -708,7 +725,7 @@ fn the_export_destination_admits_its_format_marker_and_initial_identity() {
     let before = budget.admitted_bytes_for_test();
     let artifact = RedbPersistence::create_with_accountant(
         &root.path().join("destination.db"),
-        Some(Arc::clone(&budget)),
+        Some(Arc::clone(&budget).into()),
         crate::persistence::redb_cache_bytes_for_limit(budget.usage().limit),
     )
     .expect("create an export destination");
@@ -722,7 +739,7 @@ fn the_export_destination_admits_its_format_marker_and_initial_identity() {
     ));
     let late =
         RedbPersistence::create(&root.path().join("late.db")).expect("create a second destination");
-    late.attach_memory_accountant(Arc::clone(&control));
+    late.attach_memory_accountant(Arc::clone(&control).into());
     let unaccounted = control.admitted_bytes_for_test();
     late.close();
     assert_eq!(

@@ -9,7 +9,7 @@ use contextdb_server::protocol::PROTOCOL_VERSION;
 use contextdb_server::transport::ServerResourcePolicy;
 use contextdb_server::transport::iroh::{EndpointSpec, IrohServer};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 /// The `--version` disclosure, computed from the real `PROTOCOL_VERSION`
 /// constant rather than a hand-maintained literal — a hardcoded string here
@@ -39,7 +39,7 @@ fn disclosed_version() -> &'static str {
         contextdb-server --db-path mydata.db --tenant-id acme\n    \
             Serve mydata.db, binding a dial-by-key sync endpoint and printing an\n    \
             enrollment ticket plus the exact client command to connect with it.\n\n  \
-        contextdb-server --db-path :memory: --tenant-id acme --show-ticket\n    \
+        contextdb-server --db-path mydata.db --tenant-id acme --show-ticket\n    \
             Print the enrollment ticket and exit without serving (scripting).\n\n  \
         contextdb-server --db-path mydata.db --tenant-id acme --ticket-file ticket.txt\n    \
             Serve and also write the ticket to ticket.txt for other processes to read.\n\n  \
@@ -48,8 +48,8 @@ fn disclosed_version() -> &'static str {
             Bind a stable port instead of an ephemeral one."
 )]
 struct Args {
-    /// Database path (:memory: for in-memory)
-    #[arg(long, env = "CONTEXTDB_DB_PATH", default_value = ":memory:")]
+    /// Database path
+    #[arg(long, env = "CONTEXTDB_DB_PATH")]
     db_path: String,
     /// Sync endpoint to serve on. Default form `iroh:?identity=<key-file>`
     /// binds a dial-by-key endpoint with no relay and no third-party contact;
@@ -142,7 +142,8 @@ impl Args {
     }
 }
 
-/// The path that asks for an ephemeral store with no file behind it.
+/// The one path string that names no file. contextdb is a durable database,
+/// so the server refuses it before anything is opened.
 const MEMORY_PATH: &str = ":memory:";
 
 /// Say once, at startup, when this server is not serving local reads.
@@ -168,16 +169,7 @@ fn report_owner_read_startup(db: &Database) {
 }
 
 fn default_endpoint_spec(db_path: &str) -> String {
-    let identity = if db_path == MEMORY_PATH {
-        // Per-process: two in-memory servers on one host must not share an
-        // identity (or its sticky port).
-        std::env::temp_dir().join(format!(
-            "contextdb-ephemeral-identity-{}.key",
-            std::process::id()
-        ))
-    } else {
-        std::path::PathBuf::from(format!("{db_path}.fabric-identity.key"))
-    };
+    let identity = std::path::PathBuf::from(format!("{db_path}.fabric-identity.key"));
     format!("iroh:?identity={}", identity.display())
 }
 
@@ -217,6 +209,10 @@ fn main() {
 }
 
 #[tokio::main]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     tracing::info!(
@@ -232,16 +228,15 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Settled before anything is opened: exit 2 promises the invocation was
     // never attempted, and that has to include not creating a store for a
     // server that was never going to run.
-    let owner = args.owner_read.resolve();
-    if args.db_path == MEMORY_PATH && args.owner_read.declared_any() {
+    if args.db_path == MEMORY_PATH {
         return Err(UsageError(
-            "an in-memory database has no read route, no owner channel, and no ceilings to \
-             declare, so --owner-read-*, --no-owner-reads, and --owner-read-runtime-dir are \
-             invalid with `:memory:`"
+            "`:memory:` is not a database path: contextdb is a durable database and has no \
+             in-memory mode; pass the path of a database file with --db-path"
                 .to_string(),
         )
         .into());
     }
+    let owner = args.owner_read.resolve();
     if let Some(violation) = owner.violation() {
         return Err(UsageError(violation).into());
     }
@@ -268,25 +263,21 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let db = if args.db_path == MEMORY_PATH {
-        Arc::new(Database::open_memory())
-    } else {
-        // The same writable door the writer uses, so the server advertises the
-        // owner-read policy it was asked for rather than the shipped default.
-        Arc::new(Database::open_with_options(
-            std::path::Path::new(&args.db_path),
-            DatabaseOpenOptions {
-                owner_reads: OwnerReadConfig {
-                    enabled: owner.enabled,
-                    limits: owner.limits,
-                    timeouts: owner.timeouts,
-                    runtime_dir: owner.runtime_dir.clone(),
-                    ..OwnerReadConfig::default()
-                },
-                ..DatabaseOpenOptions::default()
+    // The same writable door the writer uses, so the server advertises the
+    // owner-read policy it was asked for rather than the shipped default.
+    let db = Arc::new(Database::open_with_options(
+        std::path::Path::new(&args.db_path),
+        DatabaseOpenOptions {
+            owner_reads: OwnerReadConfig {
+                enabled: owner.enabled,
+                limits: owner.limits,
+                timeouts: owner.timeouts,
+                runtime_dir: owner.runtime_dir.clone(),
+                ..OwnerReadConfig::default()
             },
-        )?)
-    };
+            ..DatabaseOpenOptions::default()
+        },
+    )?);
     report_owner_read_startup(&db);
     // Bind eagerly so the enrollment ticket is available up front. Binding is
     // the point at which endpoint information becomes real; readiness is a
@@ -299,16 +290,20 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
     // Retain publication ordering through the established constructor.
     let server = publish_then_activate(&args, db, &endpoint, |db, endpoint, tenant| {
-        Ok(SyncServer::new(db, endpoint, tenant))
+        SyncServer::new(db, endpoint, tenant)
     })?;
 
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let signal_shutdown = shutdown.clone();
+    // The stop handle funds the native delivery installation; the status,
+    // pull, push and binding subjects keep their Legacy handlers beside it.
+    let stop = server
+        .native_stop(Arc::new(AtomicBool::new(false)))
+        .map_err(|error| error.to_string())?;
+    let signal_stop = stop.clone();
     tokio::spawn(async move {
         wait_for_shutdown_signal().await;
-        signal_shutdown.store(true, Ordering::SeqCst);
+        signal_stop.request_stop();
     });
-    server.run_until(shutdown).await;
+    server.run_until_stopped(stop).await;
     server.db().close()?;
     Ok(())
 }
@@ -551,6 +546,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     async fn a_bound_ticket_is_published_before_readiness_failure_and_no_server_is_returned() {
         let root = tempfile::tempdir().expect("temporary ticket directory");
         let identity = root.path().join("server.identity");
@@ -581,7 +580,7 @@ mod tests {
             &endpoint,
             |_, _, _| {
                 Err(contextdb_core::Error::SyncError(
-                    "forced readiness failure".to_string(),
+                    "forced readiness failure".to_string().into(),
                 ))
             },
             |line| {

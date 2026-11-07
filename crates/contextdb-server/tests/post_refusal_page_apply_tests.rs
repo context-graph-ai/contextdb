@@ -91,7 +91,7 @@ fn digest_summaries(db: &Database) -> Vec<(String, String)> {
         .execute("SELECT id, summary FROM digests", &p())
         .expect("digest scan");
     let mut rows = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match (&row[0], &row[1]) {
             (Value::Text(id), Value::Text(summary)) => (id.clone(), summary.clone()),
@@ -138,7 +138,8 @@ fn start_hub(broker: &InProcessBroker, tenant: &str) -> RunningHub {
             TenantId::from(tenant),
             hub_node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -158,6 +159,7 @@ fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, tenant: &str) -> Sy
         TenantId::from(tenant),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 async fn drain_push(client: &SyncClient) {

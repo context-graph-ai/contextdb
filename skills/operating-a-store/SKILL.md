@@ -1,6 +1,6 @@
 ---
 name: operating-a-store
-description: Run the operator lifecycle on a contextdb store — enforce RETAIN windows on demand with .maintenance run, permanently erase rows with purge (never-connected stores only), back up before a destructive op, and read sync liveness signals (pull_pages_read) instead of guessing whether a pull is stuck.
+description: Operate a contextdb store with retention, declared compaction, parent-following purge, historical-index verification, backups, and sync liveness inspection.
 ---
 
 # Operating a store
@@ -309,3 +309,88 @@ hang — a `0`-page pull with `applied:0` is often just "already converged," not
 - Open a database, run SQL, read `--json`, branch on exit codes → [`skills/using-contextdb/SKILL.md`](../using-contextdb/SKILL.md)
 - Push/pull, watermarks, the delete-durability recipe → [`skills/sync/SKILL.md`](../sync/SKILL.md)
 - Wire up sinks/routes/schedules so there's something to observe here → [`skills/running-triggers-and-schedules/SKILL.md`](../running-triggers-and-schedules/SKILL.md)
+
+## Recipe 5 — declare when storage compacts
+
+Prerequisite: the binary installed above and write access to a file store. This example
+creates a task-scoped store; use the confirmation rule above for an operator's existing store.
+
+1. Set only the clauses you intend to override: `START_RATIO`, `MIN_INTERVAL`, `STOP_RATIO`,
+   and `MAX_SWEEPS`. Omitted clauses keep their current values.
+2. Inspect `SHOW STORAGE_COMPACTION`: each row names its value and whether its source is
+   `declared` or `default`. The declaration persists across reopen and is local to the store.
+3. Use `SET STORAGE_COMPACTION DEFAULT` to reset all four clauses. A zero ratio, zero sweep
+   count or zero interval is refused and leaves the previous declaration intact. Declaring a policy
+   does not itself run a sweep; `.maintenance compact` is the explicit compaction command.
+<!-- enforced by: storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::storage_compaction_declarations_show_their_source_and_survive_reopen, storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::a_declared_stop_rule_changes_how_many_sweeps_compact_now_runs -->
+
+```bash
+db="$(mktemp -d)/compact.db"
+contextdb "$db" --write --json > /dev/null <<'SQL'
+SET STORAGE_COMPACTION START_RATIO 0.4 MIN_INTERVAL 30 MINUTES;
+SET STORAGE_COMPACTION MAX_SWEEPS 4;
+SQL
+printf 'SHOW STORAGE_COMPACTION;\n' | contextdb "$db" --write --json
+```
+
+```json
+{"result":{"columns":["setting","value","source"],"rows":[{"setting":"start_ratio","source":"declared","value":0.4},{"setting":"min_interval_ms","source":"declared","value":1800000},{"setting":"stop_ratio","source":"default","value":0.05},{"setting":"max_sweeps","source":"declared","value":4}]}}
+```
+
+## Recipe 6 — erase declared children with a parent
+
+Prerequisite: the binary installed above; run this destructive example only against its own
+new temporary store. Back up an operator's store first, as in recipe 3.
+
+1. Declare the child's reference with `REFERENCES parents(id) FOLLOWS PARENT PURGE`.
+2. Purge the parent through the SQL erasure door. Every retained life of a declared child
+   follows its parent into erasure. This is a purge declaration, not an ordinary DELETE cascade.
+3. Check both tables. Invalid reference shapes are refused at schema admission; inspect the
+   referenced primary key and the declaration instead of removing the erasure policy.
+<!-- enforced by: custody_purge_and_discard_contract::a_purge_erases_every_retained_life_of_a_declared_child, custody_purge_and_discard_contract::follows_parent_purge_is_validated_on_the_projected_catalog -->
+
+```bash
+db="$(mktemp -d)/family.db"
+contextdb "$db" --write --json > /dev/null <<'SQL'
+CREATE TABLE parents (id UUID PRIMARY KEY) SYNC OFF;
+CREATE TABLE children (id UUID PRIMARY KEY, parent_id UUID REFERENCES parents(id) FOLLOWS PARENT PURGE) SYNC OFF;
+INSERT INTO parents VALUES ('11111111-1111-1111-1111-111111111111');
+INSERT INTO children VALUES ('22222222-2222-2222-2222-222222222222', '11111111-1111-1111-1111-111111111111');
+PURGE FROM parents WHERE id = '11111111-1111-1111-1111-111111111111';
+SQL
+printf 'SELECT COUNT(*) AS children_left FROM children;\n' | contextdb "$db" --write --json
+```
+
+```json
+{"result":{"columns":["children_left"],"rows":[{"children_left":0}]}}
+```
+
+## Recipe 7 — verify historical indexes
+
+Prerequisite: the binary installed above and a table whose historical index you want to check.
+The example creates a temporary store.
+
+1. Run `.verify history <table>` from a reading session. Under `--json`, use the
+   `verify_history` document and each index's `postings` and `versions` counts.
+2. A verification error means the check failed; retain the store and diagnostic before
+   attempting repair. The command verifies rather than rewriting the historical index.
+<!-- enforced by: read_cli_journeys_metadata::verify_history_checks_each_historical_index_from_a_read_session -->
+
+```bash
+db="$(mktemp -d)/history.db"
+contextdb "$db" --write --json > /dev/null <<'SQL'
+CREATE TABLE tagged (id INTEGER PRIMARY KEY, tag TEXT);
+CREATE INDEX tagged_tag ON tagged(tag);
+INSERT INTO tagged VALUES (1, 'a');
+UPDATE tagged SET tag = 'b' WHERE id = 1;
+SQL
+printf '.verify history tagged\n' | contextdb "$db" --json
+```
+
+```json
+{"verify_history":{"indexes":[{"index":"__pk_id","postings":1,"versions":2},{"index":"tagged_tag","postings":2,"versions":2}],"table":"tagged"}}
+```
+
+The route notice, including its snapshot timestamp, is emitted on stderr separately from this
+stdout document.
+<!-- enforced by: read_cli_journeys_session_shape::the_route_notice_is_emitted_once_on_stderr_at_the_first_store_reading_command -->

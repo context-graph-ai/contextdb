@@ -1,21 +1,10 @@
-//! `change_log_table_index` (the per-table shadow a scoped version-cleanup
-//! / retention pass reads instead of scanning the whole change-log `Vec` --
-//! see `composite_store::ChangeLogTableIndex`) must never drift from
-//! `change_log` itself: for any table, the index's own `(lsn, row_id)`
-//! coordinates for that table's `RowInsert`/`RowDelete` entries must equal
-//! what a fresh scan of the real change log (filtered to that table) would
-//! find, at every point the two are maintained -- after ordinary appends,
-//! after a reopen from disk (the index is REBUILT from the loaded log, not
-//! carried over), and after a scoped cleanup pass has physically removed
-//! entries (the index's own removal must track the Vec's own removal
-//! exactly, not merely approximately).
-//!
-//! Discipline: no sleeps, no elapsed-time assertions, no raw clock reads.
+//! Row history remains selectable by table after scoped cleanup and reopen.
+//! In-memory append controls also keep their resident lookup consistent.
 
 use contextdb_core::Value;
-use contextdb_engine::Database;
 use contextdb_engine::composite_store::ChangeLogEntry;
 use contextdb_engine::work_ledger::install_work_ledger_schema;
+use contextdb_engine::{Database, MaintenancePolicy};
 use std::collections::HashMap;
 
 fn advertise(db: &Database, key: &str, capability_id: &str, advertised_at: i64) {
@@ -49,6 +38,7 @@ fn change_log_coords_for_table(
 ) -> Vec<(contextdb_core::Lsn, contextdb_core::RowId)> {
     let mut coords: Vec<(contextdb_core::Lsn, contextdb_core::RowId)> = db
         .change_log_since(contextdb_core::Lsn(0))
+        .unwrap()
         .into_iter()
         .filter_map(|entry| match entry {
             ChangeLogEntry::RowInsert {
@@ -78,6 +68,72 @@ fn assert_index_matches_change_log(db: &Database, table: &str, when: &str) {
     );
 }
 
+type Coordinate = (contextdb_core::Lsn, contextdb_core::RowId);
+
+fn advertise_coordinate(
+    db: &Database,
+    key: &str,
+    capability: &str,
+    at: i64,
+    replaces: bool,
+) -> Vec<Coordinate> {
+    let before = db.current_lsn();
+    advertise(db, key, capability, at);
+    let entries = db
+        .change_log_since(before)
+        .expect("read this committed advertisement");
+    let coordinates = entries
+        .into_iter()
+        .filter_map(|entry| match entry {
+            ChangeLogEntry::RowInsert { table, row_id, lsn }
+            | ChangeLogEntry::RowDelete {
+                table, row_id, lsn, ..
+            } if table == "work_capabilities" => Some((lsn, row_id)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        coordinates.len(),
+        1 + usize::from(replaces),
+        "an advertisement publishes its insertion and, when replacing, its prior-version deletion"
+    );
+    coordinates
+}
+
+fn assert_durable_history(db: &Database, table: &str, expected: &[Coordinate], when: &str) {
+    let mut expected = expected.to_vec();
+    expected.sort();
+    assert_eq!(
+        change_log_coords_for_table(db, table),
+        expected,
+        "public durable history returns every exact {table} coordinate {when}"
+    );
+    assert!(
+        change_log_coords_for_table(db, "missing_history_table").is_empty(),
+        "selecting a missing table must not leak another table's history"
+    );
+}
+
+fn unrelated_history(db: &Database) -> Vec<Coordinate> {
+    db.execute(
+        "CREATE TABLE unrelated_history (id INTEGER PRIMARY KEY) HISTORY ALL",
+        &HashMap::new(),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO unrelated_history VALUES (999)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    let expected = change_log_coords_for_table(db, "unrelated_history");
+    assert_eq!(
+        expected.len(),
+        1,
+        "the unrelated table has a positive history control"
+    );
+    expected
+}
+
 /// Baseline: ordinary appends (fresh inserts, then superseding upserts) keep
 /// the index and the real log in lockstep the whole time, on an in-memory
 /// database (no reopen involved yet).
@@ -95,61 +151,96 @@ fn the_index_matches_the_change_log_after_ordinary_appends() {
     assert_index_matches_change_log(&db, "work_capabilities", "after a second logical row");
 }
 
-/// Reopen: the index is REBUILT from the persisted change log at
-/// `Database::open` (`build_change_log_aux_indexes`), not carried over from
-/// the closed handle -- so this proves the rebuild reconstructs exactly
-/// what a live handle would have shown, not merely something plausible.
+/// Reopening preserves exact table-selected history and accepts a later append.
 #[test]
 fn the_index_survives_a_reopen_from_disk() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("reopen.db");
-    let before_close = {
+    let (mut expected, unrelated) = {
         let db = Database::open(&path).expect("open");
+        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
         install_work_ledger_schema(&db).expect("install");
+        let unrelated = unrelated_history(&db);
+        let mut expected = Vec::new();
         for i in 0..4 {
-            advertise(&db, "node-a", &format!("cap-{i}"), 1_700_000_000_000 + i);
+            expected.extend(advertise_coordinate(
+                &db,
+                "node-a",
+                &format!("cap-{i}"),
+                1_700_000_000_000 + i,
+                i > 0,
+            ));
         }
-        advertise(&db, "node-b", "cap-b0", 1_700_000_000_200);
-        assert_index_matches_change_log(&db, "work_capabilities", "before close");
-        db.__change_log_table_index_for_test("work_capabilities")
+        expected.extend(advertise_coordinate(
+            &db,
+            "node-b",
+            "cap-b0",
+            1_700_000_000_200,
+            false,
+        ));
+        assert_durable_history(&db, "work_capabilities", &expected, "before close");
+        db.close().unwrap();
+        (expected, unrelated)
     };
-
-    let db2 = Database::open(&path).expect("reopen");
-    assert_eq!(
-        db2.__change_log_table_index_for_test("work_capabilities"),
-        before_close,
-        "a reopen must rebuild the SAME per-table coordinates the closed handle held"
-    );
-    assert_index_matches_change_log(
-        &db2,
+    let db = Database::open(&path).expect("reopen");
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+    assert_durable_history(
+        &db,
         "work_capabilities",
-        "immediately after reopen, before any new write",
+        &expected,
+        "immediately after reopen before another write",
     );
-
-    // One more write after reopen, to prove the rebuilt index keeps
-    // tracking correctly going forward, not just at the instant of load.
-    advertise(&db2, "node-a", "cap-post-reopen", 1_700_000_000_300);
-    assert_index_matches_change_log(&db2, "work_capabilities", "after a write following reopen");
+    assert_durable_history(
+        &db,
+        "unrelated_history",
+        &unrelated,
+        "after reopening the sibling table",
+    );
+    expected.extend(advertise_coordinate(
+        &db,
+        "node-a",
+        "cap-post-reopen",
+        1_700_000_000_300,
+        true,
+    ));
+    assert_durable_history(
+        &db,
+        "work_capabilities",
+        &expected,
+        "after a write following reopen",
+    );
+    assert_durable_history(
+        &db,
+        "unrelated_history",
+        &unrelated,
+        "after the other table's append",
+    );
 }
 
-/// A scoped cleanup pass physically removes entries from the change log
-/// (`remove_pruned_change_log_entries`) -- the index's own removal
-/// (`remove_pruned_from_table_index`) must track that exactly, not merely
-/// shrink by roughly the right amount. File-backed, deliberately: an
-/// in-memory database has no persistence layer, so the scoped removal path
-/// this test exercises would never run its persisted half at all.
+/// Scoped cleanup removes only obsolete table coordinates across repeated churn.
 #[test]
 fn the_index_matches_the_change_log_after_a_scoped_cleanup_pass() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("scoped_removal.db");
     let db = Database::open(&path).expect("open");
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     install_work_ledger_schema(&db).expect("install");
+    let unrelated = unrelated_history(&db);
+    let mut expected = Vec::new();
+    let mut latest_a = Vec::new();
     for i in 0..6 {
-        advertise(&db, "node-a", &format!("cap-{i}"), 1_700_000_000_000 + i);
+        latest_a = advertise_coordinate(
+            &db,
+            "node-a",
+            &format!("cap-{i}"),
+            1_700_000_000_000 + i,
+            i > 0,
+        );
+        expected.extend(latest_a.iter().copied());
     }
-    advertise(&db, "node-b", "cap-b0", 1_700_000_000_500);
-    assert_index_matches_change_log(&db, "work_capabilities", "before cleanup");
-
+    let latest_b = advertise_coordinate(&db, "node-b", "cap-b0", 1_700_000_000_500, false);
+    expected.extend(latest_b.iter().copied());
+    assert_durable_history(&db, "work_capabilities", &expected, "before cleanup");
     let report = db
         .compact_currency_versions()
         .expect("compaction must succeed");
@@ -157,13 +248,34 @@ fn the_index_matches_the_change_log_after_a_scoped_cleanup_pass() {
         report.pruned_versions > 0,
         "setup must produce prunable versions: {report:?}"
     );
-    assert_index_matches_change_log(&db, "work_capabilities", "immediately after cleanup");
-
-    // A further write, then a second cleanup cycle -- proves the index
-    // does not merely happen to be correct once, but stays correct across
-    // repeated append/removal cycles on the SAME table.
-    advertise(&db, "node-a", "cap-after-cleanup", 1_700_000_000_600);
-    advertise(&db, "node-a", "cap-after-cleanup-2", 1_700_000_000_700);
+    // The newest replacement shares its LSN and stable row id between the
+    // delete and insert. Both durable occurrences name the surviving version.
+    assert_durable_history(
+        &db,
+        "work_capabilities",
+        &[latest_a.clone(), latest_b.clone()].concat(),
+        "immediately after cleanup",
+    );
+    assert_durable_history(
+        &db,
+        "unrelated_history",
+        &unrelated,
+        "after scoped cleanup of another table",
+    );
+    let next_a = advertise_coordinate(&db, "node-a", "cap-after-cleanup", 1_700_000_000_600, true);
+    let final_a = advertise_coordinate(
+        &db,
+        "node-a",
+        "cap-after-cleanup-2",
+        1_700_000_000_700,
+        true,
+    );
+    assert_durable_history(
+        &db,
+        "work_capabilities",
+        &[latest_a, latest_b.clone(), next_a, final_a.clone()].concat(),
+        "after further appends before the second cleanup",
+    );
     let report2 = db
         .compact_currency_versions()
         .expect("second compaction must succeed");
@@ -171,5 +283,32 @@ fn the_index_matches_the_change_log_after_a_scoped_cleanup_pass() {
         report2.pruned_versions > 0,
         "the second round of churn must also produce prunable versions: {report2:?}"
     );
-    assert_index_matches_change_log(&db, "work_capabilities", "after a second cleanup cycle");
+    // Each call performs one finite safe batch; finish this fixture's churn
+    // before asserting the final history coordinates.
+    let mut drained = false;
+    for _ in 0..16 {
+        let batch = db
+            .compact_currency_versions()
+            .expect("drain finite cleanup batch");
+        if batch.pruned_versions == 0 {
+            drained = true;
+            break;
+        }
+    }
+    assert!(
+        drained,
+        "the finite fixture must finish cleanup within sixteen batches"
+    );
+    assert_durable_history(
+        &db,
+        "work_capabilities",
+        &[final_a, latest_b].concat(),
+        "after a second cleanup cycle",
+    );
+    assert_durable_history(
+        &db,
+        "unrelated_history",
+        &unrelated,
+        "after a second scoped cleanup",
+    );
 }

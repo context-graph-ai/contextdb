@@ -19,6 +19,8 @@ re-exported from `lib.rs`. **Never add a mirror module here** — extend the eng
 public-surface audit, and are never edited on their own. No behavior configuration comes from environment
 aliases; a behavior reaches the binary as a flag.
 
+Worker reads use request-scoped memory from the engine's declared provider; hosts may supply a `ReadRequestBudgetProvider` through the `_with_read_budget_provider` entry points in `src/work_ledger.rs`. Typed local engine failures propagate rather than becoming an offline-sync success. Guard: `src/work_ledger.rs::worker_error_tests::an_internal_engine_error_cannot_be_reported_as_an_offline_hub`.
+
 ## Seams
 
 - **Below:** `contextdb-engine` (everything sync), `contextdb-core` (`Error`, `TenantId`, `Value`).
@@ -53,7 +55,7 @@ aliases; a behavior reaches the binary as a flag.
 | Change | Where it lands |
 |---|---|
 | Wire vocabulary, request kinds, arbitration, pull cursors | Engine crate (`protocol.rs`, `subjects.rs`, `sync_server.rs`, `sync_client.rs`); re-exported here |
-| A `contextdb-server` flag or exit code | `main.rs`, `exit_codes.rs`, `owner_read_options.rs` |
+| A `contextdb-server` flag or exit code | `main.rs`, `exit_codes.rs`, `main.rs` |
 | When an edge pushes automatically | `sync_plugin.rs` |
 | Claim-by-push, worker polling, lease stand-down | `work_ledger.rs`; the ledger tables themselves are the engine's `work_ledger` |
 | Received column mismatch, partial ALTER, source-transaction replay or retry outcome | Engine `database.rs`; durable schema/migration records in engine `persistence.rs`. No replay implementation here. |

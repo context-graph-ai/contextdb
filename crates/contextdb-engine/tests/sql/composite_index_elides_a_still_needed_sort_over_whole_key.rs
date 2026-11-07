@@ -106,25 +106,25 @@ fn a_sort_eliding_composite_index_beats_a_non_unique_whole_key_index() {
         )
         .expect("the ordered widget read must succeed");
     assert_eq!(
-        result.rows,
+        result.rows(),
         vec![
             vec![Value::Int64(100)],
             vec![Value::Int64(101)],
             vec![Value::Int64(102)],
         ],
         "rows must already arrive in the requested order: {:?}",
-        result.trace
+        result.trace()
     );
     assert_eq!(
-        result.trace.index_used.as_deref(),
+        result.trace().index_used.as_deref(),
         Some(COMPOSITE_INDEX),
         "a still-needed ORDER BY must be answered by the composite index, not the whole-key one: {:?}",
-        result.trace
+        result.trace()
     );
     assert!(
-        result.trace.sort_elided,
+        result.trace().sort_elided,
         "the composite index's own order already answers ORDER BY seq ASC, so no sort should run: {:?}",
-        result.trace
+        result.trace()
     );
 }
 
@@ -140,10 +140,10 @@ fn a_unique_whole_key_index_still_wins_over_a_sort_eliding_composite_candidate()
         )
         .expect("the ordered widget_u read must succeed");
     assert_eq!(
-        result.trace.index_used.as_deref(),
+        result.trace().index_used.as_deref(),
         Some(UNIQUE_FK_INDEX),
         "a UNIQUE whole-key index must still win: at most one row means the sort is moot: {:?}",
-        result.trace
+        result.trace()
     );
 }
 
@@ -161,26 +161,27 @@ fn with_no_order_by_the_original_whole_key_preference_is_unchanged() {
         )
         .expect("the unordered widget read must succeed");
     assert_eq!(
-        result.trace.index_used.as_deref(),
+        result.trace().index_used.as_deref(),
         Some(FK_INDEX),
         "with no ORDER BY, whole-key coverage must still decide the tie exactly as before: {:?}",
-        result.trace
+        result.trace()
     );
     assert!(
-        !result.trace.sort_elided,
+        !result.trace().sort_elided,
         "there is no ORDER BY to elide: {:?}",
-        result.trace
+        result.trace()
     );
     let composite = result
-        .trace
+        .trace()
         .indexes_considered
         .iter()
         .find(|candidate| candidate.name == COMPOSITE_INDEX)
-        .unwrap_or_else(|| panic!("trace omitted the competing index: {:?}", result.trace));
+        .unwrap_or_else(|| panic!("trace omitted the competing index: {:?}", result.trace()));
     assert_eq!(
-        composite.rejected_reason, "chosen index has whole-key coverage",
+        composite.rejected_reason,
+        "chosen index has whole-key coverage",
         "the pre-existing rejection wording must survive untouched when no sort is in play: {:?}",
-        result.trace
+        result.trace()
     );
 }
 

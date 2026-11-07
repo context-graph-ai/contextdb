@@ -45,7 +45,9 @@ async fn a_fully_delivered_fetch_releases_its_protection_tag() {
     let endpoint = within(IrohServer::bind(&bind_spec(&holder_key)))
         .await
         .expect("bind holder");
-    holder.serve_on(&endpoint);
+    holder
+        .serve_on(&endpoint)
+        .expect("serve blob store fixture");
     let ticket = endpoint.ticket();
 
     let consumer_db = Arc::new(Database::open_memory());

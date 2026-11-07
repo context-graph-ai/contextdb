@@ -7,6 +7,8 @@
 //! lands after a schema-only outbound snapshot. Every public bookmark must
 //! describe only history delivered to the current store.
 
+use super::retained_query_rows::RetainedRows;
+
 use contextdb_core::{TenantId, Value};
 use contextdb_engine::sync_types::{SchemaSyncCapability, SchemaSyncHoldback};
 use contextdb_engine::{Database, QueryResult};
@@ -81,10 +83,10 @@ fn insert_partitioned(db: &Database, id: Uuid, scope_id: Uuid) {
 
 fn one_column_uuids(result: QueryResult) -> Vec<Uuid> {
     result
-        .rows
-        .into_iter()
-        .map(|row| match row.into_iter().next() {
-            Some(Value::Uuid(value)) => value,
+        .rows()
+        .iter()
+        .map(|row| match row.iter().next() {
+            Some(Value::Uuid(value)) => *value,
             value => panic!("expected one UUID value, got {value:?}"),
         })
         .collect()
@@ -136,7 +138,8 @@ async fn start_server(
             TenantId::from(tenant),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -199,7 +202,8 @@ async fn a_held_tables_authoritative_purge_reaches_the_old_copy_after_upgrade() 
         broker.client_as(&receiver_node),
         TenantId::from(PURGE_TENANT),
         receiver_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     running
         .server
         .set_peer_vector_schema_support_for_test(&receiver_node, false);
@@ -228,7 +232,7 @@ async fn a_held_tables_authoritative_purge_reaches_the_old_copy_after_upgrade() 
             &params([("id", Value::Uuid(erased_id))]),
         )
         .expect("authoritatively erase the row on the source");
-    assert_eq!(purge.rows_affected, 1);
+    assert_eq!(purge.rows_affected(), 1);
     client
         .pull_default()
         .await
@@ -304,7 +308,8 @@ async fn a_rebuilt_edge_with_the_same_identity_receives_compatible_history_from_
         broker.client_as(&receiver_node),
         TenantId::from(REBUILT_EDGE_TENANT),
         receiver_identity.clone(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     running
         .server
         .set_peer_vector_schema_support_for_test(&receiver_node, false);
@@ -334,7 +339,8 @@ async fn a_rebuilt_edge_with_the_same_identity_receives_compatible_history_from_
         broker.client_as(&receiver_node),
         TenantId::from(REBUILT_EDGE_TENANT),
         receiver_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     running
         .server
         .set_peer_vector_schema_support_for_test(&receiver_node, false);
@@ -381,7 +387,8 @@ async fn a_rebuilt_hub_with_the_same_identity_receives_compatible_history_from_z
         broker.client_as(&edge_node),
         TenantId::from(REBUILT_HUB_TENANT),
         edge_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client.set_peer_vector_schema_support_for_test(false);
     client
         .push()
@@ -444,7 +451,8 @@ async fn a_row_committed_during_schema_only_push_remains_pending_for_the_next_pu
             broker.client_as(&edge_node),
             TenantId::from(SCHEMA_RACE_TENANT),
             edge_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
 
     let socket_root = tempfile::Builder::new()
@@ -503,10 +511,10 @@ async fn a_row_committed_during_schema_only_push_remains_pending_for_the_next_pu
 // ---------------------------------------------------------------------------
 // Synced vector policy applies on the receiver.
 //
-// Vector build policy is schema: a `SET HNSW (...)` or `SET AUTO_INDEX_AT`
+// Vector build policy is schema: a `SET IVF DEFAULT` or `SET AUTO_INDEX_AT`
 // declared once on the hub must govern every node that can read the clause.
 // The receiver's existing-column merge must carry `auto_index_at`, every
-// HNSW member, and the desired `vector_policy_revision`, not only
+// IVF member, and the desired `vector_policy_revision`, not only
 // `partition_key_columns`, `max_partitions`, and `search_mode`: leg 4 checks
 // the declared values replicate, leg 5 that a revision advance is scheduled,
 // and leg 6 that the edge serves the new crossover threshold.
@@ -514,14 +522,14 @@ async fn a_row_committed_during_schema_only_push_remains_pending_for_the_next_pu
 
 fn column_index(result: &QueryResult, name: &str) -> usize {
     result
-        .columns
+        .columns()
         .iter()
         .position(|candidate| candidate == name)
-        .unwrap_or_else(|| panic!("column {name} not found: {:?}", result.columns))
+        .unwrap_or_else(|| panic!("column {name} not found: {:?}", result.columns()))
 }
 
 fn value_at<'a>(result: &'a QueryResult, row: usize, name: &str) -> &'a Value {
-    &result.rows[row][column_index(result, name)]
+    &result.rows()[row][column_index(result, name)]
 }
 
 fn int_or_null_at(result: &QueryResult, row: usize, name: &str) -> Option<i64> {
@@ -548,7 +556,7 @@ fn index_row_for(result: &QueryResult, table: &str, column: &str) -> usize {
     let table_col = column_index(result, "table");
     let column_col = column_index(result, "column");
     result
-        .rows
+        .rows()
         .iter()
         .position(|values| {
             values[table_col] == Value::Text(table.to_owned())
@@ -613,7 +621,8 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
         broker.client_as(&edge_node),
         TenantId::from(POLICY_SYNC_TENANT),
         edge_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client.pull_default().await.expect(
         "both peers run at PROTOCOL_VERSION: the vector policy vocabulary is not held back",
     );
@@ -627,11 +636,11 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
     let baseline = show_vector_indexes(&edge);
     let baseline_row = index_row_for(&baseline, "docs", "embedding");
     assert_eq!(
-        int_or_null_at(&baseline, baseline_row, "declared_hnsw_m"),
+        int_or_null_at(&baseline, baseline_row, "declared_lists"),
         None
     );
     assert_eq!(
-        int_or_null_at(&baseline, baseline_row, "declared_hnsw_ef_construction"),
+        int_or_null_at(&baseline, baseline_row, "declared_probes"),
         None
     );
     assert_eq!(
@@ -647,12 +656,12 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
     )
     .expect("desired_policy_revision is always populated");
 
-    // Leg 3 -- hub declares HNSW and AUTO_INDEX_AT.
+    // Leg 3 -- hub declares IVF and AUTO_INDEX_AT.
     hub.execute(
-        "ALTER TABLE docs ALTER COLUMN embedding SET HNSW (M = 24, EF_CONSTRUCTION = 400, EF_SEARCH = 128)",
+        "ALTER TABLE docs ALTER COLUMN embedding SET IVF (LISTS = 24, PROBES = 128)",
         &empty(),
     )
-    .expect("declare HNSW policy on the hub");
+    .expect("declare IVF policy on the hub");
     hub.execute(
         "ALTER TABLE docs ALTER COLUMN embedding SET AUTO_INDEX_AT 2500",
         &empty(),
@@ -673,9 +682,8 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
     let edge_indexes = show_vector_indexes(&edge);
     let edge_row = index_row_for(&edge_indexes, "docs", "embedding");
     for field in [
-        "declared_hnsw_m",
-        "declared_hnsw_ef_construction",
-        "declared_hnsw_ef_search",
+        "declared_lists",
+        "declared_probes",
         "declared_auto_index_at",
     ] {
         assert_eq!(
@@ -685,14 +693,14 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
         );
     }
     assert_eq!(
-        int_or_null_at(&edge_indexes, edge_row, "declared_hnsw_m"),
+        int_or_null_at(&edge_indexes, edge_row, "declared_lists"),
         Some(24)
     );
 
     // Leg 5 -- a replacement build is scheduled: the edge's desired revision
     // strictly advances past the baseline and past its own serving revision.
     let after_partitions = show_vector_partitions(&edge, "docs", "embedding");
-    for row in 0..after_partitions.rows.len() {
+    for row in 0..after_partitions.rows().len() {
         let desired = int_or_null_at(&after_partitions, row, "desired_policy_revision")
             .expect("desired_policy_revision is always populated");
         assert!(
@@ -738,45 +746,45 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
         "the effective crossover must be sourced from the declaration, not the compatibility profile: {disclosure:?}"
     );
 
-    // Leg 7 -- EF_SEARCH-only does not schedule a rebuild.
-    let revision_after_hnsw = int_or_null_at(
+    // Leg 7 -- PROBES-only does not schedule a rebuild.
+    let revision_after_ivf = int_or_null_at(
         &show_vector_partitions(&edge, "docs", "embedding"),
         0,
         "desired_policy_revision",
     )
     .expect("desired_policy_revision is always populated");
     hub.execute(
-        "ALTER TABLE docs ALTER COLUMN embedding SET HNSW (EF_SEARCH = 200)",
+        "ALTER TABLE docs ALTER COLUMN embedding SET IVF (LISTS = 24, PROBES = 200)",
         &empty(),
     )
-    .expect("declare an EF_SEARCH-only change on the hub");
+    .expect("declare a PROBES-only change on the hub");
     client
         .pull_default()
         .await
-        .expect("the edge pulls the EF_SEARCH-only ALTER");
-    let ef_search_indexes = show_vector_indexes(&edge);
-    let ef_search_row = index_row_for(&ef_search_indexes, "docs", "embedding");
+        .expect("the edge pulls the PROBES-only ALTER");
+    let probes_indexes = show_vector_indexes(&edge);
+    let probes_row = index_row_for(&probes_indexes, "docs", "embedding");
     assert_eq!(
-        int_or_null_at(&ef_search_indexes, ef_search_row, "declared_hnsw_ef_search"),
+        int_or_null_at(&probes_indexes, probes_row, "declared_probes"),
         Some(200)
     );
-    let revision_after_ef_search = int_or_null_at(
+    let revision_after_probes = int_or_null_at(
         &show_vector_partitions(&edge, "docs", "embedding"),
         0,
         "desired_policy_revision",
     )
     .expect("desired_policy_revision is always populated");
     assert_eq!(
-        revision_after_ef_search, revision_after_hnsw,
-        "an EF_SEARCH-only change must not advance the desired policy revision"
+        revision_after_probes, revision_after_ivf,
+        "a PROBES-only change must not advance the desired policy revision"
     );
 
     // Leg 8 -- clearing replicates.
     hub.execute(
-        "ALTER TABLE docs ALTER COLUMN embedding SET HNSW DEFAULT",
+        "ALTER TABLE docs ALTER COLUMN embedding SET IVF DEFAULT",
         &empty(),
     )
-    .expect("clear the HNSW declaration on the hub");
+    .expect("clear the IVF declaration on the hub");
     hub.execute(
         "ALTER TABLE docs ALTER COLUMN embedding SET AUTO_INDEX_AT DEFAULT",
         &empty(),
@@ -789,9 +797,8 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
     let cleared_indexes = show_vector_indexes(&edge);
     let cleared_row = index_row_for(&cleared_indexes, "docs", "embedding");
     for field in [
-        "declared_hnsw_m",
-        "declared_hnsw_ef_construction",
-        "declared_hnsw_ef_search",
+        "declared_lists",
+        "declared_probes",
         "declared_auto_index_at",
     ] {
         assert_eq!(
@@ -807,8 +814,8 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
     )
     .expect("desired_policy_revision is always populated");
     assert!(
-        revision_after_clear > revision_after_ef_search,
-        "clearing M and EF_CONSTRUCTION must advance the desired policy revision again"
+        revision_after_clear > revision_after_probes,
+        "clearing LISTS must advance the desired policy revision again"
     );
 
     // Leg 9 -- rows keep flowing: an ordinary insert after every ALTER reaches the edge.
@@ -831,7 +838,7 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
     assert_eq!(
         edge.execute("SELECT id FROM docs", &empty())
             .expect("the edge can read its rows")
-            .rows
+            .rows()
             .len(),
         3,
         "the row inserted after every ALTER must reach the edge"
@@ -839,4 +846,162 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
 
     running.stop().await;
     edge.close().expect("close policy-sync edge");
+}
+
+// Graph row ownership uses the existing authenticated purge/restore journey.
+// Two same-triad rows must reconstruct two local bindings; sending their
+// adjacency again as standalone EdgeChange would leave an erased artifact.
+#[tokio::test]
+async fn sibling_edge_rows_survive_replication_retry_erasure_and_a_wiped_receiver() {
+    const TENANT: &str = "edge-row-ownership";
+    let root = tempfile::TempDir::new().unwrap();
+    let source = Arc::new(Database::open(root.path().join("edge-source.db")).unwrap());
+    let receiver_path = root.path().join("edge-receiver.db");
+    let receiver = Arc::new(Database::open(&receiver_path).unwrap());
+    source.execute(
+        "CREATE TABLE edge_rows (id UUID PRIMARY KEY, source_id UUID NOT NULL, target_id UUID NOT NULL, edge_type TEXT NOT NULL, context_id UUID NOT NULL, valid_from TXID NOT NULL, valid_to TXID, properties JSON, subtype_key TEXT NOT NULL, UNIQUE(source_id,target_id,edge_type,subtype_key)) SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
+        &empty()).unwrap();
+    let (start, target, context) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+    for (id, subtype) in [(first, "first"), (second, "second")] {
+        source.execute(
+            "INSERT INTO edge_rows (id,source_id,target_id,edge_type,context_id,valid_from,subtype_key) VALUES ($id,$source,$target,'RELATES_TO',$context,$from,$subtype)",
+            &params([("id",Value::Uuid(id)),("source",Value::Uuid(start)),("target",Value::Uuid(target)),
+                ("context",Value::Uuid(context)),("from",Value::TxId(contextdb_core::TxId(1))),("subtype",Value::Text(subtype.into()))])).unwrap();
+    }
+    let traverse = |db: &Database| -> RetainedRows {
+        db.execute(
+        "SELECT t FROM GRAPH_TABLE(edge_rows MATCH (a)-[:RELATES_TO]->(b) WHERE a.id=$start COLUMNS(b.id AS t))",
+        &params([("start",Value::Uuid(start))])).unwrap().into()
+    };
+    let row_ids = |db: &Database| -> RetainedRows {
+        db.execute("SELECT id FROM edge_rows ORDER BY id", &empty())
+            .unwrap()
+            .into()
+    };
+    let initial_outbound = source.changes_since(contextdb_core::Lsn(0)).unwrap();
+    assert!(
+        initial_outbound.edges.is_empty(),
+        "row-owned edges have no independent transport lane"
+    );
+    let broker = InProcessBroker::new();
+    let running = start_server(
+        &broker,
+        TENANT,
+        source.clone(),
+        Arc::new(FabricIdentity::generate()),
+    )
+    .await;
+    let identity = Arc::new(FabricIdentity::generate());
+    let node = identity.node_id();
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        receiver.clone(),
+        broker.client_as(&node),
+        TenantId::from(TENANT),
+        identity.clone(),
+    )
+    .unwrap();
+    client.pull_default().await.unwrap();
+    assert_eq!(traverse(&receiver), vec![vec![Value::Uuid(target)]; 2]);
+    let before_retry = row_ids(&receiver);
+    client.pull_default().await.unwrap();
+    assert_eq!(row_ids(&receiver), before_retry);
+    assert_eq!(traverse(&receiver), vec![vec![Value::Uuid(target)]; 2]);
+    let stale_peer = Arc::new(Database::open(root.path().join("stale-edge-receiver.db")).unwrap());
+    let stale_identity = Arc::new(FabricIdentity::generate());
+    let stale_node = stale_identity.node_id();
+    let stale_client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        stale_peer.clone(),
+        broker.client_as(&stale_node),
+        TenantId::from(TENANT),
+        stale_identity,
+    )
+    .unwrap();
+    stale_client.pull_default().await.unwrap();
+    assert_eq!(row_ids(&stale_peer), before_retry);
+    source
+        .execute(
+            "PURGE FROM edge_rows WHERE id=$id",
+            &params([("id", Value::Uuid(second))]),
+        )
+        .unwrap();
+    client.pull_default().await.unwrap();
+    assert_eq!(row_ids(&receiver), vec![vec![Value::Uuid(first)]]);
+    assert_eq!(traverse(&receiver), vec![vec![Value::Uuid(target)]]);
+    client.pull_default().await.unwrap();
+    assert_eq!(row_ids(&receiver), vec![vec![Value::Uuid(first)]]);
+    assert_eq!(traverse(&receiver), vec![vec![Value::Uuid(target)]]);
+    assert_eq!(
+        row_ids(&stale_peer),
+        before_retry,
+        "the disconnected peer still holds the erased root before reconnecting"
+    );
+    assert_eq!(
+        stale_peer
+            .execute(
+                "UPDATE edge_rows SET subtype_key=$subtype WHERE id=$id",
+                &params([
+                    ("id", Value::Uuid(second)),
+                    ("subtype", Value::Text("stale-edit".into()))
+                ]),
+            )
+            .unwrap()
+            .rows_affected(),
+        1
+    );
+    assert!(
+        stale_peer
+            .changes_since(contextdb_core::Lsn(0))
+            .unwrap()
+            .rows
+            .iter()
+            .any(|row| row.values.get("id") == Some(&Value::Uuid(second))
+                && row.values.get("subtype_key") == Some(&Value::Text("stale-edit".into())))
+    );
+    stale_client
+        .push()
+        .await
+        .expect("authenticated reconnect handles the old erased lineage");
+    assert_eq!(
+        row_ids(&source),
+        vec![vec![Value::Uuid(first)]],
+        "stale lineage cannot recreate its source row"
+    );
+    stale_client
+        .pull_default()
+        .await
+        .expect("pull delivers authoritative erasure to the stale peer");
+    assert_eq!(
+        row_ids(&stale_peer),
+        vec![vec![Value::Uuid(first)]],
+        "the stale peer erases the old lineage on reconnect"
+    );
+    assert_eq!(traverse(&stale_peer), vec![vec![Value::Uuid(target)]]);
+    client.pull_default().await.unwrap();
+    assert_eq!(
+        row_ids(&receiver),
+        vec![vec![Value::Uuid(first)]],
+        "stale lineage cannot recreate an erased receiver owner"
+    );
+    assert_eq!(traverse(&receiver), vec![vec![Value::Uuid(target)]]);
+    drop(stale_client);
+    stale_peer.close().unwrap();
+    drop(stale_peer);
+    drop(client);
+    receiver.close().unwrap();
+    drop(receiver);
+    let rebuilt = Arc::new(Database::open(root.path().join("rebuilt-edge-receiver.db")).unwrap());
+    let rebuilt_client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        rebuilt.clone(),
+        broker.client_as(&node),
+        TenantId::from(TENANT),
+        identity,
+    )
+    .unwrap();
+    rebuilt_client.pull_default().await.unwrap();
+    assert_eq!(row_ids(&rebuilt), vec![vec![Value::Uuid(first)]]);
+    assert_eq!(traverse(&rebuilt), vec![vec![Value::Uuid(target)]]);
+    rebuilt_client.pull_default().await.unwrap();
+    assert_eq!(traverse(&rebuilt), vec![vec![Value::Uuid(target)]]);
+    running.stop().await;
 }

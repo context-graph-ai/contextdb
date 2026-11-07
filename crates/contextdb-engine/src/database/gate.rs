@@ -1,4 +1,126 @@
+use super::graph_read_memory::*;
 use super::*;
+
+/// Cached identities retain their actual controls independently of source
+/// windows and of the reader that originally built the cache entry.
+pub(super) struct AdmittedAclIds {
+    ids: HashSet<uuid::Uuid>,
+    memory: contextdb_core::read_memory::ReadCredit,
+    map_bytes: usize,
+}
+impl AdmittedAclIds {
+    fn workspace(read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Self {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        Self {
+            ids: HashSet::new(),
+            memory: contextdb_core::read_memory::ReadCredit::new(read_memory),
+            map_bytes: 0,
+        }
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn new(read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<Self> {
+        Ok(Self::workspace(read_memory))
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn into_shared(mut self) -> Result<contextdb_core::read_memory::ReadShared<Self>> {
+        use contextdb_core::read_memory::ReadShared;
+        let mut invoice = self.memory.try_split_off(0)?;
+        invoice.try_grow_for(
+            ReadShared::<Self>::layout().size(),
+            "reader",
+            "acl_identities",
+            "Raise MEMORY_LIMIT to retain these ACL identities.",
+        )?;
+        ReadShared::try_from_prepaid_native(self, invoice).map_err(Error::NativeEngineOther)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn insert(&mut self, id: uuid::Uuid) -> Result<bool> {
+        if self.ids.contains(&id) {
+            return Ok(false);
+        }
+        if self.ids.len() == self.ids.capacity() {
+            let wanted = self.ids.capacity().max(1).saturating_mul(2);
+            let bytes = held::map::<uuid::Uuid, ()>(wanted);
+            self.memory.try_grow_for(
+                bytes,
+                "reader",
+                "acl_identities",
+                "Raise MEMORY_LIMIT to retain these ACL identities.",
+            )?;
+            let mut replacement = HashSet::with_capacity(wanted);
+            replacement.extend(self.ids.iter().copied());
+            self.ids = replacement;
+            self.memory.try_shrink(self.map_bytes)?;
+            self.map_bytes = bytes;
+        }
+        Ok(self.ids.insert(id))
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn copy(
+        &self,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<Self> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+        let mut copy = Self {
+            ids: HashSet::new(),
+            memory: contextdb_core::read_memory::ReadCredit::from_prepaid_owned(read_memory, 0),
+            map_bytes: 0,
+        };
+        if !self.ids.is_empty() {
+            let bytes = held::map::<uuid::Uuid, ()>(self.ids.len());
+            copy.memory.try_grow_for(
+                bytes,
+                "reader",
+                "acl_identities",
+                "Raise MEMORY_LIMIT to retain these ACL identities.",
+            )?;
+            copy.ids = HashSet::with_capacity(self.ids.len());
+            copy.ids.extend(self.ids.iter().copied());
+            copy.map_bytes = bytes;
+        }
+        Ok(copy)
+    }
+    fn remove(&mut self, id: &uuid::Uuid) {
+        self.ids.remove(id);
+    }
+}
+impl std::ops::Deref for AdmittedAclIds {
+    type Target = HashSet<uuid::Uuid>;
+    fn deref(&self) -> &Self::Target {
+        &self.ids
+    }
+}
+
+pub(super) struct AdmittedAclGrantCache {
+    entries: HashMap<AclGrantCacheKey, AdmittedAclGrantCacheEntry>,
+    map_memory: Option<contextdb_core::read_memory::ReadCredit>,
+}
+struct AdmittedAclGrantCacheEntry {
+    ids: contextdb_core::read_memory::ReadShared<AdmittedAclIds>,
+    _key_memory: contextdb_core::read_memory::ReadCredit,
+}
+impl AdmittedAclGrantCache {
+    pub(super) fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            map_memory: None,
+        }
+    }
+}
 use contextdb_core::read_contract::{OwnerLimitExceededDetail, ReadFailureLimit};
 
 /// How many resolved grant sets the store keeps for reuse. One set is kept
@@ -21,16 +143,7 @@ fn bounded_memory_refusal(bytes: usize) -> Error {
     ))
 }
 
-/// The source a suspended read anchored itself in moved before the read came
-/// back for it, so the continuation no longer describes where it left off.
-fn bounded_continuation_lost(reason: &str) -> Error {
-    Error::ReadFailure(ReadFailure::invalid_continuation(reason.to_string()))
-}
-
-type CountedGraphNeighbor = (NodeId, EdgeType, NodeId, NodeId);
 pub(crate) type CountedGraphScanEdge = (NodeId, NodeId);
-type CountedGraphScanCandidate = (GraphScanCandidate, EdgeType, CountedGraphScanEdge);
-type GraphEdgeKey = (NodeId, EdgeType, NodeId);
 
 #[derive(Clone, Copy)]
 struct GraphScanCandidate {
@@ -61,8 +174,8 @@ enum BoundedGraphScanPhase {
 /// so a suspended position must re-locate itself by identity on the next pull
 /// rather than silently skip entries the pinned snapshot is entitled to see.
 pub(crate) struct BoundedGraphEdgeCursor {
-    forward: Vec<(NodeId, usize)>,
-    reverse: Vec<(NodeId, usize)>,
+    forward: Vec<NodeId>,
+    reverse: Vec<NodeId>,
     phase: BoundedGraphScanPhase,
     /// Which orientations this scan was asked for, kept so the staged phases
     /// answer the same direction question the committed ones did.
@@ -74,9 +187,24 @@ pub(crate) struct BoundedGraphEdgeCursor {
     key_position: usize,
     edge_position: usize,
     last_inspected: Option<BoundedGraphEdgeAnchor>,
-    last_emitted: Option<BoundedGraphEdgeAnchor>,
+    source_end: Option<BoundedGraphEdgeAnchor>,
     snapshot: SnapshotId,
     retained_bytes: usize,
+    /// A durable writer's committed edges, read from the root this read
+    /// captured. Present instead of the resident key lists above.
+    durable: Option<DurableGraphEdgeScan>,
+}
+
+/// The committed-edge source of an unpinned bounded read over a durable
+/// writer. The root is immutable, so the continuation is the physical key of
+/// the last entry fully consumed; a live cursor is kept between pulls and is
+/// reopened after that key whenever a pull failed part way through an entry.
+struct DurableGraphEdgeScan {
+    row_lane: bool,
+    root: crate::persistence::graph_read::EngineGraphReadRoot,
+    cursor: Option<crate::persistence::graph_read::GraphReadCursor>,
+    last_key: Vec<u8>,
+    has_last_key: bool,
 }
 
 /// The first staged phase this direction has anything to walk in.
@@ -101,6 +229,7 @@ impl BoundedGraphEdgeCursor {
 /// transaction, LSN) so relocation after a physical compaction resumes at
 /// exactly the entry the cursor last consumed.
 struct BoundedGraphEdgeAnchor {
+    row_owner: Option<contextdb_tx::RowEdgeOwner>,
     source: NodeId,
     target: NodeId,
     edge_type: EdgeType,
@@ -109,12 +238,18 @@ struct BoundedGraphEdgeAnchor {
 }
 
 impl BoundedGraphEdgeAnchor {
-    fn matches(&self, entry: &AdjEntry) -> bool {
-        self.source == entry.source
-            && self.target == entry.target
-            && self.created_tx == entry.created_tx
-            && self.lsn == entry.lsn
-            && self.edge_type == entry.edge_type
+    fn compare(
+        &self,
+        entry: &contextdb_graph::GraphAdjEntry,
+        incoming: bool,
+    ) -> std::cmp::Ordering {
+        let left = if incoming { self.source } else { self.target };
+        let right = if incoming { entry.source } else { entry.target };
+        left.cmp(&right)
+            .then_with(|| self.edge_type.cmp(&entry.edge_type))
+            .then_with(|| self.row_owner.cmp(&entry.row_owner))
+            .then_with(|| self.created_tx.cmp(&entry.created_tx))
+            .then_with(|| self.lsn.cmp(&entry.lsn))
     }
 }
 
@@ -123,6 +258,7 @@ impl BoundedGraphEdgeAnchor {
 /// from a position, so it travels as one thing.
 #[derive(Clone, Copy)]
 struct BoundedEdgeIdentity<'a> {
+    row_owner: Option<&'a contextdb_tx::RowEdgeOwner>,
     source: NodeId,
     target: NodeId,
     edge_type: &'a str,
@@ -141,22 +277,23 @@ fn retain_bounded_edge_anchor<E>(
 where
     E: From<Error>,
 {
-    let BoundedEdgeIdentity {
-        source,
-        target,
-        edge_type,
-        created_tx,
-        lsn,
-    } = identity;
-    let planned = edge_type.len();
+    let planned = identity
+        .edge_type
+        .len()
+        .saturating_add(identity.row_owner.map_or(0, |o| o.table.len()));
     before_retain(planned)?;
-    let mut owned = String::new();
-    if owned.try_reserve_exact(planned).is_err() {
+    let mut edge_type = String::new();
+    let mut owner_table = String::new();
+    let owner_len = identity.row_owner.map_or(0, |o| o.table.len());
+    if edge_type
+        .try_reserve_exact(identity.edge_type.len())
+        .is_err()
+        || owner_table.try_reserve_exact(owner_len).is_err()
+    {
         release_retained(planned)?;
         return Err(E::from(bounded_memory_refusal(planned)));
     }
-    owned.push_str(edge_type);
-    let actual = owned.capacity();
+    let actual = edge_type.capacity().saturating_add(owner_table.capacity());
     if actual > planned {
         if let Err(error) = before_retain(actual - planned) {
             release_retained(planned)?;
@@ -165,13 +302,25 @@ where
     } else if planned > actual {
         release_retained(planned - actual)?;
     }
+    edge_type.push_str(identity.edge_type);
+    let row_owner = identity.row_owner.map(|o| {
+        owner_table.push_str(&o.table);
+        contextdb_tx::RowEdgeOwner {
+            table: owner_table,
+            table_generation: o.table_generation,
+            row_id: o.row_id,
+            created_tx: o.created_tx,
+            lsn: o.lsn,
+        }
+    });
     Ok((
         BoundedGraphEdgeAnchor {
-            source,
-            target,
-            edge_type: owned,
-            created_tx,
-            lsn,
+            source: identity.source,
+            target: identity.target,
+            edge_type,
+            created_tx: identity.created_tx,
+            lsn: identity.lsn,
+            row_owner,
         },
         actual,
     ))
@@ -188,10 +337,13 @@ where
     E: From<Error>,
 {
     if let Some(anchor) = slot.take() {
-        let bytes = anchor.edge_type.capacity();
+        let bytes = anchor
+            .edge_type
+            .capacity()
+            .saturating_add(anchor.row_owner.as_ref().map_or(0, |o| o.table.capacity()));
         *retained_bytes = retained_bytes.checked_sub(bytes).ok_or_else(|| {
             E::from(Error::Other(
-                "bounded graph edge anchor accounting underflow".to_string(),
+                ("bounded graph edge anchor accounting underflow".to_string()).into(),
             ))
         })?;
         if bytes > 0 {
@@ -216,73 +368,20 @@ fn set_bounded_edge_anchor<E>(
 where
     E: From<Error>,
 {
-    let BoundedEdgeIdentity {
-        source,
-        target,
-        edge_type,
-        created_tx,
-        lsn,
-    } = identity;
-    let Some(anchor) = slot.as_mut() else {
-        let (anchor, bytes) =
-            retain_bounded_edge_anchor(identity, before_retain, &mut *release_retained)?;
-        // The bytes are already charged by the retain above, so a total that
-        // cannot be represented must hand them back on its way out -- exactly
-        // as a refused top-up does. Unreachable short of `usize::MAX` retained
-        // bytes; the class stays uniform so no charge ever escapes.
-        let Some(total) = retained_bytes.checked_add(bytes) else {
-            if bytes > 0 {
-                release_retained(bytes)?;
-            }
-            return Err(E::from(Error::Other(
-                "bounded graph edge anchor accounting overflow".to_string(),
-            )));
-        };
-        *slot = Some(anchor);
-        *retained_bytes = total;
-        return Ok(());
-    };
-    let held = anchor.edge_type.capacity();
-    if edge_type.len() > held {
-        let growth = edge_type.len() - held;
-        before_retain(growth)?;
-        if anchor.edge_type.try_reserve_exact(edge_type.len()).is_err() {
-            release_retained(growth)?;
-            return Err(E::from(bounded_memory_refusal(growth)));
-        }
-        let actual = anchor.edge_type.capacity();
-        let taken = actual.checked_sub(held).ok_or_else(|| {
-            E::from(Error::Other(
-                "bounded graph edge anchor capacity moved backwards".to_string(),
-            ))
-        })?;
-        if taken > growth {
-            if let Err(error) = before_retain(taken - growth) {
-                release_retained(growth)?;
-                return Err(error);
-            }
-        } else if growth > taken {
-            release_retained(growth - taken)?;
-        }
-        // The growth is fully settled and charged by here, so an
-        // unrepresentable total releases what this step took before it
-        // propagates.
-        let Some(total) = retained_bytes.checked_add(taken) else {
-            if taken > 0 {
-                release_retained(taken)?;
-            }
-            return Err(E::from(Error::Other(
-                "bounded graph edge anchor accounting overflow".to_string(),
-            )));
-        };
-        *retained_bytes = total;
+    let (next, bytes) =
+        retain_bounded_edge_anchor(identity, &mut *before_retain, &mut *release_retained)?;
+    if let Err(error) = release_bounded_edge_anchor(slot, retained_bytes, &mut *release_retained) {
+        release_retained(bytes)?;
+        return Err(error);
     }
-    anchor.edge_type.clear();
-    anchor.edge_type.push_str(edge_type);
-    anchor.source = source;
-    anchor.target = target;
-    anchor.created_tx = created_tx;
-    anchor.lsn = lsn;
+    let Some(total) = retained_bytes.checked_add(bytes) else {
+        release_retained(bytes)?;
+        return Err(E::from(Error::Other(
+            "bounded graph anchor accounting overflow".into(),
+        )));
+    };
+    *slot = Some(next);
+    *retained_bytes = total;
     Ok(())
 }
 
@@ -306,54 +405,76 @@ where
     )
 }
 
-/// Record that the entry named by the inspected anchor was emitted to the
-/// caller. The emitted anchor names an edge visible at the continuation's
-/// registered snapshot — never physically removed by maintenance — so
-/// relocation always has a surviving resume point strictly after the last
-/// edge the caller consumed.
-fn note_bounded_edge_emitted<E>(
-    cursor: &mut BoundedGraphEdgeCursor,
-    mut before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
-    mut release_retained: impl FnMut(usize) -> std::result::Result<(), E>,
-) -> std::result::Result<(), E>
-where
-    E: From<Error>,
-{
-    let inspected = cursor.last_inspected.take().ok_or_else(|| {
-        E::from(Error::Other(
-            "bounded graph edge continuation lost its inspected anchor".to_string(),
-        ))
-    })?;
-    let copied = set_bounded_edge_anchor(
-        &mut cursor.last_emitted,
-        &mut cursor.retained_bytes,
-        BoundedEdgeIdentity {
-            source: inspected.source,
-            target: inspected.target,
-            edge_type: &inspected.edge_type,
-            created_tx: inspected.created_tx,
-            lsn: inspected.lsn,
-        },
-        &mut before_retain,
-        &mut release_retained,
-    );
-    cursor.last_inspected = Some(inspected);
-    copied
-}
-
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn bounded_graph_cursor_bytes(forward_capacity: usize, reverse_capacity: usize) -> Result<usize> {
     forward_capacity
         .checked_add(reverse_capacity)
-        .and_then(|capacity| capacity.checked_mul(std::mem::size_of::<(NodeId, usize)>()))
+        .and_then(|capacity| capacity.checked_mul(std::mem::size_of::<NodeId>()))
         .ok_or_else(|| {
             Error::Other(
-                "bounded graph edge-source memory size exceeds the native address space"
-                    .to_string(),
+                ("bounded graph edge-source memory size exceeds the native address space"
+                    .to_string())
+                .into(),
             )
         })
 }
 
 impl Database {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn admitted_acl_cache_key(
+        &self,
+        principal: &Principal,
+        acl_ref: &AclRef,
+        snapshot: SnapshotId,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<(AclGrantCacheKey, contextdb_core::read_memory::ReadCredit)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        let principal_bytes = match principal {
+            Principal::System => 0,
+            Principal::Agent(id) | Principal::Human(id) => held::text(id),
+        };
+        let memory = contextdb_core::read_memory::ReadCredit::try_new(
+            read_memory,
+            principal_bytes
+                .saturating_add(held::text(&acl_ref.ref_table))
+                .saturating_add(held::text(&acl_ref.ref_column)),
+            "writer_source",
+            "acl_cache_key",
+            "Raise MEMORY_LIMIT to retain this ACL cache key.",
+        )?;
+        Ok((
+            AclGrantCacheKey {
+                principal: principal.clone(),
+                ref_table: acl_ref.ref_table.clone(),
+                ref_column: acl_ref.ref_column.clone(),
+                snapshot,
+                // Handle-local caches cannot cross database incarnations. The
+                // physical user root binds both rows and their durable schema;
+                // the tag keeps authenticated retained images distinct from
+                // writer publications even when their physical headers agree.
+                source: if let Some(source) = &self.retained_relational_source {
+                    Some((true, source.storage_identity()))
+                } else {
+                    let root = self.writer_read_root()?;
+                    if let Some(root) = &root {
+                        // Erasure masks can invalidate old capabilities without
+                        // changing the physical root header. A warm cache must
+                        // pass the same reject-only source boundary.
+                        root.check_table_scope(&acl_ref.ref_table)?;
+                    }
+                    root.map(|root| (false, root.storage_identity()))
+                },
+            },
+            memory,
+        ))
+    }
     pub(super) fn access_is_admin(&self) -> bool {
         self.access.contexts.is_none()
             && self.access.scope_labels.is_none()
@@ -393,6 +514,10 @@ impl Database {
         context_gate || scope_gate || acl_gate
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn table_has_read_gate(&self, table: &str) -> Result<bool> {
         let Some(meta) = self.table_meta(table) else {
             return Err(Error::TableNotFound(table.to_string()));
@@ -400,6 +525,10 @@ impl Database {
         Ok(self.meta_has_read_gate(&meta))
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn assert_table_read_allowed(&self, table: &str) -> Result<()> {
         if self.access_is_admin() {
             return Ok(());
@@ -420,6 +549,10 @@ impl Database {
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn complete_insert_access_values(
         &self,
         table: &str,
@@ -448,29 +581,141 @@ impl Database {
         })
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn read_allowed_for_row(
         &self,
         table: &str,
         meta: &TableMeta,
         row: &VersionedRow,
         snapshot: SnapshotId,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
-        self.read_allowed_for_row_cached_in_tx(None, table, meta, row, snapshot, None)
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        self.read_allowed_for_row_cached_in_tx(
+            None,
+            table,
+            meta,
+            row,
+            snapshot,
+            None,
+            read_memory.clone(),
+        )
     }
 
     /// Borrow resident access metadata; no row/vector body or hidden candidate
     /// set is copied. An indexed Context constraint probes only the requested
     /// Context postings, irrespective of the hidden population.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn visit_authorized_row_metadata(
         &self,
         table: &str,
         snapshot: SnapshotId,
         mut visit: impl FnMut(&VersionedRow) -> Result<()>,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.assert_table_read_allowed(table)?;
         let meta = self
             .table_meta(table)
             .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
+        if self.visit_writer_rows::<Error>(
+            table,
+            |row| {
+                if row.visible_at(snapshot)
+                    && self.bounded_read_allowed_for_row(
+                        None,
+                        table,
+                        &meta,
+                        row,
+                        snapshot,
+                        &mut |_| Ok::<(), Error>(()),
+                        read_memory.clone(),
+                    )?
+                {
+                    visit(row)?;
+                }
+                Ok(())
+            },
+            read_memory.clone(),
+        )? {
+            return Ok(());
+        }
+        if self.retained_relational_source.is_some() {
+            if let (Some(contexts), Some(column)) =
+                (&self.access.contexts, self.context_column(&meta))
+                && meta
+                    .indexes
+                    .iter()
+                    .any(|index| index.columns.len() == 1 && index.columns[0].0 == column.name)
+            {
+                for context in contexts {
+                    let _rows_scope = self.writer_temporary_output_scope(read_memory.clone())?;
+                    let rows = self.indexed_rows_for_values(
+                        table, std::slice::from_ref(&column.name), &[Value::Uuid(context.0)],
+                        snapshot, read_memory.clone(),
+                    )?.ok_or_else(|| Error::Other((format!("retained access metadata table {table} has no covering context index")).into()))?;
+                    for row in rows {
+                        if self.bounded_read_allowed_for_row(
+                            None,
+                            table,
+                            &meta,
+                            &row,
+                            snapshot,
+                            &mut |_| Ok::<(), Error>(()),
+                            read_memory.clone(),
+                        )? {
+                            visit(&row)?;
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            let mut cursor = self.bounded_physical_table_cursor(table)?;
+            loop {
+                let mut row_memory =
+                    contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+                let Some(row) = self.bounded_physical_table_row_next(
+                    read_memory.clone(),
+                    table,
+                    snapshot,
+                    &mut cursor,
+                    || Ok::<(), Error>(()),
+                    |bytes| {
+                        row_memory.try_grow_for(
+                            bytes,
+                            "reader",
+                            "access_metadata_row",
+                            "Raise the declared read memory limit to inspect access metadata.",
+                        )
+                    },
+                )?
+                else {
+                    break;
+                };
+                if self.bounded_read_allowed_for_row(
+                    None,
+                    table,
+                    &meta,
+                    &row,
+                    snapshot,
+                    &mut |_| Ok::<(), Error>(()),
+                    read_memory.clone(),
+                )? {
+                    visit(&row)?;
+                }
+            }
+            return Ok(());
+        }
         let tables = self.relational_store.tables.read();
         let rows = tables
             .get(table)
@@ -485,6 +730,7 @@ impl Database {
                     row,
                     snapshot,
                     |_| Ok::<(), Error>(()),
+                    read_memory.clone(),
                 )?
             {
                 visit(row)?;
@@ -531,6 +777,10 @@ impl Database {
 
     /// Declarable row restrictions can narrow a vector source, independently
     /// of the SQL predicate. The row gate still verifies every admitted id.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn vector_access_predicate(
         &self,
         table: &str,
@@ -570,11 +820,10 @@ impl Database {
                 negated: false,
             });
         }
-        Ok(terms.into_iter().reduce(|left, right| Expr::BinaryOp {
-            left: Box::new(left),
-            op: BinOp::And,
-            right: Box::new(right),
-        }))
+        Ok(contextdb_parser::parser::balanced_boolean_expr(
+            terms,
+            BinOp::And,
+        ))
     }
 
     /// The reader's own row restrictions on this table, as the values the row
@@ -587,6 +836,10 @@ impl Database {
     /// is deliberately absent: entitlement is a lookup in another table, not a
     /// finite set of column values, and no caller may treat its absence here as
     /// permission.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn vector_access_restrictions(
         &self,
         table: &str,
@@ -617,6 +870,10 @@ impl Database {
         Ok(restrictions)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn bounded_read_requires_candidate_filter(&self, table: &str) -> Result<bool> {
         if self.access_is_admin() {
             return Ok(false);
@@ -636,10 +893,14 @@ impl Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
         before_access_row: impl FnMut(usize) -> std::result::Result<(), E>,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.bounded_read_allowed_for_row_with_tables(
             tx,
             None,
@@ -648,6 +909,7 @@ impl Database {
             row,
             snapshot,
             before_access_row,
+            read_memory.clone(),
         )
     }
 
@@ -670,10 +932,14 @@ impl Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
         before_access_row: impl FnMut(usize) -> std::result::Result<(), E>,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.bounded_read_allowed_for_row_with_tables(
             tx,
             Some(tables),
@@ -682,6 +948,7 @@ impl Database {
             row,
             snapshot,
             before_access_row,
+            read_memory.clone(),
         )
     }
 
@@ -695,10 +962,14 @@ impl Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
         before_access_row: impl FnMut(usize) -> std::result::Result<(), E>,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<Error>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.bounded_read_denial_for_row_with_tables(
             tx,
             None,
@@ -707,6 +978,7 @@ impl Database {
             row,
             snapshot,
             before_access_row,
+            read_memory.clone(),
         )
     }
 
@@ -725,10 +997,14 @@ impl Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
         before_access_row: impl FnMut(usize) -> std::result::Result<(), E>,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<Error>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.bounded_read_denial_for_row_with_tables(
             tx,
             Some(tables),
@@ -737,6 +1013,7 @@ impl Database {
             row,
             snapshot,
             before_access_row,
+            read_memory.clone(),
         )
     }
 
@@ -750,10 +1027,14 @@ impl Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
         before_access_row: impl FnMut(usize) -> std::result::Result<(), E>,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         Ok(self
             .bounded_read_denial_for_row_with_tables(
                 tx,
@@ -763,6 +1044,7 @@ impl Database {
                 row,
                 snapshot,
                 before_access_row,
+                read_memory.clone(),
             )?
             .is_none())
     }
@@ -780,10 +1062,14 @@ impl Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
         mut before_access_row: impl FnMut(usize) -> std::result::Result<(), E>,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<Error>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.access_is_admin() {
             return Ok(None);
         }
@@ -844,10 +1130,13 @@ impl Database {
             return Ok(Some(acl_denied()));
         };
         let acl_ref = column.acl_ref.as_ref().ok_or_else(|| {
-            E::from(Error::Other(format!(
-                "ACL column {}.{} is missing its grant reference",
-                table, column.name
-            )))
+            E::from(Error::Other(
+                (format!(
+                    "ACL column {}.{} is missing its grant reference",
+                    table, column.name
+                ))
+                .into(),
+            ))
         })?;
         // The COMMITTED entitlements, through the one cached build. Nothing
         // below this line ever writes to that cache, which is what keeps a
@@ -859,13 +1148,15 @@ impl Database {
                 acl_ref,
                 snapshot,
                 &mut before_access_row,
+                read_memory.clone(),
             )?,
-            None if self.retained_relational_source.is_some() => self
+            None if self.uses_retained_relational_source() => self
                 .bounded_allowed_acl_ids_in_retained_source(
                     principal,
                     acl_ref,
                     snapshot,
                     &mut before_access_row,
+                    read_memory.clone(),
                 )?,
             None => {
                 let tables = self.relational_store.tables.read();
@@ -875,6 +1166,7 @@ impl Database {
                     acl_ref,
                     snapshot,
                     &mut before_access_row,
+                    read_memory.clone(),
                 )?
             }
         };
@@ -885,6 +1177,7 @@ impl Database {
             snapshot,
             committed,
             &mut before_access_row,
+            read_memory.clone(),
         )?;
         Ok((!allowed.contains(acl_id)).then(acl_denied))
     }
@@ -895,55 +1188,89 @@ impl Database {
         acl_ref: &AclRef,
         snapshot: SnapshotId,
         before_access_row: &mut impl FnMut(usize) -> std::result::Result<(), E>,
-    ) -> std::result::Result<Arc<HashSet<uuid::Uuid>>, E>
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> std::result::Result<contextdb_core::read_memory::ReadShared<AdmittedAclIds>, E>
     where
         E: From<Error>,
     {
-        let cache_key = AclGrantCacheKey {
-            principal: principal.clone(),
-            ref_table: acl_ref.ref_table.clone(),
-            ref_column: acl_ref.ref_column.clone(),
-            snapshot,
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        // Select the writer source once for both cache qualification and the
+        // eventual stream. Retained authenticated sources never rebind here.
+        let root = if self.retained_relational_source.is_none() {
+            self.writer_read_root().map_err(E::from)?
+        } else {
+            None
         };
-        if let Some(cached) = self.acl_grant_cache.read().get(&cache_key).cloned() {
+        let _scope = self.enter_writer_read(root, read_memory.clone());
+        let (cache_key, key_memory) = self
+            .admitted_acl_cache_key(principal, acl_ref, snapshot, read_memory.clone())
+            .map_err(E::from)?;
+        if let Some(cached) = self
+            .acl_grant_cache
+            .read()
+            .entries
+            .get(&cache_key)
+            .map(|entry| entry.ids.clone())
+        {
             return Ok(cached);
         }
         let (kind, principal_id) = match principal {
-            Principal::System => return Ok(Arc::new(HashSet::new())),
+            Principal::System => {
+                return AdmittedAclIds::new(read_memory.clone())
+                    .and_then(AdmittedAclIds::into_shared)
+                    .map_err(E::from);
+            }
             Principal::Agent(id) => ("Agent", id.as_str()),
             Principal::Human(id) => ("Human", id.as_str()),
         };
-        let source = self.retained_relational_source.as_ref().ok_or_else(|| {
-            E::from(Error::Other(
-                "retained ACL scan requested without a retained relational source".to_owned(),
-            ))
-        })?;
         let meta = self
             .table_meta(&acl_ref.ref_table)
             .ok_or_else(|| E::from(Error::TableNotFound(acl_ref.ref_table.clone())))?;
-        let mut allowed = HashSet::new();
-        source.bounded_visit_relational_rows::<E>(
+        let mut allowed = AdmittedAclIds::new(read_memory.clone()).map_err(E::from)?;
+        let mut admit = |grant: &VersionedRow| {
+            if grant.visible_at(snapshot)
+                && self
+                    .grant_row_context_scope_allowed(&acl_ref.ref_table, grant, snapshot)
+                    .map_err(E::from)?
+                && grant.values.get("principal_kind") == Some(&Value::Text(kind.to_string()))
+                && grant.values.get("principal_id") == Some(&Value::Text(principal_id.to_string()))
+                && let Some(Value::Uuid(acl_id)) = grant.values.get(&acl_ref.ref_column)
+            {
+                allowed.insert(*acl_id).map_err(E::from)?;
+            }
+            Ok(())
+        };
+        if let Some(source) = self.retained_relational_source.as_ref() {
+            source.bounded_visit_relational_rows::<E>(
+                &acl_ref.ref_table,
+                &meta,
+                snapshot,
+                |grant| {
+                    before_access_row(grant.estimated_bytes())?;
+                    admit(grant)
+                },
+                read_memory.clone(),
+            )?;
+        } else if !self.visit_writer_rows_phased::<E>(
             &acl_ref.ref_table,
-            &meta,
-            snapshot,
-            |grant| {
-                before_access_row(grant.estimated_bytes())?;
-                if grant.visible_at(snapshot)
-                    && self
-                        .grant_row_context_scope_allowed(&acl_ref.ref_table, grant, snapshot)
-                        .map_err(E::from)?
-                    && grant.values.get("principal_kind") == Some(&Value::Text(kind.to_string()))
-                    && grant.values.get("principal_id")
-                        == Some(&Value::Text(principal_id.to_string()))
-                    && let Some(Value::Uuid(acl_id)) = grant.values.get(&acl_ref.ref_column)
-                {
-                    allowed.insert(*acl_id);
+            |grant| match grant {
+                None => before_access_row(0),
+                Some(grant) => {
+                    before_access_row(grant.estimated_bytes())?;
+                    admit(grant)
                 }
-                Ok(())
             },
-        )?;
-        let allowed = Arc::new(allowed);
-        self.remember_allowed_acl_ids(cache_key, Arc::clone(&allowed));
+            read_memory.clone(),
+        )? {
+            return Err(E::from(Error::Other(
+                ("ACL source requested without a captured relational source".to_owned()).into(),
+            )));
+        }
+        let allowed = allowed.into_shared().map_err(E::from)?;
+        self.remember_allowed_acl_ids(cache_key, key_memory, allowed.clone())
+            .map_err(E::from)?;
         Ok(allowed)
     }
 
@@ -960,25 +1287,35 @@ impl Database {
         acl_ref: &AclRef,
         snapshot: SnapshotId,
         before_access_row: &mut impl FnMut(usize) -> std::result::Result<(), E>,
-    ) -> std::result::Result<Arc<HashSet<uuid::Uuid>>, E>
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> std::result::Result<contextdb_core::read_memory::ReadShared<AdmittedAclIds>, E>
     where
         E: From<Error>,
     {
-        let cache_key = AclGrantCacheKey {
-            principal: principal.clone(),
-            ref_table: acl_ref.ref_table.clone(),
-            ref_column: acl_ref.ref_column.clone(),
-            snapshot,
-        };
-        if let Some(cached) = self.acl_grant_cache.read().get(&cache_key).cloned() {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        let (cache_key, key_memory) = self
+            .admitted_acl_cache_key(principal, acl_ref, snapshot, read_memory.clone())
+            .map_err(E::from)?;
+        if let Some(cached) = self
+            .acl_grant_cache
+            .read()
+            .entries
+            .get(&cache_key)
+            .map(|entry| entry.ids.clone())
+        {
             return Ok(cached);
         }
         let (kind, principal_id) = match principal {
-            Principal::System => return Ok(Arc::new(HashSet::new())),
+            Principal::System => {
+                return AdmittedAclIds::new(read_memory.clone())
+                    .and_then(AdmittedAclIds::into_shared)
+                    .map_err(E::from);
+            }
             Principal::Agent(id) => ("Agent", id.as_str()),
             Principal::Human(id) => ("Human", id.as_str()),
         };
-        let mut allowed = HashSet::new();
+        let mut allowed = AdmittedAclIds::new(read_memory.clone()).map_err(E::from)?;
         if let Some(rows) = tables.get(&acl_ref.ref_table) {
             for grant in rows {
                 before_access_row(grant.estimated_bytes())?;
@@ -991,12 +1328,13 @@ impl Database {
                         == Some(&Value::Text(principal_id.to_string()))
                     && let Some(Value::Uuid(acl_id)) = grant.values.get(&acl_ref.ref_column)
                 {
-                    allowed.insert(*acl_id);
+                    allowed.insert(*acl_id).map_err(E::from)?;
                 }
             }
         }
-        let allowed = Arc::new(allowed);
-        self.remember_allowed_acl_ids(cache_key, Arc::clone(&allowed));
+        let allowed = allowed.into_shared().map_err(E::from)?;
+        self.remember_allowed_acl_ids(cache_key, key_memory, allowed.clone())
+            .map_err(E::from)?;
         Ok(allowed)
     }
 
@@ -1009,18 +1347,26 @@ impl Database {
     /// theirs to see. A transaction that has staged nothing about the grant
     /// table returns that committed set untouched, so the ordinary read
     /// allocates nothing here.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn bounded_acl_ids_with_transaction<E>(
         &self,
         tx: Option<TxId>,
         principal: &Principal,
         acl_ref: &AclRef,
         snapshot: SnapshotId,
-        committed: Arc<HashSet<uuid::Uuid>>,
+        committed: contextdb_core::read_memory::ReadShared<AdmittedAclIds>,
         before_access_row: &mut impl FnMut(usize) -> std::result::Result<(), E>,
-    ) -> std::result::Result<Arc<HashSet<uuid::Uuid>>, E>
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> std::result::Result<contextdb_core::read_memory::ReadShared<AdmittedAclIds>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(tx) = tx else {
             return Ok(committed);
         };
@@ -1030,7 +1376,7 @@ impl Database {
             Principal::Human(id) => ("Human", id.as_str()),
         };
         let overlay = self
-            .transaction_table_overlay(tx, &acl_ref.ref_table)
+            .transaction_table_overlay(tx, &acl_ref.ref_table, read_memory.clone())
             .map_err(E::from)?;
         if overlay.is_empty() {
             return Ok(committed);
@@ -1038,35 +1384,41 @@ impl Database {
         // The grant rows this transaction staged, read one at a time and
         // charged like every other access row, and the committed grants it
         // withdrew, dropped by the identity they were granted under.
-        let mut staged_grants = Vec::new();
-        let mut withdrawn = HashSet::new();
-        for position in &overlay.staged_positions {
-            let measured = self
-                .tx_mgr
-                .with_write_set(tx, |ws| {
-                    ws.relational_inserts
-                        .get(*position)
-                        .map(|(_, row)| row.estimated_bytes())
-                })
-                .map_err(E::from)?;
-            let Some(bytes) = measured else {
-                continue;
-            };
-            before_access_row(bytes)?;
-            let staged = self
-                .tx_mgr
-                .with_write_set(tx, |ws| {
-                    ws.relational_inserts
-                        .get(*position)
-                        .map(|(_, row)| row.clone())
-                })
-                .map_err(E::from)?;
-            if let Some(staged) = staged {
-                staged_grants.push(staged);
-            }
+        let mut withdrawn = AdmittedAclIds::workspace(read_memory.clone());
+        for staged in overlay.staged_rows.iter().flat_map(|rows| rows.rows()) {
+            before_access_row(staged.estimated_bytes())?;
         }
+        let source = self
+            .writer_read_root()
+            .map_err(E::from)?
+            .map(|root| {
+                crate::persistence::writer_adapters::WriterRelationalSource::new_for_read(
+                    root,
+                    read_memory.clone(),
+                )
+            })
+            .transpose()
+            .map_err(E::from)?;
         for row_id in &overlay.deleted {
-            let withdrawn_grant = {
+            before_access_row(0)?;
+            let withdrawn_grant = if let Some(source) = &source {
+                let row = contextdb_relational::source::visible_row(
+                    source,
+                    &acl_ref.ref_table,
+                    *row_id,
+                    snapshot,
+                )
+                .map_err(E::from)?;
+                if let Some(row) = row {
+                    before_access_row(row.value().estimated_bytes())?;
+                    match row.value().values.get(&acl_ref.ref_column) {
+                        Some(Value::Uuid(acl_id)) => Some(*acl_id),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            } else {
                 let tables = self.relational_store.tables.read();
                 tables
                     .get(&acl_ref.ref_table)
@@ -1077,30 +1429,39 @@ impl Database {
                     })
             };
             if let Some(acl_id) = withdrawn_grant {
-                withdrawn.insert(acl_id);
+                withdrawn.insert(acl_id).map_err(E::from)?;
             }
         }
-        if staged_grants.is_empty() && withdrawn.is_empty() {
+        if overlay
+            .staged_rows
+            .as_ref()
+            .is_none_or(|rows| rows.is_empty())
+            && withdrawn.is_empty()
+        {
             return Ok(committed);
         }
-        let mut allowed = committed.as_ref().clone();
-        for acl_id in withdrawn {
-            allowed.remove(&acl_id);
+        let mut allowed = committed.copy(read_memory.clone()).map_err(E::from)?;
+        for acl_id in withdrawn.iter() {
+            allowed.remove(acl_id);
         }
-        for grant in staged_grants {
+        for grant in overlay.staged_rows.iter().flat_map(|rows| rows.rows()) {
             if self
-                .grant_row_context_scope_allowed(&acl_ref.ref_table, &grant, snapshot)
+                .grant_row_context_scope_allowed(&acl_ref.ref_table, grant, snapshot)
                 .map_err(E::from)?
                 && grant.values.get("principal_kind") == Some(&Value::Text(kind.to_string()))
                 && grant.values.get("principal_id") == Some(&Value::Text(principal_id.to_string()))
                 && let Some(Value::Uuid(acl_id)) = grant.values.get(&acl_ref.ref_column)
             {
-                allowed.insert(*acl_id);
+                allowed.insert(*acl_id).map_err(E::from)?;
             }
         }
-        Ok(Arc::new(allowed))
+        allowed.into_shared().map_err(E::from)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn read_allowed_for_row_cached(
         &self,
         table: &str,
@@ -1108,10 +1469,26 @@ impl Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
         allowed_acl_ids: Option<&HashSet<uuid::Uuid>>,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
-        self.read_allowed_for_row_cached_in_tx(None, table, meta, row, snapshot, allowed_acl_ids)
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        self.read_allowed_for_row_cached_in_tx(
+            None,
+            table,
+            meta,
+            row,
+            snapshot,
+            allowed_acl_ids,
+            read_memory.clone(),
+        )
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn read_allowed_for_row_in_tx(
         &self,
         tx: Option<TxId>,
@@ -1119,10 +1496,26 @@ impl Database {
         meta: &TableMeta,
         row: &VersionedRow,
         snapshot: SnapshotId,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
-        self.read_allowed_for_row_cached_in_tx(tx, table, meta, row, snapshot, None)
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        self.read_allowed_for_row_cached_in_tx(
+            tx,
+            table,
+            meta,
+            row,
+            snapshot,
+            None,
+            read_memory.clone(),
+        )
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn read_allowed_for_row_cached_in_tx(
         &self,
         tx: Option<TxId>,
@@ -1131,12 +1524,28 @@ impl Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
         allowed_acl_ids: Option<&HashSet<uuid::Uuid>>,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         Ok(self
-            .read_denial_for_row_cached_in_tx(tx, table, meta, row, snapshot, allowed_acl_ids)?
+            .read_denial_for_row_cached_in_tx(
+                tx,
+                table,
+                meta,
+                row,
+                snapshot,
+                allowed_acl_ids,
+                read_memory.clone(),
+            )?
             .is_none())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn read_denial_for_row_cached(
         &self,
         table: &str,
@@ -1144,10 +1553,26 @@ impl Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
         allowed_acl_ids: Option<&HashSet<uuid::Uuid>>,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<Error>> {
-        self.read_denial_for_row_cached_in_tx(None, table, meta, row, snapshot, allowed_acl_ids)
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        self.read_denial_for_row_cached_in_tx(
+            None,
+            table,
+            meta,
+            row,
+            snapshot,
+            allowed_acl_ids,
+            read_memory.clone(),
+        )
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn read_denial_for_row_cached_in_tx(
         &self,
         tx: Option<TxId>,
@@ -1156,7 +1581,11 @@ impl Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
         allowed_acl_ids: Option<&HashSet<uuid::Uuid>>,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<Error>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.access_is_admin() {
             return Ok(None);
         }
@@ -1213,7 +1642,12 @@ impl Database {
                     None => {
                         let acl_ref = column.acl_ref.as_ref().expect("acl column");
                         self.principal_has_acl_grant_in_tx(
-                            tx, principal, acl_ref, *acl_id, snapshot,
+                            tx,
+                            principal,
+                            acl_ref,
+                            *acl_id,
+                            snapshot,
+                            read_memory.clone(),
                         )?
                     }
                 },
@@ -1230,22 +1664,84 @@ impl Database {
         Ok(None)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn borrowed_row_read_allowed_for_query(
+        &self,
+        table: &str,
+        row: &VersionedRow,
+        snapshot: SnapshotId,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        self.assert_table_read_allowed(table)?;
+        if self.access_is_admin() {
+            return Ok(true);
+        }
+        let meta = self
+            .table_meta(table)
+            .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
+        let allowed = if let Some(column) = self.acl_column(&meta) {
+            Some(
+                self.allowed_acl_ids_for_principal(
+                    self.access
+                        .principal
+                        .as_ref()
+                        .expect("assert_table_read_allowed rejects missing principals"),
+                    column.acl_ref.as_ref().expect("acl column"),
+                    snapshot,
+                    read_memory.clone(),
+                )?,
+            )
+        } else {
+            None
+        };
+        self.read_allowed_for_row_cached(
+            table,
+            &meta,
+            row,
+            snapshot,
+            allowed.as_ref().map(|ids| &ids.ids),
+            read_memory.clone(),
+        )
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn filter_rows_for_read(
         &self,
         table: &str,
         rows: Vec<VersionedRow>,
         snapshot: SnapshotId,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<VersionedRow>> {
-        self.filter_rows_for_read_in_tx(None, table, rows, snapshot)
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        self.filter_rows_for_read_in_tx(None, table, rows, snapshot, read_memory.clone())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn filter_rows_for_read_in_tx(
         &self,
         tx: Option<TxId>,
         table: &str,
         rows: Vec<VersionedRow>,
         snapshot: SnapshotId,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.assert_table_read_allowed(table)?;
         if self.access_is_admin() || rows.is_empty() {
             return Ok(rows);
@@ -1264,6 +1760,7 @@ impl Database {
                 principal,
                 column.acl_ref.as_ref().expect("acl column"),
                 snapshot,
+                read_memory.clone(),
             )?)
         } else {
             None
@@ -1275,7 +1772,8 @@ impl Database {
                 &meta,
                 &row,
                 snapshot,
-                allowed_acl_ids.as_ref().map(|ids| ids.as_ref()),
+                allowed_acl_ids.as_ref().map(|ids| &ids.ids),
+                read_memory.clone(),
             )? {
                 out.push(row);
             }
@@ -1283,13 +1781,21 @@ impl Database {
         Ok(out)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn filter_rows_for_anchor_read_in_tx(
         &self,
         tx: Option<TxId>,
         table: &str,
         rows: Vec<VersionedRow>,
         snapshot: SnapshotId,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.assert_table_read_allowed(table)?;
         if self.access_is_admin() || rows.is_empty() {
             return Ok(rows);
@@ -1308,6 +1814,7 @@ impl Database {
                 principal,
                 column.acl_ref.as_ref().expect("acl column"),
                 snapshot,
+                read_memory.clone(),
             )?)
         } else {
             None
@@ -1320,7 +1827,8 @@ impl Database {
                 &meta,
                 &row,
                 snapshot,
-                allowed_acl_ids.as_ref().map(|ids| ids.as_ref()),
+                allowed_acl_ids.as_ref().map(|ids| &ids.ids),
+                read_memory.clone(),
             )? {
                 Some(err) => {
                     if first_denial.is_none() {
@@ -1338,6 +1846,10 @@ impl Database {
         Ok(out)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn write_allowed_for_values(
         &self,
         table: &str,
@@ -1345,7 +1857,11 @@ impl Database {
         row_id: RowId,
         values: &HashMap<ColName, Value>,
         snapshot: SnapshotId,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.access_is_admin() {
             return Ok(());
         }
@@ -1402,7 +1918,13 @@ impl Database {
             let allowed = match values.get(&column.name) {
                 Some(Value::Uuid(acl_id)) => {
                     let acl_ref = column.acl_ref.as_ref().expect("acl column");
-                    self.principal_has_acl_grant(principal, acl_ref, *acl_id, snapshot)?
+                    self.principal_has_acl_grant(
+                        principal,
+                        acl_ref,
+                        *acl_id,
+                        snapshot,
+                        read_memory.clone(),
+                    )?
                 }
                 _ => false,
             };
@@ -1417,29 +1939,56 @@ impl Database {
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn assert_row_write_allowed(
         &self,
         table: &str,
         row_id: RowId,
         values: &HashMap<ColName, Value>,
         snapshot: SnapshotId,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(meta) = self.table_meta(table) else {
             return Err(Error::TableNotFound(table.to_string()));
         };
-        self.write_allowed_for_values(table, &meta, row_id, values, snapshot)
+        self.write_allowed_for_values(table, &meta, row_id, values, snapshot, read_memory.clone())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn principal_has_acl_grant(
         &self,
         principal: &Principal,
         acl_ref: &AclRef,
         acl_id: uuid::Uuid,
         snapshot: SnapshotId,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
-        self.principal_has_acl_grant_in_tx(None, principal, acl_ref, acl_id, snapshot)
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        self.principal_has_acl_grant_in_tx(
+            None,
+            principal,
+            acl_ref,
+            acl_id,
+            snapshot,
+            read_memory.clone(),
+        )
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn principal_has_acl_grant_in_tx(
         &self,
         tx: Option<TxId>,
@@ -1447,12 +1996,26 @@ impl Database {
         acl_ref: &AclRef,
         acl_id: uuid::Uuid,
         snapshot: SnapshotId,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         Ok(self
-            .allowed_acl_ids_for_principal_in_tx(tx, principal, acl_ref, snapshot)?
+            .allowed_acl_ids_for_principal_in_tx(
+                tx,
+                principal,
+                acl_ref,
+                snapshot,
+                read_memory.clone(),
+            )?
             .contains(&acl_id))
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn grant_row_context_scope_allowed(
         &self,
         table: &str,
@@ -1487,31 +2050,55 @@ impl Database {
         Ok(true)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn allowed_acl_ids_for_principal(
         &self,
         principal: &Principal,
         acl_ref: &AclRef,
         snapshot: SnapshotId,
-    ) -> Result<Arc<HashSet<uuid::Uuid>>> {
-        let cache_key = AclGrantCacheKey {
-            principal: principal.clone(),
-            ref_table: acl_ref.ref_table.clone(),
-            ref_column: acl_ref.ref_column.clone(),
-            snapshot,
-        };
-        if let Some(cached) = self.acl_grant_cache.read().get(&cache_key).cloned() {
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<contextdb_core::read_memory::ReadShared<AdmittedAclIds>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        if self.retained_relational_source.is_some() || self.writer_read_root()?.is_some() {
+            return self.bounded_allowed_acl_ids_in_retained_source(
+                principal,
+                acl_ref,
+                snapshot,
+                &mut |_| {
+                    crate::executor::observe_bounded_access_control_row();
+                    Ok::<(), Error>(())
+                },
+                read_memory.clone(),
+            );
+        }
+        let (cache_key, key_memory) =
+            self.admitted_acl_cache_key(principal, acl_ref, snapshot, read_memory.clone())?;
+        if let Some(cached) = self
+            .acl_grant_cache
+            .read()
+            .entries
+            .get(&cache_key)
+            .map(|entry| entry.ids.clone())
+        {
             return Ok(cached);
         }
         let (kind, principal_id) = match principal {
-            Principal::System => return Ok(Arc::new(HashSet::new())),
+            Principal::System => {
+                return AdmittedAclIds::new(read_memory.clone())?.into_shared();
+            }
             Principal::Agent(id) => ("Agent", id.as_str()),
             Principal::Human(id) => ("Human", id.as_str()),
         };
         let tables = self.relational_store.tables.read();
         let Some(rows) = tables.get(&acl_ref.ref_table) else {
-            return Ok(Arc::new(HashSet::new()));
+            return AdmittedAclIds::new(read_memory.clone())?.into_shared();
         };
-        let mut allowed = HashSet::new();
+        let mut allowed = AdmittedAclIds::new(read_memory.clone())?;
         for row in rows {
             crate::executor::observe_bounded_access_control_row();
             if row.visible_at(snapshot)
@@ -1520,11 +2107,11 @@ impl Database {
                 && row.values.get("principal_id") == Some(&Value::Text(principal_id.to_string()))
                 && let Some(Value::Uuid(acl_id)) = row.values.get(&acl_ref.ref_column)
             {
-                allowed.insert(*acl_id);
+                allowed.insert(*acl_id)?;
             }
         }
-        let allowed = Arc::new(allowed);
-        self.remember_allowed_acl_ids(cache_key, Arc::clone(&allowed));
+        let allowed = allowed.into_shared()?;
+        self.remember_allowed_acl_ids(cache_key, key_memory, allowed.clone())?;
         Ok(allowed)
     }
 
@@ -1535,104 +2122,153 @@ impl Database {
     /// ceiling clears the map rather than keeping an arbitrary subset: every
     /// entry is rebuildable from committed rows, and rebuilding is charged to
     /// the read that needs it.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn remember_allowed_acl_ids(
         &self,
         cache_key: AclGrantCacheKey,
-        allowed: Arc<HashSet<uuid::Uuid>>,
-    ) {
-        let mut cache = self.acl_grant_cache.write();
-        if cache.len() >= RETAINED_GRANT_SET_CEILING && !cache.contains_key(&cache_key) {
-            cache.clear();
+        key_memory: contextdb_core::read_memory::ReadCredit,
+        allowed: contextdb_core::read_memory::ReadShared<AdmittedAclIds>,
+    ) -> Result<()> {
+        // Promotion is only an allocation optimization. Admission failure here
+        // never changes the operation's already computed authorization answer.
+        let promoted = (|| -> Result<_> {
+            let budget = self.declared_read_memory.acl_cache_budget()?;
+            let ids = allowed.copy(budget.clone())?.into_shared()?;
+            let bytes = held::text(&cache_key.ref_table)
+                .saturating_add(held::text(&cache_key.ref_column))
+                .saturating_add(match &cache_key.principal {
+                    Principal::System => 0,
+                    Principal::Agent(id) | Principal::Human(id) => held::text(id),
+                });
+            let parent_key_memory = contextdb_core::read_memory::ReadCredit::try_new_owned(
+                budget.clone(),
+                bytes,
+                "reader_acl_cache",
+                "key",
+                "Increase reader memory to cache ACL grants.",
+            )?;
+            let parent_key = cache_key.clone();
+            Ok((budget, ids, parent_key_memory, parent_key))
+        })();
+        let Ok((budget, ids, parent_key_memory, parent_key)) = promoted else {
+            return Ok(());
+        };
+        // The original key remains operation-funded until its own allocation
+        // drops. Only the separately admitted copy enters the standing cache.
+        drop(cache_key);
+        drop(key_memory);
+        loop {
+            let mut cache = self.acl_grant_cache.write();
+            if let Some(entry) = cache.entries.get_mut(&parent_key) {
+                entry.ids = ids;
+                return Ok(());
+            }
+            if cache.entries.len() >= RETAINED_GRANT_SET_CEILING {
+                cache.entries.clear();
+            }
+            if cache.entries.len() < cache.entries.capacity() {
+                cache.entries.insert(
+                    parent_key,
+                    AdmittedAclGrantCacheEntry {
+                        ids,
+                        _key_memory: parent_key_memory,
+                    },
+                );
+                return Ok(());
+            }
+            let wanted = cache.entries.capacity().max(1).saturating_mul(2);
+            drop(cache);
+            let memory = contextdb_core::read_memory::ReadCredit::try_new_owned(
+                budget.clone(),
+                held::map::<AclGrantCacheKey, AdmittedAclGrantCacheEntry>(wanted),
+                "reader_acl_cache",
+                "controls",
+                "Increase reader memory to cache ACL grants.",
+            );
+            let Ok(memory) = memory else {
+                return Ok(());
+            };
+            let mut replacement = HashMap::with_capacity(wanted);
+            let mut cache = self.acl_grant_cache.write();
+            if cache.entries.len() < cache.entries.capacity()
+                || cache.entries.len() >= replacement.capacity()
+            {
+                continue;
+            }
+            replacement.extend(cache.entries.drain());
+            cache.entries = replacement;
+            cache.map_memory = Some(memory);
         }
-        cache.insert(cache_key, allowed);
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn allowed_acl_ids_for_principal_in_tx(
         &self,
         tx: Option<TxId>,
         principal: &Principal,
         acl_ref: &AclRef,
         snapshot: SnapshotId,
-    ) -> Result<Arc<HashSet<uuid::Uuid>>> {
-        let Some(tx) = tx else {
-            return self.allowed_acl_ids_for_principal(principal, acl_ref, snapshot);
-        };
-        let (kind, principal_id) = match principal {
-            Principal::System => return Ok(Arc::new(HashSet::new())),
-            Principal::Agent(id) => ("Agent", id.as_str()),
-            Principal::Human(id) => ("Human", id.as_str()),
-        };
-        let rows = self.acl_grant_rows_in_tx(tx, &acl_ref.ref_table, snapshot)?;
-        let mut allowed = HashSet::new();
-        for row in rows {
-            if self.grant_row_context_scope_allowed(&acl_ref.ref_table, &row, snapshot)?
-                && row.values.get("principal_kind") == Some(&Value::Text(kind.to_string()))
-                && row.values.get("principal_id") == Some(&Value::Text(principal_id.to_string()))
-                && let Some(Value::Uuid(acl_id)) = row.values.get(&acl_ref.ref_column)
-            {
-                allowed.insert(*acl_id);
-            }
-        }
-        Ok(Arc::new(allowed))
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<contextdb_core::read_memory::ReadShared<AdmittedAclIds>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        let committed =
+            self.allowed_acl_ids_for_principal(principal, acl_ref, snapshot, read_memory.clone())?;
+        self.bounded_acl_ids_with_transaction(
+            tx,
+            principal,
+            acl_ref,
+            snapshot,
+            committed,
+            &mut |_| {
+                crate::executor::observe_bounded_access_control_row();
+                Ok::<(), Error>(())
+            },
+            read_memory.clone(),
+        )
     }
 
-    fn acl_grant_rows_in_tx(
-        &self,
-        tx: TxId,
-        table: &str,
-        snapshot: SnapshotId,
-    ) -> Result<Vec<VersionedRow>> {
-        let mut rows = {
-            let tables = self.relational_store.tables.read();
-            tables
-                .get(table)
-                .map(|rows| {
-                    rows.iter()
-                        .filter(|row| row.visible_at(snapshot))
-                        .cloned()
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
-        };
-        let committed_row_ids = rows.iter().map(|row| row.row_id).collect::<HashSet<_>>();
-        let deleted_row_ids = self.tx_mgr.with_write_set(tx, |ws| {
-            ws.relational_deletes
-                .iter()
-                .filter(|(delete_table, _, _)| delete_table == table)
-                .map(|(_, row_id, _)| *row_id)
-                .collect::<HashSet<_>>()
-        })?;
-        rows.retain(|row| !deleted_row_ids.contains(&row.row_id));
-
-        self.tx_mgr.with_write_set(tx, |ws| {
-            let mut seen_inserts = HashSet::new();
-            let mut inserts = ws
-                .relational_inserts
-                .iter()
-                .rev()
-                .filter(|(insert_table, row)| {
-                    insert_table == table
-                        && seen_inserts.insert(row.row_id)
-                        && (!deleted_row_ids.contains(&row.row_id)
-                            || committed_row_ids.contains(&row.row_id))
-                })
-                .map(|(_, row)| row.clone())
-                .collect::<Vec<_>>();
-            inserts.reverse();
-            rows.extend(inserts);
-        })?;
-        Ok(rows)
-    }
-
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn raw_row_by_id_in_tx(
         &self,
         tx: Option<TxId>,
         table: &str,
         row_id: RowId,
         snapshot: SnapshotId,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        if let Some(captured) = self.captured_graph_decisions().filter(|c| Some(c.tx) == tx) {
+            captured.check_table(table)?;
+            if let Some(rows) = captured.rows(table)
+                && let Some(row) = rows.row(row_id)
+            {
+                return Ok(Some(row.clone()));
+            }
+            if captured
+                .decisions
+                .relational_deletes
+                .iter()
+                .any(|(name, id, _)| name == table && *id == row_id)
+            {
+                return Ok(None);
+            }
+            return self.committed_row_at(table, row_id, snapshot, read_memory);
+        }
         if let Some(tx) = tx {
-            let staged = self.tx_mgr.with_write_set(tx, |ws| {
+            let staged = self.tx_mgr.with_read(tx, |ws| {
                 let staged_insert = ws
                     .relational_inserts
                     .iter()
@@ -1657,12 +2293,12 @@ impl Database {
                 return Ok(staged);
             }
         }
-        Ok(self.relational_store.row_by_id(table, row_id, snapshot))
+        self.committed_row_at(table, row_id, snapshot, read_memory.clone())
     }
 
     fn raw_row_missing_due_to_staged_delete(&self, tx: TxId, table: &str, row_id: RowId) -> bool {
         self.tx_mgr
-            .with_write_set(tx, |ws| {
+            .with_read(tx, |ws| {
                 ws.relational_deletes
                     .iter()
                     .any(|(delete_table, deleted_row_id, _)| {
@@ -1672,15 +2308,31 @@ impl Database {
             .unwrap_or(false)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn assert_row_id_write_allowed(
         &self,
         tx: Option<TxId>,
         table: &str,
         row_id: RowId,
         snapshot: SnapshotId,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
-        if let Some(row) = self.raw_row_by_id_in_tx(tx, table, row_id, snapshot)? {
-            self.assert_row_write_allowed(table, row.row_id, &row.values, snapshot)?;
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        if let Some(row) =
+            self.raw_row_by_id_in_tx(tx, table, row_id, snapshot, read_memory.clone())?
+        {
+            self.assert_row_write_allowed(
+                table,
+                row.row_id,
+                &row.values,
+                snapshot,
+                read_memory.clone(),
+            )?;
         } else if !tx.is_some_and(|tx| self.raw_row_missing_due_to_staged_delete(tx, table, row_id))
         {
             return Err(Error::NotFound(format!("row {row_id} in table {table}")));
@@ -1688,75 +2340,310 @@ impl Database {
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn assert_existing_row_id_write_allowed(
         &self,
         tx: Option<TxId>,
         table: &str,
         row_id: RowId,
         snapshot: SnapshotId,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
-        let Some(row) = self.raw_row_by_id_in_tx(tx, table, row_id, snapshot)? else {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        let Some(row) =
+            self.raw_row_by_id_in_tx(tx, table, row_id, snapshot, read_memory.clone())?
+        else {
             return Err(Error::NotFound(format!("row {row_id} in table {table}")));
         };
-        self.assert_row_write_allowed(table, row.row_id, &row.values, snapshot)
+        self.assert_row_write_allowed(
+            table,
+            row.row_id,
+            &row.values,
+            snapshot,
+            read_memory.clone(),
+        )
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn readable_row_id_filter(
         &self,
         table: &str,
         snapshot: SnapshotId,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<RoaringTreemap>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if !self.table_has_read_gate(table)? {
             return Ok(None);
         }
-        let rows = self.relational.scan(table, snapshot)?;
-        let rows = self.filter_rows_for_read(table, rows, snapshot)?;
+        self.assert_table_read_allowed(table)?;
+        let meta = self
+            .table_meta(table)
+            .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
         let mut bitmap = RoaringTreemap::new();
+        let mut output = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+        if self.visit_writer_rows_phased::<Error>(
+            table,
+            |row| {
+                if let Some(row) = row
+                    && row.visible_at(snapshot)
+                    && self.read_allowed_for_row(
+                        table,
+                        &meta,
+                        row,
+                        snapshot,
+                        read_memory.clone(),
+                    )?
+                {
+                    output.try_grow_for(
+                        64,
+                        "writer_source",
+                        "read_gate_candidates",
+                        "Raise MEMORY_LIMIT to retain these read candidates.",
+                    )?;
+                    bitmap.insert(row.row_id.0);
+                }
+                Ok(())
+            },
+            read_memory.clone(),
+        )? {
+            self.retain_writer_output(output);
+            return Ok(Some(bitmap));
+        }
+        let rows = self.committed_rows_at(table, snapshot, read_memory.clone())?;
+        let rows = self.filter_rows_for_read(table, rows, snapshot, read_memory.clone())?;
         for row in rows {
             bitmap.insert(row.row_id.0);
         }
         Ok(Some(bitmap))
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn effective_read_candidates(
         &self,
         table: &str,
         snapshot: SnapshotId,
         candidates: Option<&RoaringTreemap>,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<RoaringTreemap>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(candidates) = candidates {
             if !self.table_has_read_gate(table)? {
                 return Ok(Some(candidates.clone()));
             }
             let mut readable = RoaringTreemap::new();
+            let root = self.writer_read_root()?;
+            let source = root
+                .map(|root| {
+                    crate::persistence::writer_adapters::WriterRelationalSource::new_for_read(
+                        root,
+                        read_memory.clone(),
+                    )
+                })
+                .transpose()?;
+            let meta = self
+                .table_meta(table)
+                .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
             for id in candidates.iter() {
-                if let Some(row) = self.relational_store.row_by_id(table, RowId(id), snapshot)
-                    && self.read_allowed_for_row(
-                        table,
-                        &self
-                            .table_meta(table)
-                            .ok_or_else(|| Error::TableNotFound(table.to_owned()))?,
-                        &row,
-                        snapshot,
-                    )?
-                {
+                let allowed = if let Some(source) = &source {
+                    contextdb_relational::source::visible_row(source, table, RowId(id), snapshot)?
+                        .map(|row| {
+                            self.read_allowed_for_row(
+                                table,
+                                &meta,
+                                row.value(),
+                                snapshot,
+                                read_memory.clone(),
+                            )
+                        })
+                        .transpose()?
+                        .unwrap_or(false)
+                } else {
+                    self.relational_store
+                        .row_by_id(table, RowId(id), snapshot)
+                        .map(|row| {
+                            self.read_allowed_for_row(
+                                table,
+                                &meta,
+                                &row,
+                                snapshot,
+                                read_memory.clone(),
+                            )
+                        })
+                        .transpose()?
+                        .unwrap_or(false)
+                };
+                if allowed {
                     readable.insert(id);
                 }
             }
             return Ok(Some(readable));
         }
-        self.readable_row_id_filter(table, snapshot)
+        self.readable_row_id_filter(table, snapshot, read_memory.clone())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn indexed_rows_for_values(
         &self,
         table: &str,
         columns: &[String],
         values: &[Value],
         snapshot: SnapshotId,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<Vec<VersionedRow>>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if columns.is_empty() || columns.len() != values.len() {
-            return Ok(Some(Vec::new()));
+            return Err(Error::Other(
+                ("graph metadata probe requires a nonempty matching key".to_owned()).into(),
+            ));
+        }
+        if self.writer_read_root()?.is_some() {
+            return self.writer_indexed_rows_for_values(
+                table,
+                columns,
+                values,
+                snapshot,
+                read_memory.clone(),
+            );
+        }
+
+        if let Some(source) = &self.retained_relational_source {
+            let meta = self
+                .table_meta(table)
+                .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
+            let Some(index) = meta.indexes.iter().find(|index| {
+                index.columns.len() >= columns.len()
+                    && (!index.is_exact_only() || index.columns.len() == columns.len())
+                    && index
+                        .columns
+                        .iter()
+                        .zip(columns)
+                        .all(|((have, _), want)| have == want)
+            }) else {
+                return Ok(None);
+            };
+            let mut scratch = contextdb_core::read_memory::ReadCredit::try_new(
+                read_memory.clone(),
+                values
+                    .iter()
+                    .map(Value::estimated_bytes)
+                    .sum::<usize>()
+                    .saturating_mul(8)
+                    .saturating_add(256),
+                "reader",
+                "metadata_keys",
+                "Raise the declared read memory limit to inspect this metadata key.",
+            )?;
+            let key = index_key_from_values(&index.columns[..columns.len()], values);
+            let mut identities = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+            let mut output = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+            let mut seen = HashSet::new();
+            let mut rows = Vec::new();
+            let mut retain_row = |identity: VersionedRow| -> Result<()> {
+                if seen.contains(&identity.row_id) {
+                    return Ok(());
+                }
+                scratch.try_grow_for(
+                    96,
+                    "reader",
+                    "metadata_identities",
+                    "Raise the declared read memory limit to inspect these metadata rows.",
+                )?;
+                seen.insert(identity.row_id);
+                let row = self
+                    .committed_row_at(table, identity.row_id, snapshot, read_memory.clone())?
+                    .ok_or_else(|| {
+                        crate::funded_error::corruption_display(
+                            Ok(read_memory.clone()),
+                            source.database_path().display(),
+                            format_args!(
+                                "retained metadata index {} names missing row {}",
+                                index.name, identity.row_id.0
+                            ),
+                        )
+                    })?;
+                output.try_grow_for(
+                    128,
+                    "reader",
+                    "metadata_output",
+                    "Raise the declared read memory limit to return these metadata rows.",
+                )?;
+                rows.push(row);
+                Ok(())
+            };
+            if index.columns.len() == columns.len() {
+                let mut cursor =
+                    contextdb_relational::mem::BoundedExactIndexCursor::for_keys([key]);
+                cursor.select_identities_only();
+                while let Some(identity) =
+                    self.bounded_exact_index_row_next(
+                        read_memory.clone(),
+                        table,
+                        &index.name,
+                        snapshot,
+                        &mut cursor,
+                        || Ok::<(), Error>(()),
+                        || Ok::<(), Error>(()),
+                        |_| Ok(()),
+                        |_| Ok(()),
+                        |bytes| {
+                            bytes.retain_into(&mut identities, "reader", "metadata_identity",
+                        "Raise the declared read memory limit to inspect these metadata rows.")
+                        },
+                    )?
+                {
+                    retain_row(identity)?;
+                }
+            } else {
+                let mut cursor = contextdb_relational::mem::BoundedOrderedRowCursor::for_index(
+                    index.name.clone(),
+                    false,
+                )
+                .seeking_run(
+                    std::ops::Bound::Included(key.clone()),
+                    std::ops::Bound::Included(key),
+                );
+                cursor.select_identities_only();
+                while let Some(identity) =
+                    self.bounded_ordered_table_row_next(
+                        read_memory.clone(),
+                        table,
+                        &index.columns[0].0,
+                        index.columns[0].1,
+                        snapshot,
+                        &mut cursor,
+                        || Ok::<(), Error>(()),
+                        || Ok(()),
+                        |bytes| {
+                            bytes.retain_into(&mut identities, "reader", "metadata_identity",
+                        "Raise the declared read memory limit to inspect these metadata rows.")
+                        },
+                    )?
+                {
+                    retain_row(identity)?;
+                }
+            }
+            self.retain_writer_output(output);
+            return Ok(Some(rows));
         }
 
         let row_ids = {
@@ -1813,33 +2700,49 @@ impl Database {
         Ok(Some(rows))
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn rows_for_node(
         &self,
         node: NodeId,
         snapshot: SnapshotId,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<(String, VersionedRow)>> {
-        self.rows_for_node_in_tx(None, node, snapshot)
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        self.rows_for_node_in_tx(None, node, snapshot, read_memory.clone())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn rows_for_node_in_tx(
         &self,
         tx: Option<TxId>,
         node: NodeId,
         snapshot: SnapshotId,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<(String, VersionedRow)>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let id_column = vec!["id".to_string()];
         let id_value = vec![Value::Uuid(node)];
-        let table_names = self
-            .relational_store
-            .table_meta
-            .read()
-            .iter()
-            .filter(|(_, meta)| Self::has_uuid_id_column(meta))
-            .map(|(table, meta)| (table.clone(), self.meta_has_read_gate(meta)))
-            .collect::<Vec<_>>();
+        let (table_names, _table_memory) =
+            self.graph_metadata_tables(Self::has_uuid_id_column, read_memory.clone())?;
         let mut rows = Vec::new();
         for (table, has_read_gate) in table_names {
-            match self.indexed_rows_for_values(&table, &id_column, &id_value, snapshot)? {
+            match self.indexed_rows_for_values(
+                &table,
+                &id_column,
+                &id_value,
+                snapshot,
+                read_memory.clone(),
+            )? {
                 Some(mut table_rows) => {
                     if let Some(tx) = tx {
                         self.overlay_tx_node_rows(tx, &table, node, &mut table_rows)?;
@@ -1847,9 +2750,10 @@ impl Database {
                     rows.extend(table_rows.into_iter().map(|row| (table.clone(), row)))
                 }
                 None if has_read_gate => {
-                    return Err(Error::Other(format!(
-                        "graph node metadata table `{table}` requires an index on id"
-                    )));
+                    return Err(Error::Other(
+                        (format!("graph node metadata table `{table}` requires an index on id"))
+                            .into(),
+                    ));
                 }
                 None => {}
             }
@@ -1857,6 +2761,66 @@ impl Database {
         Ok(rows)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn graph_metadata_tables(
+        &self,
+        matches: fn(&TableMeta) -> bool,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<(Vec<(String, bool)>, contextdb_core::read_memory::ReadCredit)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        let mut memory = contextdb_core::read_memory::ReadCredit::new(read_memory);
+        if let Some(captured) = self.captured_graph_decisions() {
+            let mut names = Vec::new();
+            for (table, meta) in captured.catalog.iter().filter(|(_, meta)| matches(meta)) {
+                memory.try_grow_for(
+                    held::text(table).saturating_add(128),
+                    "graph",
+                    "metadata_tables",
+                    "Raise READ_MEMORY_LIMIT.",
+                )?;
+                names.push((table.clone(), self.meta_has_read_gate(meta)));
+            }
+            return Ok((names, memory));
+        }
+        // Match the catalog to the probe source: private during received replay.
+        if let Some(root) = self.scoped_writer_root() {
+            let mut names = Vec::new();
+            for (name, meta) in root
+                .captured_table_metadata()
+                .filter(|(_, meta)| matches(meta))
+            {
+                memory.try_grow_for(
+                    held::text(name).saturating_add(128),
+                    "writer_source",
+                    "graph_metadata_tables",
+                    "Raise MEMORY_LIMIT to inspect these graph metadata tables.",
+                )?;
+                names.push((name.to_owned(), self.meta_has_read_gate(meta)));
+            }
+            return Ok((names, memory));
+        }
+        let mut names = Vec::new();
+        let metadata = self.relational_store.table_meta.read();
+        for (table, meta) in metadata.iter().filter(|(_, meta)| matches(meta)) {
+            memory.try_grow_for(
+                held::text(table).saturating_add(128),
+                "reader",
+                "graph_metadata_tables",
+                "Raise reader memory to inspect graph metadata tables.",
+            )?;
+            names.push((table.clone(), self.meta_has_read_gate(meta)));
+        }
+        Ok((names, memory))
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn overlay_tx_node_rows(
         &self,
         tx: TxId,
@@ -1864,6 +2828,19 @@ impl Database {
         node: NodeId,
         rows: &mut Vec<VersionedRow>,
     ) -> Result<()> {
+        if let Some(captured) = self.captured_graph_decisions() {
+            let mut memory = contextdb_core::read_memory::ReadCredit::new(captured.reader.clone());
+            self.overlay_captured_node_rows(
+                &captured,
+                table,
+                node,
+                rows,
+                &mut |_| Ok(()),
+                &mut memory,
+            )?;
+            self.retain_writer_output(memory);
+            return Ok(());
+        }
         self.tx_mgr.with_write_set(tx, |ws| {
             let committed_row_ids = rows.iter().map(|row| row.row_id).collect::<HashSet<_>>();
             let deleted_row_ids = ws
@@ -1894,22 +2871,85 @@ impl Database {
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn overlay_tx_node_rows_within(
+        &self,
+        tx: TxId,
+        table: &str,
+        node: NodeId,
+        rows: &mut Vec<VersionedRow>,
+        work: &mut dyn FnMut(crate::executor::GraphPredicateWork) -> Result<()>,
+        memory: &mut contextdb_core::read_memory::ReadCredit,
+    ) -> Result<()> {
+        if let Some(captured) = self.captured_graph_decisions() {
+            return self.overlay_captured_node_rows(&captured, table, node, rows, work, memory);
+        }
+        self.tx_mgr.with_write_set(tx, |ws| {
+            let mut deletes = 0usize;
+            for (delete_table, _, _) in &ws.relational_deletes {
+                work(crate::executor::GraphPredicateWork::AccessRow(0))?;
+                if delete_table == table {
+                    deletes = deletes.saturating_add(1);
+                }
+            }
+            let mut bytes = rows.len().saturating_add(deletes).saturating_mul(96);
+            for (insert_table, row) in &ws.relational_inserts {
+                work(crate::executor::GraphPredicateWork::AccessRow(0))?;
+                if insert_table == table && row.values.get("id") == Some(&Value::Uuid(node)) {
+                    bytes = bytes.saturating_add(row.estimated_bytes().saturating_add(224));
+                }
+            }
+            work(crate::executor::GraphPredicateWork::Checkpoint)?;
+
+            memory.try_grow_for(
+                bytes,
+                "graph",
+                "predicate_staged_rows",
+                "Raise MEMORY_LIMIT to inspect staged graph metadata.",
+            )?;
+            let committed_row_ids = rows.iter().map(|row| row.row_id).collect::<HashSet<_>>();
+            let mut deleted_row_ids = HashSet::new();
+            for (delete_table, row_id, _) in &ws.relational_deletes {
+                work(crate::executor::GraphPredicateWork::AccessRow(0))?;
+                if delete_table == table {
+                    deleted_row_ids.insert(*row_id);
+                }
+            }
+            rows.retain(|row| !deleted_row_ids.contains(&row.row_id));
+
+            let mut seen_inserts = HashSet::new();
+            let mut inserts = Vec::new();
+            for (insert_table, row) in ws.relational_inserts.iter().rev() {
+                work(crate::executor::GraphPredicateWork::AccessRow(0))?;
+                if insert_table == table
+                    && row.values.get("id") == Some(&Value::Uuid(node))
+                    && seen_inserts.insert(row.row_id)
+                    && (!deleted_row_ids.contains(&row.row_id)
+                        || committed_row_ids.contains(&row.row_id))
+                {
+                    inserts.push(row.clone());
+                }
+            }
+            inserts.reverse();
+            rows.extend(inserts);
+            Ok::<(), Error>(())
+        })??;
+        Ok(())
+    }
+
     fn has_graph_edge_columns(meta: &TableMeta) -> bool {
         Self::has_exact_column_type(meta, "source_id", &ColumnType::Uuid)
             && Self::has_exact_column_type(meta, "target_id", &ColumnType::Uuid)
             && Self::has_exact_column_type(meta, "edge_type", &ColumnType::Text)
     }
 
-    fn edge_table_names(&self) -> Vec<(String, bool)> {
-        self.relational_store
-            .table_meta
-            .read()
-            .iter()
-            .filter(|(_, meta)| Self::has_graph_edge_columns(meta))
-            .map(|(table, meta)| (table.clone(), self.meta_has_read_gate(meta)))
-            .collect()
-    }
-
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn edge_rows_for_graph_edge_in_tx(
         &self,
         tx: Option<TxId>,
@@ -1917,8 +2957,76 @@ impl Database {
         target: NodeId,
         edge_type: &str,
         snapshot: SnapshotId,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<(String, VersionedRow)>> {
-        let edge_tables = self.edge_table_names();
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        if let Some(captured) = self.captured_graph_decisions().filter(|c| Some(c.tx) == tx) {
+            let mut output = Vec::new();
+            let mut credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+            let columns = vec![
+                "source_id".to_owned(),
+                "target_id".to_owned(),
+                "edge_type".to_owned(),
+            ];
+            let values = vec![
+                Value::Uuid(source),
+                Value::Uuid(target),
+                Value::Text(edge_type.to_owned()),
+            ];
+            for (table, _meta) in captured
+                .catalog
+                .iter()
+                .filter(|(_, meta)| Self::has_graph_edge_columns(meta))
+            {
+                captured.check_table(table)?;
+                let image = captured.rows(table);
+                let committed = self.indexed_rows_for_values(table, &columns, &values, snapshot, read_memory.clone())?
+                    .ok_or_else(|| Error::Other((format!("graph edge metadata table `{table}` requires an index on source_id, target_id, edge_type")).into()))?;
+                for row in committed {
+                    if captured
+                        .decisions
+                        .relational_deletes
+                        .iter()
+                        .any(|(name, id, _)| name == table && *id == row.row_id)
+                        || row_matches_delete_predicates(
+                            &captured.decisions.relational_delete_predicates,
+                            table,
+                            &row,
+                        )
+                        || image
+                            .as_ref()
+                            .is_some_and(|image| image.contains(&row.row_id))
+                    {
+                        continue;
+                    }
+                    output.push((table.clone(), row));
+                }
+                if let Some(image) = image {
+                    for row in image.rows().filter(|row| {
+                        row.values.get("source_id") == Some(&Value::Uuid(source))
+                            && row.values.get("target_id") == Some(&Value::Uuid(target))
+                            && row.values.get("edge_type").and_then(Value::as_text)
+                                == Some(edge_type)
+                    }) {
+                        credit.try_grow_for(
+                            row.estimated_bytes()
+                                .saturating_add(table.len())
+                                .saturating_add(128),
+                            "graph",
+                            "captured_edge_row",
+                            "Raise READ_MEMORY_LIMIT.",
+                        )?;
+                        output.push((table.clone(), row.clone()));
+                    }
+                }
+            }
+            self.retain_writer_output(credit);
+            return Ok(output);
+        }
+        let (edge_tables, _table_memory) =
+            self.graph_metadata_tables(Self::has_graph_edge_columns, read_memory.clone())?;
         let edge_table_set = edge_tables
             .iter()
             .map(|(table, _)| table.clone())
@@ -1946,7 +3054,13 @@ impl Database {
         };
         let mut rows = Vec::new();
         for (table, _) in &edge_tables {
-            match self.indexed_rows_for_values(table, &columns, &values, snapshot)? {
+            match self.indexed_rows_for_values(
+                table,
+                &columns,
+                &values,
+                snapshot,
+                read_memory.clone(),
+            )? {
                 Some(table_rows) => {
                     rows.extend(table_rows.into_iter().filter_map(|row| {
                         (!deleted_by_table.contains(&(table.clone(), row.row_id)))
@@ -1954,9 +3068,9 @@ impl Database {
                     }));
                 }
                 None => {
-                    return Err(Error::Other(format!(
+                    return Err(Error::Other((format!(
                         "graph edge metadata table `{table}` requires an index on source_id, target_id, edge_type"
-                    )));
+                    )).into()));
                 }
             }
         }
@@ -1977,6 +3091,10 @@ impl Database {
         Ok(rows)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn reject_graph_edge_without_metadata(&self) -> Result<()> {
         if let Some(contexts) = self.access.contexts.as_ref() {
             return Err(Error::ContextScopeViolation {
@@ -2005,16 +3123,35 @@ impl Database {
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn edge_read_allowed(
         &self,
         source: NodeId,
         target: NodeId,
         edge_type: &str,
         snapshot: SnapshotId,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
-        self.edge_read_allowed_in_tx(None, source, target, edge_type, snapshot)
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        self.edge_read_allowed_in_tx(
+            None,
+            source,
+            target,
+            edge_type,
+            snapshot,
+            read_memory.clone(),
+        )
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn edge_read_allowed_in_tx(
         &self,
         tx: Option<TxId>,
@@ -2022,12 +3159,22 @@ impl Database {
         target: NodeId,
         edge_type: &str,
         snapshot: SnapshotId,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.access_is_admin() {
             return Ok(true);
         }
-        let edge_rows =
-            self.edge_rows_for_graph_edge_in_tx(tx, source, target, edge_type, snapshot)?;
+        let edge_rows = self.edge_rows_for_graph_edge_in_tx(
+            tx,
+            source,
+            target,
+            edge_type,
+            snapshot,
+            read_memory.clone(),
+        )?;
         if edge_rows.is_empty() {
             return Ok(false);
         }
@@ -2037,10 +3184,17 @@ impl Database {
                 visible = true;
                 continue;
             }
-            let Some(meta) = self.table_meta(&table) else {
-                continue;
-            };
-            if !self.read_allowed_for_row_in_tx(tx, &table, &meta, &row, snapshot)? {
+            let meta = self
+                .table_meta(&table)
+                .ok_or_else(|| Error::TableNotFound(table.clone()))?;
+            if !self.read_allowed_for_row_in_tx(
+                tx,
+                &table,
+                &meta,
+                &row,
+                snapshot,
+                read_memory.clone(),
+            )? {
                 return Ok(false);
             }
             visible = true;
@@ -2048,6 +3202,10 @@ impl Database {
         Ok(visible)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn assert_graph_edge_write_allowed(
         &self,
         tx: Option<TxId>,
@@ -2055,181 +3213,35 @@ impl Database {
         target: NodeId,
         edge_type: &str,
         snapshot: SnapshotId,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.access_is_admin() {
             return Ok(());
         }
-        let edge_rows =
-            self.edge_rows_for_graph_edge_in_tx(tx, source, target, edge_type, snapshot)?;
+        let edge_rows = self.edge_rows_for_graph_edge_in_tx(
+            tx,
+            source,
+            target,
+            edge_type,
+            snapshot,
+            read_memory.clone(),
+        )?;
         if edge_rows.is_empty() {
             return self.reject_graph_edge_without_metadata();
         }
         for (table, row) in edge_rows {
-            self.assert_row_write_allowed(&table, row.row_id, &row.values, snapshot)?;
+            self.assert_row_write_allowed(
+                &table,
+                row.row_id,
+                &row.values,
+                snapshot,
+                read_memory.clone(),
+            )?;
         }
         Ok(())
-    }
-
-    pub(super) fn graph_neighbors_with_orientation(
-        &self,
-        node: NodeId,
-        edge_types: Option<&[EdgeType]>,
-        direction: Direction,
-        snapshot: SnapshotId,
-    ) -> Result<Vec<GatedGraphNeighbor>> {
-        let mut results = Vec::new();
-
-        if matches!(direction, Direction::Outgoing | Direction::Both) {
-            let fwd = self.graph_store.forward_adj.read();
-            if let Some(entries) = fwd.get(&node) {
-                for entry in entries {
-                    if !entry.visible_at(snapshot) {
-                        continue;
-                    }
-                    if let Some(types) = edge_types
-                        && !types.contains(&entry.edge_type)
-                    {
-                        continue;
-                    }
-                    results.push((
-                        entry.target,
-                        entry.edge_type.clone(),
-                        entry.properties.clone(),
-                        entry.source,
-                        entry.target,
-                    ));
-                }
-            }
-        }
-
-        if matches!(direction, Direction::Incoming | Direction::Both) {
-            let rev = self.graph_store.reverse_adj.read();
-            if let Some(entries) = rev.get(&node) {
-                for entry in entries {
-                    if !entry.visible_at(snapshot) {
-                        continue;
-                    }
-                    if let Some(types) = edge_types
-                        && !types.contains(&entry.edge_type)
-                    {
-                        continue;
-                    }
-                    results.push((
-                        entry.source,
-                        entry.edge_type.clone(),
-                        entry.properties.clone(),
-                        entry.source,
-                        entry.target,
-                    ));
-                }
-            }
-        }
-
-        Ok(results)
-    }
-
-    fn graph_neighbors_counted_in_tx(
-        &self,
-        tx: Option<TxId>,
-        node: NodeId,
-        edge_types: Option<&[EdgeType]>,
-        direction: Direction,
-        snapshot: SnapshotId,
-    ) -> Result<(Vec<CountedGraphNeighbor>, u64)> {
-        if !self.access_is_admin() && !self.node_read_allowed_in_tx(tx, node, snapshot)? {
-            return Ok((Vec::new(), 0));
-        }
-
-        let (deleted, staged_inserts) = self.graph_tx_edge_overlay(tx)?;
-
-        let mut candidates = Vec::<CountedGraphNeighbor>::new();
-
-        if matches!(direction, Direction::Outgoing | Direction::Both) {
-            let fwd = self.graph_store.forward_adj.read();
-            if let Some(entries) = fwd.get(&node) {
-                for entry in entries {
-                    if !entry.visible_at(snapshot) {
-                        continue;
-                    }
-                    if let Some(types) = edge_types
-                        && !types.contains(&entry.edge_type)
-                    {
-                        continue;
-                    }
-                    if deleted.contains(&(entry.source, entry.edge_type.clone(), entry.target)) {
-                        continue;
-                    }
-                    candidates.push((
-                        entry.target,
-                        entry.edge_type.clone(),
-                        entry.source,
-                        entry.target,
-                    ));
-                }
-            }
-        }
-
-        if matches!(direction, Direction::Incoming | Direction::Both) {
-            let rev = self.graph_store.reverse_adj.read();
-            if let Some(entries) = rev.get(&node) {
-                for entry in entries {
-                    if !entry.visible_at(snapshot) {
-                        continue;
-                    }
-                    if let Some(types) = edge_types
-                        && !types.contains(&entry.edge_type)
-                    {
-                        continue;
-                    }
-                    if deleted.contains(&(entry.source, entry.edge_type.clone(), entry.target)) {
-                        continue;
-                    }
-                    candidates.push((
-                        entry.source,
-                        entry.edge_type.clone(),
-                        entry.source,
-                        entry.target,
-                    ));
-                }
-            }
-        }
-
-        for entry in staged_inserts {
-            if let Some(types) = edge_types
-                && !types.contains(&entry.edge_type)
-            {
-                continue;
-            }
-            if matches!(direction, Direction::Outgoing | Direction::Both) && entry.source == node {
-                candidates.push((
-                    entry.target,
-                    entry.edge_type.clone(),
-                    entry.source,
-                    entry.target,
-                ));
-            }
-            if matches!(direction, Direction::Incoming | Direction::Both) && entry.target == node {
-                candidates.push((
-                    entry.source,
-                    entry.edge_type.clone(),
-                    entry.source,
-                    entry.target,
-                ));
-            }
-        }
-
-        let mut results = Vec::new();
-        let mut examined = 0_u64;
-        for (neighbor, edge_type, source, target) in candidates {
-            if self
-                .graph_neighbor_read_allowed(tx, neighbor, source, target, &edge_type, snapshot)?
-            {
-                examined += 1;
-                results.push((neighbor, edge_type, source, target));
-            }
-        }
-
-        Ok((results, examined))
     }
 
     /// What copying one staged edge's name out of the transaction costs: the
@@ -2244,6 +3256,10 @@ impl Database {
     /// build a set of every edge a transaction removed before it has been
     /// charged for a single one: the memory a read holds has to follow the
     /// walk it is doing, not the size of the transaction it is walking inside.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn transaction_hides_edge(
         &self,
         tx: Option<TxId>,
@@ -2251,11 +3267,18 @@ impl Database {
         edge_type: &str,
         target: NodeId,
     ) -> Result<bool> {
+        if let Some(captured) = self.captured_graph_decisions() {
+            return Ok(captured
+                .decisions
+                .adj_deletes
+                .iter()
+                .any(|(s, k, t, _)| *s == source && *t == target && k == edge_type));
+        }
         let Some(tx) = tx else {
             return Ok(false);
         };
         let mut hidden = false;
-        self.tx_mgr.with_write_set(tx, |ws| {
+        self.tx_mgr.with_read(tx, |ws| {
             hidden = ws
                 .adj_deletes
                 .iter()
@@ -2266,91 +3289,158 @@ impl Database {
         Ok(hidden)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn transaction_hides_owned_edge(
+        &self,
+        tx: Option<TxId>,
+        edge: &AdjEntry,
+        owner: Option<&contextdb_tx::RowEdgeOwner>,
+    ) -> Result<bool> {
+        if let Some(captured) = self.captured_graph_decisions() {
+            let overlay = contextdb_graph::source::GraphOverlay {
+                inserts: &captured.decisions.adj_inserts,
+                deletes: &captured.decisions.adj_deletes,
+                row_inserts: &captured.decisions.row_adj_inserts,
+                row_deletes: &captured.decisions.row_adj_deletes,
+            };
+            return Ok(overlay.hides_owned(edge, owner));
+        }
+        match (tx, owner) {
+            (Some(tx), Some(owner)) => self.tx_mgr.with_read(tx, |ws| {
+                ws.row_adj_deletes
+                    .iter()
+                    .any(|(before, _)| before.owner == *owner)
+            }),
+            (_, None) => self.transaction_hides_edge(tx, edge.source, &edge.edge_type, edge.target),
+            (None, _) => Ok(false),
+        }
+    }
+
     /// How many edges this transaction has staged, so a walk knows when it has
     /// reached the end of them without holding any of them.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn transaction_staged_edge_count(&self, tx: Option<TxId>) -> Result<usize> {
+        if let Some(captured) = self.captured_graph_decisions() {
+            return Ok(
+                captured.decisions.adj_inserts.len() + captured.decisions.row_adj_inserts.len()
+            );
+        }
         let Some(tx) = tx else {
             return Ok(0);
         };
         let mut count = 0usize;
-        self.tx_mgr.with_write_set(tx, |ws| {
-            count = ws.adj_inserts.len();
+        self.tx_mgr.with_read(tx, |ws| {
+            count = ws.adj_inserts.len() + ws.row_adj_inserts.len();
         })?;
         Ok(count)
     }
 
-    /// One staged edge, read by its index in the transaction's own staged
-    /// edges: who it joins, by what name, and how long that name is -- without
-    /// cloning the name, so the caller can be charged for it before it exists.
-    pub(crate) fn transaction_staged_edge_shape(
+    fn copy_staged_traversal_edge<E: From<Error>>(
         &self,
         tx: Option<TxId>,
         index: usize,
-    ) -> Result<Option<(NodeId, NodeId, usize)>> {
-        let Some(tx) = tx else {
-            return Ok(None);
-        };
-        let mut shape = None;
-        self.tx_mgr.with_write_set(tx, |ws| {
-            shape = ws
-                .adj_inserts
-                .get(index)
-                .map(|entry| (entry.source, entry.target, entry.edge_type.len()));
-        })?;
-        Ok(shape)
-    }
-
-    /// The name of the staged edge at this index, taken once the caller has
-    /// been charged for the bytes `transaction_staged_edge_shape` measured.
-    pub(crate) fn transaction_staged_edge_type(
-        &self,
-        tx: Option<TxId>,
-        index: usize,
-    ) -> Result<Option<EdgeType>> {
-        let Some(tx) = tx else {
-            return Ok(None);
-        };
-        let mut edge_type = None;
-        self.tx_mgr.with_write_set(tx, |ws| {
-            edge_type = ws
-                .adj_inserts
-                .get(index)
-                .map(|entry| entry.edge_type.clone());
-        })?;
-        Ok(edge_type)
-    }
-
-    fn graph_tx_edge_overlay(
-        &self,
-        tx: Option<TxId>,
-    ) -> Result<(HashSet<GraphEdgeKey>, Vec<AdjEntry>)> {
-        let mut deleted = HashSet::<GraphEdgeKey>::new();
-        let mut staged_inserts = Vec::<AdjEntry>::new();
-        if let Some(tx) = tx {
-            self.tx_mgr.with_write_set(tx, |ws| {
-                for (source, edge_type, target, _) in &ws.adj_deletes {
-                    deleted.insert((*source, edge_type.clone(), *target));
-                }
-                staged_inserts.extend(ws.adj_inserts.iter().cloned());
-            })?;
+        before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<(contextdb_graph::mem::StagedTraversalEdge, usize)>, E> {
+        if let Some(captured) = self.captured_graph_decisions() {
+            let read = DatabaseTransactionHost::legacy_read(&captured.decisions);
+            let selected = read.adj_inserts.get(index).map(|e| (e, None)).or_else(|| {
+                index.checked_sub(read.adj_inserts.len()).and_then(|i| {
+                    read.row_adj_inserts
+                        .get(i)
+                        .map(|e| (&e.entry, Some(&e.owner)))
+                })
+            });
+            let Some((edge, owner)) = selected else {
+                return Ok(None);
+            };
+            let bytes = Self::staged_edge_type_bytes(edge.edge_type.len())
+                .saturating_add(owner.map_or(0, |o| o.table.len()));
+            before_retain(bytes)?;
+            return Ok(Some((
+                contextdb_graph::mem::StagedTraversalEdge {
+                    source: edge.source,
+                    target: edge.target,
+                    edge_type: edge.edge_type.clone(),
+                    row_owner: owner.cloned(),
+                },
+                bytes,
+            )));
         }
-        Ok((deleted, staged_inserts))
+        let Some(tx) = tx else {
+            return Ok(None);
+        };
+        self.tx_mgr
+            .with_read(tx, |ws| {
+                let selected = if let Some(edge) = ws.adj_inserts.get(index) {
+                    Some((edge, None))
+                } else {
+                    index.checked_sub(ws.adj_inserts.len()).and_then(|i| {
+                        ws.row_adj_inserts
+                            .get(i)
+                            .map(|owned| (&owned.entry, Some(&owned.owner)))
+                    })
+                };
+                let Some((edge, owner)) = selected else {
+                    return Ok(None);
+                };
+                let bytes = Self::staged_edge_type_bytes(edge.edge_type.len())
+                    .saturating_add(owner.map_or(0, |o| o.table.len()));
+                before_retain(bytes)?;
+                Ok(Some((
+                    contextdb_graph::mem::StagedTraversalEdge {
+                        source: edge.source,
+                        target: edge.target,
+                        edge_type: edge.edge_type.clone(),
+                        row_owner: owner.cloned(),
+                    },
+                    bytes,
+                )))
+            })
+            .map_err(E::from)?
     }
 
-    fn graph_neighbor_read_allowed(
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn transaction_hides_graph_identity(
         &self,
         tx: Option<TxId>,
-        neighbor: NodeId,
         source: NodeId,
         target: NodeId,
-        edge_type: &str,
-        snapshot: SnapshotId,
+        kind: &str,
+        owner: Option<&contextdb_tx::RowEdgeOwner>,
     ) -> Result<bool> {
-        if self.access_is_admin() {
-            return Ok(true);
+        if let Some(captured) = self.captured_graph_decisions() {
+            return Ok(if let Some(owner) = owner {
+                captured
+                    .decisions
+                    .row_adj_deletes
+                    .iter()
+                    .any(|(before, _)| before.owner == *owner)
+            } else {
+                captured
+                    .decisions
+                    .adj_deletes
+                    .iter()
+                    .any(|(s, k, t, _)| *s == source && *t == target && k == kind)
+            });
         }
-        Ok(self.node_read_allowed_in_tx(tx, neighbor, snapshot)?
-            && self.edge_read_allowed_in_tx(tx, source, target, edge_type, snapshot)?)
+        match (tx, owner) {
+            (Some(tx), Some(owner)) => self.tx_mgr.with_read(tx, |ws| {
+                ws.row_adj_deletes
+                    .iter()
+                    .any(|(before, _)| before.owner == *owner)
+            }),
+            (_, None) => self.transaction_hides_edge(tx, source, kind, target),
+            _ => Ok(false),
+        }
     }
 
     /// Decide one traversal candidate for the bounded pull path, charging the
@@ -2364,31 +3454,39 @@ impl Database {
         candidate: GraphScanCandidate,
         edge_type: &str,
         snapshot: SnapshotId,
-        before_access: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.access_is_admin() {
             return Ok(true);
         }
-        Ok(
-            self.bounded_node_read_allowed(tx, candidate.start, snapshot, before_access)?
-                && self.bounded_node_read_allowed(
-                    tx,
-                    candidate.neighbor,
-                    snapshot,
-                    before_access,
-                )?
-                && self.bounded_edge_read_allowed(
-                    tx,
-                    candidate.source,
-                    candidate.target,
-                    edge_type,
-                    snapshot,
-                    before_access,
-                )?,
-        )
+        Ok(self.bounded_node_read_allowed(
+            tx,
+            candidate.start,
+            snapshot,
+            before_access,
+            read_memory.clone(),
+        )? && self.bounded_node_read_allowed(
+            tx,
+            candidate.neighbor,
+            snapshot,
+            before_access,
+            read_memory.clone(),
+        )? && self.bounded_edge_read_allowed(
+            tx,
+            candidate.source,
+            candidate.target,
+            edge_type,
+            snapshot,
+            before_access,
+            read_memory.clone(),
+        )?)
     }
 
     /// The neighbour half of the same decision, for a traversal that reaches a
@@ -2402,47 +3500,59 @@ impl Database {
         target: NodeId,
         edge_type: &str,
         snapshot: SnapshotId,
-        before_access: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.access_is_admin() {
             return Ok(true);
         }
-        Ok(
-            self.bounded_node_read_allowed(tx, neighbor, snapshot, before_access)?
-                && self.bounded_edge_read_allowed(
-                    tx,
-                    source,
-                    target,
-                    edge_type,
-                    snapshot,
-                    before_access,
-                )?,
-        )
+        Ok(self.bounded_node_read_allowed(
+            tx,
+            neighbor,
+            snapshot,
+            before_access,
+            read_memory.clone(),
+        )? && self.bounded_edge_read_allowed(
+            tx,
+            source,
+            target,
+            edge_type,
+            snapshot,
+            before_access,
+            read_memory.clone(),
+        )?)
     }
 
-    fn bounded_node_read_allowed<E>(
+    pub(super) fn bounded_node_read_allowed<E>(
         &self,
         tx: Option<TxId>,
         node: NodeId,
         snapshot: SnapshotId,
-        before_access: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let rows = self
-            .rows_for_node_in_tx(tx, node, snapshot)
+            .rows_for_node_in_tx(tx, node, snapshot, read_memory.clone())
             .map_err(E::from)?;
         for (table, row) in rows {
             if !self.table_has_read_gate(&table).map_err(E::from)? {
                 continue;
             }
-            let Some(meta) = self.table_meta(&table) else {
-                continue;
-            };
+            let meta = self
+                .table_meta(&table)
+                .ok_or_else(|| E::from(Error::TableNotFound(table.clone())))?;
             if !self.bounded_read_allowed_for_row_with_tables(
                 tx,
                 None,
@@ -2450,7 +3560,8 @@ impl Database {
                 &meta,
                 &row,
                 snapshot,
-                |_bytes| before_access(),
+                &mut *before_access,
+                read_memory.clone(),
             )? {
                 return Ok(false);
             }
@@ -2466,13 +3577,24 @@ impl Database {
         target: NodeId,
         edge_type: &str,
         snapshot: SnapshotId,
-        before_access: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let edge_rows = self
-            .edge_rows_for_graph_edge_in_tx(tx, source, target, edge_type, snapshot)
+            .edge_rows_for_graph_edge_in_tx(
+                tx,
+                source,
+                target,
+                edge_type,
+                snapshot,
+                read_memory.clone(),
+            )
             .map_err(E::from)?;
         if edge_rows.is_empty() {
             return Ok(false);
@@ -2483,9 +3605,9 @@ impl Database {
                 visible = true;
                 continue;
             }
-            let Some(meta) = self.table_meta(&table) else {
-                continue;
-            };
+            let meta = self
+                .table_meta(&table)
+                .ok_or_else(|| E::from(Error::TableNotFound(table.clone())))?;
             if !self.bounded_read_allowed_for_row_with_tables(
                 tx,
                 None,
@@ -2493,7 +3615,8 @@ impl Database {
                 &meta,
                 &row,
                 snapshot,
-                |_bytes| before_access(),
+                &mut *before_access,
+                read_memory.clone(),
             )? {
                 return Ok(false);
             }
@@ -2502,185 +3625,66 @@ impl Database {
         Ok(visible)
     }
 
-    fn graph_scan_edge_allowed(
+    fn bounded_owned_edge_read_allowed<E>(
         &self,
         tx: Option<TxId>,
-        candidate: GraphScanCandidate,
-        edge_type: &str,
+        owner: &contextdb_tx::RowEdgeOwner,
         snapshot: SnapshotId,
-    ) -> Result<bool> {
+        before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> std::result::Result<bool, E>
+    where
+        E: From<Error>,
+    {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.access_is_admin() {
             return Ok(true);
         }
-        Ok(self.node_read_allowed_in_tx(tx, candidate.start, snapshot)?
-            && self.node_read_allowed_in_tx(tx, candidate.neighbor, snapshot)?
-            && self.edge_read_allowed_in_tx(
-                tx,
-                candidate.source,
-                candidate.target,
-                edge_type,
-                snapshot,
-            )?)
+        self.assert_table_read_allowed(&owner.table)
+            .map_err(E::from)?;
+        if !self.table_has_read_gate(&owner.table).map_err(E::from)? {
+            return Ok(true);
+        }
+        let callbacks = std::cell::RefCell::new(&mut *before_access);
+        let row = self.bounded_row_by_identity(
+            read_memory.clone(),
+            tx,
+            &owner.table,
+            owner.row_id,
+            snapshot,
+            &mut || (callbacks.borrow_mut())(0),
+            &mut |bytes| (callbacks.borrow_mut())(bytes),
+        )?;
+        let Some(row) = row else {
+            return Err(E::from(Error::SyncError(
+                "visible graph owner has no exact row".into(),
+            )));
+        };
+        if row.created_tx != owner.created_tx || row.lsn != owner.lsn {
+            return Err(E::from(Error::SyncError(
+                "visible graph owner selects a different row version".into(),
+            )));
+        }
+        let meta = self
+            .table_meta(&owner.table)
+            .ok_or_else(|| E::from(Error::TableNotFound(owner.table.clone())))?;
+        self.bounded_read_allowed_for_row_with_tables(
+            tx,
+            None,
+            &owner.table,
+            &meta,
+            &row,
+            snapshot,
+            before_access,
+            read_memory,
+        )
     }
 
-    pub(crate) fn graph_edges_scan_counted(
-        &self,
-        tx: Option<TxId>,
-        edge_types: Option<&[EdgeType]>,
-        direction: Direction,
-        snapshot: SnapshotId,
-    ) -> Result<(Vec<CountedGraphScanEdge>, u64)> {
-        let (deleted, staged_inserts) = self.graph_tx_edge_overlay(tx)?;
-        let mut candidates = Vec::<CountedGraphScanCandidate>::new();
-
-        if matches!(direction, Direction::Outgoing | Direction::Both) {
-            let forward = self.graph_store.forward_adj.read();
-            for entries in forward.values() {
-                for entry in entries {
-                    if !entry.visible_at(snapshot) {
-                        continue;
-                    }
-                    if let Some(types) = edge_types
-                        && !types.contains(&entry.edge_type)
-                    {
-                        continue;
-                    }
-                    if deleted.contains(&(entry.source, entry.edge_type.clone(), entry.target)) {
-                        continue;
-                    }
-                    candidates.push((
-                        GraphScanCandidate {
-                            start: entry.source,
-                            neighbor: entry.target,
-                            source: entry.source,
-                            target: entry.target,
-                        },
-                        entry.edge_type.clone(),
-                        (entry.source, entry.target),
-                    ));
-                }
-            }
-        }
-
-        if matches!(direction, Direction::Incoming | Direction::Both) {
-            let reverse = self.graph_store.reverse_adj.read();
-            for entries in reverse.values() {
-                for entry in entries {
-                    if !entry.visible_at(snapshot) {
-                        continue;
-                    }
-                    if let Some(types) = edge_types
-                        && !types.contains(&entry.edge_type)
-                    {
-                        continue;
-                    }
-                    if deleted.contains(&(entry.source, entry.edge_type.clone(), entry.target)) {
-                        continue;
-                    }
-                    candidates.push((
-                        GraphScanCandidate {
-                            start: entry.target,
-                            neighbor: entry.source,
-                            source: entry.source,
-                            target: entry.target,
-                        },
-                        entry.edge_type.clone(),
-                        (entry.target, entry.source),
-                    ));
-                }
-            }
-        }
-
-        for entry in staged_inserts {
-            if let Some(types) = edge_types
-                && !types.contains(&entry.edge_type)
-            {
-                continue;
-            }
-            if matches!(direction, Direction::Outgoing | Direction::Both) {
-                candidates.push((
-                    GraphScanCandidate {
-                        start: entry.source,
-                        neighbor: entry.target,
-                        source: entry.source,
-                        target: entry.target,
-                    },
-                    entry.edge_type.clone(),
-                    (entry.source, entry.target),
-                ));
-            }
-            if matches!(direction, Direction::Incoming | Direction::Both) {
-                candidates.push((
-                    GraphScanCandidate {
-                        start: entry.target,
-                        neighbor: entry.source,
-                        source: entry.source,
-                        target: entry.target,
-                    },
-                    entry.edge_type.clone(),
-                    (entry.target, entry.source),
-                ));
-            }
-        }
-
-        let mut results = Vec::new();
-        let mut seen = HashSet::<CountedGraphScanEdge>::new();
-        let mut examined = 0_u64;
-        for (candidate, edge_type, edge) in candidates {
-            if self.graph_scan_edge_allowed(tx, candidate, &edge_type, snapshot)? {
-                examined += 1;
-                if seen.insert(edge) {
-                    results.push(edge);
-                }
-            }
-        }
-
-        Ok((results, examined))
-    }
-
-    pub(crate) fn graph_start_nodes_for_match_counted(
-        &self,
-        tx: Option<TxId>,
-        edge_types: Option<&[EdgeType]>,
-        direction: Direction,
-        snapshot: SnapshotId,
-    ) -> Result<(Vec<NodeId>, u64)> {
-        let (edges, examined) =
-            self.graph_edges_scan_counted(tx, edge_types, direction, snapshot)?;
-        let starts = edges
-            .into_iter()
-            .map(|(start, _)| start)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        Ok((starts, examined))
-    }
-
-    pub(crate) fn graph_adjacency_probe_counted(
-        &self,
-        tx: Option<TxId>,
-        start: NodeId,
-        edge_types: Option<&[EdgeType]>,
-        direction: Direction,
-        snapshot: SnapshotId,
-    ) -> Result<(TraversalResult, u64)> {
-        let (neighbors, examined) =
-            self.graph_neighbors_counted_in_tx(tx, start, edge_types, direction, snapshot)?;
-        let mut seen = HashSet::new();
-        let mut nodes = Vec::new();
-        for (neighbor_id, edge_type, _, _) in neighbors {
-            if !seen.insert(neighbor_id) {
-                continue;
-            }
-            nodes.push(TraversalNode {
-                id: neighbor_id,
-                depth: 1,
-                path: vec![(start, edge_type)],
-            });
-        }
-        Ok((TraversalResult { nodes }, examined))
-    }
-
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn graph_bfs_counted(
         &self,
         tx: Option<TxId>,
@@ -2689,63 +3693,98 @@ impl Database {
         direction: Direction,
         depth_range: std::ops::RangeInclusive<u32>,
         snapshot: SnapshotId,
-    ) -> Result<(TraversalResult, u64)> {
-        let min_depth = *depth_range.start();
-        let max_depth = *depth_range.end();
-        if !self.access_is_admin() && !self.node_read_allowed_in_tx(tx, start, snapshot)? {
-            return Ok((TraversalResult { nodes: Vec::new() }, 0));
-        }
 
-        let gated = !self.access_is_admin();
-        let max_visited = if gated { 10_000 } else { 100_000 };
-        let mut visited = HashSet::new();
-        visited.insert(start);
-        let mut queue: VecDeque<GatedBfsEntry> = VecDeque::new();
-        queue.push_back((start, 0, vec![]));
-        let mut result_nodes = Vec::new();
-        let mut examined = 0_u64;
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<(
+        TraversalResult,
+        u64,
+        contextdb_core::read_memory::ReadCredit,
+    )> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        while let Some((current, depth, path)) = queue.pop_front() {
-            if !gated && depth > 0 && depth >= min_depth {
-                result_nodes.push(TraversalNode {
-                    id: current,
-                    depth,
-                    path: path.clone(),
-                });
-            }
-            if depth >= max_depth {
+        use std::cell::{Cell, RefCell};
+        let memory = RefCell::new(contextdb_core::read_memory::ReadCredit::new(
+            read_memory.clone(),
+        ));
+        let examined = Cell::new(0_u64);
+        let cursor = self.bounded_graph_bfs_cursor::<Error>(
+            tx,
+            start,
+            edge_types,
+            direction,
+            *depth_range.start(),
+            *depth_range.end(),
+            snapshot,
+            |_| Ok(()),
+            |bytes| charged_bfs_admit(&mut memory.borrow_mut(), bytes),
+            |bytes| {
+                memory
+                    .borrow_mut()
+                    .try_shrink(bytes)
+                    .expect("graph kernel releases only admitted storage")
+            },
+            read_memory.clone(),
+        )?;
+        let Some(mut cursor) = cursor else {
+            return Ok((
+                TraversalResult { nodes: Vec::new() },
+                0,
+                memory.into_inner(),
+            ));
+        };
+        let cap = if self.access_is_admin() {
+            100_000
+        } else {
+            10_000
+        };
+        let mut nodes = Vec::new();
+        let mut emitted = HashSet::new();
+        let mut emitted_credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+        let single_hop = *depth_range.start() == 1 && *depth_range.end() == 1;
+        while let Some(output) = self.bounded_graph_bfs_next::<Error>(
+            &mut cursor,
+            || Ok(()),
+            || Ok(()),
+            |_| Ok(()),
+            |bytes| charged_bfs_admit(&mut memory.borrow_mut(), bytes),
+            |bytes| {
+                memory
+                    .borrow_mut()
+                    .try_shrink(bytes)
+                    .expect("graph kernel releases only admitted storage")
+            },
+            || Ok(()),
+            |bytes| charged_bfs_admit(&mut memory.borrow_mut(), bytes),
+            |bytes| {
+                memory
+                    .borrow_mut()
+                    .try_shrink(bytes)
+                    .expect("graph kernel releases only admitted storage")
+            },
+            || examined.set(examined.get().saturating_add(1)),
+            Some(cap),
+            tx,
+            read_memory.clone(),
+        )? {
+            if !single_hop && !charged_bfs_visit(&mut emitted, output.node.id, &mut emitted_credit)?
+            {
+                let bytes = output.reserved_bytes;
+                drop(output);
+                memory.borrow_mut().try_shrink(bytes)?;
                 continue;
             }
-            let (neighbors, neighbor_examined) =
-                self.graph_neighbors_counted_in_tx(tx, current, edge_types, direction, snapshot)?;
-            examined += neighbor_examined;
-            for (neighbor_id, edge_type, _, _) in neighbors {
-                let next_depth = depth + 1;
-                let mut new_path = path.clone();
-                new_path.push((current, edge_type));
-                if gated && next_depth >= min_depth {
-                    result_nodes.push(TraversalNode {
-                        id: neighbor_id,
-                        depth: next_depth,
-                        path: new_path.clone(),
-                    });
-                }
-                if neighbor_id == current || visited.contains(&neighbor_id) {
-                    continue;
-                }
-                visited.insert(neighbor_id);
-                if visited.len() > max_visited {
-                    return Err(Error::BfsVisitedExceeded(max_visited));
-                }
-                queue.push_back((neighbor_id, next_depth, new_path));
-            }
+            charged_bfs_vec_space(&mut nodes, &mut memory.borrow_mut())?;
+            nodes.push(output.node);
         }
-
+        memory
+            .borrow_mut()
+            .try_shrink(cursor.into_retained_bytes())?;
+        drop(emitted);
+        drop(emitted_credit);
         Ok((
-            TraversalResult {
-                nodes: result_nodes,
-            },
-            examined,
+            TraversalResult { nodes },
+            examined.get(),
+            memory.into_inner(),
         ))
     }
 
@@ -2761,6 +3800,35 @@ impl Database {
     where
         E: From<Error>,
     {
+        if let Some(root) = self.graph_read_root().map_err(E::from)? {
+            let phase = if matches!(direction, Direction::Outgoing | Direction::Both) {
+                BoundedGraphScanPhase::Forward
+            } else if matches!(direction, Direction::Incoming) {
+                BoundedGraphScanPhase::Reverse
+            } else {
+                BoundedGraphScanPhase::Done
+            };
+            return Ok(BoundedGraphEdgeCursor {
+                forward: Vec::new(),
+                reverse: Vec::new(),
+                phase,
+                direction,
+                staged_position: 0,
+                key_position: 0,
+                edge_position: 0,
+                last_inspected: None,
+                source_end: None,
+                snapshot,
+                retained_bytes: 0,
+                durable: Some(DurableGraphEdgeScan {
+                    row_lane: false,
+                    root,
+                    cursor: None,
+                    last_key: Vec::new(),
+                    has_last_key: false,
+                }),
+            });
+        }
         let forward_adjacency = self.graph_store.forward_adj.read();
         let reverse_adjacency = self.graph_store.reverse_adj.read();
         let forward_len = if matches!(direction, Direction::Outgoing | Direction::Both) {
@@ -2789,19 +3857,19 @@ impl Database {
         }
 
         if forward_len != 0 {
-            for (node, entries) in forward_adjacency.iter() {
-                forward.push((*node, entries.len()));
+            for node in forward_adjacency.keys() {
+                forward.push(*node);
             }
         }
         if reverse_len != 0 {
-            for (node, entries) in reverse_adjacency.iter() {
-                reverse.push((*node, entries.len()));
+            for node in reverse_adjacency.keys() {
+                reverse.push(*node);
             }
         }
         drop(reverse_adjacency);
         drop(forward_adjacency);
-        forward.sort_unstable_by_key(|(node, _)| *node);
-        reverse.sort_unstable_by_key(|(node, _)| *node);
+        forward.sort_unstable();
+        reverse.sort_unstable();
 
         let actual_bytes =
             bounded_graph_cursor_bytes(forward.capacity(), reverse.capacity()).map_err(E::from)?;
@@ -2832,9 +3900,10 @@ impl Database {
             key_position: 0,
             edge_position: 0,
             last_inspected: None,
-            last_emitted: None,
+            source_end: None,
             snapshot,
             retained_bytes: actual_bytes,
+            durable: None,
         })
     }
 
@@ -2842,7 +3911,44 @@ impl Database {
     /// return the next visible oriented edge. A failed callback leaves the
     /// cursor before that edge.
     #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg(test)]
     pub(crate) fn bounded_graph_edge_next<E>(
+        &self,
+        cursor: &mut BoundedGraphEdgeCursor,
+        edge_types: Option<&[EdgeType]>,
+        tx: Option<TxId>,
+        before_edge: impl FnMut() -> std::result::Result<(), E>,
+        before_access: impl FnMut(usize) -> std::result::Result<(), E>,
+        before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
+        release_retained: impl FnMut(usize) -> std::result::Result<(), E>,
+        entry_read: impl FnMut(),
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> std::result::Result<Option<CountedGraphScanEdge>, E>
+    where
+        E: From<Error>,
+    {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        self.bounded_graph_edge_next_with_checkpoint(
+            cursor,
+            edge_types,
+            tx,
+            &|| Ok(()),
+            before_edge,
+            before_access,
+            before_retain,
+            release_retained,
+            entry_read,
+            read_memory,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bounded_graph_edge_next_with_checkpoint<E>(
         &self,
         cursor: &mut BoundedGraphEdgeCursor,
         edge_types: Option<&[EdgeType]>,
@@ -2850,17 +3956,22 @@ impl Database {
         // asked for. Its own staged edges are part of its answer and the edges
         // it removed are not there to be read.
         tx: Option<TxId>,
+        checkpoint: &dyn Fn() -> Result<()>,
         mut before_edge: impl FnMut() -> std::result::Result<(), E>,
-        mut before_access: impl FnMut() -> std::result::Result<(), E>,
+        mut before_access: impl FnMut(usize) -> std::result::Result<(), E>,
         mut before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         mut release_retained: impl FnMut(usize) -> std::result::Result<(), E>,
         // One count per adjacency entry this scan reads, the same figure the
         // walker reports and the same one the uncapped door calls examined.
         mut entry_read: impl FnMut(),
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<CountedGraphScanEdge>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let staged_count = self.transaction_staged_edge_count(tx)?;
         loop {
             if matches!(
@@ -2877,6 +3988,30 @@ impl Database {
                     &mut before_retain,
                     &mut release_retained,
                     &mut entry_read,
+                    read_memory.clone(),
+                )? {
+                    return Ok(Some(edge));
+                }
+                continue;
+            }
+            if cursor.durable.is_some() {
+                if !matches!(
+                    cursor.phase,
+                    BoundedGraphScanPhase::Forward | BoundedGraphScanPhase::Reverse
+                ) {
+                    return Ok(None);
+                }
+                if let Some(edge) = self.bounded_graph_durable_edge_next(
+                    cursor,
+                    edge_types,
+                    tx,
+                    checkpoint,
+                    &mut before_edge,
+                    &mut before_access,
+                    &mut before_retain,
+                    &mut release_retained,
+                    &mut entry_read,
+                    read_memory.clone(),
                 )? {
                     return Ok(Some(edge));
                 }
@@ -2889,7 +4024,7 @@ impl Database {
                 | BoundedGraphScanPhase::StagedReverse
                 | BoundedGraphScanPhase::Done => return Ok(None),
             };
-            let Some((key, captured_end)) = keys.get(cursor.key_position).copied() else {
+            let Some(key) = keys.get(cursor.key_position).copied() else {
                 cursor.phase = match cursor.phase {
                     BoundedGraphScanPhase::Forward if !cursor.reverse.is_empty() => {
                         BoundedGraphScanPhase::Reverse
@@ -2904,37 +4039,17 @@ impl Database {
                 cursor.key_position = 0;
                 cursor.edge_position = 0;
                 release_bounded_edge_anchor(
-                    &mut cursor.last_inspected,
+                    &mut cursor.source_end,
                     &mut cursor.retained_bytes,
                     &mut release_retained,
                 )?;
                 release_bounded_edge_anchor(
-                    &mut cursor.last_emitted,
+                    &mut cursor.last_inspected,
                     &mut cursor.retained_bytes,
                     &mut release_retained,
                 )?;
                 continue;
             };
-            if cursor.edge_position >= captured_end {
-                cursor.key_position = cursor.key_position.checked_add(1).ok_or_else(|| {
-                    E::from(Error::Other(
-                        "bounded graph edge-source key position overflow".to_string(),
-                    ))
-                })?;
-                cursor.edge_position = 0;
-                release_bounded_edge_anchor(
-                    &mut cursor.last_inspected,
-                    &mut cursor.retained_bytes,
-                    &mut release_retained,
-                )?;
-                release_bounded_edge_anchor(
-                    &mut cursor.last_emitted,
-                    &mut cursor.retained_bytes,
-                    &mut release_retained,
-                )?;
-                continue;
-            }
-
             let adjacency = match cursor.phase {
                 BoundedGraphScanPhase::Forward => &self.graph_store.forward_adj,
                 BoundedGraphScanPhase::Reverse => &self.graph_store.reverse_adj,
@@ -2944,23 +4059,18 @@ impl Database {
             };
             let entries_guard = adjacency.read();
             let Some(entries) = entries_guard.get(&key) else {
-                // Maintenance removed every entry under this key. An edge
-                // visible at this continuation's registered snapshot is never
-                // physically removed, so an emitted anchor cannot be missing;
-                // with nothing emitted here, the key held only entries this
-                // snapshot could not see, and the walk moves on.
-                if cursor.last_emitted.is_some() {
-                    return Err(E::from(bounded_continuation_lost(
-                        "every edge under this source was removed while the read was suspended",
-                    )));
-                }
                 drop(entries_guard);
                 cursor.key_position = cursor.key_position.checked_add(1).ok_or_else(|| {
                     E::from(Error::Other(
-                        "bounded graph edge-source key position overflow".to_string(),
+                        ("bounded graph edge-source key position overflow".to_string()).into(),
                     ))
                 })?;
                 cursor.edge_position = 0;
+                release_bounded_edge_anchor(
+                    &mut cursor.source_end,
+                    &mut cursor.retained_bytes,
+                    &mut release_retained,
+                )?;
                 release_bounded_edge_anchor(
                     &mut cursor.last_inspected,
                     &mut cursor.retained_bytes,
@@ -2969,125 +4079,47 @@ impl Database {
                 continue;
             };
 
-            // Re-anchor by identity when this key's vector was compacted
-            // under the suspended continuation. Validating the anchor
-            // re-reads only the identity of an entry already charged on an
-            // earlier pull; each relocation candidate is charged before its
-            // identity is read.
-            if let (Some(anchor_position), Some(anchor)) = (
-                cursor.edge_position.checked_sub(1),
-                cursor.last_inspected.as_ref(),
+            let incoming = matches!(cursor.phase, BoundedGraphScanPhase::Reverse);
+            if cursor.source_end.is_none()
+                && let Some(end) = entries.last()
+            {
+                set_bounded_edge_anchor(
+                    &mut cursor.source_end,
+                    &mut cursor.retained_bytes,
+                    BoundedEdgeIdentity {
+                        row_owner: end.row_owner.as_ref(),
+                        source: end.source,
+                        target: end.target,
+                        edge_type: &end.edge_type,
+                        created_tx: end.created_tx,
+                        lsn: end.lsn,
+                    },
+                    &mut before_retain,
+                    &mut release_retained,
+                )?;
+            }
+            // Fallible partition_point: every actual binary-search comparison
+            // spends work before reading the candidate identity.
+            if let Some(anchor) = cursor.last_inspected.as_ref() {
+                let (mut low, mut high) = (0, entries.len());
+                while low < high {
+                    before_edge()?;
+                    let mid = low + (high - low) / 2;
+                    if anchor.compare(&entries[mid], incoming).is_ge() {
+                        low = mid + 1;
+                    } else {
+                        high = mid;
+                    }
+                }
+                cursor.edge_position = low;
+            }
+            if let (Some(end), Some(next)) = (
+                cursor.source_end.as_ref(),
+                entries.get(cursor.edge_position),
             ) {
-                let anchored = entries
-                    .get(anchor_position)
-                    .is_some_and(|entry| anchor.matches(entry));
-                if !anchored {
-                    let mut found = None;
-                    if !entries.is_empty() {
-                        let mut candidate = anchor_position.min(entries.len() - 1);
-                        loop {
-                            before_edge()?;
-                            let entry = &entries[candidate];
-                            if anchor.matches(entry) {
-                                found = Some((candidate, true));
-                                break;
-                            }
-                            if cursor
-                                .last_emitted
-                                .as_ref()
-                                .is_some_and(|emitted| emitted.matches(entry))
-                            {
-                                found = Some((candidate, false));
-                                break;
-                            }
-                            let Some(next) = candidate.checked_sub(1) else {
-                                break;
-                            };
-                            candidate = next;
-                        }
-                    }
-                    match found {
-                        Some((position, exact)) => {
-                            if exact {
-                                // Every removed slot below the anchor
-                                // tightens the captured end by the same
-                                // amount; the end only ever
-                                // over-approximates, so no entry the
-                                // snapshot can see is cut off.
-                                let adjusted =
-                                    captured_end.saturating_sub(anchor_position - position);
-                                match cursor.phase {
-                                    BoundedGraphScanPhase::Forward => {
-                                        cursor.forward[cursor.key_position].1 = adjusted;
-                                    }
-                                    BoundedGraphScanPhase::Reverse => {
-                                        cursor.reverse[cursor.key_position].1 = adjusted;
-                                    }
-                                    BoundedGraphScanPhase::StagedForward
-                                    | BoundedGraphScanPhase::StagedReverse
-                                    | BoundedGraphScanPhase::Done => {}
-                                }
-                            } else {
-                                // Resume from the emitted anchor: the entries
-                                // between it and the lost inspected anchor
-                                // were all invisible or filtered, so
-                                // re-inspecting them is deterministic
-                                // re-filtering, never a duplicate emission.
-                                let emitted = cursor.last_emitted.take().ok_or_else(|| {
-                                    E::from(bounded_continuation_lost(
-                                        "the edge this read left off at was removed while it was \
-                                         suspended",
-                                    ))
-                                })?;
-                                let copied = retain_bounded_edge_anchor(
-                                    BoundedEdgeIdentity {
-                                        source: emitted.source,
-                                        target: emitted.target,
-                                        edge_type: &emitted.edge_type,
-                                        created_tx: emitted.created_tx,
-                                        lsn: emitted.lsn,
-                                    },
-                                    &mut before_retain,
-                                    &mut release_retained,
-                                );
-                                cursor.last_emitted = Some(emitted);
-                                let (copy, bytes) = copied?;
-                                release_bounded_edge_anchor(
-                                    &mut cursor.last_inspected,
-                                    &mut cursor.retained_bytes,
-                                    &mut release_retained,
-                                )?;
-                                cursor.last_inspected = Some(copy);
-                                cursor.retained_bytes =
-                                    cursor.retained_bytes.checked_add(bytes).ok_or_else(|| {
-                                        E::from(Error::Other(
-                                            "bounded graph edge anchor accounting overflow"
-                                                .to_string(),
-                                        ))
-                                    })?;
-                            }
-                            cursor.edge_position = position.checked_add(1).ok_or_else(|| {
-                                E::from(Error::Other(
-                                    "bounded graph edge-source position overflow".to_string(),
-                                ))
-                            })?;
-                        }
-                        None => {
-                            if cursor.last_emitted.is_some() {
-                                return Err(E::from(bounded_continuation_lost(
-                                    "every edge under this source was removed while the read was \
-                                     suspended",
-                                )));
-                            }
-                            cursor.edge_position = 0;
-                            release_bounded_edge_anchor(
-                                &mut cursor.last_inspected,
-                                &mut cursor.retained_bytes,
-                                &mut release_retained,
-                            )?;
-                        }
-                    }
-                    continue;
+                before_edge()?;
+                if end.compare(next, incoming).is_lt() {
+                    cursor.edge_position = entries.len();
                 }
             }
 
@@ -3098,17 +4130,17 @@ impl Database {
                 drop(entries_guard);
                 cursor.key_position = cursor.key_position.checked_add(1).ok_or_else(|| {
                     E::from(Error::Other(
-                        "bounded graph edge-source key position overflow".to_string(),
+                        ("bounded graph edge-source key position overflow".to_string()).into(),
                     ))
                 })?;
                 cursor.edge_position = 0;
                 release_bounded_edge_anchor(
-                    &mut cursor.last_inspected,
+                    &mut cursor.source_end,
                     &mut cursor.retained_bytes,
                     &mut release_retained,
                 )?;
                 release_bounded_edge_anchor(
-                    &mut cursor.last_emitted,
+                    &mut cursor.last_inspected,
                     &mut cursor.retained_bytes,
                     &mut release_retained,
                 )?;
@@ -3120,27 +4152,16 @@ impl Database {
             let entry = &entries[cursor.edge_position];
             let next_position = cursor.edge_position.checked_add(1).ok_or_else(|| {
                 E::from(Error::Other(
-                    "bounded graph edge-source position overflow".to_string(),
+                    ("bounded graph edge-source position overflow".to_string()).into(),
                 ))
             })?;
-            // Anchor the continuation on the entry being inspected, emitted
-            // or not: the resume point is strictly after the last inspected
-            // identity, so a skipped entry is never re-charged and an
-            // emitted one is never re-emitted.
-            install_bounded_inspected_anchor(
-                cursor,
-                BoundedEdgeIdentity {
-                    source: entry.source,
-                    target: entry.target,
-                    edge_type: &entry.edge_type,
-                    created_tx: entry.created_tx,
-                    lsn: entry.lsn,
-                },
-                &mut before_retain,
-                &mut release_retained,
-            )?;
             let visible = entry.visible_at(cursor.snapshot);
             let type_allowed = edge_types.is_none_or(|types| types.contains(&entry.edge_type));
+            // A Both scan already emitted this physical self-loop in its
+            // forward phase. Distinct parallel edges remain distinct bindings.
+            let repeated_self_loop = matches!(cursor.direction, Direction::Both)
+                && matches!(cursor.phase, BoundedGraphScanPhase::Reverse)
+                && entry.source == entry.target;
             let oriented = match cursor.phase {
                 BoundedGraphScanPhase::Forward if entry.source == key => {
                     Some((entry.source, entry.target))
@@ -3157,21 +4178,47 @@ impl Database {
             let hidden_by_tx = visible
                 && type_allowed
                 && oriented.is_some()
-                && self.transaction_hides_edge(tx, entry.source, &entry.edge_type, entry.target)?;
-            if !visible || !type_allowed || oriented.is_none() || hidden_by_tx {
+                && self.transaction_hides_owned_edge(tx, entry, entry.row_owner.as_ref())?;
+            if !visible || !type_allowed || oriented.is_none() || hidden_by_tx || repeated_self_loop
+            {
+                install_bounded_inspected_anchor(
+                    cursor,
+                    BoundedEdgeIdentity {
+                        row_owner: entry.row_owner.as_ref(),
+                        source: entry.source,
+                        target: entry.target,
+                        edge_type: &entry.edge_type,
+                        created_tx: entry.created_tx,
+                        lsn: entry.lsn,
+                    },
+                    &mut before_retain,
+                    &mut release_retained,
+                )?;
                 drop(entries_guard);
                 cursor.edge_position = next_position;
                 continue;
             }
             let oriented = oriented.ok_or_else(|| {
                 E::from(Error::Other(
-                    "bounded graph edge source lost its orientation".to_string(),
+                    ("bounded graph edge source lost its orientation".to_string()).into(),
                 ))
             })?;
             if self.access_is_admin() {
+                install_bounded_inspected_anchor(
+                    cursor,
+                    BoundedEdgeIdentity {
+                        row_owner: entry.row_owner.as_ref(),
+                        source: entry.source,
+                        target: entry.target,
+                        edge_type: &entry.edge_type,
+                        created_tx: entry.created_tx,
+                        lsn: entry.lsn,
+                    },
+                    &mut before_retain,
+                    &mut release_retained,
+                )?;
                 drop(entries_guard);
                 cursor.edge_position = next_position;
-                note_bounded_edge_emitted(cursor, &mut before_retain, &mut release_retained)?;
                 return Ok(Some(oriented));
             }
 
@@ -3181,32 +4228,316 @@ impl Database {
                 source: entry.source,
                 target: entry.target,
             };
+            let (candidate_anchor, candidate_bytes) = retain_bounded_edge_anchor(
+                BoundedEdgeIdentity {
+                    row_owner: entry.row_owner.as_ref(),
+                    source: entry.source,
+                    target: entry.target,
+                    edge_type: &entry.edge_type,
+                    created_tx: entry.created_tx,
+                    lsn: entry.lsn,
+                },
+                &mut before_retain,
+                &mut release_retained,
+            )?;
             drop(entries_guard);
 
-            before_access()?;
-            // The inspected anchor installed above already holds this edge's
-            // type in memory this read has been charged for, so the decision
-            // reads it there instead of taking a second copy of the same text
-            // for every edge the traversal steps over.
-            let snapshot = cursor.snapshot;
-            let anchored_edge_type = cursor.last_inspected.as_ref().ok_or_else(|| {
-                E::from(Error::Other(
-                    "bounded graph edge continuation lost its inspected anchor".to_string(),
-                ))
-            })?;
-            let allowed = self.bounded_graph_scan_edge_allowed(
-                tx,
-                candidate,
-                &anchored_edge_type.edge_type,
-                snapshot,
-                &mut before_access,
-            )?;
+            let decided = (|| -> std::result::Result<bool, E> {
+                before_access(0)?;
+                let snapshot = cursor.snapshot;
+                let anchored_edge_type = &candidate_anchor;
+                let allowed = if let Some(owner) = &anchored_edge_type.row_owner {
+                    self.bounded_node_read_allowed(
+                        tx,
+                        oriented.0,
+                        snapshot,
+                        &mut before_access,
+                        read_memory.clone(),
+                    )? && self.bounded_node_read_allowed(
+                        tx,
+                        oriented.1,
+                        snapshot,
+                        &mut before_access,
+                        read_memory.clone(),
+                    )? && self.bounded_owned_edge_read_allowed(
+                        tx,
+                        owner,
+                        snapshot,
+                        &mut before_access,
+                        read_memory.clone(),
+                    )?
+                } else {
+                    self.bounded_graph_scan_edge_allowed(
+                        tx,
+                        candidate,
+                        &anchored_edge_type.edge_type,
+                        snapshot,
+                        &mut before_access,
+                        read_memory.clone(),
+                    )?
+                };
+                Ok(allowed)
+            })();
+            let allowed = match decided {
+                Ok(allowed) => allowed,
+                Err(error) => {
+                    drop(candidate_anchor);
+                    release_retained(candidate_bytes)?;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = release_bounded_edge_anchor(
+                &mut cursor.last_inspected,
+                &mut cursor.retained_bytes,
+                &mut release_retained,
+            ) {
+                drop(candidate_anchor);
+                release_retained(candidate_bytes)?;
+                return Err(error);
+            }
+            cursor.last_inspected = Some(candidate_anchor);
+            cursor.retained_bytes = cursor
+                .retained_bytes
+                .checked_add(candidate_bytes)
+                .ok_or_else(|| E::from(Error::Other("graph anchor accounting overflow".into())))?;
             cursor.edge_position = next_position;
             if allowed {
-                note_bounded_edge_emitted(cursor, &mut before_retain, &mut release_retained)?;
                 return Ok(Some(oriented));
             }
         }
+    }
+
+    /// One committed edge from a durable writer's captured root in the
+    /// current committed phase, or `None` once that phase is finished and the
+    /// cursor has moved to the next one. Every entry is charged before it is
+    /// read; the continuation key advances only after the entry is fully
+    /// decided, so a refused pull re-reads that entry instead of losing it.
+    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn bounded_graph_durable_edge_next<E>(
+        &self,
+        cursor: &mut BoundedGraphEdgeCursor,
+        edge_types: Option<&[EdgeType]>,
+        tx: Option<TxId>,
+        checkpoint: &dyn Fn() -> Result<()>,
+        before_edge: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+        before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+        release_retained: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+        entry_read: &mut impl FnMut(),
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> std::result::Result<Option<CountedGraphScanEdge>, E>
+    where
+        E: From<Error>,
+    {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        let reverse = match cursor.phase {
+            BoundedGraphScanPhase::Forward => false,
+            BoundedGraphScanPhase::Reverse => true,
+            _ => return Ok(None),
+        };
+        loop {
+            before_edge()?;
+            let durable = cursor.durable.as_mut().ok_or_else(|| {
+                E::from(Error::Other(
+                    ("bounded graph edge scan lost its durable source".to_string()).into(),
+                ))
+            })?;
+            if durable.cursor.is_none() {
+                let lower = if durable.has_last_key {
+                    std::ops::Bound::Excluded(durable.last_key.as_slice())
+                } else {
+                    std::ops::Bound::Unbounded
+                };
+                durable.cursor = Some(
+                    durable
+                        .root
+                        .cursor_lane(
+                            reverse,
+                            durable.row_lane,
+                            lower,
+                            std::ops::Bound::Unbounded,
+                            read_memory.clone(),
+                        )
+                        .map_err(E::from)?,
+                );
+            }
+            let next = durable
+                .cursor
+                .as_mut()
+                .map(|live| live.next_edge_with(checkpoint))
+                .transpose();
+            let window = match next {
+                Ok(window) => window.flatten(),
+                Err(error) => {
+                    durable.cursor = None;
+                    return Err(E::from(error));
+                }
+            };
+            let Some(window) = window else {
+                // This orientation is finished; its continuation key is spent.
+                durable.cursor = None;
+                durable.has_last_key = false;
+                let held = durable.last_key.capacity();
+                durable.last_key = Vec::new();
+                cursor.retained_bytes = cursor.retained_bytes.saturating_sub(held);
+                if held > 0 {
+                    release_retained(held)?;
+                }
+                if !durable.row_lane {
+                    durable.row_lane = true;
+                    continue;
+                }
+                durable.row_lane = false;
+                cursor.phase = match cursor.phase {
+                    BoundedGraphScanPhase::Forward
+                        if matches!(cursor.direction, Direction::Both) =>
+                    {
+                        BoundedGraphScanPhase::Reverse
+                    }
+                    _ => bounded_graph_first_staged_phase(cursor.direction),
+                };
+                return Ok(None);
+            };
+            entry_read();
+            let decided = self.bounded_graph_durable_edge_decide(
+                cursor,
+                window.edge(),
+                window.row_owner(),
+                reverse,
+                edge_types,
+                tx,
+                before_access,
+                read_memory.clone(),
+            );
+            let emitted = match decided {
+                Ok(emitted) => emitted,
+                Err(error) => {
+                    if let Some(durable) = cursor.durable.as_mut() {
+                        durable.cursor = None;
+                    }
+                    return Err(error);
+                }
+            };
+            // Move the continuation onto this entry, reusing the buffer it
+            // already holds and charging only growth.
+            let position = window.position();
+            let durable = cursor.durable.as_mut().ok_or_else(|| {
+                E::from(Error::Other(
+                    ("bounded graph edge scan lost its durable source".to_string()).into(),
+                ))
+            })?;
+            let held = durable.last_key.capacity();
+            if position.len() > held {
+                let growth = position.len() - held;
+                if let Err(error) = before_retain(growth) {
+                    durable.cursor = None;
+                    return Err(error);
+                }
+                if durable.last_key.try_reserve_exact(growth).is_err() {
+                    durable.cursor = None;
+                    release_retained(growth)?;
+                    return Err(E::from(bounded_memory_refusal(growth)));
+                }
+                let actual = durable.last_key.capacity();
+                if actual > position.len()
+                    && let Err(error) = before_retain(actual - position.len())
+                {
+                    durable.cursor = None;
+                    return Err(error);
+                }
+                cursor.retained_bytes = cursor
+                    .retained_bytes
+                    .saturating_add(actual.saturating_sub(held));
+            }
+            durable.last_key.clear();
+            durable.last_key.extend_from_slice(position);
+            durable.has_last_key = true;
+            if let Some(edge) = emitted {
+                return Ok(Some(edge));
+            }
+        }
+    }
+
+    /// Decide one committed durable edge: the oriented pair when this read may
+    /// see it, `None` when it is invisible, filtered, hidden by the reader's
+    /// own transaction, or denied by the node/edge gates.
+    fn bounded_graph_durable_edge_decide<E>(
+        &self,
+        cursor: &BoundedGraphEdgeCursor,
+        entry: &AdjEntry,
+        owner: Option<&contextdb_tx::RowEdgeOwner>,
+        reverse: bool,
+        edge_types: Option<&[EdgeType]>,
+        tx: Option<TxId>,
+        before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> std::result::Result<Option<CountedGraphScanEdge>, E>
+    where
+        E: From<Error>,
+    {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        if (reverse && matches!(cursor.direction, Direction::Both) && entry.source == entry.target)
+            || !entry.visible_at(cursor.snapshot)
+            || edge_types.is_some_and(|types| !types.contains(&entry.edge_type))
+            || self
+                .transaction_hides_owned_edge(tx, entry, owner)
+                .map_err(E::from)?
+        {
+            return Ok(None);
+        }
+        let oriented = if reverse {
+            (entry.target, entry.source)
+        } else {
+            (entry.source, entry.target)
+        };
+        if self.access_is_admin() {
+            return Ok(Some(oriented));
+        }
+        before_access(0)?;
+        if let Some(owner) = owner {
+            let allowed = self.bounded_node_read_allowed(
+                tx,
+                oriented.0,
+                cursor.snapshot,
+                before_access,
+                read_memory.clone(),
+            )? && self.bounded_node_read_allowed(
+                tx,
+                oriented.1,
+                cursor.snapshot,
+                before_access,
+                read_memory.clone(),
+            )? && self.bounded_owned_edge_read_allowed(
+                tx,
+                owner,
+                cursor.snapshot,
+                before_access,
+                read_memory,
+            )?;
+            return Ok(allowed.then_some(oriented));
+        }
+        let allowed = self.bounded_graph_scan_edge_allowed(
+            tx,
+            GraphScanCandidate {
+                start: oriented.0,
+                neighbor: oriented.1,
+                source: entry.source,
+                target: entry.target,
+            },
+            &entry.edge_type,
+            cursor.snapshot,
+            before_access,
+            read_memory.clone(),
+        )?;
+        Ok(allowed.then_some(oriented))
     }
 
     /// One edge this transaction staged, in the orientation the current phase
@@ -3225,80 +4556,97 @@ impl Database {
         staged_count: usize,
         edge_types: Option<&[EdgeType]>,
         before_edge: &mut impl FnMut() -> std::result::Result<(), E>,
-        before_access: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
         before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: &mut impl FnMut(usize) -> std::result::Result<(), E>,
         entry_read: &mut impl FnMut(),
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<CountedGraphScanEdge>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         while cursor.staged_position < staged_count {
             before_edge()?;
             let index = cursor.staged_position;
-            cursor.staged_position = cursor.staged_position.checked_add(1).ok_or_else(|| {
-                E::from(Error::Other(
-                    "bounded graph staged edge position overflow".to_string(),
-                ))
-            })?;
-            let Some((source, target, type_len)) = self
-                .transaction_staged_edge_shape(tx, index)
-                .map_err(E::from)?
+            let Some((edge, bytes)) = self.copy_staged_traversal_edge(tx, index, before_retain)?
             else {
                 break;
             };
-            // Charged before it is taken, measured where it still lives rather
-            // than after a copy of it already exists.
-            let name_bytes = Self::staged_edge_type_bytes(type_len);
-            before_retain(name_bytes)?;
-            let Some(edge_type) = self
-                .transaction_staged_edge_type(tx, index)
-                .map_err(E::from)?
-            else {
-                release_retained(name_bytes)?;
-                break;
-            };
-            // An edge this transaction staged and then removed was never there
-            // to walk.
-            let usable = edge_types.is_none_or(|types| types.contains(&edge_type))
-                && !self
-                    .transaction_hides_edge(tx, source, &edge_type, target)
-                    .map_err(E::from)?;
-            if !usable {
-                release_retained(name_bytes)?;
-                continue;
-            }
-            // Counted on the same rule a committed entry is: an edge this walk
-            // really read, whatever it then decides about it.
-            entry_read();
             let oriented = match cursor.phase {
-                BoundedGraphScanPhase::StagedForward => (source, target),
-                BoundedGraphScanPhase::StagedReverse => (target, source),
+                BoundedGraphScanPhase::StagedForward => (edge.source, edge.target),
+                BoundedGraphScanPhase::StagedReverse => (edge.target, edge.source),
                 _ => {
-                    release_retained(name_bytes)?;
+                    release_retained(bytes)?;
                     return Ok(None);
                 }
             };
-            if self.access_is_admin() {
-                release_retained(name_bytes)?;
-                return Ok(Some(oriented));
-            }
-            before_access()?;
-            let candidate = GraphScanCandidate {
-                start: oriented.0,
-                neighbor: oriented.1,
-                source,
-                target,
-            };
-            let allowed = self.bounded_graph_scan_edge_allowed(
-                tx,
-                candidate,
-                &edge_type,
-                cursor.snapshot,
-                before_access,
-            );
-            release_retained(name_bytes)?;
-            if allowed? {
+            let decided = (|| {
+                if (matches!(cursor.direction, Direction::Both)
+                    && matches!(cursor.phase, BoundedGraphScanPhase::StagedReverse)
+                    && edge.source == edge.target)
+                    || edge_types.is_some_and(|types| !types.contains(&edge.edge_type))
+                    || self
+                        .transaction_hides_graph_identity(
+                            tx,
+                            edge.source,
+                            edge.target,
+                            &edge.edge_type,
+                            edge.row_owner.as_ref(),
+                        )
+                        .map_err(E::from)?
+                {
+                    return Ok(false);
+                }
+                entry_read();
+                if self.access_is_admin() {
+                    return Ok(true);
+                }
+                before_access(0)?;
+                if let Some(owner) = &edge.row_owner {
+                    return Ok(self.bounded_node_read_allowed(
+                        tx,
+                        oriented.0,
+                        cursor.snapshot,
+                        before_access,
+                        read_memory.clone(),
+                    )? && self.bounded_node_read_allowed(
+                        tx,
+                        oriented.1,
+                        cursor.snapshot,
+                        before_access,
+                        read_memory.clone(),
+                    )? && self.bounded_owned_edge_read_allowed(
+                        tx,
+                        owner,
+                        cursor.snapshot,
+                        before_access,
+                        read_memory.clone(),
+                    )?);
+                }
+                self.bounded_graph_scan_edge_allowed(
+                    tx,
+                    GraphScanCandidate {
+                        start: oriented.0,
+                        neighbor: oriented.1,
+                        source: edge.source,
+                        target: edge.target,
+                    },
+                    &edge.edge_type,
+                    cursor.snapshot,
+                    before_access,
+                    read_memory.clone(),
+                )
+            })();
+            drop(edge);
+            release_retained(bytes)?;
+            let allowed = decided?;
+            cursor.staged_position = index
+                .checked_add(1)
+                .ok_or_else(|| E::from(Error::Other("staged graph position overflow".into())))?;
+            if allowed {
                 return Ok(Some(oriented));
             }
         }
@@ -3330,32 +4678,54 @@ impl Database {
         min_depth: u32,
         max_depth: u32,
         snapshot: SnapshotId,
-        mut before_access: impl FnMut() -> std::result::Result<(), E>,
-        before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
-        release_retained: impl FnMut(usize),
-    ) -> std::result::Result<Option<contextdb_graph::mem::BoundedBfsCursor>, E>
+        mut before_access: impl FnMut(usize) -> std::result::Result<(), E>,
+        mut before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
+        mut release_retained: impl FnMut(usize),
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> std::result::Result<Option<crate::database::EngineGraphBfsCursor>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        let lease = self
+            .graph_cursor_read_guard(tx, read_memory.clone())
+            .map_err(E::from)?;
+        let _decisions = lease.as_ref().map(|capture| capture.enter());
         let gated = !self.access_is_admin();
         if gated {
-            before_access()?;
-            if !self.bounded_node_read_allowed(tx, start, snapshot, &mut before_access)? {
+            before_access(0)?;
+            if !self.bounded_node_read_allowed(
+                tx,
+                start,
+                snapshot,
+                &mut before_access,
+                read_memory.clone(),
+            )? {
                 return Ok(None);
             }
         }
-        self.graph
-            .bounded_bfs_cursor(
-                start,
-                edge_types,
-                direction,
-                min_depth,
-                max_depth,
-                snapshot,
-                before_retain,
-                release_retained,
-            )
-            .map(Some)
+        let inner = self.graph.bounded_bfs_cursor_at_source(
+            start,
+            edge_types,
+            direction,
+            min_depth,
+            max_depth,
+            snapshot,
+            self.graph_snapshot(snapshot, read_memory.clone())
+                .map_err(E::from)?,
+            &mut before_retain,
+            &mut release_retained,
+        )?;
+        let retained = inner.retained_bytes();
+        match self.wrap_graph_bfs_cursor(tx, inner, lease, read_memory) {
+            Ok(cursor) => Ok(Some(cursor)),
+            Err(error) => {
+                release_retained(retained);
+                Err(E::from(error))
+            }
+        }
     }
 
     /// Advance one bounded graph continuation without materializing the rest
@@ -3364,10 +4734,10 @@ impl Database {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn bounded_graph_bfs_next<E>(
         &self,
-        cursor: &mut contextdb_graph::mem::BoundedBfsCursor,
+        cursor: &mut crate::database::EngineGraphBfsCursor,
         before_edge: impl FnMut() -> std::result::Result<(), E>,
         before_path_element: impl FnMut() -> std::result::Result<(), E>,
-        mut before_access: impl FnMut() -> std::result::Result<(), E>,
+        mut before_access: impl FnMut(usize) -> std::result::Result<(), E>,
         before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: impl FnMut(usize),
         // The staged source's own accounting: one work charge for every staged
@@ -3388,35 +4758,60 @@ impl Database {
         // walk that asks the store which one is active is told none and steps
         // over the caller's own staged edges.
         tx: Option<TxId>,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<contextdb_graph::mem::BoundedTraversalNode>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        let capture = cursor.lease.clone();
+        let _decisions = capture.as_ref().map(|capture| capture.enter());
+        if let Some(captured) = self.captured_graph_decisions()
+            && let Err(error) = captured.check()
+        {
+            cursor.lease.take();
+            return Err(E::from(error));
+        }
         let gated = !self.access_is_admin();
         let snapshot = cursor.snapshot();
-        // Nothing about the transaction is read into memory up front. Whether
-        // an edge was removed is asked one edge at a time, and the edges it
-        // staged are resumed by index rather than gathered -- so a walk inside
-        // a transaction holds what the walk holds, never what the transaction
-        // holds.
-        let staged_count = self.transaction_staged_edge_count(tx)?;
-        self.graph.bounded_bfs_next_including_staged(
-            cursor,
+        // Rows remain in captured canonical custody; ranks and delete/ACL
+        // decisions come from the same immutable transaction revision.
+        let forward = &cursor.forward;
+        let reverse = &cursor.reverse;
+        let result = self.graph.bounded_bfs_next_including_staged_with_bindings(
+            &mut cursor.inner,
             before_edge,
             before_path_element,
             before_retain,
             release_retained,
-            |neighbor, source, target, edge_type| {
+            |neighbor, source, target, edge_type, owner| {
                 // Two separate questions, asked in the order that costs least.
                 // An edge this transaction removed is not there to be read at
                 // all, whoever is asking; only then does who is asking matter.
-                if self.transaction_hides_edge(tx, source, edge_type, target)? {
+                if self.transaction_hides_graph_identity(tx, source, target, edge_type, owner)? {
                     return Ok(false);
                 }
                 if !gated {
                     return Ok(true);
                 }
-                before_access()?;
+                before_access(0)?;
+                if let Some(owner) = owner {
+                    return Ok(self.bounded_node_read_allowed(
+                        tx,
+                        neighbor,
+                        snapshot,
+                        &mut before_access,
+                        read_memory.clone(),
+                    )? && self.bounded_owned_edge_read_allowed(
+                        tx,
+                        owner,
+                        snapshot,
+                        &mut before_access,
+                        read_memory.clone(),
+                    )?);
+                }
                 self.bounded_graph_neighbor_read_allowed(
                     tx,
                     neighbor,
@@ -3425,71 +4820,102 @@ impl Database {
                     edge_type,
                     snapshot,
                     &mut before_access,
+                    read_memory.clone(),
                 )
+            },
+            |owner| {
+                self.row_graph_aliases_standalone(tx, owner, snapshot, read_memory.clone())
+                    .map_err(E::from)
             },
             |node, direction, from| {
                 // Walk forward from where the traversal left off, charging for
                 // each staged edge stepped over and stopping at the first one
                 // that reaches out of this node and that this same transaction
                 // has not since removed.
+                let order = if direction == Direction::Incoming {
+                    reverse
+                } else {
+                    forward
+                };
                 let mut index = from;
-                while index < staged_count {
+                while index < order.len() {
                     staged_touch()?;
-                    let Some((source, target, type_len)) =
-                        self.transaction_staged_edge_shape(tx, index)?
+                    let Some((edge, name_bytes)) = self.copy_ordered_staged_traversal_edge(
+                        capture.as_ref().expect("captured staged order"),
+                        order[index],
+                        &mut staged_retain,
+                    )?
                     else {
                         break;
                     };
                     let reaches = match direction {
-                        Direction::Incoming => target == node,
-                        _ => source == node,
+                        Direction::Incoming => edge.target == node,
+                        _ => edge.source == node,
                     };
                     index = index.saturating_add(1);
-                    if !reaches {
-                        continue;
+                    let hidden = self.transaction_hides_graph_identity(
+                        tx,
+                        edge.source,
+                        edge.target,
+                        &edge.edge_type,
+                        edge.row_owner.as_ref(),
+                    );
+                    match hidden {
+                        Ok(hidden) if reaches && !hidden => {}
+                        Ok(_) => {
+                            drop(edge);
+                            staged_hand_back(name_bytes);
+                            continue;
+                        }
+                        Err(error) => {
+                            drop(edge);
+                            staged_hand_back(name_bytes);
+                            return Err(E::from(error));
+                        }
                     }
-                    // Charged before it is taken, measured where it still
-                    // lives rather than after a copy of it already exists.
-                    let name_bytes = Self::staged_edge_type_bytes(type_len);
-                    staged_retain(name_bytes)?;
-                    let Some(edge_type) = self.transaction_staged_edge_type(tx, index - 1)? else {
-                        break;
-                    };
-                    // An edge this transaction staged and then removed was
-                    // never there to walk.
-                    if self.transaction_hides_edge(tx, source, &edge_type, target)? {
-                        drop(edge_type);
-                        staged_hand_back(name_bytes);
-                        continue;
-                    }
-                    return Ok(Some((
-                        contextdb_graph::mem::StagedTraversalEdge {
-                            source,
-                            target,
-                            edge_type,
-                        },
-                        name_bytes,
-                        index,
-                    )));
+                    return Ok(Some((edge, name_bytes, index)));
                 }
                 Ok(None)
             },
             entry_read,
             visited_cap,
-        )
+        );
+        if matches!(&result, Ok(None)) {
+            cursor.lease.take();
+        }
+        result
     }
 
-    pub(super) fn node_read_allowed(&self, node: NodeId, snapshot: SnapshotId) -> Result<bool> {
-        self.node_read_allowed_in_tx(None, node, snapshot)
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn node_read_allowed(
+        &self,
+        node: NodeId,
+        snapshot: SnapshotId,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        self.node_read_allowed_in_tx(None, node, snapshot, read_memory.clone())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn node_read_allowed_in_tx(
         &self,
         tx: Option<TxId>,
         node: NodeId,
         snapshot: SnapshotId,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
-        let rows = self.rows_for_node_in_tx(tx, node, snapshot)?;
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        let rows = self.rows_for_node_in_tx(tx, node, snapshot, read_memory.clone())?;
         if rows.is_empty() {
             return Ok(true);
         }
@@ -3497,32 +4923,52 @@ impl Database {
             if !self.table_has_read_gate(&table)? {
                 continue;
             }
-            let Some(meta) = self.table_meta(&table) else {
-                continue;
-            };
-            if !self.read_allowed_for_row_in_tx(tx, &table, &meta, &row, snapshot)? {
+            let meta = self
+                .table_meta(&table)
+                .ok_or_else(|| Error::TableNotFound(table.clone()))?;
+            if !self.read_allowed_for_row_in_tx(
+                tx,
+                &table,
+                &meta,
+                &row,
+                snapshot,
+                read_memory.clone(),
+            )? {
                 return Ok(false);
             }
         }
         Ok(true)
     }
 
-    pub(crate) fn readable_graph_node_column_values(
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn readable_graph_node_column_values_within(
         &self,
         tx: Option<TxId>,
         node: NodeId,
         column: &str,
         snapshot: SnapshotId,
+        work: &mut dyn FnMut(crate::executor::GraphPredicateWork) -> Result<()>,
+        memory: &mut contextdb_core::read_memory::ReadCredit,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<Value>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        work(crate::executor::GraphPredicateWork::Checkpoint)?;
         if column == "id" {
             return Ok(vec![Value::Uuid(node)]);
         }
         let id_column = vec!["id".to_string()];
         let id_value = vec![Value::Uuid(node)];
-        let table_names = self
-            .relational_store
-            .table_meta
-            .read()
+        let captured = self.captured_graph_decisions();
+        let catalog = self.relational_store.table_meta.read();
+        let metadata = captured
+            .as_ref()
+            .map_or(&*catalog, |capture| &capture.catalog);
+        let table_names = metadata
             .iter()
             .filter(|(_, meta)| {
                 Self::has_uuid_id_column(meta)
@@ -3533,35 +4979,73 @@ impl Database {
             })
             .map(|(table, meta)| (table.clone(), self.meta_has_read_gate(meta)))
             .collect::<Vec<_>>();
+        drop(catalog);
         let mut values = Vec::new();
         for (table, has_read_gate) in table_names {
-            let Some(mut table_rows) =
-                self.indexed_rows_for_values(&table, &id_column, &id_value, snapshot)?
-            else {
-                return Err(Error::Other(format!(
-                    "graph node metadata table `{table}` requires an index on id"
-                )));
-            };
-            if let Some(tx) = tx {
-                self.overlay_tx_node_rows(tx, &table, node, &mut table_rows)?;
-            }
-            if has_read_gate {
-                let Some(meta) = self.table_meta(&table) else {
-                    continue;
-                };
-                for row in table_rows {
-                    if self.read_allowed_for_row_in_tx(tx, &table, &meta, &row, snapshot)?
-                        && let Some(value) = row.values.get(column)
-                    {
-                        values.push(value.clone());
-                    }
-                }
+            work(crate::executor::GraphPredicateWork::Checkpoint)?;
+            let _rows_scope = self.writer_temporary_output_scope(read_memory.clone())?;
+            let rows = if self.writer_read_root()?.is_some() {
+                self.writer_indexed_rows_for_values_within(
+                    &table,
+                    &id_column,
+                    &id_value,
+                    snapshot,
+                    work,
+                    read_memory.clone(),
+                )?
             } else {
-                values.extend(
-                    table_rows
-                        .into_iter()
-                        .filter_map(|row| row.values.get(column).cloned()),
-                );
+                self.indexed_rows_for_values(
+                    &table,
+                    &id_column,
+                    &id_value,
+                    snapshot,
+                    read_memory.clone(),
+                )?
+            };
+            let Some(mut table_rows) = rows else {
+                return Err(Error::Other(
+                    (format!("graph node metadata table `{table}` requires an index on id")).into(),
+                ));
+            };
+            let mut overlay_memory =
+                contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+            if let Some(tx) = tx {
+                self.overlay_tx_node_rows_within(
+                    tx,
+                    &table,
+                    node,
+                    &mut table_rows,
+                    work,
+                    &mut overlay_memory,
+                )?;
+            }
+            let meta = has_read_gate.then(|| self.table_meta(&table)).flatten();
+            for row in table_rows {
+                work(crate::executor::GraphPredicateWork::Checkpoint)?;
+                if has_read_gate
+                    && (meta.as_ref().is_none()
+                        || !self.bounded_read_allowed_for_row(
+                            tx,
+                            &table,
+                            meta.as_ref().unwrap(),
+                            &row,
+                            snapshot,
+                            |bytes| work(crate::executor::GraphPredicateWork::AccessRow(bytes)),
+                            read_memory.clone(),
+                        )?)
+                {
+                    continue;
+                }
+                if let Some(value) = row.values.get(column) {
+                    let bytes = 128usize.saturating_add(value.estimated_bytes().saturating_mul(2));
+                    memory.try_grow_for(
+                        bytes,
+                        "graph",
+                        "predicate_values",
+                        "Raise MEMORY_LIMIT to evaluate graph metadata.",
+                    )?;
+                    values.push(value.clone());
+                }
             }
         }
         Ok(values)
@@ -3577,17 +5061,25 @@ impl Database {
             && columns.next().is_none()
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn assert_graph_anchor_nodes_readable_in_tx(
         &self,
         tx: Option<TxId>,
         nodes: &[NodeId],
         snapshot: SnapshotId,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.access_is_admin() {
             return Ok(());
         }
         for node in nodes {
-            let rows = self.rows_for_node_in_tx(tx, *node, snapshot)?;
+            let rows = self.rows_for_node_in_tx(tx, *node, snapshot, read_memory.clone())?;
             if rows.is_empty() {
                 continue;
             }
@@ -3598,12 +5090,18 @@ impl Database {
                     visible = true;
                     continue;
                 }
-                let Some(meta) = self.table_meta(&table) else {
-                    continue;
-                };
-                match self
-                    .read_denial_for_row_cached_in_tx(tx, &table, &meta, &row, snapshot, None)?
-                {
+                let meta = self
+                    .table_meta(&table)
+                    .ok_or_else(|| Error::TableNotFound(table.clone()))?;
+                match self.read_denial_for_row_cached_in_tx(
+                    tx,
+                    &table,
+                    &meta,
+                    &row,
+                    snapshot,
+                    None,
+                    read_memory.clone(),
+                )? {
                     Some(err) => {
                         if first_denial.is_none() {
                             first_denial = Some(err);
@@ -3632,15 +5130,19 @@ impl Database {
         nodes: &[NodeId],
         snapshot: SnapshotId,
         mut before_access_row: impl FnMut(usize) -> std::result::Result<(), E>,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<(), E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.access_is_admin() {
             return Ok(());
         }
         for node in nodes {
-            let rows = self.rows_for_node_in_tx(tx, *node, snapshot)?;
+            let rows = self.rows_for_node_in_tx(tx, *node, snapshot, read_memory.clone())?;
             if rows.is_empty() {
                 continue;
             }
@@ -3651,9 +5153,9 @@ impl Database {
                     visible = true;
                     continue;
                 }
-                let Some(meta) = self.table_meta(&table) else {
-                    continue;
-                };
+                let meta = self
+                    .table_meta(&table)
+                    .ok_or_else(|| E::from(Error::TableNotFound(table.clone())))?;
                 match self.bounded_read_denial_for_row_with_tables(
                     tx,
                     None,
@@ -3662,6 +5164,7 @@ impl Database {
                     &row,
                     snapshot,
                     &mut before_access_row,
+                    read_memory.clone(),
                 )? {
                     Some(err) => {
                         if first_denial.is_none() {
@@ -3678,32 +5181,58 @@ impl Database {
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn assert_node_write_allowed(
         &self,
         node: NodeId,
         snapshot: SnapshotId,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
-        for (table, row) in self.rows_for_node(node, snapshot)? {
-            self.assert_graph_endpoint_allowed(&table, &row, snapshot)?;
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        for (table, row) in self.rows_for_node(node, snapshot, read_memory.clone())? {
+            self.assert_graph_endpoint_allowed(&table, &row, snapshot, read_memory.clone())?;
         }
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn assert_graph_endpoint_allowed(
         &self,
         table: &str,
         row: &VersionedRow,
         snapshot: SnapshotId,
+
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.access_is_admin() {
             return Ok(());
         }
         let Some(meta) = self.table_meta(table) else {
             return Err(Error::TableNotFound(table.to_string()));
         };
-        self.write_allowed_for_values(table, &meta, row.row_id, &row.values, snapshot)
+        self.write_allowed_for_values(
+            table,
+            &meta,
+            row.row_id,
+            &row.values,
+            snapshot,
+            read_memory.clone(),
+        )
     }
-
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn query_bfs_gated(
         &self,
         start: NodeId,
@@ -3712,53 +5241,89 @@ impl Database {
         min_depth: u32,
         max_depth: u32,
         snapshot: SnapshotId,
-    ) -> Result<TraversalResult> {
-        if !self.node_read_allowed(start, snapshot)? {
-            return Ok(TraversalResult { nodes: Vec::new() });
-        }
 
-        let mut visited = HashSet::new();
-        visited.insert(start);
-        let mut queue: VecDeque<GatedBfsEntry> = VecDeque::new();
-        queue.push_back((start, 0, vec![]));
-        let mut result_nodes = Vec::new();
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<(TraversalResult, contextdb_core::read_memory::ReadCredit)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        while let Some((current, depth, path)) = queue.pop_front() {
-            if depth >= max_depth {
-                continue;
+        let (result, _, credit) = self.graph_bfs_counted(
+            None,
+            start,
+            edge_types,
+            direction,
+            min_depth..=max_depth,
+            snapshot,
+            read_memory,
+        )?;
+        Ok((result, credit))
+    }
+}
+
+impl Database {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn overlay_captured_node_rows(
+        &self,
+        captured: &graph_cursor_claims::GraphDecisionContext,
+        table: &str,
+        node: NodeId,
+        rows: &mut Vec<VersionedRow>,
+        work: &mut dyn FnMut(crate::executor::GraphPredicateWork) -> Result<()>,
+        memory: &mut contextdb_core::read_memory::ReadCredit,
+    ) -> Result<()> {
+        captured.check_table(table)?;
+        let image = captured.rows(table);
+        rows.retain(|row| {
+            !captured
+                .decisions
+                .relational_deletes
+                .iter()
+                .any(|(name, id, _)| name == table && *id == row.row_id)
+                && !row_matches_delete_predicates(
+                    &captured.decisions.relational_delete_predicates,
+                    table,
+                    row,
+                )
+                && image
+                    .as_ref()
+                    .is_none_or(|image| !image.contains(&row.row_id))
+        });
+        if let Some(image) = image {
+            for row in image.rows() {
+                work(crate::executor::GraphPredicateWork::AccessRow(0))?;
+                if row.values.get("id") != Some(&Value::Uuid(node)) {
+                    continue;
+                }
+                if captured
+                    .decisions
+                    .relational_deletes
+                    .iter()
+                    .any(|(name, id, _)| name == table && *id == row.row_id)
+                    && self
+                        .committed_row_at(
+                            table,
+                            row.row_id,
+                            self.snapshot_for_read(),
+                            captured.reader.clone(),
+                        )?
+                        .is_none()
+                {
+                    continue;
+                }
+                work(crate::executor::GraphPredicateWork::AccessRow(
+                    row.estimated_bytes(),
+                ))?;
+                memory.try_grow_for(
+                    row.estimated_bytes().saturating_add(224),
+                    "graph",
+                    "captured_node_row",
+                    "Raise READ_MEMORY_LIMIT.",
+                )?;
+                rows.push(row.clone());
             }
-            for (neighbor_id, edge_type, _, edge_source, edge_target) in
-                self.graph_neighbors_with_orientation(current, edge_types, direction, snapshot)?
-            {
-                if !self.node_read_allowed(neighbor_id, snapshot)? {
-                    continue;
-                }
-                if !self.edge_read_allowed(edge_source, edge_target, &edge_type, snapshot)? {
-                    continue;
-                }
-                let next_depth = depth + 1;
-                let mut new_path = path.clone();
-                new_path.push((current, edge_type.clone()));
-                if next_depth >= min_depth {
-                    result_nodes.push(TraversalNode {
-                        id: neighbor_id,
-                        depth: next_depth,
-                        path: new_path.clone(),
-                    });
-                }
-                if neighbor_id == current || visited.contains(&neighbor_id) {
-                    continue;
-                }
-                visited.insert(neighbor_id);
-                if visited.len() > 10_000 {
-                    return Err(Error::BfsVisitedExceeded(10_000));
-                }
-                queue.push_back((neighbor_id, next_depth, new_path));
-            }
         }
-
-        Ok(TraversalResult {
-            nodes: result_nodes,
-        })
+        Ok(())
     }
 }

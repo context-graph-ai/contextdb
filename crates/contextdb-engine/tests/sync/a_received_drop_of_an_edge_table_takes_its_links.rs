@@ -114,6 +114,10 @@ fn an_authenticated_received_drop_of_an_ordinary_edge_table_removes_its_links() 
 
     const TENANT: &str = "received-link-table-drop";
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn apply_received(author: &Database, receiver: &Database, changes: ChangeSet) {
         let identity = {
             static AUTHOR: std::sync::OnceLock<contextdb_engine::identity::FabricIdentity> =
@@ -121,6 +125,10 @@ fn an_authenticated_received_drop_of_an_ordinary_edge_table_removes_its_links() 
             AUTHOR.get_or_init(contextdb_engine::identity::FabricIdentity::generate)
         };
         let node_id = identity.node_id();
+        let fixture_operation_reader_1 = author
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         let provenance = author
             .outbound_ddl_provenance_for_test(
                 &changes,
@@ -128,8 +136,15 @@ fn an_authenticated_received_drop_of_an_ordinary_edge_table_removes_its_links() 
                 &node_id,
                 Incarnation(1),
                 &|bytes| Ok(identity.sign_for_test(bytes)),
+                fixture_operation_reader_1.clone(),
             )
             .expect("the authoring source produces canonical DDL provenance");
+        let fixture_operation_reader_2 = receiver
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut fixture_operation_copy_2 =
+            contextdb_engine::vector_read_memory::admission(fixture_operation_reader_2.clone());
+
         receiver
             .apply_received_schema_for_test(
                 changes,
@@ -137,6 +152,8 @@ fn an_authenticated_received_drop_of_an_ordinary_edge_table_removes_its_links() 
                 TenantId::from(TENANT),
                 &node_id,
                 Incarnation(1),
+                &mut fixture_operation_copy_2,
+                fixture_operation_reader_2.clone(),
             )
             .expect("an authenticated received schema unit applies");
     }
@@ -154,12 +171,16 @@ fn an_authenticated_received_drop_of_an_ordinary_edge_table_removes_its_links() 
             &empty(),
         )
         .expect("the author declares an ordinary edge table with no DAG clause");
-    let create = author.changes_since(Lsn(0));
+    let create = author
+        .changes_since(Lsn(0))
+        .expect("read or construct the declared fixture result");
     let before_drop = author.current_lsn();
     author
         .execute("DROP TABLE links", &empty())
         .expect("the author drops the edge table");
-    let drop = author.changes_since(before_drop);
+    let drop = author
+        .changes_since(before_drop)
+        .expect("read or construct the declared fixture result");
 
     {
         let database = Database::open(&path).expect("claim the receiving store");

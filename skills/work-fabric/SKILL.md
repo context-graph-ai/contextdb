@@ -219,8 +219,15 @@ let blob_store = BlobStore::new(db.clone(), policy, identity_path);
 
 // Holder: ingest (idempotent — the hash IS the content) and start serving.
 let blob_hash = blob_store.ingest_bytes(&std::fs::read("frame.jpg")?)?;
-blob_store.serve_on(&iroh_server);
+blob_store.serve_on_with_read_budget_provider(&iroh_server, read_budget_provider.clone())?;
 ```
+
+The host supplies read_budget_provider from the existing declared reader memory limit.
+Each serving request and reclaim cycle obtains its own child; resolve_blob_ref and
+reclaim_unreferenced receive the executing operation's read_memory. Registration
+and ledger read failures propagate as typed errors. The owned reclaim driver is
+spawn_reclaim_driver(read_budget_provider, grace_ms).
+
 
 `ingest_file(&Path)` is the streaming sibling of `ingest_bytes`. Because the returned `BlobHash` is
 the hash of the bytes, <!-- enforced by: crates/contextdb-server/tests/media_transfer_tests.rs::ingest_round_trip_matches_blake3_identity --> ingesting the same content twice is a no-op.
@@ -231,7 +238,7 @@ the requested `BlobHash` ever reach your sink**: <!-- enforced by: crates/contex
 ```rust
 let mut sink = Vec::new();
 let bytes_written = blob_store
-    .resolve_blob_ref(&blob_hash, &holder_ticket, &mut sink)
+    .resolve_blob_ref_with_read_memory(read_memory.clone(), &blob_hash, &holder_ticket, &mut sink)
     .await?;
 ```
 
@@ -284,7 +291,7 @@ use contextdb_server::{BlobStore, work_ledger::claim_job};
 
 let bytes = std::fs::read("frame.jpg")?;
 let blob_hash = blob_store.ingest_bytes(&bytes)?;
-blob_store.serve_on(&iroh_server);
+blob_store.serve_on_with_read_budget_provider(&iroh_server, read_budget_provider.clone())?;
 
 let spec = JobSpec::builder("job-1", "describe-image", "once", "node-a")
     .input_refs(vec![InputRef::blob_ref(blob_hash.clone())])
@@ -297,7 +304,7 @@ submit_job(&db, &spec, &no_direct_inputs)?;
 let claim = claim_job(&sync_client, "job-1", 1, "node-b", lease_deadline_ms, now_ms).await?;
 let mut sink = Vec::new();
 let bytes_written = blob_store
-    .resolve_blob_ref(&blob_hash, &holder_ticket, &mut sink)
+    .resolve_blob_ref_with_read_memory(read_memory.clone(), &blob_hash, &holder_ticket, &mut sink)
     .await?;
 ```
 

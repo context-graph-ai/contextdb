@@ -1,5 +1,700 @@
 use crate::types::{ContextId, Principal, RowId, ScopeLabel, TxId, Value, VectorIndexRef};
+use std::borrow::Cow;
 use std::collections::BTreeSet;
+
+/// Text that keeps its actual producer's native storage alive. Legacy text
+/// moves without copying; the native arm retains the same original invoice.
+/// This carrier does not qualify allocations nested inside a foreign producer.
+pub struct DiagnosticText(DiagnosticTextStorage);
+enum DiagnosticTextStorage {
+    StaticParts {
+        prefix: &'static str,
+        text: &'static str,
+        suffix: &'static str,
+    },
+    Unsigned {
+        prefix: &'static str,
+        value: u64,
+        suffix: &'static str,
+    },
+    Text(Cow<'static, str>),
+    Native(FundedEngineError),
+    Refusal(crate::read_memory::NativeRefusal),
+}
+impl DiagnosticText {
+    /// Compose immutable text without creating engine-owned storage.
+    #[doc(hidden)]
+    pub fn from_static_parts(
+        prefix: &'static str,
+        text: &'static str,
+        suffix: &'static str,
+    ) -> Self {
+        Self(DiagnosticTextStorage::StaticParts {
+            prefix,
+            text,
+            suffix,
+        })
+    }
+    /// A scalar diagnosis owns no heap allocation and borrows only constants.
+    #[doc(hidden)]
+    pub fn from_unsigned(prefix: &'static str, value: u64, suffix: &'static str) -> Self {
+        Self(DiagnosticTextStorage::Unsigned {
+            prefix,
+            value,
+            suffix,
+        })
+    }
+
+    /// Move an already admitted native diagnostic into an outer error field.
+    /// Construction allocates nothing and preserves the original cell.
+    #[doc(hidden)]
+    pub fn from_shared<T, I>(value: crate::read_memory::ReadShared<T, I>) -> Self
+    where
+        T: std::fmt::Display + Send + Sync + 'static,
+        I: Send + Sync + 'static,
+    {
+        use crate::read_memory::ReadShared;
+        unsafe fn inspect(_: std::ptr::NonNull<()>) -> (Option<std::ptr::NonNull<Error>>, bool) {
+            (None, false)
+        }
+        unsafe fn display<T: std::fmt::Display, I>(
+            pointer: std::ptr::NonNull<()>,
+            f: &mut std::fmt::Formatter<'_>,
+        ) -> std::fmt::Result {
+            let owner = std::mem::ManuallyDrop::new(unsafe {
+                ReadShared::<T, I>::from_raw(pointer.as_ptr().cast())
+            });
+            std::fmt::Display::fmt(&**owner, f)
+        }
+        unsafe fn release<T, I>(pointer: std::ptr::NonNull<()>) {
+            drop(unsafe { ReadShared::<T, I>::from_raw(pointer.as_ptr().cast()) });
+        }
+        let pointer =
+            std::ptr::NonNull::new(value.into_raw().cast_mut().cast()).expect("native diagnostic");
+        // SAFETY: ReadShared supplies the live immutable Send+Sync payload and
+        // finalizer. Its existing NativeFreeGuard frees the block before invoices.
+        let value = unsafe {
+            FundedEngineError::from_owned(pointer, inspect, display::<T, I>, release::<T, I>)
+        };
+        Self(DiagnosticTextStorage::Native(value))
+    }
+    /// Borrow existing text only; deferred diagnostics are rendered by Display.
+    pub fn as_text(&self) -> Option<&str> {
+        match &self.0 {
+            DiagnosticTextStorage::Text(text) => Some(text),
+            _ => None,
+        }
+    }
+    pub fn static_text(&self) -> Option<&'static str> {
+        match &self.0 {
+            DiagnosticTextStorage::Text(Cow::Borrowed(text)) => Some(*text),
+            _ => None,
+        }
+    }
+    /// Inspect complete deferred text without allocating or detaching its owner.
+    pub fn contains(&self, needle: &str) -> bool {
+        if let Some(text) = self.as_text() {
+            return text.contains(needle);
+        }
+        if needle.is_empty() {
+            return true;
+        }
+        struct Search<'a> {
+            needle: &'a [u8],
+            matched: usize,
+            found: bool,
+        }
+        impl std::fmt::Write for Search<'_> {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                for byte in text.bytes() {
+                    if self.found {
+                        break;
+                    }
+                    while self.matched != 0 && self.needle[self.matched] != byte {
+                        // Find the longest proper prefix that is also a suffix
+                        // of the matched prefix. Recompute from borrowed bytes;
+                        // no pattern table or diagnostic copy is allocated.
+                        self.matched = (1..self.matched)
+                            .rev()
+                            .find(|&length| {
+                                self.needle[..self.matched].ends_with(&self.needle[..length])
+                            })
+                            .unwrap_or(0);
+                    }
+                    if self.needle[self.matched] == byte {
+                        self.matched += 1;
+                    }
+                    if self.matched == self.needle.len() {
+                        self.found = true;
+                    }
+                }
+                Ok(())
+            }
+        }
+        let mut search = Search {
+            needle: needle.as_bytes(),
+            matched: 0,
+            found: false,
+        };
+        std::fmt::write(&mut search, format_args!("{self}")).is_ok() && search.found
+    }
+    /// Inspect the prefix of the complete Display text without allocating or
+    /// detaching its owner, including prefixes split across formatting chunks.
+    pub fn starts_with(&self, prefix: &str) -> bool {
+        if let Some(text) = self.as_text() {
+            return text.starts_with(prefix);
+        }
+        if prefix.is_empty() {
+            return true;
+        }
+        struct Prefix<'a> {
+            prefix: &'a [u8],
+            matched: usize,
+            matches: bool,
+        }
+        impl std::fmt::Write for Prefix<'_> {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                let length = text.len().min(self.prefix.len() - self.matched);
+                let end = self.matched + length;
+                self.matches &= text.as_bytes()[..length] == self.prefix[self.matched..end];
+                self.matched = end;
+                Ok(())
+            }
+        }
+        let mut inspect = Prefix {
+            prefix: prefix.as_bytes(),
+            matched: 0,
+            matches: true,
+        };
+        std::fmt::write(&mut inspect, format_args!("{self}")).is_ok()
+            && inspect.matches
+            && inspect.matched == inspect.prefix.len()
+    }
+    fn equals_text(&self, expected: &str) -> bool {
+        struct Equal<'a> {
+            expected: &'a [u8],
+            offset: usize,
+            equal: bool,
+        }
+        impl std::fmt::Write for Equal<'_> {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                let end = self.offset.checked_add(text.len()).ok_or(std::fmt::Error)?;
+                self.equal &= self.expected.get(self.offset..end) == Some(text.as_bytes());
+                self.offset = end;
+                Ok(())
+            }
+        }
+        let mut equal = Equal {
+            expected: expected.as_bytes(),
+            offset: 0,
+            equal: true,
+        };
+        std::fmt::write(&mut equal, format_args!("{self}")).is_ok()
+            && equal.equal
+            && equal.offset == equal.expected.len()
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error retains inline NativeRefusal diagnostics so exhausted memory budgets can refuse without allocating."
+    )]
+    fn admit(
+        owner: crate::read_memory::ReadMemoryOwner,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> crate::Result<crate::read_memory::ReadCredit> {
+        use crate::read_memory::{NativeRefusal, ReadCredit, ReadMemoryBudget};
+        // Engine suppliers with scalar admission do not format on refusal.
+        // A genuine application provider keeps its ordinary contract and its
+        // original error, unchanged; there is no unsupported fallback or skip.
+        if owner.native_reserve_supported() {
+            ReadCredit::try_new_owned_native(owner, bytes, subsystem, operation, hint).map_err(
+                |error| match error {
+                    NativeRefusal::MemoryBudgetExceeded {
+                        subsystem,
+                        operation,
+                        requested_bytes,
+                        available_bytes,
+                        budget_limit_bytes,
+                        hint,
+                    } => Error::MemoryBudgetExceeded {
+                        subsystem: subsystem.into(),
+                        operation: operation.into(),
+                        requested_bytes,
+                        available_bytes,
+                        budget_limit_bytes,
+                        hint: hint.into(),
+                    },
+                    NativeRefusal::Other(reason) => Error::Other(reason.into()),
+                    other => Error::NativeEngineOther(other),
+                },
+            )
+        } else {
+            ReadCredit::try_new_owned(owner, bytes, subsystem, operation, hint)
+        }
+    }
+    /// Prepare native diagnostic storage on its actual existing payer before
+    /// invoking the producer. Failure has no engine-owned formatted backing.
+    #[doc(hidden)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error retains inline NativeRefusal diagnostics so exhausted memory budgets can refuse without allocating."
+    )]
+    pub fn try_prepare_shared<T>(
+        owner: crate::read_memory::ReadMemoryOwner,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> crate::Result<crate::read_memory::ReadPrepared<T>> {
+        use crate::read_memory::ReadShared;
+        let invoice = Self::admit(
+            owner,
+            ReadShared::<T>::layout().size(),
+            subsystem,
+            operation,
+            hint,
+        )?;
+        ReadShared::try_prepare_native(invoice).map_err(Error::NativeEngineOther)
+    }
+    /// Admit both the exact output buffer and native cell before allocating.
+    #[doc(hidden)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error retains inline NativeRefusal diagnostics so exhausted memory budgets can refuse without allocating."
+    )]
+    pub fn try_format(
+        owner: crate::read_memory::ReadMemoryOwner,
+        value: impl std::fmt::Display,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> crate::Result<Self> {
+        use crate::read_memory::{NativeProduce, NativeRefusal, ReadShared};
+        struct Count(usize);
+        impl std::fmt::Write for Count {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                self.0 = self.0.checked_add(text.len()).ok_or(std::fmt::Error)?;
+                Ok(())
+            }
+        }
+        let mut count = Count(0);
+        std::fmt::write(&mut count, format_args!("{value}")).map_err(|_| {
+            Error::NativeEngineOther(NativeRefusal::Other("diagnostic text size overflow"))
+        })?;
+        let text_layout = std::alloc::Layout::array::<u8>(count.0).map_err(|_| {
+            Error::NativeEngineOther(NativeRefusal::Other("diagnostic text layout overflow"))
+        })?;
+        let bytes = ReadShared::<String>::layout()
+            .size()
+            .checked_add(count.0)
+            .ok_or(Error::NativeEngineOther(NativeRefusal::Other(
+                "diagnostic text layout overflow",
+            )))?;
+        let invoice = Self::admit(owner, bytes, subsystem, operation, hint)?;
+        let shared = ReadShared::try_from_prepaid_payload_with_native(invoice, || {
+            // Do not let an inconsistent Display grow past its admitted buffer.
+            struct Output(String);
+            impl std::fmt::Write for Output {
+                fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                    if text.len() > self.0.capacity() - self.0.len() {
+                        return Err(std::fmt::Error);
+                    }
+                    self.0.push_str(text);
+                    Ok(())
+                }
+            }
+            let text = if count.0 == 0 {
+                String::new()
+            } else {
+                // The original invoice is already outside the native cell. Use
+                // this exact raw layout, never an allocator-selected growth cap.
+                let raw = unsafe { std::alloc::alloc(text_layout) };
+                let pointer = std::ptr::NonNull::new(raw).ok_or(Error::NativeEngineOther(
+                    NativeRefusal::AllocatorFailed {
+                        site: "diagnostic text",
+                        layout: text_layout,
+                    },
+                ))?;
+                // SAFETY: the global allocator supplied count.0 uninitialized
+                // bytes with byte alignment; a zero-length String owns that
+                // exact capacity and will free it through the same allocator.
+                unsafe { String::from_raw_parts(pointer.as_ptr(), 0, count.0) }
+            };
+            let mut output = Output(text);
+            std::fmt::write(&mut output, format_args!("{value}")).map_err(|_| {
+                Error::NativeEngineOther(NativeRefusal::Other(
+                    "diagnostic display exceeded its admitted size",
+                ))
+            })?;
+            Ok::<_, Error>(output.0)
+        })
+        .map_err(|error| match error {
+            NativeProduce::Refused(error) => Error::NativeEngineOther(error),
+            NativeProduce::Producer(error) => error,
+        })?;
+        Ok(Self::from_shared(shared))
+    }
+}
+impl From<String> for DiagnosticText {
+    fn from(text: String) -> Self {
+        Self(DiagnosticTextStorage::Text(Cow::Owned(text)))
+    }
+}
+impl From<&'static str> for DiagnosticText {
+    fn from(text: &'static str) -> Self {
+        Self(DiagnosticTextStorage::Text(Cow::Borrowed(text)))
+    }
+}
+impl From<Cow<'static, str>> for DiagnosticText {
+    fn from(text: Cow<'static, str>) -> Self {
+        Self(DiagnosticTextStorage::Text(text))
+    }
+}
+impl From<crate::read_memory::NativeRefusal> for DiagnosticText {
+    fn from(refusal: crate::read_memory::NativeRefusal) -> Self {
+        Self(DiagnosticTextStorage::Refusal(refusal))
+    }
+}
+impl From<FundedEngineError> for DiagnosticText {
+    fn from(owner: FundedEngineError) -> Self {
+        Self(DiagnosticTextStorage::Native(owner))
+    }
+}
+impl std::fmt::Display for DiagnosticText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            DiagnosticTextStorage::StaticParts {
+                prefix,
+                text,
+                suffix,
+            } => write!(f, "{prefix}{text}{suffix}"),
+            DiagnosticTextStorage::Unsigned {
+                prefix,
+                value,
+                suffix,
+            } => write!(f, "{prefix}{value}{suffix}"),
+            DiagnosticTextStorage::Text(text) => std::fmt::Display::fmt(text, f),
+            DiagnosticTextStorage::Native(value) => std::fmt::Display::fmt(value, f),
+            DiagnosticTextStorage::Refusal(refusal) => std::fmt::Display::fmt(refusal, f),
+        }
+    }
+}
+impl PartialEq<str> for DiagnosticText {
+    fn eq(&self, other: &str) -> bool {
+        self.equals_text(other)
+    }
+}
+impl PartialEq<&str> for DiagnosticText {
+    fn eq(&self, other: &&str) -> bool {
+        self.equals_text(other)
+    }
+}
+impl std::fmt::Debug for DiagnosticText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Preserve String's quoted Debug envelope without materializing text.
+        struct Escape<'a, 'b>(&'a mut std::fmt::Formatter<'b>);
+        impl std::fmt::Write for Escape<'_, '_> {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                for ch in text.chars() {
+                    if ch == '\'' {
+                        self.0.write_str("'")?;
+                    } else {
+                        for escaped in ch.escape_debug() {
+                            std::fmt::Write::write_char(self.0, escaped)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+        f.write_str("\"")?;
+        std::fmt::write(&mut Escape(f), format_args!("{self}"))?;
+        f.write_str("\"")
+    }
+}
+
+/// A contiguous operation label. Native labels retain the original invoice;
+/// ordinary externally supplied Strings move unchanged. There is deliberately
+/// no allocating Clone implementation.
+pub struct DiagnosticLabel(DiagnosticLabelStorage);
+enum DiagnosticLabelStorage {
+    Text(Cow<'static, str>),
+    TransactionRowRoots {
+        tables: Option<usize>,
+    },
+    Native {
+        pointer: std::ptr::NonNull<()>,
+        text: unsafe fn(std::ptr::NonNull<()>) -> *const str,
+        release: unsafe fn(std::ptr::NonNull<()>),
+    },
+}
+// SAFETY: native constructors accept only immutable Send+Sync shared storage.
+unsafe impl Send for DiagnosticLabel {}
+unsafe impl Sync for DiagnosticLabel {}
+impl DiagnosticLabel {
+    /// Inline context for a real table-root refusal while writing rows.
+    /// Formatting this context requires no diagnostic allocation.
+    #[doc(hidden)]
+    pub fn transaction_row_roots_hint(tables: Option<usize>) -> Self {
+        Self(DiagnosticLabelStorage::TransactionRowRoots { tables })
+    }
+    #[doc(hidden)]
+    pub fn from_shared<I: Send + Sync + 'static>(
+        value: crate::read_memory::ReadShared<String, I>,
+    ) -> Self {
+        unsafe fn text<I>(pointer: std::ptr::NonNull<()>) -> *const str {
+            let owner = std::mem::ManuallyDrop::new(unsafe {
+                crate::read_memory::ReadShared::<String, I>::from_raw(pointer.as_ptr().cast())
+            });
+            owner.as_str() as *const str
+        }
+        unsafe fn release<I>(pointer: std::ptr::NonNull<()>) {
+            drop(unsafe {
+                crate::read_memory::ReadShared::<String, I>::from_raw(pointer.as_ptr().cast())
+            });
+        }
+        Self(DiagnosticLabelStorage::Native {
+            pointer: std::ptr::NonNull::new(value.into_raw().cast_mut().cast())
+                .expect("native label"),
+            text: text::<I>,
+            release: release::<I>,
+        })
+    }
+    /// Count without materializing, then admit the exact buffer and control
+    /// layout on the supplier's existing payer before either allocation.
+    #[doc(hidden)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error retains inline NativeRefusal diagnostics so exhausted memory budgets can refuse without allocating."
+    )]
+    pub fn try_format_with_invoice<I: Send + Sync + 'static>(
+        value: impl std::fmt::Display,
+        admit: impl FnOnce(usize) -> crate::Result<I>,
+    ) -> crate::Result<Self> {
+        use crate::read_memory::{NativeRefusal, ReadShared};
+        struct Count(usize);
+        impl std::fmt::Write for Count {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                self.0 = self.0.checked_add(text.len()).ok_or(std::fmt::Error)?;
+                Ok(())
+            }
+        }
+        let mut count = Count(0);
+        std::fmt::write(&mut count, format_args!("{value}")).map_err(|_| {
+            Error::NativeEngineOther(NativeRefusal::Other("diagnostic label size overflow"))
+        })?;
+        let layout = std::alloc::Layout::array::<u8>(count.0).map_err(|_| {
+            Error::NativeEngineOther(NativeRefusal::Other("diagnostic label layout overflow"))
+        })?;
+        let bytes = ReadShared::<String, I>::layout()
+            .size()
+            .checked_add(count.0)
+            .ok_or(Error::NativeEngineOther(NativeRefusal::Other(
+                "diagnostic label layout overflow",
+            )))?;
+        let invoice = admit(bytes)?;
+        let text = if count.0 == 0 {
+            String::new()
+        } else {
+            let pointer = std::ptr::NonNull::new(unsafe { std::alloc::alloc(layout) }).ok_or(
+                Error::NativeEngineOther(NativeRefusal::AllocatorFailed {
+                    site: "diagnostic label",
+                    layout,
+                }),
+            )?;
+            // SAFETY: exact byte-aligned global allocation, initially empty.
+            unsafe { String::from_raw_parts(pointer.as_ptr(), 0, count.0) }
+        };
+        struct Output(String);
+        impl std::fmt::Write for Output {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                if text.len() > self.0.capacity() - self.0.len() {
+                    return Err(std::fmt::Error);
+                }
+                self.0.push_str(text);
+                Ok(())
+            }
+        }
+        let mut output = Output(text);
+        std::fmt::write(&mut output, format_args!("{value}")).map_err(|_| {
+            Error::NativeEngineOther(NativeRefusal::Other(
+                "diagnostic label exceeded its admitted size",
+            ))
+        })?;
+        let shared = ReadShared::try_from_invoice_native(output.0, invoice)
+            .map_err(Error::NativeEngineOther)?;
+        Ok(Self::from_shared(shared))
+    }
+    pub fn static_text(&self) -> Option<&'static str> {
+        match &self.0 {
+            DiagnosticLabelStorage::Text(Cow::Borrowed(text)) => Some(*text),
+            DiagnosticLabelStorage::TransactionRowRoots { .. } => Some(TRANSACTION_ROW_ROOTS_HINT),
+            _ => None,
+        }
+    }
+    /// Explicit terminal materialization, matching the old Cow receiver.
+    /// Native producer paths move the label instead of calling this method.
+    pub fn into_owned(mut self) -> String {
+        match &mut self.0 {
+            DiagnosticLabelStorage::Text(text) => {
+                std::mem::replace(text, Cow::Borrowed("")).into_owned()
+            }
+            DiagnosticLabelStorage::Native { pointer, text, .. } => {
+                unsafe { &*text(*pointer) }.to_owned()
+            }
+            DiagnosticLabelStorage::TransactionRowRoots { .. } => {
+                TRANSACTION_ROW_ROOTS_HINT.to_owned()
+            }
+        }
+    }
+}
+impl Drop for DiagnosticLabelStorage {
+    fn drop(&mut self) {
+        if let Self::Native {
+            pointer, release, ..
+        } = self
+        {
+            unsafe { release(*pointer) };
+        }
+    }
+}
+impl From<&'static str> for DiagnosticLabel {
+    fn from(text: &'static str) -> Self {
+        Self(DiagnosticLabelStorage::Text(Cow::Borrowed(text)))
+    }
+}
+impl From<String> for DiagnosticLabel {
+    fn from(text: String) -> Self {
+        Self(DiagnosticLabelStorage::Text(Cow::Owned(text)))
+    }
+}
+impl From<Cow<'static, str>> for DiagnosticLabel {
+    fn from(text: Cow<'static, str>) -> Self {
+        Self(DiagnosticLabelStorage::Text(text))
+    }
+}
+impl AsRef<str> for DiagnosticLabel {
+    fn as_ref(&self) -> &str {
+        match &self.0 {
+            DiagnosticLabelStorage::Text(text) => text,
+            DiagnosticLabelStorage::TransactionRowRoots { .. } => TRANSACTION_ROW_ROOTS_HINT,
+            // SAFETY: this handle retains the immutable native cell and its
+            // original invoice for the entire returned borrow.
+            DiagnosticLabelStorage::Native { pointer, text, .. } => unsafe { &*text(*pointer) },
+        }
+    }
+}
+impl serde::Serialize for DiagnosticLabel {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_ref())
+    }
+}
+impl std::ops::Deref for DiagnosticLabel {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_ref()
+    }
+}
+impl std::fmt::Display for DiagnosticLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_ref())
+    }
+}
+impl std::fmt::Debug for DiagnosticLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_ref(), f)
+    }
+}
+impl PartialEq<str> for DiagnosticLabel {
+    fn eq(&self, other: &str) -> bool {
+        self.as_ref() == other
+    }
+}
+impl PartialEq<&str> for DiagnosticLabel {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_ref() == *other
+    }
+}
+impl PartialEq<String> for DiagnosticLabel {
+    fn eq(&self, other: &String) -> bool {
+        self.as_ref() == other.as_str()
+    }
+}
+
+/// The helper's complete exit diagnosis needs no owned text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderWaitHelperExit {
+    Exited(i32),
+    Killed,
+    Unknown,
+}
+impl std::fmt::Display for ReaderWaitHelperExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the writer's acquisition helper ended without the store: {self:?}"
+        )
+    }
+}
+
+const TRANSACTION_ROW_ROOTS_HINT: &str =
+    "Raise MEMORY_LIMIT to admit the tables this transaction's rows are written to.";
+
+struct MemoryBudgetDisplay<'a> {
+    subsystem: &'a DiagnosticLabel,
+    operation: &'a DiagnosticLabel,
+    requested: &'a usize,
+    available: &'a usize,
+    limit: &'a usize,
+    hint: &'a DiagnosticLabel,
+}
+impl std::fmt::Display for MemoryBudgetDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let DiagnosticLabelStorage::TransactionRowRoots { tables } = &self.hint.0 {
+            f.write_str("writing this transaction's rows")?;
+            if let Some(tables) = tables {
+                write!(f, " to {tables} tables")?;
+            }
+            write!(
+                f,
+                ": the table roots did not fit in the declared memory ({} B requested, {} B available of {} B). Hint: {}",
+                self.requested, self.available, self.limit, self.hint
+            )
+        } else {
+            write!(
+                f,
+                "memory budget exceeded: {}/{} requested {} bytes, {} available of {} budget. Hint: {}",
+                self.subsystem,
+                self.operation,
+                self.requested,
+                self.available,
+                self.limit,
+                self.hint
+            )
+        }
+    }
+}
+fn memory_budget_display<'a>(
+    subsystem: &'a DiagnosticLabel,
+    operation: &'a DiagnosticLabel,
+    requested: &'a usize,
+    available: &'a usize,
+    limit: &'a usize,
+    hint: &'a DiagnosticLabel,
+) -> MemoryBudgetDisplay<'a> {
+    MemoryBudgetDisplay {
+        subsystem,
+        operation,
+        requested,
+        available,
+        limit,
+        hint,
+    }
+}
 
 /// Distinguishes which callback context produced a callback-active error.
 ///
@@ -20,57 +715,114 @@ impl std::fmt::Display for CallbackKind {
     }
 }
 
-fn format_context_set(values: &BTreeSet<ContextId>) -> String {
-    let body = values
-        .iter()
-        .map(|context| context.0.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("{{{body}}}")
-}
-
-fn format_scope_label_set(values: &BTreeSet<ScopeLabel>) -> String {
-    let body = values
-        .iter()
-        .map(|label| label.0.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("{{{body}}}")
-}
-
-fn format_principal(principal: &Principal) -> String {
-    match principal {
-        Principal::System => "system".to_string(),
-        Principal::Agent(id) => format!("agent:{id}"),
-        Principal::Human(id) => format!("human:{id}"),
+struct ContextSetDisplay<'a>(&'a BTreeSet<ContextId>);
+impl std::fmt::Display for ContextSetDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("{")?;
+        for (index, context) in self.0.iter().enumerate() {
+            if index != 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{}", context.0)?;
+        }
+        f.write_str("}")
     }
 }
 
-fn context_scope_violation_display(requested: &ContextId, allowed: &BTreeSet<ContextId>) -> String {
-    let requested = if requested.0 == uuid::Uuid::from_u128(u128::MAX) {
-        "row has no context".to_string()
-    } else {
-        format!("context {}", requested.0)
-    };
-    format!(
-        "row hidden by context scope: requested {requested}, allowed {}",
-        format_context_set(allowed)
-    )
+struct ScopeLabelSetDisplay<'a>(&'a BTreeSet<ScopeLabel>);
+impl std::fmt::Display for ScopeLabelSetDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("{")?;
+        for (index, label) in self.0.iter().enumerate() {
+            if index != 0 {
+                f.write_str(", ")?;
+            }
+            f.write_str(label.0.as_str())?;
+        }
+        f.write_str("}")
+    }
 }
 
-fn scope_label_violation_display(requested: &ScopeLabel, allowed: &BTreeSet<ScopeLabel>) -> String {
-    format!(
-        "row hidden by scope label: requested {}, allowed {}",
-        requested.0,
-        format_scope_label_set(allowed)
-    )
+struct PrincipalDisplay<'a>(&'a Principal);
+impl std::fmt::Display for PrincipalDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Principal::System => f.write_str("system"),
+            Principal::Agent(id) => write!(f, "agent:{id}"),
+            Principal::Human(id) => write!(f, "human:{id}"),
+        }
+    }
 }
 
-fn acl_denied_display(table: &str, row_id: &RowId, principal: &Principal) -> String {
-    format!(
-        "row hidden by ACL on table `{table}` row {row_id} for principal {}",
-        format_principal(principal)
-    )
+struct ContextScopeViolationDisplay<'a> {
+    requested: &'a ContextId,
+    allowed: &'a BTreeSet<ContextId>,
+}
+impl std::fmt::Display for ContextScopeViolationDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("row hidden by context scope: requested ")?;
+        if self.requested.0 == uuid::Uuid::from_u128(u128::MAX) {
+            f.write_str("row has no context")?;
+        } else {
+            write!(f, "context {}", self.requested.0)?;
+        }
+        write!(f, ", allowed {}", ContextSetDisplay(self.allowed))
+    }
+}
+fn context_scope_violation_display<'a>(
+    requested: &'a ContextId,
+    allowed: &'a BTreeSet<ContextId>,
+) -> ContextScopeViolationDisplay<'a> {
+    ContextScopeViolationDisplay { requested, allowed }
+}
+
+struct ScopeLabelViolationDisplay<'a> {
+    requested: &'a ScopeLabel,
+    allowed: &'a BTreeSet<ScopeLabel>,
+}
+impl std::fmt::Display for ScopeLabelViolationDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "row hidden by scope label: requested {}, allowed {}",
+            self.requested.0,
+            ScopeLabelSetDisplay(self.allowed)
+        )
+    }
+}
+fn scope_label_violation_display<'a>(
+    requested: &'a ScopeLabel,
+    allowed: &'a BTreeSet<ScopeLabel>,
+) -> ScopeLabelViolationDisplay<'a> {
+    ScopeLabelViolationDisplay { requested, allowed }
+}
+
+struct AclDeniedDisplay<'a> {
+    table: &'a str,
+    row_id: &'a RowId,
+    principal: &'a Principal,
+}
+impl std::fmt::Display for AclDeniedDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "row hidden by ACL on table `{}` row {} for principal {}",
+            self.table,
+            self.row_id,
+            PrincipalDisplay(self.principal)
+        )
+    }
+}
+fn acl_denied_display<'a>(
+    table: &'a str,
+    row_id: &'a RowId,
+    principal: &'a Principal,
+) -> AclDeniedDisplay<'a> {
+    AclDeniedDisplay {
+        table,
+        row_id,
+        principal,
+    }
 }
 
 /// Safe structural reasons a vector partition declaration can be refused.
@@ -106,23 +858,53 @@ pub enum VectorPartitionDeclarationIssue {
 /// Safe structural reasons a per-column vector workload policy can be
 /// refused. The enclosing error identifies the column; values are omitted so
 /// bound or synced input is never echoed through the diagnostic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum VectorPolicyDeclarationIssue {
+    #[error("vector dimensions must be at least 1")]
+    DimensionsNotPositive,
+    #[error("unknown WITH member {member}")]
+    UnknownMember { member: String },
+    #[error("{member} has an invalid vector policy value")]
+    InvalidMember { member: &'static str },
+
+    #[error("{member} has invalid training value {value}")]
+    InvalidTrainingValue { member: &'static str, value: u64 },
     #[error("vector policy clauses require a VECTOR column")]
     RequiresVectorColumn,
     #[error("AUTO_INDEX_AT must be a positive integer")]
     AutoIndexAtNotPositive,
     #[error("AUTO_INDEX_AT is outside the persisted numeric range")]
     AutoIndexAtOutOfRange,
-    #[error("HNSW policy values must be positive integers")]
-    HnswValueNotPositive,
-    #[error("an HNSW policy value is outside the persisted numeric range")]
-    HnswValueOutOfRange,
-    #[error("HNSW EF_CONSTRUCTION must be at least M")]
-    EfConstructionBelowM,
+    #[error("FLAT_BELOW must be a non-negative integer")]
+    FlatBelowNegative,
+    #[error("FLAT_BELOW is outside the persisted numeric range")]
+    FlatBelowOutOfRange,
+    #[error("AUTO_EXPANSION_CEILING must be an integer percent from 1 through 100")]
+    AutoExpansionCeilingOutOfRange,
     #[error("vector consolidation percentages must be integers from 1 through 100")]
     ConsolidationPercentOutOfRange,
+}
+
+/// Why a `SET STORAGE_COMPACTION` declaration was refused. The SQL statement
+/// and the Rust setter refuse the same declarations with the same issue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum StorageCompactionDeclarationIssue {
+    #[error("START_RATIO must be greater than 0 and at most 1")]
+    StartRatioOutOfRange,
+    #[error("STOP_RATIO must be greater than 0 and at most 1")]
+    StopRatioOutOfRange,
+    #[error("MAX_SWEEPS must be at least 1")]
+    MaxSweepsNotPositive,
+    #[error("MAX_SWEEPS is outside the persisted numeric range")]
+    MaxSweepsOutOfRange,
+    #[error("MIN_INTERVAL must be positive")]
+    MinIntervalNotPositive,
+    #[error("MIN_INTERVAL is longer than 9223372036854775807 milliseconds")]
+    MinIntervalOutOfRange,
+    #[error("a clause may appear only once in one declaration")]
+    DuplicateClause,
 }
 
 /// The engine's own answers.
@@ -137,6 +919,34 @@ pub enum VectorPolicyDeclarationIssue {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// Sink delivery starts only from a database a caller opened. A trigger
+    /// callback running inside a schema change holds that change's private
+    /// working image, and nothing it holds may be delivered before the outer commit.
+    #[error(
+        "sink {sink} can only be registered on an opened database: this handle is a schema change's private working image"
+    )]
+    SinkRegistrationRequiresOpenedDatabase { sink: String },
+    /// A setting was understood but its value is outside the allowed range.
+    #[error("invalid {name} value {value}; allowed: {allowed}")]
+    InvalidSetting {
+        name: &'static str,
+        value: String,
+        allowed: String,
+    },
+    /// Engine-produced diagnostic whose admitted backing survives until the
+    /// caller destroys it. Application/plugin errors keep their original form.
+    #[doc(hidden)]
+    #[error(transparent)]
+    FundedEngine(FundedEngineError),
+    /// Allocation-free native diagnostics with the existing Other wire class.
+    #[doc(hidden)]
+    #[error("{0}")]
+    NativeEngineOther(crate::read_memory::NativeRefusal),
+    /// Native cancellation identities are never reused. This is a local,
+    /// typed construction refusal rather than a channel or wire condition.
+    #[doc(hidden)]
+    #[error("native cancellation identity space exhausted")]
+    NativeCancellationIdentityExhausted,
     #[error("bounded read session is not implemented")]
     ReadSessionNotImplemented,
     #[error("owner reads did not drain before shutdown deadline")]
@@ -147,6 +957,23 @@ pub enum Error {
     EventBusQueueQuiescent,
     #[error("read operation was cancelled")]
     ReadCancelled,
+    /// A writable open asked to bound its wait for starting readers by a
+    /// cancellation or a deadline, and this process cannot give it a wait it
+    /// can end early. An open that asks for neither still waits.
+    #[error("a cancellable or bounded wait for starting readers is not available in this process")]
+    ReaderWaitUnsupported,
+    /// The helper a writable open's cancellable wait started ended without
+    /// handing over the store; the open is refused and holds nothing.
+    #[error("the wait for starting readers failed: {0}")]
+    ReaderWaitHelperFailed(ReaderWaitHelperExit),
+    /// A writable open's acquisition helper could not be confirmed dead after
+    /// its wait was ended. This process keeps the store held, so nothing the
+    /// helper might still be granted can reach anyone else; a later open or
+    /// close of the store re-checks, and process exit releases it.
+    #[error(
+        "the store at {path} is held by this process until an ended reader wait is confirmed; restart the process if it persists"
+    )]
+    ReaderWaitQuarantined { path: DiagnosticText },
     #[error("{0}")]
     ReadFailure(crate::read_contract::ReadFailure),
     #[error("table not found: {0}")]
@@ -157,6 +984,10 @@ pub enum Error {
     ImmutableColumn { table: String, column: String },
     #[error("invalid state transition: {0}")]
     InvalidStateTransition(String),
+
+    /// A conditional row mutation no longer names the current committed version.
+    #[error("stale row version: expected LSN {expected}, current {current:?}")]
+    StaleRowVersion { expected: u64, current: Option<u64> },
     #[error("conditional update conflict: {count} staged update(s) no longer matched at commit")]
     ConditionalUpdateConflict { count: u64 },
     #[error("propagation aborted: {table}.{column} transition {from} -> {to} is invalid")]
@@ -170,11 +1001,32 @@ pub enum Error {
     BfsDepthExceeded(u32),
     #[error("BFS visited set exceeded limit ({0})")]
     BfsVisitedExceeded(usize),
+    #[error("vector {index:?} contains a non-finite component at position {position}")]
+    InvalidVectorValue {
+        index: VectorIndexRef,
+        position: usize,
+    },
     #[error("vector index dimension mismatch on {index}: expected {expected}, got {actual}")]
     VectorIndexDimensionMismatch {
         index: VectorIndexRef,
         expected: usize,
         actual: usize,
+    },
+    #[error(
+        "vector source identity mismatch on {index} row {row_id}: expected created {expected_created_tx}/LSN {expected_lsn}, got created {actual_created_tx:?}/LSN {actual_lsn:?}"
+    )]
+    VectorSourceIdentityMismatch {
+        index: VectorIndexRef,
+        row_id: RowId,
+        expected_created_tx: TxId,
+        expected_lsn: crate::types::Lsn,
+        actual_created_tx: Option<TxId>,
+        actual_lsn: Option<crate::types::Lsn>,
+    },
+    #[error("vector index {index} is corrupted: {reason}")]
+    IndexCorrupted {
+        index: VectorIndexRef,
+        reason: DiagnosticText,
     },
     #[error("unknown vector index {index}")]
     UnknownVectorIndex { index: VectorIndexRef },
@@ -187,6 +1039,10 @@ pub enum Error {
     InvalidVectorPolicyDeclaration {
         index: VectorIndexRef,
         issue: VectorPolicyDeclarationIssue,
+    },
+    #[error("invalid storage compaction declaration: {issue}")]
+    InvalidStorageCompactionDeclaration {
+        issue: StorageCompactionDeclarationIssue,
     },
     /// A write's PARTITION_KEY value is not of the type its column declares.
     ///
@@ -217,10 +1073,15 @@ pub enum Error {
         required_bytes: u64,
         available_bytes: u64,
     },
-    #[error(
-        "INDEXED vector search on {index} has no complete maintained route; wait for or repair index maintenance"
-    )]
+    #[error("no vector index ships in this release; use EXACT or AUTO")]
     VectorIndexedRouteUnavailable { index: VectorIndexRef },
+    #[error(
+        "INDEXED vector search on {index} refused: partition {partition} (in scope order) holds live rows its maintained graph does not connect (graph_frontier_disconnected); repair index maintenance, or use AUTO or EXACT"
+    )]
+    VectorIndexedPartitionDisconnected {
+        index: VectorIndexRef,
+        partition: u64,
+    },
     #[error(
         "filtered vector search on {index} has no bounded relational candidate route for columns {predicate_columns:?}; add a supporting relational index or use EXACT"
     )]
@@ -310,17 +1171,33 @@ pub enum Error {
         expected_release: String,
     },
     #[error("corrupt store at {path}: {reason}")]
-    StoreCorrupted { path: String, reason: String },
+    StoreCorrupted {
+        path: DiagnosticText,
+        reason: DiagnosticText,
+    },
+    #[error("vector metadata I/O failed during {operation}: {reason}")]
+    VectorMetadataIo {
+        operation: DiagnosticLabel,
+        reason: DiagnosticText,
+    },
     #[error(
         "no store at {path}: this open was asked to change a store that already exists, so it created nothing — point it at an existing store, or open it with the creating disposition if a new one is wanted"
     )]
-    StoreMissing { path: String },
+    StoreMissing { path: DiagnosticText },
     #[error(
         "the store's identity could not be proven, so its fingerprint identifies nothing: more than one name resolves to the file at {path}"
     )]
     StoreIdentityUnprovable { path: String },
     #[error("{operation} cannot safely coordinate readers through {path}: {reason}")]
     ReaderCoordinationUnavailable {
+        operation: String,
+        path: String,
+        reason: String,
+    },
+    #[error(
+        "{operation} cannot take a holder-presence lock through {path}: {reason}; this filesystem cannot prove whether a background-work holder is alive"
+    )]
+    HolderPresenceUnavailable {
         operation: String,
         path: String,
         reason: String,
@@ -343,8 +1220,8 @@ pub enum Error {
     },
     #[error("recursive CTEs are not supported")]
     RecursiveCteNotSupported,
-    #[error("window functions are not supported")]
-    WindowFunctionNotSupported,
+    #[error("window form is not supported: {form}")]
+    WindowFunctionNotSupported { form: String },
     #[error("stored procedures/functions are not supported")]
     StoredProcNotSupported,
     #[error("graph traversal requires explicit depth bound")]
@@ -359,12 +1236,14 @@ pub enum Error {
         "ORDER BY requires a column reference, a SELECT-list alias naming one, COALESCE(...), or arithmetic (+, -, *, /); this sort key expression is not supported"
     )]
     OrderByExpressionNotSupported,
+    #[error("expression depth {depth} exceeds limit {limit}")]
+    ExpressionDepthExceeded { depth: usize, limit: usize },
     #[error("parse error: {0}")]
     ParseError(String),
     #[error("plan error: {0}")]
     PlanError(String),
     #[error("sync error: {0}")]
-    SyncError(String),
+    SyncError(Cow<'static, str>),
     #[error("tenant table policy is not declared for {table}")]
     TenantPolicyNotDeclared { table: String },
     #[error("tenant table policy for {table} differs at {clause}")]
@@ -476,15 +1355,23 @@ pub enum Error {
     #[error("plugin rejected at {hook}: {reason}")]
     PluginRejected { hook: String, reason: String },
     #[error(
-        "memory budget exceeded: {subsystem}/{operation} requested {requested_bytes} bytes, {available_bytes} available of {budget_limit_bytes} budget. Hint: {hint}"
+        "{}",
+        memory_budget_display(
+            subsystem,
+            operation,
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            hint
+        )
     )]
     MemoryBudgetExceeded {
-        subsystem: String,
-        operation: String,
+        subsystem: DiagnosticLabel,
+        operation: DiagnosticLabel,
         requested_bytes: usize,
         available_bytes: usize,
         budget_limit_bytes: usize,
-        hint: String,
+        hint: DiagnosticLabel,
     },
     #[error(
         "disk budget exceeded: {operation} - file is {current_bytes} bytes, limit is {budget_limit_bytes} bytes. Hint: {hint}"
@@ -494,6 +1381,14 @@ pub enum Error {
         current_bytes: u64,
         budget_limit_bytes: u64,
         hint: String,
+    },
+    /// Scratch working storage could not complete `create`, `read`, or `write`.
+    /// This is an I/O failure, not a refusal of the store's configured disk
+    /// budget. Retain the kind without exposing a scratch path or error source.
+    #[error("scratch working storage unavailable during {operation}: {io_kind}")]
+    ScratchWorkingStorageUnavailable {
+        operation: String,
+        io_kind: std::io::ErrorKind,
     },
     #[error("column type mismatch: {table}.{column} expected {expected}, got {actual}")]
     ColumnTypeMismatch {
@@ -517,6 +1412,8 @@ pub enum Error {
     IndexNotFound { table: String, index: String },
     #[error("duplicate index: {table}.{index}")]
     DuplicateIndex { table: String, index: String },
+    #[error("reserved column name: {table}.{column} is owned by the engine")]
+    ReservedColumnName { table: String, column: String },
     #[error("reserved index name: {table}.{name} uses reserved prefix `{prefix}`")]
     ReservedIndexName {
         table: String,
@@ -687,12 +1584,137 @@ pub enum Error {
     )]
     PublicationInterrupted,
     #[error("{0}")]
-    Other(String),
+    Other(DiagnosticText),
 }
 
 impl Error {
+    /// Borrow the logical diagnosis without releasing its physical owner.
+    #[doc(hidden)]
+    pub fn engine_diagnostic(&self) -> &Self {
+        let mut error = self;
+        while let Self::FundedEngine(owner) = error {
+            let Some(diagnostic) = owner.diagnostic() else {
+                break;
+            };
+            error = diagnostic;
+        }
+        error
+    }
+
     pub const fn owner_read_drain_timeout() -> Self {
         Self::OwnerReadDrainTimeout
+    }
+}
+
+type DiagnosticInspector =
+    unsafe fn(std::ptr::NonNull<()>) -> (Option<std::ptr::NonNull<Error>>, bool);
+
+/// An opaque bridge to the engine's already admitted diagnostic storage, or
+/// an inline native OS diagnosis. Construction neither allocates nor admits bytes.
+#[doc(hidden)]
+pub struct FundedEngineError {
+    pointer: std::ptr::NonNull<()>,
+    inspect: DiagnosticInspector,
+    display: unsafe fn(std::ptr::NonNull<()>, &mut std::fmt::Formatter<'_>) -> std::fmt::Result,
+    release: unsafe fn(std::ptr::NonNull<()>),
+}
+impl FundedEngineError {
+    /// An allocation-free native OS diagnosis of the existing Other class.
+    /// The nonzero errno is scalar data, never a pointer to owned storage.
+    /// This companion does not change the owned producer bridge below.
+    #[doc(hidden)]
+    pub fn from_os_error(errno: std::num::NonZeroI32) -> Self {
+        unsafe fn inspect(_: std::ptr::NonNull<()>) -> (Option<std::ptr::NonNull<Error>>, bool) {
+            (None, true)
+        }
+        unsafe fn display(
+            code: std::ptr::NonNull<()>,
+            f: &mut std::fmt::Formatter<'_>,
+        ) -> std::fmt::Result {
+            let errno = code.addr().get() as i32;
+            std::fmt::Display::fmt(&std::io::Error::from_raw_os_error(errno), f)
+        }
+        unsafe fn release(_: std::ptr::NonNull<()>) {}
+        // Strict-provenance scalar encoding. None of these callbacks ever
+        // dereferences this address, and signed nonzero values round-trip.
+        let scalar = std::num::NonZeroUsize::new(errno.get() as isize as usize)
+            .expect("nonzero errno remains nonzero at pointer width");
+        Self {
+            pointer: std::ptr::NonNull::without_provenance(scalar),
+            inspect,
+            display,
+            release,
+        }
+    }
+    /// Transfer one strong owner of producer-prepared diagnostic storage.
+    ///
+    /// # Safety
+    /// The pointer must own initialized, Send + Sync diagnostic storage whose
+    /// complete carrier allocation and control invoices were admitted before
+    /// allocation. It must retain the payload's actual producer invoices; this
+    /// bridge does not certify a foreign diagnostic's allocation provenance.
+    /// `inspect` must return the same live logical Error on every call, or None
+    /// only for a deferred diagnostic of the existing Other class. Its boolean
+    /// may be true only if the original source owns no unpaid allocation and
+    /// its actual producer invoices remain retained through physical free.
+    /// A foreign or inherited diagnostic is not qualified by this carrier.
+    /// `display`
+    /// must render the original diagnosis without copying it. Neither may refer
+    /// back to this carrier. `release` must destroy the payload, then free its
+    /// storage, then release its invoices exactly once, including on unwind.
+    /// No borrowed pointer may outlive this owner. The owner must not contain
+    /// this carrier.
+    pub unsafe fn from_owned(
+        pointer: std::ptr::NonNull<()>,
+        inspect: DiagnosticInspector,
+        display: unsafe fn(std::ptr::NonNull<()>, &mut std::fmt::Formatter<'_>) -> std::fmt::Result,
+        release: unsafe fn(std::ptr::NonNull<()>),
+    ) -> Self {
+        Self {
+            pointer,
+            inspect,
+            display,
+            release,
+        }
+    }
+    fn diagnostic(&self) -> Option<&Error> {
+        unsafe {
+            (self.inspect)(self.pointer)
+                .0
+                .map(|pointer| pointer.as_ref())
+        }
+    }
+    /// Source qualification supplied by the actual opaque producer, never
+    /// inferred from the carrier's existence or from a later reservation.
+    #[doc(hidden)]
+    pub fn source_is_qualified(&self) -> bool {
+        unsafe { (self.inspect)(self.pointer).1 }
+    }
+}
+// Owned storage requires Send + Sync and shared-only access; native errno is scalar.
+unsafe impl Send for FundedEngineError {}
+unsafe impl Sync for FundedEngineError {}
+impl std::fmt::Debug for FundedEngineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.diagnostic() {
+            Some(error) => std::fmt::Debug::fmt(error, f),
+            None => std::fmt::Display::fmt(self, f),
+        }
+    }
+}
+impl std::fmt::Display for FundedEngineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        unsafe { (self.display)(self.pointer, f) }
+    }
+}
+impl std::error::Error for FundedEngineError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.diagnostic().and_then(std::error::Error::source)
+    }
+}
+impl Drop for FundedEngineError {
+    fn drop(&mut self) {
+        unsafe { (self.release)(self.pointer) }
     }
 }
 
@@ -702,42 +1724,100 @@ impl From<crate::read_contract::ReadFailure> for Error {
     }
 }
 
-fn drop_blocked_rank_policy_display(
-    table: &str,
-    column: &Option<Box<str>>,
-    dropped_index: &Option<Box<str>>,
-    policy_table: &str,
-    policy_column: &str,
-    sort_key: &str,
-) -> String {
-    if let Some(column) = column {
-        return format!(
-            "cannot drop or rename column `{table}.{column}`: rank policy `{sort_key}` on `{policy_table}.{policy_column}` depends on it"
-        );
+struct DropBlockedRankPolicyDisplay<'a> {
+    table: &'a str,
+    column: &'a Option<Box<str>>,
+    dropped_index: &'a Option<Box<str>>,
+    policy_table: &'a str,
+    policy_column: &'a str,
+    sort_key: &'a str,
+}
+impl std::fmt::Display for DropBlockedRankPolicyDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            table,
+            column,
+            dropped_index,
+            policy_table,
+            policy_column,
+            sort_key,
+        } = self;
+        if let Some(column) = column {
+            return write!(
+                f,
+                "cannot drop or rename column `{table}.{column}`: rank policy `{sort_key}` on `{policy_table}.{policy_column}` depends on it"
+            );
+        }
+        if let Some(index) = dropped_index {
+            return write!(
+                f,
+                "cannot drop index `{index}` on `{table}`: rank policy `{sort_key}` on `{policy_table}.{policy_column}` depends on it"
+            );
+        }
+        write!(
+            f,
+            "cannot drop table `{table}`: rank policy `{sort_key}` on `{policy_table}.{policy_column}` depends on it"
+        )
     }
-    if let Some(index) = dropped_index {
-        return format!(
-            "cannot drop index `{index}` on `{table}`: rank policy `{sort_key}` on `{policy_table}.{policy_column}` depends on it"
-        );
+}
+fn drop_blocked_rank_policy_display<'a>(
+    table: &'a str,
+    column: &'a Option<Box<str>>,
+    dropped_index: &'a Option<Box<str>>,
+    policy_table: &'a str,
+    policy_column: &'a str,
+    sort_key: &'a str,
+) -> DropBlockedRankPolicyDisplay<'a> {
+    DropBlockedRankPolicyDisplay {
+        table,
+        column,
+        dropped_index,
+        policy_table,
+        policy_column,
+        sort_key,
     }
-    format!(
-        "cannot drop table `{table}`: rank policy `{sort_key}` on `{policy_table}.{policy_column}` depends on it"
-    )
 }
 
-fn foreign_key_violation_display(
-    child_table: &str,
-    child_columns: &[String],
-    parent_table: &str,
-    parent_columns: &[String],
-) -> String {
-    format!(
-        "foreign key violation: {}({}) references {}({})",
+struct ForeignKeyViolationDisplay<'a> {
+    child_table: &'a str,
+    child_columns: &'a [String],
+    parent_table: &'a str,
+    parent_columns: &'a [String],
+}
+impl std::fmt::Display for ForeignKeyViolationDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "foreign key violation: {}(", self.child_table)?;
+        for (index, column) in self.child_columns.iter().enumerate() {
+            if index != 0 {
+                f.write_str(", ")?;
+            }
+            f.write_str(column)?;
+        }
+        write!(f, ") references {}(", self.parent_table)?;
+        for (index, column) in self.parent_columns.iter().enumerate() {
+            if index != 0 {
+                f.write_str(", ")?;
+            }
+            f.write_str(column)?;
+        }
+        f.write_str(")")
+    }
+}
+fn foreign_key_violation_display<'a>(
+    child_table: &'a str,
+    child_columns: &'a [String],
+    parent_table: &'a str,
+    parent_columns: &'a [String],
+) -> ForeignKeyViolationDisplay<'a> {
+    ForeignKeyViolationDisplay {
         child_table,
-        child_columns.join(", "),
+        child_columns,
         parent_table,
-        parent_columns.join(", ")
-    )
+        parent_columns,
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+// Inline refusal diagnostics must stay allocation-free without further Error growth.
+const _: () = assert!(std::mem::size_of::<Error>() <= 160);

@@ -115,13 +115,21 @@ fn source_params() -> HashMap<String, Value> {
 }
 
 fn answer(result: &QueryResult) -> String {
-    format!("{:?}", result.rows)
+    format!("{:?}", result.rows())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn eager(database: &Database) -> contextdb_core::Result<QueryResult> {
     database.execute(NEAREST, &source_params())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn bounded(database: &Database) -> contextdb_core::Result<QueryResult> {
     database
         .read_session(roomy())
@@ -280,7 +288,7 @@ fn clearing_the_vector_a_search_measures_from_fails_the_same_way_through_both_do
         Ok(answered) => panic!(
             "a bounded read answered {:?} from a vector this transaction cleared -- falling back \
              on the committed vector answers a question nobody asked",
-            answered.rows
+            answered.rows()
         ),
         Err(bounded_refusal) => assert_eq!(
             format!("{bounded_refusal:?}"),

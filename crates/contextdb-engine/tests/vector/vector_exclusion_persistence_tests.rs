@@ -43,7 +43,7 @@ fn nearest_id(db: &Database, query: Vec<f32>) -> Option<Uuid> {
             &params(vec![("query", Value::Vector(query))]),
         )
         .expect("vector search must succeed");
-    result.rows.first().map(|row| match row[0] {
+    result.rows().first().map(|row| match row[0] {
         Value::Uuid(id) => id,
         ref other => panic!("expected UUID id, got {other:?}"),
     })
@@ -119,7 +119,7 @@ fn excluded_vector_stays_excluded_across_reopen() {
         )
         .expect("read back status after reopen");
     assert_eq!(
-        status.rows,
+        status.rows(),
         vec![vec![Value::Text("invalidated".to_string())]],
         "the row's status column must persist as 'invalidated' across reopen -- this is the \
          half of the bug that already works; if THIS fails, the defect is broader than the \

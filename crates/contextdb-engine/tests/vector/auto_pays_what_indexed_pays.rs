@@ -8,6 +8,8 @@
 //! total charged work, examined rows, the per-source work split, the source
 //! items actually reached, and the answer itself.
 
+use super::retained_query_rows::RetainedRows;
+
 use contextdb_core::read_contract::{DeadlineClock, DeadlineWait, ReadLimits};
 use contextdb_core::{Value, VectorIndexRef};
 use contextdb_engine::executor::bounded_read_test_support as bounded;
@@ -80,7 +82,7 @@ impl TouchCounter {
 }
 
 struct Executed {
-    rows: Vec<Vec<Value>>,
+    rows: RetainedRows,
     work_units: u64,
     rows_examined: u64,
     source_work: BTreeMap<bounded::TestWorkSource, u64>,
@@ -158,11 +160,26 @@ fn fixture() -> Database {
     for _ in 0..512 {
         db.run_maintenance_cycle()
             .expect("advance deterministic maintenance");
+        let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+            db.declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         let ready = db
             .vector_store_for_test()
-            .partition_infos(&VectorIndexRef::new("route_vectors", "embedding"))
+            .partition_infos(
+                &VectorIndexRef::new("route_vectors", "embedding"),
+                &mut partition_observation_owner_1,
+            )
             .expect("inspect partition readiness");
-        if ready.len() == PARTITIONS && ready.iter().all(|partition| partition.graph_available) {
+        if ready.len() == PARTITIONS
+            && ready.iter().all(|partition| {
+                db.__debug_vector_partition_indexed_for_test(
+                    partition.partition.index.clone(),
+                    partition.partition.partition_key.clone(),
+                )
+            })
+        {
             return db;
         }
     }
@@ -209,16 +226,16 @@ fn execute(db: &Database, partitions: usize, mode: Option<&str>) -> Executed {
         bounded::BoundedReadRequest::new(sql, params, limits(), Arc::new(FrozenClock));
     request.probe = Some(counter.clone());
     let executed = bounded::execute(db, &request).expect("the bounded route arm succeeds");
-    let disclosure = executed.result.trace.vector_search.as_ref();
+    let disclosure = executed.result.trace().vector_search.as_ref();
     Executed {
-        rows: executed.result.rows.clone(),
         work_units: executed.telemetry.work_units,
-        rows_examined: executed.result.trace.rows_examined,
+        rows_examined: executed.result.trace().rows_examined,
         source_work: executed.telemetry.source_work.clone(),
         touches: counter.snapshot(),
         resolved_mode: disclosure.map(|disclosure| disclosure.resolved_mode),
         route: disclosure.and_then(|disclosure| disclosure.route),
         aggregate_allowed_vectors: disclosure.and_then(|d| d.aggregate_allowed_vectors),
+        rows: executed.result.into(),
     }
 }
 

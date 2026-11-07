@@ -1,0 +1,2945 @@
+{
+  "aggregates": {
+    "custody": {
+      "modules": [
+        {
+          "cfg": [],
+          "name": "custody_inspection_contract",
+          "owners": [
+            "custody_custody_inspection"
+          ],
+          "path": "crates/contextdb-engine/tests/custody/custody_inspection_contract.rs",
+          "proofs": {
+            "custody_custody_inspection": {
+              "aggregate_required_features": [
+                "test-seams",
+                "iroh"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams",
+                "iroh"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "custody_inspection_contract",
+                "path": "crates/contextdb-engine/tests/custody/custody_inspection_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "custody_protocol_contract",
+          "owners": [
+            "custody_custody_protocol"
+          ],
+          "path": "crates/contextdb-engine/tests/custody/custody_protocol_contract.rs",
+          "proofs": {
+            "custody_custody_protocol": {
+              "aggregate_required_features": [
+                "test-seams",
+                "iroh"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams",
+                "iroh"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "custody_protocol_contract",
+                "path": "crates/contextdb-engine/tests/custody/custody_protocol_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "custody_purge_and_discard_contract",
+          "owners": [
+            "custody_custody_purge_and_discard"
+          ],
+          "path": "crates/contextdb-engine/tests/custody/custody_purge_and_discard_contract.rs",
+          "proofs": {
+            "custody_custody_purge_and_discard": {
+              "aggregate_required_features": [
+                "test-seams",
+                "iroh"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams",
+                "iroh"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "custody_purge_and_discard_contract",
+                "path": "crates/contextdb-engine/tests/custody/custody_purge_and_discard_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "delivery_manifest_contract",
+          "owners": [
+            "custody_delivery_manifest"
+          ],
+          "path": "crates/contextdb-engine/tests/custody/delivery_manifest_contract.rs",
+          "proofs": {
+            "custody_delivery_manifest": {
+              "aggregate_required_features": [
+                "test-seams",
+                "iroh"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams",
+                "iroh"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "delivery_manifest_contract",
+                "path": "crates/contextdb-engine/tests/custody/delivery_manifest_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "delivery_outcome_contract",
+          "owners": [
+            "custody_delivery_outcome"
+          ],
+          "path": "crates/contextdb-engine/tests/custody/delivery_outcome_contract.rs",
+          "proofs": {
+            "custody_delivery_outcome": {
+              "aggregate_required_features": [
+                "test-seams",
+                "iroh"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams",
+                "iroh"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "delivery_outcome_contract",
+                "path": "crates/contextdb-engine/tests/custody/delivery_outcome_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [
+            "#[cfg(feature = \"nightly-tests\")]"
+          ],
+          "name": "find_show_status_stay_fast_while_schema_replays",
+          "owners": [],
+          "path": "crates/contextdb-engine/tests/schema/find_show_status_stay_fast_while_schema_replays.rs",
+          "proofs": {}
+        },
+        {
+          "cfg": [],
+          "name": "schema_replay_is_proportional_to_affected_tables",
+          "owners": [
+            "custody_schema_replay_bounded_contract",
+            "custody_schema_replay_is_proportional_to_affected_tables"
+          ],
+          "path": "crates/contextdb-engine/tests/schema/schema_replay_is_proportional_to_affected_tables.rs",
+          "proofs": {
+            "custody_schema_replay_bounded_contract": {
+              "aggregate_required_features": [
+                "test-seams",
+                "iroh"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams",
+                "iroh"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "schema_replay_is_proportional_to_affected_tables",
+                "path": "crates/contextdb-engine/tests/schema/schema_replay_is_proportional_to_affected_tables.rs"
+              },
+              "wrapper_cfg": []
+            },
+            "custody_schema_replay_is_proportional_to_affected_tables": {
+              "aggregate_required_features": [
+                "test-seams",
+                "iroh"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams",
+                "iroh"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "schema_replay_is_proportional_to_affected_tables",
+                "path": "crates/contextdb-engine/tests/schema/schema_replay_is_proportional_to_affected_tables.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "server_resource_policy_contract_tests",
+          "owners": [
+            "custody_server_resource_policy_contract_tests"
+          ],
+          "path": "crates/contextdb-engine/tests/custody/server_resource_policy_contract_tests.rs",
+          "proofs": {
+            "custody_server_resource_policy_contract_tests": {
+              "aggregate_required_features": [
+                "test-seams",
+                "iroh"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams",
+                "iroh"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "server_resource_policy_contract_tests",
+                "path": "crates/contextdb-engine/tests/custody/server_resource_policy_contract_tests.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "tenant_table_policy_contract",
+          "owners": [
+            "custody_tenant_table_policy"
+          ],
+          "path": "crates/contextdb-engine/tests/custody/tenant_table_policy_contract.rs",
+          "proofs": {
+            "custody_tenant_table_policy": {
+              "aggregate_required_features": [
+                "test-seams",
+                "iroh"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams",
+                "iroh"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "tenant_table_policy_contract",
+                "path": "crates/contextdb-engine/tests/custody/tenant_table_policy_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "the_whole_startup_schema_installs_in_one_transaction",
+          "owners": [
+            "custody_the_whole_startup_schema_installs_in_one_transaction"
+          ],
+          "path": "crates/contextdb-engine/tests/schema/the_whole_startup_schema_installs_in_one_transaction.rs",
+          "proofs": {
+            "custody_the_whole_startup_schema_installs_in_one_transaction": {
+              "aggregate_required_features": [
+                "test-seams",
+                "iroh"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams",
+                "iroh"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "the_whole_startup_schema_installs_in_one_transaction",
+                "path": "crates/contextdb-engine/tests/schema/the_whole_startup_schema_installs_in_one_transaction.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        }
+      ],
+      "wrapper": "tests/custody.rs"
+    },
+    "vector": {
+      "modules": [
+        {
+          "cfg": [],
+          "name": "a_broad_filter_examines_rows_within_the_breadth",
+          "owners": [],
+          "path": "crates/contextdb-engine/tests/vector/a_broad_filter_examines_rows_within_the_breadth.rs",
+          "proofs": {}
+        },
+        {
+          "cfg": [],
+          "name": "a_damaged_index_refuses_only_reads_that_consume_its_postings",
+          "owners": [],
+          "path": "crates/contextdb-engine/tests/vector/a_damaged_index_refuses_only_reads_that_consume_its_postings.rs",
+          "proofs": {}
+        },
+        {
+          "cfg": [],
+          "name": "a_damaged_saved_graph_page_refuses_only_its_route",
+          "owners": [],
+          "path": "crates/contextdb-engine/tests/vector/a_damaged_saved_graph_page_refuses_only_its_route.rs",
+          "proofs": {}
+        },
+        {
+          "cfg": [],
+          "name": "a_declared_breadth_gets_exactly_its_approved_budget",
+          "owners": [
+            "vector_declared_budget"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/a_declared_breadth_gets_exactly_its_approved_budget.rs",
+          "proofs": {
+            "vector_declared_budget": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "a_declared_breadth_gets_exactly_its_approved_budget",
+                "path": "crates/contextdb-engine/tests/vector/a_declared_breadth_gets_exactly_its_approved_budget.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "a_declared_serving_cache_is_honoured",
+          "owners": [
+            "vector_declared_budget"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/a_declared_serving_cache_is_honoured.rs",
+          "proofs": {
+            "vector_declared_budget": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "a_declared_serving_cache_is_honoured",
+                "path": "crates/contextdb-engine/tests/vector/a_declared_serving_cache_is_honoured.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "a_disconnected_graph_partition_is_compared_exactly",
+          "owners": [],
+          "path": "crates/contextdb-engine/tests/vector/a_disconnected_graph_partition_is_compared_exactly.rs",
+          "proofs": {}
+        },
+        {
+          "cfg": [],
+          "name": "a_filtered_scope_is_charged_for_its_candidates",
+          "owners": [
+            "vector_a_filtered_scope_is_charged_for_its_candidates"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/a_filtered_scope_is_charged_for_its_candidates.rs",
+          "proofs": {
+            "vector_a_filtered_scope_is_charged_for_its_candidates": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "a_filtered_scope_is_charged_for_its_candidates",
+                "path": "crates/contextdb-engine/tests/vector/a_filtered_scope_is_charged_for_its_candidates.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "a_find_answers_a_full_page_when_a_candidate_is_withdrawn",
+          "owners": [
+            "vector_a_find_answers_a_full_page_when_a_candidate_is_withdrawn"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/a_find_answers_a_full_page_when_a_candidate_is_withdrawn.rs",
+          "proofs": {
+            "vector_a_find_answers_a_full_page_when_a_candidate_is_withdrawn": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "a_find_answers_a_full_page_when_a_candidate_is_withdrawn",
+                "path": "crates/contextdb-engine/tests/vector/a_find_answers_a_full_page_when_a_candidate_is_withdrawn.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "a_find_decodes_only_the_rows_it_returns",
+          "owners": [
+            "vector_a_find_decodes_only_the_rows_it_returns"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/a_find_decodes_only_the_rows_it_returns.rs",
+          "proofs": {
+            "vector_a_find_decodes_only_the_rows_it_returns": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "a_find_decodes_only_the_rows_it_returns",
+                "path": "crates/contextdb-engine/tests/vector/a_find_decodes_only_the_rows_it_returns.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [
+            "#[cfg(unix)]"
+          ],
+          "name": "a_find_names_only_the_pairs_it_asks_for",
+          "owners": [
+            "vector_a_find_names_only_the_pairs_it_asks_for"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/a_find_names_only_the_pairs_it_asks_for.rs",
+          "proofs": {
+            "vector_a_find_names_only_the_pairs_it_asks_for": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [
+                  "#[cfg(unix)]"
+                ],
+                "name": "a_find_names_only_the_pairs_it_asks_for",
+                "path": "crates/contextdb-engine/tests/vector/a_find_names_only_the_pairs_it_asks_for.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "a_find_over_many_contexts_spends_one_search_budget",
+          "owners": [
+            "vector_a_find_over_many_contexts_spends_one_search_budget"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/a_find_over_many_contexts_spends_one_search_budget.rs",
+          "proofs": {
+            "vector_a_find_over_many_contexts_spends_one_search_budget": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "a_find_over_many_contexts_spends_one_search_budget",
+                "path": "crates/contextdb-engine/tests/vector/a_find_over_many_contexts_spends_one_search_budget.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "a_row_checked_find_keeps_recall_and_refusals",
+          "owners": [],
+          "path": "crates/contextdb-engine/tests/vector/a_row_checked_find_keeps_recall_and_refusals.rs",
+          "proofs": {}
+        },
+        {
+          "cfg": [],
+          "name": "a_store_reopens_after_every_vector_maintenance_commit",
+          "owners": [],
+          "path": "crates/contextdb-engine/tests/vector/a_store_reopens_after_every_vector_maintenance_commit.rs",
+          "proofs": {}
+        },
+        {
+          "cfg": [],
+          "name": "a_synced_vector_policy_change_keeps_the_receivers_graphs",
+          "owners": [],
+          "path": "crates/contextdb-engine/tests/vector/a_synced_vector_policy_change_keeps_the_receivers_graphs.rs",
+          "proofs": {}
+        },
+        {
+          "cfg": [],
+          "name": "an_exact_search_authenticates_pages_not_every_vector",
+          "owners": [
+            "vector_an_exact_search_authenticates_pages_not_every_vector"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/an_exact_search_authenticates_pages_not_every_vector.rs",
+          "proofs": {
+            "vector_an_exact_search_authenticates_pages_not_every_vector": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "an_exact_search_authenticates_pages_not_every_vector",
+                "path": "crates/contextdb-engine/tests/vector/an_exact_search_authenticates_pages_not_every_vector.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "an_exhaustive_find_streams_bodies_it_cannot_hold",
+          "owners": [
+            "vector_an_exhaustive_find_streams_bodies_it_cannot_hold"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/an_exhaustive_find_streams_bodies_it_cannot_hold.rs",
+          "proofs": {
+            "vector_an_exhaustive_find_streams_bodies_it_cannot_hold": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "an_exhaustive_find_streams_bodies_it_cannot_hold",
+                "path": "crates/contextdb-engine/tests/vector/an_exhaustive_find_streams_bodies_it_cannot_hold.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "auto_chooses_the_cheaper_route_for_each_partition",
+          "owners": [
+            "vector_auto_chooses_the_cheaper_route_for_each_partition"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/auto_chooses_the_cheaper_route_for_each_partition.rs",
+          "proofs": {
+            "vector_auto_chooses_the_cheaper_route_for_each_partition": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "auto_chooses_the_cheaper_route_for_each_partition",
+                "path": "crates/contextdb-engine/tests/vector/auto_chooses_the_cheaper_route_for_each_partition.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "auto_decides_the_route_once_for_the_whole_scope",
+          "owners": [
+            "vector_auto_decides_the_route_once_for_the_whole_scope"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/auto_decides_the_route_once_for_the_whole_scope.rs",
+          "proofs": {
+            "vector_auto_decides_the_route_once_for_the_whole_scope": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "auto_decides_the_route_once_for_the_whole_scope",
+                "path": "crates/contextdb-engine/tests/vector/auto_decides_the_route_once_for_the_whole_scope.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "auto_pays_what_indexed_pays",
+          "owners": [
+            "vector_auto_pays_what_indexed_pays"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/auto_pays_what_indexed_pays.rs",
+          "proofs": {
+            "vector_auto_pays_what_indexed_pays": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "auto_pays_what_indexed_pays",
+                "path": "crates/contextdb-engine/tests/vector/auto_pays_what_indexed_pays.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [
+            "#[cfg(feature = \"nightly-tests\")]"
+          ],
+          "name": "continuous_writers_hold_throughput_and_reader_latency",
+          "owners": [],
+          "path": "crates/contextdb-engine/tests/vector/continuous_writers_hold_throughput_and_reader_latency.rs",
+          "proofs": {}
+        },
+        {
+          "cfg": [],
+          "name": "equal_distance_rows_keep_canonical_order_across_contexts",
+          "owners": [
+            "vector_equal_distance_rows_keep_canonical_order_across_contexts"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/equal_distance_rows_keep_canonical_order_across_contexts.rs",
+          "proofs": {
+            "vector_equal_distance_rows_keep_canonical_order_across_contexts": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "equal_distance_rows_keep_canonical_order_across_contexts",
+                "path": "crates/contextdb-engine/tests/vector/equal_distance_rows_keep_canonical_order_across_contexts.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "every_graph_route_reaches_every_row",
+          "owners": [],
+          "path": "crates/contextdb-engine/tests/vector/every_graph_route_reaches_every_row.rs",
+          "proofs": {}
+        },
+        {
+          "cfg": [],
+          "name": "flat_route_below_declared_threshold",
+          "owners": [],
+          "path": "crates/contextdb-engine/tests/vector/flat_route_below_declared_threshold.rs",
+          "proofs": {}
+        },
+        {
+          "cfg": [],
+          "name": "indexed_route_does_less_work_than_exact",
+          "owners": [
+            "vector_indexed_route_does_less_work_than_exact"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/indexed_route_does_less_work_than_exact.rs",
+          "proofs": {
+            "vector_indexed_route_does_less_work_than_exact": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "indexed_route_does_less_work_than_exact",
+                "path": "crates/contextdb-engine/tests/vector/indexed_route_does_less_work_than_exact.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "maintained_search",
+          "owners": [
+            "vector_a_filtered_scope_is_charged_for_its_candidates",
+            "vector_indexed_route_does_less_work_than_exact"
+          ],
+          "path": "crates/contextdb-engine/tests/fixtures/maintained_search/mod.rs",
+          "proofs": {
+            "vector_a_filtered_scope_is_charged_for_its_candidates": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "maintained_search",
+                "path": "crates/contextdb-engine/tests/fixtures/maintained_search/mod.rs"
+              },
+              "wrapper_cfg": []
+            },
+            "vector_indexed_route_does_less_work_than_exact": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "maintained_search",
+                "path": "crates/contextdb-engine/tests/fixtures/maintained_search/mod.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "multi_partition_union_recovers_nearest_rows",
+          "owners": [
+            "vector_multi_partition_union_recovers_nearest_rows"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/multi_partition_union_recovers_nearest_rows.rs",
+          "proofs": {
+            "vector_multi_partition_union_recovers_nearest_rows": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "multi_partition_union_recovers_nearest_rows",
+                "path": "crates/contextdb-engine/tests/vector/multi_partition_union_recovers_nearest_rows.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "named_vector_planner_tests",
+          "owners": [
+            "vector_named_vector_planner_tests"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/named_vector_planner_tests.rs",
+          "proofs": {
+            "vector_named_vector_planner_tests": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "named_vector_planner_tests",
+                "path": "crates/contextdb-engine/tests/vector/named_vector_planner_tests.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "passive_explain_predicts_the_executed_auto_route",
+          "owners": [],
+          "path": "crates/contextdb-engine/tests/vector/passive_explain_predicts_the_executed_auto_route.rs",
+          "proofs": {}
+        },
+        {
+          "cfg": [],
+          "name": "public_row_apis_honor_quantized_columns",
+          "owners": [
+            "vector_quantized"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/public_row_apis_honor_quantized_columns.rs",
+          "proofs": {
+            "vector_quantized": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "public_row_apis_honor_quantized_columns",
+                "path": "crates/contextdb-engine/tests/vector/public_row_apis_honor_quantized_columns.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "quantized_vector_read_agreement",
+          "owners": [
+            "vector_quantized"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/quantized_vector_read_agreement.rs",
+          "proofs": {
+            "vector_quantized": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "quantized_vector_read_agreement",
+                "path": "crates/contextdb-engine/tests/vector/quantized_vector_read_agreement.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "retained_indexed_rows",
+          "owners": [
+            "vector_retained_indexed_rows"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/retained_indexed_rows.rs",
+          "proofs": {
+            "vector_retained_indexed_rows": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "retained_indexed_rows",
+                "path": "crates/contextdb-engine/tests/vector/retained_indexed_rows.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "retained_query_rows",
+          "owners": [
+            "vector_a_filtered_scope_is_charged_for_its_candidates",
+            "vector_auto_pays_what_indexed_pays",
+            "vector_schema"
+          ],
+          "path": "crates/contextdb-engine/tests/fixtures/retained_query_rows.rs",
+          "proofs": {
+            "vector_a_filtered_scope_is_charged_for_its_candidates": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "retained_query_rows",
+                "path": "crates/contextdb-engine/tests/fixtures/retained_query_rows.rs"
+              },
+              "wrapper_cfg": []
+            },
+            "vector_auto_pays_what_indexed_pays": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "retained_query_rows",
+                "path": "crates/contextdb-engine/tests/fixtures/retained_query_rows.rs"
+              },
+              "wrapper_cfg": []
+            },
+            "vector_schema": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "retained_query_rows",
+                "path": "crates/contextdb-engine/tests/fixtures/retained_query_rows.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "row_delete_and_guards_honor_vector_columns",
+          "owners": [
+            "vector_row_delete_and_guards_honor_vector_columns"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/row_delete_and_guards_honor_vector_columns.rs",
+          "proofs": {
+            "vector_row_delete_and_guards_honor_vector_columns": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "row_delete_and_guards_honor_vector_columns",
+                "path": "crates/contextdb-engine/tests/vector/row_delete_and_guards_honor_vector_columns.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "the_owner_doors_run_one_search_over_every_layer",
+          "owners": [
+            "vector_the_owner_doors_run_one_search_over_every_layer"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/the_owner_doors_run_one_search_over_every_layer.rs",
+          "proofs": {
+            "vector_the_owner_doors_run_one_search_over_every_layer": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "the_owner_doors_run_one_search_over_every_layer",
+                "path": "crates/contextdb-engine/tests/vector/the_owner_doors_run_one_search_over_every_layer.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_exclusion_persistence_tests",
+          "owners": [
+            "vector_exclusion_persistence_tests"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_exclusion_persistence_tests.rs",
+          "proofs": {
+            "vector_exclusion_persistence_tests": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_exclusion_persistence_tests",
+                "path": "crates/contextdb-engine/tests/vector/vector_exclusion_persistence_tests.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_generation_authoritative_purge_contract",
+          "owners": [
+            "vector_generation"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_generation_authoritative_purge_contract.rs",
+          "proofs": {
+            "vector_generation": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_generation_authoritative_purge_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_generation_authoritative_purge_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_generation_ddl_cleanup_contract",
+          "owners": [
+            "vector_generation"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_generation_ddl_cleanup_contract.rs",
+          "proofs": {
+            "vector_generation": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_generation_ddl_cleanup_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_generation_ddl_cleanup_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_held_out_native_reference",
+          "owners": [
+            "vector_held_out_native_reference"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_held_out_native_reference.rs",
+          "proofs": {
+            "vector_held_out_native_reference": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_held_out_native_reference",
+                "path": "crates/contextdb-engine/tests/vector/vector_held_out_native_reference.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_inspection_explain_truth_contract",
+          "owners": [
+            "vector_inspection_explain_truth_contract"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_inspection_explain_truth_contract.rs",
+          "proofs": {
+            "vector_inspection_explain_truth_contract": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_inspection_explain_truth_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_inspection_explain_truth_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_lazy_consumer_restart_contract",
+          "owners": [
+            "vector_lazy"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_lazy_consumer_restart_contract.rs",
+          "proofs": {
+            "vector_lazy": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_lazy_consumer_restart_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_lazy_consumer_restart_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_lazy_raw_residency_contract",
+          "owners": [
+            "vector_lazy"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_lazy_raw_residency_contract.rs",
+          "proofs": {
+            "vector_lazy": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_lazy_raw_residency_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_lazy_raw_residency_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_maintained_lifecycle_contract",
+          "owners": [
+            "vector_maintained_lifecycle_contract"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_maintained_lifecycle_contract.rs",
+          "proofs": {
+            "vector_maintained_lifecycle_contract": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_maintained_lifecycle_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_maintained_lifecycle_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_memory_ownership_reconciliation_contract",
+          "owners": [
+            "vector_memory_ownership_reconciliation_contract"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_memory_ownership_reconciliation_contract.rs",
+          "proofs": {
+            "vector_memory_ownership_reconciliation_contract": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_memory_ownership_reconciliation_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_memory_ownership_reconciliation_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_operation_observations",
+          "owners": [
+            "vector_operation_observations"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_operation_observations.rs",
+          "proofs": {
+            "vector_operation_observations": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_operation_observations",
+                "path": "crates/contextdb-engine/tests/vector/vector_operation_observations.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_partition_cleanup_inspection_contract",
+          "owners": [
+            "vector_partition"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_partition_cleanup_inspection_contract.rs",
+          "proofs": {
+            "vector_partition": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_partition_cleanup_inspection_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_partition_cleanup_inspection_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_partition_declaration_contract",
+          "owners": [
+            "vector_partition"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_partition_declaration_contract.rs",
+          "proofs": {
+            "vector_partition": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_partition_declaration_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_partition_declaration_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_partition_query_contract",
+          "owners": [
+            "vector_partition"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_partition_query_contract.rs",
+          "proofs": {
+            "vector_partition": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_partition_query_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_partition_query_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_partition_restart_contract",
+          "owners": [
+            "vector_partition"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_partition_restart_contract.rs",
+          "proofs": {
+            "vector_partition": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_partition_restart_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_partition_restart_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_partition_scope_resolves_after_bind_contract",
+          "owners": [
+            "vector_partition"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_partition_scope_resolves_after_bind_contract.rs",
+          "proofs": {
+            "vector_partition": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_partition_scope_resolves_after_bind_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_partition_scope_resolves_after_bind_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_partition_sync_inspection_contract",
+          "owners": [
+            "vector_partition"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_partition_sync_inspection_contract.rs",
+          "proofs": {
+            "vector_partition": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_partition_sync_inspection_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_partition_sync_inspection_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_policy_declaration_contract",
+          "owners": [
+            "vector_policy"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_policy_declaration_contract.rs",
+          "proofs": {
+            "vector_policy": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_policy_declaration_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_policy_declaration_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_policy_mixed_version_contract",
+          "owners": [
+            "vector_policy"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_policy_mixed_version_contract.rs",
+          "proofs": {
+            "vector_policy": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_policy_mixed_version_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_policy_mixed_version_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_policy_resolver_contract",
+          "owners": [
+            "vector_policy"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_policy_resolver_contract.rs",
+          "proofs": {
+            "vector_policy": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_policy_resolver_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_policy_resolver_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_policy_revision_publication_contract",
+          "owners": [
+            "vector_policy"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_policy_revision_publication_contract.rs",
+          "proofs": {
+            "vector_policy": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_policy_revision_publication_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_policy_revision_publication_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_rank_policy_exact_audits_the_whole_table",
+          "owners": [
+            "vector_rank_policy_exact_audits_the_whole_table"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_rank_policy_exact_audits_the_whole_table.rs",
+          "proofs": {
+            "vector_rank_policy_exact_audits_the_whole_table": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_rank_policy_exact_audits_the_whole_table",
+                "path": "crates/contextdb-engine/tests/vector/vector_rank_policy_exact_audits_the_whole_table.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_received_generation_invalidation_contract",
+          "owners": [
+            "vector_received_generation_invalidation_contract"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_received_generation_invalidation_contract.rs",
+          "proofs": {
+            "vector_received_generation_invalidation_contract": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_received_generation_invalidation_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_received_generation_invalidation_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_resource_maintenance_contract",
+          "owners": [
+            "vector_resource_maintenance_contract"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_resource_maintenance_contract.rs",
+          "proofs": {
+            "vector_resource_maintenance_contract": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_resource_maintenance_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_resource_maintenance_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_schema_mixed_version_compatibility_contract",
+          "owners": [
+            "vector_schema"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_schema_mixed_version_compatibility_contract.rs",
+          "proofs": {
+            "vector_schema": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_schema_mixed_version_compatibility_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_schema_mixed_version_compatibility_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_schema_mixed_version_erasure_frontier_contract",
+          "owners": [
+            "vector_schema"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_schema_mixed_version_erasure_frontier_contract.rs",
+          "proofs": {
+            "vector_schema": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_schema_mixed_version_erasure_frontier_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_schema_mixed_version_erasure_frontier_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_schema_mixed_version_push_compatibility_contract",
+          "owners": [
+            "vector_schema"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_schema_mixed_version_push_compatibility_contract.rs",
+          "proofs": {
+            "vector_schema": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_schema_mixed_version_push_compatibility_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_schema_mixed_version_push_compatibility_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_schema_mixed_version_recovery_cursor_contract",
+          "owners": [
+            "vector_schema"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_schema_mixed_version_recovery_cursor_contract.rs",
+          "proofs": {
+            "vector_schema": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_schema_mixed_version_recovery_cursor_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_schema_mixed_version_recovery_cursor_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_schema_mixed_version_restart_contract",
+          "owners": [
+            "vector_schema"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_schema_mixed_version_restart_contract.rs",
+          "proofs": {
+            "vector_schema": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_schema_mixed_version_restart_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_schema_mixed_version_restart_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_search_answers_quantized_columns_on_every_route",
+          "owners": [
+            "vector_quantized"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_search_answers_quantized_columns_on_every_route.rs",
+          "proofs": {
+            "vector_quantized": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_search_answers_quantized_columns_on_every_route",
+                "path": "crates/contextdb-engine/tests/vector/vector_search_answers_quantized_columns_on_every_route.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_search_mode_bounded_contract",
+          "owners": [
+            "vector_search_mode_bounded_contract"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_search_mode_bounded_contract.rs",
+          "proofs": {
+            "vector_search_mode_bounded_contract": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_search_mode_bounded_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_search_mode_bounded_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_serving_merge_contract",
+          "owners": [
+            "vector_serving_merge_contract"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_serving_merge_contract.rs",
+          "proofs": {
+            "vector_serving_merge_contract": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_serving_merge_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_serving_merge_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_tail_transaction_contract",
+          "owners": [
+            "vector_tail_transaction_contract"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_tail_transaction_contract.rs",
+          "proofs": {
+            "vector_tail_transaction_contract": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_tail_transaction_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_tail_transaction_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "vector_transaction_filter_snapshot_truth_contract",
+          "owners": [
+            "vector_transaction_filter_snapshot_truth_contract"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/vector_transaction_filter_snapshot_truth_contract.rs",
+          "proofs": {
+            "vector_transaction_filter_snapshot_truth_contract": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "vector_transaction_filter_snapshot_truth_contract",
+                "path": "crates/contextdb-engine/tests/vector/vector_transaction_filter_snapshot_truth_contract.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "writer_residency_attribution",
+          "owners": [
+            "vector_writer_residency_attribution"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/writer_residency_attribution.rs",
+          "proofs": {
+            "vector_writer_residency_attribution": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "writer_residency_attribution",
+                "path": "crates/contextdb-engine/tests/vector/writer_residency_attribution.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "a_ranked_file_route_read_holds_bounded_memory",
+          "owners": [],
+          "path": "crates/contextdb-engine/tests/vector/a_ranked_file_route_read_holds_bounded_memory.rs",
+          "proofs": {}
+        },
+        {
+          "cfg": [],
+          "name": "a_ranked_search_answers_the_same_on_every_read_route",
+          "owners": [],
+          "path": "crates/contextdb-engine/tests/vector/a_ranked_search_answers_the_same_on_every_read_route.rs",
+          "proofs": {}
+        },
+        {
+          "cfg": [],
+          "name": "a_search_is_exact_with_no_index_built",
+          "owners": [
+            "vector_a_search_is_exact_with_no_index_built"
+          ],
+          "path": "crates/contextdb-engine/tests/vector/a_search_is_exact_with_no_index_built.rs",
+          "proofs": {
+            "vector_a_search_is_exact_with_no_index_built": {
+              "aggregate_required_features": [
+                "test-seams"
+              ],
+              "allocator": "no test-crate override in either complete literal closure",
+              "feature_profiles": [
+                [
+                  "iroh",
+                  "test-seams"
+                ],
+                [
+                  "iroh",
+                  "nightly-tests",
+                  "test-seams"
+                ]
+              ],
+              "owner_required_features": [
+                "test-seams"
+              ],
+              "root_helpers": {},
+              "shared": {
+                "cfg": [],
+                "name": "a_search_is_exact_with_no_index_built",
+                "path": "crates/contextdb-engine/tests/vector/a_search_is_exact_with_no_index_built.rs"
+              },
+              "wrapper_cfg": []
+            }
+          }
+        },
+        {
+          "cfg": [],
+          "name": "a_write_transactions_vector_copies_are_funded_by_the_writer",
+          "owners": [],
+          "path": "crates/contextdb-engine/tests/vector/a_write_transactions_vector_copies_are_funded_by_the_writer.rs",
+          "proofs": {}
+        }
+      ],
+      "wrapper": "tests/vector.rs"
+    }
+  },
+  "full_only_rule": {
+    "full_owner": "custody_schema_replay_is_proportional_to_affected_tables",
+    "full_skip_owner": "custody_schema_replay_bounded_contract",
+    "module": "schema_replay_is_proportional_to_affected_tables",
+    "normal_owner": "custody_schema_replay_bounded_contract",
+    "source": "crates/contextdb-engine/tests/schema/schema_replay_is_proportional_to_affected_tables.rs"
+  },
+  "schema_version": 1,
+  "source_sha256": {
+    "crates/contextdb-engine/Cargo.toml": "390a0e63e1577d565751bf44024c56aa3277c6a3e0f348ccaac0689596e7cf4a",
+    "crates/contextdb-engine/tests/custody.rs": "ffbf87bd12016a926c637fc342555a4dc3dda3953893470ec8aea9bb331f931d",
+    "crates/contextdb-engine/tests/custody/custody_inspection_contract.rs": "a2b30f8a7195603edd72c4395d29885ded5fb48151bb382f857cc39d0e4856ec",
+    "crates/contextdb-engine/tests/custody/custody_protocol_contract.rs": "822dad465eff806fb22795285463fd7653ddbbeae435013ca9fe1a369aee9f39",
+    "crates/contextdb-engine/tests/custody/custody_purge_and_discard_contract.rs": "35ea5e727000df67232b951ae95f1c59750eb487b1e1fe17f533ef747e1e0f87",
+    "crates/contextdb-engine/tests/custody/delivery_manifest_contract.rs": "8806811577b1b2d3daa3bc14d61d74e25537fb76cde491500f2f155c3afd9275",
+    "crates/contextdb-engine/tests/custody/delivery_outcome_contract.rs": "317a2bd6b076b44389783a4ad39b08a7b5bec8762d1ced8b0d29017cf40a5466",
+    "crates/contextdb-engine/tests/custody/server_resource_policy_contract_tests.rs": "37cab0dcd0a36bd9097cdd6765b87d7b1696224442c6446c08bddee46b486da6",
+    "crates/contextdb-engine/tests/custody/tenant_table_policy_contract.rs": "7ee0eb6055b1cdc195dc725f9bd731b408fb7624a1fabb7be48dc9d0686a2d98",
+    "crates/contextdb-engine/tests/custody_custody_inspection.rs": "efb0c121753bef2ab12d33a98df68b3e4654873d9b577d1af9ecfa9b72540326",
+    "crates/contextdb-engine/tests/custody_custody_protocol.rs": "3fd5f8bbd0295e1687bc70270718f1f372decc541369a84132cc4c8fffdb3cf6",
+    "crates/contextdb-engine/tests/custody_custody_purge_and_discard.rs": "d8ab44ad868926f785e83ec572b1380877b9b5570f34d2c99e2d1b5205ae4b50",
+    "crates/contextdb-engine/tests/custody_delivery_manifest.rs": "667144cac12d7b93f3d9b8dfd87543f229c7e2e6c26d3dd8028c5fd1335fe647",
+    "crates/contextdb-engine/tests/custody_delivery_outcome.rs": "5361fad2155c9e92a0a79f17b04f387147ac7e92e055d325af7f08e0ad7ed54f",
+    "crates/contextdb-engine/tests/custody_schema_replay_bounded_contract.rs": "485f156989117d57272c5a1ebf4f80caa60027c785a4d1f9d53b66dc17b2cbd2",
+    "crates/contextdb-engine/tests/custody_schema_replay_is_proportional_to_affected_tables.rs": "f47a93e394d67067901197f7fb25aba8f90b149183f77f58d6a82a696ad5aeea",
+    "crates/contextdb-engine/tests/custody_server_resource_policy_contract_tests.rs": "e39b587dfb050c0d1ac0501f3518c54b77ca42675621ad7b5c8522de1bf9efb6",
+    "crates/contextdb-engine/tests/custody_tenant_table_policy.rs": "f78bc3bd1918a1af2c63da856958939963d1e3b5a0d787178add7de754b623b7",
+    "crates/contextdb-engine/tests/custody_the_whole_startup_schema_installs_in_one_transaction.rs": "cb166e12f675cc770281a66168ca3ad22801a184bf36e56ba5981cd220aa5b20",
+    "crates/contextdb-engine/tests/fixtures/maintained_search/generator.rs": "b13db79f7923a71a757aa6fd87d6b4ce9969d4dc38985cfaed6ee5df7a492f19",
+    "crates/contextdb-engine/tests/fixtures/maintained_search/mod.rs": "a4786e3c30f5dccf1e3c20874b885523576f48a9209c73d7b2e15ccd062dde9c",
+    "crates/contextdb-engine/tests/fixtures/pinned_cg_startup/mod.rs": "c8cad3bdd56627cddd2af4d750a985a364d7af273ff0ae9b59f350048e002b67",
+    "crates/contextdb-engine/tests/fixtures/retained_query_rows.rs": "59988e2242ccd86da2c705c31f241309b64580ce23725873423af701ba436c8f",
+    "crates/contextdb-engine/tests/fixtures/schema_wall/largest.rs": "c32dec0b648f5e212b4976261942fd59ca3b1422e498edbd2f480dca050dc338",
+    "crates/contextdb-engine/tests/fixtures/schema_wall/mod.rs": "4211f3a6b7533561f6149fab21b88b5ab71b2cbb8a46f2bc58f656a89c4e8e8d",
+    "crates/contextdb-engine/tests/schema/find_show_status_stay_fast_while_schema_replays.rs": "9a9c1f655537024ea43fe0af38c646d7e935dc0e42e6093ee7b8755d8ac4a7c9",
+    "crates/contextdb-engine/tests/schema/schema_replay_exchange_helpers.rs": "da2d0ab145bc77344eb93c87bc6b11ef4c752b3eb0b33dea3b17f9146e8e38a4",
+    "crates/contextdb-engine/tests/schema/schema_replay_identical_schema_does_no_artifact_work.rs": "3cd36d27ea537baa07f4e4f203cb13cbddae24dc25c24b4d815ad405e689d29f",
+    "crates/contextdb-engine/tests/schema/schema_replay_is_proportional_to_affected_tables.rs": "1703d12e8f9d7cad8e91f83db9f4f400f7db61920c23ee267958798f9f76f502",
+    "crates/contextdb-engine/tests/schema/schema_replay_support.rs": "f57ceff1f73ac1ffc9e74f73b94e2b97c8e2257a0f3b59670a7b89fabc2f49d5",
+    "crates/contextdb-engine/tests/schema/schema_replay_work_limited_to_affected_tables.rs": "6e39eb1ce852765191ce9f05708b4bf3181e8d65afddd8d1fac9177f9f8b2893",
+    "crates/contextdb-engine/tests/schema/the_whole_startup_schema_installs_in_one_transaction.rs": "bc2678e1178333de8936e9b8ea56a8c2437a9fdfa6397dc138bc0a4aa067f360",
+    "crates/contextdb-engine/tests/vector.rs": "1f330d6c0031da68109fc3cdcdce303e81bec709b5b46826edc2a01109d3b404",
+    "crates/contextdb-engine/tests/vector/a_broad_filter_examines_rows_within_the_breadth.rs": "c53777cd914fe24c9f1eb3f22c3dd6ebf8af6e6bea5d1c805c79a359ea470392",
+    "crates/contextdb-engine/tests/vector/a_damaged_index_refuses_only_reads_that_consume_its_postings.rs": "66da4ae583d65ca80ff209639444869aee92c002109fd8320bdf43392efc9e4c",
+    "crates/contextdb-engine/tests/vector/a_damaged_saved_graph_page_refuses_only_its_route.rs": "6c0e4e73bf35e33717fcf98a0764296008aa6fe8be37fa6f2048dad3d0b6e4d6",
+    "crates/contextdb-engine/tests/vector/a_declared_breadth_gets_exactly_its_approved_budget.rs": "cabd872ddfec1f30c8d23c67a0c6a9d406af8a844c12ba571d4aa31e31064032",
+    "crates/contextdb-engine/tests/vector/a_declared_serving_cache_is_honoured.rs": "560567d85a136b9b9f61f184c6c5e3635f8ce99cea6bdd73d3a4025fff3ebec8",
+    "crates/contextdb-engine/tests/vector/a_disconnected_graph_partition_is_compared_exactly.rs": "03bc648589e485f34a1aea3a9a7f5da159b96ff4bda389d50036795f87421cfa",
+    "crates/contextdb-engine/tests/vector/a_filtered_scope_is_charged_for_its_candidates.rs": "102aeff2b356e907393d3dba1a044a7c0cc2d49c0f79e1b0c7c94c8c81ef570a",
+    "crates/contextdb-engine/tests/vector/a_find_answers_a_full_page_when_a_candidate_is_withdrawn.rs": "71e69a53e2b860ce481d74c88a84db7325561a7f445c56aca816f7b0ccc80d17",
+    "crates/contextdb-engine/tests/vector/a_find_decodes_only_the_rows_it_returns.rs": "fd9873638c1d6eda6ee16bd6a7c711381187e0d6a3a931b782a4fc3c100ec2c5",
+    "crates/contextdb-engine/tests/vector/a_find_names_only_the_pairs_it_asks_for.rs": "b5b5cd5fb7bedb14601f9448e70f8456bf4dfa4a6a0d498cfe2e48edc3f4d817",
+    "crates/contextdb-engine/tests/vector/a_find_over_many_contexts_spends_one_search_budget.rs": "87df8ca3f0450e6036ead6cbfadcaea5fb46a30a8101bf2e92c728f6e4399c9d",
+    "crates/contextdb-engine/tests/vector/a_ranked_file_route_read_holds_bounded_memory.rs": "00df4bca0e89395999aa8b47ce7a2a8f0473a80d7ebf0f6907cc3b945d1d2e0b",
+    "crates/contextdb-engine/tests/vector/a_ranked_search_answers_the_same_on_every_read_route.rs": "32cede92c26db89b77494c7039d420b97704db51b2f5e4ab172f595863fcd424",
+    "crates/contextdb-engine/tests/vector/a_row_checked_find_keeps_recall_and_refusals.rs": "0507458a6153fc69a2286b2e90090997367f5202d9afb6fd36eb0c4ca97c8a5d",
+    "crates/contextdb-engine/tests/vector/a_search_is_exact_with_no_index_built.rs": "a19beb660afa0bb75850dae8e8d95f6f913b3c739ef78316107dc8fed859fdd1",
+    "crates/contextdb-engine/tests/vector/a_store_reopens_after_every_vector_maintenance_commit.rs": "d740deb2c9b62a657f3441157b83f01bc3605c22a13996dec6c38d484adb8a80",
+    "crates/contextdb-engine/tests/vector/a_synced_vector_policy_change_keeps_the_receivers_graphs.rs": "c7f3d4acb21f26a57c6057c509f5264ac18f4c173f0d17148acfca96f328d89f",
+    "crates/contextdb-engine/tests/vector/a_write_transactions_vector_copies_are_funded_by_the_writer.rs": "c36287b670b58a487dc36d961dd79abc281bfdda74f0c8af2ec877a85ec77eab",
+    "crates/contextdb-engine/tests/vector/an_exact_search_authenticates_pages_not_every_vector.rs": "18c424ad7098da27cd45b46c87cc8630ede2b490ff248982af875fbff32bd325",
+    "crates/contextdb-engine/tests/vector/an_exhaustive_find_streams_bodies_it_cannot_hold.rs": "82c41cde0dc709ba89d3ea493b9256e2e735ad992256729f97f7e7eac2e8cb80",
+    "crates/contextdb-engine/tests/vector/auto_chooses_the_cheaper_route_for_each_partition.rs": "f3d87514314c4489a0aa255ea7995953fdf473e79cc3c948129d3495d94ebe6e",
+    "crates/contextdb-engine/tests/vector/auto_decides_the_route_once_for_the_whole_scope.rs": "b37435c48c9c73125562622d758f8334c378c9ad9692c981390618dc5adeffc1",
+    "crates/contextdb-engine/tests/vector/auto_pays_what_indexed_pays.rs": "d1bdf22d9941784dad1012eb7a4c62e3d8faaf1cee4f184981d4f0fb89a82c7f",
+    "crates/contextdb-engine/tests/vector/continuous_writers_hold_throughput_and_reader_latency.rs": "23afbb9123270c4a6ce59dd89d267400754934f5b07888b28cd8a2af0bf5e5e7",
+    "crates/contextdb-engine/tests/vector/equal_distance_rows_keep_canonical_order_across_contexts.rs": "98aa244e3d981987355edab3d7960e7713018aad4884124d26ec07f53a7c0b2d",
+    "crates/contextdb-engine/tests/vector/every_graph_route_reaches_every_row.rs": "541e7cdd3bc012378207a4cd6b50a80be3970fe44e75b62450162d2dfa6f79f2",
+    "crates/contextdb-engine/tests/vector/flat_route_below_declared_threshold.rs": "c092f4890d5eca2c513c265e3505c1744519cceeb208b0fbb606f7caab2406fa",
+    "crates/contextdb-engine/tests/vector/indexed_route_does_less_work_than_exact.rs": "4e1fb754f8390febdaa1ba057883e9224f302887daa48b942e02260bdf14c019",
+    "crates/contextdb-engine/tests/vector/multi_partition_union_recovers_nearest_rows.rs": "ca1096c3a0808061ff2c98c7ad0e53bc80e76a38b394c82bab5b652daaf0195e",
+    "crates/contextdb-engine/tests/vector/named_vector_planner_tests.rs": "e4cfe8517826ead9dc477890a4c78d5ffb71a002b606d1048c0e2ba55c31d1ea",
+    "crates/contextdb-engine/tests/vector/passive_explain_predicts_the_executed_auto_route.rs": "9280eea43682688563a3b0f85a3f88af054471d41d8e0ca642ebc991eaa8cdf1",
+    "crates/contextdb-engine/tests/vector/public_row_apis_honor_quantized_columns.rs": "9d3d2ec572d8a7793d4d5f87cc78c8c4e19d5d5c8396ea804289e49f02b54be2",
+    "crates/contextdb-engine/tests/vector/quantized_vector_read_agreement.rs": "951335c19a07fc454f49767d0ae3096048774c931466711d84dfa455422c7a93",
+    "crates/contextdb-engine/tests/vector/retained_indexed_rows.rs": "e62bac0487283be5bf1f2b700cdea8465878a47a338b3aab7d9b4af0ae741551",
+    "crates/contextdb-engine/tests/vector/row_delete_and_guards_honor_vector_columns.rs": "2208dc2d9f2855aaf14ad539b2db906d5aff4635d21282bb07ded91f90a191d3",
+    "crates/contextdb-engine/tests/vector/the_owner_doors_run_one_search_over_every_layer.rs": "d7d0df4bdde46de8edfeea0f75047fddcddc6b6e8eee7c2e62232fc8137e9cd3",
+    "crates/contextdb-engine/tests/vector/vector_exclusion_persistence_tests.rs": "83bc517e44e7a651348f1e9b1c2736266e6cfb40accf31fec36e82fe94596403",
+    "crates/contextdb-engine/tests/vector/vector_generation_authoritative_purge_contract.rs": "1913c338b5135bd9fd8a1d1ab7bdff9459d9a363f68ae7c1417382ba3c02d647",
+    "crates/contextdb-engine/tests/vector/vector_generation_ddl_cleanup_contract.rs": "ffe3aba574acd68e3d4624611dd642d25ef04b9953e3e662478ee95bbeed45a9",
+    "crates/contextdb-engine/tests/vector/vector_held_out_native_reference.rs": "25693ada3295ea9178b8f0cdac5b36035133f13e22d367f28b8d69116f220b8c",
+    "crates/contextdb-engine/tests/vector/vector_inspection_explain_truth_contract.rs": "0fe8a20e557564356206caaccef08cf85e61dac610a450d5673f0011a5cc9321",
+    "crates/contextdb-engine/tests/vector/vector_lazy_consumer_restart_contract.rs": "ef1d6e3af6ca81842d6483704d8f7fb1d17f2f90b15648299a09c0815b1d1804",
+    "crates/contextdb-engine/tests/vector/vector_lazy_raw_residency_contract.rs": "9db4fae09231620a5698352b83a7993960c9523287834a308b826d8a33615e85",
+    "crates/contextdb-engine/tests/vector/vector_maintained_lifecycle_contract.rs": "16d4c138fc36100d8812cb6fb0f06382fa369517d031ec6b268d9fed2180c760",
+    "crates/contextdb-engine/tests/vector/vector_memory_ownership_reconciliation_contract.rs": "b1cffe8966b63baf80d70bd71595f244d947ce7de430752d215e0afa2d60e288",
+    "crates/contextdb-engine/tests/vector/vector_operation_observations.rs": "3c2b9f085bc99e094e398f04bf68d70c406816047a4f60b2946de5625ff29925",
+    "crates/contextdb-engine/tests/vector/vector_partition_cleanup_inspection_contract.rs": "925d843440eb7fab2bb447892d4a5129f9deafb3782cd4ce6965b1442709869f",
+    "crates/contextdb-engine/tests/vector/vector_partition_declaration_contract.rs": "7922dc8cc9a3e3f20b63787b386c288ae153f0980ce999630d89837df75c76f7",
+    "crates/contextdb-engine/tests/vector/vector_partition_query_contract.rs": "f030df5d1dea140c27ca4213fe49858b4f31a91a5b3a4217c2f5c357e886e1fa",
+    "crates/contextdb-engine/tests/vector/vector_partition_restart_contract.rs": "ec3fb2752119f6ca530cdf409d6c8f1201337b95e89b7286a2e2820b3da5f5fb",
+    "crates/contextdb-engine/tests/vector/vector_partition_scope_resolves_after_bind_contract.rs": "8fbb3992734a5999351091a5176e27ee88a1f21f254cb1625f112cc6ded4b426",
+    "crates/contextdb-engine/tests/vector/vector_partition_sync_inspection_contract.rs": "04e09257d4243961761ac4c0488cb950b08a02eb858a1673a8b6ca504b924d5a",
+    "crates/contextdb-engine/tests/vector/vector_policy_declaration_contract.rs": "e7df812fc607e9790e8d05603a4bdb9c5d0b41b272a032ae9b6a2585f528ce5a",
+    "crates/contextdb-engine/tests/vector/vector_policy_mixed_version_contract.rs": "1aff1c836ab855147f428375b3527c1db1a894306ad1ca049f1ac5078461c11c",
+    "crates/contextdb-engine/tests/vector/vector_policy_resolver_contract.rs": "d2facfc7d46193db4a7d38018d6a2c97150581262fe8b66092da77399e7eec3c",
+    "crates/contextdb-engine/tests/vector/vector_policy_revision_publication_contract.rs": "bde27b53b0d0ca222d3564c9034d655d19bc5e9d4c3dc29308f7028c871c4d64",
+    "crates/contextdb-engine/tests/vector/vector_rank_policy_exact_audits_the_whole_table.rs": "9c07661c596582102ca2b8297dcef66a1e024b3d1c659212d1a5a9137a27f25a",
+    "crates/contextdb-engine/tests/vector/vector_received_generation_invalidation_contract.rs": "1969d48ad16ace53c380c7ee0be0d9fbb5af8013228faa2590500b23d77e7707",
+    "crates/contextdb-engine/tests/vector/vector_resource_maintenance_contract.rs": "a2c3abba69ee04938c65854f671a30169a05fefeb99c28377a6989e9e2fc058f",
+    "crates/contextdb-engine/tests/vector/vector_schema_mixed_version_compatibility_contract.rs": "a599fe159106a0ca1969b733260e70d9d57cd3f7e82602ff0ba8f33b32e0e8c8",
+    "crates/contextdb-engine/tests/vector/vector_schema_mixed_version_erasure_frontier_contract.rs": "1a2eb1bebe76fe4c4046652f0d9ab121ad2e0d3a5c319ceb645878876b70387d",
+    "crates/contextdb-engine/tests/vector/vector_schema_mixed_version_push_compatibility_contract.rs": "6218db637654d44a06803b8a7c643583922cd750f60857d8604bd2fd505399ec",
+    "crates/contextdb-engine/tests/vector/vector_schema_mixed_version_recovery_cursor_contract.rs": "2344f0ebb1338ce4a2176e89d4c77ade0822740e7a3cb07ae0ae26c1e9e241fe",
+    "crates/contextdb-engine/tests/vector/vector_schema_mixed_version_restart_contract.rs": "a88ce72b35a5805848cbddb14ad18b4a5f95db95b1f4fc99f3fdbbb4f9b65ba9",
+    "crates/contextdb-engine/tests/vector/vector_search_answers_quantized_columns_on_every_route.rs": "c03f27785d0f9c47c2bbf617a7bd6b6dd8f4f8cebb0c4bcbcd2d68fb7c17122f",
+    "crates/contextdb-engine/tests/vector/vector_search_mode_bounded_contract.rs": "28c385878d31e08863dc3a818ae170f1af05984a3cc1f97e74e2533977fb0793",
+    "crates/contextdb-engine/tests/vector/vector_serving_merge_contract.rs": "dd17bed385ebed860b52f31c233cc8184e306e6969afc2f7b7a82a4609b21ed7",
+    "crates/contextdb-engine/tests/vector/vector_tail_transaction_contract.rs": "19974b4bbea04fa2ebceff1fa47a0931f172bc5123c9f765b5ae3e3deb9ffb0b",
+    "crates/contextdb-engine/tests/vector/vector_transaction_filter_snapshot_truth_contract.rs": "08f21a3a1f94da65bf96e29c913f16cd262387490df747681bfc32fdc3f1b4b6",
+    "crates/contextdb-engine/tests/vector/writer_residency_attribution.rs": "a753feacca287a8f34a7a09c57b47de0189880c64f6192f826a8e93f43b3480e",
+    "crates/contextdb-engine/tests/vector_a_filtered_scope_is_charged_for_its_candidates.rs": "24a9c60e6d60d6e4a29eb3e0bb66fa401e226dcfb906e76274271280515affbe",
+    "crates/contextdb-engine/tests/vector_a_find_answers_a_full_page_when_a_candidate_is_withdrawn.rs": "a6c86b30ea3d2595e00efcba65fc3108fb66e0a074167454a340bdf54e1510ff",
+    "crates/contextdb-engine/tests/vector_a_find_decodes_only_the_rows_it_returns.rs": "f378aa1685fe4aca86d3ab027483904d0aa7b329794fc5185bf63d78f38a38a5",
+    "crates/contextdb-engine/tests/vector_a_find_names_only_the_pairs_it_asks_for.rs": "64461a0a66b44e8504440ce5426f3c41daeb59699674ea21524e5f9ef706aa43",
+    "crates/contextdb-engine/tests/vector_a_find_over_many_contexts_spends_one_search_budget.rs": "b8c7142caf96af56a2b1389e579d1e2d680e559154607a5c74351460b4fe9d59",
+    "crates/contextdb-engine/tests/vector_a_search_is_exact_with_no_index_built.rs": "1f3db7b32adbb0ca7adf9dc8f3011fe8ebfaef3c49b01078dd81d1002a4b77df",
+    "crates/contextdb-engine/tests/vector_an_exact_search_authenticates_pages_not_every_vector.rs": "950eee61ec7e85d23203fdf3423db8bfe256d9d65287daa25f4cd6b607e97182",
+    "crates/contextdb-engine/tests/vector_an_exhaustive_find_streams_bodies_it_cannot_hold.rs": "ae40b1f93988a7618c3d12ec191e004ef05a88b4b880c7a36bd4191e44c755db",
+    "crates/contextdb-engine/tests/vector_auto_chooses_the_cheaper_route_for_each_partition.rs": "04dc7abf09cea0db58d268ff6ce2c0fe80662e5f5b86d16004395bc1ae9b4ea7",
+    "crates/contextdb-engine/tests/vector_auto_decides_the_route_once_for_the_whole_scope.rs": "80f96372c39029735769fb0f351c01a3e1816d4450e13929d226316a4e45298e",
+    "crates/contextdb-engine/tests/vector_auto_pays_what_indexed_pays.rs": "44e4c7b671b6c2fb0e45282a6fbc36a96e71a0331773071b3b990322bf3dd18a",
+    "crates/contextdb-engine/tests/vector_declared_budget.rs": "fc17a313758fad218f2ba59297c090f35b5a262089622871dad6b4684193c762",
+    "crates/contextdb-engine/tests/vector_equal_distance_rows_keep_canonical_order_across_contexts.rs": "ead3c514af75bfdfa39d1c6f67d7705300132c8399c34f28757c6e3f97da4d5f",
+    "crates/contextdb-engine/tests/vector_exclusion_persistence_tests.rs": "cd716d506ce5c48e251965af22927b89d6e30c10bdba2437e0c3c209ffdc6da3",
+    "crates/contextdb-engine/tests/vector_generation.rs": "d56ea9c8f8394d1569d09aeecaf497e84bc594ffb86dc8d114a3678dce8c82c2",
+    "crates/contextdb-engine/tests/vector_held_out_native_reference.rs": "6813bb0dae1cbe794a010a77dd128525ed80d36302a0efac55a2831a7dbbfe38",
+    "crates/contextdb-engine/tests/vector_indexed_route_does_less_work_than_exact.rs": "5743bcb39c97cd36ca9a9c88783014e56e2efc924e91709049e7f2601690e76a",
+    "crates/contextdb-engine/tests/vector_inspection_explain_truth_contract.rs": "682fc3fa1ffe8485eb10725de8388fc7254594ecaf0dd1db8099f0c259cd5ef1",
+    "crates/contextdb-engine/tests/vector_lazy.rs": "2b9f92f7677797283eb7552515bbc51975b7a643211e0fecd583fefdb714bf62",
+    "crates/contextdb-engine/tests/vector_maintained_lifecycle_contract.rs": "d2ee779d798fa771b9819e24fca8805d54b9dbcfc8c6e454484108d5dbf2c5a7",
+    "crates/contextdb-engine/tests/vector_memory_ownership_reconciliation_contract.rs": "f480900fc4d8ee602a245aaac7d0f3cb4acc33837ea871db20ca3ddcc0dd9948",
+    "crates/contextdb-engine/tests/vector_multi_partition_union_recovers_nearest_rows.rs": "aada30b15e762387b367c7dc3c090ed95fa523698ba6f9934bf4e9940a2befa0",
+    "crates/contextdb-engine/tests/vector_named_vector_planner_tests.rs": "f1f1687e698eb29ca4369fcf1af1a1a62b1cdf7d8a257ee932743bffb65f8d6d",
+    "crates/contextdb-engine/tests/vector_operation_observations.rs": "c62a80d30a9516cb429108436a1d9d6901cd5a7abb564ce49c8e70e5737ed45a",
+    "crates/contextdb-engine/tests/vector_partition.rs": "28fde04427f02c1f672913e9aa375425c3f23fcaba60b13494a5fe8fc913c646",
+    "crates/contextdb-engine/tests/vector_policy.rs": "5eb88433aef37b0e8afcf30276138f7f4e11a15db72560a18acf06e738f1e2bd",
+    "crates/contextdb-engine/tests/vector_quantized.rs": "f39da5356fc5d33d5105896488c242e161781944e5b9273d6f3662cc65a0fb65",
+    "crates/contextdb-engine/tests/vector_rank_policy_exact_audits_the_whole_table.rs": "d48af0b350423388c94ac6d8a91658c2fe23ac331401bfc3cd64bc429a703381",
+    "crates/contextdb-engine/tests/vector_received_generation_invalidation_contract.rs": "6c2a08686394e54d99bf9f696027f06f6a1c4a805e32a454422a206028c2e927",
+    "crates/contextdb-engine/tests/vector_resource_maintenance_contract.rs": "d192fefb4867773362b587b2675e637dbd9d0e5a10e70fd83c4d5c937f3ce395",
+    "crates/contextdb-engine/tests/vector_retained_indexed_rows.rs": "07f49545fa3997fc4c32f622f39d87fc5969754ce2a53fcc727b797ee17700fa",
+    "crates/contextdb-engine/tests/vector_row_delete_and_guards_honor_vector_columns.rs": "4e29cb36e7b79a7ec247c82cda08023ab5460e057c7c002dc1e71ac09c775469",
+    "crates/contextdb-engine/tests/vector_schema.rs": "53b23c7fc297f72b0c0ad6f0347920429fa809e46fac734d8e7ee1ed9a1812a7",
+    "crates/contextdb-engine/tests/vector_search_mode_bounded_contract.rs": "b366cb73970db7d58a81c15c0832ec04a1a2f6cac0529e01618a1bb479db099c",
+    "crates/contextdb-engine/tests/vector_serving_merge_contract.rs": "00371c52fa924a4875f1e5d67eadd1f06ef6706c209516cdfdbee930ba3deb42",
+    "crates/contextdb-engine/tests/vector_tail_transaction_contract.rs": "4c27459d13fb95677da30a961b3850382210b03597e8a50e26ceb0c0e52a3141",
+    "crates/contextdb-engine/tests/vector_the_owner_doors_run_one_search_over_every_layer.rs": "86fd4309bdf9d3853ef37573099de9ecdda2d6230ddbc58a30d1ba35443b1ac5",
+    "crates/contextdb-engine/tests/vector_transaction_filter_snapshot_truth_contract.rs": "16cd2c0da9324b1e0be688b772dba4c9901599e2b44de5f98457163d7399927c",
+    "crates/contextdb-engine/tests/vector_writer_residency_attribution.rs": "3f917b0f6db0fcd04d000355c7cbf0213fd9256ec3816705da883052a0acae95",
+    "tests/support/binary_path.rs": "34e764f8f77dd3161d43848c204b3ccb6eb8156b32fb00cc8e6bd3818b10b82b",
+    "tests/support/binary_path_helpers.rs": "05bd95280e47f5141b2a04bec3bcf5ca934c4cc642597cc46e16496d9461cb0c"
+  },
+  "wrapper_sha256": {
+    "custody": "ffbf87bd12016a926c637fc342555a4dc3dda3953893470ec8aea9bb331f931d",
+    "custody_custody_inspection": "efb0c121753bef2ab12d33a98df68b3e4654873d9b577d1af9ecfa9b72540326",
+    "custody_custody_protocol": "3fd5f8bbd0295e1687bc70270718f1f372decc541369a84132cc4c8fffdb3cf6",
+    "custody_custody_purge_and_discard": "d8ab44ad868926f785e83ec572b1380877b9b5570f34d2c99e2d1b5205ae4b50",
+    "custody_delivery_manifest": "667144cac12d7b93f3d9b8dfd87543f229c7e2e6c26d3dd8028c5fd1335fe647",
+    "custody_delivery_outcome": "5361fad2155c9e92a0a79f17b04f387147ac7e92e055d325af7f08e0ad7ed54f",
+    "custody_schema_replay_bounded_contract": "485f156989117d57272c5a1ebf4f80caa60027c785a4d1f9d53b66dc17b2cbd2",
+    "custody_schema_replay_is_proportional_to_affected_tables": "f47a93e394d67067901197f7fb25aba8f90b149183f77f58d6a82a696ad5aeea",
+    "custody_server_resource_policy_contract_tests": "e39b587dfb050c0d1ac0501f3518c54b77ca42675621ad7b5c8522de1bf9efb6",
+    "custody_tenant_table_policy": "f78bc3bd1918a1af2c63da856958939963d1e3b5a0d787178add7de754b623b7",
+    "custody_the_whole_startup_schema_installs_in_one_transaction": "cb166e12f675cc770281a66168ca3ad22801a184bf36e56ba5981cd220aa5b20",
+    "vector": "1f330d6c0031da68109fc3cdcdce303e81bec709b5b46826edc2a01109d3b404",
+    "vector_a_filtered_scope_is_charged_for_its_candidates": "24a9c60e6d60d6e4a29eb3e0bb66fa401e226dcfb906e76274271280515affbe",
+    "vector_a_find_answers_a_full_page_when_a_candidate_is_withdrawn": "a6c86b30ea3d2595e00efcba65fc3108fb66e0a074167454a340bdf54e1510ff",
+    "vector_a_find_decodes_only_the_rows_it_returns": "f378aa1685fe4aca86d3ab027483904d0aa7b329794fc5185bf63d78f38a38a5",
+    "vector_a_find_names_only_the_pairs_it_asks_for": "64461a0a66b44e8504440ce5426f3c41daeb59699674ea21524e5f9ef706aa43",
+    "vector_a_find_over_many_contexts_spends_one_search_budget": "b8c7142caf96af56a2b1389e579d1e2d680e559154607a5c74351460b4fe9d59",
+    "vector_a_search_is_exact_with_no_index_built": "1f3db7b32adbb0ca7adf9dc8f3011fe8ebfaef3c49b01078dd81d1002a4b77df",
+    "vector_an_exact_search_authenticates_pages_not_every_vector": "950eee61ec7e85d23203fdf3423db8bfe256d9d65287daa25f4cd6b607e97182",
+    "vector_an_exhaustive_find_streams_bodies_it_cannot_hold": "ae40b1f93988a7618c3d12ec191e004ef05a88b4b880c7a36bd4191e44c755db",
+    "vector_auto_chooses_the_cheaper_route_for_each_partition": "04dc7abf09cea0db58d268ff6ce2c0fe80662e5f5b86d16004395bc1ae9b4ea7",
+    "vector_auto_decides_the_route_once_for_the_whole_scope": "80f96372c39029735769fb0f351c01a3e1816d4450e13929d226316a4e45298e",
+    "vector_auto_pays_what_indexed_pays": "44e4c7b671b6c2fb0e45282a6fbc36a96e71a0331773071b3b990322bf3dd18a",
+    "vector_declared_budget": "fc17a313758fad218f2ba59297c090f35b5a262089622871dad6b4684193c762",
+    "vector_equal_distance_rows_keep_canonical_order_across_contexts": "ead3c514af75bfdfa39d1c6f67d7705300132c8399c34f28757c6e3f97da4d5f",
+    "vector_exclusion_persistence_tests": "cd716d506ce5c48e251965af22927b89d6e30c10bdba2437e0c3c209ffdc6da3",
+    "vector_generation": "d56ea9c8f8394d1569d09aeecaf497e84bc594ffb86dc8d114a3678dce8c82c2",
+    "vector_held_out_native_reference": "6813bb0dae1cbe794a010a77dd128525ed80d36302a0efac55a2831a7dbbfe38",
+    "vector_indexed_route_does_less_work_than_exact": "5743bcb39c97cd36ca9a9c88783014e56e2efc924e91709049e7f2601690e76a",
+    "vector_inspection_explain_truth_contract": "682fc3fa1ffe8485eb10725de8388fc7254594ecaf0dd1db8099f0c259cd5ef1",
+    "vector_lazy": "2b9f92f7677797283eb7552515bbc51975b7a643211e0fecd583fefdb714bf62",
+    "vector_maintained_lifecycle_contract": "d2ee779d798fa771b9819e24fca8805d54b9dbcfc8c6e454484108d5dbf2c5a7",
+    "vector_memory_ownership_reconciliation_contract": "f480900fc4d8ee602a245aaac7d0f3cb4acc33837ea871db20ca3ddcc0dd9948",
+    "vector_multi_partition_union_recovers_nearest_rows": "aada30b15e762387b367c7dc3c090ed95fa523698ba6f9934bf4e9940a2befa0",
+    "vector_named_vector_planner_tests": "f1f1687e698eb29ca4369fcf1af1a1a62b1cdf7d8a257ee932743bffb65f8d6d",
+    "vector_operation_observations": "c62a80d30a9516cb429108436a1d9d6901cd5a7abb564ce49c8e70e5737ed45a",
+    "vector_partition": "28fde04427f02c1f672913e9aa375425c3f23fcaba60b13494a5fe8fc913c646",
+    "vector_policy": "5eb88433aef37b0e8afcf30276138f7f4e11a15db72560a18acf06e738f1e2bd",
+    "vector_quantized": "f39da5356fc5d33d5105896488c242e161781944e5b9273d6f3662cc65a0fb65",
+    "vector_rank_policy_exact_audits_the_whole_table": "d48af0b350423388c94ac6d8a91658c2fe23ac331401bfc3cd64bc429a703381",
+    "vector_received_generation_invalidation_contract": "6c2a08686394e54d99bf9f696027f06f6a1c4a805e32a454422a206028c2e927",
+    "vector_resource_maintenance_contract": "d192fefb4867773362b587b2675e637dbd9d0e5a10e70fd83c4d5c937f3ce395",
+    "vector_retained_indexed_rows": "07f49545fa3997fc4c32f622f39d87fc5969754ce2a53fcc727b797ee17700fa",
+    "vector_row_delete_and_guards_honor_vector_columns": "4e29cb36e7b79a7ec247c82cda08023ab5460e057c7c002dc1e71ac09c775469",
+    "vector_schema": "53b23c7fc297f72b0c0ad6f0347920429fa809e46fac734d8e7ee1ed9a1812a7",
+    "vector_search_mode_bounded_contract": "b366cb73970db7d58a81c15c0832ec04a1a2f6cac0529e01618a1bb479db099c",
+    "vector_serving_merge_contract": "00371c52fa924a4875f1e5d67eadd1f06ef6706c209516cdfdbee930ba3deb42",
+    "vector_tail_transaction_contract": "4c27459d13fb95677da30a961b3850382210b03597e8a50e26ceb0c0e52a3141",
+    "vector_the_owner_doors_run_one_search_over_every_layer": "86fd4309bdf9d3853ef37573099de9ecdda2d6230ddbc58a30d1ba35443b1ac5",
+    "vector_transaction_filter_snapshot_truth_contract": "16cd2c0da9324b1e0be688b772dba4c9901599e2b44de5f98457163d7399927c",
+    "vector_writer_residency_attribution": "3f917b0f6db0fcd04d000355c7cbf0213fd9256ec3816705da883052a0acae95"
+  }
+}

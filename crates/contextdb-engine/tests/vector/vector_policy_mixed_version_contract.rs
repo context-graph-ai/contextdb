@@ -28,10 +28,10 @@ fn params(pairs: impl IntoIterator<Item = (&'static str, Value)>) -> HashMap<Str
 
 fn ids(result: QueryResult) -> Vec<Uuid> {
     result
-        .rows
-        .into_iter()
-        .map(|row| match row.into_iter().next() {
-            Some(Value::Uuid(id)) => id,
+        .rows()
+        .iter()
+        .map(|row| match row.iter().next() {
+            Some(Value::Uuid(id)) => *id,
             value => panic!("expected one UUID value, got {value:?}"),
         })
         .collect()
@@ -48,6 +48,7 @@ fn schema(db: &Database, table: &str) -> String {
 fn create_table_ddl_bytes(db: &Database, table: &str) -> Vec<u8> {
     let declaration = db
         .changes_since(Lsn(0))
+        .expect("read the declared changes")
         .ddl
         .into_iter()
         .find(|change| matches!(change, DdlChange::CreateTable { name, .. } if name == table))
@@ -112,7 +113,8 @@ async fn start_server(
             TenantId::from(TENANT),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -171,14 +173,14 @@ async fn current_transport_holds_missing_capabilities_until_the_receiver_gains_t
         .expect("the source accepts AUTO_INDEX_AT policy vocabulary");
     source
         .execute(
-            "CREATE TABLE hnsw_policy_vectors (id UUID PRIMARY KEY, embedding VECTOR(3) HNSW (M = 24, EF_CONSTRUCTION = 400, EF_SEARCH = 401)) SYNC TWO WAY",
+ "CREATE TABLE ivf_policy_vectors (id UUID PRIMARY KEY, embedding VECTOR(3) IVF (PROBES = 401)) SYNC TWO WAY",
             &empty(),
         )
-        .expect("the source accepts grouped HNSW policy vocabulary");
+        .expect("the source accepts grouped IVF policy vocabulary");
 
     let untouched = Uuid::from_u128(0xB501);
     let auto = Uuid::from_u128(0xB502);
-    let hnsw = Uuid::from_u128(0xB503);
+    let ivf = Uuid::from_u128(0xB503);
     let watermark = source.current_lsn();
     source
         .execute(
@@ -191,7 +193,7 @@ async fn current_transport_holds_missing_capabilities_until_the_receiver_gains_t
         .expect("insert ordinary work that must remain continuous");
     for (table, id, vector) in [
         ("auto_policy_vectors", auto, vec![0.0, 1.0, 0.0]),
-        ("hnsw_policy_vectors", hnsw, vec![0.0, 0.0, 1.0]),
+        ("ivf_policy_vectors", ivf, vec![0.0, 0.0, 1.0]),
     ] {
         source
             .execute(
@@ -203,7 +205,10 @@ async fn current_transport_holds_missing_capabilities_until_the_receiver_gains_t
             )
             .expect("insert one vector through the ordinary SQL path");
     }
-    let vector_changes = source.changes_since(watermark).vectors;
+    let vector_changes = source
+        .changes_since(watermark)
+        .expect("read the declared changes")
+        .vectors;
     assert_eq!(
         vector_changes.len(),
         2,
@@ -228,7 +233,8 @@ async fn current_transport_holds_missing_capabilities_until_the_receiver_gains_t
         broker.client_as(&receiver_node),
         TenantId::from(TENANT),
         receiver_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     running
         .server
         .set_peer_vector_schema_support_for_test(&receiver_node, false);
@@ -254,21 +260,21 @@ async fn current_transport_holds_missing_capabilities_until_the_receiver_gains_t
         "the untouched table's shipped CREATE TABLE payload is byte-identical"
     );
     assert!(receiver.table_meta("auto_policy_vectors").is_none());
-    assert!(receiver.table_meta("hnsw_policy_vectors").is_none());
+    assert!(receiver.table_meta("ivf_policy_vectors").is_none());
 
     let holdbacks = holdbacks_by_table(running.server.schema_sync_holdbacks());
     assert_eq!(holdbacks.len(), 2, "only the two adopting tables are held");
     let auto_holdback = holdbacks
         .get("auto_policy_vectors")
         .expect("AUTO_INDEX_AT table is held independently");
-    let hnsw_holdback = holdbacks
-        .get("hnsw_policy_vectors")
-        .expect("HNSW table is held independently");
+    let ivf_holdback = holdbacks
+        .get("ivf_policy_vectors")
+        .expect("IVF table is held independently");
     assert_actionable_holdback(auto_holdback, "auto_policy_vectors", &receiver_node);
-    assert_actionable_holdback(hnsw_holdback, "hnsw_policy_vectors", &receiver_node);
+    assert_actionable_holdback(ivf_holdback, "ivf_policy_vectors", &receiver_node);
     assert_ne!(
-        auto_holdback.capability, hnsw_holdback.capability,
-        "AUTO_INDEX_AT and HNSW are independently actionable schema capabilities"
+        auto_holdback.capability, ivf_holdback.capability,
+        "AUTO_INDEX_AT and IVF are independently actionable schema capabilities"
     );
 
     running
@@ -286,9 +292,9 @@ async fn current_transport_holds_missing_capabilities_until_the_receiver_gains_t
     );
     assert_eq!(
         ids(receiver
-            .execute("SELECT id FROM hnsw_policy_vectors", &empty())
-            .expect("held HNSW row arrives after upgrade")),
-        vec![hnsw]
+            .execute("SELECT id FROM ivf_policy_vectors", &empty())
+            .expect("held IVF row arrives after upgrade")),
+        vec![ivf]
     );
     assert!(running.server.schema_sync_holdbacks().is_empty());
     assert_eq!(

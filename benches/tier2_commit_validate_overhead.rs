@@ -81,7 +81,7 @@ fn setup_seeded_db() -> (Database, u64) {
     let count = db
         .execute("SELECT id FROM entities", &empty())
         .expect("count seeded rows")
-        .rows
+        .rows()
         .len();
     assert_eq!(count as u64, pre_gate_rows);
     (db, pre_gate_rows)
@@ -123,6 +123,13 @@ fn assert_report(report: &CommitReport) {
 }
 
 fn bench(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function(
+            "tier2_commit_validate_overhead/100k_seeded_1k_distinct_unique_commits",
+            |_| {},
+        );
+        return;
+    }
     let (db, seeded_rows) = setup_seeded_db();
     let mut next_seq = seeded_rows;
     let pre_gate = run_distinct_unique_commits(&db, &mut next_seq, 128);

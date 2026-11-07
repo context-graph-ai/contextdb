@@ -48,7 +48,7 @@ fn classify(err: &Error) -> &'static str {
         Error::UniqueViolation { .. } => "a",
         Error::ForeignKeyViolation { .. } => "a",
         Error::RecursiveCteNotSupported => "a",
-        Error::WindowFunctionNotSupported => "a",
+        Error::WindowFunctionNotSupported { .. } => "a",
         Error::StoredProcNotSupported => "a",
         Error::UnboundedTraversal => "a",
         Error::UnboundedVectorSearch => "a",

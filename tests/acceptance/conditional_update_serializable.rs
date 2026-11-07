@@ -37,13 +37,13 @@ fn setup_lifecycle_table(db: &Database) -> Uuid {
 }
 
 fn invalidation_status(db: &Database, id: Uuid) -> String {
-    let rows = db
+    let rows_answer = db
         .execute(
             "SELECT status FROM invalidations WHERE id = $id",
             &[("id".to_string(), Value::Uuid(id))].into_iter().collect(),
         )
-        .unwrap()
-        .rows;
+        .unwrap();
+    let rows = rows_answer.rows();
     match &rows[0][0] {
         Value::Text(s) => s.clone(),
         other => panic!("expected text status, got {other:?}"),
@@ -68,7 +68,7 @@ fn t16_01_two_parallel_conditional_updates_one_winner() {
                     &[("id".to_string(), Value::Uuid(id))].into_iter().collect(),
                 )
                 .unwrap()
-                .rows_affected
+                .rows_affected()
             }));
         }
         barrier.wait();
@@ -100,7 +100,7 @@ fn t16_02_six_parallel_conditional_updates_one_winner() {
                     &[("id".to_string(), Value::Uuid(id))].into_iter().collect(),
                 )
                 .unwrap()
-                .rows_affected
+                .rows_affected()
             }));
         }
         barrier.wait();
@@ -133,7 +133,7 @@ fn t16_03_concurrent_same_target_value_one_winner() {
                     &[("id".to_string(), Value::Uuid(id))].into_iter().collect(),
                 )
                 .unwrap()
-                .rows_affected
+                .rows_affected()
             }));
         }
         barrier.wait();
@@ -157,14 +157,14 @@ fn t16_04_sequential_stale_where_returns_zero() {
             &params,
         )
         .unwrap();
-    assert_eq!(first.rows_affected, 1);
+    assert_eq!(first.rows_affected(), 1);
     let second = db
         .execute(
             "UPDATE invalidations SET status = 'acknowledged' WHERE id = $id AND status = 'pending'",
             &params,
         )
         .unwrap();
-    assert_eq!(second.rows_affected, 0);
+    assert_eq!(second.rows_affected(), 0);
 }
 
 #[test]
@@ -204,18 +204,18 @@ fn t16_05_conditional_update_non_state_machine_column_one_winner() {
                 .collect(),
             )
             .unwrap();
-        assert_eq!(staged.rows_affected, 1);
+        assert_eq!(staged.rows_affected(), 1);
     }
     db.commit(tx_one).expect("first conditional update commits");
     db.commit(tx_two)
         .expect("second conditional update commits as commit-time no-op");
-    let rows = db
+    let rows_answer = db
         .execute(
             "SELECT value FROM counters WHERE id = $id",
             &[("id".to_string(), Value::Uuid(id))].into_iter().collect(),
         )
-        .unwrap()
-        .rows;
+        .unwrap();
+    let rows = rows_answer.rows();
     assert_eq!(rows[0][0], Value::Int64(1));
 }
 
@@ -262,7 +262,7 @@ fn t16_06_non_overlapping_conditional_updates_both_commit() {
                     .collect(),
                 )
                 .unwrap()
-                .rows_affected
+                .rows_affected()
             }));
         }
         barrier.wait();
@@ -309,18 +309,18 @@ fn t16_07_non_pk_conditional_update_revalidates_expected_value() {
                 .collect(),
             )
             .unwrap();
-        assert_eq!(staged.rows_affected, 1);
+        assert_eq!(staged.rows_affected(), 1);
     }
 
     db.commit(tx_one).expect("first conditional update commits");
     db.commit(tx_two)
         .expect("second conditional update commits as commit-time no-op");
-    let rows = db
+    let rows_answer = db
         .execute(
             "SELECT value FROM counters WHERE id = $id",
             &[("id".to_string(), Value::Uuid(id))].into_iter().collect(),
         )
-        .unwrap()
-        .rows;
+        .unwrap();
+    let rows = rows_answer.rows();
     assert_eq!(rows[0][0], Value::Int64(1));
 }

@@ -402,7 +402,7 @@ fn c2_05_subscribe_conflict_detected() {
     let result = db
         .execute("SELECT COUNT(*) FROM entities", &HashMap::new())
         .unwrap();
-    let count = match &result.rows[0][0] {
+    let count = match &result.rows()[0][0] {
         Value::Int64(n) => *n,
         _ => panic!("expected integer"),
     };
@@ -479,7 +479,7 @@ fn c2_06_callback_exception_isolated() {
     let result = db
         .execute("SELECT COUNT(*) FROM entities", &HashMap::new())
         .unwrap();
-    let count = match &result.rows[0][0] {
+    let count = match &result.rows()[0][0] {
         Value::Int64(n) => *n,
         _ => panic!("expected integer"),
     };

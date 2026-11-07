@@ -72,6 +72,7 @@ readonly -a META_COMMAND_DECLARATIONS=(
     'StoreRead|.explain'
     'StoreRead|.events status'
     'StoreRead|.maintenance status'
+    'StoreRead|.verify history'
     'StoreRead|.cursor open'
     'StoreRead|.cursor fetch'
     'StoreRead|.cursor close'
@@ -94,6 +95,7 @@ readonly -a META_COMMAND_DECLARATIONS=(
     'SessionOnly|.sync status'
     'Invalid|.events'
     'Invalid|.maintenance'
+    'Invalid|.verify'
     'Invalid|.cursor'
     'Invalid|.sync'
     'Invalid|.owner'
@@ -665,12 +667,13 @@ for case_row in "${AST_READ_STATEMENTS[@]}"; do
         ast-read-show-memory-limit)
             read_assertion='
                 length == 1 and
-                .[0].result.columns == ["limit", "used", "available", "startup_ceiling"] and
+                .[0].result.columns == ["limit", "used", "available", "startup_ceiling", "ceiling_refresh_failures"] and
                 (.[0].result.rows | length) == 1 and
                 .[0].result.rows[0].limit == $memory_limit_bytes and
                 (.[0].result.rows[0].used | type == "number") and
                 .[0].result.rows[0].available == ($memory_limit_bytes - .[0].result.rows[0].used) and
-                .[0].result.rows[0].startup_ceiling == "none"
+                .[0].result.rows[0].startup_ceiling == "none" and
+                (.[0].result.rows[0].ceiling_refresh_failures | type == "number")
             '
             ;;
         ast-read-show-disk-limit)
@@ -702,15 +705,26 @@ for case_row in "${AST_READ_STATEMENTS[@]}"; do
             read_assertion='
                 length == 1 and .[0] == {
                     "result": {
-                        "columns": ["table", "column", "dimension", "quantization", "vector_count", "bytes", "partition_key_columns", "max_partitions", "live_partitions", "retained_partitions", "search_mode", "declared_auto_index_at", "effective_auto_index_at", "declared_hnsw_m", "declared_hnsw_ef_construction", "declared_hnsw_ef_search", "declared_consolidation_mode", "declared_consolidation_change_percent", "declared_consolidation_tombstone_percent", "effective_consolidation_mode", "effective_consolidation_change_percent", "effective_consolidation_tombstone_percent", "oldest_base_tx", "newest_base_tx", "pending_inserts", "tombstones", "durable_vector_bytes", "charged_vector_bytes", "durable_index_bytes", "charged_index_bytes", "query_state", "maintenance_state", "maintenance_vectors_total", "maintenance_vectors_done", "maintenance_vectors_remaining", "unavailable_partitions", "stalled_partitions", "broad_route", "broad_route_state", "broad_route_base_tx", "broad_route_vectors_total", "broad_route_vectors_done", "broad_route_vectors_remaining", "broad_route_reason", "broad_route_recovery_action"],
+                        "columns": ["table", "column", "dimension", "quantization", "vector_count", "bytes", "partition_key_columns", "max_partitions", "live_partitions", "retained_partitions", "search_mode", "declared_auto_index_at", "effective_auto_index_at", "declared_target_accuracy", "declared_expected_vectors", "declared_lists", "declared_probes", "declared_refine_factor", "declared_consolidation_mode", "declared_consolidation_change_percent", "declared_consolidation_tombstone_percent", "effective_consolidation_mode", "effective_consolidation_change_percent", "effective_consolidation_tombstone_percent", "oldest_base_tx", "newest_base_tx", "pending_inserts", "tombstones", "durable_vector_bytes", "charged_vector_bytes", "durable_index_bytes", "charged_index_bytes", "query_state", "indexed_available", "objective_status", "maintenance_state", "maintenance_vectors_total", "maintenance_vectors_done", "maintenance_vectors_remaining", "unavailable_partitions", "stalled_partitions", "broad_route", "broad_route_state", "broad_route_base_tx", "broad_route_vectors_total", "broad_route_vectors_done", "broad_route_vectors_remaining", "broad_route_reason", "broad_route_recovery_action", "recovery_action", "state"],
                         "rows": [{
-                            "table": $vector_table, "column": "embedding", "dimension": 3,
-                            "quantization": "F32", "vector_count": 0, "bytes": 24,
-                            "partition_key_columns": [], "max_partitions": null,
-                            "live_partitions": 0, "retained_partitions": 0, "search_mode": "AUTO",
-                            "declared_auto_index_at": null, "effective_auto_index_at": 1000,
-                            "declared_hnsw_m": null, "declared_hnsw_ef_construction": null,
-                            "declared_hnsw_ef_search": null,
+                            "table": $vector_table,
+                            "column": "embedding",
+                            "dimension": 3,
+                            "quantization": "F32",
+                            "vector_count": 0,
+                            "bytes": 32,
+                            "partition_key_columns": [],
+                            "max_partitions": null,
+                            "live_partitions": 0,
+                            "retained_partitions": 0,
+                            "search_mode": "AUTO",
+                            "declared_auto_index_at": null,
+                            "effective_auto_index_at": 1000,
+                            "declared_target_accuracy": null,
+                            "declared_expected_vectors": null,
+                            "declared_lists": null,
+                            "declared_probes": null,
+                            "declared_refine_factor": null,
                             "declared_consolidation_mode": null,
                             "declared_consolidation_change_percent": null,
                             "declared_consolidation_tombstone_percent": null,
@@ -718,17 +732,32 @@ for case_row in "${AST_READ_STATEMENTS[@]}"; do
                             "effective_consolidation_change_percent": 20,
                             "effective_consolidation_tombstone_percent": 10,
                             "oldest_base_tx": null,
-                            "newest_base_tx": null, "pending_inserts": 0, "tombstones": 0,
-                            "durable_vector_bytes": 0, "charged_vector_bytes": 0,
-                            "durable_index_bytes": 0, "charged_index_bytes": 24,
-                            "query_state": "empty", "maintenance_state": "idle",
-                            "maintenance_vectors_total": null, "maintenance_vectors_done": null,
-                            "maintenance_vectors_remaining": null, "unavailable_partitions": 0,
-                            "stalled_partitions": 0, "broad_route": "fanout",
-                            "broad_route_state": "ready", "broad_route_base_tx": null,
-                            "broad_route_vectors_total": null, "broad_route_vectors_done": null,
-                            "broad_route_vectors_remaining": null, "broad_route_reason": "none",
-                            "broad_route_recovery_action": "none"
+                            "newest_base_tx": null,
+                            "pending_inserts": 0,
+                            "tombstones": 0,
+                            "durable_vector_bytes": 0,
+                            "charged_vector_bytes": 0,
+                            "durable_index_bytes": null,
+                            "charged_index_bytes": 32,
+                            "query_state": "empty",
+                            "indexed_available": false,
+                            "objective_status": null,
+                            "maintenance_state": "idle",
+                            "maintenance_vectors_total": null,
+                            "maintenance_vectors_done": null,
+                            "maintenance_vectors_remaining": null,
+                            "unavailable_partitions": 0,
+                            "stalled_partitions": 0,
+                            "broad_route": "fanout",
+                            "broad_route_state": "ready",
+                            "broad_route_base_tx": null,
+                            "broad_route_vectors_total": null,
+                            "broad_route_vectors_done": null,
+                            "broad_route_vectors_remaining": null,
+                            "broad_route_reason": "none",
+                            "broad_route_recovery_action": "none",
+                            "recovery_action": "none",
+                            "state": null
                         }]
                     }
                 }
@@ -738,28 +767,48 @@ for case_row in "${AST_READ_STATEMENTS[@]}"; do
             read_assertion='
                 length == 1 and .[0] == {
                     "result": {
-                        "columns": ["table", "column", "partition_key", "live_rows", "retained_rows", "base_generation", "base_tx", "pending_inserts", "tombstones", "durable_vector_bytes", "charged_vector_bytes", "durable_index_bytes", "charged_index_bytes", "query_state", "availability_reason", "maintenance_state", "maintenance_reason", "maintenance_vectors_total", "maintenance_vectors_done", "maintenance_vectors_remaining", "maintenance_checkpoint_tx", "desired_hnsw_m", "desired_hnsw_ef_construction", "desired_hnsw_ef_search", "serving_hnsw_m", "serving_hnsw_ef_construction", "serving_hnsw_ef_search", "declared_consolidation_mode", "declared_consolidation_change_percent", "declared_consolidation_tombstone_percent", "effective_consolidation_mode", "effective_consolidation_change_percent", "effective_consolidation_tombstone_percent", "desired_policy_revision", "serving_policy_revision", "recovery_action"],
+                        "columns": ["table", "column", "partition_key", "live_rows", "retained_rows", "base_generation", "base_tx", "pending_inserts", "tombstones", "durable_vector_bytes", "charged_vector_bytes", "durable_index_bytes", "charged_index_bytes", "query_state", "availability_reason", "maintenance_state", "maintenance_reason", "maintenance_vectors_total", "maintenance_vectors_done", "maintenance_vectors_remaining", "maintenance_checkpoint_tx", "indexed_available", "codebook_identity", "objective_status", "lists", "lists_source", "probes", "probes_source", "refine_factor", "refine_factor_source", "declared_consolidation_mode", "declared_consolidation_change_percent", "declared_consolidation_tombstone_percent", "effective_consolidation_mode", "effective_consolidation_change_percent", "effective_consolidation_tombstone_percent", "desired_policy_revision", "serving_policy_revision", "recovery_action", "state"],
                         "rows": [{
-                            "table": $vector_table, "column": "embedding", "partition_key": {},
-                            "live_rows": 0, "retained_rows": 0, "base_generation": null,
-                            "base_tx": null, "pending_inserts": 0, "tombstones": 0,
-                            "durable_vector_bytes": 0, "charged_vector_bytes": 0,
-                            "durable_index_bytes": 0, "charged_index_bytes": 24,
-                            "query_state": "empty", "availability_reason": "none",
-                            "maintenance_state": "idle", "maintenance_reason": "none",
-                            "maintenance_vectors_total": null, "maintenance_vectors_done": null,
-                            "maintenance_vectors_remaining": null, "maintenance_checkpoint_tx": null,
-                            "desired_hnsw_m": 16, "desired_hnsw_ef_construction": 200,
-                            "desired_hnsw_ef_search": 10, "serving_hnsw_m": null,
-                            "serving_hnsw_ef_construction": null, "serving_hnsw_ef_search": null,
+                            "table": $vector_table,
+                            "column": "embedding",
+                            "partition_key": {},
+                            "live_rows": 0,
+                            "retained_rows": 0,
+                            "base_generation": null,
+                            "base_tx": null,
+                            "pending_inserts": 0,
+                            "tombstones": 0,
+                            "durable_vector_bytes": 0,
+                            "charged_vector_bytes": 0,
+                            "durable_index_bytes": null,
+                            "charged_index_bytes": 32,
+                            "query_state": "empty",
+                            "availability_reason": "none",
+                            "maintenance_state": "idle",
+                            "maintenance_reason": "none",
+                            "maintenance_vectors_total": null,
+                            "maintenance_vectors_done": null,
+                            "maintenance_vectors_remaining": null,
+                            "maintenance_checkpoint_tx": null,
+                            "indexed_available": false,
+                            "codebook_identity": null,
+                            "objective_status": null,
+                            "lists": null,
+                            "lists_source": null,
+                            "probes": null,
+                            "probes_source": null,
+                            "refine_factor": null,
+                            "refine_factor_source": null,
                             "declared_consolidation_mode": null,
                             "declared_consolidation_change_percent": null,
                             "declared_consolidation_tombstone_percent": null,
                             "effective_consolidation_mode": "thresholds",
                             "effective_consolidation_change_percent": 20,
                             "effective_consolidation_tombstone_percent": 10,
-                            "desired_policy_revision": 1, "serving_policy_revision": null,
-                            "recovery_action": "none"
+                            "desired_policy_revision": 1,
+                            "serving_policy_revision": null,
+                            "recovery_action": "none",
+                            "state": null
                         }]
                     }
                 }
@@ -1097,6 +1146,8 @@ if ! jq -e -s '
         "$output_dir/maintenance-status-empty-fixture.after.manifest"
 fi
 exercised_store_read_commands['.maintenance status']=present
+expect_read_success 'verify-history-read-entries' ".verify history $read_entries_table"
+exercised_store_read_commands['.verify history']=present
 
 cursor_journey='cursor-open-fetch-close-one-row-pages'
 cursor_stdout="$output_dir/$cursor_journey.stdout"

@@ -42,6 +42,7 @@ mod binary_path;
 mod cli_ux;
 #[path = "acceptance/common.rs"]
 mod common;
+#[cfg(feature = "test-seams")]
 #[path = "acceptance/common_tracing.rs"]
 mod common_tracing;
 #[path = "acceptance/composite_foreign_key.rs"]
@@ -98,6 +99,9 @@ mod persistence;
 mod precommit_context_guard;
 #[path = "acceptance/principal_scoped_handle.rs"]
 mod principal_scoped_handle;
+#[cfg(not(feature = "test-seams"))]
+#[path = "acceptance/production_layout_inventory.rs"]
+mod production_layout_inventory;
 #[path = "acceptance/query_surface.rs"]
 mod query_surface;
 #[path = "acceptance/schema_evolution.rs"]
@@ -128,3 +132,140 @@ mod trigger_same_db_progress;
 mod txid_monotonic_concurrent_commits;
 #[path = "acceptance/vector_reindex_ordering.rs"]
 mod vector_reindex_ordering;
+
+#[cfg(not(feature = "test-seams"))]
+#[path = "acceptance/production_layout.rs"]
+mod production_layout;
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_server_fixture_cannot_survive_an_unwinding_or_killed_test() {
+    use common::{ServerChild, wait_for_child_stdout_contains, with_parent_death};
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+    const CHILD: &str = "CONTEXTDB_SERVER_FIXTURE_LIFETIME_CHILD";
+    fn spawn(mode: &str) -> ServerChild {
+        ServerChild::new(
+            with_parent_death(Command::new(
+                std::env::current_exe().expect("test executable"),
+            ))
+            .args([
+                "--exact",
+                "a_server_fixture_cannot_survive_an_unwinding_or_killed_test",
+                "--nocapture",
+            ])
+            .env(CHILD, mode)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn guarded fixture child"),
+        )
+    }
+    match std::env::var(CHILD).ok().as_deref() {
+        Some("child") => {
+            println!("server fixture child ready");
+            std::io::stdout().flush().expect("publish readiness");
+            loop {
+                std::thread::park();
+            }
+        }
+        Some("parent") => {
+            let mut child = spawn("child");
+            let ready = wait_for_child_stdout_contains(
+                &mut child,
+                "server fixture child ready",
+                Duration::from_secs(15),
+            );
+            assert!(ready.contains("server fixture child ready"));
+            println!("server fixture descendant={}", child.id());
+            std::io::stdout()
+                .flush()
+                .expect("publish descendant identity");
+            // The test process will be killed while this child remains live.
+            loop {
+                std::thread::park();
+            }
+        }
+        None => {}
+        Some(mode) => panic!("unknown fixture mode {mode}"),
+    }
+    let mut child = spawn("child");
+    let ready = wait_for_child_stdout_contains(
+        &mut child,
+        "server fixture child ready",
+        Duration::from_secs(15),
+    );
+    assert!(ready.contains("server fixture child ready"));
+    let pid = child.id() as libc::pid_t;
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _child = child;
+        panic!("exercise fixture cleanup during unwind");
+    }));
+    assert!(unwound.is_err());
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD),
+        "the guard killed and reaped the child during unwind"
+    );
+
+    // Adopt the descendant so this test also reaps it after its parent dies.
+    assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+    let mut parent = spawn("parent");
+    let ready = wait_for_child_stdout_contains(
+        &mut parent,
+        "server fixture descendant=",
+        Duration::from_secs(15),
+    );
+    let descendant: libc::pid_t = ready
+        .lines()
+        .find_map(|line| {
+            line.split_once("server fixture descendant=")
+                .map(|(_, pid)| pid)
+        })
+        .expect("parent reported its live descendant")
+        .parse()
+        .expect("descendant pid");
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, descendant, 0) } as i32;
+    assert!(
+        fd >= 0,
+        "open the exact live descendant: {}",
+        std::io::Error::last_os_error()
+    );
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    parent.kill().expect("simulate a killed test process");
+    parent.wait().expect("reap the killed test process");
+    let mut poll = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let exited = unsafe { libc::poll(&mut poll, 1, 15_000) };
+    // Even a failed assertion cannot leave this fixture running on the host.
+    unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd.as_raw_fd(),
+            libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        );
+    }
+    assert_eq!(
+        unsafe { libc::waitpid(descendant, &mut status, 0) },
+        descendant
+    );
+    assert_eq!(
+        exited, 1,
+        "the kernel ended the child when its test parent died"
+    );
+    assert!(libc::WIFSIGNALED(status));
+    assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
+}

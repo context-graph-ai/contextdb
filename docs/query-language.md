@@ -80,7 +80,8 @@ ALTER TABLE t SET MAINTAIN COUNT (col [ASC|DESC], ...), (...) | ALL PREFIXES | N
 ALTER TABLE t ALTER COLUMN vector_col SET MAX_PARTITIONS positive_integer
 ALTER TABLE t ALTER COLUMN vector_col SET SEARCH_MODE AUTO | EXACT | INDEXED
 ALTER TABLE t ALTER COLUMN vector_col SET AUTO_INDEX_AT positive_integer | DEFAULT
-ALTER TABLE t ALTER COLUMN vector_col SET HNSW DEFAULT | (M = positive_integer | DEFAULT, EF_CONSTRUCTION = positive_integer | DEFAULT, EF_SEARCH = positive_integer | DEFAULT)
+ALTER TABLE t ALTER COLUMN vector_col SET SEARCH DEFAULT | (TARGET_ACCURACY = decimal_percent | DEFAULT, EXPECTED_VECTORS = positive_integer | DEFAULT)
+ALTER TABLE t ALTER COLUMN vector_col SET IVF DEFAULT | (LISTS = positive_integer | DEFAULT, PROBES = positive_integer | DEFAULT, REFINE_FACTOR = decimal_at_least_1 | DEFAULT)
 ```
 
 `COLUMN` is optional on `ADD` and on `DROP` — `ALTER TABLE t DROP a` and `ALTER TABLE t DROP COLUMN a` both parse.
@@ -129,6 +130,16 @@ pending delivery in the same commit, and the sink runs only after that commit is
 durable, retrying with the same `SinkEvent::action_id` after a failure or
 restart.
 <!-- enforced by: tests/integration/transactional_callback_delivery.rs::callback_created_dependency_commits_with_observation_and_pending_delivery, tests/integration/transactional_callback_delivery.rs::final_commit_validation_failure_discards_callback_records_delivery_and_event, tests/integration/transactional_callback_delivery.rs::late_plugin_refusal_after_preparation_publishes_no_records_delivery_or_event, tests/integration/transactional_callback_delivery.rs::restart_after_commit_recovers_pending_action_and_delivers_committed_records -->
+
+Delivery is at least once: after a crash or an uncertain outcome the sink may see the same
+`SinkEvent::action_id` again, so a receiver deduplicates by it. There is no cross-event order
+promise. An event the sink's registration cannot see (another context or scope label) stays queued
+and is retried on a later pass over the queue, behind events queued after it. A file-backed store
+keeps at most 1,024 queued events, or 1 MiB of decoded events, of each sink in memory and reads the
+rest from the store as delivery reaches it. A window the writer memory limit cannot hold is counted
+in `SinkMetrics::window_refusals` and flagged by `SinkMetrics::window_refused`; those events stay
+queued and are delivered once the limit admits them.
+<!-- enforced by: opening_a_store_holds_a_bounded_window_of_queued_events::opening_a_store_holds_the_same_window_however_many_events_are_queued, opening_a_store_holds_a_bounded_window_of_queued_events::events_a_registration_cannot_see_never_hide_the_ones_it_can, opening_a_store_holds_a_bounded_window_of_queued_events::a_window_the_writer_budget_cannot_hold_is_refused_observably_and_resumes_when_it_can -->
 
 `DROP TRIGGER` requires an administrative handle and is refused inside a trigger callback,
 including its transaction-bound handle, with `Error::TriggerRequiresAdmin`. The refusal
@@ -205,12 +216,15 @@ DELETE FROM scratch WHERE created_at < $cutoff
 
 ```sql
 SELECT [DISTINCT] columns FROM table
-  [INNER JOIN | LEFT JOIN other ON condition]
+  [[INNER] JOIN | LEFT JOIN other ON condition]
   [WHERE condition]
   [ORDER BY col [ASC|DESC]]
   [USE RANK sort_key]
   [LIMIT n]
 ```
+
+`GROUP BY` is accepted only as `COUNT(*)` grouped by a declared `MAINTAIN COUNT` list; see
+[Grouped counts](#maintain-count).
 
 A `SELECT`-list column that does not exist on the table is `ColumnNotFound { table, column }` — the same class WHERE/JOIN/ORDER BY already use for an identical unknown-name failure — never `Ok` with a wrong or missing column:
 
@@ -253,6 +267,10 @@ SELECT t.id FROM items AS t WHERE t.name = 'a';
 SELECT items.id FROM items INNER JOIN tags ON items.id = tags.item_id WHERE tags.label = 'x';
 ```
 
+A bare `JOIN` with no join type is an inner join, as in standard SQL: `FROM items JOIN tags ON ...`
+parses exactly as `FROM items INNER JOIN tags ON ...`. The alias rules are unchanged, so
+`FROM items x JOIN tags y ON x.id = y.id` keeps `x` and `y` as the aliases.
+
 #### Standard-SQL WHERE Forms
 
 A bare boolean column, its negation, a boolean `$param`, and a literal `NULL` are all standard SQL and all work as predicates on their own — no `= TRUE` / `= FALSE` needed:
@@ -291,6 +309,41 @@ SELECT * FROM active WHERE name LIKE 'sensor%'
 
 Multiple CTEs via comma separation. Non-recursive only.
 
+### Ranked rows per group
+
+`ROW_NUMBER() OVER (PARTITION BY cols ORDER BY col [ASC|DESC], ...)` numbers each partition's
+rows 1, 2, 3, ... in the window's order; `OVER (ORDER BY ...)` without `PARTITION BY` numbers the
+whole input as one partition. Ties get distinct numbers in the window's order. Filter on the
+number in an outer query to take the first rows of each partition:
+
+```sql
+WITH ranked AS (
+  SELECT context_id, connector_id, session_ref, latest_occurred_at,
+         ROW_NUMBER() OVER (PARTITION BY context_id
+                            ORDER BY latest_occurred_at DESC, connector_id ASC, session_ref ASC)
+           AS session_rank
+  FROM event_context_sessions
+  WHERE context_id IN ($a, $b) AND latest_occurred_at IS NOT NULL
+)
+SELECT context_id, connector_id, session_ref FROM ranked
+WHERE (context_id = $a AND session_rank <= $n) OR (context_id = $b AND session_rank <= $m)
+ORDER BY context_id ASC, session_rank ASC
+```
+
+When each selected partition is named by equality with its own `rank <=` limit, and an index
+leads with the partition columns followed by the window's order columns in the same directions (a
+column the inner WHERE pins with `=` or `IS NULL` may sit between them), each partition is read as
+one index seek that stops at its own limit: it examines at most its limit plus one entry, however
+many rows the partition holds. Otherwise the input is sorted by partition and order and numbered —
+the same answer, within the statement's ordinary work and memory budgets. A reversed index does
+not serve a mixed-direction order, so newest-first and oldest-first each need their own index.
+The trace's `groups` lists each partition the read touched, its key redacted, with the entries it
+examined, the rows it returned, and whether `Index` or `Sort` served it.
+
+Every other window form is refused with `WindowFunctionNotSupported` naming it: `RANK`,
+`DENSE_RANK`, aggregates with `OVER`, `ROW_NUMBER` without `ORDER BY`, frames, named windows,
+several different windows in one `SELECT`, and computed partition or order expressions.
+
 ### Anchor-Shape vs List-Shape Reads
 
 Scoped handles filter ordinary reads to the rows visible to that handle. List
@@ -304,6 +357,11 @@ specific row identity through equality on a primary key, a single-column
 hidden by the handle, the query returns the typed visibility error from the
 gate that hid it: `ContextScopeViolation`, `ScopeLabelViolation`, or
 `AclDenied`. Missing rows still return an empty result.
+
+Graph queries follow the same split. A `GRAPH_TABLE ... MATCH` query whose anchor pins a
+node the handle cannot see returns the typed visibility error that hid it — `AclDenied`
+for an ACL-hidden node — rather than an empty result. A traversal that reaches a hidden
+node omits that node silently; it does not return an error.
 
 Predicate writes keep their existing contract. `UPDATE ... WHERE pk = $id` and
 `DELETE ... WHERE pk = $id` against a hidden row return
@@ -342,13 +400,60 @@ SHOW MAINTENANCE_POLL_INTERVAL;
 
 `SHOW SYNC_CONFLICT_POLICY` returns one `policy` column: a first row giving the bare deployment default (`keep_first`), then one `{table}={word}` row per table that declares a conflict policy, plus one such row for each built-in work-ledger table (and `peer_directory`) currently present in the store, suffixed `(engine-owned)` to distinguish it from an operator-declared row.
 
-`SHOW MEMORY_LIMIT` returns `limit`, `used`, `available`, and `startup_ceiling`.
-Size suffixes are binary. Both settings accept an unquoted or quoted size and `NONE`: `SET MEMORY_LIMIT 2G`,
+`SHOW MEMORY_LIMIT` returns `limit`, `used`, `available`, `startup_ceiling`, and
+`ceiling_refresh_failures`: how many times this process could not read its inherited memory
+ceiling (its cgroup limit). Each such failure keeps the last ceiling it did read; a process
+that has never read one refuses writer admissions, typed, until it can.
+Size suffixes are binary. Both settings accept optional `=`, an unquoted or quoted size, and `NONE`: `SET MEMORY_LIMIT 2G`,
 `SET MEMORY_LIMIT '2G'`, `SET DISK_LIMIT 2G`, and `SET DISK_LIMIT NONE` use the same forms. `2G` resolves to
 **2147483648 bytes**. CLI `--memory-limit 2G` uses the same value. The limit governs charged bytes,
 which are separate from whole-process RSS.
 
-`SHOW DISK_LIMIT` returns the same columns for file-backed storage. On `:memory:` databases, disk limit commands are accepted but ignored.
+`SET READ_CACHE_SHARE = <percent>` changes only the current `ReadSession`'s file page cache.
+The `=` is optional, as it is for SET MEMORY_LIMIT and SET DISK_LIMIT.
+An integer from 0 through 100 declares that percentage of the session memory budget after fixed
+source reservations. `SET READ_CACHE_SHARE = DEFAULT` restores the exact derived default,
+`(budget - fixed reservations) / 7`, displayed as default (14%). Zero disables the file cache.
+The change takes effect immediately without reopening the snapshot; an open cursor keeps its
+rows, snapshot, and funded pinned pages. An existing cursor also applies a later declaration on
+its next fetch after its writer exits. Cache inspection selects the current readable route after
+writer turnover; routing failures remain typed errors. Another session and a reopened session keep
+their own policy. These statements require no writable store and do not persist a store setting.
+
+```sql
+SET READ_CACHE_SHARE = 40;
+SHOW READ_CACHE_SHARE;
+SET READ_CACHE_SHARE = 0;
+SET READ_CACHE_SHARE = DEFAULT;
+```
+
+Range refusals use `Error::InvalidSetting { name, value, allowed }`; for this setting `name` is
+`READ_CACHE_SHARE` and `allowed` is `0..=100, an integer percent`. Non-integers such as `40%` or `4.5`
+use this typed refusal and keep the previous declaration. `SET MEMORY_LIMIT` above its startup ceiling (or
+`NONE` under a finite startup ceiling) uses the same typed variant. A valid cache percentage still
+has to pass total memory admission: on an opened file reader, 100 consumes the entire remainder
+and leaves no room for the prepaid index and decoded state, so it returns the typed
+`MemoryBudgetExceeded` refusal. Either refusal keeps the previous declaration and capacity.
+
+`SHOW READ_CACHE_SHARE` returns one row: `declared` (an integer, or text `default`),
+`effective_bytes` (Int64), `effective_percent` (Float64, relative to the remainder after fixed
+reservations), `last_refusal` (the last refused value as text, possibly shortened; initially
+Null), `last_query_resident_percent` (Float64 percent; initially Null), `budget_bytes`,
+`fixed_reservation_bytes`, `prepaid_index_bytes`, `held_page_bytes`, and `default_percent`.
+Settings and their inspection do not replace the last data statement's residency observation. A running cursor can keep a smaller cache when
+following a growth would leave too little room to build its pages. Its rows and snapshot continue;
+the session's declared share stays what the user set. `last_refusal` identifies the cursor and the
+capacity it kept. A later shrink still applies on its next fetch.
+On the owner route the policy describes a future file reader; physical cache fields and query
+residency are Null because this session does not own the writer's shared cache.
+
+Query residency is an advisory check of up to one cache-full of distinct pages from the last
+successful data statement. It can change with concurrent eviction and does not predict query cost.
+Null means no pages were measured: this includes no prior data statement, a statement that read no
+file pages, a disabled file cache, or a window superseded while another statement ran. Inspecting
+other settings and statements that fail before execution keep the last data statement's observation.
+
+`SHOW DISK_LIMIT` returns the same columns for file-backed storage.
 
 `SHOW MAINTENANCE_POLL_INTERVAL` returns one `milliseconds` column. The default is 60,000 ms.
 `SET MAINTENANCE_POLL_INTERVAL` accepts a positive integer followed by `MILLISECONDS` or `SECONDS`,
@@ -357,6 +462,39 @@ millisecond value, not SQL text. If that flag is omitted, a file-backed store ke
 persisted interval.
 For a file-backed database the value persists and governs later opens. Time wakes the engine-owned
 worker; the declared per-column thresholds decide whether vector consolidation runs.
+
+```sql
+SET STORAGE_COMPACTION START_RATIO 0.4 MIN_INTERVAL 30 MINUTES;
+SET STORAGE_COMPACTION STOP_RATIO 0.02 MAX_SWEEPS 4;
+SET STORAGE_COMPACTION DEFAULT;
+SHOW STORAGE_COMPACTION;
+```
+
+Storage compaction is a per-store setting, like the polling interval: local configuration, not
+schema, and never synced. Undeclared values use these defaults:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `START_RATIO` | 0.5 | Automatic and post-prune compaction start once the share of the file a tidy-up could give back by moving pages reaches this. That share is interior free pages over the pages a trim would leave. Greater than 0 and at most 1. |
+| `MIN_INTERVAL` | 1 hour | Minimum time between automatic attempts. A check that finds the file below the start ratio also starts the interval. Takes `MILLISECONDS`, `SECONDS`, `MINUTES` or `HOURS`. Must be positive and at most 9,223,372,036,854,775,807 ms, so `SHOW` reports it exactly. |
+| `STOP_RATIO` | 0.05 | Explicit compaction (`.maintenance compact`) keeps sweeping while the share is at or above this and a sweep still shrinks the file; when the share cannot be measured, it keeps sweeping while sweeps shrink the file. The same ratio also bounds every growth of the file: one growth adds at most this share of the file's usable size (rounded down to whole bytes), or twice the allocation that needs it when that is larger, so a compacted file does not double back on its next write. Page and region-header rounding can add a few pages on top; a declared `DISK_LIMIT` still refuses growth past it. Greater than 0 and at most 1. |
+| `MAX_SWEEPS` | 8 | The most sweeps one explicit compaction runs. At least 1. |
+
+Each `SET STORAGE_COMPACTION` names only the clauses it changes; the others keep their values.
+`SET STORAGE_COMPACTION DEFAULT` returns every setting to its default and removes the
+declaration. `SHOW STORAGE_COMPACTION` returns one row per setting with `setting`, `value` and
+`source`; `source` is `declared` or `default`. For a file-backed database the declaration
+persists across opens. `.maintenance status` shows the same values and sources, and every
+maintenance and compaction receipt names the policy that governed it.
+
+A value outside its range, or a clause named twice in one statement, is refused with
+`InvalidStorageCompactionDeclaration` and changes nothing. The Rust setter
+`Database::set_storage_compaction` refuses the same values with the same issue, and a persisted
+declaration is checked again when the store opens. Concurrent declarations apply one at a time,
+so each keeps the clauses the other did not name, and the live setting is always the persisted
+one.
+<!-- enforced by: storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::the_rust_setter_refuses_what_sql_refuses_and_changes_nothing, storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::the_longest_interval_shows_exactly_and_a_longer_one_is_refused, storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::concurrent_declarations_of_different_settings_both_survive_in_live_show_and_reopen, storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::a_default_racing_a_declaration_leaves_live_show_and_reopen_agreeing -->
+<!-- enforced by: storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::storage_compaction_declarations_show_their_source_and_survive_reopen, storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::a_declared_start_ratio_changes_when_automatic_compaction_starts, storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::a_declared_stop_rule_changes_how_many_sweeps_compact_now_runs, storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::a_declared_minimum_interval_changes_when_a_negative_check_repeats -->
 
 ---
 
@@ -393,6 +531,10 @@ CREATE TABLE media (
 ```
 
 Valid quantization values are `F32`, `SQ8`, and `SQ4`; the default is `F32`.
+
+A `VECTOR(n)` declaration requires `n` to be at least 1. `VECTOR(0)` is refused before
+publishing the schema with `InvalidVectorPolicyDeclaration` and the
+`DimensionsNotPositive` issue: "vector dimensions must be at least 1".
 
 A `VECTOR(n)` column holds embeddings and nothing else. Every write door — `INSERT`, `UPDATE`, a
 conditional `UPDATE`, `ON CONFLICT ... DO UPDATE`, and a column default — accepts an embedding of
@@ -548,14 +690,8 @@ made the formula large.
 
 Current limits to account for in production designs:
 
-- `INDEXED` — and `AUTO` on the indexed route — ranks the rank formula over the
-  bounded candidate set vector retrieval returns, then applies the final
-  top-k; it does not force an exhaustive scan of every row in the corpus.
-  `USE VECTOR EXACT` evaluates the rank formula over every allowed stored
-  vector before the final `LIMIT`. If a formula does not reference
-  `{vector_score}` and cosine is a weak candidate generator for the metric
-  being optimized, use `USE VECTOR EXACT` rather than widening the search
-  limit.
+- `AUTO` and `EXACT` evaluate the rank formula over allowed vectors before the final limit. `INDEXED` is unavailable in this release.
+  <!-- enforced by: a_search_is_exact_with_no_index_built::an_auto_find_answers_exactly_after_commit_with_no_maintenance, a_search_is_exact_with_no_index_built::indexed_is_refused_at_every_door, a_search_is_exact_with_no_index_built::no_cycle_or_commit_builds_or_writes_an_index, a_search_is_exact_with_no_index_built::declared_index_policy_is_recorded_and_has_no_effect -->
 - If more than one joined row matches a candidate, the current policy uses one
   matched row, chosen by highest internal `RowId`. Model joined data as a
   single current summary row when ranking semantics need to be stable.
@@ -615,6 +751,12 @@ CREATE TABLE child (
 | `REFERENCES table(col)` / `FOREIGN KEY (...) REFERENCES ...` | Foreign key — writes are rejected if the referenced row or tuple does not exist; in explicit transactions the error may surface at `COMMIT` |
 | `IMMUTABLE` | Column is audit-frozen — INSERT sets the value once; `UPDATE`, `ON CONFLICT DO UPDATE`, sync-apply mutations, and schema-altering DDL against the column are rejected with `Error::ImmutableColumn` |
 | `ACL REFERENCES table(col)` | Column carries the row's access-control id — a non-administrative handle reads the row only when its principal holds a matching grant; a handle with no grant-holding principal is refused the table with `Error::PrincipalRequired` |
+
+Declared column defaults apply to both SQL `INSERT` and `Database::insert_row`
+before constraint validation. Supplied values remain unchanged; an omitted
+`DEFAULT NULL` is stored as a NULL cell. `DEFAULT NOW()` is evaluated at insertion,
+and later reads and reopens keep that stored timestamp.
+<!-- enforced by: crates/contextdb-engine/tests/sql_surface/raw_row_inserts_apply_declared_defaults.rs::raw_row_inserts_apply_typed_literal_defaults_and_preserve_explicit_values, crates/contextdb-engine/tests/sql_surface/raw_row_inserts_apply_declared_defaults.rs::raw_row_inserts_store_null_defaults_and_preserve_explicit_values, crates/contextdb-engine/tests/sql_surface/raw_row_inserts_apply_declared_defaults.rs::raw_row_inserts_evaluate_now_once_and_preserve_explicit_timestamps -->
 
 ### Audit-Frozen Columns
 
@@ -946,10 +1088,11 @@ cannot fit is the ordinary typed budget refusal with nothing installed.
 **Which route a `COUNT(*)` took.** `.explain` says so in one of three states,
 and names the statement that would change it when a statement would.
 
-A stored count is reachable only from a store read as a committed image — the
-direct-file read route. A writable handle and the owner read route count the
-live postings over the same exact prefix range instead. Every one of the three
-answers is exact; only the first is O(1):
+The direct-file route serves a stored count from its committed image. Writable
+handles and the owner read route serve it from the statement's captured writer
+root and report `used`. If a route cannot serve the stored count, it counts the
+live postings over the same exact prefix range and reports `declared`. Every
+answer is exact; serving the stored count is O(1):
 
 ```
 IndexScan { index: events_by_context }
@@ -976,6 +1119,24 @@ runnable as printed. Because `SET MAINTAIN COUNT`
 replaces the whole declared set, the advice carries the lists the table already
 declares alongside the missing one — following it never drops a count you
 already asked for.
+
+**Grouped counts.** `COUNT(*)` grouped by the rest of a declared list, with the list's leading
+columns pinned by `=` or `IS NULL`, is answered from the stored counts — one stored count per
+group, so its work is the number of groups and never the number of rows they count:
+
+```sql
+SELECT connector_id, source_instance_ref, COUNT(*) AS event_count
+FROM events WHERE context_id = $context_id
+GROUP BY connector_id, source_instance_ref
+```
+
+A writable handle and the owner read route serve it from the counts at the statement's own
+snapshot (`maintained count: used (...)`). A transaction that has staged rows of the table, a
+table whose rows are filtered per reader, and a store read as a committed image count the same
+groups from the rows instead, and the trace says `declared (...), counted from the index range on
+this read route`. Groups come back in the declared list's order. A grouped `COUNT(*)` over columns
+the table maintains no count for is refused, naming the `ALTER TABLE ... SET MAINTAIN COUNT` that
+would serve it.
 
 **The refusals.** A list no index leads with is refused, naming the list and
 the indexes considered — a count nothing can read is not a thing to maintain.
@@ -1171,7 +1332,12 @@ WHERE embedding IS NOT NULL
 | `COALESCE(a, b, ...)` | varies | First non-NULL argument |
 | `NOW()` | TIMESTAMP | Current Unix timestamp |
 
-COUNT and SUM operate over the entire result set. No GROUP BY or HAVING — use CTEs or application-level grouping for aggregation.
+COUNT and SUM operate over the entire result set. The one grouped form is `COUNT(*)` grouped by a
+column list the table declares under [MAINTAIN COUNT](#maintain-count) — the WHERE clause pins that
+list's leading columns with `=` or `IS NULL` and `GROUP BY` names the rest — and it is answered
+from the stored counts. Every other grouped form is refused: `HAVING`, `SUM` or `COUNT(col)` per
+group, a select item that is neither a grouped column nor `COUNT(*)`, and `DISTINCT`, `ORDER BY`,
+`LIMIT`, joins or CTEs around a grouped read.
 
 **`NOW()` in an `INSERT ... VALUES` list is refused for a `NOT NULL` column.** Writing it into a
 nullable column is accepted, and `UPDATE ... SET ts = NOW()` is accepted for either; but
@@ -1229,6 +1395,17 @@ The CLI does not support parameter binding — use literal values directly.
 
 ## Graph Traversal
 
+An edge's identity is the unique key its table declares. Where no edge key is declared,
+`(source_id, target_id, edge_type)` is automatically deduplicated; a surrogate `id` primary key
+still identifies the stored row. A declared key containing additional columns makes those columns
+part of the edge's identity, so two rows differing in one of them are distinct edges. A row
+that duplicates a declared unique key, including a key that is exactly the triple, is refused
+with `UniqueViolation`. Both insertion APIs observe the same logical edge identity.
+<!-- enforced by: an_edge_keeps_the_identity_its_table_declares::with_no_declared_key_the_triple_is_still_deduplicated, an_edge_keeps_the_identity_its_table_declares::an_edge_differing_only_by_an_extra_declared_key_column_is_inserted, an_edge_keeps_the_identity_its_table_declares::a_true_duplicate_under_the_declared_key_is_still_not_inserted_twice -->
+
+Graph cursors keep the row and authorization view captured when they open. Valid writes in the same transaction continue; a newly opened cursor sees those later writes. Captured staged rows retain their original writer admission until their last holder drops.
+
+
 Graph queries use `GRAPH_TABLE` in the FROM clause with openCypher-subset `MATCH` patterns. The graph executor uses dedicated adjacency indexes and bounded BFS — graph traversal is a native operator, not recursive SQL.
 
 ### Syntax
@@ -1272,6 +1449,14 @@ MATCH (a)-[:EDGE]->{1,10}(b)
 
 An explicit upper bound is always required. Maximum traversal depth enforced by the engine is 10.
 
+### What a Match Returns
+
+The same matching rule applies to every reader. Access rules only remove the nodes and edges a reader may not see; they never change how the rest are matched.
+
+- **A single hop** returns one row for each matching edge. `MATCH (a)-[:LINKS]->(b)` with edges x→z and y→z returns (x, z) and (y, z). Two edges between the same nodes that both match, such as edges of two types under `MATCH (a)-[]->(b)`, return two rows. An undirected hop reports a self-loop once.
+- **A longer match** (a variable-length step or several steps) walks every matching edge out from each start, up to the upper bound. An edge back to a node already reached still counts, so cycles and self-loops count as reachable, and a cycle that returns to a start node reports that start node when the cycle's length is within the range.
+- **Each combination of target nodes is reported once** in a longer match, at the shallowest depth any start node reaches it. When two start nodes reach it at the same depth, the start node that comes first wins: first in the order the start nodes are given (an `IN` list, or the rows of a start subquery), or the smallest node id when the match does not name its start nodes.
+
 ### Filtering and Projection
 
 Use WHERE to filter after traversal, COLUMNS to project results:
@@ -1284,6 +1469,8 @@ SELECT target_id FROM GRAPH_TABLE(
   COLUMNS (b.id AS target_id)
 )
 ```
+
+`COLUMNS` can project the id of each node the match binds (`a.id`, `b.id`), plus `id` and `depth` for the node reached and its depth. It cannot yet project any other property of a bound node: `COLUMNS (b.context_id AS context)` fails with `project column not found: b.context_id`. To read such a property, project the node's id and join the node table on it.
 
 ### Composing with SQL via CTEs
 
@@ -1402,7 +1589,8 @@ CREATE TABLE vector_items (
     MAX_PARTITIONS 256
     SEARCH_MODE AUTO
     AUTO_INDEX_AT 10000
-    HNSW (M = 24, EF_CONSTRUCTION = 400, EF_SEARCH = 128)
+    SEARCH (TARGET_ACCURACY = 95, EXPECTED_VECTORS = 1000000)
+    IVF (LISTS = 64, PROBES = 8)
     CONSOLIDATION (CHANGE_PERCENT = 25, TOMBSTONE_PERCENT = 5)
 );
 ```
@@ -1414,82 +1602,22 @@ repeat a column or include the vector column. `MAX_PARTITIONS` is legal only wit
 `PARTITION_KEY`; omitting it means the effective limit is 256, and `.schema` prints that value.
 A key value written to a row, locally or through sync, must be of its column's declared type or
 the write is refused naming that column; the declaration itself is not at fault.
-The limit counts layouts containing a live indexed vector or a version still needed by a held
+The limit counts layouts containing a live stored vector or a version still needed by a held
 snapshot. A NULL vector creates no layout. A write that would exceed the limit is refused as one
 atomic write; it does not leave a row accepted without its vector.
 <!-- enforced by: vector_partition_declaration_contract::partitioned_vector_schema_survives_reopen_with_canonical_defaults, vector_partition_declaration_contract::invalid_partition_components_are_refused_without_partial_schema, vector_partition_declaration_contract::max_partitions_without_a_partition_key_is_a_typed_refusal, vector_partition_declaration_contract::every_exact_identity_type_is_valid_in_a_composite_partition_key, vector_partition_query_contract::a_partition_key_value_of_the_wrong_type_gets_its_own_typed_refusal_naming_the_column, vector_partition_query_contract::a_partition_key_value_of_the_wrong_type_arriving_through_sync_gets_the_same_typed_refusal, vector_partition_cleanup_inspection_contract::second_vector_column_cap_refusal_rolls_back_the_row_and_both_columns -->
 
-`AUTO_INDEX_AT`, `HNSW`, and `CONSOLIDATION` are optional per-column policy clauses and follow
-`SEARCH_MODE` in
-the canonical rendered order. `AUTO_INDEX_AT` is the first aggregate allowed-vector count for the
-whole requested answer at which `AUTO` requires the maintained indexed route; below it, `AUTO`
-compares exactly only when the existing resource limits permit. It is not a per-partition
-threshold. `HNSW` names the maintained graph's `M` (neighbour links per point),
-`EF_CONSTRUCTION` (candidate work while building), and `EF_SEARCH` (candidate work while
-searching). `EF_CONSTRUCTION` must be at least `M`.
-
-`CONSOLIDATION` controls when maintenance rebuilds an otherwise healthy graph. `CHANGE_PERCENT`
-counts pending inserts plus tombstones against the live-plus-retained partition population;
-`TOMBSTONE_PERCENT` counts tombstones alone. Because tombstones are part of total change, the
-tombstone trigger can decide first only when its percentage is lower than the change percentage.
-Each value is from 1 through 100. If the clause or one member is silent, the effective defaults are
-20% total change and 10% tombstones, and `.schema` keeps that default silent. At each maintenance
-wake, the change percentage is the policy bound that decides when a healthy partition's retained
-post-base journal is published into a replacement generation. Writes can take the journal past that
-percentage between wakes, and the percentage is not a byte ceiling. `ALTER ... SET CONSOLIDATION
-(...)` changes the named members while retaining omitted members; `ALTER ... SET CONSOLIDATION
-DEFAULT` clears both declarations. The policy persists in schema, travels with it, and is honored by
-in-memory and file-backed maintenance.
-`CONSOLIDATION NONE` (including `ALTER ... SET CONSOLIDATION NONE`) disables automatic threshold
-consolidation without disabling the maintained index, initial construction, topology replacement,
-or repair. Because healthy-tail threshold rebuilds no longer advance the covered frontier, the
-post-base change journal remains retained until a required replacement or repair publishes, or
-threshold consolidation is re-enabled and becomes due; choose `NONE` with that disk-retention
-consequence in mind. Both vector inspection surfaces show
-the declared mode and members beside their effective mode and members.
-`declared_consolidation_mode` is `NULL` when the declaration is silent, `thresholds` when either
-percentage is explicit, and `none` for explicit `CONSOLIDATION NONE`; effective mode is always
-`thresholds` or `none`.
-<!-- enforced by: vector_partition_declaration_contract::consolidation_and_maintenance_poll_declarations_round_trip_and_reset, vector_resource_maintenance_contract::in_memory_maintenance_honours_declared_consolidation_thresholds, vector_partition_sync_inspection_contract::every_consolidation_form_keeps_schema_identity_across_sync -->
-
-On `CREATE TABLE`, omitting either clause preserves the compatibility profile and `.schema`
-renders that silence. Its current defaults are: F32 uses `(M, EF_CONSTRUCTION, profile
-EF_SEARCH)` of `(16, 200, 10)` through 2,500 live vectors, `(16, 200, 20)` from 2,501 through
-5,000, `(24, 400, 400)` from 5,001 through 50,000, and `(16, 200, 200)` above 50,000;
-SQ8/SQ4 use `(8, 32,
-min(96,max(32,n)))` through 5,000 and `(12, 64, 128)` above 5,000. The undeclared
-`AUTO_INDEX_AT` defaults are 1,000 for F32 and 5,001 for SQ8/SQ4. An undeclared `EF_SEARCH` uses
-at least its profile and the existing `10 * k` query default; an explicit value is raised only to
-reach `k`.
-
-**The F32 search breadth default is now narrower for small layouts.** An F32 vector column that
-does not declare `EF_SEARCH` now searches a layout of up to 2,500 live vectors with a profile
-breadth of 10, and a layout of 2,501 through 5,000 with 20. The query default of `10 * k`
-still applies, so a top-10 query searches at least 100
-candidates. `M` and `EF_CONSTRUCTION` for these bands are unchanged, and the bands above 5,000 are
-unchanged. A column that declares `EF_SEARCH` keeps exactly its declared breadth; declare one, for
-example `ALTER TABLE t ALTER COLUMN embedding SET HNSW (EF_SEARCH = 200)`, to search more widely.
-<!-- enforced by: crates/contextdb-vector/src/store.rs::compatibility_profile_edges_and_partial_policy_validation_agree -->
-
-Change the policy online with the `ALTER` forms above. `DEFAULT` on `AUTO_INDEX_AT` clears that
-declaration; `SET HNSW DEFAULT` clears the whole group, while `DEFAULT` for a named HNSW member
-clears only that member and omitted members retain their declarations. Each statement changes its
-named HNSW members atomically. `AUTO_INDEX_AT` and `EF_SEARCH` affect newly opened queries without
-rebuilding a graph. A change to the effective `M` or `EF_CONSTRUCTION` topology schedules a bounded
-replacement generation; the previous complete graph continues serving, and an older policy revision
-cannot publish over a newer declaration. An explicit value that resolves to the serving topology
-retains its authored identity without forcing a redundant build. Explicit `AUTO_INDEX_AT`, `HNSW`,
-and `CONSOLIDATION` values persist, participate in schema identity, and render in this canonical
-order.
-<!-- enforced by: vector_policy_resolver_contract::declared_vector_policy_resolves_consistently_at_default_and_declared_boundaries, vector_policy_declaration_contract::partial_alters_member_defaults_and_group_defaults_change_only_the_declared_policy, vector_policy_declaration_contract::invalid_policy_values_refuse_atomically_without_changing_schema_or_inspection, vector_policy_revision_publication_contract::online_vector_policy_revisions_keep_the_complete_graph_serving_and_reject_stale_publication, vector_policy_revision_publication_contract::explicit_current_defaults_keep_their_identity_without_rebuilding_matching_graphs -->
+`AUTO_INDEX_AT`, `SEARCH`, `IVF`, and `CONSOLIDATION` remain optional schema declarations.
+This release ships exact vector search only. `AUTO` and `EXACT` compare allowed stored vectors within active budgets. `INDEXED` returns `VectorIndexedRouteUnavailable`; the clustered index is switched off. Index policy declarations do not enable construction, maintenance or indexed serving.
+<!-- enforced by: a_search_is_exact_with_no_index_built::an_auto_find_answers_exactly_after_commit_with_no_maintenance, a_search_is_exact_with_no_index_built::indexed_is_refused_at_every_door, a_search_is_exact_with_no_index_built::no_cycle_or_commit_builds_or_writes_an_index, a_search_is_exact_with_no_index_built::declared_index_policy_is_recorded_and_has_no_effect -->
 
 An operator can raise the limit online, but cannot lower it below live-plus-retained use:
 
 ```sql
 ALTER TABLE vector_items ALTER COLUMN embedding SET MAX_PARTITIONS 512;
-ALTER TABLE vector_items ALTER COLUMN embedding SET SEARCH_MODE INDEXED;
+ALTER TABLE vector_items ALTER COLUMN embedding SET SEARCH_MODE EXACT;
 ALTER TABLE vector_items ALTER COLUMN embedding SET AUTO_INDEX_AT 10000;
-ALTER TABLE vector_items ALTER COLUMN embedding SET HNSW (EF_SEARCH = 128);
+ALTER TABLE vector_items ALTER COLUMN embedding SET IVF (PROBES = 16);
 ALTER TABLE vector_items ALTER COLUMN embedding SET CONSOLIDATION (CHANGE_PERCENT = 11);
 ALTER TABLE vector_items ALTER COLUMN embedding SET CONSOLIDATION NONE;
 ```
@@ -1504,54 +1632,15 @@ column creates the corresponding local vector index.
 
 ### Search modes and query override
 
-`SEARCH_MODE` sets the column default:
+This release ships exact vector search only. `AUTO` and `EXACT` compare allowed stored vectors within the active budgets; `INDEXED` returns `VectorIndexedRouteUnavailable`. The clustered index is switched off: commits and maintenance do not build or write it, and queries and inspection do not read it. Index policy declarations are retained but do not enable an index.
+<!-- enforced by: a_search_is_exact_with_no_index_built::an_auto_find_answers_exactly_after_commit_with_no_maintenance, a_search_is_exact_with_no_index_built::indexed_is_refused_at_every_door, a_search_is_exact_with_no_index_built::no_cycle_or_commit_builds_or_writes_an_index, a_search_is_exact_with_no_index_built::declared_index_policy_is_recorded_and_has_no_effect -->
 
-- `AUTO` decides by count: it compares the aggregate allowed count for the whole requested answer
-  against the column's effective `AUTO_INDEX_AT`. Below that count, the answer is exact when the
-  active limits can pay for it and a typed refusal when they cannot; memory never silently picks
-  the indexed route on `AUTO`'s behalf. At or above that count, `AUTO` admits indexed planning for
-  the whole answer, then chooses work per Context: a Context whose live vector count is at or below
-  its resolved `EF_SEARCH` is compared exactly, while a larger Context traverses its maintained
-  graph. ContextDB merges both kinds of candidates into the same global answer. For F32 the
-  automatic switch is at 1,000 allowed vectors; for SQ8/SQ4 it is at 5,001. These counts apply to
-  the whole requested answer, not separately to each partition.
-- `EXACT` compares every allowed stored vector, or returns a typed budget refusal. It never quietly
-  substitutes an indexed answer. Exact means exact over the stored column values; SQ8 and SQ4 stay
-  quantized by design.
-- `INDEXED` requires a maintained bounded route, including for a small non-empty layout. If that
-  route is not ready, it returns a typed unavailable-route refusal instead of a full scan. It
-  traverses the graph even when `AUTO` would exact-compare that same small Context.
-  <!-- enforced by: vector_search_mode_bounded_contract::auto_admits_indexed_planning_by_aggregate_then_exact_compares_each_small_partition, vector_search_mode_bounded_contract::exact_override_is_exhaustive_across_partitions_and_matches_rust_and_bounded_reads, vector_search_mode_bounded_contract::indexed_small_nonempty_scope_refuses_until_maintenance_then_keeps_a_staged_delta_visible, vector_policy_resolver_contract::default_crossovers_execute_both_sides_without_a_normal_write_availability_gap -->
-
-Override the declaration for one vector-nearest-neighbour query after vector ordering and before
-`USE RANK` or `LIMIT`:
+Use `USE VECTOR EXACT` after vector ordering and before `USE RANK` or `LIMIT`:
 
 ```sql
-SELECT passage_id
-FROM event_search_passages
-WHERE context_id = $context
-ORDER BY vector_text <=> $query
-USE VECTOR EXACT
-LIMIT 10;
+SELECT passage_id FROM event_search_passages
+ORDER BY vector_text <=> $query USE VECTOR EXACT LIMIT 10;
 ```
-
-`USE VECTOR` is legal only with vector ordering. The selected mode covers the whole requested
-scope: if any required layout cannot satisfy `INDEXED`, the query refuses rather than omit that
-layout or return a partial list. A missing or empty authorized tuple is a complete empty result.
-<!-- enforced by: vector_partition_syntax_contract::vector_search_override_follows_vector_ordering_and_precedes_rank_and_limit, vector_partition_query_contract::every_use_vector_mode_refuses_a_non_vector_ordering_query, vector_partition_query_contract::missing_named_partition_tuple_is_an_empty_answer, vector_search_mode_bounded_contract::auto_keeps_healthy_partition_results_for_preflight_and_mid_merge_fallbacks -->
-
-Initial graph construction and repair run only through maintenance. Declarations, writes, database
-open, and queries do not wait for a full build. Engine-owned maintenance advances in the background;
-caller-driven hosts advance it with `Database::run_maintenance_cycle` or CLI `.maintenance run`.
-While a required indexed route is unavailable, `INDEXED` refuses and `AUTO` may compare exactly only
-inside its existing budget. Ordinary relational/graph reads and admitted writes remain usable.
-<!-- enforced by: vector_maintained_lifecycle_contract::caller_driven_vector_indexes_are_built_and_maintained_only_by_maintenance, vector_maintained_lifecycle_contract::engine_owned_file_maintenance_publishes_a_durable_indexed_route_for_a_reopened_reader, vector_generation_quarantine_compaction_lock_contract::corrupt_lazy_base_becomes_typed_unavailable_then_repairs_from_raw_vectors -->
-
-For an exhaustive `AUTO` query over dormant raw partitions, a refused whole-partition load can
-fall back to reading one stored vector at a time, preserving the exact answer without installing
-a resident partition. For the same unrestricted search, a writable handle explicitly requesting
-`EXACT` retains whole-partition admission and can be refused at that load under the same ceiling.
-<!-- enforced by: vector_lazy_raw_residency_contract::auto_exhaustive_find_answers_inside_memory_that_cannot_hold_a_partition -->
 
 ### Partition scope, filters, and one answer
 
@@ -1561,26 +1650,19 @@ layout. A named tuple that does not exist returns no rows and never broadens to 
 ContextDB searches selected layouts independently, then merges candidates by score before `USE RANK`
 and `LIMIT`. The result is one global top-k, with the existing ascending row-id tie-break for equal
 scores — never one limit per layout and never iteration-order results.
-<!-- enforced by: vector_partition_query_contract::equality_on_every_partition_component_selects_one_named_tuple, vector_partition_query_contract::finite_in_partition_scope_merges_before_one_limit, vector_partition_query_contract::equivalent_or_partition_scope_keeps_cross_partition_row_id_ties, vector_partition_query_contract::composite_partition_prefix_selects_every_tuple_below_the_prefix, vector_partition_query_contract::no_partition_key_predicate_returns_one_global_limited_answer, vector_partition_query_contract::missing_named_partition_tuple_is_an_empty_answer, vector_serving_merge_contract::global_ties_keep_internal_row_order_across_partition_load_permutations -->
+<!-- enforced by: vector_partition_query_contract::equality_on_every_partition_component_selects_one_named_tuple, vector_partition_query_contract::finite_in_partition_scope_merges_before_one_limit, vector_partition_query_contract::equivalent_or_partition_scope_keeps_cross_partition_row_id_ties, vector_partition_query_contract::composite_partition_prefix_selects_every_tuple_below_the_prefix, vector_partition_query_contract::no_partition_key_predicate_returns_one_global_limited_answer, vector_partition_query_contract::missing_named_partition_tuple_is_an_empty_answer -->
 
-`WHERE` filters still decide which rows are allowed inside that scope. A small allowed set may be
-compared exactly under `AUTO`; a large one needs a bounded filtered-index route. If ContextDB has
-no bounded way to find or evaluate the allowed rows, `INDEXED` refuses before a table-wide predicate
-scan. `AUTO` uses exact work only when the active budget can pay for it; `EXACT` remains exhaustive
-within its declared budget. `.explain` names a supporting ordinary `CREATE INDEX` when one is a safe
-recovery, otherwise it says to use `EXACT` or rewrite the filter. It never hides a full table scan
-behind indexed search.
-<!-- enforced by: vector_search_mode_bounded_contract::indexed_broad_filter_refuses_before_scan_and_becomes_eligible_with_a_relational_index, vector_partition_query_contract::unaligned_restriction_inside_a_bounded_candidate_set_never_scans, vector_search_mode_bounded_contract::exact_override_is_exhaustive_across_partitions_and_matches_rust_and_bounded_reads -->
+`WHERE` filters decide which rows are allowed before exact scoring. The active read budgets still apply.
+<!-- enforced by: a_search_is_exact_with_no_index_built::an_auto_find_answers_exactly_after_commit_with_no_maintenance, a_search_is_exact_with_no_index_built::indexed_is_refused_at_every_door, a_search_is_exact_with_no_index_built::no_cycle_or_commit_builds_or_writes_an_index, a_search_is_exact_with_no_index_built::declared_index_policy_is_recorded_and_has_no_effect -->
 
 ### Explain
 
 `.explain` reports the requested and resolved mode, declared partition key, whether the query
 selects one, several, or all authorized layouts, the route used by each Context, the global
 candidate merge, and any safe fallback or refusal reason. It redacts unauthorized keys and counts.
-A constrained handle's explanation omits per-partition HNSW numbers, whose adaptive values could reveal
-the hidden population. For an unrestricted caller, disclosed `M`, `EF_CONSTRUCTION`, and policy
-revision describe the snapshot's serving graph; `EF_SEARCH` describes the current query policy at
-its requested `k`. A query-only policy change therefore applies immediately even while the serving
+A constrained handle's explanation omits per-partition index numbers, whose adaptive values could reveal
+the hidden population. For an unrestricted caller, disclosed `LISTS`, `REFINE_FACTOR`, and policy
+revision describe the snapshot's serving index; `PROBES` describes the current query policy. A query-only policy change therefore applies immediately even while the serving
 build revision is older. Its authorized count and memory refusals use only authorized identities
 and the operation's available headroom. Explaining is
 metadata-only: it does not build an index, replay a journal, start repair, or fault every graph or
@@ -1607,10 +1689,11 @@ These are explicitly rejected with descriptive error messages:
 | Feature | Error |
 |---------|-------|
 | `WITH RECURSIVE` | `RecursiveCteNotSupported` |
-| Window functions (`OVER`) | `WindowFunctionNotSupported` |
+| Window functions other than `ROW_NUMBER() OVER ([PARTITION BY ...] ORDER BY ...)` | `WindowFunctionNotSupported { form }` |
 | `CREATE PROCEDURE` / `CREATE FUNCTION` | `StoredProcNotSupported` |
 | Full-text search (`WHERE col MATCH pattern`) | `FullTextSearchNotSupported` |
-| `GROUP BY` / `HAVING` | Not supported |
+| `GROUP BY` other than `COUNT(*)` grouped by a declared `MAINTAIN COUNT` list, and `HAVING` | `ParseError("GROUP BY is not supported")` |
+| `COUNT(*)` grouped by columns the table maintains no count over | `PlanError` naming the `ALTER TABLE ... SET MAINTAIN COUNT` that would serve it |
 | `UNION` / `INTERSECT` / `EXCEPT` | Not supported |
 | `INSERT ... SELECT` | Not supported |
 | Subqueries outside `IN` | `SubqueryNotSupported` |
@@ -1637,7 +1720,7 @@ CREATE INDEX idx_items ON items (context_id, item_type, created_at DESC, id DESC
 Indexable column types: `INTEGER`, `TEXT`, `UUID`, `TIMESTAMP`, `TXID`,
 `BOOLEAN`, `REAL`. `JSON` and `VECTOR` columns are rejected at DDL time
 with `ColumnNotIndexable`; extract JSON fields into typed columns or use
-HNSW for vectors.
+vector search for vectors.
 
 Index names are scoped to the table. A duplicate name on the same table
 returns `DuplicateIndex`; the same name on two different tables is allowed.
@@ -1890,3 +1973,15 @@ Declarations and bindings report `TenantPolicyNotDeclared`, `TenantPolicyMismatc
 Manifest registration reports `ManifestRequired`, `ManifestIncomplete`, or
 `ManifestMemberOutsideTransaction`. Discard eligibility and mode failures are `DiscardNotEligible`,
 `DiscardNotOnHub`, and `EdgeDiscardDenied`; they name tables, modes, and counts, never row content.
+
+### Expression nesting limit
+
+SQL expressions permit nesting of at most 128 levels in the source text, and expression trees at most 128 deep.
+These limits are independent. Parentheses, unary `NOT` and unary minus count
+toward source nesting; SQL strings, quoted identifiers and comments do not.
+Boolean `AND` and `OR` chains form balanced trees, preserving operand order and
+short-circuit evaluation; their balanced tree depth counts toward the expression-tree limit.
+Arithmetic retains its left-to-right grouping to preserve floating-point and overflow
+semantics. An arithmetic chain whose left-fold depth exceeds 128 is refused, never
+reassociated. Excessive nesting returns the typed `ExpressionDepthExceeded` error
+with the observed depth and limit before recursive parsing or AST use can overflow.

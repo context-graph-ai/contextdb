@@ -72,9 +72,13 @@ fn public_relational_reads_fault_only_the_selected_rows_and_survive_writer_recyc
     seed(&path);
 
     let routes = Arc::new(fixture::Routes::default());
+    let expected_open_hash_bytes = fixture::expected_open_history_hash_bytes(&path);
     let open_scope = ReadWorkObservationScope::enter(ReadWorkPhase::Open);
     let reader = fixture::open_file(&path, fixture::options(), routes.clone());
-    fixture::assert_open_proves_history_and_startup_digest(open_scope.counters(), 6, 5_750);
+    fixture::assert_open_proves_history_and_startup_digest(
+        open_scope.counters(),
+        expected_open_hash_bytes,
+    );
     drop(open_scope);
     let snapshot = reader.file_snapshot_for_test().unwrap();
 
@@ -85,8 +89,8 @@ fn public_relational_reads_fault_only_the_selected_rows_and_survive_writer_recyc
             &params([("id", Value::Int64(17))]),
         )
         .unwrap();
-    assert_eq!(point.rows, vec![vec![Value::Text(payload(17))]]);
-    assert!(point.trace.index_used.is_some());
+    assert_eq!(point.rows(), vec![vec![Value::Text(payload(17))]]);
+    assert!(point.trace().index_used.is_some());
     let point_work = point_scope.counters();
     assert!(point_work.decoded_rows > 0 && point_work.decoded_rows <= 2);
     drop(point_scope);
@@ -102,16 +106,16 @@ fn public_relational_reads_fault_only_the_selected_rows_and_survive_writer_recyc
         )
         .unwrap();
     assert_eq!(
-        range.rows,
+        range.rows(),
         (100..116)
             .map(|sequence| vec![Value::Int64(sequence * BUCKETS as i64 + 3)])
             .collect::<Vec<_>>()
     );
     assert_eq!(
-        range.trace.index_used.as_deref(),
+        range.trace().index_used.as_deref(),
         Some("relational_bucket_sequence")
     );
-    assert!(range.trace.sort_elided);
+    assert!(range.trace().sort_elided);
     let reverse = reader
         .execute(
             "SELECT id FROM relational_work WHERE bucket = $bucket AND sequence >= $low AND sequence < $high ORDER BY sequence DESC LIMIT 16",
@@ -123,13 +127,13 @@ fn public_relational_reads_fault_only_the_selected_rows_and_survive_writer_recyc
         )
         .unwrap();
     assert_eq!(
-        reverse.rows,
+        reverse.rows(),
         (100..116)
             .rev()
             .map(|sequence| vec![Value::Int64(sequence * BUCKETS as i64 + 3)])
             .collect::<Vec<_>>()
     );
-    assert!(reverse.trace.sort_elided);
+    assert!(reverse.trace().sort_elided);
 
     let physical = reader
         .execute(
@@ -137,9 +141,47 @@ fn public_relational_reads_fault_only_the_selected_rows_and_survive_writer_recyc
             &params([("payload", Value::Text(payload(0)))]),
         )
         .unwrap();
-    assert_eq!(physical.rows, vec![vec![Value::Int64(0)]]);
-    assert!(physical.trace.index_used.is_none());
+    assert_eq!(physical.rows(), vec![vec![Value::Int64(0)]]);
+    assert!(physical.trace().index_used.is_none());
 
+    let backend_bytes = Arc::new(AtomicU64::new(0));
+    let observed = backend_bytes.clone();
+    let observation = redb::observe_backend_reads(Arc::new(move |bytes| {
+        observed.fetch_add(bytes as u64, Ordering::SeqCst);
+    }));
+    let pinned_point = reader
+        .open_cursor(
+            "SELECT payload FROM relational_work WHERE id = $id",
+            &params([("id", Value::Int64(5_000))]),
+        )
+        .unwrap();
+    drop(observation);
+    let pinned_membership = reader
+        .open_cursor(
+            "SELECT id FROM relational_work WHERE bucket = 0 AND sequence = 625",
+            &HashMap::new(),
+        )
+        .unwrap();
+    let pinned_buckets =
+        (0..BUCKETS)
+            .map(|bucket| {
+                reader.open_cursor(
+        "SELECT payload FROM relational_work WHERE bucket = $bucket ORDER BY sequence",
+        &params([("bucket", Value::Int64(bucket as i64))]),
+    ).unwrap()
+            })
+            .collect::<Vec<_>>();
+    assert!(
+        pinned_buckets
+            .iter()
+            .all(|cursor| cursor.first_page().has_more())
+    );
+    let pinned_reload = reader
+        .open_cursor(
+            "SELECT payload FROM relational_work WHERE bucket = 0 ORDER BY sequence",
+            &HashMap::new(),
+        )
+        .unwrap();
     let writer = Database::open(&path).unwrap();
     writer
         .execute(
@@ -151,41 +193,20 @@ fn public_relational_reads_fault_only_the_selected_rows_and_survive_writer_recyc
     assert!(compacted.ran && compacted.handle_recycled);
     writer.close().unwrap();
 
-    let backend_bytes = Arc::new(AtomicU64::new(0));
-    let observed = backend_bytes.clone();
-    let observation = redb::observe_backend_reads(Arc::new(move |bytes| {
-        observed.fetch_add(bytes as u64, Ordering::SeqCst);
-    }));
-    let old = reader
-        .execute(
-            "SELECT payload FROM relational_work WHERE id = $id",
-            &params([("id", Value::Int64(5_000))]),
-        )
-        .unwrap();
-    drop(observation);
-    assert_eq!(old.rows, vec![vec![Value::Text(payload(5_000))]]);
+    let old = pinned_point.first_page();
+    assert_eq!(old.rows(), vec![vec![Value::Text(payload(5_000))]]);
+    pinned_point.close().unwrap();
     assert!(backend_bytes.load(Ordering::SeqCst) > 0);
     assert_eq!(reader.file_snapshot_for_test(), Some(snapshot));
     assert_eq!(
-        reader
-            .execute(
-                "SELECT id FROM relational_work WHERE bucket = 0 AND sequence = 625",
-                &HashMap::new(),
-            )
-            .unwrap()
-            .rows,
+        fixture::drain_cursor_rows(pinned_membership),
         vec![vec![Value::Int64(5_000)]]
     );
 
-    for bucket in 0..BUCKETS {
-        let rows = reader
-            .execute(
-                "SELECT payload FROM relational_work WHERE bucket = $bucket ORDER BY sequence",
-                &params([("bucket", Value::Int64(bucket as i64))]),
-            )
-            .unwrap();
-        assert_eq!(rows.rows.len(), ROWS / BUCKETS);
-        assert_eq!(rows.rows[0], vec![Value::Text(payload(bucket))]);
+    for (bucket, cursor) in pinned_buckets.into_iter().enumerate() {
+        let rows = fixture::drain_cursor_rows(cursor);
+        assert_eq!(rows.len(), ROWS / BUCKETS);
+        assert_eq!(rows[0], vec![Value::Text(payload(bucket))]);
         assert_eq!(reader.file_snapshot_for_test(), Some(snapshot));
     }
     let reloaded_bytes = Arc::new(AtomicU64::new(0));
@@ -193,17 +214,23 @@ fn public_relational_reads_fault_only_the_selected_rows_and_survive_writer_recyc
     let observation = redb::observe_backend_reads(Arc::new(move |bytes| {
         observed.fetch_add(bytes as u64, Ordering::SeqCst);
     }));
-    let reloaded = reader
-        .execute(
-            "SELECT payload FROM relational_work WHERE bucket = 0 ORDER BY sequence",
-            &HashMap::new(),
-        )
-        .unwrap();
+    let reloaded = fixture::drain_cursor_rows(pinned_reload);
     drop(observation);
-    assert_eq!(reloaded.rows.len(), ROWS / BUCKETS);
+    assert_eq!(reloaded.len(), ROWS / BUCKETS);
     assert!(reloaded_bytes.load(Ordering::SeqCst) > 0);
     assert_eq!(reader.file_snapshot_for_test(), Some(snapshot));
     routes.file_only();
+    assert_eq!(
+        reader
+            .execute(
+                "SELECT payload FROM relational_work WHERE id = $id",
+                &params([("id", Value::Int64(5_000))])
+            )
+            .unwrap()
+            .rows(),
+        vec![vec![Value::Text("new-snapshot-value".into())]]
+    );
+    assert_ne!(reader.file_snapshot_for_test(), Some(snapshot));
     drop(reader);
 
     let newer = fixture::open_file(
@@ -219,7 +246,7 @@ fn public_relational_reads_fault_only_the_selected_rows_and_survive_writer_recyc
                 &HashMap::new(),
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![
             Value::Int64(5_000),
             Value::Text("new-snapshot-value".to_owned())
@@ -232,7 +259,7 @@ fn public_relational_reads_fault_only_the_selected_rows_and_survive_writer_recyc
                 &HashMap::new(),
             )
             .unwrap()
-            .rows
+            .rows()
             .is_empty()
     );
 }
@@ -263,7 +290,7 @@ fn authenticated_index_count_stays_snapshot_exact_without_loading_matching_row_b
 
     let (before, before_work) = count(&old, 3);
     assert_eq!(
-        before.rows,
+        before.rows(),
         vec![vec![Value::Int64((ROWS / BUCKETS) as i64)]]
     );
     assert_eq!(
@@ -275,6 +302,18 @@ fn authenticated_index_count_stays_snapshot_exact_without_loading_matching_row_b
         "the authenticated count record replaces per-row hashing: {before_work:?}"
     );
 
+    let pinned_scope = ReadWorkObservationScope::enter(ReadWorkPhase::Query);
+    let pinned = old
+        .open_cursor(
+            "SELECT COUNT(*) AS n FROM relational_work WHERE bucket = $bucket",
+            &params([("bucket", Value::Int64(3))]),
+        )
+        .expect("open the count cursor before publication");
+    assert_eq!(pinned.first_page().rows(), before.rows());
+    let pinned_work = pinned_scope.counters();
+    drop(pinned_scope);
+    assert_eq!(pinned_work.decoded_rows, 0);
+    assert_eq!(pinned_work.hashed_rows, 0);
     let writer = Database::open(&path).unwrap();
     writer
         .execute(
@@ -301,7 +340,18 @@ fn authenticated_index_count_stays_snapshot_exact_without_loading_matching_row_b
     writer.close().unwrap();
 
     let (old_after_commit, old_after_work) = count(&old, 3);
-    assert_eq!(old_after_commit.rows, before.rows);
+    assert_eq!(
+        pinned.first_page().rows(),
+        before.rows(),
+        "the pre-publication cursor keeps its original count result"
+    );
+    assert_eq!(
+        old_after_commit.rows(),
+        vec![vec![Value::Int64((ROWS / BUCKETS + 1) as i64)]],
+        "a later statement follows the new committed writer state"
+    );
+    assert_eq!(old_after_work.hashed_rows, 0);
+    pinned.close().unwrap();
     assert_eq!(old_after_work.decoded_rows, 0);
     drop(old);
 
@@ -312,17 +362,17 @@ fn authenticated_index_count_stays_snapshot_exact_without_loading_matching_row_b
     );
     let (matching, matching_work) = count(&fresh, 3);
     assert_eq!(
-        matching.rows,
+        matching.rows(),
         vec![vec![Value::Int64((ROWS / BUCKETS + 1) as i64)]]
     );
     assert_eq!(matching_work.decoded_rows, 0);
     assert_eq!(matching_work.hashed_rows, 0);
     let (unrelated, unrelated_work) = count(&fresh, 0);
-    assert_eq!(unrelated.rows, before.rows);
+    assert_eq!(unrelated.rows(), before.rows());
     assert_eq!(unrelated_work.decoded_rows, 0);
     assert_eq!(unrelated_work.hashed_rows, 0);
     let (absent, absent_work) = count(&fresh, i64::MAX);
-    assert_eq!(absent.rows, vec![vec![Value::Int64(0)]]);
+    assert_eq!(absent.rows(), vec![vec![Value::Int64(0)]]);
     assert_eq!(
         absent_work.decoded_rows, 0,
         "authenticated count absence is an exact zero without row fallback: {absent_work:?}"
@@ -441,7 +491,7 @@ fn shared_index_prefixes_have_one_exact_count_per_row_and_prefix() {
                 &HashMap::new(),
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(2)]]
     );
     assert_eq!(
@@ -451,7 +501,7 @@ fn shared_index_prefixes_have_one_exact_count_per_row_and_prefix() {
                 &HashMap::new(),
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1)]]
     );
     drop(reader);
@@ -481,7 +531,7 @@ fn shared_index_prefixes_have_one_exact_count_per_row_and_prefix() {
                 &HashMap::new(),
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(3)]]
     );
     // The bounded case, asserted rather than assumed: storing no count for a
@@ -494,7 +544,7 @@ fn shared_index_prefixes_have_one_exact_count_per_row_and_prefix() {
                 &HashMap::new(),
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1)]],
         "a primary key that holds a row counts one although no count is stored for it"
     );
@@ -505,7 +555,7 @@ fn shared_index_prefixes_have_one_exact_count_per_row_and_prefix() {
                 &HashMap::new(),
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(0)]],
         "and a primary key that holds none counts zero"
     );
@@ -556,7 +606,7 @@ fn authenticated_exact_counts_encode_the_planners_variant_exact_probe_values() {
             .unwrap();
         let work = scope.counters();
         drop(scope);
-        assert_eq!(result.rows, vec![vec![Value::Int64(1)]], "{column} count");
+        assert_eq!(result.rows(), vec![vec![Value::Int64(1)]], "{column} count");
         assert_eq!(
             work.decoded_rows, 0,
             "the variant-exact {column} probe reaches the matching authenticated count key: {work:?}"
@@ -573,7 +623,7 @@ fn authenticated_exact_counts_encode_the_planners_variant_exact_probe_values() {
             &params([("probe", Value::Int64(999))]),
         )
         .unwrap();
-    assert_eq!(absent.rows, vec![vec![Value::Int64(0)]]);
+    assert_eq!(absent.rows(), vec![vec![Value::Int64(0)]]);
 }
 
 const NEAR_LIMIT_INDEX_TEXT_BYTES: usize = 60 * 1024;
@@ -629,10 +679,12 @@ fn a_seventy_kibibyte_indexed_text_value_commits_reads_and_authenticates() {
         fixture::options(),
         Arc::new(fixture::Routes::default()),
     );
-    let ordered = reader
-        .execute("SELECT id FROM wide_rows ORDER BY label", &HashMap::new())
-        .unwrap()
-        .rows;
+    let ordered = {
+        let fixture_answer_23 = reader
+            .execute("SELECT id FROM wide_rows ORDER BY label", &HashMap::new())
+            .unwrap();
+        fixture_answer_23.rows().to_vec()
+    };
     assert_eq!(
         ordered,
         vec![
@@ -642,13 +694,15 @@ fn a_seventy_kibibyte_indexed_text_value_commits_reads_and_authenticates() {
         ],
         "the authenticated index answers in declared order across every key size"
     );
-    let selected = reader
-        .execute(
-            "SELECT id FROM wide_rows WHERE label = $label",
-            &params([("label", Value::Text(wide_label('c', WIDE_INDEX_TEXT_BYTES)))]),
-        )
-        .unwrap()
-        .rows;
+    let selected = {
+        let fixture_answer_24 = reader
+            .execute(
+                "SELECT id FROM wide_rows WHERE label = $label",
+                &params([("label", Value::Text(wide_label('c', WIDE_INDEX_TEXT_BYTES)))]),
+            )
+            .unwrap();
+        fixture_answer_24.rows().to_vec()
+    };
     assert_eq!(selected, vec![vec![Value::Int64(2)]]);
     drop(reader);
 
@@ -658,25 +712,65 @@ fn a_seventy_kibibyte_indexed_text_value_commits_reads_and_authenticates() {
         let definition: TableDefinition<&[u8], &[u8]> =
             TableDefinition::new("__content_identity_nodes");
         let mut nodes = write.open_table(definition).unwrap();
-        // The authenticated wide-key blob: a zero marker, then the key itself.
-        let (key, mut value) = nodes
-            .iter()
-            .unwrap()
-            .map(|entry| {
-                let (key, value) = entry.unwrap();
-                (key.value().to_vec(), value.value().to_vec())
-            })
-            .filter(|(_, value)| value.first() == Some(&0))
-            .max_by_key(|(_, value)| value.len())
-            .expect("the widest index key is stored by authenticated reference");
-        assert!(
-            value.len() > NEAR_LIMIT_INDEX_TEXT_BYTES,
-            "the stored blob is the 70 KiB key: {}",
-            value.len()
+        let mut payloads = write
+            .open_table(TableDefinition::<u64, &[u8]>::new(
+                "__content_identity_payloads",
+            ))
+            .unwrap();
+        // The independent logical identity names this table/index and its exact
+        // 70 KiB value; the directory supplies only the current physical slot.
+        let mut prefix = vec![0, 1]; // wide-key body, ordered posting key
+        for name in ["wide_rows", "wide_rows_label"] {
+            prefix.extend_from_slice(&(name.len() as u32).to_be_bytes());
+            prefix.extend_from_slice(name.as_bytes());
+        }
+        prefix.push(1); // actual posting
+        let wanted = vec![(false, Value::Text(wide_label('c', WIDE_INDEX_TEXT_BYTES)))];
+        let mut matching = Vec::new();
+        for entry in nodes.iter().unwrap() {
+            let (key, locator) = entry.unwrap();
+            if key.value().first() != Some(&5) {
+                continue;
+            }
+            let locator = locator.value();
+            assert_eq!(locator.len(), 48);
+            assert_eq!(&locator[40..], b"proof-v2");
+            let block = u64::from_be_bytes(locator[..8].try_into().unwrap());
+            let offset = u32::from_be_bytes(locator[32..36].try_into().unwrap()) as usize;
+            let len = u32::from_be_bytes(locator[36..40].try_into().unwrap()) as usize;
+            let payload = payloads.get(block).unwrap().unwrap();
+            let body = &payload.value()[offset..offset + len];
+            if !body.starts_with(&prefix) {
+                continue;
+            }
+            let Some(position) = mirrored_position(&body[prefix.len()..]) else {
+                continue;
+            };
+            if position.key == wanted && position.created_tx == contextdb_core::TxId(0) {
+                assert!(
+                    len > NEAR_LIMIT_INDEX_TEXT_BYTES,
+                    "the selected physical body holds the 70 KiB key: {len}"
+                );
+                matching.push((key.value().to_vec(), locator.to_vec(), block, offset, len));
+            }
+        }
+        assert_eq!(
+            matching.len(),
+            1,
+            "the independently named wide posting has one physical body"
         );
-        let last = value.last_mut().unwrap();
-        *last ^= 0x01;
-        nodes.insert(key.as_slice(), value.as_slice()).unwrap();
+        let (key, mut locator, block, offset, len) = matching.pop().unwrap();
+        let mut payload = payloads.get_mut(block).unwrap().unwrap();
+        assert_eq!(
+            u32::from_be_bytes(payload.as_mut()[1..5].try_into().unwrap()),
+            1,
+            "the oversized key has its own physical payload block"
+        );
+        payload.as_mut()[offset + len - 1] ^= 0x01;
+        let handle = payload.singleton_u64_handle(block).unwrap();
+        drop(payload);
+        locator[8..32].copy_from_slice(&handle);
+        nodes.insert(key.as_slice(), locator.as_slice()).unwrap();
     }
     write.commit().unwrap();
     drop(raw);
@@ -947,7 +1041,7 @@ fn a_damaged_physical_index_key_is_typed_corruption_on_point_and_both_range_dire
                 &HashMap::new()
             )
             .unwrap()
-            .rows,
+            .rows(),
         (0..8)
             .map(|row| vec![Value::Int64(row)])
             .collect::<Vec<_>>()
@@ -959,7 +1053,7 @@ fn a_damaged_physical_index_key_is_typed_corruption_on_point_and_both_range_dire
                 &HashMap::new()
             )
             .unwrap()
-            .rows,
+            .rows(),
         (0..8)
             .rev()
             .map(|row| vec![Value::Int64(row)])
@@ -1157,7 +1251,7 @@ fn trailing_truncated_and_noncanonical_posting_keys_are_typed_corruption_everywh
             let error = match answer {
                 Ok(result) => panic!(
                     "{what} on the {route} answered {:?} instead of reporting stored corruption",
-                    result.rows
+                    result.rows()
                 ),
                 Err(error) => error,
             };
@@ -1284,7 +1378,7 @@ const EXACT_IN_LIST: &str = "SELECT id FROM exact_candidates \
 
 fn exact_ids(result: &contextdb_engine::QueryResult) -> Vec<i64> {
     let mut ids = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.as_slice() {
             [Value::Int64(id)] => *id,

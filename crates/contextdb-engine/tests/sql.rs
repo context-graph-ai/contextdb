@@ -1,5 +1,7 @@
 #[path = "sql/a_local_create_table_never_replaces_an_existing_table.rs"]
 mod a_local_create_table_never_replaces_an_existing_table;
+#[path = "sql/a_write_bound_through_a_full_index_prefix_examines_only_its_rows.rs"]
+mod a_write_bound_through_a_full_index_prefix_examines_only_its_rows;
 #[path = "sql/composite_index_elides_a_descending_sort.rs"]
 mod composite_index_elides_a_descending_sort;
 #[path = "sql/composite_index_elides_a_still_needed_sort_over_whole_key.rs"]
@@ -20,5 +22,7 @@ mod ordered_and_bounded_finite_index_runs;
 mod schema_ddl_and_rows_in_one_transaction_are_still_refused;
 #[path = "sql/sql_tests.rs"]
 mod sql_tests;
+#[path = "sql/tied_indexes_binding_the_same_columns_read_no_range_to_compare.rs"]
+mod tied_indexes_binding_the_same_columns_read_no_range_to_compare;
 #[path = "sql/unique_index_one_row_claim_is_honest.rs"]
 mod unique_index_one_row_claim_is_honest;

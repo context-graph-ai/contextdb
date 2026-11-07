@@ -4,6 +4,7 @@ use contextdb_core::{TenantId, Value};
 use contextdb_engine::database::DeliveryManifest;
 use contextdb_engine::sync_client::ApplicationTablePolicyExpectation;
 use contextdb_engine::sync_types::NaturalKey;
+use contextdb_engine::vector_read_memory::{DeclaredReadMemory, admission};
 use contextdb_engine::{Database, DeliveryOutcomeKind};
 use contextdb_server::protocol::{
     MessageType, PushRequest, PushResponse, WireDeliveryManifest, decode, encode,
@@ -111,7 +112,8 @@ async fn start_hub_with_expectation(
             TenantId::from(tenant),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -131,7 +133,8 @@ fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, tenant: &str) -> (S
         broker.client_as(&node_id),
         TenantId::from(tenant),
         identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     (client, node_id)
 }
 
@@ -167,12 +170,20 @@ fn seed_committed_manifest(
                     .map(|member| (MEMBER_TABLE, root_key(*member)))
                     .collect(),
             },
+            client
+                .db()
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
         )
         .expect("prepare a committed unit before exercising push");
 }
 
 /// Write one root row and its member rows, and register the unit's membership,
 /// all inside one transaction — the only shape the contract admits.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn commit_unit(
     db: &Database,
     root_id: Uuid,
@@ -216,6 +227,10 @@ fn commit_unit(
 }
 
 // Commit only source rows; canonical metadata is arranged explicitly by the caller.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn stage_fixture_rows(
     db: &Database,
     root_id: Uuid,
@@ -275,7 +290,7 @@ async fn replay_push(
 fn row_count(db: &Database, table: &str) -> usize {
     db.execute(&format!("SELECT id FROM {table}"), &p())
         .unwrap_or_else(|err| panic!("{table} scan must succeed: {err}"))
-        .rows
+        .rows()
         .len()
 }
 
@@ -298,8 +313,14 @@ fn committed_row_digest(db: &Database, table: &str, id: Uuid) -> [u8; 32] {
             &HashMap::from([("id".into(), Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    let mut columns: Vec<_> = result.columns.iter().zip(&result.rows[0]).collect();
+    assert_eq!(result.rows().len(), 1);
+    // A column with no value has no place in a row's canonical form.
+    let mut columns: Vec<_> = result
+        .columns()
+        .iter()
+        .zip(&result.rows()[0])
+        .filter(|(_, value)| !matches!(value, Value::Null))
+        .collect();
     columns.sort_by_key(|(name, _)| *name);
     let mut bytes = Vec::new();
     canonical_string(&mut bytes, "row.v1");
@@ -314,6 +335,13 @@ fn committed_row_digest(db: &Database, table: &str, id: Uuid) -> [u8; 32] {
             Value::Uuid(value) => {
                 bytes.push(5);
                 bytes.extend(value.as_bytes());
+            }
+            Value::Vector(vector) => {
+                bytes.push(8);
+                bytes.extend((vector.len() as u64).to_be_bytes());
+                for component in vector {
+                    bytes.extend(component.to_bits().to_be_bytes());
+                }
             }
             other => panic!("unexpected fixture column type: {other:?}"),
         }
@@ -386,9 +414,16 @@ async fn a_manifest_commits_with_its_rows_carries_engine_digests_and_no_column_v
 
     let edge_db = Arc::new(Database::open_memory());
     let (edge, _edge_node_id) = edge_client(&edge_db, &broker, tenant);
-    within(edge.__seed_application_table_policy_binding_for_test(expectation()))
-        .await
-        .expect("the edge binds the hub's declaration before it writes a unit");
+    within(
+        edge.__seed_application_table_policy_binding_for_test(
+            expectation(),
+            edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .expect("the edge binds the hub's declaration before it writes a unit");
     declare_edge_tables(&edge_db);
 
     // A unit whose membership is two rows, committed with its rows.
@@ -452,10 +487,19 @@ async fn a_manifest_commits_with_its_rows_carries_engine_digests_and_no_column_v
     let manifests: Vec<WireDeliveryManifest> = [root_id, empty_root]
         .into_iter()
         .flat_map(|id| {
-            edge.__delivery_push_request_for_test(ROOT_TABLE, &root_key(id))
-                .unwrap()
-                .changeset
-                .manifests
+            let memory = edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader");
+            let mut vector_copies = admission(memory.clone());
+            edge.__delivery_push_request_for_test(
+                ROOT_TABLE,
+                &root_key(id),
+                &mut vector_copies,
+                memory,
+            )
+            .unwrap()
+            .changeset
+            .manifests
         })
         .collect();
     assert_eq!(
@@ -517,9 +561,16 @@ async fn a_manifest_commits_with_its_rows_carries_engine_digests_and_no_column_v
     // content produces byte-identical digests.
     let other_edge_db = Arc::new(Database::open_memory());
     let (other_edge, _other_node_id) = edge_client(&other_edge_db, &broker, tenant);
-    within(other_edge.__seed_application_table_policy_binding_for_test(expectation()))
-        .await
-        .expect("the second edge binds the same declaration");
+    within(
+        other_edge.__seed_application_table_policy_binding_for_test(
+            expectation(),
+            other_edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .expect("the second edge binds the same declaration");
     declare_edge_tables(&other_edge_db);
     commit_unit(
         &other_edge_db,
@@ -532,8 +583,17 @@ async fn a_manifest_commits_with_its_rows_carries_engine_digests_and_no_column_v
     let other_manifests: Vec<WireDeliveryManifest> = [root_id, empty_root]
         .into_iter()
         .flat_map(|id| {
+            let memory = other_edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader");
+            let mut vector_copies = admission(memory.clone());
             other_edge
-                .__delivery_push_request_for_test(ROOT_TABLE, &root_key(id))
+                .__delivery_push_request_for_test(
+                    ROOT_TABLE,
+                    &root_key(id),
+                    &mut vector_copies,
+                    memory,
+                )
                 .unwrap()
                 .changeset
                 .manifests
@@ -570,13 +630,29 @@ async fn a_manifest_commits_with_its_rows_carries_engine_digests_and_no_column_v
     // Hold every root column and key fixed: only explicit membership differs.
     let empty_db = Arc::new(Database::open_memory());
     let (empty_edge, _) = edge_client(&empty_db, &broker, tenant);
-    within(empty_edge.__seed_application_table_policy_binding_for_test(expectation()))
-        .await
-        .unwrap();
+    within(
+        empty_edge.__seed_application_table_policy_binding_for_test(
+            expectation(),
+            empty_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .unwrap();
     declare_edge_tables(&empty_db);
     commit_unit(&empty_db, root_id, "root-body", &[]).unwrap();
+    let memory = empty_db
+        .declared_reader_memory()
+        .expect("admit the fixture client reader");
+    let mut vector_copies = admission(memory.clone());
     let same_root_empty = empty_edge
-        .__delivery_push_request_for_test(ROOT_TABLE, &root_key(root_id))
+        .__delivery_push_request_for_test(
+            ROOT_TABLE,
+            &root_key(root_id),
+            &mut vector_copies,
+            memory,
+        )
         .unwrap();
     assert_eq!(
         same_root_empty.changeset.manifests[0].member_count_for_test(),
@@ -614,9 +690,16 @@ async fn registering_a_manifest_for_an_undeclared_root_an_unnamed_member_table_a
         .execute(UNDECLARED_ROOT_DDL, &p())
         .expect("edge undeclared root table");
     let (edge, _edge_node_id) = edge_client(&edge_db, &broker, tenant);
-    within(edge.__seed_application_table_policy_binding_for_test(expectation()))
-        .await
-        .expect("the edge binds before it writes");
+    within(
+        edge.__seed_application_table_policy_binding_for_test(
+            expectation(),
+            edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .expect("the edge binds before it writes");
     declare_edge_tables(&edge_db);
     edge_db
         .execute(UNNAMED_MEMBER_DDL, &p())
@@ -840,9 +923,16 @@ async fn a_manifested_unit_travels_on_the_ordinary_push_and_the_oversized_stagin
 
     let edge_db = Arc::new(Database::open_memory());
     let (edge, _edge_node_id) = edge_client(&edge_db, &broker, tenant);
-    within(edge.__seed_application_table_policy_binding_for_test(expectation()))
-        .await
-        .expect("the edge binds before it writes");
+    within(
+        edge.__seed_application_table_policy_binding_for_test(
+            expectation(),
+            edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .expect("the edge binds before it writes");
     declare_edge_tables(&edge_db);
     // A manifested unit and ordinary accepted/conflicting rows
     // actually share one source transaction and one authenticated push envelope.
@@ -928,7 +1018,7 @@ async fn a_manifested_unit_travels_on_the_ordinary_push_and_the_oversized_stagin
                 &HashMap::from([("id".into(), Value::Uuid(ordinary))])
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("edge sibling".into())]]
     );
     assert_eq!(
@@ -938,7 +1028,7 @@ async fn a_manifested_unit_travels_on_the_ordinary_push_and_the_oversized_stagin
                 &HashMap::from([("id".into(), Value::Uuid(collision))])
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("hub winner".into())]]
     );
     assert_eq!(row_count(&hub.db, "record_marks"), 1);
@@ -949,7 +1039,7 @@ async fn a_manifested_unit_travels_on_the_ordinary_push_and_the_oversized_stagin
                 &HashMap::from([("id".into(), Value::Uuid(ordinary_child))])
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("outside the signed membership".into())]]
     );
     assert!(edge.push_watermark() >= source_frontier);
@@ -989,11 +1079,11 @@ async fn a_manifested_unit_travels_on_the_ordinary_push_and_the_oversized_stagin
             hub.db
                 .execute(&format!("SELECT * FROM {table} ORDER BY id"), &p())
                 .unwrap()
-                .rows,
+                .rows(),
             edge_db
                 .execute(&format!("SELECT * FROM {table} ORDER BY id"), &p())
                 .unwrap()
-                .rows
+                .rows()
         );
     }
 
@@ -1062,7 +1152,7 @@ async fn a_manifested_unit_travels_on_the_ordinary_push_and_the_oversized_stagin
         hub.db
             .execute("SELECT body FROM ordinary_parents", &p())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("winner".into())]]
     );
     assert_eq!(
@@ -1072,7 +1162,7 @@ async fn a_manifested_unit_travels_on_the_ordinary_push_and_the_oversized_stagin
                 &HashMap::from([("id".into(), Value::Uuid(sibling))])
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("independent".into())]]
     );
     assert_eq!(
@@ -1124,16 +1214,20 @@ async fn oversized_manifested_unit() {
         .await
         .expect("bind the authenticated hub endpoint");
     let ticket = endpoint.ticket();
-    let iroh_hub_db = Arc::new(Database::open(root.path().join("hub.db")).expect("open hub store"));
+    let mut oversized_reader = contextdb_engine::DatabaseOpenOptions::default();
+    oversized_reader.owner_reads.limits.limits.memory = 2 * 1024 * 1024 * 1024;
+    let iroh_hub_db = Arc::new(
+        Database::open_with_options(root.path().join("hub.db"), oversized_reader.clone())
+            .expect("open hub store"),
+    );
     declare_hub_tables(&iroh_hub_db);
     iroh_hub_db
         .__seed_tenant_table_policies_for_test(TenantId::from(iroh_tenant), expectation())
         .expect("canonical hub declarations");
-    let server = Arc::new(SyncServer::new(
-        iroh_hub_db.clone(),
-        &endpoint,
-        TenantId::from(iroh_tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::new(iroh_hub_db.clone(), &endpoint, TenantId::from(iroh_tenant))
+            .expect("construct the authenticated sync endpoint"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -1144,16 +1238,26 @@ async fn oversized_manifested_unit() {
     let edge_identity_path = root.path().join("edge.db.fabric-identity.key");
     FabricIdentity::load_or_generate(&edge_identity_path).expect("persist the edge identity");
     let dial_spec = peer_dial_spec(&ticket, &edge_identity_path);
-    let iroh_edge_db =
-        Arc::new(Database::open(root.path().join("edge.db")).expect("open edge store"));
+    let iroh_edge_db = Arc::new(
+        Database::open_with_options(root.path().join("edge.db"), oversized_reader)
+            .expect("open edge store"),
+    );
     let iroh_edge = SyncClient::new(
         iroh_edge_db.clone(),
         &dial_spec,
         TenantId::from(iroh_tenant),
-    );
-    within(iroh_edge.__seed_application_table_policy_binding_for_test(expectation()))
-        .await
-        .expect("the edge binds over the authenticated transport");
+    )
+    .expect("construct the authenticated sync endpoint");
+    within(
+        iroh_edge.__seed_application_table_policy_binding_for_test(
+            expectation(),
+            iroh_edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .expect("the edge binds over the authenticated transport");
     declare_edge_tables(&iroh_edge_db);
     let big_root = Uuid::from_u128(0x3333_0000_0000_0000_0000_0000_0000_0011);
     let big_member = Uuid::from_u128(0x3333_0000_0000_0000_0000_0000_0000_0012);
@@ -1189,11 +1293,11 @@ async fn oversized_manifested_unit() {
             iroh_hub_db
                 .execute(&format!("SELECT * FROM {table} ORDER BY id"), &p())
                 .unwrap()
-                .rows,
+                .rows(),
             iroh_edge_db
                 .execute(&format!("SELECT * FROM {table} ORDER BY id"), &p())
                 .unwrap()
-                .rows,
+                .rows(),
             "oversized push preserves every actual row value"
         );
     }
@@ -1237,9 +1341,16 @@ async fn receiver_refusal(case: &str) {
     } else {
         expectation()
     };
-    within(edge.__seed_application_table_policy_binding_for_test(source_policy))
-        .await
-        .unwrap();
+    within(
+        edge.__seed_application_table_policy_binding_for_test(
+            source_policy,
+            edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .unwrap();
     // Bind the edge's actual root declaration to a policy that
     // differs from the hub's declaration before installing its manifested unit.
     // The existing signed binding fixture makes this an authenticated source
@@ -1288,8 +1399,12 @@ async fn receiver_refusal(case: &str) {
         .unwrap();
     seed_committed_manifest(&edge, tx, root, &members);
     edge_db.commit(tx).unwrap();
+    let memory = edge_db
+        .declared_reader_memory()
+        .expect("admit the fixture client reader");
+    let mut vector_copies = admission(memory.clone());
     let mut request = edge
-        .__delivery_push_request_for_test(ROOT_TABLE, &root_key(root))
+        .__delivery_push_request_for_test(ROOT_TABLE, &root_key(root), &mut vector_copies, memory)
         .unwrap();
     assert_eq!(
         request.changeset.rows.len(),
@@ -1321,7 +1436,13 @@ async fn receiver_refusal(case: &str) {
     }
     // Adapter: add the same-transaction ordinary row and its real
     // authenticated lineage to the deliberately incomplete unit request.
-    let all = edge.__ordinary_push_request_for_test().unwrap();
+    let all = edge
+        .__ordinary_push_request_for_test(
+            edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        )
+        .unwrap();
     request.changeset.rows.extend(
         all.changeset
             .rows
@@ -1387,4 +1508,334 @@ async fn the_hub_verifies_complete_membership_content_and_binding_before_applyin
     ] {
         receiver_refusal(cause).await;
     }
+}
+
+const VECTOR_MEMBER_DDL: &str = "CREATE TABLE record_parts \
+     (id UUID PRIMARY KEY, record_id UUID REFERENCES records(id), body TEXT, \
+     full_precision VECTOR(3) WITH (quantization = 'F32'), \
+     eight_bit VECTOR(3) WITH (quantization = 'SQ8'), \
+     four_bit VECTOR(3) WITH (quantization = 'SQ4')) \
+     SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST";
+
+fn declare_vector_tables(db: &Database) {
+    db.execute(ROOT_DDL, &p()).expect("declare root table");
+    db.execute(VECTOR_MEMBER_DDL, &p())
+        .expect("declare member table");
+}
+
+/// One unit whose members hold every vector representation three ways: in the
+/// row, written beside an empty slot in the same transaction, and not at all.
+fn commit_vector_unit(db: &Database, root: Uuid, inline: Uuid, beside: Uuid, none: Uuid) {
+    let tx = db.begin().expect("begin the unit");
+    db.insert_row(
+        tx,
+        ROOT_TABLE,
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(root)),
+            ("body".to_string(), Value::Text("root".to_string())),
+        ]),
+    )
+    .expect("insert the root");
+    let columns = ["full_precision", "eight_bit", "four_bit"];
+    let values = [
+        vec![0.125_f32, -0.75, 0.3],
+        vec![-0.61_f32, 0.2, 0.47],
+        vec![0.33_f32, 0.9, -0.1],
+    ];
+    let member = |id: Uuid| {
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(id)),
+            ("record_id".to_string(), Value::Uuid(root)),
+            ("body".to_string(), Value::Text("part".to_string())),
+        ])
+    };
+    let mut carrying = member(inline);
+    for (column, value) in columns.iter().zip(&values) {
+        carrying.insert((*column).to_string(), Value::Vector(value.clone()));
+    }
+    db.insert_row(tx, MEMBER_TABLE, carrying)
+        .expect("insert the member carrying its vectors");
+    let beside_row = db
+        .insert_row(tx, MEMBER_TABLE, member(beside))
+        .expect("insert the member with empty slots");
+    for (column, value) in columns.iter().zip(&values) {
+        db.insert_vector(
+            tx,
+            contextdb_core::VectorIndexRef::new(MEMBER_TABLE, *column),
+            beside_row,
+            value.clone(),
+        )
+        .expect("write the vector beside the empty slot");
+    }
+    db.insert_row(tx, MEMBER_TABLE, member(none))
+        .expect("insert the member with no vector");
+    db.register_delivery_manifest(
+        tx,
+        DeliveryManifest {
+            root_table: ROOT_TABLE,
+            root_key: root_key(root),
+            members: [inline, beside, none]
+                .into_iter()
+                .map(|id| (MEMBER_TABLE, root_key(id)))
+                .collect(),
+        },
+    )
+    .expect("register the unit");
+    db.commit(tx).expect("commit the unit");
+}
+
+/// The digest the engine sealed while the row was staged is the digest of that
+/// same row once committed, on the machine that received it, in the projection
+/// a pull sends, and in an exported store after reopening.
+#[tokio::test]
+async fn a_member_digests_the_same_vector_values_on_every_route_for_every_representation() {
+    let tenant = "manifest-vector-digest-parity";
+    let directory = tempfile::tempdir().expect("scratch directory");
+    let broker = InProcessBroker::new();
+    let hub_db = Arc::new(Database::open_memory());
+    declare_vector_tables(&hub_db);
+    let hub = start_hub(&broker, tenant, hub_db.clone()).await;
+
+    let edge_db = Arc::new(Database::open(directory.path().join("edge.db")).expect("open edge"));
+    let (edge, _edge_node_id) = edge_client(&edge_db, &broker, tenant);
+    within(
+        edge.__seed_application_table_policy_binding_for_test(
+            expectation(),
+            edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .expect("the edge binds the declaration");
+    declare_vector_tables(&edge_db);
+
+    let (root, inline, beside, none) = (
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    commit_vector_unit(&edge_db, root, inline, beside, none);
+    let members = [inline, beside, none];
+
+    // Staged against committed: the request only forms if the committed rows
+    // still hash to the digests sealed at staging, and the oracle agrees.
+    let memory = edge_db
+        .declared_reader_memory()
+        .expect("admit the fixture client reader");
+    let mut vector_copies = admission(memory.clone());
+    let request = edge
+        .__delivery_push_request_for_test(ROOT_TABLE, &root_key(root), &mut vector_copies, memory)
+        .expect("committed rows match the digests sealed while they were staged");
+    let manifest = request
+        .changeset
+        .manifests
+        .first()
+        .expect("the unit's manifest")
+        .clone();
+    assert_manifest_row_digests(&edge_db, &manifest, root, &members);
+    let unit_digest = manifest.unit_digest_for_test();
+
+    // Peer: the hub verified the unit and holds the same values.
+    within(edge.push()).await.expect("the hub accepts the unit");
+    assert_manifest_row_digests(&hub_db, &manifest, root, &members);
+
+    // Pull: the projection a peer is sent carries the same values. These tables
+    // are push-only, so this reads the projection itself, not a live pull.
+    let projected = hub_db
+        .changes_since(contextdb_core::Lsn(0))
+        .expect("read the hub's change projection");
+    for id in members {
+        let row = projected
+            .rows
+            .iter()
+            .rev()
+            .find(|row| {
+                row.table == MEMBER_TABLE
+                    && row.natural_key.value == Value::Uuid(id)
+                    && !row.deleted
+            })
+            .expect("the member is in the projection");
+        let stored = hub_db
+            .execute(
+                "SELECT full_precision, eight_bit, four_bit FROM record_parts WHERE id = $id",
+                &HashMap::from([("id".to_string(), Value::Uuid(id))]),
+            )
+            .expect("read the member back");
+        for (column, value) in ["full_precision", "eight_bit", "four_bit"]
+            .iter()
+            .zip(&stored.rows()[0])
+        {
+            match value {
+                Value::Vector(vector) => assert_eq!(
+                    row.values.get(*column),
+                    Some(&Value::Vector(vector.clone())),
+                    "{column}: the projection carries the stored value"
+                ),
+                _ => assert!(
+                    !matches!(row.values.get(*column), Some(Value::Vector(_))),
+                    "{column}: the projection invents no vector"
+                ),
+            }
+        }
+    }
+
+    // Export: the artifact's committed rows still satisfy the sealed digests.
+    let exported = directory.path().join("exported.db");
+    edge_db
+        .export_snapshot(&exported)
+        .expect("export the store");
+    let exported_db = Arc::new(Database::open(&exported).expect("open the export"));
+    assert_manifest_row_digests(&exported_db, &manifest, root, &members);
+    let (exported_client, _node) = edge_client(&exported_db, &broker, tenant);
+    let exported_memory = exported_db
+        .declared_reader_memory()
+        .expect("admit the fixture client reader");
+    let mut exported_vector_copies = admission(exported_memory.clone());
+    let reread = exported_client
+        .__delivery_push_request_for_test(
+            ROOT_TABLE,
+            &root_key(root),
+            &mut exported_vector_copies,
+            exported_memory,
+        )
+        .expect("the export's committed rows match the sealed digests");
+    assert_eq!(
+        reread
+            .changeset
+            .manifests
+            .first()
+            .expect("the export's manifest")
+            .unit_digest_for_test(),
+        unit_digest,
+        "the unit digest survives export and reopen"
+    );
+    hub.stop().await;
+}
+
+/// The most this reader can still take, found without keeping any of it.
+fn free_read_memory(memory: &contextdb_core::read_memory::ReadMemoryOwner, limit: usize) -> usize {
+    let (mut low, mut high) = (0, limit);
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        let fits = contextdb_core::read_memory::ReadCredit::try_new(
+            memory.clone(),
+            middle,
+            "test",
+            "free_probe",
+            "fixture",
+        )
+        .is_ok();
+        if fits {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    low
+}
+
+/// What the delivery test seams hand back keeps its separately stored vectors
+/// charged while the caller reads and encodes it, and the charge returns once
+/// the payload and then its owner are gone.
+#[tokio::test]
+async fn a_returned_delivery_payload_keeps_its_vectors_charged_until_it_is_gone() {
+    const LIMIT: usize = 32 * 1024 * 1024;
+    let tenant = "manifest-vector-payload-funding";
+    let broker = InProcessBroker::new();
+    let hub_db = Arc::new(Database::open_memory());
+    declare_vector_tables(&hub_db);
+    let hub = start_hub(&broker, tenant, hub_db).await;
+    let edge_db = Arc::new(Database::open_memory());
+    let (edge, _edge_node_id) = edge_client(&edge_db, &broker, tenant);
+    within(
+        edge.__seed_application_table_policy_binding_for_test(
+            expectation(),
+            edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .expect("the edge binds the declaration");
+    declare_vector_tables(&edge_db);
+    let (root, inline, beside, none) = (
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    commit_vector_unit(&edge_db, root, inline, beside, none);
+    let carries_a_vector = |values: &HashMap<String, Value>| {
+        values
+            .values()
+            .any(|value| matches!(value, Value::Vector(_)))
+    };
+
+    let budget = DeclaredReadMemory::from_reader_limit(LIMIT as u64).expect("declare the budget");
+    let memory: contextdb_core::read_memory::ReadMemoryOwner =
+        budget.child().expect("admit the fixture reader");
+    let before = free_read_memory(&memory, LIMIT);
+
+    let mut vector_copies = admission(memory.clone());
+    let request = edge
+        .__delivery_push_request_for_test(
+            ROOT_TABLE,
+            &root_key(root),
+            &mut vector_copies,
+            memory.clone(),
+        )
+        .expect("build the delivery request");
+    assert!(
+        request
+            .changeset
+            .rows
+            .iter()
+            .any(|row| carries_a_vector(&row.values)),
+        "the request carries the separately stored vector"
+    );
+    let encoded = rmp_serde::to_vec(&request).expect("encode the request");
+    assert!(!encoded.is_empty());
+    let held = free_read_memory(&memory, LIMIT);
+    assert!(
+        before - held >= 3 * 3 * std::mem::size_of::<f32>(),
+        "the vectors stay charged while the request is alive: {before} then {held}"
+    );
+    drop(request);
+    drop(vector_copies);
+    assert_eq!(
+        free_read_memory(&memory, LIMIT),
+        before,
+        "the request's vector charge returns"
+    );
+
+    let mut vector_copies = admission(memory.clone());
+    let rows = edge
+        .__manifest_rows_for_test(
+            ROOT_TABLE,
+            &root_key(root),
+            &mut vector_copies,
+            memory.clone(),
+        )
+        .expect("build the fixture rows");
+    assert!(
+        rows.iter().any(|row| carries_a_vector(&row.values)),
+        "the fixture rows carry the separately stored vector"
+    );
+    let encoded = rmp_serde::to_vec(&rows).expect("encode the rows");
+    assert!(!encoded.is_empty());
+    let held = free_read_memory(&memory, LIMIT);
+    assert!(
+        before - held >= 3 * 3 * std::mem::size_of::<f32>(),
+        "the vectors stay charged while the rows are alive: {before} then {held}"
+    );
+    drop(rows);
+    drop(vector_copies);
+    assert_eq!(
+        free_read_memory(&memory, LIMIT),
+        before,
+        "the fixture rows' vector charge returns"
+    );
+    hub.stop().await;
 }

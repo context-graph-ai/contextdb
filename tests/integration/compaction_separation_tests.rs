@@ -157,11 +157,18 @@ fn compact_now_is_a_no_op_on_an_in_memory_database() {
 fn the_automatic_compaction_path_is_interval_gated_not_per_cycle() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = open_caller_driven(&dir.path().join("interval_gated.db"));
+    // The start decision reads interior free pages, the space only moving
+    // pages can return. This churn leaves about 5% of the file as interior
+    // holes (in-page slack and the trailing free run are not counted), so the
+    // store declares a start ratio below that: the subject here is the
+    // interval gate, not the default ratio.
+    db.execute("SET STORAGE_COMPACTION START_RATIO 0.02", &HashMap::new())
+        .expect("declare the start ratio");
     churn_one_row(&db, 2_000);
 
     // First qualifying cycle: nothing has EVER auto-compacted on this
     // handle, so the interval is trivially satisfied; if fragmentation is at
-    // or above the shared threshold, this cycle compacts.
+    // or above the declared start ratio, this cycle compacts.
     let first = db
         .run_maintenance_cycle()
         .expect("first maintenance cycle must succeed");
@@ -243,10 +250,10 @@ fn compact_now_resets_the_automatic_paths_interval_clock() {
 
 fn col_idx(result: &contextdb_engine::QueryResult, name: &str) -> usize {
     result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == name)
-        .unwrap_or_else(|| panic!("column '{name}' not found in {:?}", result.columns))
+        .unwrap_or_else(|| panic!("column '{name}' not found in {:?}", result.columns()))
 }
 
 /// A compaction restores steady-state write cost, not just file size, by
@@ -288,7 +295,7 @@ fn compact_now_recycles_the_handle_and_reports_it_honestly() {
         .expect("a query right after compact_now must succeed through the recycled handle");
     let idx = col_idx(&result, "capability_id");
     let node_idx = col_idx(&result, "node_id");
-    let found = result.rows.iter().any(|row| {
+    let found = result.rows().iter().any(|row| {
         row[node_idx] == Value::Text("node-marker".to_string())
             && row[idx] == Value::Text("cap-marker".to_string())
     });
@@ -296,7 +303,7 @@ fn compact_now_recycles_the_handle_and_reports_it_honestly() {
         found,
         "the row written before compaction must still be readable through the same handle \
          right after the recycle: {:?}",
-        result.rows
+        result.rows()
     );
 }
 
@@ -342,13 +349,13 @@ fn a_failed_handle_recycle_leaves_the_file_intact_and_a_fresh_open_recovers() {
         .expect("a fresh open must read back every row, including what compaction reclaimed");
     let idx = col_idx(&result, "capability_id");
     let node_idx = col_idx(&result, "node_id");
-    let found = result.rows.iter().any(|row| {
+    let found = result.rows().iter().any(|row| {
         row[node_idx] == Value::Text("node-marker".to_string())
             && row[idx] == Value::Text("cap-marker".to_string())
     });
     assert!(
         found,
         "the marker row must survive a failed handle recycle followed by a fresh open: {:?}",
-        result.rows
+        result.rows()
     );
 }

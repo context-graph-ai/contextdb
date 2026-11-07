@@ -10,7 +10,7 @@ use contextdb_server::transport::{
 use contextdb_server::{FabricIdentity, SyncClient, SyncServer};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use uuid::Uuid;
 
 struct AlwaysIncompleteTransport {
@@ -88,7 +88,8 @@ async fn push_does_not_retry_incomplete_reply() {
         transport.clone(),
         contextdb_core::TenantId::from("push-incomplete-reply"),
         Arc::new(FabricIdentity::generate()),
-    );
+    )
+    .expect("construct SyncClient fixture");
     let result = client.push().await;
 
     assert!(
@@ -197,7 +198,8 @@ async fn valid_server_error_surfaces_directly_without_lost_ack_reconciliation() 
         transport.clone(),
         contextdb_core::TenantId::from("push-terminal-error"),
         Arc::new(FabricIdentity::generate()),
-    );
+    )
+    .expect("construct SyncClient fixture");
     let result = client.push().await;
 
     assert!(
@@ -359,7 +361,8 @@ async fn push_retry_unsafe_transport_falls_back_to_one_single_attempt() {
         transport.clone(),
         contextdb_core::TenantId::from("push-retry-unsafe"),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     client
         .push()
         .await
@@ -427,7 +430,8 @@ async fn pull_does_not_retry_no_responder() {
         transport.clone(),
         contextdb_core::TenantId::from("pull-no-responder"),
         Arc::new(FabricIdentity::generate()),
-    );
+    )
+    .expect("construct SyncClient fixture");
     let result = client.pull_default().await;
 
     assert!(
@@ -441,9 +445,9 @@ async fn pull_does_not_retry_no_responder() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn in_process_request_timeout_bounds_handler_and_reply_wait() {
-    let broker = contextdb_server::InProcessBroker::new();
+    let broker = contextdb_server::InProcessBroker::with_event_driven_shutdown_for_test();
     let client = broker.client_as("timeout-edge");
     let server = broker.server_as("timeout-hub");
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -464,25 +468,36 @@ async fn in_process_request_timeout_bounds_handler_and_reply_wait() {
             )
             .await
     });
-    // Deterministic readiness (was a fixed 20 ms settle sleep): serve()
-    // registers its routes synchronously at its top, so retry a cheap probe
-    // until the route exists — NoResponder means the spawned server task has
-    // not been polled yet. The deadline is a failure ceiling.
-    let ready_deadline = Instant::now() + Duration::from_secs(5);
-    while let Err(TransportError::NoResponder) = client
-        .request(
-            "sync.timeout-test.pull",
-            b"probe".to_vec(),
-            Duration::from_millis(5),
-        )
-        .await
-    {
-        assert!(
-            Instant::now() < ready_deadline,
-            "server task must register its handler"
-        );
-        tokio::task::yield_now().await;
+    struct RouteWatchdog {
+        cancel: std::sync::mpsc::Sender<()>,
+        thread: Option<std::thread::JoinHandle<()>>,
     }
+    impl Drop for RouteWatchdog {
+        fn drop(&mut self) {
+            let _ = self.cancel.send(());
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+    let (cancel, canceled) = std::sync::mpsc::channel();
+    let (expired, expiry) = tokio::sync::oneshot::channel();
+    let watchdog = RouteWatchdog {
+        cancel,
+        thread: Some(std::thread::spawn(move || {
+            if matches!(
+                canceled.recv_timeout(Duration::from_secs(60)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                let _ = expired.send(());
+            }
+        })),
+    };
+    tokio::select! {
+        _ = broker.wait_for_registered_route_for_test("sync.timeout-test.pull") => {}
+        _ = expiry => panic!("route registration never delivered"),
+    }
+    drop(watchdog);
 
     let result = tokio::time::timeout(
         Duration::from_secs(1),
@@ -502,7 +517,7 @@ async fn in_process_request_timeout_bounds_handler_and_reply_wait() {
     // (The old `elapsed < 500ms` upper bound was redundant with the 1 s outer
     // guard + the Timeout match, and flipped under load — removed.)
 
-    shutdown.store(true, Ordering::SeqCst);
+    broker.stop_serving_for_test(&shutdown);
     let _ = server_task.await;
 }
 
@@ -561,7 +576,8 @@ async fn server_run_until_returns_after_accepted_push_apply_finishes() {
         contextdb_core::TenantId::from("apply-drain"),
         node_id,
         identity,
-    );
+    )
+    .expect("construct SyncServer fixture");
 
     // The exact lost-wakeup requires a scheduler interleaving inside wait_idle,
     // so this bounded test guards the observable contract: after the transport

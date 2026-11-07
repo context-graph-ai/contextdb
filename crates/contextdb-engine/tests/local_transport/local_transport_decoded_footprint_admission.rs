@@ -7,11 +7,12 @@
 //! read-contract memory ceiling, and require the channel to refuse them with a
 //! typed transport error rather than allocate first and answer later.
 
+use super::wire_fixture_test_support::encode_message;
 use contextdb_core::Value;
-use contextdb_core::read_contract::{CursorPage, MetadataPage, ReadLimits};
+use contextdb_core::read_contract::{MetadataPage, ReadLimits};
 use contextdb_engine::local_transport::{
     CursorPageResponse, LocalRequest, LocalRequestEnvelope, LocalResponse, LocalTransportError,
-    MAX_FRAME_BYTES, decode_message_exact, encode_message,
+    MAX_FRAME_BYTES, decode_message_exact,
 };
 use std::collections::BTreeMap;
 use std::mem::size_of;
@@ -153,6 +154,7 @@ fn refusal_is_typed(error: &LocalTransportError) -> bool {
 }
 
 #[test]
+#[allow(clippy::useless_conversion)] // Preserve the existing test expression and its assertion contract.
 fn the_crafted_request_bytes_match_the_channel_encoder() {
     let text = json_zero_array_text(2);
     assert_eq!(text, b"[0,0]");
@@ -161,10 +163,13 @@ fn the_crafted_request_bytes_match_the_channel_encoder() {
     let mut params = BTreeMap::new();
     params.insert(
         "p".to_owned(),
-        Value::Json(serde_json::Value::Array(vec![
-            serde_json::Value::from(0u8),
-            serde_json::Value::from(0u8),
-        ])),
+        Value::Json(
+            serde_json::Value::Array(vec![
+                serde_json::Value::from(0u8),
+                serde_json::Value::from(0u8),
+            ])
+            .into(),
+        ),
     );
     let envelope = LocalRequestEnvelope {
         limits: ReadLimits::default(),
@@ -219,6 +224,7 @@ fn a_json_parameter_request_within_the_wire_ceiling_is_refused_before_its_tree_i
 }
 
 #[test]
+#[allow(clippy::useless_conversion)] // Preserve the existing test expression and its assertion contract.
 fn an_ordinary_json_parameter_request_is_still_admitted() {
     let text = json_zero_array_text(4);
     let frame = crafted_json_parameter_request_bytes(&text);
@@ -229,12 +235,15 @@ fn an_ordinary_json_parameter_request_is_still_admitted() {
     };
     assert_eq!(
         params.get("p"),
-        Some(&Value::Json(serde_json::Value::Array(vec![
-            serde_json::Value::from(0u8),
-            serde_json::Value::from(0u8),
-            serde_json::Value::from(0u8),
-            serde_json::Value::from(0u8),
-        ])))
+        Some(&Value::Json(
+            serde_json::Value::Array(vec![
+                serde_json::Value::from(0u8),
+                serde_json::Value::from(0u8),
+                serde_json::Value::from(0u8),
+                serde_json::Value::from(0u8),
+            ])
+            .into()
+        ))
     );
 }
 
@@ -258,7 +267,7 @@ fn a_cursor_page_whose_decoded_rows_exceed_the_memory_ceiling_is_refused() {
         ReadLimits::SHIPPED_MEMORY
     );
 
-    let outcome = decode_message_exact::<CursorPage>(&page_bytes);
+    let outcome = contextdb_engine::read_contract::decode_cursor_page(&page_bytes);
     let error = match outcome {
         Ok(_) => panic!(
             "a {page_length} byte cursor page was admitted; it decodes into at least \
@@ -268,58 +277,88 @@ fn a_cursor_page_whose_decoded_rows_exceed_the_memory_ceiling_is_refused() {
         Err(error) => error,
     };
     assert!(
-        refusal_is_typed(&error),
+        matches!(
+            error,
+            contextdb_engine::read_contract::ReadEncodingError::MemoryCeilingExceeded { .. }
+        ),
         "an oversized cursor page must be refused with a typed transport error, observed {error:?}"
     );
 }
 
 #[test]
 fn a_response_frame_carrying_that_cursor_page_is_refused_before_the_page_is_decoded() {
-    let page_bytes = crafted_cursor_page_bytes(CRAFTED_ROWS, CRAFTED_COLUMNS);
-    let payload_length = page_bytes.len();
-    let frame = encode_message(&LocalResponse::CursorPage {
-        page: CursorPageResponse {
-            payload: page_bytes,
-        },
-    })
-    .expect("the channel encodes a cursor-page response");
-    assert!(
-        frame.len() <= MAX_FRAME_BYTES,
-        "the crafted response must sit inside the wire ceiling to prove admission, observed {} bytes",
-        frame.len()
-    );
-
-    let decoded_footprint = u64::try_from(CRAFTED_ROWS * CRAFTED_COLUMNS * size_of::<Value>())
-        .expect("a decoded footprint fits an unsigned word");
-    let outcome = decode_message_exact::<LocalResponse>(&frame);
-    let error = match outcome {
-        Ok(_) => panic!(
-            "a {} byte response frame carrying a {payload_length} byte cursor page was admitted; \
-             the page decodes into at least {decoded_footprint} bytes of live values, past the \
-             {} byte memory ceiling",
-            frame.len(),
-            ReadLimits::SHIPPED_MEMORY
-        ),
-        Err(error) => error,
+    use contextdb_engine::local_transport::{
+        FrameBufferAllocator, FrameReader, FrameViolation, LocalInboundKind, LocalProtocolBoundary,
+        LocalResponseExpectation, PayloadViolation,
     };
+    use contextdb_engine::vector_read_memory::{
+        take_reader_budget_ledger_for_test, watch_reader_budget_ledger_for_test,
+    };
+    struct Reader(std::io::Cursor<Vec<u8>>);
+    impl FrameReader for Reader {
+        fn read_exact(&mut self, bytes: &mut [u8]) -> Result<(), LocalTransportError> {
+            std::io::Read::read_exact(&mut self.0, bytes)
+                .map_err(|_| LocalTransportError::Frame(FrameViolation::TruncatedPayload))
+        }
+    }
+    struct Allocator;
+    impl FrameBufferAllocator for Allocator {
+        fn allocate(&mut self, length: usize) -> Result<Vec<u8>, LocalTransportError> {
+            Ok(vec![0; length])
+        }
+    }
+    // Leave room for the real observation envelope inside the page-byte limit.
+    let columns = CRAFTED_COLUMNS - 64;
+    let page_bytes = crafted_cursor_page_bytes(CRAFTED_ROWS, columns);
+    let decoded_footprint = (CRAFTED_ROWS * columns * size_of::<Value>()) as u64;
+    assert!(decoded_footprint > ReadLimits::SHIPPED_MEMORY);
+    let payload = owner_cursor_test_support::with_empty_observation(page_bytes);
+    assert!(payload.len() as u64 <= ReadLimits::SHIPPED_CURSOR_PAGE_BYTES);
+    let response = encode_message(&LocalResponse::CursorPage {
+        page: CursorPageResponse { payload },
+    })
+    .expect("encode the valid oversized page response");
+    assert!(response.len() <= MAX_FRAME_BYTES);
+    let frame = super::wire_fixture_test_support::encode_payload_frame(&response)
+        .expect("frame the page response");
+    let boundary = LocalProtocolBoundary::with_effective_limits(ReadLimits::default());
+    let mut reader = Reader(std::io::Cursor::new(frame));
+    watch_reader_budget_ledger_for_test();
+    let outcome = boundary.receive_frame(
+        LocalInboundKind::Response(LocalResponseExpectation::CursorFetch),
+        &mut reader,
+        &mut Allocator,
+    );
+    let admissions = take_reader_budget_ledger_for_test();
     assert!(
-        refusal_is_typed(&error),
-        "a response frame carrying an oversized cursor page must be refused with a typed \
-         transport error, observed {error:?}"
+        matches!(
+            outcome,
+            Err(LocalTransportError::Payload(
+                PayloadViolation::MemoryCeilingExceeded {
+                    ceiling: ReadLimits::SHIPPED_MEMORY,
+                    required: None,
+                }
+            ))
+        ),
+        "oversized native rows must refuse at the production receive boundary: {outcome:?}"
+    );
+    super::wire_fixture_test_support::assert_native_refusal_within_ceiling(
+        &admissions,
+        ReadLimits::SHIPPED_MEMORY,
     );
 }
 
 #[test]
 fn an_ordinary_cursor_page_response_is_still_admitted() {
     let page_bytes = crafted_cursor_page_bytes(100, 8);
-    let page = decode_message_exact::<CursorPage>(&page_bytes)
+    let page = contextdb_engine::read_contract::decode_cursor_page(&page_bytes)
         .expect("an ordinary cursor page stays admissible");
-    assert_eq!(page.columns.len(), 8);
-    assert_eq!(page.rows.len(), 100);
+    assert_eq!(page.columns().len(), 8);
+    assert_eq!(page.rows().len(), 100);
 
     let frame = encode_message(&LocalResponse::CursorPage {
         page: CursorPageResponse {
-            payload: page_bytes,
+            payload: owner_cursor_test_support::with_empty_observation(page_bytes),
         },
     })
     .expect("the channel encodes a cursor-page response");
@@ -370,3 +409,5 @@ fn an_ordinary_metadata_page_is_still_admitted() {
         .expect("an ordinary metadata page stays admissible");
     assert_eq!(page.items.len(), 4);
 }
+
+use super::owner_cursor_test_support;

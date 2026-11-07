@@ -1,7 +1,7 @@
 //! The `ALTER TABLE` that `.explain` prints can be run as printed.
 //!
 //! `SET MAINTAIN COUNT` replaces a table's whole declared set — that is its
-//! contract, the same one `SET HNSW (...)` has. So advice that names only the
+//! contract, the same one `SET IVF DEFAULT` has. So advice that names only the
 //! missing column list is advice that silently drops every count the table
 //! already declares: a consumer that follows the engine's own suggestion to
 //! make one read O(1) makes its other reads O(rows). The printed statement
@@ -55,6 +55,10 @@ fn advised_statement(rendered: &str) -> String {
 }
 
 #[test]
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn the_declaration_explain_advises_keeps_the_declarations_already_made() {
     let root = tempfile::tempdir().expect("task-scoped fixture root");
     let path = root.path().join("advice.db");
@@ -109,7 +113,7 @@ fn the_declaration_explain_advises_keeps_the_declarations_already_made() {
     // The count over `b` is the one that is not declared, so it is the one the
     // engine advises about.
     let undeclared = db.execute(OVER_B, &over_b()).expect("count over b");
-    let advice = advised_statement(&render_explain_trace(&undeclared.trace));
+    let advice = advised_statement(&render_explain_trace(&undeclared.trace()));
     eprintln!("the engine advises: {advice}");
 
     // Run it exactly as printed — that is the whole point of printing it.
@@ -126,14 +130,16 @@ fn the_declaration_explain_advises_keeps_the_declarations_already_made() {
          was about: {schema}"
     );
 
-    for (sql, params, what) in [
-        (OVER_A, over_a(), "the count that was already declared"),
-        (OVER_B, over_b(), "the count the advice was about"),
+    for (sql, params, column, what) in [
+        (OVER_A, over_a(), "a", "the count that was already declared"),
+        (OVER_B, over_b(), "b", "the count the advice was about"),
     ] {
         let answered = db.execute(sql, &params).expect("count after the advice");
-        let rendered = render_explain_trace(&answered.trace);
+        let rendered = render_explain_trace(&answered.trace());
         assert!(
-            rendered.contains("maintained count: declared"),
+            matches!(answered.trace().maintained_count.as_deref(),
+                Some(contextdb_engine::maintained_counts::MaintainedCountDisclosure::Used { table, columns })
+                    if table == "placements" && columns == &vec![(column.to_owned(), contextdb_core::SortDirection::Asc)]),
             "{what} is reported as declared after the advice ran: {rendered}"
         );
         assert!(
@@ -142,11 +148,11 @@ fn the_declaration_explain_advises_keeps_the_declarations_already_made() {
         );
     }
     assert_eq!(
-        db.execute(OVER_A, &over_a()).unwrap().rows[0][0],
+        db.execute(OVER_A, &over_a()).unwrap().rows()[0][0],
         Value::Int64(6)
     );
     assert_eq!(
-        db.execute(OVER_B, &over_b()).unwrap().rows[0][0],
+        db.execute(OVER_B, &over_b()).unwrap().rows()[0][0],
         Value::Int64(4)
     );
 
@@ -155,13 +161,16 @@ fn the_declaration_explain_advises_keeps_the_declarations_already_made() {
     let owner_session = ReadSession::open_with_options(&path, ReadSessionOptions::default())
         .expect("open a reading session while the writer holds the store");
     assert_eq!(owner_session.route(), ReadRoute::Owner);
-    for (sql, params) in [(OVER_A, over_a()), (OVER_B, over_b())] {
+    for (sql, params, column) in [(OVER_A, over_a(), "a"), (OVER_B, over_b(), "b")] {
         let answered = owner_session
             .execute(sql, &params)
             .expect("owner-route count");
-        let rendered = render_explain_trace(&answered.trace);
+        let rendered = render_explain_trace(&answered.trace());
         assert!(
-            rendered.contains("maintained count: declared") && !rendered.contains("not declared"),
+            matches!(answered.trace().maintained_count.as_deref(),
+                Some(contextdb_engine::maintained_counts::MaintainedCountDisclosure::Used { table, columns })
+                    if table == "placements" && columns == &vec![(column.to_owned(), contextdb_core::SortDirection::Asc)])
+                && !rendered.contains("not declared"),
             "the owner route carries the same disclosure the owner made: {rendered}"
         );
     }
@@ -180,8 +189,8 @@ fn the_declaration_explain_advises_keeps_the_declarations_already_made() {
         let answered = file_session
             .execute(sql, &params)
             .expect("file-route count");
-        assert_eq!(answered.rows[0][0], expected);
-        let rendered = render_explain_trace(&answered.trace);
+        assert_eq!(answered.rows()[0][0], expected);
+        let rendered = render_explain_trace(&answered.trace());
         assert!(
             rendered.contains("maintained count: used"),
             "the file route serves both counts from the declaration the advice produced: \

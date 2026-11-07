@@ -56,17 +56,17 @@ fn route(scope: &str) -> VectorPartitionRef {
 
 fn column(result: &QueryResult, name: &str) -> usize {
     result
-        .columns
+        .columns()
         .iter()
         .position(|candidate| candidate == name)
-        .unwrap_or_else(|| panic!("inspection contains {name}: {:?}", result.columns))
+        .unwrap_or_else(|| panic!("inspection contains {name}: {:?}", result.columns()))
 }
 
 fn row_for(result: &QueryResult, table: &str, vector_column: &str) -> usize {
     let table_column = column(result, "table");
     let vector_column_index = column(result, "column");
     result
-        .rows
+        .rows()
         .iter()
         .position(|row| {
             row[table_column] == Value::Text(table.to_owned())
@@ -78,7 +78,7 @@ fn row_for(result: &QueryResult, table: &str, vector_column: &str) -> usize {
 fn partition_row_for_scope(result: &QueryResult, scope: &str) -> usize {
     let key_column = column(result, "partition_key");
     result
-        .rows
+        .rows()
         .iter()
         .position(|row| {
             matches!(
@@ -92,7 +92,7 @@ fn partition_row_for_scope(result: &QueryResult, scope: &str) -> usize {
 
 fn value<'a>(result: &'a QueryResult, row: usize, name: &str) -> &'a Value {
     result
-        .rows
+        .rows()
         .get(row)
         .and_then(|values| values.get(column(result, name)))
         .unwrap_or_else(|| panic!("inspection has row {row} and {name}: {result:?}"))
@@ -122,12 +122,12 @@ fn non_null(result: &QueryResult, row: usize, name: &str) {
 
 fn ids(result: &QueryResult) -> Vec<Uuid> {
     let id_column = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == "id" || name.rsplit('.').next() == Some("id"))
         .expect("vector result projects its UUID id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(id_column) {
             Some(Value::Uuid(id)) => *id,
@@ -206,7 +206,8 @@ fn show_partitions(db: &Database) -> QueryResult {
 fn drive_to_ready(db: &Database) {
     for _ in 0..MAX_FINITE_CYCLES {
         let partitions = show_partitions(db);
-        if (0..partitions.rows.len()).all(|row| text(&partitions, row, "query_state") == "ready") {
+        if (0..partitions.rows().len()).all(|row| text(&partitions, row, "query_state") == "ready")
+        {
             return;
         }
         db.run_maintenance_cycle()
@@ -236,9 +237,19 @@ fn failed_maintenance_memory_admission_stays_inspectable_until_limit_raise_recov
     assert!(reported.requested_bytes.unwrap() > reported.available_bytes.unwrap());
     assert!(reported.recovery_instruction.contains("SET MEMORY_LIMIT"));
     let alpha_route = route(SCOPE_ALPHA);
+    let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     let inspected = db
         .vector_store_for_test()
-        .partition_info(&alpha_route.index, &alpha_route.partition_key)
+        .partition_info(
+            &alpha_route.index,
+            &alpha_route.partition_key,
+            &mut partition_observation_owner_1,
+        )
+        .unwrap()
         .and_then(|partition| partition.maintenance_failure_details)
         .expect("Rust partition inspection retains the same safe failure detail");
     assert_eq!(inspected, reported);
@@ -279,7 +290,7 @@ fn policy_changes_clear_a_failure_when_the_healthy_route_no_longer_needs_work() 
             id INT PRIMARY KEY, \
             scope_id TEXT NOT NULL, \
             embedding VECTOR(3) PARTITION_KEY (scope_id) SEARCH_MODE INDEXED \
-                HNSW (M = 16, EF_CONSTRUCTION = 200, EF_SEARCH = 200) \
+                IVF (PROBES = 200) \
                 CONSOLIDATION (CHANGE_PERCENT = 1, TOMBSTONE_PERCENT = 100)\
         )",
         &empty(),
@@ -351,14 +362,26 @@ fn policy_changes_clear_a_failure_when_the_healthy_route_no_longer_needs_work() 
         assert_eq!(int(&indexes, index, "stalled_partitions"), 0);
         assert_eq!(text(&indexes, index, "broad_route_reason"), "none");
         assert_eq!(text(&indexes, index, "broad_route_recovery_action"), "none");
+        // Fund the measured healthy preparation peak. Closing retains only
+        // 264 of those 6,153 bytes, then admits two 1,024-byte paths; the
+        // remaining 3,841 bytes cannot admit a real 4,224-byte payload.
+        let replacement_limit = db.memory_limit();
+        let closing_limit = db.accountant().usage().used + 6_153;
+        db.set_memory_limit(Some(closing_limit))
+            .expect("fund healthy preparation below the closing payload admission");
         let error = db
             .run_maintenance_cycle()
             .expect_err("closing compaction reports its typed resource deferral");
+        db.set_memory_limit(replacement_limit)
+            .expect("restore the replacement-build budget for the next policy change");
         assert!(
             matches!(
                 error,
-                contextdb_core::Error::MemoryBudgetExceeded { .. }
-                    | contextdb_core::Error::DiskBudgetExceeded { .. }
+                contextdb_core::Error::MemoryBudgetExceeded {
+                    ref subsystem, ref operation, requested_bytes: 4_224,
+                    available_bytes, budget_limit_bytes, ..
+                } if subsystem == "storage_compaction" && operation == "relocate_pages"
+                    && available_bytes < 4_224 && budget_limit_bytes == closing_limit
             ),
             "closing compaction resource refusal: {error:?}"
         );
@@ -405,12 +428,19 @@ fn policy_changes_clear_a_failure_when_the_healthy_route_no_longer_needs_work() 
 
     let partition_key = VectorPartitionKey::from_values(&[Value::Text(POLICY_SCOPE.to_owned())])
         .expect("construct the declared TEXT partition key");
+    let mut partition_observation_owner_2 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     assert_eq!(
         db.vector_store_for_test()
             .partition_info(
                 &VectorIndexRef::new("policy_failure_docs", "embedding"),
                 &partition_key,
+                &mut partition_observation_owner_2
             )
+            .unwrap()
             .and_then(|info| info.maintenance_failure),
         None,
         "an obsolete refusal cannot reappear when later changes become eligible"
@@ -472,7 +502,7 @@ fn assert_explain_fact(explain: &str, name: &str, expected: &str) {
 
 fn runtime_vector_explain(result: &QueryResult) -> String {
     result
-        .trace
+        .trace()
         .vector_search
         .as_ref()
         .expect("a runtime vector query returns its own typed vector disclosure")
@@ -487,10 +517,19 @@ fn assert_ready_layer_facts(explain: &str) {
 }
 
 #[test]
+#[ignore = "the vector index route is switched off in this release"]
 fn vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts() {
     let (db, source_id) = fixture();
+    // Declared before the first build: one append stays below the 100% change
+    // threshold, while the later deletion crosses the 10% tombstone threshold.
+    db.execute(
+        "ALTER TABLE vector_inspection_docs ALTER COLUMN embedding \
+         SET CONSOLIDATION (CHANGE_PERCENT = 100, TOMBSTONE_PERCENT = 10)",
+        &empty(),
+    )
+    .expect("declare the consolidation thresholds before the first build");
     let before_charge = db.accountant().usage().used;
-    let before_serial = db.__debug_vector_hnsw_build_serial_for_test(index());
+    let before_serial = db.__debug_vector_index_generation_for_test(index());
     let before_activity = db.__vector_passive_activity_counters_for_test();
     assert_eq!(
         before_serial, None,
@@ -501,7 +540,7 @@ fn vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts(
     let index_row = row_for(&indexes, "vector_inspection_docs", "embedding");
     let partitions = show_partitions(&db);
     assert_eq!(
-        partitions.rows.len(),
+        partitions.rows().len(),
         2,
         "two real key tuples have two detail rows"
     );
@@ -537,7 +576,6 @@ fn vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts(
         "tombstones",
         "durable_vector_bytes",
         "charged_vector_bytes",
-        "durable_index_bytes",
         "charged_index_bytes",
     ] {
         non_null(&indexes, index_row, field);
@@ -548,21 +586,25 @@ fn vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts(
             + int(&indexes, index_row, "charged_index_bytes"),
         "the compatibility byte total is the two charged categories exactly once"
     );
-    assert_eq!(
-        int(&indexes, index_row, "durable_vector_bytes"),
-        0,
-        "an in-memory database must not relabel charged vector memory as durable file bytes"
+    assert!(
+        int(&indexes, index_row, "durable_vector_bytes") > 0,
+        "the scratch store holds the stored vectors as durable file bytes"
     );
     assert_eq!(
-        int(&indexes, index_row, "durable_index_bytes"),
+        int(&indexes, index_row, "charged_vector_bytes"),
         0,
-        "an in-memory database has no durable index artifact"
+        "durable-only backing charges no resident vector memory"
+    );
+    assert_eq!(
+        value(&indexes, index_row, "durable_index_bytes"),
+        &Value::Null,
+        "no index is published yet, so there is no durable index artifact to size"
     );
     assert!(
         int(&indexes, index_row, "charged_vector_bytes")
             + int(&indexes, index_row, "charged_index_bytes")
             > 0,
-        "the live in-memory fixture has positive charged ownership even though durable bytes are zero"
+        "the scratch fixture has positive charged ownership"
     );
     for field in [
         "oldest_base_tx",
@@ -582,7 +624,7 @@ fn vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts(
         );
     }
 
-    for partition_row in 0..partitions.rows.len() {
+    for partition_row in 0..partitions.rows().len() {
         assert_eq!(int(&partitions, partition_row, "live_rows"), 2);
         assert_eq!(int(&partitions, partition_row, "retained_rows"), 0);
         assert_eq!(
@@ -611,11 +653,15 @@ fn vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts(
             "tombstones",
             "durable_vector_bytes",
             "charged_vector_bytes",
-            "durable_index_bytes",
             "charged_index_bytes",
         ] {
             non_null(&partitions, partition_row, field);
         }
+        assert_eq!(
+            value(&partitions, partition_row, "durable_index_bytes"),
+            &Value::Null,
+            "no index is published yet, so there is no durable index artifact to size"
+        );
         for field in [
             "base_generation",
             "base_tx",
@@ -633,7 +679,7 @@ fn vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts(
     }
 
     assert_eq!(
-        db.__debug_vector_hnsw_build_serial_for_test(index()),
+        db.__debug_vector_index_generation_for_test(index()),
         before_serial,
         "SHOW VECTOR_* must not build or load the maintained route"
     );
@@ -650,12 +696,14 @@ fn vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts(
 
     drive_to_ready(&db);
     let ready_charge_before = db.accountant().usage().used;
-    let ready_serial_before = db.__debug_vector_hnsw_build_serial_for_test(index());
+    let ready_serial_before = db.__debug_vector_index_generation_for_test(index());
     let ready_activity_before = db.__vector_passive_activity_counters_for_test();
     let ready_generation_before = [SCOPE_ALPHA, SCOPE_BRAVO].map(|scope| {
-        db.vector_store_for_test()
-            .partition_graph_generation_status(&route(scope))
-            .expect("ready partition has generation state")
+        db.__debug_vector_partition_generation_for_test(
+            route(scope).index,
+            route(scope).partition_key,
+        )
+        .expect("ready partition has generation state")
     });
     let ready_indexes = show_indexes(&db);
     let ready_index_row = row_for(&ready_indexes, "vector_inspection_docs", "embedding");
@@ -712,7 +760,7 @@ fn vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts(
     ] {
         assert_eq!(value(&ready_indexes, ready_index_row, field), &Value::Null);
     }
-    for partition_row in 0..ready_partitions.rows.len() {
+    for partition_row in 0..ready_partitions.rows().len() {
         assert_eq!(int(&ready_partitions, partition_row, "live_rows"), 2);
         assert_eq!(int(&ready_partitions, partition_row, "retained_rows"), 0);
         assert_eq!(
@@ -758,13 +806,15 @@ fn vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts(
     }
     assert_eq!(db.accountant().usage().used, ready_charge_before);
     assert_eq!(
-        db.__debug_vector_hnsw_build_serial_for_test(index()),
+        db.__debug_vector_index_generation_for_test(index()),
         ready_serial_before
     );
     let ready_generation_after = [SCOPE_ALPHA, SCOPE_BRAVO].map(|scope| {
-        db.vector_store_for_test()
-            .partition_graph_generation_status(&route(scope))
-            .expect("ready partition still has generation state")
+        db.__debug_vector_partition_generation_for_test(
+            route(scope).index,
+            route(scope).partition_key,
+        )
+        .expect("ready partition still has generation state")
     });
     assert_eq!(
         ready_generation_after, ready_generation_before,
@@ -816,6 +866,7 @@ fn vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts(
 }
 
 #[test]
+#[ignore = "the vector index route is switched off in this release"]
 fn file_backed_inspection_separates_positive_durable_bytes_from_charged_residency_once() {
     let root = TempDir::new().expect("temporary durable inspection store");
     let path = root.path().join("vector-inspection-durable.redb");
@@ -832,9 +883,11 @@ fn file_backed_inspection_separates_positive_durable_bytes_from_charged_residenc
     let charge_before = db.accountant().usage().used;
     let activity_before = db.__vector_passive_activity_counters_for_test();
     let generations_before = [SCOPE_ALPHA, SCOPE_BRAVO].map(|scope| {
-        db.vector_store_for_test()
-            .partition_graph_generation_status(&route(scope))
-            .expect("reopened partition has dormant generation state")
+        db.__debug_vector_partition_generation_for_test(
+            route(scope).index,
+            route(scope).partition_key,
+        )
+        .expect("reopened partition has dormant generation state")
     });
 
     let indexes = show_indexes(&db);
@@ -842,10 +895,10 @@ fn file_backed_inspection_separates_positive_durable_bytes_from_charged_residenc
     let partitions = show_partitions(&db);
     let indexes_again = show_indexes(&db);
     let partitions_again = show_partitions(&db);
-    assert_eq!(indexes_again.columns, indexes.columns);
-    assert_eq!(indexes_again.rows, indexes.rows);
-    assert_eq!(partitions_again.columns, partitions.columns);
-    assert_eq!(partitions_again.rows, partitions.rows);
+    assert_eq!(indexes_again.columns(), indexes.columns());
+    assert_eq!(indexes_again.rows(), indexes.rows());
+    assert_eq!(partitions_again.columns(), partitions.columns());
+    assert_eq!(partitions_again.rows(), partitions.rows());
 
     let durable_vector = int(&indexes, index_row, "durable_vector_bytes");
     let durable_index = int(&indexes, index_row, "durable_index_bytes");
@@ -870,7 +923,7 @@ fn file_backed_inspection_separates_positive_durable_bytes_from_charged_residenc
         ("charged_vector_bytes", "charged_vector_bytes"),
         ("charged_index_bytes", "charged_index_bytes"),
     ] {
-        let detail_sum: i64 = (0..partitions.rows.len())
+        let detail_sum: i64 = (0..partitions.rows().len())
             .map(|row| int(&partitions, row, partition_field))
             .sum();
         assert_eq!(
@@ -886,12 +939,125 @@ fn file_backed_inspection_separates_positive_durable_bytes_from_charged_residenc
         "repeated file-backed inspection cannot load dormant raw bodies or graphs and then evict them"
     );
     let generations_after = [SCOPE_ALPHA, SCOPE_BRAVO].map(|scope| {
-        db.vector_store_for_test()
-            .partition_graph_generation_status(&route(scope))
-            .expect("inspection leaves reopened generation state present")
+        db.__debug_vector_partition_generation_for_test(
+            route(scope).index,
+            route(scope).partition_key,
+        )
+        .expect("inspection leaves reopened generation state present")
     });
     assert_eq!(generations_after, generations_before);
     db.close().expect("close durable inspection verification");
+}
+
+// A saved base with a nonempty suffix must inspect without replaying that suffix.
+// Each arm has N surviving inserts and N insert/delete pairs after the same base.
+fn inspect_reopened_backlog_without_maintenance(backlog: usize) -> usize {
+    use contextdb_engine::{DatabaseOpenOptions, writer_query_test_seams};
+    let root = TempDir::new().expect("temporary pending inspection store");
+    let path = root.path().join("vector-inspection-pending.redb");
+    let open = || {
+        Database::open_with_options(
+            &path,
+            DatabaseOpenOptions {
+                maintenance_policy: MaintenancePolicy::CallerDriven,
+                ..Default::default()
+            },
+        )
+        .expect("open caller-driven inspection store")
+    };
+    let db = open();
+    seed_fixture(&db);
+    drive_to_ready(&db);
+    let context = Uuid::from_u128(0xA11C_E000_0000_0000_0000_0000_0000_0101);
+    for ordinal in 0..backlog {
+        for deleted in [false, true] {
+            let id = Uuid::from_u128(0xBACC_0000 + ordinal as u128 * 2 + u128::from(deleted));
+            db.execute("INSERT INTO vector_inspection_docs (id,context_id,scope_id,kind,embedding) VALUES ($id,$context,$scope,'pending','[0.8,0.2,0.0]')",
+                &params([("id",Value::Uuid(id)),("context",Value::Uuid(context)),
+                         ("scope",Value::Text(SCOPE_ALPHA.to_owned()))])).unwrap();
+            if deleted {
+                db.execute(
+                    "DELETE FROM vector_inspection_docs WHERE id = $id",
+                    &params([("id", Value::Uuid(id))]),
+                )
+                .unwrap();
+            }
+        }
+    }
+    // Do not consolidate the suffix or inspect it before closing.
+    db.close().expect("seal a nonempty insert/delete suffix");
+    drop(db);
+    let db = open();
+    let cache_before = db.__writer_cache_stats_for_test().unwrap();
+    let activity_before = db.__vector_passive_activity_counters_for_test();
+    let charged_before = db.accountant().usage().used;
+    let generations_before = [SCOPE_ALPHA, SCOPE_BRAVO].map(|scope| {
+        db.__debug_vector_partition_generation_for_test(
+            route(scope).index,
+            route(scope).partition_key,
+        )
+        .unwrap()
+    });
+    db.__reset_vector_membership_records_decoded_for_test();
+    let ((indexes, partitions), work) =
+        writer_query_test_seams::observe(|| (show_indexes(&db), show_partitions(&db)));
+    let cache_after = db.__writer_cache_stats_for_test().unwrap();
+    let row = row_for(&indexes, "vector_inspection_docs", "embedding");
+    assert_eq!(int(&indexes, row, "pending_inserts"), backlog as i64);
+    assert_eq!(int(&indexes, row, "tombstones"), backlog as i64);
+    assert_eq!(int(&indexes, row, "vector_count"), backlog as i64 + 4);
+    let alpha = partition_row_for_scope(&partitions, SCOPE_ALPHA);
+    let bravo = partition_row_for_scope(&partitions, SCOPE_BRAVO);
+    assert_eq!(int(&partitions, alpha, "pending_inserts"), backlog as i64);
+    assert_eq!(int(&partitions, alpha, "tombstones"), backlog as i64);
+    assert_eq!(int(&partitions, alpha, "live_rows"), backlog as i64 + 2);
+    assert_eq!(int(&partitions, bravo, "pending_inserts"), 0);
+    assert_eq!(int(&partitions, bravo, "tombstones"), 0);
+    assert_eq!(int(&partitions, bravo, "live_rows"), 2);
+    assert_eq!(
+        work.history.vector_memberships, 0,
+        "inspection never traverses durable membership history"
+    );
+    assert_eq!(
+        db.__vector_membership_records_decoded_for_test(),
+        0,
+        "truthful pending counts never decode the membership population"
+    );
+    assert_eq!(
+        db.__vector_passive_activity_counters_for_test(),
+        activity_before,
+        "pending inspection cannot load, replay, build, repair, compact or evict vector state"
+    );
+    assert_eq!(db.accountant().usage().used, charged_before);
+    let generations_after = [SCOPE_ALPHA, SCOPE_BRAVO].map(|scope| {
+        db.__debug_vector_partition_generation_for_test(
+            route(scope).index,
+            route(scope).partition_key,
+        )
+        .unwrap()
+    });
+    assert_eq!(generations_after, generations_before);
+    let indexes_again = show_indexes(&db);
+    let partitions_again = show_partitions(&db);
+    assert_eq!(indexes_again.rows(), indexes.rows());
+    assert_eq!(partitions_again.rows(), partitions.rows());
+    assert_eq!(
+        db.__vector_passive_activity_counters_for_test(),
+        activity_before
+    );
+    let growth = cache_after.3.checked_sub(cache_before.3).unwrap();
+    db.close().unwrap();
+    growth
+}
+
+#[test]
+fn reopened_nonempty_vector_backlog_inspection_has_fixed_cache_work_and_truthful_counts() {
+    let small = inspect_reopened_backlog_without_maintenance(8);
+    let grown = inspect_reopened_backlog_without_maintenance(256);
+    assert_eq!(
+        grown, small,
+        "metadata-only inspection has the same cache residency increase with a grown insert/delete backlog"
+    );
 }
 
 #[test]
@@ -919,18 +1085,22 @@ fn active_inspection_reports_one_atomic_progress_snapshot_without_advancing_it()
         let charge_before = db.accountant().usage().used;
         let activity_before = db.__vector_passive_activity_counters_for_test();
         let generation_before = [SCOPE_ALPHA, SCOPE_BRAVO].map(|scope| {
-            db.vector_store_for_test()
-                .partition_graph_generation_status(&route(scope))
-                .unwrap_or_else(|| panic!("the partition {scope:?} has generation state"))
+            db.__debug_vector_partition_generation_for_test(
+                route(scope).index,
+                route(scope).partition_key,
+            )
+            .unwrap_or_else(|| panic!("the partition {scope:?} has generation state"))
         });
         let partitions = show_partitions(&db);
         let indexes = show_indexes(&db);
         let charge_after = db.accountant().usage().used;
         let activity_after = db.__vector_passive_activity_counters_for_test();
         let generation_after = [SCOPE_ALPHA, SCOPE_BRAVO].map(|scope| {
-            db.vector_store_for_test()
-                .partition_graph_generation_status(&route(scope))
-                .unwrap_or_else(|| panic!("inspection leaves partition {scope:?} present"))
+            db.__debug_vector_partition_generation_for_test(
+                route(scope).index,
+                route(scope).partition_key,
+            )
+            .unwrap_or_else(|| panic!("inspection leaves partition {scope:?} present"))
         });
         (
             charge_before,
@@ -1040,21 +1210,24 @@ fn active_inspection_reports_one_atomic_progress_snapshot_without_advancing_it()
 }
 
 #[test]
+#[ignore = "the vector index route is switched off in this release"]
 fn engine_owned_ready_inspection_reports_no_recovery_without_inspecting_into_a_build() {
     let (db, _) = fixture();
     drive_to_ready(&db);
-    let serial_before = db.__debug_vector_hnsw_build_serial_for_test(index());
+    let serial_before = db.__debug_vector_index_generation_for_test(index());
     db.set_maintenance_policy(MaintenancePolicy::EngineOwned);
     let charge_before = db.accountant().usage().used;
     let activity_before = db.__vector_passive_activity_counters_for_test();
     let generations_before = [SCOPE_ALPHA, SCOPE_BRAVO].map(|scope| {
-        db.vector_store_for_test()
-            .partition_graph_generation_status(&route(scope))
-            .expect("ready engine-owned partition has generation state")
+        db.__debug_vector_partition_generation_for_test(
+            route(scope).index,
+            route(scope).partition_key,
+        )
+        .expect("ready engine-owned partition has generation state")
     });
 
     let partitions = show_partitions(&db);
-    for partition_row in 0..partitions.rows.len() {
+    for partition_row in 0..partitions.rows().len() {
         assert_eq!(
             text(&partitions, partition_row, "recovery_action"),
             "none",
@@ -1069,7 +1242,7 @@ fn engine_owned_ready_inspection_reports_no_recovery_without_inspecting_into_a_b
         "the healthy whole-index broad route reports no recovery action"
     );
     assert_eq!(
-        db.__debug_vector_hnsw_build_serial_for_test(index()),
+        db.__debug_vector_index_generation_for_test(index()),
         serial_before,
         "inspection itself must not be the action that builds an EngineOwned route"
     );
@@ -1084,9 +1257,11 @@ fn engine_owned_ready_inspection_reports_no_recovery_without_inspecting_into_a_b
         "engine-owned inspection cannot trigger and then undo vector lifecycle work"
     );
     let generations_after = [SCOPE_ALPHA, SCOPE_BRAVO].map(|scope| {
-        db.vector_store_for_test()
-            .partition_graph_generation_status(&route(scope))
-            .expect("engine-owned inspection leaves generation state present")
+        db.__debug_vector_partition_generation_for_test(
+            route(scope).index,
+            route(scope).partition_key,
+        )
+        .expect("engine-owned inspection leaves generation state present")
     });
     assert_eq!(
         generations_after, generations_before,
@@ -1095,6 +1270,7 @@ fn engine_owned_ready_inspection_reports_no_recovery_without_inspecting_into_a_b
 }
 
 #[test]
+#[ignore = "the vector index route is switched off in this release"]
 fn the_same_pending_partition_reports_the_owner_of_maintenance_on_both_show_surfaces() {
     let (db, _) = fixture();
     let caller_partitions = show_partitions(&db);
@@ -1102,12 +1278,12 @@ fn the_same_pending_partition_reports_the_owner_of_maintenance_on_both_show_surf
     let caller_index_row = row_for(&caller_indexes, "vector_inspection_docs", "embedding");
     assert!(
         caller_partitions
-            .rows
+            .rows()
             .iter()
             .enumerate()
             .all(|(row, _)| text(&caller_partitions, row, "query_state") == "unavailable")
     );
-    assert!(caller_partitions.rows.iter().enumerate().all(|(row, _)| {
+    assert!(caller_partitions.rows().iter().enumerate().all(|(row, _)| {
         text(&caller_partitions, row, "recovery_action") == "run_maintenance_cycle"
     }));
     assert_eq!(
@@ -1124,9 +1300,9 @@ fn the_same_pending_partition_reports_the_owner_of_maintenance_on_both_show_surf
     let engine_indexes = show_indexes(&db);
     let engine_index_row = row_for(&engine_indexes, "vector_inspection_docs", "embedding");
     assert_eq!(
-        engine_partitions.rows,
+        engine_partitions.rows(),
         caller_partitions
-            .rows
+            .rows()
             .iter()
             .cloned()
             .map(|mut row| {
@@ -1180,13 +1356,15 @@ fn vector_explain_names_mode_scope_route_merge_and_safe_filter_recovery_without_
     let literal_vector = "[0.1234567,0.2345678,0.3456789]".to_owned();
     let explain_passively = |sql: &str| {
         let charge_before = db.accountant().usage().used;
-        let serial_before = db.__debug_vector_hnsw_build_serial_for_test(index());
+        let serial_before = db.__debug_vector_index_generation_for_test(index());
         let activity_before = db.__vector_passive_activity_counters_for_test();
         let scan_before = db.__relational_scan_rows_touched();
         let generations_before = [SCOPE_ALPHA, SCOPE_BRAVO, SCOPE_HIDDEN].map(|scope| {
-            db.vector_store_for_test()
-                .partition_graph_generation_status(&route(scope))
-                .expect("ready partition has generation state before explain")
+            db.__debug_vector_partition_generation_for_test(
+                route(scope).index,
+                route(scope).partition_key,
+            )
+            .expect("ready partition has generation state before explain")
         });
         let explain = scoped
             .explain(sql)
@@ -1207,14 +1385,16 @@ fn vector_explain_names_mode_scope_route_merge_and_safe_filter_recovery_without_
             "explain cannot load a graph or vector body"
         );
         assert_eq!(
-            db.__debug_vector_hnsw_build_serial_for_test(index()),
+            db.__debug_vector_index_generation_for_test(index()),
             serial_before,
             "explain cannot build a route"
         );
         let generations_after = [SCOPE_ALPHA, SCOPE_BRAVO, SCOPE_HIDDEN].map(|scope| {
-            db.vector_store_for_test()
-                .partition_graph_generation_status(&route(scope))
-                .expect("ready partition has generation state after explain")
+            db.__debug_vector_partition_generation_for_test(
+                route(scope).index,
+                route(scope).partition_key,
+            )
+            .expect("ready partition has generation state after explain")
         });
         assert_eq!(
             generations_after, generations_before,
@@ -1264,8 +1444,8 @@ fn vector_explain_names_mode_scope_route_merge_and_safe_filter_recovery_without_
         assert_ready_layer_facts(&explain);
         if requested_mode == "EXACT" {
             assert!(
-                !explain.contains("HNSW"),
-                "explicit EXACT must never be described as an HNSW route: {explain}"
+                !explain.contains("strategy=Indexed"),
+                "explicit EXACT must never be described as an indexed route: {explain}"
             );
         }
         assert!(
@@ -1308,8 +1488,8 @@ fn vector_explain_names_mode_scope_route_merge_and_safe_filter_recovery_without_
         assert_ready_layer_facts(&runtime_explain);
         if requested_mode == "EXACT" {
             assert!(
-                !runtime_explain.contains("HNSW"),
-                "explicit EXACT runtime explain must never describe HNSW: {runtime_explain}"
+                !runtime_explain.contains("strategy=Indexed"),
+                "explicit EXACT runtime explain must never describe an indexed route: {runtime_explain}"
             );
         }
         assert!(
@@ -1347,7 +1527,7 @@ fn vector_explain_names_mode_scope_route_merge_and_safe_filter_recovery_without_
         assert_explain_fact(&explain, "refusal", "none");
         assert_ready_layer_facts(&explain);
         assert!(
-            !explain.contains("HNSW"),
+            !explain.contains("strategy=Indexed"),
             "every explicit EXACT scope shape remains an exact route: {explain}"
         );
         assert!(
@@ -1529,7 +1709,7 @@ fn explaining_a_prepared_partition_predicate_binds_nothing_and_names_the_shape()
 
     let explain_passively = |sql: &str| -> String {
         let charge_before = db.accountant().usage().used;
-        let serial_before = db.__debug_vector_hnsw_build_serial_for_test(index());
+        let serial_before = db.__debug_vector_index_generation_for_test(index());
         let activity_before = db.__vector_passive_activity_counters_for_test();
         let explain = db
             .explain(sql)
@@ -1540,7 +1720,7 @@ fn explaining_a_prepared_partition_predicate_binds_nothing_and_names_the_shape()
             "a prepared-predicate explain cannot load a graph or vector body"
         );
         assert_eq!(
-            db.__debug_vector_hnsw_build_serial_for_test(index()),
+            db.__debug_vector_index_generation_for_test(index()),
             serial_before,
             "a prepared-predicate explain cannot build a route"
         );

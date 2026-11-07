@@ -126,7 +126,7 @@ fn assert_image(db: &redb::Database, family: LogicalFamily, records: &[ContentId
         actual == expected,
         "incremental root differs from independent sorted rebuild"
     );
-    let stored = read.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+    let stored = crate::persistence::content_identity::payloads::open(&read).unwrap();
     let mut count = 0;
     for row in stored.iter().unwrap() {
         let (key, bytes) = row.unwrap();
@@ -151,12 +151,56 @@ fn assert_image(db: &redb::Database, family: LogicalFamily, records: &[ContentId
     assert_eq!(count, nodes.len(), "all canonical chunks are present");
 }
 
-fn apply(db: &redb::Database, mutations: &[ContentIdentityMutation]) {
+fn fixture_edge(row: u64) -> contextdb_core::AdjEntry {
+    contextdb_core::AdjEntry {
+        source: uuid::Uuid::from_u128(u128::from(row) + 1),
+        target: uuid::Uuid::from_u128(u128::MAX),
+        edge_type: "fixture".to_owned(),
+        properties: std::collections::HashMap::from([(
+            "value".to_owned(),
+            Value::Int64((row * 7) as i64),
+        )]),
+        created_tx: TxId(1),
+        deleted_tx: None,
+        lsn: Lsn(row + 1),
+    }
+}
+
+fn apply(db: &ProofFixtureDatabase, mutations: &[ContentIdentityMutation]) {
     let write = db.begin_write().unwrap();
+    {
+        let mut forward = write
+            .open_table(crate::persistence::GRAPH_FWD_TABLE)
+            .unwrap();
+        for mutation in mutations
+            .iter()
+            .filter(|mutation| mutation.family == LogicalFamily::Graph)
+        {
+            let source_at = 8 + "fixture".len() + 8;
+            let source =
+                uuid::Uuid::from_slice(&mutation.logical_key[source_at..source_at + 16]).unwrap();
+            let row = u64::try_from(source.as_u128() - 1).unwrap();
+            let edge = fixture_edge(row);
+            assert_eq!(
+                mutation.logical_key,
+                edge_mutation(&edge).unwrap().logical_key
+            );
+            let key = RedbPersistence::graph_fwd_key(&edge);
+            if mutation.logical_value.is_some() {
+                let value = RedbPersistence::encode(&edge).unwrap();
+                forward.insert(key.as_slice(), value.as_slice()).unwrap();
+            } else {
+                assert!(forward.remove(key.as_slice()).unwrap().is_some());
+            }
+        }
+    }
+    let accountant = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
+        64 * 1024 * 1024,
+    ));
     RedbPersistence::apply_content_identity_mutations_in_write(
         &write,
         mutations,
-        &mut ProofAdmission::unaccounted(),
+        &mut db.admission(Some(accountant.into())),
     )
     .unwrap();
     write.commit().unwrap();
@@ -165,18 +209,40 @@ fn apply(db: &redb::Database, mutations: &[ContentIdentityMutation]) {
 #[test]
 fn canonical_incremental_insert_delete_cascades_match_sorted_rebuild_and_compaction() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = redb::Database::create(dir.path().join("canonical.db")).unwrap();
+    let db = ProofFixtureDatabase::create(dir.path().join("canonical.db")).unwrap();
     let write = db.begin_write().unwrap();
+    crate::persistence::erasure_frontiers::initialize(&write).unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     write.commit().unwrap();
+    let schema_fixture = crate::Database::open_memory();
+    schema_fixture
+        .execute(
+            "CREATE TABLE fixture (id INTEGER PRIMARY KEY)",
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
+    let schema_meta = schema_fixture.table_meta("fixture").unwrap();
     for family in LogicalFamily::ALL {
         let records = (0..4096u64)
             .map(|i| {
-                ContentIdentityMutation::put(
-                    family,
-                    i.to_be_bytes().to_vec(),
-                    (i * 7).to_be_bytes().to_vec(),
-                )
+                if family == SCHEMA_RECORD_FAMILY {
+                    let name = format!("fixture_{i:016x}");
+                    schema_mutations(&name, &schema_meta).unwrap().remove(0)
+                } else if family == LogicalFamily::Graph {
+                    edge_mutation(&fixture_edge(i)).unwrap()
+                } else if family == LogicalFamily::Configuration {
+                    ContentIdentityMutation::put(
+                        family,
+                        format!("fixture_{i:016x}").into_bytes(),
+                        (i * 7).to_be_bytes().to_vec(),
+                    )
+                } else {
+                    ContentIdentityMutation::put(
+                        family,
+                        i.to_be_bytes().to_vec(),
+                        (i * 7).to_be_bytes().to_vec(),
+                    )
+                }
             })
             .collect::<Vec<_>>();
         let mut live = Vec::new();
@@ -200,7 +266,17 @@ fn canonical_incremental_insert_delete_cascades_match_sorted_rebuild_and_compact
             );
             assert_image(&db, family, &live);
             if phase == 3 {
-                db.compact().unwrap();
+                let mut cursor = redb::CompactionCursor::default();
+                loop {
+                    let write = db
+                        .begin_write()
+                        .unwrap()
+                        .with_table_root_hook(payloads::relocation_event);
+                    let progress = write.compact_step(&mut cursor, 1, |_| Ok(())).unwrap();
+                    if progress.complete {
+                        break;
+                    }
+                }
                 assert_image(&db, family, &live);
             }
         }
@@ -209,10 +285,18 @@ fn canonical_incremental_insert_delete_cascades_match_sorted_rebuild_and_compact
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn large_ordered_keys_split_by_bytes_and_rejoin_after_boundary_deletions() {
     let dir = tempfile::tempdir().unwrap();
-    let db = redb::Database::create(dir.path().join("large.db")).unwrap();
+    let db = ProofFixtureDatabase::create(dir.path().join("large.db")).unwrap();
     let write = db.begin_write().unwrap();
+    crate::persistence::erasure_frontiers::initialize(&write).unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     write.commit().unwrap();
     let mut records = (0..160u64)
@@ -284,10 +368,18 @@ fn large_ordered_keys_split_by_bytes_and_rejoin_after_boundary_deletions() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn wide_separator_reference_corruption_is_rejected_before_a_posting_is_used() {
     let dir = tempfile::tempdir().unwrap();
-    let db = redb::Database::create(dir.path().join("damaged-key.db")).unwrap();
+    let db = ProofFixtureDatabase::create(dir.path().join("damaged-key.db")).unwrap();
     let write = db.begin_write().unwrap();
+    crate::persistence::erasure_frontiers::initialize(&write).unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     write.commit().unwrap();
     let records = (0..4u64)
@@ -307,7 +399,7 @@ fn wide_separator_reference_corruption_is_rejected_before_a_posting_is_used() {
     let target = mutation_tree_key(&records[0]).unwrap();
     let write = db.begin_write().unwrap();
     {
-        let mut nodes = write.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+        let mut nodes = crate::persistence::content_identity::payloads::open(&write).unwrap();
         let storage_key = node_storage_key(LogicalFamily::SchemaAndIndexes, &key_hash(&target));
         let mut damaged = nodes
             .get(storage_key.as_slice())
@@ -350,8 +442,10 @@ fn remove_then_put_coalesces_to_the_same_physical_work_as_a_value_update() {
     let mut results = Vec::new();
     for with_remove in [false, true] {
         let db =
-            redb::Database::create(dir.path().join(format!("coalesce-{with_remove}.db"))).unwrap();
+            ProofFixtureDatabase::create(dir.path().join(format!("coalesce-{with_remove}.db")))
+                .unwrap();
         let write = db.begin_write().unwrap();
+        crate::persistence::erasure_frontiers::initialize(&write).unwrap();
         RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
         write.commit().unwrap();
         let records = (0..1000u64)
@@ -388,10 +482,18 @@ fn remove_then_put_coalesces_to_the_same_physical_work_as_a_value_update() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn keys_too_large_for_a_chunk_are_authenticated_by_reference_and_rebuild_identically() {
     let dir = tempfile::tempdir().unwrap();
-    let db = redb::Database::create(dir.path().join("oversized.db")).unwrap();
+    let db = ProofFixtureDatabase::create(dir.path().join("oversized.db")).unwrap();
     let write = db.begin_write().unwrap();
+    crate::persistence::erasure_frontiers::initialize(&write).unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     write.commit().unwrap();
     // A mix the leaf rule must keep apart: ordinary keys, keys that still fit
@@ -471,10 +573,23 @@ fn keys_too_large_for_a_chunk_are_authenticated_by_reference_and_rebuild_identic
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_damaged_oversized_leaf_key_is_typed_corruption_before_any_posting() {
+    // Raw proof verification has no public request to supply its decode owner.
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let db = redb::Database::create(dir.path().join("oversized-damage.db")).unwrap();
+    let db = ProofFixtureDatabase::create(dir.path().join("oversized-damage.db")).unwrap();
     let write = db.begin_write().unwrap();
+    crate::persistence::erasure_frontiers::initialize(&write).unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     write.commit().unwrap();
     let records = (0..4u64)
@@ -502,7 +617,7 @@ fn a_damaged_oversized_leaf_key_is_typed_corruption_before_any_posting() {
     );
     let write = db.begin_write().unwrap();
     {
-        let mut nodes = write.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+        let mut nodes = crate::persistence::content_identity::payloads::open(&write).unwrap();
         let storage_key = node_storage_key(LogicalFamily::SchemaAndIndexes, &key_hash(&target));
         let mut damaged = nodes
             .get(storage_key.as_slice())

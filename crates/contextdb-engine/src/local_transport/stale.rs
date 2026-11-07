@@ -10,7 +10,21 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaleIdentityEvidence {
     VerifiedOwner,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_stale.rs"
+        )
+    )]
     WrongResponder,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_stale.rs"
+        )
+    )]
     Unverifiable,
 }
 
@@ -19,6 +33,13 @@ pub enum StaleIdentityEvidence {
 pub enum LivenessEvidence {
     NoResponderBeforeDeadline,
     LiveResponder,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_stale.rs"
+        )
+    )]
     Unverifiable,
 }
 
@@ -45,6 +66,13 @@ impl FinalStaleIdentityObservation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaleFilesystemEvidence {
     Exact(ChannelFilesystemIdentity),
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_stale.rs"
+        )
+    )]
     Unverifiable,
 }
 
@@ -63,6 +91,13 @@ pub enum StaleChannelAction {
 
 /// The old owner identity is supplied by the coordination layer; this module
 /// never reads a durable coordination record itself.
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from open_and_owner_reads.rs"
+    )
+)]
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaleChannelProbe {
@@ -71,6 +106,10 @@ pub struct StaleChannelProbe {
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn channel_filesystem_identity(
     path: &std::path::Path,
 ) -> Result<ChannelFilesystemIdentity, LocalTransportError> {
@@ -93,6 +132,10 @@ pub fn channel_filesystem_identity(
 /// other process has since bound at the same pathname is preserved rather than
 /// taken down with ours.
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn remove_own_bound_channel(
     path: &std::path::Path,
     identity: ChannelFilesystemIdentity,
@@ -104,6 +147,10 @@ pub fn remove_own_bound_channel(
 /// Implementations must use an identity-bound, descriptor-relative primitive
 /// and preserve a different object that appears at the pathname.
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn remove_channel_if_identity_matches(
     path: &std::path::Path,
     observation: FinalStaleIdentityObservation,
@@ -144,6 +191,10 @@ pub(super) fn remove_channel_if_identity_matches(
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn observe_final_stale_identity(
     path: &std::path::Path,
 ) -> Result<FinalStaleIdentityObservation, LocalTransportError> {
@@ -156,6 +207,17 @@ pub(super) fn observe_final_stale_identity(
 /// The carrier still binds probe evidence to the socket's exact filesystem
 /// identity and conditionally preserves any replacement seen at removal.
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from open_and_owner_reads.rs"
+    )
+)]
 pub fn reconcile_stale_channel(
     carrier: &UnixLocalCarrier,
     probe: &StaleChannelProbe,
@@ -169,6 +231,17 @@ pub fn reconcile_stale_channel(
 /// Decide whether an existing channel is proven stale. Removal still must
 /// compare the exact filesystem identity immediately before a race-safe,
 /// descriptor-relative removal.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_stale.rs"
+    )
+)]
 pub fn decide_stale_channel_action(
     evidence: StaleChannelEvidence,
 ) -> Result<StaleChannelAction, LocalTransportError> {

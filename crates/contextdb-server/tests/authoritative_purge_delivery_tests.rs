@@ -49,7 +49,7 @@ fn note_body(db: &Database, id: Uuid) -> Option<String> {
         &HashMap::from([("id".to_string(), Value::Uuid(id))]),
     )
     .expect("read exact note")
-    .rows
+    .rows()
     .first()
     .map(|row| match &row[0] {
         Value::Text(body) => body.clone(),
@@ -57,10 +57,14 @@ fn note_body(db: &Database, id: Uuid) -> Option<String> {
     })
 }
 
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn note_ids(db: &Database) -> BTreeSet<Uuid> {
     db.execute("SELECT id FROM notes", &HashMap::new())
         .expect("read note keys")
-        .rows
+        .rows()
         .into_iter()
         .map(|row| match row[0] {
             Value::Uuid(id) => id,
@@ -93,11 +97,10 @@ async fn start_hub(root: &Path, tenant: &str) -> Hub {
     let node_id = endpoint.node_id();
     let db = Arc::new(Database::open(root.join("hub.db")).expect("open file-backed hub"));
     declare_notes(&db);
-    let server = Arc::new(SyncServer::new(
-        db.clone(),
-        &endpoint,
-        TenantId::from(tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::new(db.clone(), &endpoint, TenantId::from(tenant))
+            .expect("construct SyncServer fixture"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -141,7 +144,8 @@ async fn authoritative_hub_purge_reaches_bound_edge_and_survives_reopen() {
     let edge_lsn = edge.current_lsn();
 
     let edge_dial = peer_dial_spec(&hub.ticket, &edge_identity_path);
-    let client = SyncClient::new(edge.clone(), &edge_dial, TenantId::from(tenant));
+    let client = SyncClient::new(edge.clone(), &edge_dial, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     let seed = within(client.push())
         .await
         .expect("edge-originated selected row and survivor reach the hub");
@@ -240,7 +244,8 @@ async fn authoritative_hub_purge_reaches_bound_edge_and_survives_reopen() {
         "the same edge reconnects with its original durable identity"
     );
     let restarted_dial = peer_dial_spec(&restarted.ticket, &edge_identity_path);
-    let client = SyncClient::new(edge.clone(), &restarted_dial, TenantId::from(tenant));
+    let client = SyncClient::new(edge.clone(), &restarted_dial, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     within(client.pull_default())
         .await
         .expect("bound edge pulls from the restarted hub");

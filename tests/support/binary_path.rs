@@ -3,7 +3,6 @@
 //! `[[test]]` targets of `contextdb-engine` -- this file is included by
 //! `#[path]` into each, so it compiles once per test binary from one
 //! physical source instead of being copy-pasted per test root.
-#![allow(dead_code)]
 
 include!("binary_path_helpers.rs");
 

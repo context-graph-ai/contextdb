@@ -75,7 +75,7 @@ fn body(db: &Database, id: Uuid) -> Option<String> {
     let result = db
         .execute("SELECT body FROM notes WHERE id = $id", &values)
         .expect("select note");
-    result.rows.first().and_then(|row| match row.first() {
+    result.rows().first().and_then(|row| match row.first() {
         Some(Value::Text(value)) => Some(value.clone()),
         _ => None,
     })
@@ -100,11 +100,10 @@ async fn hub(root: &Path, tenant: &str) -> Hub {
     let node_id = endpoint.node_id();
     let db = Arc::new(Database::open(db_path).expect("open hub database"));
     table_if_absent(&db);
-    let server = Arc::new(SyncServer::new(
-        db.clone(),
-        &endpoint,
-        TenantId::from(tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::new(db.clone(), &endpoint, TenantId::from(tenant))
+            .expect("construct SyncServer fixture"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let stop = stop.clone();
@@ -145,7 +144,8 @@ fn edge(root: &Path, name: &str, ticket: &str, tenant: &str) -> (Arc<Database>, 
     let db = Arc::new(Database::open(root.join(format!("{name}.db"))).expect("open edge"));
     table_if_absent(&db);
     // The documented constructor must derive the adjacent persisted identity.
-    let client = SyncClient::new(db.clone(), ticket, TenantId::from(tenant));
+    let client = SyncClient::new(db.clone(), ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     (db, client)
 }
 
@@ -184,6 +184,10 @@ struct TamperPushLineageTransport {
 }
 
 impl TamperPushLineageTransport {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn rewrite(&self, subject: &str, bytes: Vec<u8>) -> TransportResult<Vec<u8>> {
         if subject != self.subject {
             return Ok(bytes);
@@ -290,7 +294,8 @@ async fn assert_authenticated_iroh_lineage_fault_is_refused(fault: LineageFault)
     let dial_spec = peer_dial_spec(&hub.ticket, &identity_path);
     let edge = Arc::new(Database::open(&edge_path).expect("open edge database"));
     table(&edge);
-    let bootstrap = SyncClient::new(edge.clone(), &dial_spec, TenantId::from(tenant.as_str()));
+    let bootstrap = SyncClient::new(edge.clone(), &dial_spec, TenantId::from(tenant.as_str()))
+        .expect("construct SyncClient fixture");
     within(bootstrap.push())
         .await
         .expect("bootstrap declarations reach the authenticated hub");
@@ -321,7 +326,8 @@ async fn assert_authenticated_iroh_lineage_fault_is_refused(fault: LineageFault)
         }),
         TenantId::from(tenant.as_str()),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     let source_push_before = client.push_watermark();
     let source_progress_before = edge
         .persisted_sync_watermarks(&TenantId::from(tenant.as_str()))
@@ -444,8 +450,10 @@ async fn declared_policy_survives_restart_and_governs_an_authenticated_exchange(
     client_a.shutdown().await;
     client_b.shutdown().await;
     let hub = restart_hub(hub, root.path(), tenant).await;
-    let client_a = SyncClient::new(edge_a.clone(), &hub.ticket, TenantId::from(tenant));
-    let client_b = SyncClient::new(edge_b.clone(), &hub.ticket, TenantId::from(tenant));
+    let client_a = SyncClient::new(edge_a.clone(), &hub.ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
+    let client_b = SyncClient::new(edge_b.clone(), &hub.ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     let refused = within(client_b.push()).await.expect("second push replies");
     within(client_a.pull_default())
         .await
@@ -499,8 +507,10 @@ async fn keep_first_refusal_names_authenticated_winner_and_hub_position() {
     winner.shutdown().await;
     loser.shutdown().await;
     let hub = restart_hub(hub, root.path(), tenant).await;
-    let winner = SyncClient::new(winner_db.clone(), &hub.ticket, TenantId::from(tenant));
-    let loser = SyncClient::new(loser_db.clone(), &hub.ticket, TenantId::from(tenant));
+    let winner = SyncClient::new(winner_db.clone(), &hub.ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
+    let loser = SyncClient::new(loser_db.clone(), &hub.ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     within(winner.pull_default())
         .await
         .expect("winner pull after hub restart");
@@ -540,7 +550,8 @@ async fn file_backed_identity_survives_restart_and_database_recreation() {
         .sync_incarnation(&TenantId::from(tenant))
         .expect("first incarnation");
     insert(&first, Uuid::new_v4(), "first life");
-    let first_client = SyncClient::new(first.clone(), &hub.ticket, TenantId::from(tenant));
+    let first_client = SyncClient::new(first.clone(), &hub.ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     within(first_client.push()).await.expect("first push");
     drop(first_client);
     drop(first);
@@ -552,7 +563,8 @@ async fn file_backed_identity_survives_restart_and_database_recreation() {
         first_incarnation,
     );
     insert(&reopened, Uuid::new_v4(), "restarted process");
-    let reopened_client = SyncClient::new(reopened.clone(), &hub.ticket, TenantId::from(tenant));
+    let reopened_client = SyncClient::new(reopened.clone(), &hub.ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     within(reopened_client.push()).await.expect("reopened push");
     drop(reopened_client);
     drop(reopened);
@@ -566,7 +578,8 @@ async fn file_backed_identity_survives_restart_and_database_recreation() {
         first_incarnation,
     );
     insert(&recreated, Uuid::new_v4(), "recreated database");
-    let recreated_client = SyncClient::new(recreated, &hub.ticket, TenantId::from(tenant));
+    let recreated_client = SyncClient::new(recreated, &hub.ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     within(recreated_client.push())
         .await
         .expect("recreated push");
@@ -628,10 +641,15 @@ async fn production_sync_refuses_identityless_transport() {
     table(&anonymous);
     let anonymous_id = Uuid::new_v4();
     insert(&anonymous, anonymous_id, "must not be accepted anonymously");
-    let anonymous_client = SyncClient::new(anonymous, &hub.ticket, TenantId::from(tenant));
+    let anonymous_client = SyncClient::with_authenticated_transport_for_test(
+        anonymous,
+        InProcessBroker::new().client(),
+        TenantId::from(tenant),
+    )
+    .expect("construct SyncClient fixture");
     assert!(
         within(anonymous_client.push()).await.is_err(),
-        "bare in-memory dialing is refused"
+        "a transport without an authenticated node identity is refused"
     );
     assert_eq!(
         hub.db.scan("notes", hub.db.snapshot()).expect("hub rows"),
@@ -648,7 +666,8 @@ async fn production_sync_refuses_identityless_transport() {
     let explicit_db = Arc::new(Database::open_memory());
     table(&explicit_db);
     insert(&explicit_db, Uuid::new_v4(), "explicit persisted identity");
-    let explicit = SyncClient::new(explicit_db.clone(), &explicit_spec, TenantId::from(tenant));
+    let explicit = SyncClient::new(explicit_db.clone(), &explicit_spec, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     within(explicit.push())
         .await
         .expect("explicit in-memory identity syncs");
@@ -658,7 +677,8 @@ async fn production_sync_refuses_identityless_transport() {
         Uuid::new_v4(),
         "explicit identity after reconstruction",
     );
-    let explicit_again = SyncClient::new(explicit_db, &explicit_spec, TenantId::from(tenant));
+    let explicit_again = SyncClient::new(explicit_db, &explicit_spec, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     within(explicit_again.push())
         .await
         .expect("reconstructed explicit client syncs");
@@ -678,11 +698,14 @@ async fn production_sync_refuses_identityless_transport() {
     let broker = InProcessBroker::new();
     let direct_db = Arc::new(Database::open_memory());
     table(&direct_db);
-    let direct_server = Arc::new(SyncServer::with_authenticated_transport_for_test(
-        direct_db.clone(),
-        broker.server(),
-        TenantId::from("identityless-direct"),
-    ));
+    let direct_server = Arc::new(
+        SyncServer::with_authenticated_transport_for_test(
+            direct_db.clone(),
+            broker.server(),
+            TenantId::from("identityless-direct"),
+        )
+        .expect("construct SyncServer fixture"),
+    );
     let direct_stop = Arc::new(AtomicBool::new(false));
     let direct_task = tokio::spawn({
         let direct_server = direct_server.clone();
@@ -698,7 +721,10 @@ async fn production_sync_refuses_identityless_transport() {
     table(&direct_source);
     let after_table = direct_source.current_lsn();
     insert(&direct_source, Uuid::new_v4(), "identityless wire mutation");
-    let changeset: WireChangeSet = direct_source.changes_since(after_table).into();
+    let changeset: WireChangeSet = direct_source
+        .changes_since(after_table)
+        .expect("read changes_since fixture")
+        .into();
     assert!(
         changeset.ddl.is_empty(),
         "direct request carries no duplicate schema DDL"
@@ -873,7 +899,8 @@ async fn edge_with_reply_loss(
         transport.clone(),
         TenantId::from(tenant),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     within(client.push())
         .await
         .expect("ordinary declaration bootstrap");
@@ -979,7 +1006,8 @@ async fn current_iroh_lost_refusal_is_not_clean_success_on_any_status_probe() {
         transport.clone(),
         TenantId::from(tenant),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     assert!(matches!(
         within(reopened_client.push()).await,
         Err(contextdb_core::Error::SyncPushUnconfirmed { .. })
@@ -1028,11 +1056,10 @@ async fn current_iroh_push_only_lost_refusal_stays_unconfirmed_without_resending
     hub_db
         .execute(declaration, &HashMap::new())
         .expect("declare hub push-only table");
-    let server = Arc::new(SyncServer::new(
-        hub_db.clone(),
-        &endpoint,
-        TenantId::from(tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::new(hub_db.clone(), &endpoint, TenantId::from(tenant))
+            .expect("construct SyncServer fixture"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let stop = stop.clone();
@@ -1079,7 +1106,8 @@ async fn current_iroh_push_only_lost_refusal_stays_unconfirmed_without_resending
         transport.clone(),
         TenantId::from(tenant),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     let bootstrap = within(client.push())
         .await
         .expect("push-only declaration bootstrap");
@@ -1317,24 +1345,18 @@ async fn a_maintained_count_declaration_crosses_sync_or_holds_back_its_table() {
         )]])),
         "the receiver carries the declaration the author wrote"
     );
-    // A writable handle counts the live postings over the same exact prefix
-    // range instead of reading the stored count: a stored maintained count is
-    // reachable only from a store read as a committed image, the direct-file
-    // read route (docs/query-language.md:928-931).
+    // The captured writer root serves the declared count on this handle.
     let sql = "SELECT COUNT(*) FROM placements WHERE owner = $owner";
     let params = HashMap::from([("owner".to_string(), Value::Text("ada".into()))]);
     let count = hub.db.execute(sql, &params).unwrap();
-    assert_eq!(count.rows[0][0], Value::Int64(3));
+    assert_eq!(count.rows()[0][0], Value::Int64(3));
     assert!(
         matches!(
-            count.trace.maintained_count.as_deref(),
-            Some(
-                contextdb_engine::maintained_counts::MaintainedCountDisclosure::DeclaredNotServed { .. }
-            )
+            count.trace().maintained_count.as_deref(),
+            Some(contextdb_engine::maintained_counts::MaintainedCountDisclosure::Used { .. })
         ),
-        "a writable handle documents the same exact count from the live postings, not the \
-         maintained count, per docs/query-language.md:928-931: {:?}",
-        count.trace.maintained_count
+        "a writable handle serves the same exact maintained count: {:?}",
+        count.trace().maintained_count
     );
 
     let edge_b_path = root.path().join("edge-b.db");
@@ -1356,15 +1378,15 @@ async fn a_maintained_count_declaration_crosses_sync_or_holds_back_its_table() {
     let edge_b_read_only = contextdb_engine::ReadSession::open(&edge_b_path)
         .expect("read the second edge's committed image after close");
     let edge_b_count = edge_b_read_only.execute(sql, &params).unwrap();
-    assert_eq!(edge_b_count.rows[0][0], Value::Int64(3));
+    assert_eq!(edge_b_count.rows()[0][0], Value::Int64(3));
     assert!(
         matches!(
-            edge_b_count.trace.maintained_count.as_deref(),
+            edge_b_count.trace().maintained_count.as_deref(),
             Some(contextdb_engine::maintained_counts::MaintainedCountDisclosure::Used { .. })
         ),
         "the second edge's committed image serves the received count, per \
          docs/query-language.md:928-931: {:?}",
-        edge_b_count.trace.maintained_count
+        edge_b_count.trace().maintained_count
     );
 
     let hub_path = root.path().join("hub.db");
@@ -1379,15 +1401,15 @@ async fn a_maintained_count_declaration_crosses_sync_or_holds_back_its_table() {
     let read_only =
         contextdb_engine::ReadSession::open(&hub_path).expect("read the hub's committed image");
     let read_only_count = read_only.execute(sql, &params).unwrap();
-    assert_eq!(read_only_count.rows[0][0], Value::Int64(3));
+    assert_eq!(read_only_count.rows()[0][0], Value::Int64(3));
     assert!(
         matches!(
-            read_only_count.trace.maintained_count.as_deref(),
+            read_only_count.trace().maintained_count.as_deref(),
             Some(contextdb_engine::maintained_counts::MaintainedCountDisclosure::Used { .. })
         ),
         "a store read as a committed image serves the answer from the maintained count, per \
          docs/query-language.md:928-931: {:?}",
-        read_only_count.trace.maintained_count
+        read_only_count.trace().maintained_count
     );
 }
 
@@ -1447,7 +1469,7 @@ async fn current_iroh_holds_only_the_missing_schema_capability_then_catches_up()
         hub.db
             .execute("SELECT id FROM embeddings", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         1
     );
@@ -1477,7 +1499,7 @@ async fn current_iroh_holds_only_the_missing_schema_capability_then_catches_up()
         receiver
             .execute("SELECT id FROM embeddings", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         1
     );

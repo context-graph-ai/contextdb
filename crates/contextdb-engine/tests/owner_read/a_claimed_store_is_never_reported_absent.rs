@@ -356,6 +356,10 @@ fn a_budget_that_expires_inside_the_claim_window_never_licenses_an_absent_store_
 /// owned? A held claim is never answered with owner-absent, whichever door the
 /// question comes through.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_owner_status_ask_inside_the_claim_window_is_not_answered_owner_absent() {
     let directory = tempfile::TempDir::new().expect("task-scoped claim-window directory");
     let runtime_root = secure_runtime_root(directory.path(), "claim-window-status-runtime");

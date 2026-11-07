@@ -228,7 +228,11 @@ fn open_node(
         db.clone(),
         &endpoint,
         contextdb_core::TenantId::from(tenant),
-    );
+    )
+    .unwrap_or_else(|err| {
+        eprintln!("cannot construct sync client: {err}");
+        std::process::exit(EXIT_ERROR);
+    });
     (db, client, node_id, identity_path)
 }
 
@@ -414,7 +418,10 @@ async fn run_holder(
         std::process::exit(EXIT_ERROR);
     });
     eprintln!("[holder] serving endpoint bound (relay={relay})");
-    holder.serve_on(&serve_endpoint);
+    holder.serve_on(&serve_endpoint).unwrap_or_else(|err| {
+        eprintln!("cannot serve blobs: {err}");
+        std::process::exit(EXIT_ERROR);
+    });
     let serve_ticket = serve_endpoint.ticket();
 
     // serve_on already registers this node's OWN ticket in the peer
@@ -641,13 +648,13 @@ fn run_scan_hub(db_path: &str, marker: &str) {
             eprintln!("[scan-hub] could not scan table {table}; skipping");
             continue;
         };
-        if table == "work_jobs" && !result.rows.is_empty() {
+        if table == "work_jobs" && !result.rows().is_empty() {
             has_job_rows = true;
         }
-        if table == "work_claims" && !result.rows.is_empty() {
+        if table == "work_claims" && !result.rows().is_empty() {
             has_claim_rows = true;
         }
-        for row in &result.rows {
+        for row in result.rows() {
             for value in row {
                 let text = cell_as_text(value);
                 if text.contains(marker) || text.contains(&marker_hex) || text.contains(&marker_b64)

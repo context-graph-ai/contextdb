@@ -15,6 +15,8 @@
 //! quarter of a megabyte of stack -- far too little to hold a million frames,
 //! and ample for the one frame the iterative release needs.
 
+#[path = "../../contextdb-tx/tests/support/read_memory.rs"]
+mod test_read_memory;
 use contextdb_core::{AdjEntry, Direction, Error, Lsn, NodeId, Result, RowId, SnapshotId, TxId};
 use contextdb_graph::mem::BoundedBfsCursor;
 use contextdb_graph::{GraphStore, MemGraphExecutor};
@@ -52,7 +54,11 @@ struct TestStore {
 }
 
 impl WriteSetApplicator for TestStore {
-    fn apply(&self, ws: &WriteSet) -> Result<()> {
+    fn apply(
+        &self,
+        ws: &WriteSet,
+        _read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<()> {
         self.graph.apply_inserts(ws.adj_inserts.clone());
         self.graph.apply_deletes(ws.adj_deletes.clone());
         Ok(())
@@ -105,6 +111,10 @@ fn hub_with_many_edges() -> (Arc<GraphStore>, MemGraphExecutor<TestStore>, NodeI
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_traversal_queue_holding_a_million_entries_is_released_on_a_small_stack() {
     let (_graph, executor, hub) = hub_with_many_edges();
 
@@ -116,6 +126,7 @@ fn a_traversal_queue_holding_a_million_entries_is_released_on_a_small_stack() {
             1,
             1,
             SEEDED_SNAPSHOT,
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
             |_| Ok(()),
             |_| {},
         )

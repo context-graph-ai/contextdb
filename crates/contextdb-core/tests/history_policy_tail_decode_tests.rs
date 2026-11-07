@@ -38,13 +38,18 @@ fn sample_columns() -> Vec<ColumnDef> {
         max_partitions: None,
         search_mode: Default::default(),
         auto_index_at: None,
-        hnsw_m: None,
-        hnsw_ef_construction: None,
-        hnsw_ef_search: None,
+        flat_below: None,
+        auto_expansion_ceiling: None,
         vector_policy_revision: DEFAULT_VECTOR_POLICY_REVISION,
         consolidation_change_percent: None,
         consolidation_tombstone_percent: None,
         consolidation_disabled: false,
+        search_target_accuracy_hundredths: None,
+        search_expected_vectors: None,
+        ivf_lists: None,
+        ivf_probes: None,
+        ivf_refine_factor_hundredths: None,
+        vector_engine_policy: Default::default(),
     }]
 }
 

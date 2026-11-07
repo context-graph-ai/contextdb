@@ -135,14 +135,14 @@ fn order_by_select_list_alias_must_sort_not_silently_pass_through() {
     let r = db
         .execute("SELECT b AS x FROM t ORDER BY x", &empty())
         .expect("ORDER BY a SELECT-list alias is standard SQL and must succeed");
-    let got: Vec<i64> = r.rows.iter().map(|row| int_col(&row[0])).collect();
+    let got: Vec<i64> = r.rows().iter().map(|row| int_col(&row[0])).collect();
     assert_eq!(
         got,
         vec![8, 9, 10],
         "ORDER BY x must actually sort by the aliased column b; got {:?} \
          (insertion order [10, 9, 8] would mean the alias silently failed to \
          sort)",
-        r.rows
+        r.rows()
     );
 }
 
@@ -186,12 +186,12 @@ fn order_by_arithmetic_expression_sorts_by_the_evaluated_value() {
     let r = db
         .execute("SELECT b FROM t ORDER BY a + 1", &empty())
         .expect("ORDER BY a + 1 is standard SQL arithmetic and must succeed");
-    let got: Vec<i64> = r.rows.iter().map(|row| int_col(&row[0])).collect();
+    let got: Vec<i64> = r.rows().iter().map(|row| int_col(&row[0])).collect();
     assert_eq!(
         got,
         vec![9, 8, 10],
         "must sort ascending by a + 1 = [2, 3, 4] (a = [1, 2, 3]), got {:?}",
-        r.rows
+        r.rows()
     );
 }
 
@@ -252,7 +252,7 @@ fn ambiguous_order_by_column_across_join_is_an_error_not_silently_unsorted() {
 // ============================================================================
 // Regression lock (documentary; no new test authored here): a
 // vector-similarity ORDER BY (`embedding <=> $q USE RANK ...`) is a
-// structurally distinct code path — planned as `VectorSearch`/`HnswSearch`,
+// structurally distinct code path — planned as `VectorSearch`,
 // never the generic `Sort` node the tests above exercise (`plan_select_body`
 // gates the plain `Sort` branch on `!uses_vector_search`) — so plain-column
 // ORDER BY validation must not regress it. Already covered by

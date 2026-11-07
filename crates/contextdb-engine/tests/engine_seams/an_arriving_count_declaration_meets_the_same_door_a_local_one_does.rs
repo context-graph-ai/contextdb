@@ -82,6 +82,10 @@ fn create_declaring(list: &str) -> DdlChange {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn apply(db: &Database, changes: ChangeSet) -> contextdb_core::Result<()> {
     db.apply_changes(
         changes,
@@ -200,5 +204,5 @@ fn the_same_declaration_is_adopted_where_an_index_carries_it() {
             &HashMap::from([("owner".to_string(), Value::Text("ada".into()))]),
         )
         .expect("count over the adopted declaration");
-    assert_eq!(answer.rows[0][0], Value::Int64(3));
+    assert_eq!(answer.rows()[0][0], Value::Int64(3));
 }

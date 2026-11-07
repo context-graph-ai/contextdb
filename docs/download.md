@@ -89,7 +89,7 @@ The read-only build checks out that SHA without persisted credentials, uses
 `Cargo.lock` with `--locked`, and builds the two named release binaries with
 package-default features. It unpacks the archive into a fresh directory, runs
 both binaries' `--version` and `--help`, and checks the CLI computes
-`SELECT 1 + 1;` as JSON in `:memory:`. It then runs the complete existing
+`SELECT 1 + 1;` as JSON in a fresh database file. It then runs the complete existing
 `installed-release-durable-sync-smoke.sh` against those exact unpacked CLI/server
 bytes, including durable files and ticketed Iroh sync. The required
 `contextdb-smoke-driver` verifier is built separately with the existing

@@ -56,6 +56,21 @@ fn writer_child() {
                 .read_line(&mut input)
                 .expect("writer command");
             match input.trim() {
+                "purge-provisional" => {
+                    let result =
+                        db.execute("PURGE FROM handover_rows WHERE id = 110", &HashMap::new());
+                    assert!(
+                        matches!(result,
+                            Err(contextdb_core::Error::ReaderCoordinationUnavailable { operation, reason, .. })
+                                if operation == "authoritative purge" && reason.contains("is still acquiring its snapshot")
+                        ),
+                        "an acquiring reader must be coordinated before successful purge"
+                    );
+                    println!("PROVISIONAL_PURGE_REFUSED");
+                    std::io::stdout()
+                        .flush()
+                        .expect("flush provisional refusal marker");
+                }
                 "purge" => {
                     db.execute("PURGE FROM handover_rows WHERE id = 110", &HashMap::new())
                         .expect("purge a row in the affected cursor");
@@ -200,7 +215,7 @@ fn owner_cursor_handover_uses_the_supplied_runtime_root() {
     while seen.len() < 120 {
         let page = cursor.fetch(None).expect("continue retained root");
         seen.extend(ids(&page));
-        if !page.has_more {
+        if !page.has_more() {
             break;
         }
     }
@@ -208,7 +223,7 @@ fn owner_cursor_handover_uses_the_supplied_runtime_root() {
 }
 
 fn ids(page: &contextdb_core::read_contract::CursorPage) -> Vec<i64> {
-    page.rows
+    page.rows()
         .iter()
         .map(|row| match row.as_slice() {
             [Value::Int64(id)] => *id,
@@ -302,7 +317,7 @@ fn small_cursor_admission_work_and_charged_memory_ignore_unrelated_store_size() 
             .open_cursor("SELECT id FROM handover_rows ORDER BY id", &HashMap::new())
             .expect("open small cursor");
         drop(observation);
-        assert!(cursor.first_page().has_more);
+        assert!(cursor.first_page().has_more());
         let charged_delta = session
             .charged_bytes()
             .expect("cursor charged memory")
@@ -347,7 +362,7 @@ fn complete_first_page_releases_the_owner_cursor_hold() {
     let cursor = session
         .open_cursor("SELECT id FROM handover_rows ORDER BY id", &HashMap::new())
         .expect("open complete cursor");
-    assert!(!cursor.first_page().has_more);
+    assert!(!cursor.first_page().has_more());
     assert!(!cursor.is_live());
     holder.release();
     let writer = Database::open(&path).expect("replacement writer");
@@ -360,6 +375,63 @@ fn complete_first_page_releases_the_owner_cursor_hold() {
         "the cursor object remains alive but its root is released"
     );
     let _ = &cursor;
+}
+
+// Only allocations in transactions after the covering reclaim commit count.
+fn prove_exact_reclaim(writer: &Database, retained: &[[u8; 8]]) {
+    use redb::allocation_observation::{AllocationObserverForTest, AllocationPlanForTest};
+    struct Reallocated(Mutex<std::collections::HashSet<[u8; 8]>>);
+    impl AllocationObserverForTest for Reallocated {
+        fn before_allocate(&self, _: AllocationPlanForTest) -> redb::Result {
+            Ok(())
+        }
+        fn allocated(&self, _: AllocationPlanForTest, page: [u8; 8]) {
+            self.0.lock().unwrap().insert(page);
+        }
+    }
+    let captured: std::collections::HashSet<_> = retained.iter().copied().collect();
+    assert!(!captured.is_empty());
+    let seen = Reallocated(Mutex::new(std::collections::HashSet::new()));
+    let mut covering_commit = false;
+    for id in 1001..1004 {
+        redb::commit_work::reset_commit_pages_for_test();
+        let write = || {
+            writer
+                .execute(
+                    &format!("INSERT INTO handover_rows (id) VALUES ({id})"),
+                    &HashMap::new(),
+                )
+                .expect("advance reclamation")
+        };
+        if covering_commit {
+            redb::allocation_observation::with_borrowed_allocation_observer_for_test(
+                &seen, false, write,
+            );
+        } else {
+            write();
+        }
+        let work = redb::commit_work::take_commit_pages_for_test();
+        assert_eq!(
+            work.commits, 1,
+            "observe one reclaim commit at a time: {work:?}"
+        );
+        if work.reclaimed_pages >= captured.len() as u64 {
+            covering_commit = true;
+        }
+    }
+    assert!(
+        covering_commit,
+        "a reclaim commit must cover all {} captured extents",
+        captured.len()
+    );
+    let seen = seen.0.lock().unwrap();
+    let missing: Vec<_> = captured.difference(&seen).collect();
+    assert!(
+        missing.is_empty(),
+        "every captured address must be reallocated after the covering reclaim commit; missing {}/{}: {missing:?}",
+        missing.len(),
+        captured.len()
+    );
 }
 
 #[test]
@@ -376,7 +448,7 @@ fn final_fetch_releases_pages_before_the_cursor_object_is_dropped() {
     let mut cursor = session
         .open_cursor("SELECT id FROM handover_rows ORDER BY id", &HashMap::new())
         .expect("open paged cursor");
-    assert!(cursor.first_page().has_more);
+    assert!(cursor.first_page().has_more());
     holder.release();
     let writer = Database::open(&path).expect("replacement writer");
     writer
@@ -391,30 +463,15 @@ fn final_fetch_releases_pages_before_the_cursor_object_is_dropped() {
     assert!(retained.retained_pages > 0);
     let last = cursor.fetch(None).expect("finish old snapshot");
     assert_eq!(ids(&last), (100..120).collect::<Vec<_>>());
-    assert!(!last.has_more);
+    assert!(!last.has_more());
     assert!(!cursor.is_live());
-    for id in 1001..1004 {
-        writer
-            .execute(
-                &format!("INSERT INTO handover_rows (id) VALUES ({id})"),
-                &HashMap::new(),
-            )
-            .expect("advance reclamation");
-    }
+    prove_exact_reclaim(&writer, &retained.retained_page_allocations);
     assert_eq!(
         writer
             .__external_snapshot_retention_for_test()
             .expect("observe released root")
             .snapshots,
         0
-    );
-    assert!(
-        retained.retained_page_allocations.iter().any(|page| {
-            !writer
-                .__external_snapshot_page_allocated_for_test(*page)
-                .expect("inspect physical page allocation")
-        }),
-        "the replacement writer must reclaim at least one formerly held page"
     );
     let _ = &cursor;
 }
@@ -497,8 +554,8 @@ fn memory_refusal_on_file_continuation_releases_registration_and_presence() {
     let mut cursor = session
         .open_cursor("SELECT id, payload FROM handover_rows", &HashMap::new())
         .expect("open first small page");
-    assert_eq!(cursor.first_page().rows.len(), 1);
-    assert!(cursor.first_page().has_more);
+    assert_eq!(cursor.first_page().rows().len(), 1);
+    assert!(cursor.first_page().has_more());
     holder.release();
     let writer = Database::open(&path).expect("open replacement writer");
     assert!(
@@ -565,7 +622,7 @@ fn idle_expiry_reclaims_pages_without_another_client_request() {
     let mut cursor = session
         .open_cursor("SELECT id FROM handover_rows ORDER BY id", &HashMap::new())
         .expect("open paged cursor");
-    assert!(cursor.first_page().has_more);
+    assert!(cursor.first_page().has_more());
     holder.release();
     let writer = Database::open(&path).expect("replacement writer");
     writer
@@ -582,14 +639,7 @@ fn idle_expiry_reclaims_pages_without_another_client_request() {
     expired_rx
         .recv()
         .expect("deadline watcher releases the root");
-    for id in 1001..1004 {
-        writer
-            .execute(
-                &format!("INSERT INTO handover_rows (id) VALUES ({id})"),
-                &HashMap::new(),
-            )
-            .expect("advance reclamation");
-    }
+    prove_exact_reclaim(&writer, &retained.retained_page_allocations);
     assert_eq!(
         writer
             .__external_snapshot_retention_for_test()
@@ -597,11 +647,6 @@ fn idle_expiry_reclaims_pages_without_another_client_request() {
             .snapshots,
         0
     );
-    assert!(retained.retained_page_allocations.iter().any(|page| {
-        !writer
-            .__external_snapshot_page_allocated_for_test(*page)
-            .expect("inspect physical page allocation")
-    }));
     match cursor.fetch(None) {
         Err(contextdb_core::Error::ReadFailure(failure)) => {
             assert_eq!(failure.kind(), ReadFailureKind::CursorExpired);
@@ -630,6 +675,10 @@ impl ReadSessionTestObserver for PauseBeforeRegistration {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn owner_exit_after_open_response_does_not_break_client_registration() {
     if std::env::var_os(ROLE).is_some() {
         return;
@@ -689,7 +738,7 @@ fn owner_exit_after_open_response_does_not_break_client_registration() {
     while seen.len() < 120 {
         let page = cursor.fetch(None).expect("continue old root");
         seen.extend(ids(&page));
-        if !page.has_more {
+        if !page.has_more() {
             break;
         }
     }
@@ -697,6 +746,10 @@ fn owner_exit_after_open_response_does_not_break_client_registration() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn purge_during_handoff_invalidates_affected_continuation_after_owner_exit() {
     if std::env::var_os(ROLE).is_some() {
         return;
@@ -742,7 +795,7 @@ fn purge_during_handoff_invalidates_affected_continuation_after_owner_exit() {
     let mut unaffected = unaffected_session
         .open_cursor("SELECT id FROM other_rows ORDER BY id", &HashMap::new())
         .expect("open unaffected cursor before purge");
-    assert!(unaffected.first_page().has_more);
+    assert!(unaffected.first_page().has_more());
 
     let (reached_tx, reached_rx) = mpsc::channel();
     let (resume_tx, resume_rx) = mpsc::channel();
@@ -756,14 +809,20 @@ fn purge_during_handoff_invalidates_affected_continuation_after_owner_exit() {
         affected_session.open_cursor("SELECT id FROM handover_rows ORDER BY id", &HashMap::new())
     });
     reached_rx.recv().expect("affected first page received");
-    holder.purge();
-    holder.release();
+    writeln!(
+        holder.child.stdin.as_mut().expect("child stdin"),
+        "purge-provisional"
+    )
+    .expect("request purge while registration is provisional");
+    holder.wait_for("PROVISIONAL_PURGE_REFUSED");
     resume_tx.send(()).expect("finish exact registration");
     let mut affected = opening
         .join()
         .expect("join affected opener")
         .expect("register affected old root");
-    assert!(affected.first_page().has_more);
+    assert!(affected.first_page().has_more());
+    holder.purge();
+    holder.release();
     match affected.fetch(None) {
         Err(contextdb_core::Error::ReadFailure(failure)) => {
             assert_eq!(failure.kind(), ReadFailureKind::AuthoritativeErasure);
@@ -781,7 +840,7 @@ fn purge_during_handoff_invalidates_affected_continuation_after_owner_exit() {
             .fetch(None)
             .expect("continue unaffected old root");
         seen.extend(ids(&page));
-        if !page.has_more {
+        if !page.has_more() {
             break;
         }
     }
@@ -838,7 +897,7 @@ fn cursor_opened_before_writer_handover_finishes_its_snapshot() {
         .expect("open owner cursor");
     let mut seen = ids(cursor.first_page());
     assert_eq!(seen.len(), 100);
-    assert!(cursor.first_page().has_more);
+    assert!(cursor.first_page().has_more());
 
     holder.release();
     WriterChild::spawn("arriving", &path).finish("COMMITTED");
@@ -848,7 +907,7 @@ fn cursor_opened_before_writer_handover_finishes_its_snapshot() {
             .fetch(None)
             .expect("finish opened snapshot after writer handover");
         seen.extend(ids(&page));
-        if !page.has_more {
+        if !page.has_more() {
             break;
         }
     }
@@ -911,7 +970,7 @@ fn multiple_owner_pages_continue_while_the_replacement_writer_is_live() {
     loop {
         let page = cursor.fetch(None).expect("continue while writer is live");
         seen.extend(ids(&page));
-        if !page.has_more {
+        if !page.has_more() {
             break;
         }
     }
@@ -969,9 +1028,9 @@ fn an_abrupt_owner_exit_preserves_old_rows_through_replacement_rewrites() {
             &HashMap::new(),
         )
         .expect("open retained owner cursor");
-    let mut seen = cursor.first_page().rows.clone();
+    let mut seen = cursor.first_page().rows().to_vec();
     assert_eq!(seen, expected[..4]);
-    assert!(cursor.first_page().has_more);
+    assert!(cursor.first_page().has_more());
 
     // kill + wait is the synchronization: no graceful database shutdown or
     // owner cursor cleanup can protect the remaining pages for this client.
@@ -1016,8 +1075,8 @@ fn an_abrupt_owner_exit_preserves_old_rows_through_replacement_rewrites() {
         let page = cursor
             .fetch(None)
             .expect("read old pages retained across abrupt owner exit");
-        seen.extend(page.rows);
-        if !page.has_more {
+        seen.extend(page.rows().iter().cloned());
+        if !page.has_more() {
             break;
         }
     }
@@ -1026,6 +1085,10 @@ fn an_abrupt_owner_exit_preserves_old_rows_through_replacement_rewrites() {
     drop(writer);
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn small_budget_handover(deliver_owner_rows: usize) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bounded-replay.db");
@@ -1101,7 +1164,7 @@ fn small_budget_handover(deliver_owner_rows: usize) {
             "an unfinished aggregate starts with an empty page"
         );
     }
-    assert!(cursor.first_page().has_more);
+    assert!(cursor.first_page().has_more());
     for _ in 0..100 {
         if seen.len() >= deliver_owner_rows {
             break;
@@ -1118,15 +1181,15 @@ fn small_budget_handover(deliver_owner_rows: usize) {
     );
     let replay = cursor.fetch(None).unwrap();
     assert!(
-        replay.rows.is_empty(),
+        replay.rows().is_empty(),
         "replay yields after spending one caller allowance of {upper} work units"
     );
-    assert!(replay.has_more);
+    assert!(replay.has_more());
     let mut finished = false;
     for _ in 0..200 {
         let page = cursor.fetch(None).unwrap();
         seen.extend(ids(&page));
-        if !page.has_more {
+        if !page.has_more() {
             finished = true;
             break;
         }
@@ -1154,16 +1217,21 @@ fn an_empty_owner_first_page_does_not_skip_the_first_replayed_row() {
 // the thread inside measure() participate; a header retains the measurement so
 // deallocation on another thread, or after the next sample starts, is correct.
 // The oracle includes transient vectors and COW buffers, unlike reader charges.
-mod append_heap_oracle {
+pub(crate) mod append_heap_oracle {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 
     #[derive(Default)]
     struct Counters {
         live: AtomicUsize,
         peak: AtomicUsize,
+        net: AtomicIsize,
+        net_peak: AtomicIsize,
+        funding: Option<Arc<AtomicUsize>>,
+        unfunded: AtomicUsize,
+        allocations: AtomicUsize,
     }
     thread_local! {
         static ACTIVE: Cell<*const Counters> = const { Cell::new(std::ptr::null()) };
@@ -1201,6 +1269,21 @@ mod append_heap_oracle {
                 let counters = unsafe { &*counters };
                 let live = counters.live.fetch_add(layout.size(), Ordering::SeqCst) + layout.size();
                 counters.peak.fetch_max(live, Ordering::SeqCst);
+                let net = counters
+                    .net
+                    .fetch_add(layout.size() as isize, Ordering::SeqCst)
+                    + layout.size() as isize;
+                counters.net_peak.fetch_max(net, Ordering::SeqCst);
+                if let Some(funding) = &counters.funding {
+                    // No caller code runs between System.alloc and this sample.
+                    // Observe the funding at this allocation boundary, including
+                    // both buffers of a realloc; never infer order from a peak.
+                    counters.allocations.fetch_add(1, Ordering::SeqCst);
+                    counters.unfunded.fetch_max(
+                        live.saturating_sub(funding.load(Ordering::SeqCst)),
+                        Ordering::SeqCst,
+                    );
+                }
             }
             pointer
         }
@@ -1216,7 +1299,18 @@ mod append_heap_oracle {
                 let counters = unsafe { Arc::from_raw(header.counters) };
                 counters.live.fetch_sub(layout.size(), Ordering::SeqCst);
             }
+            let physical = contextdb_engine::read_work_probe::allocator_events::before_dealloc(
+                pointer, layout,
+            );
             unsafe { System.dealloc(pointer.sub(offset), allocation) };
+            contextdb_engine::read_work_probe::allocator_events::after_dealloc(physical);
+            let active = ACTIVE.try_with(Cell::get).unwrap_or(std::ptr::null());
+            if !active.is_null() {
+                // Signed net heap includes evictions of pages predating this sample.
+                unsafe { &*active }
+                    .net
+                    .fetch_sub(layout.size() as isize, Ordering::SeqCst);
+            }
         }
     }
     #[global_allocator]
@@ -1237,11 +1331,41 @@ mod append_heap_oracle {
         let reset = Reset;
         let value = operation();
         drop(reset);
-        (value, counters.peak.load(Ordering::SeqCst))
+        (
+            value,
+            usize::try_from(counters.net_peak.load(Ordering::SeqCst)).expect("peak starts at zero"),
+        )
+    }
+
+    pub(crate) fn measure_funding<T>(
+        funding: Arc<AtomicUsize>,
+        operation: impl FnOnce() -> T,
+    ) -> (T, usize, usize, usize) {
+        let counters = Arc::new(Counters {
+            funding: Some(funding),
+            ..Counters::default()
+        });
+        ACTIVE.with(|active| {
+            assert!(active.get().is_null());
+            active.set(Arc::as_ptr(&counters));
+        });
+        let reset = Reset;
+        let value = operation();
+        drop(reset);
+        (
+            value,
+            counters.peak.load(Ordering::SeqCst),
+            counters.unfunded.load(Ordering::SeqCst),
+            counters.allocations.load(Ordering::SeqCst),
+        )
     }
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn closing_a_cursor_keeps_the_next_small_append_cleanup_bounded() {
     if std::env::var_os(ROLE).is_some() {
         return;
@@ -1277,7 +1401,7 @@ fn closing_a_cursor_keeps_the_next_small_append_cleanup_bounded() {
         let cursor = session
             .open_cursor("SELECT id FROM handover_rows ORDER BY id", &HashMap::new())
             .expect("hold selected snapshot");
-        assert!(cursor.first_page().has_more);
+        assert!(cursor.first_page().has_more());
         for generation in 0..churn_commits {
             db.execute(
                 "UPDATE unrelated_rows SET payload = $payload WHERE id = 0",
@@ -1359,7 +1483,7 @@ fn closing_a_cursor_keeps_the_next_small_append_cleanup_bounded() {
         let retained_cursor = session
             .open_cursor("SELECT id FROM handover_rows ORDER BY id", &HashMap::new())
             .expect("retain a snapshot across writer close");
-        assert!(retained_cursor.first_page().has_more);
+        assert!(retained_cursor.first_page().has_more());
         for generation in 0..96 {
             db.execute(
                 "UPDATE unrelated_rows SET payload = $payload WHERE id = 0",
@@ -1438,7 +1562,7 @@ fn closing_a_cursor_keeps_the_next_small_append_cleanup_bounded() {
                 &HashMap::new(),
             )
             .expect("first small append survives reopen and complete cleanup");
-        assert_eq!(rows.rows, vec![vec![Value::Int64(1000)]]);
+        assert_eq!(rows.rows(), vec![vec![Value::Int64(1000)]]);
         reopened.close().expect("close fully drained engine store");
     }
     eprintln!(
@@ -1514,7 +1638,7 @@ fn explicit_close_drains_released_snapshot_frees_before_handoff() {
     let cursor = session
         .open_cursor("SELECT id FROM handover_rows ORDER BY id", &HashMap::new())
         .expect("pin old snapshot");
-    assert!(cursor.first_page().has_more);
+    assert!(cursor.first_page().has_more());
     for generation in 0..96 {
         db.execute(
             "UPDATE churn SET payload = $payload WHERE id = 0",
@@ -1605,7 +1729,7 @@ fn explicit_close_reports_drain_io_failure_and_releases_the_store() {
     let cursor = session
         .open_cursor("SELECT id FROM handover_rows ORDER BY id", &HashMap::new())
         .expect("hold old snapshot");
-    assert!(cursor.first_page().has_more);
+    assert!(cursor.first_page().has_more());
     for generation in 0..70 {
         db.execute(
             "UPDATE churn SET payload = $payload WHERE id = 0",
@@ -1651,7 +1775,7 @@ fn explicit_close_reports_drain_io_failure_and_releases_the_store() {
     let rows = reopened
         .execute("SELECT id FROM handover_rows ORDER BY id", &HashMap::new())
         .expect("committed data remains readable");
-    assert_eq!(rows.rows.len(), 120);
+    assert_eq!(rows.rows().len(), 120);
     reopened.close().expect("close reopened store");
 }
 
@@ -1678,7 +1802,7 @@ fn handoff_preparation_failure_still_releases_explicit_close_resources() {
         reopened
             .execute("SELECT id FROM handover_rows ORDER BY id", &HashMap::new())
             .expect("committed data remains readable")
-            .rows
+            .rows()
             .len(),
         2
     );

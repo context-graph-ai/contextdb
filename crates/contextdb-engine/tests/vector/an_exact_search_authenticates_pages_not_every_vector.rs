@@ -127,11 +127,24 @@ fn seed_with_rows(path: &std::path::Path, runtime: &std::path::Path, row_count: 
         admin
             .run_maintenance_cycle()
             .expect("advance deterministic maintenance");
+        let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+            admin
+                .declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         let ready = admin
             .vector_store_for_test()
-            .partition_infos(&index)
+            .partition_infos(&index, &mut partition_observation_owner_1)
             .expect("inspect partition readiness");
-        if !ready.is_empty() && ready.iter().all(|partition| partition.graph_available) {
+        if !ready.is_empty()
+            && ready.iter().all(|partition| {
+                admin.__debug_vector_partition_indexed_for_test(
+                    partition.partition.index.clone(),
+                    partition.partition.partition_key.clone(),
+                )
+            })
+        {
             break;
         }
     }
@@ -141,6 +154,10 @@ fn seed_with_rows(path: &std::path::Path, runtime: &std::path::Path, row_count: 
 #[cfg(unix)]
 #[test]
 #[ignore = "large exact-search diagnostic; run explicitly when measuring body and proof work"]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_exact_search_authenticates_pages_not_every_vector() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -186,7 +203,7 @@ fn an_exact_search_authenticates_pages_not_every_vector() {
     };
     let ids = |answer: &contextdb_engine::QueryResult| {
         answer
-            .rows
+            .rows()
             .iter()
             .map(|row| match row.first() {
                 Some(Value::Int64(id)) => *id,
@@ -270,6 +287,10 @@ fn an_exact_search_authenticates_pages_not_every_vector() {
 
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn exact_search_refuses_damaged_missing_and_mismatched_authoritative_bodies() {
     use std::os::unix::fs::PermissionsExt;
 

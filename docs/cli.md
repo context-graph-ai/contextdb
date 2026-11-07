@@ -13,7 +13,7 @@ Two binaries: `contextdb` (interactive client) and `contextdb-server` (sync coor
 contextdb <PATH> [OPTIONS]
 ```
 
-`<PATH>` is the database file. Use `:memory:` for an in-memory (ephemeral) database.
+`<PATH>` is the database file.
 
 **Reading is the default.** `contextdb <PATH>` opens an existing store for bounded, read-only
 inspection: it never creates the store, never mutates it, and leaves every byte in the store
@@ -33,7 +33,7 @@ The same command works whether the store is idle or already owned by a live proc
 | Idle or missing store | `contextdb <path> --write` | Full read-write session; the store is created if missing. <!-- enforced by: read_cli_journeys_invocation::bare_path_on_a_missing_store_refuses_and_creates_nothing, read_cli_journeys_invocation::write_flag_creates_the_store_a_read_refused_to_create --> |
 | Live file-backed owner | `contextdb <path>` | Reading session over that owner's authenticated local channel. <!-- enforced by: read_cli_journeys_live_owner::a_reading_session_routes_through_the_live_owner_and_says_so_once --> |
 | Live file-backed owner | `contextdb <path> --write` | Refused with `held_by_writer`; the refusal says a read session (drop `--write`) reaches the live owner's channel. <!-- enforced by: read_cli_journeys_machine_surface::every_refusal_carries_its_ratified_class_and_kind --> |
-| Readers hydrating | `contextdb <path> --write` | Refused with `held_by_readers`, listing the hydrating readers when identifiable, else "N direct readers are hydrating this store; retry in a moment". <!-- unbound: no wall test yet — a hydrating-readers race needs a second process holding the shared lock --> |
+| Reader selecting its snapshot | `contextdb <path> --write` | Waits once for the OS store lock; the reader releases its admission hold after fixed-cost snapshot selection and registration, before heavy loading. Only caller cancellation/deadline ends the wait early; an already-expired deadline yields typed `held_by_readers` with the actual count and identifiable names. |
 
 ### Options
 
@@ -44,8 +44,8 @@ The same command works whether the store is idle or already owned by a live proc
 | `--sync-endpoint <TICKET>` | *(none)* | Writer-only: server's enrollment ticket to sync with (dial-by-key). |
 | `--tenant-id <ID>` | *(none)* | Writer-only: sync namespace. Omit for local-only mode. |
 | `--sync-debounce-ms <MS>` | 500 | Writer-only: auto-sync batching window. |
-| `--memory-limit <SIZE>` | *(unlimited)* | Whole-session memory ceiling, read or write mode. Suffixes: `K`, `M`, `G`. |
-| `--disk-limit <SIZE>` | *(unlimited)* | File-backed session disk ceiling. Never authorizes writes; invalid for `:memory:`. |
+| `--memory-limit <SIZE>` | *(unlimited)* | Whole-session memory ceiling, read or write mode. Suffixes: `K`, `M`, `G`. A read-only open first reserves about 200 KB (197,048 bytes) of fixed source memory plus its cache share, so a limit below that is refused; the floor is necessary, not sufficient, because the schema, controls and cache need more. |
+| `--disk-limit <SIZE>` | *(unlimited)* | Session disk ceiling. Never authorizes writes. |
 | `--maintenance <MODE>` | `engine-owned` | Maintenance schedule for this process: `engine-owned` starts the database worker when work is declared; `caller-driven` starts no worker and leaves scheduling to `.maintenance run` or the embedding host. Writer-only for file-backed stores. |
 | `--maintenance-poll-ms <MS>` | persisted value, else `60000` | Positive engine-owned poll interval in milliseconds. A supplied value is persisted for a file-backed database; omitting the flag uses that persisted value on later opens rather than overwriting it. Writer-only for file-backed stores. |
 
@@ -73,34 +73,35 @@ All limit values must be positive; configuration is refused before open (exit `2
 
 **The environment is not a behavior surface.** The CLI reads exactly two declared-behavior
 environment variables — `CONTEXTDB_DB_PATH` and `CONTEXTDB_OWNER_READ_RUNTIME_DIR`, the two things
-a process must know before flags exist — and a flag always wins over either. One more variable is
-read, but only as a platform location input, never a behavior override: `XDG_RUNTIME_DIR` locates
-the per-user runtime directory the owner channel falls back to when `--owner-read-runtime-dir` is
-not set (see [Owner Inspection](#owner-inspection-owner-status)) — it picks where the channel
-lives, never whether it runs or how it behaves. No other environment variable exists to the CLI,
-with one observability exception: `RUST_LOG` changes log verbosity on the diagnostic stream and
+a process must know before flags exist — and a flag always wins over either. Platform location inputs also locate the channel and private data directories:
+`XDG_RUNTIME_DIR`, `XDG_DATA_HOME` and `HOME` (with an effective-user home lookup when needed).
+These select locations, not read limits or query behavior; see
+[Owner Inspection](#owner-inspection-owner-status). For observability, `RUST_LOG` changes log verbosity on the diagnostic stream and
 nothing else — never routing, limits, results, or exits.
-<!-- enforced by: read_cli_journeys_invocation::a_former_behavior_environment_alias_changes_nothing_and_says_nothing, read_cli_journeys_invocation::an_explicit_path_wins_over_the_bootstrap_database_path_variable -->
+<!-- enforced by: read_cli_journeys_invocation::a_former_behavior_environment_alias_changes_nothing_and_says_nothing, read_cli_journeys_invocation::an_explicit_path_wins_over_the_bootstrap_database_path_variable, crates/contextdb-engine/src/persistence/reader_registration_privacy_tests.rs::reader_data_home_uses_effective_user_when_home_is_unset -->
 
 #### Reading routes
 
 The first store-reading command resolves how this session reads (`.help`, `.trace`, `.quit`,
 `.exit`, `.sync status`, and `.owner status` never resolve a route). At route selection the CLI
-emits exactly one structured notice on stderr, and the route never changes within the session:
+emits a structured notice on stderr after that command. It emits another notice whenever the
+selected route or committed snapshot LSN changes; an unchanged selection is announced only once:
 <!-- enforced by: read_cli_journeys_session_shape::the_route_notice_is_emitted_once_on_stderr_at_the_first_store_reading_command, read_cli_journeys_session_shape::session_only_commands_never_resolve_a_route -->
 
 ```json
-{"notice":{"class":"io","message":"…","detail":{"kind":"read_route","route":"file","snapshot_at":"2026-08-16T09:30:12Z"}}}
+{"notice":{"class":"io","message":"…","detail":{"kind":"read_route","route":"file","snapshot_lsn":42,"snapshot_at":"2026-08-16T09:30:12Z"}}}
 ```
 
 `route` is `file` (a direct read of the committed snapshot) or `owner` (a live process owns the
 store and serves this session over its authenticated local channel — same commands, same
-shapes). On the file route `snapshot_at` states the committed-snapshot moment this session
-serves — a long-open read terminal is a snapshot, not a live view; on the owner route it is
-`null` (an owner serves live committed state). <!-- enforced by: read_cli_journeys_session_shape::the_route_notice_is_emitted_once_on_stderr_at_the_first_store_reading_command, read_cli_journeys_session_shape::session_only_commands_never_resolve_a_route --> If the owner
-disappears mid-session the statement fails with `owner_disconnected`, nothing of that result is
-published, and the session never silently falls back to the file; a new invocation routes
-afresh. <!-- enforced by: read_cli_journeys_live_owner::a_vanished_owner_fails_the_session_visibly_and_never_rereads_the_file, read_cli_journeys_live_owner::a_fresh_invocation_after_the_owner_leaves_reads_the_idle_file -->
+shapes). On the file route `snapshot_lsn` identifies the committed snapshot, and `snapshot_at`
+states when it was selected. The LSN names its committed read frontier. Both fields are
+`null` on the owner route, which serves live committed state.
+Later commands follow returning writers within the same store incarnation and announce their
+new selection. An already open cursor keeps the snapshot it captured. If a statement loses its
+owner while running and cannot continue, the statement fails visibly without publishing a
+partial result; later commands select the current route within their routing allowance.
+<!-- enforced by: read_cli_journeys_route_changes::a_reading_shell_reports_its_route_again_each_time_its_writer_leaves_or_returns -->
 
 Two liveness notices share the `--read-hydration-notice-ms` threshold (default 1 s), both on
 stderr so `--json` stdout stays pure: while the first read is still loading the store, a
@@ -128,6 +129,7 @@ Every meta-command emits a document whose top-level key names its payload:
 | `.schema <table>` | `{"schema":{"table":…,"columns":[…],"primary_key":[…],"indexes":[…],…,"ddl":…}}` — the full declared contract, namespaced |
 | `.events status` | `{"events_status":{"items":[…],"has_more":bool,"continuation":"…"\|null}}` <!-- enforced by: read_cli_journeys_metadata::tables_under_json_is_a_namespaced_page_document, read_cli_journeys_metadata::events_status_pages_under_its_own_namespaced_key, read_cli_journeys_metadata::tables_resumes_through_its_own_continuation_until_exhausted, read_cli_journeys_metadata::a_human_metadata_page_prints_the_exact_follow_up_command, read_cli_journeys_metadata::a_continuation_is_refused_by_a_command_that_did_not_issue_it, read_cli_journeys_metadata::a_complete_metadata_response_that_does_not_fit_refuses_with_the_setting_that_would --> |
 | `.maintenance status` | `{"maintenance":{…}}` |
+| `.verify history <table>` | `{"verify_history":{"table":…,"indexes":[{"index":…,"postings":n,"versions":n}]}}` <!-- enforced by: read_cli_journeys_metadata::verify_history_checks_each_historical_index_from_a_read_session --> |
 | `.explain <sql>` | `{"explain":{"physical_plan":…,"runtime_trace":true|false,…}}` |
 | `.cursor open` / `.cursor fetch` | `{"cursor":{"columns":[…],"rows":[…],"has_more":bool}}` <!-- enforced by: read_cli_journeys_cursor::a_first_page_carries_its_columns --> |
 | `.cursor close` | `{"cursor":{"closed":true}}` |
@@ -249,6 +251,8 @@ A `--write` session may use the cursor while no transaction is open; `.cursor op
 active transaction refuses with `cursor_transaction_active` without disturbing the transaction.
 <!-- enforced by: read_cli_journeys_cursor::a_write_session_may_page_outside_a_transaction_but_not_inside_one -->
 
+A cursor you opened while the writer was running keeps its results after the writer stops; it uses the memory you gave the reader, not the writer's.
+
 #### Metadata: bounded and resumable
 
 `.tables` and `.events status` return as many complete items as fit in `result_bytes`, plus
@@ -280,12 +284,14 @@ document whose detail names `result_bytes`, `required_bytes`, and `required_sett
 `effective result_bytes >= <required_bytes>`. A single `.tables`/`.events status` item that
 cannot fit even an empty page refuses the same way — never a partial or oversized page. Both
 routes have identical shapes, continuation mechanics, and refusal fields. Consistency across
-pages differs by route: reading an idle file, your whole session is one fixed snapshot, so pages
-are always mutually consistent; reading through a live owner, each page reads current committed
+pages differs by route: reading an idle file, metadata pages use the selected committed snapshot and
+are mutually consistent while that committed file is unchanged; reading through a live owner, each page reads current committed
 state in stable item order — an item never appears on two pages, an item that existed unchanged
 throughout is never skipped, and an item created or dropped between pages may or may not appear
 (as psql's catalog listings behave under concurrent DDL).
 <!-- enforced by: read_cli_journeys_metadata::tables_under_json_is_a_namespaced_page_document, read_cli_journeys_metadata::events_status_pages_under_its_own_namespaced_key, read_cli_journeys_metadata::tables_resumes_through_its_own_continuation_until_exhausted, read_cli_journeys_metadata::a_human_metadata_page_prints_the_exact_follow_up_command, read_cli_journeys_metadata::a_continuation_is_refused_by_a_command_that_did_not_issue_it, read_cli_journeys_metadata::a_complete_metadata_response_that_does_not_fit_refuses_with_the_setting_that_would -->
+
+A reader keeps working while the writer restarts. If the writer is down, the reader answers from what was last saved. When the writer is back, the reader switches to it on its own. You never have to reopen a reader because the writer came and went. In the read shell you see a short line each time this happens, with the point in the data it is reading from.
 
 ### Declared limits
 
@@ -305,14 +311,7 @@ The simplest way to start — no server, no network:
 ```bash
 contextdb ./my.db          # read-only inspection of an existing store
 contextdb ./my.db --write  # create/mutate, persisted to file
-contextdb :memory:         # ephemeral writable scratch database, lost on exit
 ```
-
-`:memory:` is always writable: mutation, transaction control, and sync configuration work
-without `--write`, and an explicit `--write` is an accepted no-op. It creates no file, no
-companion, no owner channel, emits no route notice, and reports owner state `not_applicable`.
-Every `--read-*` and `--owner-read-*` flag, and `--no-owner-reads`, is invalid with `:memory:`
-(exit `2`). <!-- enforced by: read_cli_journeys_invocation::memory_store_is_writable_without_the_flag_and_accepts_the_flag_as_a_no_op, read_cli_journeys_invocation::read_and_owner_read_flags_are_invalid_with_a_memory_store, read_cli_journeys_invocation::memory_store_emits_no_route_notice_and_reports_owner_state_not_applicable -->
 
 ### Sync Mode
 
@@ -321,9 +320,8 @@ edge enrollment, exactly as before. A read session's `.sync status` prints exact
 this session — this reports the CLI session only, not the store; a live owner's sync state
 belongs to that owner process.` <!-- enforced by: read_cli_journeys_session_shape::read_mode_sync_status_reports_the_session_and_disclaims_the_store -->
 
-For a file-backed edge, a bare pasted ticket uses the durable adjacent identity at
-`<canonical-db-path>.fabric-identity.key`; an explicit `identity=<key-file>` always wins. A
-memory-backed edge must name an explicit persisted identity in its endpoint. If the endpoint is
+For an edge, a bare pasted ticket uses the durable adjacent identity at
+`<canonical-db-path>.fabric-identity.key`; an explicit `identity=<key-file>` always wins. If the endpoint is
 down, sync prints one clear warning line rather than failing hard.
 
 ### Logging
@@ -439,6 +437,13 @@ Every statement ends with a `;`; pressing Enter before one continues the stateme
 returns to the prompt with the session and any open cursor intact; Ctrl-C at an idle prompt
 clears the typed line; Ctrl-D or `.quit` ends the session. <!-- enforced by: read_cli_journeys_cancellation::interrupting_a_running_statement_returns_to_the_prompt_with_the_session_alive, read_cli_journeys_cancellation::interrupting_at_an_idle_prompt_clears_the_typed_line, read_cli_journeys_cancellation::an_open_cursor_survives_the_interruption -->
 
+A reader can use `SET READ_CACHE_SHARE 40` (or `SET READ_CACHE_SHARE = 40`),
+`SET READ_CACHE_SHARE DEFAULT`, and `SHOW READ_CACHE_SHARE` without `--write`.
+The declaration changes this session's file cache immediately; it is not persisted.
+SHOW includes the declared/effective share, the last refusal and advisory last-query residency.
+Null means no pages were measured. Percentages must be integers from 0 through 100; admission
+can refuse a valid percentage while keeping the previous declaration.
+
 Runtime budget control is SQL-driven and classified like everything else: `SHOW MEMORY_LIMIT` /
 `SHOW DISK_LIMIT` are reads; `SET MEMORY_LIMIT '512M'` / `SET DISK_LIMIT '1G'` are writes and
 need a `--write` session. <!-- enforced by: read_cli_journeys_invocation::a_reading_session_refuses_every_mutating_statement_before_it_executes, read_cli_journeys_invocation::writer_only_meta_commands_are_refused_in_a_reading_session --> Input that does not parse as any
@@ -467,6 +472,7 @@ Paste a meta-command's whole invocation, including any SQL argument, on one line
 | `.trace on` / `.trace off` | | session | Toggle one-line execution traces. |
 | `.events status [--continue <c>]` | | read | Bounded, resumable event/sink/route/schedule health. |
 | `.maintenance status` | | read | One complete bounded maintenance-state response. |
+| `.verify history <table>` | | read | Check every historical index of a table against its row versions; refuses with `StoreCorrupted` on the first disagreement. |
 | `.maintenance run` / `.maintenance compact` | | **write** | Run one synchronous maintenance cycle / explicitly drain file compaction. |
 | `.cursor open/fetch/close` | | read | Bounded traversal beyond an ordinary-result ceiling. |
 | `.owner status` | | status | Owner policy and state; works at capacity. |
@@ -494,7 +500,7 @@ caller-driven`, which starts no background worker and leaves scheduling to this
 command. An idle file-backed store prints one line of counters:
 
 ```text
-pruned_rows=0 rows_deferred_for_readers=0 currency_pruned_versions=0 pruned_trigger_audit_rows=0 auto_compact_ran=true vector_built_indexes=0 vector_remaining_indexes=0 vector_nonempty_partitions=0 vector_ready_partitions=0 vector_built_partitions=0 vector_remaining_partitions=0 vector_first_failure=none vector_failure_operation=none vector_failure_requested_bytes=none vector_failure_available_bytes=none vector_failure_current_bytes=none vector_failure_budget_limit_bytes=none vector_failure_message=none vector_failure_recovery_action=none vector_failure_recovery_instruction=none
+pruned_rows=0 rows_deferred_for_readers=0 currency_pruned_versions=0 pruned_trigger_audit_rows=0 auto_compact_ran=true vector_built_indexes=0 vector_remaining_indexes=0 vector_nonempty_partitions=0 vector_ready_partitions=0 vector_built_partitions=0 vector_remaining_partitions=0 vector_first_failure=none vector_failure_operation=none vector_failure_requested_bytes=none vector_failure_available_bytes=none vector_failure_current_bytes=none vector_failure_budget_limit_bytes=none vector_failure_message=none vector_failure_recovery_action=none vector_failure_recovery_instruction=none auto_compact_fragmentation_before=unknown compaction_policy=start_ratio:0.5(default),min_interval_ms:3600000(default),stop_ratio:0.05(default),max_sweeps:8(default)
 ```
 
 `--json` emits one `maintenance_cycle` document with those same facts as named
@@ -503,6 +509,35 @@ fields (`pruned_rows`, `rows_deferred_for_readers`, `reclaimed_bytes`,
 `currency_redb_compacted`, `pruned_trigger_audit_rows`, `vector`, `compaction`).
 Compaction byte counts and duration depend on the file.
 <!-- enforced by: read_cli_journeys_ordinary_results::maintenance_run_and_status_publish_their_text_receipts_through_the_real_cli -->
+
+A compaction receipt's `fragmentation_before` is the share of the file a tidy-up could give
+back by moving pages: interior free pages over the pages a trim would leave. Both the automatic
+path and `.maintenance compact` report this one quantity, and automatic compaction starts when
+it reaches the declared start ratio (0.5 by default; see `SET STORAGE_COMPACTION` in the query
+language reference). `.maintenance compact` also reports `page_slack_ratio`: the share of bytes
+inside live pages that hold no data, from an exact walk of the file. Compaction moves whole
+pages and does not repack them, so that slack is not given back; it is `unknown` (JSON `null`)
+when the walk failed, and always JSON `null` in `.maintenance run`'s `compaction` document. When nothing was measured, the field is unknown:
+JSON `null`, text `fragmentation_before=unknown` (`auto_compact_fragmentation_before=unknown` in
+the `.maintenance run` line). That covers a cycle with no check due, a store whose allocator
+totals are not trusted, and a failed measurement. A check that found the
+file below the start ratio reports what it measured. Every later batch of a sweep reports the
+measurement that sweep started on, so a sweep that started unmeasured stays unknown until it
+completes, across reopen. It is never reported as 0.
+<!-- enforced by: storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::untrusted_free_page_totals_report_unknown_fragmentation_and_take_no_decision, storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::an_unknown_measurement_stays_unknown_when_an_interrupted_sweep_resumes, read_cli_journeys_ordinary_results::maintenance_run_and_status_publish_their_text_receipts_through_the_real_cli -->
+
+Each compaction receipt also names the storage compaction policy that governed it. JSON carries
+a `policy` object under `compaction`, mapping each setting to its `value` and `source`
+(`declared` or `default`). Text carries one `compaction_policy=` token, for example
+`compaction_policy=start_ratio:0.5(default),min_interval_ms:3600000(default),stop_ratio:0.05(default),max_sweeps:8(default)`.
+<!-- enforced by: storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::every_maintenance_receipt_names_the_policy_that_governed_it, read_cli_journeys_ordinary_results::maintenance_run_and_status_publish_their_text_receipts_through_the_real_cli -->
+
+`.maintenance status` adds a `storage_compaction` list. Each entry is a `setting`, `value` and
+`source`; `source` is `declared` or `default`. The text form adds one line, for example
+`storage_compaction start_ratio=0.5(default) min_interval_ms=3600000(default) stop_ratio=0.05(default) max_sweeps=8(default)`.
+Both read routes show the same declaration and sources: the committed file when no writer is
+open, and the live owner when one is.
+<!-- enforced by: read_cli_journeys_metadata::maintenance_status_and_explain_keep_their_own_document_keys, read_cli_journeys_metadata::a_declared_storage_compaction_shows_its_source_through_both_read_routes -->
 
 ### Trace vs Explain
 
@@ -561,6 +596,27 @@ Four things the printed DDL does not reproduce literally, and what to read inste
   neither the printed DDL nor `--json` names this column today, so replaying `.schema` output
   alone silently drops the narrowing.
 
+### `.verify history` — check a table's historical indexes
+
+A historical index answers a read at an older snapshot from its postings alone, so its postings
+must cover exactly what the row versions cover. Every write commits to both, and a read at an
+older snapshot already refuses a commitment that does not authenticate. `.verify history <table>`
+runs the full check: it recomputes both sides from every stored posting and row version, checks
+that no row's postings overlap or touch and no row's versions overlap, and requires the result
+to match the published commitment. It works in a read session, visits every posting and row
+version once, and refuses with `StoreCorrupted` (exit code 1) naming the first disagreement.
+
+```bash
+db="$(mktemp -d)/history.db"
+printf "%s\n" \
+  "CREATE TABLE tagged (id INTEGER PRIMARY KEY, tag TEXT) HISTORY ALL;" \
+  "CREATE INDEX tagged_by_tag ON tagged (tag);" \
+  "INSERT INTO tagged VALUES (1, 'a');" \
+  "UPDATE tagged SET tag = 'b' WHERE id = 1;" | contextdb "$db" --write --json > /dev/null
+echo ".verify history tagged" | contextdb "$db" --json
+# {"verify_history":{"table":"tagged","indexes":[…,{"index":"tagged_by_tag","postings":2,"versions":2}]}}
+```
+
 ### Vector inspection and recovery
 
 Use SQL `SHOW VECTOR_INDEXES` to inspect a vector column as a whole. It keeps the familiar
@@ -601,109 +657,16 @@ INSERT INTO vector_items VALUES (1, 10, '[1,0,0]'), (2, 20, '[0,1,0]');
 SQL
 ```
 
-A populated caller-driven result is immediately actionable; for example, a summary can report
-`vector_count=120`, `bytes=44064`, `charged_vector_bytes=15360`,
-`charged_index_bytes=28704`, `pending_inserts=3`, `tombstones=2`,
-`query_state=ready`, `maintenance_state=idle`, `broad_route=fanout`, and
-`broad_route_state=ready`. Its partition row can report
-`partition_key={"context_id":"camera-17"}`, `base_generation=4`, `base_tx=891`, the same pending
-counts for that route, `maintenance_reason=tombstones`, and
-`recovery_action=run_maintenance_cycle`. The compatibility `bytes` value is exactly
-`15360 + 28704`; durable byte columns are separate file-storage facts and are zero for an
-in-memory database.
+This release ships exact vector search only. `AUTO` and `EXACT` compare allowed stored vectors within active budgets. `INDEXED` returns `VectorIndexedRouteUnavailable`; the clustered index is switched off. Index policy declarations do not enable construction, maintenance or indexed serving.
+<!-- enforced by: a_search_is_exact_with_no_index_built::an_auto_find_answers_exactly_after_commit_with_no_maintenance, a_search_is_exact_with_no_index_built::indexed_is_refused_at_every_door, a_search_is_exact_with_no_index_built::no_cycle_or_commit_builds_or_writes_an_index, a_search_is_exact_with_no_index_built::declared_index_policy_is_recorded_and_has_no_effect -->
 
-Rows are in stable `(table, column, canonical_partition_key)` order. Each reports its key, live and
-retained rows, serving base generation/transaction, tail and tombstone counts, durable and charged
-bytes, availability, maintenance state and progress checkpoint, and a recovery action. The empty
-key `{}` is the one unpartitioned layout; it appears even before its first vector. An empty
-partitioned column has no detail row until a key tuple receives a vector.
-
-`broad_route` is `fanout` when a broad filter searches the eligible partitions separately and `maintained` when it uses the maintained broad route. `broad_route_state` is `ready`, `partial`, or `unavailable`; `partial` reports maintained-route build progress and never permits a partial answer.
-
-`query_state` is `empty`, `ready`, or `unavailable` for a layout; the whole-index view can also say
-`partial`. A layout's `maintenance_state` is `idle`, `building`, `replaying`, `compacting`,
-`repairing`, or `stalled`. The whole-index summary is `idle` when every layout is idle; it reports
-`building`, `replaying`, `compacting`, or `repairing` only when all non-idle work has that one state;
-it reports `active` when several non-stalled activities coexist, `stalled` only when every busy
-layout is stalled, and `mixed` when stalled and live work coexist. Per-partition inspection reports
-desired topology (`desired_hnsw_m`, `desired_hnsw_ef_construction`) separately from the complete
-serving graph (`serving_hnsw_m`, `serving_hnsw_ef_construction`) and their policy revisions.
-`desired_hnsw_ef_search` is the current query policy resolved for inspection (`k = 1`);
-`serving_hnsw_ef_search` reports that same current breadth when a serving graph exists, and is
-`NULL` without one. It is not a frozen build setting. An actual query resolves breadth at its own
-`k`: explicit `EF_SEARCH` is raised only to `k`, while omission uses at least the profile and
-`10 * k`. Query-only changes therefore need not advance `serving_policy_revision`, which identifies
-the graph's build. A pending topology replacement remains visible in the desired/serving values. The response uses stable
-words, not free-form errors:
-
-- `availability_reason` is `none`, `initial_build`, `replay`, `corrupt_base`,
-  `corrupt_changes`, `incompatible_format`, `resource_stalled`, or `build_failure`.
-- `maintenance_reason` is `none`, `initial_build`, `new_changes`, `tombstones`, `corrupt_base`,
-  `corrupt_changes`, `incompatible_format`, `memory_limit`, `disk_limit`, or `build_failure`.
-- `recovery_action` is `none`, `wait_for_automatic_work`, `run_maintenance_cycle`,
-  `raise_memory_limit`, `raise_disk_limit_or_free_space`, or `inspect_build_failure`.
-
-`corrupt_base` identifies the serving-base artifact; `corrupt_changes` identifies committed changes
-after that base. A healthy, caught-up layout reports `maintenance_state=idle`, both reasons as
-`none`, and `recovery_action=none` under either maintenance policy. Real initial-build,
-`new_changes`, tombstone, replay, corruption, or incompatible-format work reports
-`wait_for_automatic_work` under engine-owned maintenance and `run_maintenance_cycle` under
-caller-driven maintenance (the CLI spelling is `.maintenance run`). A failed reservation or build
-overrides that policy advice with the action that can clear it: `memory_limit` maps to
-`raise_memory_limit`, `disk_limit` maps to `raise_disk_limit_or_free_space`, and `build_failure`
-maps to `inspect_build_failure`. These failure facts remain visible until a successful publication
-clears them or a policy change removes the work that failed.
-
-`.maintenance run` reports the vector counters from that cycle in text and under
-`maintenance_cycle.vector` in JSON: built and remaining indexes, plus nonempty, ready, built, and
-remaining partitions, and `first_failure` (`null` when every attempt succeeded). A partition-local
-failure does not discard successful counts or skip cycle-closing reclamation, retirement, and
-automatic-compaction work. Engine-owned maintenance is the default and polls every 60 seconds unless
-the database's persisted interval is changed with `SET MAINTENANCE_POLL_INTERVAL` or
-`--maintenance-poll-ms`. Each wake samples the finite backlog and advances every needy partition
-sequentially within the declared memory and work limits, with never-built partitions before
-previously built repair or consolidation work. There is no separate per-wake partition-count cap:
-the work is finite because the wake uses one fixed candidate sample. Caller-driven mode starts no maintenance thread; each
-`.maintenance run` applies that same all-needy sampled cycle. New writes or a resource refusal can
-still leave work for a later cycle.
-
-When `first_failure` is present, the text receipt and JSON `first_failure_details` retain a safe
-operation, message, recovery instruction, and the requested, available, current, and limit byte
-fields that apply. A memory refusal points to `SET MEMORY_LIMIT <SIZE>` or `--memory-limit <SIZE>`;
-a disk refusal points to `SET DISK_LIMIT <SIZE>`, `--disk-limit <SIZE>`, or freeing disk space.
-
-Inspection only reads lifecycle metadata: it never loads an evicted graph, replays a tail, builds a
-route, or starts repair. It reports current local lifecycle state and recovery advice.
-
-These `SHOW VECTOR_*` commands require the existing unrestricted admin database handle. A narrowed
-handle is refused rather than receiving partial totals. Use `.explain` for that caller's redacted
-route instead. Restricted explanations omit per-partition adaptive HNSW values as well as hidden
-keys and populations. Unrestricted explanations pair the snapshot's serving topology/build revision
-with the query's current `EF_SEARCH`; a stale build revision does not imply stale search breadth.
-When a partition limit blocks a write, raise it with `ALTER TABLE ... ALTER COLUMN
-... SET MAX_PARTITIONS ...`; lowering below live-plus-retained use is refused until retained
-snapshots finish.
-
-`SET MEMORY_LIMIT 2G` and CLI `--memory-limit 2G` both resolve to **2147483648 bytes**.
-`SHOW MEMORY_LIMIT` reports the resolved limit; it counts charged memory, which is separate from
-whole-process RSS. Under pressure, idle vector graphs are reclaimed in least-recently-used order
-only until the selected graph's complete load fits. Without `SET MEMORY_LIMIT` or
-`--memory-limit`, loaded graphs remain resident.
+Use `SHOW VECTOR_INDEXES` and `SHOW VECTOR_PARTITIONS` for the declared columns and local partition inventory. They do not activate an index.
+<!-- enforced by: a_search_is_exact_with_no_index_built::an_auto_find_answers_exactly_after_commit_with_no_maintenance, a_search_is_exact_with_no_index_built::indexed_is_refused_at_every_door, a_search_is_exact_with_no_index_built::no_cycle_or_commit_builds_or_writes_an_index, a_search_is_exact_with_no_index_built::declared_index_policy_is_recorded_and_has_no_effect -->
 
 ### Vector column policy
 
-Use SQL to declare or change a vector column's `AUTO_INDEX_AT`, HNSW, and `CONSOLIDATION` policy;
-`CONSOLIDATION` controls when maintenance rebuilds a healthy graph, and its rules and defaults are
-in [Vector Similarity Search](query-language.md#vector-similarity-search). Foreground vector writes
-remain searchable while construction runs.
-`AUTO_INDEX_AT` and `EF_SEARCH` affect newly opened queries without a graph rebuild; changing `M`
-or `EF_CONSTRUCTION` schedules a replacement while the previous complete graph serves. The
-declarations persist with the schema. `SHOW VECTOR_INDEXES` and `SHOW VECTOR_PARTITIONS` expose
-declared, desired, and serving policy values and revisions. Their `declared_consolidation_mode` is
-`NULL` for a silent declaration, `thresholds` for explicit percentages, and `none` for explicit
-`CONSOLIDATION NONE`; the effective mode remains `thresholds` or `none`. See
-[Vector Similarity Search](query-language.md#vector-similarity-search) for canonical declarations,
-`ALTER ... SET ...` forms, default/silence rules, and numeric defaults.
+Use SQL to retain a vector column's `AUTO_INDEX_AT`, `SEARCH`, `IVF`, and `CONSOLIDATION` declarations; these do not activate an index in this release. See [Vector Similarity Search](query-language.md#vector-similarity-search) for syntax.
+<!-- enforced by: a_search_is_exact_with_no_index_built::declared_index_policy_is_recorded_and_has_no_effect -->
 
 ### Sync Commands (write sessions)
 
@@ -735,7 +698,6 @@ row-reading route and stays usable when every reader slot is occupied:
 | Owner serving | `serving` | 0 |
 | Deliberately disabled (`--no-owner-reads`) | `serving_disabled` + reason | 0 |
 | Expected to serve but cannot | `not_serving` + reason | 1 |
-| `:memory:` | `not_applicable` | 0 |
 | Windows | `not_applicable` + reason `platform_unsupported` | 0 |
 
 Windows has no local owner channel: a store held by a live writer cannot be inspected there —
@@ -751,11 +713,12 @@ the writer's `--owner-read-concurrency`. No queue forms. An open owner cursor ho
 its lifetime; direct readers have no owner slot ceiling. <!-- enforced by: read_cli_journeys_live_owner::owner_status_reports_the_serving_owner_as_control_data -->
 
 The channel lives in the per-user runtime directory (`$XDG_RUNTIME_DIR/contextdb`, with
-`/run/user/<uid>` as the systemd fallback; `--owner-read-runtime-dir` overrides — required for
-containers and packaged services). That one directory serves BOTH sides: give the same
+`/run/user/<uid>` as the systemd fallback). Headless Linux and containers without either
+use an automatically prepared private directory beneath the effective user’s data home; no
+runtime-folder setup is required. `--owner-read-runtime-dir` is an optional override. That one directory serves BOTH sides: give the same
 `--owner-read-runtime-dir` (or `CONTEXTDB_OWNER_READ_RUNTIME_DIR`) to a reading session and it
 looks for the channel exactly where the writer put it.
-<!-- enforced by: read_cli_journeys_runtime_root::a_reader_given_the_writer_s_runtime_root_reaches_the_owner -->
+<!-- enforced by: read_cli_journeys_runtime_root::a_reader_given_the_writer_s_runtime_root_reaches_the_owner, local_transport_runtime::linux_process_fallback_is_derived_from_the_effective_uid_not_the_request, crates/contextdb-engine/src/persistence/reader_registration_privacy_tests.rs::reader_data_home_uses_effective_user_when_home_is_unset -->
 Owner-channel startup failure never fails the database open:
 the writer keeps running and reports `not_serving` with one startup warning. Two distinct names
 for the two sides of that situation: `not_serving` is the serving STATE on the owner's own
@@ -764,7 +727,8 @@ tries to reach that owner — scripts branch on each in its own place.
 <!-- enforced by: read_cli_journeys_live_owner::owner_status_reports_the_serving_owner_as_control_data -->
 
 Reader breadcrumbs, retained-snapshot registrations, and erasure fences use the platform per-user
-directory when it is available; in a container without one, they use the supplied directory.
+directory when it is available; headless Linux also discovers the private data-home fallback.
+An explicitly supplied directory participates in discovery too.
 A participant also inventories the supplied directory when configured, so a reader and writer
 using different channel directories still coordinate over the same physical database through the
 platform directory when it is available. Purge publication reaches every known candidate
@@ -772,8 +736,8 @@ directory. An empty candidate directory alone never
 proves that there are no readers. If a candidate directory cannot be authenticated, reclamation
 or purge refuses with a typed reader-coordination error naming that directory; channel startup
 failure alone leaves the database open and reports `not_serving`.
-In a container without a platform runtime directory, the reader and writer may supply different
-channel directories. A direct reader keeps a byte-free advisory presence lock on the database
+If neither a platform runtime nor a secure data-home fallback is available, the reader and writer
+may supply different channel directories. A direct reader keeps a byte-free advisory presence lock on the database
 file after its initial load lock releases. If the writer sees that lock but cannot find the
 reader's registration in any runtime directory it knows, ordinary opens and commits remain
 available with a conservative retention floor. Explicit storage reclamation and authoritative
@@ -798,7 +762,7 @@ contextdb-server --tenant-id <TENANT_ID> [OPTIONS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--db-path <PATH>` | `:memory:` | Database file path (env bootstrap alias: `CONTEXTDB_DB_PATH`, flag wins). A `:memory:` server serves sync but never a local owner-read channel. <!-- enforced by: read_cli_journeys_invocation::memory_store_is_writable_without_the_flag_and_accepts_the_flag_as_a_no_op, read_cli_journeys_invocation::read_and_owner_read_flags_are_invalid_with_a_memory_store, read_cli_journeys_invocation::memory_store_emits_no_route_notice_and_reports_owner_state_not_applicable --> |
+| `--db-path <PATH>` | *(required)* | Database file path (env bootstrap alias: `CONTEXTDB_DB_PATH`, flag wins). The server refuses to start without one. |
 | `--sync-endpoint <SPEC>` | *(auto)* | `iroh:?identity=<key-file>[&port=<u16>][&relay=…][&relay-ca=…][&publish=…][&lookup=…]` — transport identity and routing only. |
 | `--response-staging-bytes <N>` | unlimited | Durable unfinished-response storage bound. |
 | `--pre-admission-connections <N>` | 128 | Incoming connection/handshake task bound. |
@@ -846,7 +810,7 @@ a non-interactive agent. <!-- enforced by: read_cli_journeys_session_shape::a_pi
   process exits `1` if any statement suffered a runtime refusal
 
 ```bash
-echo "SELECT 1 + 1;" | contextdb :memory:
+echo "SELECT 1 + 1;" | contextdb ./my.db --write
 contextdb ./my.db --write < schema.sql
 echo "SELECT * FROM t;" | contextdb ./my.db && echo "OK" || echo "FAILED"
 ```
@@ -870,7 +834,9 @@ nobody can act on it once the process is gone.
 
 A script continues after a refused statement, including a memory or disk refusal. Independent
 statements still run. `SHOW MEMORY_LIMIT` / `SET MEMORY_LIMIT` and `SHOW DISK_LIMIT` /
-`SET DISK_LIMIT` remain available to inspect and raise an exhausted limit, but successful recovery
+`SET DISK_LIMIT` accept optional `=` and remain available to inspect and raise an exhausted limit.
+`SET READ_CACHE_SHARE [=] <percent> | DEFAULT` and `SHOW READ_CACHE_SHARE` also remain available
+to adjust or inspect this session's file cache without a writable store. Successful recovery
 does not erase the earlier error: that scripted run still exits `1`.
 <!-- enforced by: read_cli_journeys_script_continuation::a_memory_refusal_is_followed_by_independent_work_and_recovery, read_cli_journeys_script_continuation::a_disk_refusal_is_followed_by_independent_work_and_recovery, read_cli_journeys_script_continuation::a_refusal_through_the_translated_sync_inspection_route_still_continues -->
 
@@ -887,15 +853,15 @@ teaching its recovery: <!-- enforced by: read_cli_journeys_machine_surface::ever
 | `write_requires_flag` | sql | A read session got a mutating statement/command; add `--write`. |
 | `store_not_found` | io | The store does not exist; `--write` creates it. |
 | `held_by_writer` | io | A writer owns the store; a read session (drop `--write`) reaches its channel. The refusal names the store in `store_path` and, when the holder has published a record about itself, the holding process in `process_id`. |
-| `held_by_readers` | io | Readers hold the file during hydration; the refusal lists them or says to retry in a moment. |
-| `owner_not_running` | io | Rust `request_owner` was called on a direct-file route. |
+| `held_by_readers` | io | The caller's expired writer-open deadline ended admission while starting readers held the snapshot-selection window; includes the real observed reader count and identifiable names. |
+| `owner_not_running` | io | No writer is running for this store right now. |
 | `owner_not_serving` | io | A writer holds the store but has no usable inspection channel — including a writer that has claimed the store and not published its serving decision inside the caller's declared deadlines, or a draining owner that released the requested cursor/page before delivery. |
 | `owner_user_mismatch` | io | The owner belongs to a different operating-system user. |
 | `owner_mismatch` | io | The responder does not own this database/run. |
 | `owner_at_capacity` | io | Every reader slot is occupied; retry, close a session, or raise `--owner-read-concurrency`. |
 | `owner_limit_exceeded` | io | A read ceiling was crossed; carries `limit`, the ceiling in `value`, the refused `statement`, and the route-aware remedy. |
 | `owner_timeout` | io | A connected owner missed a configured deadline. |
-| `owner_disconnected` | io | The owner disappeared mid-session; no partial result; start a new invocation. |
+| `owner_disconnected` | io | The in-flight statement or cursor aborts. The next command on the same session reads the committed file image or follows a returning writer. |
 | `invalid_channel_data` | io | A malformed or oversized local frame. |
 | `local_protocol_mismatch` | io | Caller and owner use different local protocol versions. |
 | `invalid_continuation` | usage | A continuation was malformed or given to a command that did not issue it. |

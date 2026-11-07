@@ -13,10 +13,11 @@ use tempfile::tempdir;
 fn show_ticket_json_emits_structured_object() {
     let root = tempdir().expect("temporary ticket directory");
     let ticket_file = root.path().join("enrollment.ticket");
+    let db_path = root.path().join("ticket.db").to_string_lossy().into_owned();
     let out = Command::new(env!("CARGO_BIN_EXE_contextdb-server"))
         .args([
             "--db-path",
-            ":memory:",
+            &db_path,
             "--tenant-id",
             "acme",
             "--show-ticket",

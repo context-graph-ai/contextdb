@@ -41,9 +41,8 @@ if '--plan-only' in sys.argv:
         decision = i.plan_decision('normal', False)
         planned = i.matrix(rows, False, 'normal', decision)
         selected = i.active_rows(rows, False, 'normal', decision)
-        assert len(selected) == 23
-        assert not {'engine-family-10', 'engine-family-11', 'engine-family-13',
-                    'engine-family-14'} & {r['id'] for r in selected}
+        assert len(selected) == 22
+        assert not {'engine-family-10', 'engine-family-11', 'engine-family-13'} & {r['id'] for r in selected}
         owner = next(r for r in selected if r['id'] == 'engine-family-1')
         assert i.commands(owner, mode='normal')[0][-1] == '--no-run'
         needs = dict(plan=dict(result='success', outputs=dict(enabled='true', matrix=json.dumps(planned), **decision)), slice=dict(result='success'))
@@ -62,7 +61,7 @@ if '--plan-only' in sys.argv:
         with patch.object(i, 'normal_dedup_certificate', return_value=off):
             disabled = i.plan_decision('normal', False)
         fallback = i.active_rows(rows, False, 'normal', disabled)
-        assert len(fallback) == 27
+        assert len(fallback) == 25
         executed = [t for row in fallback for t in row['targets']]
         assert all(executed.count(t) == 1 for t in i.NORMAL_DEDUP_TARGETS)
         for row in fallback:
@@ -90,10 +89,76 @@ if '--plan-only' in sys.argv:
             with tempfile.TemporaryDirectory() as tmp:
                 assert i.run_slice(broken, Path(tmp) / 'refused', 'normal') == 1
                 assert (Path(tmp) / 'refused/receipt.json').is_file()
+        # Complete classifications cross the per-environment-string limit via a file,
+        # while inactive integration retains the exact diagnostic and published plan.
+        sys.path.insert(0, str(ROOT / 'scripts'))
+        impact_spec = importlib.util.spec_from_file_location('impact', ROOT / 'scripts/ci-impact.py')
+        impact = importlib.util.module_from_spec(impact_spec)
+        impact_spec.loader.exec_module(impact)
+        paths = [f'docs/{n:04d}-' + 'x' * 128 + '.md' for n in range(1024)]
+        paths += ['docs/quoted-"-雪\n.md', '.gitignore', 'scripts/ci-performance.py']
+        expected_classes = {path: 'documentation-only' for path in paths[:-2]}
+        expected_classes.update({'.gitignore': 'maintainer-metadata',
+                                 'scripts/ci-performance.py': 'performance-only'})
+        assert len(json.dumps(expected_classes, ensure_ascii=True).encode()) > 128 * 1024
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            event = root / 'event.json'
+            event.write_text(json.dumps({'before': '1' * 40}))
+            classified_output = root / 'classified-output'
+            summary = root / 'summary'
+            env = dict(GITHUB_EVENT_PATH=str(event), GITHUB_OUTPUT=str(classified_output),
+                       GITHUB_STEP_SUMMARY=str(summary), RUNNER_TEMP=tmp)
+            classified_stdout = io.StringIO()
+            with patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(classified_stdout), patch.object(impact.subprocess, 'check_output', return_value=b'\0'.join(p.encode() for p in paths) + b'\0'):
+                impact.main()
+            assert json.loads(classified_stdout.getvalue())['path_impact'] == expected_classes
+            published = dict(line.split('=', 1) for line in classified_output.read_text().splitlines())
+            assert 'path_classes' not in published, 'complete path map must never be a GitHub output'
+            classes_file = Path(published['path_classes_file'])
+            assert classes_file.is_file() and classes_file.stat().st_size > 128 * 1024
+            assert json.loads(classes_file.read_text()) == expected_classes
+            assert published['integration_required'] == 'false'
+            assert all(len(value.encode()) < 128 * 1024 for value in published.values())
+            plan_output = root / 'plan-output'
+            env = dict(GITHUB_OUTPUT=str(plan_output), GITHUB_STEP_SUMMARY=str(summary),
+                       CI_GATE_MODE='normal', CI_INTEGRATION_DEFAULT='false',
+                       CI_INTEGRATION_ENABLED=published['integration_required'],
+                       IMPACT_REASON=published['impact_reason'],
+                       PERFORMANCE_QUALIFICATION=published['performance_qualification'],
+                       PATH_CLASSES_FILE=str(classes_file))
+            assert 'PATH_CLASSES' not in env and all(len(value.encode()) < 128 * 1024 for value in env.values())
+            plan_stdout = io.StringIO()
+            with patch.dict(os.environ, env, clear=True), patch.object(sys, 'argv', ['ci-integration.py', 'plan']), contextlib.redirect_stdout(plan_stdout):
+                assert i.main() == 0
+            reported = next(line.removeprefix('Path classes: ') for line in plan_stdout.getvalue().splitlines() if line.startswith('Path classes: '))
+            assert json.loads(reported) == expected_classes
+            assert 'Extended integration deliberately not required: ' + published['impact_reason'] in plan_stdout.getvalue()
+            assert 'All original PR checks remain required.' in plan_stdout.getvalue()
+            outputs = dict(line.split('=', 1) for line in plan_output.read_text().splitlines())
+            assert outputs['enabled'] == 'false'
+            assert json.loads(outputs['matrix']) == planned
+            assert json.loads(outputs['combined_matrix']) == i.combined_matrix(rows, False, decision)
+            assert not {'path_classes', 'path_classes_file'} & outputs.keys()
+            assert max(map(len, plan_output.read_text().splitlines())) < 128 * 1024
     i.workflow_contract()
     ci = (ROOT / '.github/workflows/ci.yml').read_text()
+    integration = (ROOT / '.github/workflows/integration.yml').read_text()
+    assert 'PATH_CLASSES:' not in ci + integration
+    assert 'outputs.path_classes }}' not in ci + integration
+    assert '      path_classes:\n' not in ci + integration
+    assert 'PATH_CLASSES_FILE: ${{ steps.classify.outputs.path_classes_file }}' in ci
+    assert 'path: ${{ steps.classify.outputs.path_classes_file }}' in ci
+    assert '      path_classes_artifact: ci-impact-${{ github.run_id }}-${{ github.run_attempt }}' in ci
+    assert '          name: ci-impact-${{ github.run_id }}-${{ github.run_attempt }}' in ci
+    assert '          if-no-files-found: error' in ci
+    assert '      path_classes_artifact:\n        type: string' in integration
+    assert 'uses: actions/download-artifact@' in integration
+    assert '          name: ${{ inputs.path_classes_artifact }}' in integration
+    assert '          path: ${{ runner.temp }}/ci-impact' in integration
+    assert "PATH_CLASSES_FILE: ${{ inputs.path_classes_artifact != '' && format('{0}/ci-impact/path-classes.json', runner.temp) || '' }}" in integration
     assert all(int(n) <= 30 for n in i.re.findall(r'timeout-minutes: (\d+)', ci))
-    print(f'Review17 plan fixtures PASS: valid→stale refuses before build with receipt; off→valid retains59/26; compile owner/dropped rows; {controls} mutation refusals; normal timeout caps.')
+    print(f'Routing fixtures PASS: valid→stale refuses before build with receipt; off→valid retains52/25; compile owner/dropped rows; {controls} mutation refusals; normal timeout caps; >128KiB exact file-backed classifications and artifact wiring.')
     sys.exit(0)
 
 if '--dedup-only' in sys.argv:
@@ -142,14 +207,13 @@ if '--dedup-only' in sys.argv:
             unrelated.write_text('const X: bool = cfg!(feature = "nightly-tests");')
             assert not i.normal_dedup_certificate(root)['targets']; controls += 1
             unrelated.unlink()
-            test_profile = {'CARGO_PROFILE_TEST_OPT_LEVEL': '1',
-                            'CARGO_PROFILE_TEST_DEBUG_ASSERTIONS': 'true',
-                            'CARGO_PROFILE_TEST_OVERFLOW_CHECKS': 'true'}
-            with patch.dict(os.environ, test_profile):
+            with patch.dict(os.environ, {'CARGO_PROFILE_TEST_DEBUG': '0'}):
                 assert i.normal_dedup_certificate(root)['targets']
             for flags in [{'RUSTFLAGS': '--cfg other'},
                           {'CARGO_PROFILE_TEST_OPT_LEVEL': '1'},
-                          dict(test_profile, CARGO_PROFILE_TEST_OPT_LEVEL='3')]:
+                          {'CARGO_PROFILE_TEST_OPT_LEVEL': '3'},
+                          {'CARGO_PROFILE_TEST_DEBUG_ASSERTIONS': 'true'},
+                          {'CARGO_PROFILE_TEST_OVERFLOW_CHECKS': 'true'}]:
                 with patch.dict(os.environ, flags): assert not i.normal_dedup_certificate(root)['targets']
                 controls += 1
             # Local-only regeneration refuses unequal case and ignored inventories.
@@ -162,10 +226,10 @@ if '--dedup-only' in sys.argv:
     rows = i.load_manifest()
     with patch.object(i, 'normal_dedup_certificate', return_value=dict(targets={}, reason='dedup disabled: stale certificate', fallback_targets=list(i.NORMAL_DEDUP_TARGETS))):
         fallback = i.active_rows(rows, False, 'normal')
-        assert len(fallback) == 27
+        assert len(fallback) == 25
         assert set(i.NORMAL_DEDUP_TARGETS) <= {t for row in fallback for t in row['targets']}
         for row in fallback: i.commands(row, mode='normal')
-    print(f'Review16 fixture controls PASS: local regeneration, conservative fallback, unchanged unrelated source, all59 fallback targets/26 physical slices; {controls} negative controls.')
+    print(f'Deduplication fixture controls PASS: local regeneration, conservative fallback, unchanged unrelated source, all52 fallback targets/25 physical slices; {controls} negative controls.')
     sys.exit(0)
 
 # Routing tests use the checked-in certificate as test data, never recertify a live tree.
@@ -175,11 +239,49 @@ i.normal_dedup_certificate = lambda *a, **k: dict(fixture_certificate, targets=f
 rows = i.load_manifest()
 i.workflow_contract()
 assert i.quarantine_contract() is None
-for path, case in list(i.QUARANTINE_EXCEPTIONS)[:2]:
+# The enabled saved-graph assertion cannot be ignored or lose its nightly route.
+source = ROOT / 'crates/contextdb-engine/tests/vector/indexed_route_does_less_work_than_exact.rs'
+original = source.read_text()
+read_text = Path.read_text
+case = 'single_context_saved_graph_auto_and_indexed_are_faster_than_exact'
+for mutation in [original.replace('fn ' + case, '#[ignore]\nfn ' + case),
+                 original.replace('fn ' + case, 'fn renamed_' + case)]:
+    with patch.object(Path, 'read_text', lambda p, *a, **kw: mutation if p == source else read_text(p, *a, **kw)):
+        reject(lambda: i.quarantine_contract())
+manifest = ROOT / 'scripts/ci-integration-targets.json'
+data = json.loads(manifest.read_text())
+data['slices'] = [row for row in data['slices'] if row['id'] != 'indexed-search-work-latency']
+with patch.object(Path, 'read_text', lambda p, *a, **kw: json.dumps(data) if p == manifest else read_text(p, *a, **kw)):
+    reject(lambda: i.load_manifest())
+for (path, case), reason in list(i.QUARANTINE_EXCEPTIONS.items())[:2]:
     source = ROOT / path
     original = source.read_text()
+    prefix = reason
+    assert prefix in original
     read_text = Path.read_text
-    with patch.object(Path, 'read_text', lambda p, *a, **kw: original.replace('CDB-160:', 'CDB-999:') if p == source else read_text(p, *a, **kw)):
+    with patch.object(Path, 'read_text', lambda p, *a, **kw: original.replace(prefix, 'unregistered ignore reason:') if p == source else read_text(p, *a, **kw)):
+        reject(lambda: i.quarantine_contract())
+# Every ignore, including a conditional declaration outside the extended suite,
+# must be registered exactly once and bound to its original test.
+source = ROOT / 'crates/contextdb-core/src/lib.rs'
+original = source.read_text()
+for attribute in ['#[ignore]', '#[ignore = "unregistered reason"]',
+                  '#[cfg_attr(feature = "test-seams", ignore = "unregistered reason")]']:
+    mutation = original + '\n#[test]\n' + attribute + '\nfn unregistered_ignored_case() {}\n'
+    with patch.object(Path, 'read_text', lambda p, *a, **kw: mutation if p == source else read_text(p, *a, **kw)):
+        reject(lambda: i.quarantine_contract())
+mutation = original + '\nmod nested { #[test] #[ignore = "unregistered inline"] fn inline_case() {} }\n'
+with patch.object(Path, 'read_text', lambda p, *a, **kw: mutation if p == source else read_text(p, *a, **kw)):
+    reject(lambda: i.quarantine_contract())
+with patch.object(i, 'OTHER_IGNORED_TESTS', i.OTHER_IGNORED_TESTS + i.OTHER_IGNORED_TESTS[:1]):
+    reject(lambda: i.quarantine_contract())
+path, case, reason = i.OTHER_IGNORED_TESTS[0]
+source = ROOT / path
+original = source.read_text()
+for mutation in [original.replace(reason, 'changed registered reason'),
+                 original.replace('fn ' + case, 'fn changed_' + case),
+                 original + '\n#[test]\n#[ignore = "' + reason + '"]\nfn ' + case + '() {}\n']:
+    with patch.object(Path, 'read_text', lambda p, *a, **kw: mutation if p == source else read_text(p, *a, **kw)):
         reject(lambda: i.quarantine_contract())
 # CI test/lint/full checkouts are depth 1. The runtime quarantine inventory must
 # inspect only checkout files, never ask Git for the frozen base object.
@@ -187,8 +289,8 @@ check_output = i.subprocess.check_output
 with patch.object(i.subprocess, 'check_output', lambda argv, *a, **kw: (_ for _ in ()).throw(AssertionError('runtime guard asked for git history')) if argv[:2] == ['git', 'show'] else check_output(argv, *a, **kw)):
     assert i.quarantine_contract() is None
     assert i.load_manifest()
-print(f'Quarantine guard PASS: CDB-154 baseline plus seven exact owner-approved rc2 attributes; {controls} mutation refusals.')
-for mode, default, count in [('normal', False, 23), ('full', False, 32), ('full', True, 36)]:
+print(f'Quarantine guard PASS: enabled saved-graph assertion and the existing purge baseline plus every ignore registered by exact path, name and reason; {controls} mutation refusals.')
+for mode, default, count in [('normal', False, 22), ('full', False, 26), ('full', True, 30)]:
     matrix = i.matrix(rows, default, mode)
     assert len(matrix['include']) == count
     selected = i.active_rows(rows, default, mode)
@@ -196,10 +298,8 @@ for mode, default, count in [('normal', False, 23), ('full', False, 32), ('full'
     targets = [t for row in selected if row['kind'] == 'engine-tests' for t in row['targets']]
     assert 'custody_schema_replay_bounded_contract' in targets
     assert 'vector_indexed_route_does_less_work_than_exact' in targets
-    assert 'vector_graph_route_profile_quality' in targets
     assert sum(row['kind'] == 'release-acceptance' for row in selected) == 3
     assert bool(set(targets) & i.FULL_SCHEMA) == (mode == 'full')
-    assert bool(set(targets) & i.FULL_CORPORA) == (mode == 'full')
     for row in selected:
         commands = i.commands(row, mode=mode)
         for cmd in commands:
@@ -213,9 +313,14 @@ for mode, default, count in [('normal', False, 23), ('full', False, 32), ('full'
                 assert commands[1][-2:] == [i.OVERSIZED, '--exact']
                 assert commands[1][commands[1].index('--features') + 1] == 'test-seams,iroh'
         if mode == 'full' and set(row['targets']) & i.FULL_SCHEMA:
-            assert len(commands) == 2
+            bounded = 'custody_schema_replay_bounded_contract'
+            assert len(commands) == 2 + int(bounded in row['targets'])
             assert commands[1][commands[1].index('--features') + 1] == 'test-seams,iroh'
             assert '--skip' not in commands[1]
+            if bounded in row['targets']:
+                assert bounded not in commands[0] and bounded not in commands[1]
+                assert commands[2][commands[2].index('--test') + 1] == bounded
+                i.aggregate_module().validate_command(ROOT, bounded, commands[2])
     needs = dict(plan=dict(result='success', outputs=dict(enabled='true', **{k: matrix['include'][0][k] for k in i.PLAN_FIELDS}, matrix=json.dumps(matrix))),
                  slice=dict(result='success'))
     i.required(needs, rows, True, default, mode)
@@ -237,7 +342,7 @@ for mode, default, count in [('normal', False, 23), ('full', False, 32), ('full'
 reject(lambda: i.matrix(rows, True, 'normal'))
 reject(lambda: i.matrix(rows, False, 'typo'))
 for row in rows:
-    if set(row['targets']) & (i.FULL_SCHEMA | i.FULL_CORPORA):
+    if set(row['targets']) & i.FULL_SCHEMA:
         reject(lambda: i.commands(row, mode='normal'))
 for mode, companion, passed, ignored, filtered in [('normal', False, 12, 0, 1), ('full', False, 12, 1, 0), ('full', True, 0, 1, 12)]:
     entry = dict(target='tests/sync_schema_transactions.rs', passed=passed,
@@ -276,7 +381,6 @@ for mode in ['normal', 'full']:
             assert ('custody_schema_replay_is_proportional_to_affected_tables' in targets.split()) == (mode == 'full')
             assert 'custody_schema_replay_bounded_contract' in targets.split()
         if shard.endswith('-12'):
-            assert ('vector_graph_recall_50000_isotropic_per_context' in targets.split()) == True
             assert 'vector_indexed_route_does_less_work_than_exact' in targets.split()
         assert skip == (i.OVERSIZED if mode == 'normal' and shard.endswith('-15') else '')
 print('Six normal/full Bash shard plans PASS; original indexed route remains normal.')

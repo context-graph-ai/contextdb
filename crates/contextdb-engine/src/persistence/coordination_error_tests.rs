@@ -41,8 +41,8 @@ fn closed_writer_ownership_refuses_recovery_compaction_and_cursor_pin_with_typed
     assert_coordination_error(
         persistence
             .compact_incremental(
-                Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()),
-                0.0,
+                Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into(),
+                Some(0.0),
             )
             .expect_err("closed ownership refuses compaction"),
         "storage reclamation",
@@ -84,8 +84,8 @@ fn poisoned_writer_state_refuses_recovery_compaction_and_cursor_pin_with_typed_p
     assert_coordination_error(
         persistence
             .compact_incremental(
-                Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()),
-                0.0,
+                Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into(),
+                Some(0.0),
             )
             .expect_err("poisoned ownership refuses compaction"),
         "storage reclamation",
@@ -132,6 +132,13 @@ fn missing_companion_refuses_recovery_and_cursor_pin_with_typed_database_path() 
 
 #[test]
 fn unusable_publication_fence_refuses_recovery_and_cursor_registration_with_typed_paths() {
+    if crate::test_process::rerun_alone(
+        module_path!(),
+        "unusable_publication_fence_refuses_recovery_and_cursor_registration_with_typed_paths",
+        &[],
+    ) {
+        return;
+    }
     let (directory, mut persistence) = writer();
     let runtime = directory.path().join("runtime");
     std::fs::create_dir(&runtime).unwrap();
@@ -202,6 +209,12 @@ fn unusable_publication_fence_refuses_recovery_and_cursor_registration_with_type
 
 #[test]
 fn provider_inventory_refusal_preserves_owner_cursor_operation_runtime_and_cause() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     const CHILD: &str = "CONTEXTDB_OWNER_PIN_PROVIDER_COORDINATION_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let directory = tempfile::tempdir().expect("task-scoped platform runtime");
@@ -243,11 +256,73 @@ fn provider_inventory_refusal_preserves_owner_cursor_operation_runtime_and_cause
         refusal,
         "owner cursor pin",
         &runtime,
-        "authenticated reader snapshot registry is indeterminate",
+        "candidate reader registry is indeterminate",
     );
     drop(
         persistence
             .owner_cursor_pin()
             .expect("restored coordination admits the pin"),
     );
+}
+
+#[test]
+fn compaction_checkpoint_control_reservation_remains_non_io_at_the_hook() {
+    let accountant = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(31));
+    accountant.try_allocate(7).unwrap();
+    let refusal = match RedbPersistence::reserve_compaction_checkpoint_controls(
+        Arc::clone(&accountant).into(),
+        Some("items"),
+        &[2, 3],
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("checkpoint controls unexpectedly admitted"),
+    };
+    let failure = parking_lot::Mutex::new(None);
+    let storage = RedbPersistence::compaction_checkpoint_storage_error(refusal, &failure);
+    let redb::StorageError::AdmissionRefused(payload) = storage else {
+        panic!("checkpoint reservation crossed storage as {storage:?}");
+    };
+    assert!(
+        failure.lock().is_none(),
+        "memory refusal needs no I/O side channel"
+    );
+    let error = payload.downcast::<Error>().unwrap();
+    assert!(matches!(*error, Error::MemoryBudgetExceeded {
+        subsystem, operation, requested_bytes: 1024, available_bytes: 24,
+        budget_limit_bytes: 31, ..
+    } if subsystem == "storage_compaction" && operation == "checkpoint_controls"));
+    assert_eq!(accountant.usage().used, 7);
+    accountant.release(7);
+}
+
+#[test]
+fn compaction_hook_preserves_recovered_page_refusal_and_keeps_device_failures_as_io() {
+    let accountant = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(19));
+    let refusal = accountant
+        .try_allocate_for(
+            4096,
+            "storage_compaction",
+            "relocate_pages",
+            "checkpoint page read",
+        )
+        .unwrap_err();
+    let recovered =
+        RedbPersistence::storage_error(redb::StorageError::AdmissionRefused(Box::new(refusal)));
+    let failure = parking_lot::Mutex::new(None);
+    let storage = RedbPersistence::compaction_checkpoint_storage_error(recovered, &failure);
+    assert!(matches!(&storage, redb::StorageError::AdmissionRefused(_)));
+    assert!(failure.lock().is_none());
+    let recovered = RedbPersistence::storage_error(storage);
+    assert!(matches!(recovered, Error::MemoryBudgetExceeded {
+        subsystem, operation, requested_bytes: 4096, available_bytes: 19,
+        budget_limit_bytes: 19, ..
+    } if subsystem == "storage_compaction" && operation == "relocate_pages"));
+    let device_error = RedbPersistence::storage_error(redb::StorageError::Io(std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        "checkpoint device failed",
+    )));
+    let storage = RedbPersistence::compaction_checkpoint_storage_error(device_error, &failure);
+    assert!(matches!(storage, redb::StorageError::Io(_)));
+    assert!(matches!(failure.lock().take(), Some(Error::Other(message))
+        if message.contains("checkpoint device failed")));
 }

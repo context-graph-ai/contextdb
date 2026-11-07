@@ -1,18 +1,21 @@
+use super::wire_fixture_test_support::FixtureFrame;
+use super::wire_fixture_test_support::QueryFixture as QueryResult;
+use super::wire_fixture_test_support::{encode_message, encode_payload_frame, encode_query_result};
 use contextdb_core::Value;
 use contextdb_core::read_contract::{ReadFailure, ReadFailureDetail, ReadFailureKind, ReadLimits};
 use contextdb_engine::local_transport::{
     FrameBufferAllocator, FrameReader, FrameViolation, LocalInboundKind, LocalOutboundMessage,
     LocalProtocolBoundary, LocalResponse, LocalResponseExpectation, LocalTransportError,
     MAX_FRAME_BYTES, OrdinaryResultReceiver, PayloadViolation, ResultChunk, ResultReceiveOutcome,
-    ResultReceiveState, TerminalSuccess, decode_frame_exact, encode_message, encode_payload_frame,
-    frame_length_prefix, read_payload_with_admission, split_canonical_result,
+    ResultReceiveState, TerminalSuccess, decode_frame_exact, frame_length_prefix,
+    read_payload_with_admission, split_canonical_result,
 };
 #[cfg(unix)]
 use contextdb_engine::local_transport::{ManualDeadlineClock, UnixLocalCarrier};
 use contextdb_engine::read_contract::{
-    CanonicalIndexCandidate, CanonicalQueryResult, decode_query_result, encode_query_result,
+    CanonicalIndexCandidate, CanonicalQueryResult, decode_query_result,
 };
-use contextdb_engine::{CascadeReport, IndexCandidate, QueryResult, QueryTrace};
+use contextdb_engine::{CascadeReport, IndexCandidate, QueryTrace};
 
 struct InstrumentedReader {
     prefix: [u8; 4],
@@ -93,12 +96,14 @@ fn local_frame_fixture_encodes_and_decodes_exactly() {
 
 #[test]
 fn a_response_over_the_read_memory_ceiling_keeps_its_budget_class() {
-    let canonical = encode_query_result(&QueryResult {
-        columns: vec!["value".into()],
-        rows: vec![vec![Value::Text("a real answer".into())]],
-        rows_affected: 0,
-        trace: QueryTrace::scan(),
-        cascade: None,
+    let canonical = encode_query_result(&{
+        let mut query_fixture = QueryResult::empty();
+        query_fixture.columns = vec!["value".into()];
+        query_fixture.rows = vec![vec![Value::Text("a real answer".into())]];
+        query_fixture.rows_affected = 0;
+        query_fixture.trace = QueryTrace::scan();
+        query_fixture.cascade = None;
+        query_fixture
     })
     .expect("encode a valid query result");
     let frame = frame_for_ordinary_response(&LocalResponse::TerminalSuccess {
@@ -114,6 +119,8 @@ fn a_response_over_the_read_memory_ceiling_keeps_its_budget_class() {
         maximum: MAX_FRAME_BYTES,
         calls: 0,
     };
+    // Native owner admission can refuse before a complete byte requirement
+    // is known; the class and the caller's exact ceiling must survive.
     let budget_error = boundary
         .receive_frame(
             LocalInboundKind::Response(LocalResponseExpectation::OrdinaryResult),
@@ -123,7 +130,10 @@ fn a_response_over_the_read_memory_ceiling_keeps_its_budget_class() {
         .expect_err("a valid answer exceeds the caller's one-byte memory ceiling");
     assert_eq!(
         budget_error,
-        LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded { ceiling: 1 })
+        LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded {
+            ceiling: 1,
+            required: None
+        })
     );
 
     let malformed = encode_payload_frame(&[0xff]).expect("frame invalid response bytes");
@@ -148,12 +158,14 @@ fn a_response_over_the_read_memory_ceiling_keeps_its_budget_class() {
 async fn a_live_response_decode_keeps_memory_refusals_separate_from_corrupt_bytes() {
     use std::io::Write;
 
-    let canonical = encode_query_result(&QueryResult {
-        columns: vec!["value".into()],
-        rows: vec![vec![Value::Text("a real answer".into())]],
-        rows_affected: 0,
-        trace: QueryTrace::scan(),
-        cascade: None,
+    let canonical = encode_query_result(&{
+        let mut query_fixture = QueryResult::empty();
+        query_fixture.columns = vec!["value".into()];
+        query_fixture.rows = vec![vec![Value::Text("a real answer".into())]];
+        query_fixture.rows_affected = 0;
+        query_fixture.trace = QueryTrace::scan();
+        query_fixture.cascade = None;
+        query_fixture
     })
     .expect("encode a valid query result");
     let valid_frame = frame_for_ordinary_response(&LocalResponse::TerminalSuccess {
@@ -168,10 +180,15 @@ async fn a_live_response_decode_keeps_memory_refusals_separate_from_corrupt_byte
     });
     let clock = ManualDeadlineClock::at(0);
 
+    // One byte cannot admit even the native decoder owner. Its typed
+    // refusal has no complete required-byte figure at this boundary.
     for (frame, expected) in [
         (
             valid_frame,
-            LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded { ceiling: 1 }),
+            LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded {
+                ceiling: 1,
+                required: None,
+            }),
         ),
         (
             malformed_frame,
@@ -270,12 +287,14 @@ fn four_mebibytes_is_admitted_through_the_allocation_limited_reader_seam() {
 
 #[test]
 fn ordinary_result_chunks_stay_unpublished_until_terminal_success() {
-    let canonical = encode_query_result(&QueryResult {
-        columns: vec!["value".to_owned()],
-        rows: vec![vec![Value::Null]],
-        rows_affected: 0,
-        trace: QueryTrace::scan(),
-        cascade: None,
+    let canonical = encode_query_result(&{
+        let mut query_fixture = QueryResult::empty();
+        query_fixture.columns = vec!["value".to_owned()];
+        query_fixture.rows = vec![vec![Value::Null]];
+        query_fixture.rows_affected = 0;
+        query_fixture.trace = QueryTrace::scan();
+        query_fixture.cascade = None;
+        query_fixture
     })
     .expect("encode a valid canonical ordinary result");
     assert!(canonical.len() >= 3);
@@ -356,105 +375,111 @@ fn ordinary_result_chunks_stay_unpublished_until_terminal_success() {
 
 #[test]
 fn canonical_result_crosses_frames_and_publishes_only_the_exact_terminal_assembly() {
-    let result = QueryResult {
-        columns: vec!["payload".to_owned()],
-        rows: vec![vec![Value::Text("x".repeat(MAX_FRAME_BYTES + 512))]],
-        rows_affected: 0,
-        trace: QueryTrace::scan(),
-        cascade: None,
+    let result = {
+        let mut query_fixture = QueryResult::empty();
+        query_fixture.columns = vec!["payload".to_owned()];
+        query_fixture.rows = vec![vec![Value::Text("x".repeat(MAX_FRAME_BYTES + 512))]];
+        query_fixture.rows_affected = 0;
+        query_fixture.trace = QueryTrace::scan();
+        query_fixture.cascade = None;
+        query_fixture
     };
     let canonical = encode_query_result(&result).expect("encode the route-neutral result");
     assert!(canonical.len() > MAX_FRAME_BYTES);
-    let boundary = LocalProtocolBoundary::with_effective_limits(ReadLimits {
-        result_rows: 2,
-        result_bytes: canonical.len() as u64,
-        work: 10_000,
-        active_ms: 10_000,
-        memory: (canonical.len() * 2) as u64,
-        cursor_page_rows: 1,
-        cursor_page_bytes: 1_024,
-        cursor_idle_ms: 1_000,
-        cursor_lifetime_ms: 2_000,
-    });
+    let exercise = |memory| {
+        let boundary = LocalProtocolBoundary::with_effective_limits(ReadLimits {
+            result_rows: 2,
+            result_bytes: canonical.len() as u64,
+            work: 10_000,
+            active_ms: 10_000,
+            memory,
+            cursor_page_rows: 1,
+            cursor_page_bytes: 1_024,
+            cursor_idle_ms: 1_000,
+            cursor_lifetime_ms: 2_000,
+        });
 
-    let responses = split_canonical_result(&canonical).expect("split the canonical result");
-    assert!(
-        responses.len() >= 2,
-        "the result must cross at least two envelopes"
-    );
-    assert!(matches!(
-        responses.last(),
-        Some(LocalResponse::TerminalSuccess { .. })
-    ));
-    let frames = responses
-        .iter()
-        .map(|response| {
-            let expectation = LocalResponseExpectation::OrdinaryResult;
-            let frame = boundary
-                .encode_frame(LocalOutboundMessage::Response {
-                    response,
-                    expectation: &expectation,
-                })
-                .expect("encode complete response through the bounded boundary");
-            assert!(
-                frame.len() - 4 <= MAX_FRAME_BYTES,
-                "the complete response envelope must fit the payload ceiling"
-            );
-            frame
-        })
-        .collect::<Vec<_>>();
+        let responses = split_canonical_result(&canonical).expect("split the canonical result");
+        assert!(
+            responses.len() >= 2,
+            "the result must cross at least two envelopes"
+        );
+        assert!(matches!(
+            responses.last(),
+            Some(LocalResponse::TerminalSuccess { .. })
+        ));
+        let frames = responses
+            .iter()
+            .map(|response| {
+                let expectation = LocalResponseExpectation::OrdinaryResult;
+                let frame = boundary
+                    .encode_fixture_frame(LocalOutboundMessage::Response {
+                        response,
+                        expectation: &expectation,
+                    })
+                    .expect("encode complete response through the bounded boundary");
+                assert!(
+                    frame.len() - 4 <= MAX_FRAME_BYTES,
+                    "the complete response envelope must fit the payload ceiling"
+                );
+                frame
+            })
+            .collect::<Vec<_>>();
 
-    OrdinaryResultReceiver::reset_canonical_receive_trace_for_test();
-    let mut receiver = OrdinaryResultReceiver::new();
-    for (index, frame) in frames.into_iter().enumerate() {
-        let mut reader = SliceReader::new(frame);
-        let mut allocator = AllocationLimit {
-            maximum: MAX_FRAME_BYTES,
-            calls: 0,
-        };
-        let outcome = boundary
-            .receive_ordinary_result_frame(&mut receiver, &mut reader, &mut allocator)
-            .expect("read and publish through the production receiver");
-        assert_eq!(allocator.calls, 1);
-        assert_eq!(reader.offset, reader.bytes.len());
-
-        if index + 1 == responses.len() {
-            let ResultReceiveOutcome::Published(assembled) = outcome else {
-                panic!("terminal success must publish the assembled result");
+        OrdinaryResultReceiver::reset_canonical_receive_trace_for_test();
+        let mut receiver = OrdinaryResultReceiver::new();
+        for (index, frame) in frames.into_iter().enumerate() {
+            let mut reader = SliceReader::new(frame);
+            let mut allocator = AllocationLimit {
+                maximum: MAX_FRAME_BYTES,
+                calls: 0,
             };
-            assert_eq!(assembled.bytes, canonical);
-            assert_eq!(receiver.state(), ResultReceiveState::Published);
-            assert_eq!(receiver.buffered_byte_count(), 0);
-            assert!(
-                OrdinaryResultReceiver::canonical_preflight_matches_for_test(
-                    &canonical,
-                    (canonical.len() * 2) as u64,
-                    true,
-                )
-            );
-            assert_eq!(
-                OrdinaryResultReceiver::canonical_decode_entries_for_test(),
-                1
-            );
-            assert_eq!(
-                OrdinaryResultReceiver::canonical_receive_events_for_test(),
-                vec![
-                    OrdinaryResultReceiver::TEST_EVENT_CANONICAL_PREFLIGHT_PASSED,
-                    OrdinaryResultReceiver::TEST_EVENT_CANONICAL_DECODE_AUTHORIZED,
-                    OrdinaryResultReceiver::TEST_EVENT_PUBLISHED,
-                    OrdinaryResultReceiver::TEST_EVENT_ASSEMBLED_RESULT,
-                ],
-                "the real terminal receiver must complete allocation-free preflight before entering the canonical decoder and publication boundaries"
-            );
-        } else {
-            assert_eq!(outcome, ResultReceiveOutcome::Pending);
-            assert_eq!(receiver.state(), ResultReceiveState::Receiving);
-            assert_eq!(
-                OrdinaryResultReceiver::canonical_decode_entries_for_test(),
-                0
-            );
+            let outcome = boundary
+                .receive_ordinary_result_frame(&mut receiver, &mut reader, &mut allocator)
+                .expect("read and publish through the production receiver");
+            assert_eq!(allocator.calls, 1);
+            assert_eq!(reader.offset, reader.bytes.len());
+
+            if index + 1 == responses.len() {
+                let ResultReceiveOutcome::Published(assembled) = outcome else {
+                    panic!("terminal success must publish the assembled result");
+                };
+                assert_eq!(assembled.bytes, canonical);
+                assert_eq!(receiver.state(), ResultReceiveState::Published);
+                assert_eq!(receiver.buffered_byte_count(), 0);
+                assert!(
+                    OrdinaryResultReceiver::canonical_preflight_matches_for_test(
+                        &canonical, memory, true,
+                    )
+                );
+                assert_eq!(
+                    OrdinaryResultReceiver::canonical_decode_entries_for_test(),
+                    1
+                );
+                assert_eq!(
+                    OrdinaryResultReceiver::canonical_receive_events_for_test(),
+                    vec![
+                        OrdinaryResultReceiver::TEST_EVENT_CANONICAL_PREFLIGHT_PASSED,
+                        OrdinaryResultReceiver::TEST_EVENT_CANONICAL_DECODE_AUTHORIZED,
+                        OrdinaryResultReceiver::TEST_EVENT_PUBLISHED,
+                        OrdinaryResultReceiver::TEST_EVENT_ASSEMBLED_RESULT,
+                    ],
+                    "the real terminal receiver must complete allocation-free preflight before entering the canonical decoder and publication boundaries"
+                );
+            } else {
+                assert_eq!(outcome, ResultReceiveOutcome::Pending);
+                assert_eq!(receiver.state(), ResultReceiveState::Receiving);
+                assert_eq!(
+                    OrdinaryResultReceiver::canonical_decode_entries_for_test(),
+                    0
+                );
+            }
         }
-    }
+    };
+    // Measure the actual original-parent admissions once, then prove the full
+    // journey under that finite ceiling rather than a wire-length multiplier.
+    let memory = super::wire_fixture_test_support::measured_receive_memory(&exercise);
+    exercise(memory);
 }
 
 #[test]
@@ -477,7 +502,7 @@ fn splitter_accounts_for_the_response_envelope_at_both_chunk_boundaries() {
     for response in &responses {
         let expectation = LocalResponseExpectation::OrdinaryResult;
         let encoded = boundary
-            .encode_frame(LocalOutboundMessage::Response {
+            .encode_fixture_frame(LocalOutboundMessage::Response {
                 response,
                 expectation: &expectation,
             })
@@ -604,12 +629,14 @@ impl CompactCanonicalContainer {
 fn compact_canonical_result(
     container: CompactCanonicalContainer,
 ) -> (Vec<u8>, CanonicalQueryResult) {
-    let mut result = QueryResult {
-        columns: vec!["value".to_owned()],
-        rows: vec![vec![Value::Null]],
-        rows_affected: 0,
-        trace: QueryTrace::scan(),
-        cascade: None,
+    let mut result = {
+        let mut query_fixture = QueryResult::empty();
+        query_fixture.columns = vec!["value".to_owned()];
+        query_fixture.rows = vec![vec![Value::Null]];
+        query_fixture.rows_affected = 0;
+        query_fixture.trace = QueryTrace::scan();
+        query_fixture.cascade = None;
+        query_fixture
     };
     match container {
         CompactCanonicalContainer::ColumnsAndValues => {
@@ -684,20 +711,24 @@ fn frame_for_ordinary_response(response: &LocalResponse) -> Vec<u8> {
 
 #[test]
 fn canonical_preflight_capability_is_exact_one_shot_and_consumed_at_actual_decode_entry() {
-    let canonical = encode_query_result(&QueryResult {
-        columns: vec!["value".to_owned()],
-        rows: vec![vec![Value::Null]],
-        rows_affected: 0,
-        trace: QueryTrace::scan(),
-        cascade: None,
+    let canonical = encode_query_result(&{
+        let mut query_fixture = QueryResult::empty();
+        query_fixture.columns = vec!["value".to_owned()];
+        query_fixture.rows = vec![vec![Value::Null]];
+        query_fixture.rows_affected = 0;
+        query_fixture.trace = QueryTrace::scan();
+        query_fixture.cascade = None;
+        query_fixture
     })
     .expect("encode valid canonical causal fixture");
-    let different_canonical = encode_query_result(&QueryResult {
-        columns: vec!["value".to_owned()],
-        rows: vec![vec![Value::Null]],
-        rows_affected: 1,
-        trace: QueryTrace::scan(),
-        cascade: None,
+    let different_canonical = encode_query_result(&{
+        let mut query_fixture = QueryResult::empty();
+        query_fixture.columns = vec!["value".to_owned()];
+        query_fixture.rows = vec![vec![Value::Null]];
+        query_fixture.rows_affected = 1;
+        query_fixture.trace = QueryTrace::scan();
+        query_fixture.cascade = None;
+        query_fixture
     })
     .expect("encode distinct valid canonical causal fixture");
     let same_bytes_different_storage = canonical.clone();
@@ -831,12 +862,14 @@ fn canonical_preflight_capability_is_exact_one_shot_and_consumed_at_actual_decod
 
 #[test]
 fn malformed_assembled_canonical_result_is_discarded_before_actual_decode() {
-    let mut malformed = encode_query_result(&QueryResult {
-        columns: vec!["value".to_owned()],
-        rows: vec![vec![Value::Null]],
-        rows_affected: 0,
-        trace: QueryTrace::scan(),
-        cascade: None,
+    let mut malformed = encode_query_result(&{
+        let mut query_fixture = QueryResult::empty();
+        query_fixture.columns = vec!["value".to_owned()];
+        query_fixture.rows = vec![vec![Value::Null]];
+        query_fixture.rows_affected = 0;
+        query_fixture.trace = QueryTrace::scan();
+        query_fixture.cascade = None;
+        query_fixture
     })
     .expect("encode canonical fixture before truncating it");
     malformed
@@ -926,7 +959,7 @@ fn malformed_assembled_canonical_result_is_discarded_before_actual_decode() {
                 0
             );
         } else {
-            assert_eq!(received, Err(expected_error.clone()));
+            assert_eq!(received.as_ref(), Err(&expected_error));
             assert_eq!(receiver.state(), ResultReceiveState::Discarded);
             assert_eq!(receiver.buffered_byte_count(), 0);
             assert!(
@@ -950,77 +983,59 @@ fn malformed_assembled_canonical_result_is_discarded_before_actual_decode() {
 }
 
 fn assert_compact_canonical_container_is_preflighted(container: CompactCanonicalContainer) {
+    use contextdb_engine::vector_read_memory::{
+        take_reader_budget_ledger_for_test, watch_reader_budget_ledger_for_test,
+    };
     let (canonical, decoded) = compact_canonical_result(container);
-    assert!(
-        canonical.len() as u64 <= EFFECTIVE_MEMORY_CEILING,
-        "the {label} fixture fits the effective memory ceiling as wire bytes",
-        label = container.label()
-    );
-    assert!(
-        container.minimum_native_allocation(&decoded) > EFFECTIVE_MEMORY_CEILING as usize,
-        "the {label} fixture's nested native container allocation exceeds the effective memory ceiling",
-        label = container.label()
-    );
+    assert!(canonical.len() as u64 <= EFFECTIVE_MEMORY_CEILING);
+    assert!(container.minimum_native_allocation(&decoded) > EFFECTIVE_MEMORY_CEILING as usize);
 
-    let split_at = canonical.len() / 2;
-    let responses = [
-        LocalResponse::ResultChunk {
-            chunk: ResultChunk {
-                bytes: canonical[..split_at].to_vec(),
-            },
-        },
-        LocalResponse::TerminalSuccess {
-            success: TerminalSuccess {
-                final_bytes: canonical[split_at..].to_vec(),
-            },
-        },
-    ];
-    let frames = responses
+    // Keep each envelope small enough that the refusal must come from the
+    // nested canonical containers, after all wire bytes have arrived.
+    let pieces: Vec<_> = canonical.chunks(1_024).collect();
+    let frames: Vec<_> = pieces
         .iter()
-        .map(|response| {
-            let frame = frame_for_ordinary_response(response);
-            assert!(
-                frame.len() - 4 <= MAX_FRAME_BYTES,
-                "the {label} envelope must fit the outer frame ceiling",
-                label = container.label()
-            );
+        .enumerate()
+        .map(|(index, bytes)| {
+            let response = if index + 1 == pieces.len() {
+                LocalResponse::TerminalSuccess {
+                    success: TerminalSuccess {
+                        final_bytes: bytes.to_vec(),
+                    },
+                }
+            } else {
+                LocalResponse::ResultChunk {
+                    chunk: ResultChunk {
+                        bytes: bytes.to_vec(),
+                    },
+                }
+            };
+            let frame = frame_for_ordinary_response(&response);
+            assert!(frame.len() - 4 <= MAX_FRAME_BYTES);
             frame
         })
-        .collect::<Vec<_>>();
+        .collect();
     let boundary = LocalProtocolBoundary::with_effective_limits(ReadLimits {
         result_rows: u64::MAX,
         result_bytes: MAX_FRAME_BYTES as u64,
-        work: 1,
-        active_ms: 1,
         memory: EFFECTIVE_MEMORY_CEILING,
-        cursor_page_rows: 1,
-        cursor_page_bytes: 1,
-        cursor_idle_ms: 1,
-        cursor_lifetime_ms: 1,
+        ..ReadLimits::default()
     });
-    let mut receiver = OrdinaryResultReceiver::new();
     let expected_error = LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded {
         ceiling: EFFECTIVE_MEMORY_CEILING,
+        required: None,
     });
     OrdinaryResultReceiver::reset_canonical_receive_trace_for_test();
-    assert!(
-        OrdinaryResultReceiver::preflight_canonical_result_for_test(
-            &canonical,
-            EFFECTIVE_MEMORY_CEILING,
-        )
-        .is_err(),
-        "the real allocation-free canonical preflight must reject the over-memory {label} fixture",
-        label = container.label()
-    );
-    assert_eq!(
-        OrdinaryResultReceiver::canonical_receive_events_for_test(),
-        vec![OrdinaryResultReceiver::TEST_EVENT_CANONICAL_PREFLIGHT_FAILED]
-    );
+    OrdinaryResultReceiver::preflight_canonical_result_for_test(
+        &canonical,
+        EFFECTIVE_MEMORY_CEILING,
+    )
+    .expect("the valid canonical grammar passes before actual allocation admission");
     assert!(
         OrdinaryResultReceiver::canonical_preflight_matches_for_test(
             &canonical,
             EFFECTIVE_MEMORY_CEILING,
-            false,
+            true,
         )
     );
     assert_eq!(
@@ -1028,18 +1043,20 @@ fn assert_compact_canonical_container_is_preflighted(container: CompactCanonical
         0
     );
     OrdinaryResultReceiver::reset_canonical_receive_trace_for_test();
-
+    let mut receiver = OrdinaryResultReceiver::new();
+    let count = frames.len();
     for (index, frame) in frames.into_iter().enumerate() {
         let mut reader = SliceReader::new(frame);
         let mut allocator = AllocationLimit {
             maximum: MAX_FRAME_BYTES,
             calls: 0,
         };
+        watch_reader_budget_ledger_for_test();
         let received =
             boundary.receive_ordinary_result_frame(&mut receiver, &mut reader, &mut allocator);
+        let admissions = take_reader_budget_ledger_for_test();
         assert_eq!(reader.offset, reader.bytes.len());
-
-        if index == 0 {
+        if index + 1 < count {
             assert_eq!(received, Ok(ResultReceiveOutcome::Pending));
             assert_eq!(receiver.state(), ResultReceiveState::Receiving);
             assert!(OrdinaryResultReceiver::canonical_receive_events_for_test().is_empty());
@@ -1049,16 +1066,14 @@ fn assert_compact_canonical_container_is_preflighted(container: CompactCanonical
             );
         } else {
             assert_eq!(
-                OrdinaryResultReceiver::canonical_receive_events_for_test(),
-                vec![OrdinaryResultReceiver::TEST_EVENT_CANONICAL_PREFLIGHT_FAILED],
-                "the over-ceiling {label} fixture must be refused after allocation-free preflight without entering canonical decode, publication, or assembled-result construction",
+                received.as_ref(),
+                Err(&expected_error),
+                "the {label} native containers must refuse before allocation",
                 label = container.label()
             );
-            assert_eq!(
-                received,
-                Err(expected_error.clone()),
-                "the valid assembled {label} result must be rejected before nested serde allocation",
-                label = container.label()
+            super::wire_fixture_test_support::assert_native_refusal_within_ceiling(
+                &admissions,
+                EFFECTIVE_MEMORY_CEILING,
             );
             assert_eq!(receiver.state(), ResultReceiveState::Discarded);
             assert_eq!(receiver.buffered_byte_count(), 0);
@@ -1066,21 +1081,28 @@ fn assert_compact_canonical_container_is_preflighted(container: CompactCanonical
                 OrdinaryResultReceiver::canonical_preflight_matches_for_test(
                     &canonical,
                     EFFECTIVE_MEMORY_CEILING,
-                    false,
+                    true,
                 )
             );
             assert_eq!(
+                OrdinaryResultReceiver::canonical_receive_events_for_test(),
+                vec![
+                    OrdinaryResultReceiver::TEST_EVENT_CANONICAL_PREFLIGHT_PASSED,
+                    OrdinaryResultReceiver::TEST_EVENT_CANONICAL_DECODE_AUTHORIZED,
+                ],
+                "admission refusal must precede publication and assembled-result construction"
+            );
+            assert_eq!(
                 OrdinaryResultReceiver::canonical_decode_entries_for_test(),
-                0,
-                "the over-memory {label} fixture must be refused before the actual canonical decoder entrance",
-                label = container.label()
+                1,
+                "the real scoped decoder must attempt and refuse the nested allocation"
             );
         }
     }
 }
 
 #[test]
-fn assembled_canonical_results_preflight_compact_nested_containers_before_deserialization() {
+fn assembled_canonical_results_refuse_compact_nested_containers_before_allocation() {
     for container in [
         CompactCanonicalContainer::ColumnsAndValues,
         CompactCanonicalContainer::Rows,

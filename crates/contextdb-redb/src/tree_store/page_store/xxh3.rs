@@ -56,6 +56,7 @@ const INIT_ACCUMULATORS: [u64; 8] = [
     PRIME32[2], PRIME64[0], PRIME64[1], PRIME64[2], PRIME64[3], PRIME32[1], PRIME64[4], PRIME32[0],
 ];
 
+#[cfg(test)]
 pub fn hash64_with_seed(data: &[u8], seed: u64) -> u64 {
     if data.len() <= 240 {
         hash64_0to240(data, &DEFAULT_SECRET, seed)
@@ -228,7 +229,7 @@ unsafe fn scramble_accumulators_neon(
     }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(any(not(target_arch = "aarch64"), feature = "contextdb-internal"))]
 fn scramble_accumulators_generic(accumulators: &mut [u64; INIT_ACCUMULATORS.len()], secret: &[u8]) {
     for (i, x) in accumulators.iter_mut().enumerate() {
         let s = get_u64(secret, i);
@@ -242,6 +243,7 @@ fn xorshift(x: u64, shift: u64) -> u64 {
     x ^ (x >> shift)
 }
 
+#[cfg(test)]
 fn rrmxmx(mut x: u64, y: u64) -> u64 {
     x ^= x.rotate_left(49) ^ x.rotate_left(24);
     x = x.wrapping_mul(0x9FB21C651E98DF25);
@@ -383,7 +385,7 @@ unsafe fn accumulate_stripe_avx2(accumulators: &mut [u64; 8], data: &[u8], secre
     }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(any(not(target_arch = "aarch64"), feature = "contextdb-internal"))]
 fn accumulate_stripe_generic(accumulators: &mut [u64; 8], data: &[u8], secret: &[u8]) {
     for i in 0..accumulators.len() {
         let x = get_u64(&data[i * 8..], 0);
@@ -467,6 +469,7 @@ fn hash64_0(secret: &[u8], seed: u64) -> u64 {
     xxh64_avalanche(result)
 }
 
+#[cfg(test)]
 fn hash64_1to3(data: &[u8], secret: &[u8], seed: u64) -> u64 {
     let x1 = data[0] as u32;
     let x2 = data[data.len() >> 1] as u32;
@@ -481,6 +484,7 @@ fn hash64_1to3(data: &[u8], secret: &[u8], seed: u64) -> u64 {
     xxh64_avalanche(result)
 }
 
+#[cfg(test)]
 fn hash64_4to8(data: &[u8], secret: &[u8], mut seed: u64) -> u64 {
     #[allow(clippy::cast_possible_truncation)]
     let truncate_seed = seed as u32;
@@ -492,6 +496,7 @@ fn hash64_4to8(data: &[u8], secret: &[u8], mut seed: u64) -> u64 {
     rrmxmx(x ^ s, data.len() as u64)
 }
 
+#[cfg(test)]
 fn hash64_9to16(data: &[u8], secret: &[u8], seed: u64) -> u64 {
     let s1 = (get_u64(secret, 3) ^ get_u64(secret, 4)).wrapping_add(seed);
     let s2 = (get_u64(secret, 5) ^ get_u64(secret, 6)).wrapping_sub(seed);
@@ -504,6 +509,7 @@ fn hash64_9to16(data: &[u8], secret: &[u8], seed: u64) -> u64 {
     xxh3_avalanche(result)
 }
 
+#[cfg(test)]
 fn hash64_0to16(data: &[u8], secret: &[u8], seed: u64) -> u64 {
     if data.is_empty() {
         hash64_0(secret, seed)
@@ -516,6 +522,7 @@ fn hash64_0to16(data: &[u8], secret: &[u8], seed: u64) -> u64 {
     }
 }
 
+#[cfg(test)]
 fn hash64_17to128(data: &[u8], secret: &[u8], seed: u64) -> u64 {
     let mut result = PRIME64[0].wrapping_mul(data.len() as u64);
     let iterations = (data.len() - 1) / 32;
@@ -530,6 +537,7 @@ fn hash64_17to128(data: &[u8], secret: &[u8], seed: u64) -> u64 {
     xxh3_avalanche(result)
 }
 
+#[cfg(test)]
 fn hash64_129to240(data: &[u8], secret: &[u8], seed: u64) -> u64 {
     let mut result = PRIME64[0].wrapping_mul(data.len() as u64);
     for i in 0..8 {
@@ -549,6 +557,7 @@ fn hash64_129to240(data: &[u8], secret: &[u8], seed: u64) -> u64 {
     xxh3_avalanche(result)
 }
 
+#[cfg(test)]
 fn hash64_0to240(data: &[u8], secret: &[u8], seed: u64) -> u64 {
     if data.len() <= 16 {
         hash64_0to16(data, secret, seed)
@@ -559,7 +568,7 @@ fn hash64_0to240(data: &[u8], secret: &[u8], seed: u64) -> u64 {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(test, target_arch = "aarch64"))]
 unsafe fn hash64_large_neon(data: &[u8], seed: u64) -> u64 {
     hash64_large_generic(
         data,
@@ -572,6 +581,7 @@ unsafe fn hash64_large_neon(data: &[u8], seed: u64) -> u64 {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
+#[cfg(test)]
 unsafe fn hash64_large_avx2(data: &[u8], seed: u64) -> u64 {
     hash64_large_generic(
         data,
@@ -583,6 +593,7 @@ unsafe fn hash64_large_avx2(data: &[u8], seed: u64) -> u64 {
 }
 
 #[inline(always)]
+#[cfg(test)]
 fn hash64_large_generic(
     data: &[u8],
     seed: u64,
@@ -811,6 +822,64 @@ fn hash128_large_generic(
     );
 
     ((high as u128) << 64) | low as u128
+}
+
+/// The same seed-zero page checksum, fetched in bounded source windows.
+/// The long-input loop is the existing scalar algorithm with its original
+/// block/stripe boundaries, including the overlapping final stripe.
+#[cfg(feature = "contextdb-internal")]
+pub(in crate::tree_store) fn hash128_from_windows<E>(
+    len: usize,
+    mut read: impl FnMut(usize, &mut [u8]) -> Result<(), E>,
+) -> Result<u128, E> {
+    if len <= 240 {
+        let mut bytes = [0u8; 240];
+        read(0, &mut bytes[..len])?;
+        return Ok(hash128_with_seed(&bytes[..len], 0));
+    }
+    let secret = &DEFAULT_SECRET;
+    let mut accumulators = INIT_ACCUMULATORS;
+    let stripes_per_block = (secret.len() - STRIPE_LENGTH) / SECRET_CONSUME_RATE;
+    let block_len = STRIPE_LENGTH * stripes_per_block;
+    let blocks = (len - 1) / block_len;
+    let mut stripe = [0u8; STRIPE_LENGTH];
+    for block in 0..blocks {
+        for index in 0..stripes_per_block {
+            read(block * block_len + index * STRIPE_LENGTH, &mut stripe)?;
+            accumulate_stripe_generic(
+                &mut accumulators,
+                &stripe,
+                &secret[index * SECRET_CONSUME_RATE..],
+            );
+        }
+        scramble_accumulators_generic(&mut accumulators, &secret[secret.len() - STRIPE_LENGTH..]);
+    }
+    let stripes = ((len - 1) - block_len * blocks) / STRIPE_LENGTH;
+    for index in 0..stripes {
+        read(blocks * block_len + index * STRIPE_LENGTH, &mut stripe)?;
+        accumulate_stripe_generic(
+            &mut accumulators,
+            &stripe,
+            &secret[index * SECRET_CONSUME_RATE..],
+        );
+    }
+    read(len - STRIPE_LENGTH, &mut stripe)?;
+    accumulate_stripe_generic(
+        &mut accumulators,
+        &stripe,
+        &secret[secret.len() - STRIPE_LENGTH - 7..],
+    );
+    let low = merge_accumulators(
+        accumulators,
+        &secret[11..],
+        PRIME64[0].wrapping_mul(len as u64),
+    );
+    let high = merge_accumulators(
+        accumulators,
+        &secret[secret.len() - 64 - 11..],
+        !(PRIME64[1].wrapping_mul(len as u64)),
+    );
+    Ok(((high as u128) << 64) | low as u128)
 }
 
 #[cfg(test)]

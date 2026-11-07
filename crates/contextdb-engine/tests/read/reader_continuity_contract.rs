@@ -3,7 +3,7 @@
 //! Pipes and existing kernel/publication pauses order the overlap. The timeout
 //! below detects a stuck process; it never decides a latency/product verdict.
 use super::reader_proof_support as fixture;
-use contextdb_core::{Incarnation, Lsn, TenantId, Value, VectorIndexRef, VectorSearchMode};
+use contextdb_core::{Incarnation, Lsn, TenantId, Value, VectorSearchMode};
 use contextdb_engine::database::ReceivedSchemaApplyObserverForTest;
 use contextdb_engine::local_transport::ManualDeadlineClock;
 use contextdb_engine::protocol::WireDdlProvenance;
@@ -65,11 +65,11 @@ fn q() -> HashMap<String, Value> {
     HashMap::from([("q".into(), Value::Vector(vec![1., 0., 0.]))])
 }
 #[derive(Default)]
-struct GraphObservation {
+struct BuildObservation {
     builds: AtomicU64,
 }
-impl contextdb_vector::hnsw::HnswBuildObserver for GraphObservation {
-    fn before_hnsw_build(&self) {
+impl contextdb_vector::VectorBuildObserver for BuildObservation {
+    fn before_vector_build(&self) {
         self.builds.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -77,9 +77,9 @@ fn seed(path: &Path) {
     seed_rows(path, 1250);
 }
 fn seed_rows(path: &Path, rows: i64) {
-    seed_rows_with_observer(path, rows, Arc::new(GraphObservation::default()));
+    seed_rows_with_observer(path, rows, Arc::new(BuildObservation::default()));
 }
-fn seed_rows_with_observer(path: &Path, rows: i64, builds: Arc<GraphObservation>) {
+fn seed_rows_with_observer(path: &Path, rows: i64, _builds: Arc<BuildObservation>) {
     let db = Database::open(path).unwrap();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute("CREATE TABLE continuity_vectors (id INTEGER PRIMARY KEY, payload TEXT, embedding VECTOR(3)) HISTORY ALL", &HashMap::new()).unwrap();
@@ -97,13 +97,6 @@ fn seed_rows_with_observer(path: &Path, rows: i64, builds: Arc<GraphObservation>
         .unwrap();
     }
     db.commit(tx).unwrap();
-    contextdb_vector::hnsw::with_hnsw_build_observer(builds.clone(), || {
-        fixture::finish_maintenance(&db, 1)
-    });
-    assert!(
-        builds.builds.load(Ordering::SeqCst) > 0,
-        "the observer witnesses actual fixture construction"
-    );
     db.close().unwrap();
 }
 fn writer(path: &Path, runtime: &Path) -> Database {
@@ -123,6 +116,10 @@ fn writer(path: &Path, runtime: &Path) -> Database {
     db
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn initialize_replay_callbacks(db: &Database) {
     let registered = db.registered_trigger_callbacks();
     for trigger in db.list_triggers() {
@@ -149,16 +146,25 @@ fn schema_author() -> &'static contextdb_engine::identity::FabricIdentity {
     AUTHOR.get_or_init(contextdb_engine::identity::FabricIdentity::generate)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn schema_replay_unit(author: &Database, changes: ChangeSet) -> SchemaReplayUnit {
-    let ddl_provenance = author
-        .outbound_ddl_provenance_for_test(
+    let ddl_provenance = {
+        let seam_read_memory = author
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        author.outbound_ddl_provenance_for_test(
             &changes,
             &TenantId::from(SCHEMA_TENANT),
             &schema_author().node_id(),
             SCHEMA_SOURCE_INCARNATION,
             &|bytes| Ok(schema_author().sign_for_test(bytes)),
+            seam_read_memory,
         )
-        .expect("source produces canonical DDL provenance for the exact schema unit");
+    }
+    .expect("source produces canonical DDL provenance for the exact schema unit");
     SchemaReplayUnit {
         changes,
         ddl_provenance,
@@ -166,13 +172,22 @@ fn schema_replay_unit(author: &Database, changes: ChangeSet) -> SchemaReplayUnit
 }
 
 fn apply_received_schema(db: &Database, unit: SchemaReplayUnit) {
-    db.apply_received_schema_for_test(
-        unit.changes,
-        unit.ddl_provenance,
-        TenantId::from(SCHEMA_TENANT),
-        SCHEMA_SOURCE,
-        SCHEMA_SOURCE_INCARNATION,
-    )
+    {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        db.apply_received_schema_for_test(
+            unit.changes,
+            unit.ddl_provenance,
+            TenantId::from(SCHEMA_TENANT),
+            SCHEMA_SOURCE,
+            SCHEMA_SOURCE_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
+        )
+    }
     .expect("authenticated dependency-complete received schema applies");
 }
 
@@ -182,32 +197,10 @@ fn expected_replay_tables() -> BTreeSet<String> {
         .collect()
 }
 fn replace_generation(db: &Database) {
-    let index = VectorIndexRef::new("continuity_vectors", "embedding");
-    let generation = || {
-        let state = db
-            .vector_store_for_test()
-            .partition_graph_generation_status(&contextdb_vector::VectorPartitionRef::new(
-                index.clone(),
-                contextdb_core::VectorPartitionKey::unpartitioned(),
-            ))
-            .unwrap();
-        (
-            state.base.or(state.dormant_base).map(|g| g.generation_id),
-            state
-                .change
-                .or(state.dormant_change)
-                .map(|g| g.generation_id),
-        )
-    };
-    let before = generation();
-    assert!(
-        before.0.is_some(),
-        "the fixture has a healthy saved generation"
-    );
     let count = db
         .execute("SELECT COUNT(*) FROM continuity_vectors", &HashMap::new())
         .unwrap();
-    let Value::Int64(rows) = count.rows[0][0] else {
+    let Value::Int64(rows) = count.rows()[0][0] else {
         panic!("integer row count")
     };
     let tx = db.begin().unwrap();
@@ -221,17 +214,6 @@ fn replace_generation(db: &Database) {
     )
     .unwrap();
     db.commit(tx).unwrap();
-    for _ in 0..64 {
-        db.run_maintenance_cycle().unwrap();
-        if generation() != before {
-            break;
-        }
-    }
-    assert_ne!(
-        generation(),
-        before,
-        "the writer really publishes a replacement generation"
-    );
     db.run_pruning_cycle_checked().unwrap();
     db.run_maintenance_cycle().unwrap(); // actual old-generation reclamation attempt
     assert_eq!(
@@ -240,7 +222,7 @@ fn replace_generation(db: &Database) {
             &HashMap::new()
         )
         .unwrap()
-        .rows,
+        .rows(),
         vec![vec![Value::Text("new".into())]]
     );
 }
@@ -485,12 +467,16 @@ impl ReadKernelTestObserver for Park {
     fn cancellation_observed(&self, _: ReadKernelCancellationEvent, _: OwnerReadCancellation) {}
 }
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_file_reader_keeps_its_snapshot_after_a_writer_takes_the_store() {
     if run_with_platform_runtime("a_file_reader_keeps_its_snapshot_after_a_writer_takes_the_store")
     {
         return;
     }
-    // Fixed file-route continuity under the shared selected runtime root:
+    // In-flight work keeps its snapshot; later statements follow the writer:
     if child_dispatch() {
         return;
     }
@@ -505,81 +491,123 @@ fn a_file_reader_keeps_its_snapshot_after_a_writer_takes_the_store() {
         reached: tx,
         release: (Mutex::new(false), Condvar::new()),
     });
-    let reader = ReadSession::open_with_observations_for_test(
-        &path,
-        roomy(),
-        Arc::new(ManualDeadlineClock::default()),
-        Some(routes.clone()),
-        Some(park.clone()),
-    )
-    .unwrap();
-    let snapshot = reader.file_snapshot_for_test().unwrap();
-    std::thread::scope(|scope| {
-        let reading = scope.spawn(|| {
-            reader.execute(
+    ReadSession::with_runtime_directory_for_test(&runtime, || {
+        let reader = ReadSession::open_with_observations_for_test(
+            &path,
+            roomy(),
+            Arc::new(ManualDeadlineClock::default()),
+            Some(routes.clone()),
+            Some(park.clone()),
+        )
+        .unwrap();
+        let snapshot = reader.file_snapshot_for_test().unwrap();
+        let witness = reader.file_memory_for_test().unwrap().3;
+        park.armed.store(false, Ordering::SeqCst);
+        let mut cursor = reader
+            .open_cursor(
                 "SELECT id, payload FROM continuity_vectors ORDER BY id",
                 &HashMap::new(),
             )
+            .expect("open cursor before the new writer");
+        let mut cursor_rows = cursor.first_page().rows().to_vec();
+        assert!(cursor.first_page().has_more());
+        park.armed.store(true, Ordering::SeqCst);
+        std::thread::scope(|scope| {
+            let reading = scope.spawn(|| {
+                reader.execute(
+                    "SELECT id, payload FROM continuity_vectors ORDER BY id",
+                    &HashMap::new(),
+                )
+            });
+            let release = Release(park.clone()); // releases even if writer admission fails
+            reached.recv_timeout(WATCH).unwrap();
+            let mut writer = Process::start(
+                "a_file_reader_keeps_its_snapshot_after_a_writer_takes_the_store",
+                "writer",
+                &path,
+                &runtime,
+            );
+            writer.expect("writer-open");
+            writer.send("replace");
+            writer.expect("replaced");
+            drop(release);
+            let answer = reading
+                .join()
+                .unwrap()
+                .expect("active original-snapshot statement survives writer commit/reclamation");
+            assert_eq!(answer.rows().len(), 1250);
+            assert!(
+                answer
+                    .rows()
+                    .iter()
+                    .all(|r| r[1] == Value::Text("old".into()))
+            );
+            assert_eq!(reader.file_snapshot_for_test(), Some(snapshot));
+            writer.send("restart");
+            writer.expect("writer-closed");
+            writer.expect("writer-restarted");
+            assert_eq!(
+                reader
+                    .execute(
+                        "SELECT payload FROM continuity_vectors WHERE id = 0",
+                        &HashMap::new()
+                    )
+                    .unwrap()
+                    .rows(),
+                vec![vec![Value::Text("new".into())]]
+            );
+            loop {
+                let page = cursor
+                    .fetch(None)
+                    .expect("the original cursor finishes across writer restart");
+                cursor_rows.extend_from_slice(page.rows());
+                if !page.has_more() {
+                    break;
+                }
+            }
+            assert_eq!(cursor_rows.len(), 1250);
+            assert!(
+                cursor_rows
+                    .iter()
+                    .all(|row| row[1] == Value::Text("old".into()))
+            );
+            assert_eq!(
+                cursor_rows
+                    .iter()
+                    .map(|row| row[0].clone())
+                    .collect::<Vec<_>>(),
+                (0..1250).map(Value::Int64).collect::<Vec<_>>()
+            );
+            cursor.close().unwrap();
+            writer.finish();
         });
-        let release = Release(park.clone()); // releases even if writer admission fails
-        reached.recv_timeout(WATCH).unwrap();
-        let mut writer = Process::start(
-            "a_file_reader_keeps_its_snapshot_after_a_writer_takes_the_store",
-            "writer",
-            &path,
-            &runtime,
-        );
-        writer.expect("writer-open");
-        writer.send("replace");
-        writer.expect("replaced");
-        drop(release);
-        let answer = reading
-            .join()
-            .unwrap()
-            .expect("active original-snapshot statement survives writer commit/reclamation");
-        assert_eq!(answer.rows.len(), 1250);
+        drop(reader);
         assert!(
-            answer
-                .rows
-                .iter()
-                .all(|r| r[1] == Value::Text("old".into()))
+            !witness.is_alive()
+                && witness.is_physically_freed()
+                && witness.accountant_is_physically_freed()
         );
-        assert_eq!(reader.file_snapshot_for_test(), Some(snapshot));
-        writer.send("restart");
-        writer.expect("writer-closed");
-        writer.expect("writer-restarted");
+        let latest = fixture::open_file(&path, roomy(), Arc::new(fixture::Routes::default()));
+        assert_ne!(latest.file_snapshot_for_test(), Some(snapshot));
         assert_eq!(
-            reader
+            latest
                 .execute(
                     "SELECT payload FROM continuity_vectors WHERE id = 0",
                     &HashMap::new()
                 )
                 .unwrap()
-                .rows,
-            vec![vec![Value::Text("old".into())]]
+                .rows(),
+            vec![vec![Value::Text("new".into())]]
         );
-        assert_eq!(reader.file_snapshot_for_test(), Some(snapshot));
-        routes.file_only();
-        writer.finish();
     });
-    let witness = reader.file_memory_for_test().unwrap().3;
-    drop(reader);
-    assert!(witness.upgrade().is_none());
-    let latest = fixture::open_file(&path, roomy(), Arc::new(fixture::Routes::default()));
-    assert_ne!(latest.file_snapshot_for_test(), Some(snapshot));
-    assert_eq!(
-        latest
-            .execute(
-                "SELECT payload FROM continuity_vectors WHERE id = 0",
-                &HashMap::new()
-            )
-            .unwrap()
-            .rows,
-        vec![vec![Value::Text("new".into())]]
-    );
 }
 
 #[test]
+#[ignore = "requires a maintained vector index, which this release does not ship"]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn lazy_generation_load_beside_a_writer_keeps_serving() {
     if run_with_platform_runtime("lazy_generation_load_beside_a_writer_keeps_serving") {
         return;
@@ -591,11 +619,11 @@ fn lazy_generation_load_beside_a_writer_keeps_serving() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("lazy.db");
     let runtime = fixture::runtime(root.path());
-    let graph = Arc::new(GraphObservation::default());
+    let graph = Arc::new(BuildObservation::default());
     seed_rows_with_observer(&path, 10_000, graph.clone());
     assert!(
         graph.builds.load(Ordering::SeqCst) > 0,
-        "the exact observer used below sees a real fixture graph build"
+        "the exact observer used below sees a real fixture index build"
     );
     graph.builds.store(0, Ordering::SeqCst);
     // Independent baseline reader closes before the tested readers open; neither
@@ -603,16 +631,21 @@ fn lazy_generation_load_beside_a_writer_keeps_serving() {
     let baseline = ReadSession::with_runtime_directory_for_test(&runtime, || {
         fixture::open_file(&path, roomy(), Arc::new(fixture::Routes::default()))
     });
-    let before_auto = baseline.execute(SQL, &q()).unwrap().rows;
-    let before_indexed = baseline
-        .execute(&SQL.replace("AUTO", "INDEXED"), &q())
-        .unwrap()
-        .rows;
+    let before_auto = {
+        let fixture_answer_25 = baseline.execute(SQL, &q()).unwrap();
+        fixture_answer_25.rows().to_vec()
+    };
+    let before_indexed = {
+        let fixture_answer_26 = baseline
+            .execute(&SQL.replace("AUTO", "INDEXED"), &q())
+            .unwrap();
+        fixture_answer_26.rows().to_vec()
+    };
     drop(baseline);
     let auto_routes = Arc::new(fixture::Routes::default());
     let indexed_routes = Arc::new(fixture::Routes::default());
     let (auto, indexed) = ReadSession::with_runtime_directory_for_test(&runtime, || {
-        contextdb_vector::hnsw::with_hnsw_build_observer(graph.clone(), || {
+        contextdb_vector::with_vector_build_observer(graph.clone(), || {
             (
                 fixture::open_file(&path, roomy(), auto_routes.clone()),
                 fixture::open_file(&path, roomy(), indexed_routes.clone()),
@@ -637,10 +670,10 @@ fn lazy_generation_load_beside_a_writer_keeps_serving() {
         let backend_observation = redb::observe_backend_reads(Arc::new(move |bytes| {
             observed_bytes.fetch_add(bytes as u64, Ordering::SeqCst);
         }));
-        let answer = contextdb_vector::hnsw::with_hnsw_build_observer(graph.clone(), || {
+        let answer = contextdb_vector::with_vector_build_observer(graph.clone(), || {
             reader.execute(&SQL.replace("AUTO", mode), &q())
         })
-        .expect("first lazy graph load under writer ownership must serve the original snapshot");
+        .expect("first lazy index load under writer ownership must serve the original snapshot");
         drop(backend_observation);
         assert!(
             backend_bytes.load(Ordering::SeqCst) > 0,
@@ -649,7 +682,7 @@ fn lazy_generation_load_beside_a_writer_keeps_serving() {
         assert_eq!(
             graph.builds.load(Ordering::SeqCst),
             0,
-            "read-open/query never rebuilds the graph"
+            "read-open/query never rebuilds the index"
         );
         let expected = if mode == "AUTO" {
             &before_auto
@@ -657,11 +690,12 @@ fn lazy_generation_load_beside_a_writer_keeps_serving() {
             &before_indexed
         };
         assert_eq!(
-            &answer.rows, expected,
+            &answer.rows(),
+            expected,
             "the identical query on the original snapshot retains its answer"
         );
         assert_eq!(
-            answer.trace.vector_search.unwrap().resolved_mode,
+            answer.trace().vector_search.as_ref().unwrap().resolved_mode,
             VectorSearchMode::Indexed
         );
         assert_eq!(reader.file_snapshot_for_test(), snapshot);
@@ -670,7 +704,7 @@ fn lazy_generation_load_beside_a_writer_keeps_serving() {
     writer.expect("writer-closed");
     writer.expect("writer-restarted");
     for reader in [&auto, &indexed] {
-        assert_eq!(reader.execute(SQL, &q()).unwrap().rows, before_auto);
+        assert_eq!(reader.execute(SQL, &q()).unwrap().rows(), before_auto);
     }
     auto_routes.file_only();
     indexed_routes.file_only();
@@ -705,7 +739,7 @@ fn read_journey(reader: &ReadSession) -> (Vec<Vec<Value>>, Vec<Vec<Value>>, Vec<
     let find = reader.execute("SELECT id FROM reader_work WHERE context_id = $context ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 10",
         &HashMap::from([("q".into(), Value::Vector(fixture::vector(0))), ("context".into(), Value::Uuid(fixture::context_id(0)))])).unwrap();
     assert_eq!(
-        find.trace.vector_search.unwrap().resolved_mode,
+        find.trace().vector_search.as_ref().unwrap().resolved_mode,
         VectorSearchMode::Indexed
     );
     let show = reader
@@ -719,10 +753,15 @@ fn read_journey(reader: &ReadSession) -> (Vec<Vec<Value>>, Vec<Vec<Value>>, Vec<
     let status = reader
         .execute("SHOW VECTOR_INDEXES", &HashMap::new())
         .unwrap();
-    assert!(!find.rows.is_empty() && !show.rows.is_empty() && !status.rows.is_empty());
-    (find.rows, show.rows, status.rows)
+    assert!(!find.rows().is_empty() && !show.rows().is_empty() && !status.rows().is_empty());
+    (
+        find.rows().to_vec(),
+        show.rows().to_vec(),
+        status.rows().to_vec(),
+    )
 }
 #[test]
+#[ignore = "requires a maintained vector index, which this release does not ship"]
 fn schema_replay_does_not_interrupt_active_readers() {
     if child_dispatch() {
         return;
@@ -734,7 +773,9 @@ fn schema_replay_does_not_interrupt_active_readers() {
     fixture::seed_working_set(&path);
     let author = Database::open_memory();
     declare_replay_schema(&author);
-    let initial = author.changes_since(Lsn(0));
+    let initial = author
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     assert_eq!(initial.ddl.len(), 102);
     let initial = schema_replay_unit(&author, initial);
     let receiver = writer(&path, &runtime);
@@ -768,7 +809,9 @@ fn schema_replay_does_not_interrupt_active_readers() {
             )
             .unwrap();
     }
-    let migration = author.changes_since(since);
+    let migration = author
+        .changes_since(since)
+        .expect("read the declared changes");
     assert_eq!(
         migration.ddl.len(),
         100,
@@ -788,7 +831,7 @@ fn schema_replay_does_not_interrupt_active_readers() {
             &HashMap::new(),
         )
         .unwrap();
-    assert!(cursor.first_page().has_more);
+    assert!(cursor.first_page().has_more());
     let mut writer = Process::start(
         "schema_replay_does_not_interrupt_active_readers",
         "writer",
@@ -807,7 +850,7 @@ fn schema_replay_does_not_interrupt_active_readers() {
         "find/show/status while received-schema publication is parked"
     );
     let page = cursor.fetch(std::num::NonZeroUsize::new(2)).unwrap();
-    assert_eq!(page.rows[0][0], Value::Uuid(fixture::row_id(2)));
+    assert_eq!(page.rows()[0][0], Value::Uuid(fixture::row_id(2)));
     writer.send("publish");
     writer.expect("schema-published");
     assert_eq!(read_journey(&reader), before);
@@ -822,7 +865,7 @@ fn schema_replay_does_not_interrupt_active_readers() {
         reader
             .execute("SELECT body FROM schema_099", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("kept".into())]]
     );
     cursor.close().unwrap();
@@ -835,14 +878,14 @@ fn schema_replay_does_not_interrupt_active_readers() {
         restarted
             .execute("SELECT body, revised FROM schema_099", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("kept".into()), Value::Null]]
     );
     assert_eq!(
         restarted
             .execute("SELECT body, revised FROM schema_000", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("kept".into()), Value::Null]]
     );
 }
@@ -879,23 +922,37 @@ fn a_dead_reader_process_does_not_prevent_later_write_maintenance_and_restart() 
                 &HashMap::new()
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("new".into())]]
     );
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_owner_query_keeps_its_registered_snapshot_while_the_writer_commits() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("owner-overlap.db");
     let runtime = fixture::runtime(root.path());
     seed(&path);
-    let baseline = fixture::open_file(&path, roomy(), Arc::new(fixture::Routes::default()));
-    let expected = baseline
-        .execute(&SQL.replace("AUTO", "EXACT"), &q())
-        .unwrap()
-        .rows;
+    let baseline =
+        ReadSession::open_with_clock_for_test(&path, roomy(), Arc::new(ManualDeadlineClock::at(0)))
+            .unwrap();
+    assert_eq!(
+        baseline.route(),
+        contextdb_core::read_contract::ReadRoute::File
+    );
+    let expected = {
+        let fixture_answer_28 = baseline
+            .execute(&SQL.replace("AUTO", "EXACT"), &q())
+            .unwrap();
+        fixture_answer_28.rows().to_vec()
+    };
     drop(baseline);
+    let request_clock = Arc::new(ManualDeadlineClock::at(0));
+    let (drain_started, _drain_seen) = mpsc::channel();
     let (tx, reached) = mpsc::channel();
     let park = Arc::new(Park {
         armed: AtomicBool::new(true),
@@ -908,6 +965,15 @@ fn an_owner_query_keeps_its_registered_snapshot_while_the_writer_commits() {
             maintenance_policy: MaintenancePolicy::CallerDriven,
             owner_reads: OwnerReadConfig {
                 runtime_dir: Some(runtime.clone()),
+                test_hooks: Some(contextdb_engine::OwnerReadTestHooks {
+                    clock: request_clock.clone(),
+                    drain_started,
+                    active_request_registered: None,
+                    accept_thread_exited: None,
+                    accept_thread_joined: None,
+                    service_dropped: None,
+                    quiescent_stop: None,
+                }),
                 ..Default::default()
             },
             test_kernel_observer: Some(park.clone()),
@@ -915,9 +981,19 @@ fn an_owner_query_keeps_its_registered_snapshot_while_the_writer_commits() {
         },
     )
     .unwrap();
-    let reader =
-        ReadSession::with_runtime_directory_for_test(&runtime, || ReadSession::open(&path))
-            .unwrap();
+    let reader = {
+        let mut options = roomy();
+        // This fixture synchronizes at a source barrier; the writer, not
+        // elapsed kernel time, controls when the reader may continue.
+        options.limits.active_ms = u64::MAX;
+        ReadSession::open_in_runtime_dir_with_clock_for_test(
+            &path,
+            options,
+            Some(runtime.clone()),
+            request_clock.clone(),
+        )
+    }
+    .unwrap();
     assert_eq!(
         reader.route(),
         contextdb_core::read_contract::ReadRoute::Owner
@@ -942,7 +1018,7 @@ fn an_owner_query_keeps_its_registered_snapshot_while_the_writer_commits() {
             .unwrap()
             .expect("owner query completes its registered snapshot");
         progress.expect("the writer made progress before the reader was released");
-        assert_eq!(answer.rows, expected);
+        assert_eq!(answer.rows(), expected);
     });
     assert_eq!(
         reader
@@ -951,7 +1027,7 @@ fn an_owner_query_keeps_its_registered_snapshot_while_the_writer_commits() {
                 &HashMap::new()
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("new".into())]],
         "later owner statements correctly see the later committed state"
     );

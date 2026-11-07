@@ -37,12 +37,16 @@ impl ApplicationTablePolicyExpectation {
     /// Add caller input using the same clause words as
     /// `DECLARE TENANT TABLE POLICY`. The hub still resolves and
     /// authenticates this expectation before it can become authority.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn expect_table(
         mut self,
         table: impl Into<String>,
         clauses: &str,
     ) -> contextdb_core::Result<Self> {
-        let table = table.into();
+        let table: String = table.into();
         let policy = parse_expectation_clauses(&table, clauses)?;
         if self.tables.insert(table.clone(), policy).is_some() {
             return Err(contextdb_core::Error::SchemaInvalid {
@@ -53,6 +57,10 @@ impl ApplicationTablePolicyExpectation {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn parse_expectation_clauses(
     table: &str,
     clauses: &str,
@@ -85,13 +93,13 @@ fn parse_expectation_clauses(
     })
 }
 
-fn empty_inspection(columns: &[&str]) -> crate::database::QueryResult {
-    let mut result = crate::database::QueryResult::empty();
+fn empty_inspection(columns: &[&str]) -> crate::database::QueryResultData {
+    let mut result = crate::database::QueryResultData::empty();
     result.columns = columns.iter().map(|column| (*column).to_string()).collect();
     result
 }
 
-pub(crate) fn empty_policy_inspection() -> crate::database::QueryResult {
+pub(crate) fn empty_policy_inspection() -> crate::database::QueryResultData {
     empty_inspection(&[
         "table",
         "tenant_id",
@@ -110,7 +118,7 @@ pub(crate) fn empty_policy_inspection() -> crate::database::QueryResult {
     ])
 }
 
-pub(crate) fn empty_binding_inspection() -> crate::database::QueryResult {
+pub(crate) fn empty_binding_inspection() -> crate::database::QueryResultData {
     empty_inspection(&[
         "table",
         "tenant_id",
@@ -132,7 +140,7 @@ pub(crate) fn empty_binding_inspection() -> crate::database::QueryResult {
     ])
 }
 
-pub(crate) fn empty_outcome_inspection() -> crate::database::QueryResult {
+pub(crate) fn empty_outcome_inspection() -> crate::database::QueryResultData {
     empty_inspection(&[
         "root_table",
         "root_key",
@@ -303,11 +311,34 @@ impl crate::Database {
     /// Members must be named by that policy, written in `tx`, and reference this root. An empty
     /// member list is valid. Invalid registration aborts `tx`; rollback or failed commit leaves
     /// neither rows nor a manifest. The engine computes BLAKE3 over every application column.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn register_delivery_manifest(
         &self,
         tx: TxId,
         manifest: DeliveryManifest<'_>,
     ) -> contextdb_core::Result<()> {
+        self.register_delivery_manifest_with_read_memory(
+            tx,
+            manifest,
+            self.declared_reader_memory()?,
+        )
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn register_delivery_manifest_with_read_memory(
+        &self,
+        tx: TxId,
+        manifest: DeliveryManifest<'_>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> contextdb_core::Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let runtime =
             self.custody_runtime()
                 .ok_or_else(|| contextdb_core::Error::SchemaInvalid {
@@ -332,37 +363,80 @@ impl crate::Database {
                     })
                     .collect(),
             },
+            read_memory,
         )
     }
     /// Read the durable outcome for the visible current root at the registered destination.
     ///
     /// Returns `None` for a missing, hidden, purged, discarded, pending, or old-destination root.
     /// This metadata read changes no journal, binding, or watermark and obeys the handle's scope.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn delivery_outcome(
         &self,
         root_table: &str,
         root_key: &NaturalKey,
     ) -> contextdb_core::Result<Option<DeliveryOutcome>> {
-        crate::custody::inspection::outcome(self, root_table, root_key)
+        self.delivery_outcome_with_read_memory(root_table, root_key, self.declared_reader_memory()?)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn delivery_outcome_with_read_memory(
+        &self,
+        root_table: &str,
+        root_key: &NaturalKey,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> contextdb_core::Result<Option<DeliveryOutcome>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        crate::custody::inspection::outcome(self, root_table, root_key, read_memory)
     }
     /// Count visible eligible units and their accepted, equivalent, refused, and pending states.
     ///
     /// Only an admitted durable outcome grants credit; transport watermarks do not. `SYNC OFF`
     /// returns disabled and zero eligible units. Counts obey this handle's row scope and do not
     /// mutate custody. Administrative `SHOW` queries use the ordinary read session limits.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn delivery_status(
         &self,
         root_table: &str,
     ) -> contextdb_core::Result<DeliveryStatusCounts> {
-        crate::custody::inspection::status(self, root_table)
+        self.delivery_status_with_read_memory(root_table, self.declared_reader_memory()?)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn delivery_status_with_read_memory(
+        &self,
+        root_table: &str,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> contextdb_core::Result<DeliveryStatusCounts> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        crate::custody::inspection::status(self, root_table, read_memory)
     }
 }
 
 // Only the authenticated local read decoder constructs this projection. Public
 // deserialization is deliberately not provided for an admitted outcome or cursor.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn decode_outcome_projection(
     text: &str,
 ) -> contextdb_core::Result<Option<DeliveryOutcome>> {
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     fn required_nullable<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -400,8 +474,10 @@ pub(crate) fn decode_outcome_projection(
         #[serde(deserialize_with = "required_nullable")]
         conflicts: Option<Vec<Conflict>>,
     }
-    let Some(p): Option<OutcomeProjection> =
-        serde_json::from_str(text).map_err(|_| crate::custody::canonical::invalid())?
+    let Some(p): Option<OutcomeProjection> = crate::read_image_memory::decode_json(
+        &crate::read_image_memory::ImageMemory::enter_decode_call()?,
+        text.as_bytes(),
+    )?
     else {
         return Ok(None);
     };

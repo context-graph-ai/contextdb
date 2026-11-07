@@ -14,7 +14,7 @@ JSON Lines.
 |---|---|
 | `main.rs` | Argument parsing (clap), the `Operation` subcommand tree, opening the store or the `ReadSession`, startup/shutdown errors and the process exit code. |
 | `command_registry.rs` | The one table of meta-command spellings, aliases and their store effect; `--help`, `.help` and pre-dispatch write authorization all read it. |
-| `repl.rs` | `Session`, `run`, `feed_line`, statement framing (`;` outside quotes and comments), meta-commands, cursors, Ctrl-C handling, `:memory:` default sink/cron callbacks. |
+| `repl.rs` | `Session`, `run`, `feed_line`, statement framing (`;` outside quotes and comments), meta-commands, cursors, Ctrl-C handling. |
 | `ops.rs` | `reset`, `diagnose`, `snapshot`, `inspect`, `purge`. |
 | `json_output.rs` / `formatter.rs` | `--json` documents and `ErrorClass` (`#[non_exhaustive]`); human tables. |
 | `sync_status.rs` / `auto_sync.rs` | `.sync status` wording in transport-neutral endpoint language; background sync. |
@@ -28,7 +28,7 @@ never gets CLI-registered callbacks — events queue durably for the owning prog
 ## Seams
 
 Below: `contextdb-engine` (`Database`, `ReadSession`, `DatabaseOpenOptions`), `contextdb-server`
-(sync client, exit codes), `contextdb-parser` (re-parse for callback registration),
+(sync client, exit codes), `contextdb-parser` (statement parsing and effect classification),
 `contextdb-core`. Above: operators and scripts. Library exports: `run`, `Session`, `OutputOptions`,
 `ErrorClass`, `EXIT_*`, `canonical_help_signatures`, `operational_command_discovery`.
 
@@ -49,11 +49,11 @@ Below: `contextdb-engine` (`Database`, `ReadSession`, `DatabaseOpenOptions`), `c
 | `.explain` never applies a write | `tests/explain_non_execution_tests.rs::explain_json_delete_leaves_rows_intact` |
 | A `;` inside a quoted string or comment is not a terminator | `tests/multiline_statement_tests.rs::quoted_semicolon_survives_when_the_statement_itself_spans_multiple_lines`, `tests/comment_remainder_tests.rs::trailing_line_comment_at_eof_exits_cleanly` |
 | Ctrl-C cancels the statement, keeps the session and its cursor | `tests/read_cli_journeys_cancellation.rs::an_open_cursor_survives_the_interruption` |
+| `.verify history <table>` checks historical indexes through the read session; dispatch and help stay in the command registry and REPL | `src/repl.rs` and `src/command_registry.rs`; guard `tests/read_cli_journeys_metadata.rs::verify_history_checks_each_historical_index_from_a_read_session` |
 | Spellings come from one registry; removed spellings are refused by name | `src/command_registry.rs::contract_tests::generated_discovery_is_the_exact_filtered_canonical_registry`, `tests/removed_spellings_are_refused_by_name.rs::the_removed_repair_command_is_refused_by_name_and_points_at_diagnose` |
 | `reset` and `purge` refuse without `--force`; `reset` never replaces a live owner's store | `tests/reset_repair_tests.rs::reset_without_force_uses_the_usage_exit_code`, `tests/purge_cli_verb_tests.rs::purge_without_force_refuses_and_leaves_data_untouched`, `tests/reset_live_owner_tests.rs::reset_force_refuses_a_live_owner_without_unlinking_its_store_or_lock` |
 | A corrupt store yields a handled error naming `diagnose` and `reset`, never a panic | `tests/corrupt_store_open_tests.rs::opening_a_corrupt_store_error_names_the_diagnose_and_reset_commands` |
 | `SHOW VECTOR_PARTITIONS` uses the ordinary bounded result and cursor | `tests/vector_partition_show_cursor_contract.rs::oversized_vector_inspection_refuses_then_the_ordinary_cursor_pages_every_row` |
-| A `:memory:` session registers default sink and cron callbacks so a routed event and a scheduled fire both deliver observably | `src/repl.rs::tests::cli_statement_flow_registers_a_default_sink_callback_so_a_routed_event_delivers`, `::tests::cli_statement_flow_registers_a_cron_callback_so_a_schedule_fires` |
 | `.schema --json` speaks declared-policy words, never Rust `Debug` spellings | `tests/json_schema_sync_vocabulary_tests.rs::json_schema_emits_both_vocabularies_together` |
 
 ## Where a change lives

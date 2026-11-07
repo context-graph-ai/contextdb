@@ -96,9 +96,9 @@ fn select_where_valid_column_still_works() {
     let r = db
         .execute("SELECT a, b, tag FROM t WHERE a = 1", &empty())
         .expect("SELECT with a valid WHERE column must succeed");
-    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows().len(), 1);
     assert_eq!(
-        r.rows[0],
+        r.rows()[0],
         vec![
             Value::Int64(1),
             Value::Int64(100),
@@ -183,7 +183,7 @@ fn delete_where_nonexistent_column_is_column_not_found_error() {
             let remaining = db
                 .execute("SELECT a FROM t", &empty())
                 .expect("count remaining rows in `t`")
-                .rows
+                .rows()
                 .len();
             panic!(
                 "DELETE FROM t WHERE ghost IS NULL must fail with \
@@ -192,7 +192,7 @@ fn delete_where_nonexistent_column_is_column_not_found_error() {
                  an `IS NULL` check on a column that doesn't exist must never be treated \
                  as vacuously true for every row and wipe the ENTIRE table instead of \
                  refusing. Full result: {r:?}",
-                r.rows_affected,
+                r.rows_affected(),
             );
         }
         Err(other) => panic!(
@@ -225,7 +225,7 @@ fn update_where_nonexistent_column_is_column_not_found_error() {
             let rewritten = db
                 .execute("SELECT a FROM t WHERE b = 999", &empty())
                 .expect("count rows rewritten to b = 999")
-                .rows
+                .rows()
                 .len();
             panic!(
                 "UPDATE t SET b = 999 WHERE ghost IS NULL must fail with \
@@ -234,7 +234,7 @@ fn update_where_nonexistent_column_is_column_not_found_error() {
                  an `IS NULL` check on a column that doesn't exist must never be treated \
                  as vacuously true for every row and rewrite EVERY row in the table \
                  instead of refusing. Full result: {r:?}",
-                r.rows_affected,
+                r.rows_affected(),
             );
         }
         Err(other) => panic!(

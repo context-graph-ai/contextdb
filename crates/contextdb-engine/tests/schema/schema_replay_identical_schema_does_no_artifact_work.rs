@@ -33,7 +33,10 @@ async fn identical_schema_replay_does_zero_actual_artifact_work() {
         ("first", &first, &a, first_before),
         ("second", &second, &b, second_before),
     ] {
-        let expected = edge.changes_since(since).ddl;
+        let expected = edge
+            .changes_since(since)
+            .expect("read authored schema changes")
+            .ddl;
         assert_eq!(expected.len(), 102);
         let exchange_start = hub.broker.recorded_exchanges().len();
         let pushed = ReceivedSchemaApplyObserverForTest::new();

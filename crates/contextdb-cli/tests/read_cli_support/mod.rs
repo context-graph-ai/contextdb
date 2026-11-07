@@ -13,10 +13,8 @@
 //! * Nothing sleeps to "let the child get ready". Readiness is proven by the
 //!   child publishing a document.
 
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
@@ -25,6 +23,10 @@ use std::time::Duration;
 use serde_json::Value;
 
 /// Failsafe for a hung child. Never an assertion about how long work takes.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by interactive_type_ahead, read_cli_journeys_cancellation, read_cli_journeys_cursor"
+)]
 pub const WATCHDOG: Duration = Duration::from_secs(120);
 
 /// Environment names the ratified contract says are either bootstrap-only or
@@ -42,6 +44,35 @@ pub const CONTEXTDB_ENV_NAMES: &[&str] = &[
 
 pub fn cli_binary() -> &'static str {
     env!("CARGO_BIN_EXE_contextdb")
+}
+
+/// Make a spawned session's SIGINT state explicit: default disposition and
+/// not blocked. A child inherits its launcher's signal state across exec, and a
+/// harness started as a background job (or under nohup/timeout) can hand down an
+/// ignored or blocked SIGINT, which would make the ordinary meaning of an
+/// interrupt untestable. The journeys that interrupt a session depend on this
+/// precondition, so it is set here rather than assumed.
+#[cfg(unix)]
+fn restore_default_sigint(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure runs between fork and exec and calls only
+    // async-signal-safe functions (signal, sigemptyset, sigaddset,
+    // pthread_sigmask) on stack data.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::signal(libc::SIGINT, libc::SIG_DFL) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGINT);
+            let rc = libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+            if rc != 0 {
+                return Err(std::io::Error::from_raw_os_error(rc));
+            }
+            Ok(())
+        });
+    }
 }
 
 fn base_command() -> Command {
@@ -69,6 +100,10 @@ impl Outcome {
 
     /// Every non-empty stdout line parsed as JSON. Panics naming the offending
     /// line, which is itself the JSON-Lines purity contract.
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by interactive_type_ahead, read_cli_journeys_cursor, read_cli_journeys_invocation, "
+    )]
     pub fn stdout_docs(&self) -> Vec<Value> {
         strict_json_lines(&self.stdout, "stdout")
     }
@@ -76,22 +111,42 @@ impl Outcome {
     /// The JSON documents present on stderr. Lenient by design: the purity
     /// promise applies to stdout, and a stderr-purity journey asserts stderr
     /// separately rather than making every other test depend on it.
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_cursor, read_cli_journeys_invocation, read_cli_journeys_live_o"
+    )]
     pub fn stderr_docs(&self) -> Vec<Value> {
         lenient_json_lines(&self.stderr)
     }
 
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_cursor, read_cli_journeys_invocation, read_cli_journeys_live_o"
+    )]
     pub fn errors(&self) -> Vec<Value> {
         inner_objects(&self.stderr_docs(), "error")
     }
 
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_invocation, read_cli_journeys_live_owner, read_cli_journeys_ma"
+    )]
     pub fn notices(&self) -> Vec<Value> {
         inner_objects(&self.stderr_docs(), "notice")
     }
 
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_cursor, read_cli_journeys_invocation, read_cli_journeys_live_o"
+    )]
     pub fn error_kinds(&self) -> Vec<String> {
         self.errors().iter().filter_map(detail_kind).collect()
     }
 
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_invocation, read_cli_journeys_live_owner, read_cli_journeys_ma"
+    )]
     pub fn route_notices(&self) -> Vec<Value> {
         self.notices()
             .into_iter()
@@ -100,6 +155,10 @@ impl Outcome {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_cursor, read_cli_journeys_invocation, read_cli_journeys_live_o"
+)]
 pub fn detail_kind(envelope: &Value) -> Option<String> {
     envelope
         .get("detail")?
@@ -108,6 +167,10 @@ pub fn detail_kind(envelope: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by interactive_type_ahead, read_cli_journeys_cursor, read_cli_journeys_invocation, "
+)]
 pub fn strict_json_lines(text: &str, stream: &str) -> Vec<Value> {
     text.lines()
         .filter(|line| !line.trim().is_empty())
@@ -133,24 +196,44 @@ pub fn lenient_json_lines(text: &str) -> Vec<Value> {
         .collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by interactive_type_ahead, read_cli_journeys_cursor, read_cli_journeys_invocation, "
+)]
 pub fn inner_objects(docs: &[Value], key: &str) -> Vec<Value> {
     docs.iter().filter_map(|d| d.get(key).cloned()).collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by interactive_type_ahead, read_cli_journeys_cursor, read_cli_journeys_live_owner, "
+)]
 pub fn documents_named(docs: &[Value], key: &str) -> Vec<Value> {
     inner_objects(docs, key)
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_cursor, read_cli_journeys_invocation, read_cli_journeys_live_o"
+)]
 pub fn document_named(docs: &[Value], key: &str) -> Option<Value> {
     docs.iter().find_map(|d| d.get(key).cloned())
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_cursor, read_cli_journeys_invocation, read_cli_journeys_live_o"
+)]
 pub fn expect_document(docs: &[Value], key: &str, context: &str) -> Value {
     document_named(docs, key).unwrap_or_else(|| {
         panic!("{context}: expected one document whose top-level key is {key:?}, saw: {docs:?}")
     })
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by interactive_type_ahead, read_cli_journeys_cancellation, read_cli_journeys_cursor"
+)]
 pub fn rows_of(document: &Value) -> Vec<Value> {
     document
         .get("rows")
@@ -192,6 +275,10 @@ pub fn run_with_env(args: &[&str], env: &[(&str, &str)], stdin_text: &str) -> Ou
 
 /// A store folder plus the database path inside it.
 pub struct Store {
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_cursor, read_cli_journeys_invocation, read_cli_journeys_live_o"
+    )]
     pub dir: tempfile::TempDir,
     pub path: PathBuf,
 }
@@ -201,10 +288,18 @@ impl Store {
         self.path.to_str().expect("utf-8 store path")
     }
 
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_invocation, read_cli_journeys_live_owner, read_cli_journeys_ma"
+    )]
     pub fn folder(&self) -> &Path {
         self.dir.path()
     }
 
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_cursor, read_cli_journeys_invocation"
+    )]
     pub fn contents(&self) -> BTreeMap<String, Vec<u8>> {
         folder_contents(self.dir.path())
     }
@@ -222,6 +317,10 @@ pub fn absent_store() -> Store {
 /// Creation goes through `--write` deliberately: the contract is that a bare
 /// path never creates anything, so a fixture that creates one without the flag
 /// would be testing a surface the contract removes.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by interactive_type_ahead, read_cli_journeys_cancellation, read_cli_journeys_cursor"
+)]
 pub fn store_with(sql: &str) -> Store {
     let store = absent_store();
     let path = store.path.clone();
@@ -236,12 +335,20 @@ pub fn store_with(sql: &str) -> Store {
     store
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_cursor, read_cli_journeys_invocation"
+)]
 pub fn folder_contents(dir: &Path) -> BTreeMap<String, Vec<u8>> {
     let mut found = BTreeMap::new();
     collect_folder(dir, dir, &mut found);
     found
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_cursor, read_cli_journeys_invocation"
+)]
 fn collect_folder(root: &Path, current: &Path, into: &mut BTreeMap<String, Vec<u8>>) {
     let entries = match std::fs::read_dir(current) {
         Ok(entries) => entries,
@@ -265,6 +372,10 @@ fn collect_folder(root: &Path, current: &Path, into: &mut BTreeMap<String, Vec<u
 
 /// SQL that fills `table` with `count` rows whose payloads are distinct and
 /// carry no restatement of any expected answer.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by interactive_type_ahead, read_cli_journeys_cancellation, read_cli_journeys_cursor"
+)]
 pub fn seed_rows(table: &str, count: usize) -> String {
     let mut sql = String::new();
     let mut written = 0usize;
@@ -284,6 +395,10 @@ pub fn seed_rows(table: &str, count: usize) -> String {
     sql
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by interactive_type_ahead, read_cli_journeys_cursor, read_cli_journeys_invocation, "
+)]
 pub fn create_seeded_table(table: &str, count: usize) -> String {
     format!(
         "CREATE TABLE {table} (id INTEGER PRIMARY KEY, label TEXT);\n{}",
@@ -303,12 +418,20 @@ pub fn create_seeded_table(table: &str, count: usize) -> String {
 /// terminal, so the binary under test sees exactly what a person's terminal
 /// gives it. Terminal echo means the transcript contains typed input as well as
 /// output, which is why assertions look for markers rather than whole lines.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by interactive_type_ahead, read_cli_journeys_cancellation, read_cli_journeys_cursor"
+)]
 pub struct Terminal {
     child: Child,
     stdin: ChildStdin,
     transcript: Arc<(Mutex<String>, Condvar)>,
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by interactive_type_ahead, read_cli_journeys_cancellation, read_cli_journeys_cursor"
+)]
 pub fn terminal(args: &[&str]) -> Terminal {
     let mut invocation = shell_quote(cli_binary());
     for arg in args {
@@ -382,16 +505,28 @@ pub fn terminal(args: &[&str]) -> Terminal {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by interactive_type_ahead, read_cli_journeys_cancellation, read_cli_journeys_cursor"
+)]
 enum StreamHandle {
     Out(std::process::ChildStdout),
     Err(std::process::ChildStderr),
 }
 
 impl Terminal {
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_cancellation"
+    )]
     pub fn transcript(&self) -> String {
         self.transcript.0.lock().expect("transcript lock").clone()
     }
 
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by interactive_type_ahead, read_cli_journeys_cancellation, read_cli_journeys_cursor"
+    )]
     pub fn send(&mut self, text: &str) {
         self.stdin
             .write_all(text.as_bytes())
@@ -399,23 +534,39 @@ impl Terminal {
         self.stdin.flush().expect("flush terminal session input");
     }
 
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by interactive_type_ahead, read_cli_journeys_cancellation, read_cli_journeys_cursor"
+    )]
     pub fn send_line(&mut self, line: &str) {
         self.send(&format!("{line}\n"));
     }
 
     /// Interrupt: the byte a terminal's line discipline turns into SIGINT for
     /// the foreground session, i.e. what pressing Ctrl-C does.
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_cancellation"
+    )]
     pub fn interrupt(&mut self) {
         self.send("\x03");
     }
 
     /// Block until `marker` appears in the transcript. Waits on an output
     /// event; the watchdog only converts a hang into a readable failure.
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by interactive_type_ahead, read_cli_journeys_cancellation, read_cli_journeys_cursor"
+    )]
     pub fn wait_for(&self, marker: &str) -> String {
         self.wait_for_count(marker, 1)
     }
 
     /// Block until `marker` has appeared at least `occurrences` times.
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by interactive_type_ahead, read_cli_journeys_cancellation, read_cli_journeys_cursor"
+    )]
     pub fn wait_for_count(&self, marker: &str, occurrences: usize) -> String {
         let (lock, signal) = &*self.transcript;
         let mut held = lock.lock().expect("transcript lock");
@@ -436,20 +587,20 @@ impl Terminal {
         }
     }
 
-    pub fn contains(&self, marker: &str) -> bool {
-        self.transcript().contains(marker)
-    }
-
-    pub fn occurrences(&self, marker: &str) -> usize {
-        self.transcript().matches(marker).count()
-    }
-
     /// End the session the way a person does and collect its exit code.
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by interactive_type_ahead, read_cli_journeys_cancellation, read_cli_journeys_cursor"
+    )]
     pub fn quit(mut self) -> (Option<i32>, String) {
         self.send_line(".quit");
         self.finish()
     }
 
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by interactive_type_ahead, read_cli_journeys_cancellation, read_cli_journeys_cursor"
+    )]
     pub fn finish(mut self) -> (Option<i32>, String) {
         drop(self.stdin);
         let sink = Arc::clone(&self.transcript);
@@ -457,13 +608,12 @@ impl Terminal {
         let text = sink.0.lock().expect("transcript lock").clone();
         (status.code(), text)
     }
-
-    pub fn kill(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by interactive_type_ahead, read_cli_journeys_cancellation, read_cli_journeys_cursor"
+)]
 fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
@@ -476,68 +626,78 @@ fn shell_quote(text: &str) -> String {
 /// output accumulates as it is produced, and the test drives it statement by
 /// statement. Used for the journeys where two processes must overlap, and for
 /// the ones that act on a session WHILE a statement is running.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_cancellation, read_cli_journeys_live_owner, read_cli_journeys_"
+)]
 pub struct Background {
     child: Child,
     stdin: Option<ChildStdin>,
     transcript: Arc<(Mutex<String>, Condvar)>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by interactive_type_ahead, read_cli_journeys_cancellation, read_cli_journeys_cursor"
+    )]
     output_readers: Vec<std::thread::JoinHandle<()>>,
     pub path: PathBuf,
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_cancellation, read_cli_journeys_live_owner, read_cli_journeys_"
+)]
 pub fn background(args: &[&str]) -> Background {
     let mut cmd = base_command();
     cmd.args(args);
+    #[cfg(unix)]
+    restore_default_sigint(&mut cmd);
+    // This fixture observes one ordered transcript. One kernel pipe preserves
+    // the child's write order across its two descriptors. The stream-purity
+    // journeys use run(), which captures stdout and stderr separately.
+    let (output, sink) = std::io::pipe().expect("background output pipe");
     let mut child = cmd
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(sink.try_clone().expect("clone background output writer"))
+        .stderr(sink)
         .spawn()
         .expect("spawn a background contextdb session");
 
     let stdin = child.stdin.take().expect("background stdin");
     let transcript = Arc::new((Mutex::new(String::new()), Condvar::new()));
-    let mut output_readers = Vec::new();
-    for stream in [
-        child.stdout.take().map(StreamHandle::Out),
-        child.stderr.take().map(StreamHandle::Err),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let sink = Arc::clone(&transcript);
-        output_readers.push(std::thread::spawn(move || {
-            let mut reader: Box<dyn Read + Send> = match stream {
-                StreamHandle::Out(out) => Box::new(out),
-                StreamHandle::Err(err) => Box::new(err),
-            };
-            let mut buffer = [0u8; 4096];
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) | Err(_) => break,
-                    Ok(read) => {
-                        let text = String::from_utf8_lossy(&buffer[..read]).into_owned();
-                        let (lock, signal) = &*sink;
-                        let mut held = lock.lock().expect("background transcript lock");
-                        held.push_str(&text);
-                        signal.notify_all();
-                    }
+    let sink = Arc::clone(&transcript);
+    let output_reader = std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(output);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let (lock, signal) = &*sink;
+                    let mut held = lock.lock().expect("background transcript lock");
+                    held.push_str(&line);
+                    signal.notify_all();
                 }
             }
-            let (_, signal) = &*sink;
-            signal.notify_all();
-        }));
-    }
+        }
+        let (_, signal) = &*sink;
+        signal.notify_all();
+    });
 
     Background {
         child,
         stdin: Some(stdin),
         transcript,
-        output_readers,
+        output_readers: vec![output_reader],
         path: PathBuf::new(),
     }
 }
 
 impl Background {
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_cancellation, read_cli_journeys_live_owner, read_cli_journeys_"
+    )]
     pub fn transcript(&self) -> String {
         self.transcript
             .0
@@ -546,10 +706,18 @@ impl Background {
             .clone()
     }
 
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_ordinary_results, read_cli_journeys_route_changes"
+    )]
     pub fn documents(&self) -> Vec<Value> {
         lenient_json_lines(&self.transcript())
     }
 
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_cancellation, read_cli_journeys_live_owner, read_cli_journeys_"
+    )]
     pub fn send(&mut self, text: &str) {
         let stdin = self.stdin.as_mut().expect("background stdin");
         stdin
@@ -558,22 +726,38 @@ impl Background {
         stdin.flush().expect("flush background session input");
     }
 
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_cancellation, read_cli_journeys_live_owner, read_cli_journeys_"
+    )]
     pub fn send_line(&mut self, line: &str) {
         self.send(&format!("{line}\n"));
     }
 
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_cancellation"
+    )]
     pub fn try_send_line(&mut self, line: &str) -> std::io::Result<()> {
         let stdin = self.stdin.as_mut().expect("background stdin");
         stdin.write_all(format!("{line}\n").as_bytes())?;
         stdin.flush()
     }
 
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_cancellation"
+    )]
     pub fn pid(&self) -> u32 {
         self.child.id()
     }
 
     /// Deliver the signal a terminal's Ctrl-C sends, to a session that has no
     /// terminal — the journey where interruption must still end the process.
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_cancellation"
+    )]
     pub fn interrupt(&self) {
         let status = Command::new("kill")
             .arg("-INT")
@@ -585,6 +769,10 @@ impl Background {
 
     /// Block until `marker` appears. Waits on an output event; the watchdog only
     /// turns a hang into a readable failure.
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_cancellation, read_cli_journeys_live_owner, read_cli_journeys_"
+    )]
     pub fn wait_for(&self, marker: &str) -> String {
         let (lock, signal) = &*self.transcript;
         let mut held = lock.lock().expect("background transcript");
@@ -602,15 +790,15 @@ impl Background {
         }
     }
 
-    pub fn close_input(&mut self) {
-        self.stdin.take();
-    }
-
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_cancellation, read_cli_journeys_live_owner, read_cli_journeys_"
+    )]
     pub fn finish(mut self) -> (Option<i32>, String) {
         self.stdin.take();
         let status = self.child.wait().expect("wait for the background session");
-        // Process exit closes its pipes, but the reader threads may still be
-        // draining them. Collect both streams before asserting on the output.
+        // Process exit closes its output. Collect the reader's remaining
+        // bytes before returning the transcript.
         for reader in self.output_readers.drain(..) {
             reader.join().expect("collect background session output");
         }
@@ -618,6 +806,10 @@ impl Background {
     }
 
     /// Stop the session abruptly — the journey where a process disappears.
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_live_owner"
+    )]
     pub fn kill(&mut self) {
         self.stdin.take();
         let _ = self.child.kill();
@@ -638,11 +830,19 @@ impl Drop for Background {
 ///
 /// Cross-process is the point: an in-process stand-in cannot prove the owner
 /// route, so every owner journey in this estate uses a real second process.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_live_owner, read_cli_journeys_metadata, read_cli_journeys_rout"
+)]
 pub fn live_owner(path: &Path, setup_sql: &str) -> Background {
     live_owner_with(path, &[], setup_sql)
 }
 
 /// The same live owner, started with explicit owner-service policy flags.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_cancellation, read_cli_journeys_live_owner, read_cli_journeys_"
+)]
 pub fn live_owner_with(path: &Path, extra: &[&str], setup_sql: &str) -> Background {
     let mut args = vec![
         path.to_str().expect("utf-8 store path"),

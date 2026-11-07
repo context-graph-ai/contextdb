@@ -78,7 +78,7 @@ fn p() -> HashMap<String, Value> {
 fn row_count(db: &Database, table: &str) -> usize {
     db.execute(&format!("SELECT * FROM {table}"), &p())
         .unwrap_or_else(|err| panic!("{table} scan must succeed: {err}"))
-        .rows
+        .rows()
         .len()
 }
 
@@ -168,7 +168,8 @@ fn start_hub_as(broker: &InProcessBroker, node_id: &str) -> RunningHub {
             TenantId::from(TENANT),
             authenticated_node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -204,6 +205,7 @@ fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, node_id: &str) -> S
         TenantId::from(TENANT),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 /// Receipts exist ONLY for authenticated peers: `peer_node_id` is a plain
@@ -277,6 +279,7 @@ fn offline_client(db: &Arc<Database>, role: &str) -> SyncClient {
         TenantId::from(TENANT),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 // ---------------------------------------------------------------------------
@@ -757,7 +760,9 @@ struct RejectPulledCommit;
 impl DatabasePlugin for RejectPulledCommit {
     fn pre_commit(&self, _ws: &WriteSet, source: CommitSource) -> contextdb_core::Result<()> {
         if source == CommitSource::SyncPull {
-            return Err(Error::Other("injected pull commit failure".to_string()));
+            return Err(Error::Other(
+                "injected pull commit failure".to_string().into(),
+            ));
         }
         Ok(())
     }
@@ -1106,7 +1111,8 @@ async fn c9_an_unauthenticated_peer_produces_no_transfer_receipt() {
         anonymous.clone(),
         broker.client(),
         TenantId::from(TENANT),
-    );
+    )
+    .expect("construct SyncClient fixture");
     let refusal = within(anonymous_client.push())
         .await
         .expect_err("an identityless transport is refused before it can push");
@@ -1259,7 +1265,7 @@ async fn c9_blob_receipts_split_serve_and_fetch_by_peer() {
     let endpoint = within(IrohServer::bind(&bind_spec(&holder_key)))
         .await
         .expect("bind holder");
-    holder.serve_on(&endpoint);
+    let _ = holder.serve_on(&endpoint);
     let ticket = endpoint.ticket();
 
     let mut fetched_by_one = Vec::new();
@@ -1670,6 +1676,7 @@ fn lost_ack_client(
         TenantId::from(TENANT),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 fn lost_ack_client_with_newer_hub_edit(
@@ -1698,6 +1705,7 @@ fn lost_ack_client_with_newer_hub_edit(
         TenantId::from(TENANT),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 fn lost_ack_client_with_failed_reconciliation_pull(
@@ -1720,6 +1728,7 @@ fn lost_ack_client_with_failed_reconciliation_pull(
         TenantId::from(TENANT),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 /// A push whose ack was lost but whose batch landed returns through
@@ -1839,12 +1848,12 @@ async fn lost_ack_recovery_pulls_a_newer_hub_edit_without_replaying_the_stale_ed
         .db
         .execute("SELECT body FROM notes WHERE id = 1", &p())
         .expect("hub read")
-        .rows[0][0]
+        .rows()[0][0]
         .clone();
     let edge_body = edge
         .execute("SELECT body FROM notes WHERE id = 1", &p())
         .expect("edge read")
-        .rows[0][0]
+        .rows()[0][0]
         .clone();
     assert_eq!(hub_body, Value::Text("hub-newer".to_string()));
     assert_eq!(
@@ -1906,12 +1915,12 @@ async fn reopened_edge_reconciles_pending_lost_ack_before_it_can_resend_old_rows
         .db
         .execute("SELECT body FROM notes WHERE id = 1", &p())
         .expect("hub read")
-        .rows[0][0]
+        .rows()[0][0]
         .clone();
     let edge_body = reopened
         .execute("SELECT body FROM notes WHERE id = 1", &p())
         .expect("edge read")
-        .rows[0][0]
+        .rows()[0][0]
         .clone();
     assert_eq!(hub_body, Value::Text("hub-newer".to_string()));
     assert_eq!(
@@ -2079,7 +2088,8 @@ async fn lost_refusal_reply_keeps_original_diagnostics_after_a_newer_hub_edit() 
         }),
         TenantId::from(TENANT),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     let result = within(client.push()).await.unwrap();
     assert_eq!(result.applied_rows, 0);
     assert_eq!(result.skipped_rows, 1);
@@ -2097,7 +2107,7 @@ async fn lost_refusal_reply_keeps_original_diagnostics_after_a_newer_hub_edit() 
         loser
             .execute("SELECT body FROM windows", &p())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("refused-value".to_string())]],
         "push-only content never arrives by pull"
     );
@@ -2111,7 +2121,7 @@ async fn lost_refusal_reply_keeps_original_diagnostics_after_a_newer_hub_edit() 
         hub.db
             .execute("SELECT body FROM windows", &p())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("newer-hub-value".to_string())]]
     );
     hub.stop().await;
@@ -2180,7 +2190,8 @@ async fn accepted_delete_replay_retires_only_its_adjudicated_work_across_reopen(
         }),
         TenantId::from(TENANT),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     let result = within(client.push()).await.unwrap();
     assert_eq!(result.applied_rows, 0);
     assert_eq!(result.skipped_rows, 2);
@@ -2235,7 +2246,7 @@ async fn accepted_delete_replay_retires_only_its_adjudicated_work_across_reopen(
     );
     assert!(!resumed.has_pending_push_changes().unwrap());
     assert_eq!(
-        hub.db.execute("SELECT id FROM notes", &p()).unwrap().rows,
+        hub.db.execute("SELECT id FROM notes", &p()).unwrap().rows(),
         vec![vec![Value::Int64(2)]]
     );
     hub.stop().await;

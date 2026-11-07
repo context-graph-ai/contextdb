@@ -7,8 +7,7 @@
 //!
 //! # Example
 //!
-//! Open an in-memory database, create a table, insert a row, and read it
-//! back. contextdb ships no built-in tables — the schema below is only an
+//! Open a database file, create a table, insert a row, and read it back. contextdb ships no built-in tables — the schema below is only an
 //! example a caller defines for their own data:
 //!
 //! ```
@@ -16,7 +15,8 @@
 //! use std::collections::HashMap;
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let db = Database::open_memory();
+//! let directory = tempfile::tempdir()?;
+//! let db = Database::open(directory.path().join("notes.db"))?;
 //! let params = HashMap::new();
 //!
 //! // An example schema — contextdb ships no built-in tables.
@@ -40,7 +40,7 @@
 //! )?;
 //!
 //! let result = db.execute("SELECT body FROM notes", &params)?;
-//! assert_eq!(result.rows.len(), 1);
+//! assert_eq!(result.rows().len(), 1);
 //! # Ok(())
 //! # }
 //! ```
@@ -49,6 +49,16 @@
 // `Database`; raw apply and progress writers therefore remain crate-private.
 // The server crate exposes the stable safe façade instead of a capability.
 extern crate self as contextdb_engine;
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod outbound_ddl_test_seams;
+#[cfg(feature = "in-process-test-seams")]
+#[doc(hidden)]
+pub mod writer_commit_test_seams;
+#[cfg(feature = "in-process-test-seams")]
+#[doc(hidden)]
+pub mod writer_query_test_seams;
 
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
@@ -66,6 +76,7 @@ mod direct_file_reader;
 #[doc(hidden)]
 pub mod direct_file_reader;
 pub mod executor;
+mod funded_error;
 #[cfg(not(feature = "test-seams"))]
 mod local_transport;
 #[cfg(feature = "test-seams")]
@@ -78,6 +89,12 @@ mod memory_accounting;
 pub mod memory_accounting;
 mod metadata_page;
 #[cfg(not(feature = "test-seams"))]
+mod owned_cursor_page;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod owned_cursor_page;
+mod owned_worker;
+#[cfg(not(feature = "test-seams"))]
 mod owner_read;
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
@@ -88,14 +105,13 @@ pub mod persistent_store;
 pub mod plugin;
 pub mod rank_formula;
 #[cfg(not(feature = "test-seams"))]
-#[allow(dead_code)]
 pub(crate) mod read_contract;
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
 pub mod read_contract;
 mod read_image;
 mod read_image_memory;
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 mod read_probe;
 mod read_progress;
 #[cfg(not(feature = "test-seams"))]
@@ -103,11 +119,17 @@ mod read_session;
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
 pub mod read_session;
-#[cfg(feature = "test-seams")]
-mod read_work_probe;
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub mod read_work_probe;
+mod runtime_directory;
 pub mod schema_enforcer;
+mod scratch;
 pub mod sync;
 pub mod sync_types;
+#[cfg(test)]
+mod test_process;
+pub mod vector_read_memory;
 pub mod work_ledger;
 
 #[cfg(feature = "sync-orchestration")]
@@ -126,6 +148,8 @@ pub(crate) mod protocol;
 pub mod subjects;
 #[cfg(feature = "sync-orchestration")]
 pub mod sync_client;
+#[cfg(feature = "sync-orchestration")]
+mod sync_native_delivery;
 #[cfg(feature = "sync-orchestration")]
 pub mod sync_server;
 #[cfg(feature = "sync-orchestration")]
@@ -146,11 +170,13 @@ pub use contextdb_core::read_contract::{
 /// reads it back from the structures; it is not a ledger figure.
 #[cfg(any(test, feature = "test-seams"))]
 pub use contextdb_relational::store::RetainedStructureBytes;
+#[doc(hidden)]
+pub use contextdb_vector::VectorPartitionRef;
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub use contextdb_vector::{
-    VectorGraphCallbackPhaseForTest, VectorJournalTruncationPhaseForTest,
-    VectorMaintenancePreparationPhaseForTest, VectorMemoryWorkspacePhaseForTest,
+    VectorJournalTruncationPhaseForTest, VectorMaintenancePreparationPhaseForTest,
+    VectorMemoryWorkspacePhaseForTest,
 };
 pub use custody_types::{
     ApplicationTablePolicy, ApplicationTablePolicyExpectation, AuthenticatedTenantPolicyBinding,
@@ -162,6 +188,7 @@ pub use database::CommitStageStats;
 pub use database::MemoryHeldReceivedSchemaUnit;
 pub use database::PolicyHeldReceivedTable;
 pub use database::TriggerProgressTelemetrySnapshot;
+#[doc(hidden)]
 pub use database::{
     ApplyPhasePauseGuard, CronAuditEntry, CronAuditKind, CronPauseGuard, CronScheduleStatus,
     EventBusStatus, EventTypeStatus, RouteStatus, SinkError, SinkEvent, SinkMetrics, SinkStatus,
@@ -170,14 +197,14 @@ pub use database::{
 };
 pub use database::{
     CascadeReport, Database, ExplainOutput, ExportReport, IndexCandidate, QueryResult, QueryTrace,
-    VectorPartitionHnswDisclosure, VectorQuerySourceDisclosure, VectorSearchDisclosure,
+    VectorPartitionDisclosure, VectorQuerySourceDisclosure, VectorSearchDisclosure,
     VectorSearchLayerPresence, VectorSearchResidual, VectorSearchRoute, VectorSearchRouteEvidence,
     VectorSearchScopeShape, VectorSearchTailState,
 };
 pub use database::{
     CompactionReport, MaintenancePolicy, MaintenanceReport, MaintenanceStatus, PruningReport,
     REDB_COMPACT_FRAGMENTATION_THRESHOLD, RETENTION_CLOCK_SKEW_TOLERANCE, SnapshotPin,
-    TableSizeEstimate,
+    StorageCompactionPolicy, StorageCompactionValue, TableSizeEstimate,
 };
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
@@ -190,6 +217,9 @@ pub use database::{
     VectorMemoryOwnershipReceiptForTest, VectorPartitionGenerationRetentionForTest,
     VectorPartitionJournalFileForTest,
 };
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use database::{reclaim_steps_last_cycle_for_test, set_reclaim_steps_per_cycle_for_test};
 pub use direct_file_reader::{
     DirectChangeFrontiers, DirectChangeState, DirectColumnReference, DirectConfigurationState,
     DirectEventTypeStatus, DirectEventsStatus, DirectImageMetadataKind, DirectImageState,
@@ -202,16 +232,14 @@ pub use direct_file_reader::{
 };
 #[cfg(feature = "sync-orchestration")]
 pub use identity::FabricIdentity;
-#[cfg(any(test, feature = "test-seams"))]
-#[doc(hidden)]
-pub use persistence::VectorGenerationCatalogRecordFaultForTest;
+pub use persistence::HistoricalIndexVerification;
 pub use plugin::DatabasePlugin;
 pub use read_progress::{ReadPhase, ReadProgress, ReadProgressObserver};
 pub use read_session::{
     DatabaseOpenOptions, MetadataAnswer, OpenDisposition, OwnerAdmissionReport,
     OwnerConfigurationSource, OwnerConfiguredValue, OwnerEffectiveLimits, OwnerMemoryReport,
-    OwnerReadConfig, OwnerReport, OwnerServingReport, OwnerTimeoutReport, ReadCursor, ReadSession,
-    ReadSessionOptions,
+    OwnerReadConfig, OwnerReport, OwnerServingReport, OwnerTimeoutReport, ReadCacheShareStatus,
+    ReadCursor, ReadSession, ReadSessionOptions, ReaderWaitDeadline,
 };
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
@@ -227,7 +255,7 @@ pub use sync_types::{
 };
 
 pub(crate) mod custody;
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub mod vector_observations;
 
@@ -241,3 +269,7 @@ pub mod read_content_test_adapter;
 pub fn page_cache_floor_bytes() -> usize {
     crate::persistence::REDB_CACHE_FLOOR_BYTES
 }
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod vector_ivf_observations;

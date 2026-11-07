@@ -78,6 +78,10 @@ fn column_names(db: &Database, table: &str) -> Vec<String> {
         .collect()
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn apply_single_ddl(db: &Database, ddl: DdlChange) -> contextdb_core::Result<()> {
     let changes = ChangeSet {
         rows: Vec::new(),
@@ -138,17 +142,17 @@ fn a_refused_recreate_leaves_the_existing_columns_and_rows_untouched() {
         .execute("SELECT a FROM foo", &empty())
         .expect("foo must still be readable after a refused re-create");
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "the row declared before the refused re-create must still be there"
     );
     let a_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "a")
         .expect("column `a` must still be projectable");
     assert_eq!(
-        result.rows[0][a_idx],
+        result.rows()[0][a_idx],
         Value::Text("x".to_string()),
         "the value in the column the refused declaration would have dropped must survive"
     );
@@ -175,14 +179,18 @@ fn create_table_if_not_exists_on_an_existing_name_changes_nothing() {
     let result = db
         .execute("SELECT a FROM foo", &empty())
         .expect("foo must still be readable after an IF NOT EXISTS no-op");
-    assert_eq!(result.rows.len(), 1, "the existing row must still be there");
+    assert_eq!(
+        result.rows().len(),
+        1,
+        "the existing row must still be there"
+    );
     let a_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "a")
         .expect("column `a` must still be projectable");
     assert_eq!(
-        result.rows[0][a_idx],
+        result.rows()[0][a_idx],
         Value::Text("x".to_string()),
         "IF NOT EXISTS must not drop the column the second declaration omitted"
     );

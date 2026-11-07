@@ -6,6 +6,7 @@ pub(crate) mod canonical;
 pub(crate) mod decoder;
 pub(crate) mod durability;
 #[cfg(feature = "test-seams")]
+#[cfg_attr(not(feature = "sync-orchestration"), allow(dead_code, unused_imports))]
 pub(crate) mod fixtures;
 pub(crate) mod preparation;
 pub(crate) mod records;
@@ -27,4 +28,18 @@ pub(crate) mod store;
 pub(crate) mod checkpoint;
 
 // Explicit outbound membership.
+#[cfg_attr(not(feature = "sync-orchestration"), allow(dead_code))]
 pub(crate) mod outbound;
+
+// Borrowed writer-side inspection is needed on every producer route.
+pub(crate) mod native_decode;
+// Borrowed writer-side inspection is needed on every producer route.
+pub(crate) mod native_records;
+// Borrowed writer-side inspection is needed on every producer route.
+pub(crate) mod native_selection;
+// Borrowed writer-side inspection is needed on every producer route; the
+// native value codec uses it on every build.
+pub(crate) mod native_json;
+pub(crate) mod native_record_codec;
+
+pub(crate) mod signature_work;

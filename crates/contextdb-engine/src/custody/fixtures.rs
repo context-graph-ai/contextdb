@@ -24,15 +24,36 @@ pub(crate) fn fixture_outcome_batch_subject(t: &TenantId) -> String {
 
 impl Database {
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __delivery_record_json_for_test(bytes: &[u8]) -> Result<serde_json::Value> {
         serde_json::to_value(super::records::decode(bytes)?).map_err(|_| invalid())
     }
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __delivery_record_bytes_for_test(value: serde_json::Value) -> Result<Vec<u8>> {
         super::records::encode(&serde_json::from_value(value).map_err(|_| invalid())?)
     }
     /// Stage authoritative local source rows without inventing a peer binding.
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __stage_local_delivery_manifest_for_test(
         &self,
         tx: contextdb_core::TxId,
@@ -44,7 +65,8 @@ impl Database {
             return Err(invalid());
         }
         let edge = identity.node_id();
-        self.sync_incarnation(&tenant)?;
+        let read_memory = self.declared_reader_memory()?;
+        self.sync_incarnation_with_read_memory(&tenant, read_memory.clone())?;
         self.stage_delivery_registration(
             tx,
             SourceRegistration {
@@ -64,6 +86,7 @@ impl Database {
                     .collect(),
                 signer: std::sync::Arc::new(move |bytes| Ok(identity.sign_lineage(bytes))),
             },
+            read_memory,
         )
     }
     /// Fail this unit's real storage commit, including on a receiver worker.
@@ -87,12 +110,19 @@ impl Database {
         super::durability::commit_fault_reached()
     }
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __delivery_prerequisite_wires_for_test(
         &self,
     ) -> Result<Vec<crate::protocol::WireDeliveryOutcome>> {
-        let records = self.custody_records()?;
+        let records = self.custody_records(self.declared_reader_memory()?)?;
         let mut wires = Vec::new();
-        for record in &records {
+        for record in records.iter() {
             if let Record::Terminal { record: t, .. } = record {
                 let block = records
                     .iter()
@@ -113,17 +143,38 @@ impl Database {
         Ok(wires)
     }
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __verify_delivery_core_for_test(node: &str, bytes: &[u8]) -> Result<()> {
         super::decoder::verify_terminal_signature(node, bytes)
     }
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __delivery_metadata_bytes_for_test(&self) -> Result<Vec<Vec<u8>>> {
-        self.custody_records()?
+        self.custody_records(self.declared_reader_memory()?)?
             .iter()
             .map(super::records::encode)
             .collect()
     }
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __verify_delivery_metadata_bytes_for_test(bytes: &[u8]) -> Result<()> {
         super::records::decode(bytes)?.verify()
     }
@@ -140,6 +191,13 @@ impl Database {
         (full_row_digest(values), content_row_digest(values, exclude))
     }
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __delivery_diagnostic_encoding_for_test(
         conflicts: Vec<crate::sync_types::Conflict>,
     ) -> Result<Vec<u8>> {
@@ -167,16 +225,32 @@ impl Database {
         .bytes()
     }
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __delivery_diagnostic_resolution_roundtrip_for_test(tag: u8) -> Result<u8> {
         Ok(diagnostic_resolution(decode_diagnostic_resolution(tag)?))
     }
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __seed_tenant_table_policies_for_test(
         &self,
         tenant: TenantId,
         expectation: ApplicationTablePolicyExpectation,
     ) -> Result<()> {
-        let existing = self.custody_records()?;
+        let read_memory = self.declared_reader_memory()?;
+        let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
+        let existing = self.custody_records(read_memory.clone())?;
         if existing
             .iter()
             .any(|r| matches!(r,Record::Policy(p) if p.tenant.as_ref().is_some_and(|t|t!=&tenant)))
@@ -209,19 +283,26 @@ impl Database {
         if records.is_empty() {
             return Ok(());
         }
-        self.commit_delivery_metadata(|_| Ok(records))
+        self.commit_delivery_metadata(|_| Ok(records), &mut vector_copy_owner, read_memory)
     }
     /// Inspect actual canonical prerequisite records independently of public delivery reads.
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __delivery_prerequisites_for_test(&self) -> Result<serde_json::Value> {
-        let records = self.custody_records()?;
-        for r in &records {
+        let records = self.custody_records(self.declared_reader_memory()?)?;
+        for r in records.iter() {
             match r {
             Record::Root{life,submission} if !records.iter().any(|r|matches!(r,Record::Manifest(m) if m.id==*submission&&m.root_life==*life))=>{return Err(invalid());},
             Record::MemberOwner{member,root,submission} if !records.iter().any(|r|matches!(r,Record::Manifest(m) if m.id==*submission&&m.root_life==*root&&m.member_lives.contains(member)))=>{return Err(invalid());},
             Record::Terminal{edge:true,record:t} if !records.iter().any(|r|matches!(r,Record::Manifest(m) if m.id==t.submission&&m.seal.digest()==t.seal_digest))=>{return Err(invalid());},_=>{} }
         }
-        serde_json::to_value(records).map_err(|_| invalid())
+        serde_json::to_value(&*records).map_err(|_| invalid())
     }
     #[doc(hidden)]
     pub fn __arm_erasure_boundary_persist_fault_for_test(&self) {
@@ -236,11 +317,25 @@ impl Database {
 #[cfg(feature = "sync-orchestration")]
 pub(crate) use super::delivery::manifested_request;
 
-pub(crate) fn manifest_rows(db: &Database, m: &ManifestRecord) -> Result<Vec<RowChange>> {
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
+pub(crate) fn manifest_rows(
+    db: &Database,
+    m: &ManifestRecord,
+    vector_copies: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+) -> Result<Vec<RowChange>> {
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     m.rows
         .iter()
         .map(|e| {
-            let row = actual_row(db, &e.reference)?;
+            let row = actual_row(db, &e.reference, vector_copies, read_memory.clone())?;
             if full_row_digest(&row.values) != e.row_digest {
                 return Err(invalid());
             }
@@ -258,6 +353,13 @@ pub(crate) fn manifest_rows(db: &Database, m: &ManifestRecord) -> Result<Vec<Row
 
 // Fixture builder: arrange signed mismatched caller policy without
 // weakening the real bind door, which now rejects that expectation.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(crate) fn issue_fixture_binding(
     db: &Database,
     tenant: TenantId,
@@ -267,7 +369,9 @@ pub(crate) fn issue_fixture_binding(
     signer: &LineageSigner,
 ) -> Result<SignedBindingPacket> {
     let expected = input.expectation.clone();
-    let records = db.custody_records()?;
+    let read_memory = db.declared_reader_memory()?;
+    let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
+    let records = db.custody_records(read_memory.clone())?;
     for (table, policy) in &mut input.expectation.tables {
         if let Some(declared) = records.iter().find_map(|r| match r {
             Record::Policy(p) if p.table == *table => Some(&p.policy),
@@ -276,7 +380,16 @@ pub(crate) fn issue_fixture_binding(
             *policy = declared.clone();
         }
     }
-    let mut packet = commit_binding(db, tenant, hub, edge, input, signer)?;
+    let mut packet = commit_binding(
+        db,
+        tenant,
+        hub,
+        edge,
+        input,
+        signer,
+        &mut vector_copy_owner,
+        read_memory,
+    )?;
     for p in &mut packet.binding.tables {
         p.policy = normalized(&p.table, expected.tables[&p.table].clone())?;
         p.digest = policy_digest(&p.table, &p.policy)?;

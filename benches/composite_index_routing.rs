@@ -93,12 +93,12 @@ fn insert_edge(db: &Database, id: Uuid, source_id: Uuid, target_id: Uuid, edge_t
 
 fn ids_from_result(result: &QueryResult) -> BTreeSet<Uuid> {
     let id_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "id" || c.rsplit('.').next() == Some("id"))
-        .unwrap_or_else(|| panic!("id column not found in {:?}", result.columns));
+        .unwrap_or_else(|| panic!("id column not found in {:?}", result.columns()));
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[id_idx] {
             Value::Uuid(id) => *id,
@@ -195,19 +195,19 @@ fn run_route_query(case: &RouteCase, assert_rows_examined: bool) {
     }
     let result = case.db.execute(&case.sql, &case.params).unwrap();
     assert_eq!(ids_from_result(&result), case.expected_ids);
-    assert_eq!(result.trace.physical_plan, "IndexScan");
+    assert_eq!(result.trace().physical_plan, "IndexScan");
     assert_eq!(
-        result.trace.index_used.as_deref(),
+        result.trace().index_used.as_deref(),
         Some("__graph_edge_source_target_type")
     );
     let pushed = result
-        .trace
+        .trace()
         .predicates_pushed
         .iter()
         .map(|c| c.as_ref())
         .collect::<Vec<_>>();
     assert_eq!(pushed, ["source_id", "target_id", "edge_type"]);
-    assert!(result.trace.indexes_considered.iter().any(|candidate| {
+    assert!(result.trace().indexes_considered.iter().any(|candidate| {
         candidate.name == "idx_edges_source"
             && candidate.rejected_reason.as_ref()
                 == "fewer predicate columns matched than chosen index"
@@ -335,6 +335,15 @@ fn route_scales() -> Vec<(usize, Duration)> {
 }
 
 fn bench_context_graph_route(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        for (rows, _) in route_scales() {
+            c.bench_function(
+                &format!("composite_index_context_graph_route/{rows}"),
+                |_| {},
+            );
+        }
+        return;
+    }
     let mut group = c.benchmark_group("composite_index_context_graph_route");
     for (rows, budget) in route_scales() {
         let case = seed_context_graph_route_case(rows);
@@ -348,6 +357,10 @@ fn bench_context_graph_route(c: &mut Criterion) {
 }
 
 fn bench_inlist_10k_param_peak_rss(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function("composite_index_inlist_10k_params_peak_rss", |_| {});
+        return;
+    }
     let case = seed_inlist_10k_param_case();
     let stats = measure_inlist_probe(&case);
     assert_inlist_memory_under_budget(stats);
@@ -369,6 +382,10 @@ fn bench_inlist_10k_param_peak_rss(c: &mut Criterion) {
 }
 
 fn bench_concurrent_write_route(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function("composite_index_route_concurrent_writes", |_| {});
+        return;
+    }
     let case = seed_context_graph_route_case(10_000);
     run_concurrent_write_probe(&case, 0);
     let mut batch = 1usize;

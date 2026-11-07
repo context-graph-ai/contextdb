@@ -159,13 +159,13 @@ fn null_divisor_propagates_null_not_an_error() {
     let r = db
         .execute("SELECT a / b FROM t", &empty())
         .expect("a NULL divisor must propagate NULL, never error");
-    assert_eq!(r.rows, vec![vec![Value::Null]]);
+    assert_eq!(r.rows(), vec![vec![Value::Null]]);
 
     let r = db
         .execute("SELECT id FROM t WHERE a / b = 1", &empty())
         .expect("a NULL divisor in a WHERE predicate must exclude the row, never error");
     assert_eq!(
-        r.rows.len(),
+        r.rows().len(),
         0,
         "NULL = anything excludes the row without erroring"
     );
@@ -184,7 +184,7 @@ fn division_by_a_nonzero_value_still_works() {
     let r = db
         .execute("SELECT a / b FROM t", &empty())
         .expect("ordinary division must still work");
-    assert_eq!(r.rows, vec![vec![Value::Int64(5)]]);
+    assert_eq!(r.rows(), vec![vec![Value::Int64(5)]]);
 }
 
 // ============================================================================
@@ -202,7 +202,7 @@ fn null_operand_on_addition_excludes_the_row_not_an_error() {
     let r = db
         .execute("SELECT b + 1 FROM t", &empty())
         .expect("a NULL operand on addition must propagate NULL, never error");
-    assert_eq!(r.rows, vec![vec![Value::Null]]);
+    assert_eq!(r.rows(), vec![vec![Value::Null]]);
 
     let r = db
         .execute("SELECT id FROM t WHERE b + 1 > 0", &empty())
@@ -210,7 +210,7 @@ fn null_operand_on_addition_excludes_the_row_not_an_error() {
             "a NULL operand on addition in a WHERE predicate must exclude the row, never error",
         );
     assert_eq!(
-        r.rows.len(),
+        r.rows().len(),
         0,
         "NULL > 0 excludes the row without erroring"
     );
@@ -271,7 +271,7 @@ fn indexed_predicate_with_overflowing_addition_is_handled_safely() {
         )
         .expect("non-overflowing addition must work");
     assert_eq!(
-        r_ok.rows.len(),
+        r_ok.rows().len(),
         2,
         "both rows (a=i64::MAX and a=100) satisfy a - 1 > 0"
     );
@@ -306,7 +306,7 @@ fn indexed_predicate_with_overflowing_subtraction_is_handled_safely() {
             &params(vec![("delta", Value::Int64(-1))]),
         )
         .expect("non-overflowing subtraction must work");
-    assert_eq!(r_ok.rows.len(), 1, "only a=100 satisfies a + 1 > 0");
+    assert_eq!(r_ok.rows().len(), 1, "only a=100 satisfies a + 1 > 0");
 }
 
 #[test]
@@ -338,5 +338,5 @@ fn indexed_predicate_with_overflowing_multiplication_is_handled_safely() {
             &params(vec![("factor", Value::Int64(1))]),
         )
         .expect("non-overflowing multiplication must work");
-    assert_eq!(r_ok.rows.len(), 2, "both rows satisfy a * 1 > 0");
+    assert_eq!(r_ok.rows().len(), 2, "both rows satisfy a * 1 > 0");
 }

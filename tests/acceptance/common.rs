@@ -1,6 +1,4 @@
-#![allow(dead_code)]
-
-use contextdb_core::{Direction, Error, Value, VectorIndexRef, VersionedRow};
+use contextdb_core::{Error, Value, VersionedRow};
 use contextdb_engine::{Database, QueryResult};
 use contextdb_server::transport::iroh::IrohServer;
 use std::collections::HashMap;
@@ -26,6 +24,10 @@ pub(crate) struct SyncFixture {
     pub(crate) ticket: String,
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn workspace_root() -> PathBuf {
     crate::binary_path::workspace_root()
 }
@@ -66,14 +68,26 @@ pub(crate) fn ensure_release_binaries() {
     );
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
     pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance, acceptance_sync"
+)]
 pub(crate) fn empty_params() -> HashMap<String, Value> {
     HashMap::new()
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn values(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
     params(pairs)
 }
@@ -104,6 +118,10 @@ pub(crate) fn run_cli_script(db_path: &Path, extra_args: &[&str], script: &str) 
     child.wait_with_output().expect("CLI should finish")
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn run_cli_script_allow_startup_failure(
     db_path: &Path,
     extra_args: &[&str],
@@ -117,6 +135,10 @@ pub(crate) fn run_cli_script_allow_startup_failure(
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn run_cli_script_allow_startup_failure_with_timeout(
     db_path: &Path,
     extra_args: &[&str],
@@ -146,6 +168,10 @@ pub(crate) fn run_cli_script_allow_startup_failure_with_timeout(
     output
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn run_cli_script_from_file(
     db_path: &Path,
     extra_args: &[&str],
@@ -163,6 +189,10 @@ pub(crate) fn run_cli_script_from_file(
         .expect("CLI should run")
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance, acceptance_sync"
+)]
 pub(crate) fn spawn_cli(db_path: &Path, extra_args: &[&str]) -> Child {
     ensure_release_binaries();
     Command::new(cli_bin())
@@ -175,22 +205,87 @@ pub(crate) fn spawn_cli(db_path: &Path, extra_args: &[&str]) -> Child {
         .expect("CLI should spawn")
 }
 
-pub(crate) fn spawn_server(db_path: &Path, tenant_id: &str, bind_spec: &str) -> Child {
+/// Own a server until it is reaped, including readiness assertion unwinds.
+pub(crate) struct ServerChild {
+    child: Option<Child>,
+}
+
+impl ServerChild {
+    pub(crate) fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+}
+
+impl std::ops::Deref for ServerChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        self.child.as_ref().expect("server child is still owned")
+    }
+}
+
+impl std::ops::DerefMut for ServerChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("server child is still owned")
+    }
+}
+
+impl Drop for ServerChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// The kernel also kills the server if nextest terminates its parent test:
+/// destructors cannot run after a killed or timed-out test process.
+pub(crate) fn server_command() -> Command {
+    with_parent_death(Command::new(server_bin()))
+}
+
+pub(crate) fn with_parent_death(command: Command) -> Command {
+    #[cfg(target_os = "linux")]
+    let mut command = command;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        let parent = std::process::id() as libc::pid_t;
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Cover a parent exit between fork and installing the signal.
+                if libc::getppid() != parent {
+                    return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+                }
+                Ok(())
+            });
+        }
+    }
+    command
+}
+
+pub(crate) fn spawn_server(db_path: &Path, tenant_id: &str, bind_spec: &str) -> ServerChild {
     ensure_release_binaries();
-    let mut child = Command::new(server_bin())
-        .args([
-            "--db-path",
-            db_path.to_str().expect("utf-8 db path"),
-            "--tenant-id",
-            tenant_id,
-            "--sync-endpoint",
-            bind_spec,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("server should spawn");
+    let mut child = ServerChild::new(
+        server_command()
+            .args([
+                "--db-path",
+                db_path.to_str().expect("utf-8 db path"),
+                "--tenant-id",
+                tenant_id,
+                "--sync-endpoint",
+                bind_spec,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("server should spawn"),
+    );
     let ready =
         wait_for_child_stdout_contains(&mut child, "enrollment ticket:", Duration::from_secs(15));
     assert!(
@@ -205,6 +300,10 @@ pub(crate) fn stop_child(child: &mut Child) {
     let _ = child.wait();
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance, acceptance_sync"
+)]
 pub(crate) fn write_child_stdin(child: &mut Child, script: &str) {
     child
         .stdin
@@ -289,6 +388,10 @@ pub(crate) async fn start_sync_fixture() -> SyncFixture {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance, acceptance_sync"
+)]
 pub(crate) fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -300,17 +403,20 @@ pub(crate) fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool)
     false
 }
 
-pub(crate) fn wait_for_child_output(mut child: Child, timeout: Duration, context: &str) -> Output {
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
+fn wait_for_child_exit(child: &mut Child, timeout: Duration, context: &str) {
     let start = Instant::now();
     loop {
-        match child.try_wait().expect("CLI status poll") {
-            Some(_) => return child.wait_with_output().expect(context),
+        match child.try_wait().expect(context) {
+            Some(_) => return,
             None => {
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
-                    return child
-                        .wait_with_output()
-                        .expect("CLI should finish after timeout kill");
+                    child.wait().expect("child exits after timeout kill");
+                    return;
                 }
                 thread::sleep(Duration::from_millis(50));
             }
@@ -318,129 +424,52 @@ pub(crate) fn wait_for_child_output(mut child: Child, timeout: Duration, context
     }
 }
 
-async fn wait_for_path(path: &Path, timeout: Duration) {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if path.exists() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("timed out waiting for path to exist: {}", path.display());
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
+pub(crate) fn wait_for_child_output(mut child: Child, timeout: Duration, context: &str) -> Output {
+    wait_for_child_exit(&mut child, timeout, context);
+    child.wait_with_output().expect(context)
 }
 
-pub(crate) async fn push_change_through_server(
-    ticket: &str,
-    tenant_id: &str,
-    table: &str,
-    id: Uuid,
-    vector: Vec<f32>,
-) {
-    let tmp = TempDir::new().expect("tempdir for edge push");
-    let edge_path = temp_db_file(&tmp, "edge-push.db");
-    let db = Arc::new(Database::open(&edge_path).expect("open edge db"));
-    db.execute(
-        &format!(
-            "CREATE TABLE {table} (id UUID PRIMARY KEY, vector_text VECTOR({})) SYNC CONFLICT KEEP FIRST",
-            vector.len()
-        ),
-        &empty_params(),
-    )
-    .expect("create edge schema");
-
-    let tx = db.begin_or_panic();
-    let row_id = db
-        .insert_row(tx, table, values(vec![("id", Value::Uuid(id))]))
-        .expect("insert edge row");
-    db.insert_vector(
-        tx,
-        VectorIndexRef::new(table, "vector_text"),
-        row_id,
-        vector,
-    )
-    .expect("insert edge vector");
-    db.commit(tx).expect("commit edge row");
-
-    let identity_path = PathBuf::from(format!("{}.fabric-identity.key", edge_path.display()));
-    let dial_spec = contextdb_server::peer_dial_spec(ticket, &identity_path);
-    let client = contextdb_server::SyncClient::new(
-        db,
-        &dial_spec,
-        contextdb_core::TenantId::from(tenant_id),
-    );
-    client.push().await.expect("push change through server");
-}
-
-pub(crate) async fn push_many_changes_through_server(
-    ticket: &str,
-    tenant_id: &str,
-    table: &str,
-    ids: Vec<Uuid>,
-    dim: usize,
-    started: Option<tokio::sync::oneshot::Sender<()>>,
-    server_barrier_path: Option<PathBuf>,
-) {
-    let tmp = TempDir::new().expect("tempdir for edge push");
-    let edge_path = temp_db_file(&tmp, "edge-push-many.db");
-    let db = Arc::new(Database::open(&edge_path).expect("open edge db"));
-    db.execute(
-        &format!(
-            "CREATE TABLE {table} (id UUID PRIMARY KEY, vector_text VECTOR({dim})) SYNC CONFLICT KEEP FIRST"
-        ),
-        &empty_params(),
-    )
-    .expect("create edge schema");
-
-    let tx = db.begin_or_panic();
-    for (offset, id) in ids.into_iter().enumerate() {
-        let row_id = db
-            .insert_row(tx, table, values(vec![("id", Value::Uuid(id))]))
-            .expect("insert edge row");
-        let mut vector = vec![0.0_f32; dim];
-        vector[offset % dim] = 1.0;
-        db.insert_vector(
-            tx,
-            VectorIndexRef::new(table, "vector_text"),
-            row_id,
-            vector,
-        )
-        .expect("insert edge vector");
-    }
-    db.commit(tx).expect("commit edge rows");
-
-    let identity_path = PathBuf::from(format!("{}.fabric-identity.key", edge_path.display()));
-    let dial_spec = contextdb_server::peer_dial_spec(ticket, &identity_path);
-    let client = contextdb_server::SyncClient::new(
-        db,
-        &dial_spec,
-        contextdb_core::TenantId::from(tenant_id),
-    );
-    let push_task = tokio::spawn(async move { client.push().await });
-
-    if let Some(started) = started {
-        if let Some(path) = server_barrier_path {
-            wait_for_path(&path, Duration::from_secs(10)).await;
-        }
-        let _ = started.send(());
-    }
-
-    let result = tokio::time::timeout(Duration::from_secs(45), push_task)
-        .await
-        .expect("direct push must respond after graceful drain")
-        .expect("direct push task must not panic");
-    result.expect("direct push response must include apply result");
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
+pub(crate) fn wait_for_server_output(
+    mut child: ServerChild,
+    timeout: Duration,
+    context: &str,
+) -> Output {
+    wait_for_child_exit(&mut child, timeout, context);
+    // Only transfer the process out of its guard after it is already reaped.
+    child
+        .child
+        .take()
+        .expect("server child")
+        .wait_with_output()
+        .expect(context)
 }
 
 pub(crate) fn temp_db_file(tmp: &TempDir, name: &str) -> PathBuf {
     tmp.path().join(name)
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance, acceptance_sync"
+)]
 pub(crate) fn count_rows(db: &Database, table: &str) -> usize {
     db.scan(table, db.snapshot())
         .expect("scan should succeed")
         .len()
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance, acceptance_sync"
+)]
 pub(crate) fn count_rows_from_file(db_path: &Path, table: &str) -> usize {
     let db = Database::open(db_path).expect("db should open");
     let count = count_rows(&db, table);
@@ -448,6 +477,14 @@ pub(crate) fn count_rows_from_file(db_path: &Path, table: &str) -> usize {
     count
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn try_count_rows_from_file(
     db_path: &Path,
     table: &str,
@@ -465,6 +502,10 @@ pub(crate) fn try_count_rows_from_file(
     Ok(count)
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn query_count(db: &Database, sql: &str) -> i64 {
     let result = db
         .execute(sql, &empty_params())
@@ -472,20 +513,32 @@ pub(crate) fn query_count(db: &Database, sql: &str) -> i64 {
     extract_i64(&result, 0, 0)
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn extract_i64(result: &QueryResult, row: usize, col: usize) -> i64 {
-    match &result.rows[row][col] {
+    match &result.rows()[row][col] {
         Value::Int64(value) => value.to_owned(),
         other => panic!("expected integer cell, got {other:?}"),
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn extract_f64(result: &QueryResult, row: usize, col: usize) -> f64 {
-    match &result.rows[row][col] {
+    match &result.rows()[row][col] {
         Value::Float64(value) => value.to_owned(),
         other => panic!("expected float cell, got {other:?}"),
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn text_value<'a>(row: &'a VersionedRow, key: &str) -> &'a str {
     row.values
         .get(key)
@@ -493,6 +546,10 @@ pub(crate) fn text_value<'a>(row: &'a VersionedRow, key: &str) -> &'a str {
         .expect("text value")
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn setup_simple_sensor_db(db: &Database) {
     db.execute(
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT, reading REAL)",
@@ -501,6 +558,10 @@ pub(crate) fn setup_simple_sensor_db(db: &Database) {
     .expect("create sensors table");
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn insert_sensor_rows(db: &Database, count: usize) {
     for idx in 0..count {
         db.execute(
@@ -515,6 +576,10 @@ pub(crate) fn insert_sensor_rows(db: &Database, count: usize) {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn setup_graph_entities(db: &Database, ids: &[Uuid]) {
     db.execute(
         "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT)",
@@ -536,6 +601,10 @@ pub(crate) fn setup_graph_entities(db: &Database, ids: &[Uuid]) {
     db.commit(tx).expect("commit entities");
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn setup_vector_table(db: &Database, dimension: usize) {
     db.execute(
         &format!("CREATE TABLE embeddings (id UUID PRIMARY KEY, embedding VECTOR({dimension}))"),
@@ -544,6 +613,10 @@ pub(crate) fn setup_vector_table(db: &Database, dimension: usize) {
     .expect("create vector table");
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn insert_embedding(db: &Database, id: Uuid, vector: Vec<f32>) -> i64 {
     let tx = db.begin_or_panic();
     let row_id = db
@@ -558,13 +631,4 @@ pub(crate) fn insert_embedding(db: &Database, id: Uuid, vector: Vec<f32>) -> i64
     .expect("insert embedding vector");
     db.commit(tx).expect("commit embedding row");
     row_id.0 as i64
-}
-
-pub(crate) fn bfs_ids(db: &Database, start: Uuid) -> Vec<Uuid> {
-    db.query_bfs(start, None, Direction::Outgoing, 5, db.snapshot())
-        .expect("bfs should succeed")
-        .nodes
-        .iter()
-        .map(|node| node.id)
-        .collect()
 }

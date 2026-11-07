@@ -9,8 +9,8 @@
 //! maintained index exists to avoid, and it grows with the scope rather than
 //! with the answer.
 
+use contextdb_core::Value;
 use contextdb_core::read_contract::{DeadlineClock, DeadlineWait, ReadLimits};
-use contextdb_core::{Value, VectorIndexRef};
 use contextdb_engine::direct_file_reader::test_seams::{ReadWorkObservationScope, ReadWorkPhase};
 use contextdb_engine::executor::bounded_read_test_support as bounded;
 use contextdb_engine::persistence::read_persistence_test_scaffold::{
@@ -155,18 +155,7 @@ fn fixture_in(db: Database, plant_a_non_current_row: bool) -> Database {
         )
         .expect("plant the nearest row before the graphs are built");
     }
-    for _ in 0..512 {
-        db.run_maintenance_cycle()
-            .expect("advance deterministic maintenance");
-        let ready = db
-            .vector_store_for_test()
-            .partition_infos(&VectorIndexRef::new("scoped_rows", "embedding"))
-            .expect("inspect partition readiness");
-        if ready.len() == PARTITIONS && ready.iter().all(|partition| partition.graph_available) {
-            return db;
-        }
-    }
-    panic!("every partition must publish a maintained route before the read is measured");
+    db
 }
 
 struct Measured {
@@ -243,10 +232,10 @@ fn try_measure_contexts(db: &Database, selected: &[usize]) -> Result<Measured, S
         .expect("the touch counter is never poisoned")
         .clone();
     Ok(Measured {
-        rows: executed.result.rows.len(),
+        rows: executed.result.rows().len(),
         returned: executed
             .result
-            .rows
+            .rows()
             .iter()
             .map(|row| match row.first() {
                 Some(Value::Int64(id)) => *id,
@@ -262,12 +251,12 @@ fn try_measure_contexts(db: &Database, selected: &[usize]) -> Result<Measured, S
         verified_runs_built: counters.verified_runs_built,
         verified_postings_walked: counters.verified_postings_walked,
         hashed_bytes: counters.hashed_bytes,
-        rows_examined: executed.result.trace.rows_examined,
+        rows_examined: executed.result.trace().rows_examined,
         plan: format!(
             "{} index={:?} pushed={:?}",
-            executed.result.trace.physical_plan,
-            executed.result.trace.index_used,
-            executed.result.trace.predicates_pushed,
+            executed.result.trace().physical_plan,
+            executed.result.trace().index_used,
+            executed.result.trace().predicates_pushed,
         ),
     })
 }
@@ -288,6 +277,10 @@ fn authorized_reader(db: &Database) -> Database {
 /// index identities instead of stored row versions.
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_find_decodes_only_the_rows_it_returns() {
     use contextdb_core::read_contract::ReadRoute;
     use contextdb_core::types::ContextId;
@@ -406,9 +399,9 @@ fn measure_reader(reader: &contextdb_engine::ReadSession, partitions: usize) -> 
     let counters = work.counters();
     drop(work);
     Measured {
-        rows: answer.rows.len(),
+        rows: answer.rows().len(),
         returned: answer
-            .rows
+            .rows()
             .iter()
             .map(|row| match row.first() {
                 Some(Value::Int64(id)) => *id,
@@ -423,10 +416,12 @@ fn measure_reader(reader: &contextdb_engine::ReadSession, partitions: usize) -> 
         verified_runs_built: counters.verified_runs_built,
         verified_postings_walked: counters.verified_postings_walked,
         hashed_bytes: counters.hashed_bytes,
-        rows_examined: answer.trace.rows_examined,
+        rows_examined: answer.trace().rows_examined,
         plan: format!(
             "{} index={:?} pushed={:?}",
-            answer.trace.physical_plan, answer.trace.index_used, answer.trace.predicates_pushed,
+            answer.trace().physical_plan,
+            answer.trace().index_used,
+            answer.trace().predicates_pushed,
         ),
     }
 }
@@ -474,6 +469,10 @@ fn only_the_rows_an_answer_publishes_are_put_through_the_row_gate() {
 /// nothing.
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_find_verifies_what_it_walks_not_the_scope_it_searches() {
     use contextdb_core::read_contract::ReadRoute;
     use contextdb_core::types::ContextId;
@@ -592,6 +591,10 @@ fn a_find_verifies_what_it_walks_not_the_scope_it_searches() {
 /// made where the row is published is the only one that can see it.
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_row_that_contradicts_its_index_posting_is_reported_as_damage() {
     use contextdb_core::read_contract::ReadRoute;
     use contextdb_core::types::ContextId;
@@ -639,12 +642,12 @@ fn a_row_that_contradicts_its_index_posting_is_reported_as_damage() {
         .execute(&sql, &params)
         .expect("the undamaged store answers");
     assert_eq!(
-        answer.rows.len(),
+        answer.rows().len(),
         LIMIT,
         "the undamaged store answers a full page"
     );
     assert_eq!(
-        answer.rows.first().and_then(|row| row.first()),
+        answer.rows().first().and_then(|row| row.first()),
         Some(&Value::Int64(PLANTED_ROW_ID)),
         "the planted row is the nearest searchable row in its partition, so it heads the answer"
     );
@@ -664,7 +667,7 @@ fn a_row_that_contradicts_its_index_posting_is_reported_as_damage() {
     match open_reader().execute(&sql, &params) {
         Ok(served) => panic!(
             "a row whose body contradicts its index posting was served in an answer of {} rows",
-            served.rows.len(),
+            served.rows().len(),
         ),
         Err(refusal) => {
             let refusal = format!("{refusal:?}");
@@ -687,6 +690,10 @@ fn a_row_that_contradicts_its_index_posting_is_reported_as_damage() {
 /// asserted, over the same Context.
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_moved_index_posting_is_reported_as_damage() {
     use contextdb_core::read_contract::ReadRoute;
     use contextdb_core::types::ContextId;
@@ -749,7 +756,7 @@ fn a_moved_index_posting_is_reported_as_damage() {
         .execute(&sql, &params)
         .expect("the whole-pair find never reads the damaged page and answers");
     let ids = served
-        .rows
+        .rows()
         .iter()
         .filter_map(|row| match row.first() {
             Some(Value::Int64(id)) => Some(*id),
@@ -757,12 +764,12 @@ fn a_moved_index_posting_is_reported_as_damage() {
         })
         .collect::<Vec<_>>();
     assert!(
-        served.rows.len() == LIMIT
+        served.rows().len() == LIMIT
             && ids
                 .iter()
                 .all(|id| (1..=ROWS_PER_PARTITION as i64).contains(id)),
         "a posting filed under another Context's key was served in an answer of {} rows: {ids:?}",
-        served.rows.len(),
+        served.rows().len(),
     );
 
     // The window arm, over the same Context. Pinning only `context_id` names
@@ -777,7 +784,7 @@ fn a_moved_index_posting_is_reported_as_damage() {
     match reader.execute(&windowed, &params) {
         Ok(served) => panic!(
             "a find that reads the damaged posting page served {} rows instead of reporting it",
-            served.rows.len(),
+            served.rows().len(),
         ),
         Err(refusal) => {
             let refusal = format!("{refusal:?}");

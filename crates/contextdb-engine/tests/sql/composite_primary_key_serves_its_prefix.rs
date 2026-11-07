@@ -32,7 +32,7 @@ fn limits() -> ReadLimits {
 
 fn assert_primary_key_prefix(result: &contextdb_engine::QueryResult) {
     assert_eq!(
-        result.rows,
+        result.rows(),
         vec![
             vec![Value::Int64(0)],
             vec![Value::Int64(1)],
@@ -41,16 +41,17 @@ fn assert_primary_key_prefix(result: &contextdb_engine::QueryResult) {
         "the primary-key prefix returns this passage's three source links"
     );
     assert_eq!(
-        result.trace.index_used.as_deref(),
+        result.trace().index_used.as_deref(),
         Some("__pk_context_id_passage_id_source_order")
     );
     assert_eq!(
-        result.trace.predicates_pushed.len(),
+        result.trace().predicates_pushed.len(),
         2,
         "both equality columns of the primary-key prefix are pushed"
     );
     assert_eq!(
-        result.trace.rows_examined, 3,
+        result.trace().rows_examined,
+        3,
         "one passage lookup must not scan a 30,000-link context"
     );
 }
@@ -86,16 +87,16 @@ fn composite_primary_key_serves_its_prefix() {
     )
     .expect("the bounded production kernel serves the same primary-key prefix");
     assert_primary_key_prefix(&bounded.result);
-    assert_eq!(bounded.result.rows, ordinary.rows);
+    assert_eq!(bounded.result.rows(), ordinary.rows());
     println!(
         "wall_search_pk ordinary={{index:{:?},pushed:{},examined:{},rows:{:?}}} bounded={{index:{:?},pushed:{},examined:{},rows:{:?}}}",
-        ordinary.trace.index_used.as_deref(),
-        ordinary.trace.predicates_pushed.len(),
-        ordinary.trace.rows_examined,
-        ordinary.rows,
-        bounded.result.trace.index_used.as_deref(),
-        bounded.result.trace.predicates_pushed.len(),
-        bounded.result.trace.rows_examined,
-        bounded.result.rows,
+        ordinary.trace().index_used.as_deref(),
+        ordinary.trace().predicates_pushed.len(),
+        ordinary.trace().rows_examined,
+        ordinary.rows(),
+        bounded.result.trace().index_used.as_deref(),
+        bounded.result.trace().predicates_pushed.len(),
+        bounded.result.trace().rows_examined,
+        bounded.result.rows(),
     );
 }

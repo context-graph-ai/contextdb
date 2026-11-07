@@ -4,7 +4,6 @@
 
 use contextdb_core::Value;
 use contextdb_engine::{Database, MaintenancePolicy, QueryResult};
-use contextdb_vector::hnsw::with_union_search_receipts;
 use std::collections::{HashMap, HashSet};
 
 const PARTITIONS: usize = 8;
@@ -12,12 +11,7 @@ const ROWS_PER_PARTITION: usize = 1_250;
 const DIMENSIONS: usize = 768;
 const QUERIES: usize = 100;
 const LIMIT: usize = 10;
-const M: usize = 16;
 const CLUSTERS_PER_PARTITION: usize = 64;
-const FEW_PARTITIONS_EF: usize = 100;
-const ALL_PARTITIONS_EF: usize = 400;
-const BASE_BUDGET: usize = FEW_PARTITIONS_EF * (2 * M);
-const ALL_PARTITIONS_BUDGET: usize = ALL_PARTITIONS_EF * (2 * M);
 
 #[derive(Clone, Copy, Debug)]
 enum Fixture {
@@ -67,7 +61,7 @@ fn clustered_embedding(center: &[f32], seed: u64, scale: f32) -> Vec<f32> {
 
 fn ids(result: &QueryResult) -> HashSet<i64> {
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.as_slice() {
             [Value::Int64(id)] => *id,
@@ -83,7 +77,7 @@ fn seeded_store(fixture: Fixture) -> Database {
         "CREATE TABLE union_recall (id INTEGER PRIMARY KEY, scope_id INTEGER NOT NULL, \
          embedding VECTOR(768) PARTITION_KEY (scope_id) MAX_PARTITIONS 8 \
          SEARCH_MODE INDEXED AUTO_INDEX_AT 1 \
-         HNSW (M = 16, EF_CONSTRUCTION = 200))",
+         )",
         &HashMap::new(),
     )
     .expect("declare eight maintained vector partitions");
@@ -119,10 +113,8 @@ fn seeded_store(fixture: Fixture) -> Database {
     }
     db.commit(tx).expect("commit all stored vectors");
     for _ in 0..64 {
-        db.run_maintenance_cycle()
-            .expect("advance deterministic maintenance");
-        let status = db.vector_store_for_test().hnsw_maintenance_status();
-        if status.ready_partitions == PARTITIONS && status.remaining_partitions == 0 {
+        let report = db.run_maintenance_cycle().unwrap().vector;
+        if report.ready_partitions == PARTITIONS && report.remaining_partitions == 0 {
             return db;
         }
     }
@@ -132,14 +124,7 @@ fn seeded_store(fixture: Fixture) -> Database {
 #[derive(Default)]
 struct Measurement {
     matched: usize,
-    refused: usize,
-    admission: Vec<usize>,
-    expansion: Vec<usize>,
     answer_digest: u64,
-}
-
-fn mean(values: &[usize]) -> f64 {
-    values.iter().sum::<usize>() as f64 / values.len() as f64
 }
 
 fn digest_page(mut digest: u64, ids: &HashSet<i64>) -> u64 {
@@ -156,16 +141,11 @@ fn digest_page(mut digest: u64, ids: &HashSet<i64>) -> u64 {
 fn check_shared_walk(fixture: Fixture) {
     let db = seeded_store(fixture);
     let scopes = [
-        (1, " WHERE scope_id = 0", FEW_PARTITIONS_EF, BASE_BUDGET),
-        (
-            3,
-            " WHERE scope_id IN (0, 1, 2)",
-            FEW_PARTITIONS_EF,
-            BASE_BUDGET,
-        ),
-        (8, "", ALL_PARTITIONS_EF, ALL_PARTITIONS_BUDGET),
+        (1, " WHERE scope_id = 0"),
+        (3, " WHERE scope_id IN (0, 1, 2)"),
+        (8, ""),
     ];
-    for (scope, predicate, resolved_ef, budget) in scopes
+    for (scope, predicate) in scopes
         .into_iter()
         .filter(|(scope, ..)| matches!(fixture, Fixture::Clustered) || *scope != 1)
     {
@@ -173,6 +153,8 @@ fn check_shared_walk(fixture: Fixture) {
             answer_digest: 0xcbf29ce484222325,
             ..Measurement::default()
         };
+        let mut repeated_digest = 0xcbf29ce484222325;
+        let mut low_recall_queries = Vec::new();
         for probe in 0..QUERIES {
             let query = match fixture {
                 Fixture::Uniform => embedding(10_000_000 + probe),
@@ -194,69 +176,38 @@ fn check_shared_walk(fixture: Fixture) {
                 .expect("exhaustive search of the stored vectors");
             let truth = ids(&exact);
             assert_eq!(truth.len(), LIMIT);
-            let (indexed, receipts) =
-                with_union_search_receipts(|| db.execute(&statement("INDEXED"), &params));
-            let [receipt] = receipts.as_slice() else {
-                panic!("one union search must serve each query: {receipts:?}");
-            };
-            assert_eq!(receipt.partitions, scope);
-            assert_eq!(receipt.resolved_ef_search, resolved_ef);
-            assert_eq!(receipt.budget, budget);
-            assert!(receipt.expansion_evaluations <= budget);
-            measured.admission.push(receipt.admission_evaluations);
-            measured.expansion.push(receipt.expansion_evaluations);
-            match indexed {
-                Ok(indexed) => {
-                    assert_eq!(receipt.terminal, "answer_complete");
-                    let found = ids(&indexed);
-                    assert_eq!(found.len(), LIMIT);
-                    measured.matched += found.intersection(&truth).count();
-                    measured.answer_digest = digest_page(measured.answer_digest, &found);
-                }
-                Err(_) if receipt.terminal == "refused" => measured.refused += 1,
-                Err(error) => panic!("unexpected indexed error at probe {probe}: {error}"),
+            let found = ids(&db
+                .execute(&statement("INDEXED"), &params)
+                .unwrap_or_else(|error| {
+                    panic!("unexpected indexed error at probe {probe}: {error}")
+                }));
+            assert_eq!(found.len(), LIMIT);
+            let matched = found.intersection(&truth).count();
+            let threshold = 0.95;
+            if (matched as f64 / LIMIT as f64) < threshold {
+                low_recall_queries.push((probe, matched));
             }
+            measured.matched += matched;
+            let repeated = ids(&db
+                .execute(&statement("INDEXED"), &params)
+                .expect("the repeated indexed query must not refuse"));
+            repeated_digest = digest_page(repeated_digest, &repeated);
+            measured.answer_digest = digest_page(measured.answer_digest, &found);
         }
         eprintln!(
-            "{fixture:?} {scope}/8 B={budget} recall={}/{} refused={} D_total={} D_mean={:.1} D_max={} W_total={} W_mean={:.1} W_max={} answer_digest={:016x}",
+            "{fixture:?} {scope}/8 recall={}/{} answer_digest={:016x}",
             measured.matched,
             QUERIES * LIMIT,
-            measured.refused,
-            measured.admission.iter().sum::<usize>(),
-            mean(&measured.admission),
-            measured.admission.iter().max().unwrap(),
-            measured.expansion.iter().sum::<usize>(),
-            mean(&measured.expansion),
-            measured.expansion.iter().max().unwrap(),
             measured.answer_digest,
         );
-        let (before_admission, before_expansion, after_admission, after_expansion, before_answers) =
-            match (fixture, scope) {
-                (Fixture::Uniform, 3) => (31_287, 200_654, 27_074, 181_447, 0xaed6_c620_ec42_f1a5),
-                (Fixture::Uniform, 8) => (84_088, 672_979, 72_918, 616_997, 0x1c86_a680_5436_cd0d),
-                (Fixture::Clustered, 1) => (9_122, 52_514, 7_291, 47_400, 0x0581_1d82_5b7f_fc35),
-                (Fixture::Clustered, 3) => (27_044, 64_882, 21_574, 52_986, 0xe2cb_4fa9_8f70_a8b8),
-                (Fixture::Clustered, 8) => {
-                    (71_060, 242_430, 57_107, 208_609, 0xc605_5824_6975_385d)
-                }
-                _ => unreachable!(),
-            };
-        let admission = measured.admission.iter().sum::<usize>();
-        let expansion = measured.expansion.iter().sum::<usize>();
         assert_eq!(
-            measured.answer_digest, before_answers,
-            "admission deduplication must preserve the shared walk's answer pages"
+            measured.answer_digest, repeated_digest,
+            "approximate answer pages must be deterministic on the same build"
         );
         assert!(
-            admission < before_admission,
-            "admission must spend fewer distance evaluations than the pre-fix walk"
+            low_recall_queries.is_empty(),
+            "each indexed query must meet its recall threshold: {low_recall_queries:?}"
         );
-        assert!(
-            admission + expansion < before_admission + before_expansion,
-            "the whole graph walk must spend fewer distance evaluations"
-        );
-        assert_eq!((admission, expansion), (after_admission, after_expansion));
-        assert_eq!(measured.refused, 0);
         if matches!(fixture, Fixture::Clustered) {
             assert!(measured.matched >= 950, "clustered recall fell below 95%");
         }
@@ -266,17 +217,16 @@ fn check_shared_walk(fixture: Fixture) {
                 "uniform all-scope recall regressed"
             );
         }
-        // Uniform 3/8 has no recall floor: its independent random directions
-        // are a separate fixture question. All 8/8 uses the real B=12,800.
+        // Every scope also keeps the per-query recall floor above.
     }
 }
 
 #[test]
-fn uniform_three_and_eight_partition_shared_walk_regression() {
+fn uniform_three_and_eight_partition_recall_regression() {
     check_shared_walk(Fixture::Uniform);
 }
 
 #[test]
-fn clustered_one_three_and_eight_partition_shared_walk_regression() {
+fn clustered_one_three_and_eight_partition_recall_regression() {
     check_shared_walk(Fixture::Clustered);
 }

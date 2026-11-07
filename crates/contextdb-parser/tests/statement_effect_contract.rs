@@ -3,7 +3,7 @@ use std::collections::HashSet;
 
 // Custody adds two writes and three metadata reads; vector inspection and the
 // maintenance cadence add two reads, and the cadence declaration adds a write.
-const STATEMENT_VARIANT_COUNT: usize = 37;
+const STATEMENT_VARIANT_COUNT: usize = 42;
 
 #[test]
 fn binary_memory_declaration_accepts_quoted_and_unquoted_sizes() {
@@ -65,12 +65,17 @@ fn statement_variant(statement: &Statement) -> &'static str {
         Statement::Rollback => "ROLLBACK",
         Statement::SetMemoryLimit(_) => "SET MEMORY_LIMIT",
         Statement::ShowMemoryLimit => "SHOW MEMORY_LIMIT",
+        Statement::SetReadCacheShare(_) => "SET READ_CACHE_SHARE",
+        Statement::ShowReadCacheShare => "SHOW READ_CACHE_SHARE",
         Statement::SetDiskLimit(_) => "SET DISK_LIMIT",
         Statement::ShowDiskLimit => "SHOW DISK_LIMIT",
+        Statement::ShowContentSize => "SHOW CONTENT_SIZE",
         Statement::SetMaintenancePollInterval(_) => "SET MAINTENANCE_POLL_INTERVAL",
         Statement::ShowMaintenancePollInterval => "SHOW MAINTENANCE_POLL_INTERVAL",
         Statement::SetVectorServingCache(_) => "SET VECTOR_SERVING_CACHE",
         Statement::ShowVectorServingCache => "SHOW VECTOR_SERVING_CACHE",
+        Statement::SetStorageCompaction(_) => "SET STORAGE_COMPACTION",
+        Statement::ShowStorageCompaction => "SHOW STORAGE_COMPACTION",
         Statement::ShowSyncConflictPolicy => "SHOW SYNC_CONFLICT_POLICY",
         Statement::ShowVectorIndexes => "SHOW VECTOR_INDEXES",
         Statement::ShowVectorPartitions { .. } => "SHOW VECTOR_PARTITIONS",
@@ -88,6 +93,16 @@ fn statement_variant(statement: &Statement) -> &'static str {
 #[test]
 fn statement_effect_marks_only_the_inspection_variants_as_reads() {
     let cases = [
+        (
+            "SET READ_CACHE_SHARE",
+            "SET READ_CACHE_SHARE = 40",
+            StatementEffect::Read,
+        ),
+        (
+            "SHOW READ_CACHE_SHARE",
+            "SHOW READ_CACHE_SHARE",
+            StatementEffect::Read,
+        ),
         (
             "DISCARD",
             "DISCARD FROM entries WHERE id = $id",
@@ -175,6 +190,11 @@ fn statement_effect_marks_only_the_inspection_variants_as_reads() {
         ),
         ("SHOW DISK_LIMIT", "SHOW DISK_LIMIT", StatementEffect::Read),
         (
+            "SHOW CONTENT_SIZE",
+            "SHOW CONTENT_SIZE",
+            StatementEffect::Read,
+        ),
+        (
             "SET MAINTENANCE_POLL_INTERVAL",
             "SET MAINTENANCE_POLL_INTERVAL '5 SECONDS'",
             StatementEffect::Write,
@@ -192,6 +212,16 @@ fn statement_effect_marks_only_the_inspection_variants_as_reads() {
         (
             "SHOW VECTOR_SERVING_CACHE",
             "SHOW VECTOR_SERVING_CACHE",
+            StatementEffect::Read,
+        ),
+        (
+            "SET STORAGE_COMPACTION",
+            "SET STORAGE_COMPACTION START_RATIO 0.4 MAX_SWEEPS 4",
+            StatementEffect::Write,
+        ),
+        (
+            "SHOW STORAGE_COMPACTION",
+            "SHOW STORAGE_COMPACTION",
             StatementEffect::Read,
         ),
         (
@@ -294,12 +324,12 @@ fn statement_effect_marks_only_the_inspection_variants_as_reads() {
         .filter(|(_, expected_effect, _)| *expected_effect == StatementEffect::Read)
         .count();
     assert_eq!(
-        declared_read_count, 11,
-        "exactly eleven current Statement variants are declared reads"
+        declared_read_count, 15,
+        "exactly fifteen current Statement variants need no writable store"
     );
     assert_eq!(
         parsed_cases.len() - declared_read_count,
-        26,
+        27,
         "every other current Statement variant is declared a write"
     );
 
