@@ -1,4 +1,8 @@
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The public statement and plan types are matched by value across crates; boxing a variant would change that public layout."
+)]
 pub enum Statement {
     CreateTable(CreateTable),
     AlterTable(AlterTable),
@@ -16,8 +20,12 @@ pub enum Statement {
     Rollback,
     SetMemoryLimit(SetMemoryLimitValue),
     ShowMemoryLimit,
+    /// Session-only file-cache policy; None restores the derived default.
+    SetReadCacheShare(Option<String>),
+    ShowReadCacheShare,
     SetDiskLimit(SetDiskLimitValue),
     ShowDiskLimit,
+    ShowContentSize,
     SetMaintenancePollInterval(u64),
     ShowMaintenancePollInterval,
     /// The serving page cache a maintained vector partition may keep resident.
@@ -25,6 +33,10 @@ pub enum Statement {
     /// memory limit.
     SetVectorServingCache(Option<u64>),
     ShowVectorServingCache,
+    /// Declares storage compaction settings for this store, or returns every
+    /// setting to its default.
+    SetStorageCompaction(StorageCompactionSetting),
+    ShowStorageCompaction,
     ShowSyncConflictPolicy,
     ShowVectorIndexes,
     DeclareTenantTablePolicy(DeclareTenantTablePolicy),
@@ -111,6 +123,30 @@ pub enum SetMemoryLimitValue {
     None,
 }
 
+/// `SET STORAGE_COMPACTION`: either back to the defaults, or the clauses the
+/// statement declares. An omitted clause keeps its current value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StorageCompactionSetting {
+    Default,
+    Declare(StorageCompactionClauses),
+}
+
+/// The clauses one `SET STORAGE_COMPACTION` statement declared. Ranges are
+/// checked by the engine when the declaration is applied, for SQL and Rust
+/// callers alike.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct StorageCompactionClauses {
+    /// Reclaimable share of the file at which compaction starts, in (0, 1].
+    pub start_ratio: Option<f64>,
+    /// Minimum time between automatic compaction attempts: positive, at most
+    /// `i64::MAX` milliseconds.
+    pub min_interval_ms: Option<u64>,
+    /// Explicit compaction stops sweeping below this reclaimable share, in (0, 1].
+    pub stop_ratio: Option<f64>,
+    /// The most sweeps one explicit compaction runs, at least 1.
+    pub max_sweeps: Option<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub enum SetDiskLimitValue {
     Bytes(u64),
@@ -186,8 +222,13 @@ pub struct SelectBody {
     pub from: Vec<FromItem>,
     pub joins: Vec<JoinClause>,
     pub where_clause: Option<Expr>,
+    /// `GROUP BY` items as written. `parse` admits a nonempty list only in the
+    /// one grouped form the engine answers: `COUNT(*)` per group of plain
+    /// columns of one table.
+    pub group_by: Vec<Expr>,
     pub order_by: Vec<OrderByItem>,
     pub use_vector: Option<VectorSearchMode>,
+    pub vector_search_override: Option<VectorSearchOverride>,
     pub use_rank: Option<String>,
     pub limit: Option<u64>,
 }
@@ -246,6 +287,10 @@ pub enum SortDirection {
 
 #[derive(Debug, Clone)]
 pub enum Expr {
+    /// Parsed window specification. It is lowered before scalar evaluation.
+    RowNumber(RowNumberWindow),
+    /// Planner-only binding in the WindowRank output, separate from named columns.
+    WindowRank(WindowBindingId),
     Column(ColumnRef),
     Literal(Literal),
     Parameter(String),
@@ -296,10 +341,28 @@ pub enum Expr {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnRef {
     pub table: Option<String>,
     pub column: String,
+}
+
+/// A binding is local to its WindowRank node and consumed at that query's projection.
+/// SQL identifiers cannot create or address this namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WindowBindingId(pub u32);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowNumberWindow {
+    /// Empty means a single partition over the input.
+    pub partition_by: Vec<ColumnRef>,
+    pub order_by: Vec<WindowOrderColumn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowOrderColumn {
+    pub column: ColumnRef,
+    pub direction: SortDirection,
 }
 
 #[derive(Debug, Clone)]
@@ -415,6 +478,8 @@ pub struct CompositeForeignKey {
     pub child_columns: Vec<String>,
     pub parent_table: String,
     pub parent_columns: Vec<String>,
+    /// `FOLLOWS PARENT PURGE`: a PURGE of the parent row erases this row too.
+    pub follows_parent_purge: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -433,6 +498,10 @@ pub struct AlterTable {
 }
 
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The public statement and plan types are matched by value across crates; boxing a variant would change that public layout."
+)]
 pub enum AlterAction {
     AddColumn(Box<ColumnDef>),
     DropColumn {
@@ -458,11 +527,31 @@ pub enum AlterAction {
         /// `None` is the explicit `DEFAULT` spelling.
         auto_index_at: Option<String>,
     },
-    SetVectorHnsw {
+    SetVectorAutoExpansionCeiling {
         column: String,
-        /// `None` is `HNSW DEFAULT`; otherwise omitted members retain their
-        /// current declarations and member `DEFAULT` values clear one member.
-        hnsw: Option<VectorHnswOptions>,
+        /// `None` is the explicit `DEFAULT` spelling.
+        auto_expansion_ceiling: Option<String>,
+    },
+    SetVectorFlatBelow {
+        column: String,
+        /// `None` is the explicit `DEFAULT` spelling.
+        flat_below: Option<String>,
+    },
+    SetVectorSearch {
+        column: String,
+        search: Option<VectorSearchObjectives>,
+    },
+    SetVectorIvf {
+        column: String,
+        ivf: Option<VectorIvfOptions>,
+    },
+    SetVectorWith {
+        column: String,
+        policy: VectorEnginePolicyOptions,
+    },
+    ResetVectorWith {
+        column: String,
+        members: Vec<String>,
     },
     SetVectorConsolidation {
         column: String,
@@ -526,22 +615,16 @@ pub struct ColumnDef {
     pub max_partitions: Option<String>,
     pub search_mode: Option<VectorSearchMode>,
     pub auto_index_at: Option<String>,
-    pub hnsw: VectorHnswOptions,
+    pub auto_expansion_ceiling: Option<String>,
+    pub flat_below: Option<String>,
+    pub search: VectorSearchObjectives,
+    pub ivf: VectorIvfOptions,
+    pub engine_policy: VectorEnginePolicyOptions,
     pub consolidation: VectorConsolidationOptions,
     pub rank_policy: Option<Box<RankPolicyAst>>,
     pub context_id: bool,
     pub scope_label: Option<Box<ScopeLabelConstraint>>,
     pub acl_ref: Option<Box<AclConstraint>>,
-}
-
-/// One parsed grouped HNSW declaration. The outer option on each member
-/// distinguishes omission (retain the current declaration) from a named
-/// value; a named `DEFAULT` is represented by [`VectorPolicyValue::Default`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct VectorHnswOptions {
-    pub m: Option<VectorPolicyValue>,
-    pub ef_construction: Option<VectorPolicyValue>,
-    pub ef_search: Option<VectorPolicyValue>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -588,6 +671,8 @@ pub struct ForeignKey {
     pub table: String,
     pub column: String,
     pub propagation_rules: Vec<AstPropagationRule>,
+    /// `FOLLOWS PARENT PURGE`: a PURGE of the parent row erases this row too.
+    pub follows_parent_purge: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -666,4 +751,65 @@ pub struct Update {
     pub table: String,
     pub assignments: Vec<(String, Expr)>,
     pub where_clause: Option<Expr>,
+}
+
+/// Requested recall and the sizing hint for each declared partition.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VectorSearchObjectives {
+    pub target_accuracy: Option<VectorPolicyValue>,
+    pub expected_vectors: Option<VectorPolicyValue>,
+}
+/// Explicit clustered layout and query breadth declarations.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VectorIvfOptions {
+    pub lists: Option<VectorPolicyValue>,
+    pub probes: Option<VectorPolicyValue>,
+    pub refine_factor: Option<VectorPolicyValue>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VectorPolicyListValue {
+    Default,
+    Values(Vec<String>),
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VectorPolicyReferenceValue {
+    Default,
+    Reference { table: String, column: String },
+}
+/// WITH declarations retain omission separately from an explicit reset.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VectorEnginePolicyOptions {
+    pub unknown_members: Vec<String>,
+    pub quantization: Option<Option<VectorQuantization>>,
+    pub calibration_max_k: Option<VectorPolicyValue>,
+    pub calibration_depths: Option<VectorPolicyListValue>,
+    pub probe_grid: Option<VectorPolicyValue>,
+    pub refine_factors: Option<VectorPolicyListValue>,
+    pub refine_growth: Option<VectorPolicyValue>,
+    pub calibration_samples: Option<VectorPolicyValue>,
+    pub calibration_queries: Option<VectorPolicyReferenceValue>,
+    pub min_lists: Option<VectorPolicyValue>,
+    pub vectors_per_list: Option<VectorPolicyValue>,
+    pub centroid_memory_percent: Option<VectorPolicyValue>,
+    pub training_samples: Option<VectorPolicyValue>,
+    pub training_iterations: Option<VectorPolicyValue>,
+    pub training_seed: Option<VectorPolicyValue>,
+    pub max_delta_runs: Option<VectorPolicyValue>,
+    pub write_buffer_bytes: Option<VectorPolicyValue>,
+    pub ingest_batch_keys: Option<VectorPolicyValue>,
+    pub coalesce_pages_per_step: Option<VectorPolicyValue>,
+    pub build_batch_entries: Option<VectorPolicyValue>,
+    pub remap_batch_entries: Option<VectorPolicyValue>,
+    pub directory_window_objects: Option<VectorPolicyValue>,
+    pub page_window_bytes: Option<VectorPolicyValue>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VectorSearchOverride {
+    Objectives {
+        target_accuracy: VectorPolicyValue,
+    },
+    Ivf {
+        probes: Option<VectorPolicyValue>,
+        refine_factor: Option<VectorPolicyValue>,
+    },
 }

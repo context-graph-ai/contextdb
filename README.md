@@ -34,6 +34,18 @@ The website's `/docs/` opens the development documentation, `/docs/dev/` selects
 
 See [Why contextdb?](docs/why-contextdb.md) for the full problem statement, or jump to [Getting Started](docs/getting-started.md) to try it in 2 minutes.
 
+## Try it
+
+With Rust and Cargo installed:
+
+```bash
+cargo install contextdb-cli
+db="$(mktemp -d)/demo.db"
+printf "SELECT 1;\n" | contextdb "$db" --write --json
+```
+
+Then try the [state-machine example](#or-explore-with-the-cli) or embed the library below.
+
 ## Use It As a Library
 
 contextdb is an embedded database. The primary interface is the Rust API:
@@ -44,7 +56,6 @@ use contextdb_engine::Database;
 use std::collections::HashMap;
 
 let db = Database::open(std::path::Path::new("./my.db"))?;
-// or: Database::open_memory() for ephemeral
 
 let params = HashMap::new();
 
@@ -116,7 +127,7 @@ use contextdb_core::Value;
 use contextdb_engine::Database;
 use std::collections::HashMap;
 
-let db = Database::open_memory();
+let db = Database::open(std::path::Path::new("./my.db"))?;
 db.execute("CREATE TABLE observation (id UUID PRIMARY KEY)", &HashMap::new())?;
 db.execute(
     "CREATE TABLE derived (id UUID PRIMARY KEY, observation_id UUID)",
@@ -221,7 +232,7 @@ create the store again.
 
 ```bash
 cargo build --release -p contextdb-cli
-./target/release/contextdb :memory:
+./target/release/contextdb ./my.db --write
 ```
 
 ```
@@ -259,15 +270,11 @@ ORDER BY vector_text <=> ROW_VECTOR('evidence', 'vector_text', '11111111-1111-11
 LIMIT 1;
 ```
 
-Every `VECTOR(N)` column is searchable with no separate index to create.
-Index construction and repair run only through maintenance — see
-[Vector Similarity Search](docs/query-language.md#vector-similarity-search).
-Declare `PARTITION_KEY (...)` on a vector column to keep one smaller index per key
-value, so a search whose `WHERE` names a key looks only inside that partition.
-`SHOW VECTOR_INDEXES` returns one summary row per vector column, and `SHOW
-VECTOR_PARTITIONS FOR table.column` shows each partition's state. Use `VECTOR(N) WITH (quantization = 'F32'|'SQ8'|'SQ4')` to choose the
-per-column storage footprint; omitted quantization defaults to `F32`.
-<!-- enforced by: vector_serving_merge_contract::updated_base_and_tail_publish_one_visible_row_per_identity, vector_partition_query_contract::equality_on_every_partition_component_selects_one_named_tuple, vector_lazy_raw_residency_contract::reopen_and_selected_queries_keep_raw_vector_residency_partition_local, vector_partition_sync_inspection_contract::existing_two_row_sync_keeps_each_vector_with_its_row_and_shows_summary, vector_partition_sync_inspection_contract::show_vector_partitions_supports_all_sql_forms -->
+This release ships exact vector search only. `AUTO` and `EXACT` compare allowed stored vectors within the active budgets; `INDEXED` returns `VectorIndexedRouteUnavailable`. The clustered index is switched off: commits and maintenance do not build or write it, and queries and inspection do not read it. Index policy declarations are retained but do not enable an index.
+<!-- enforced by: a_search_is_exact_with_no_index_built::an_auto_find_answers_exactly_after_commit_with_no_maintenance, a_search_is_exact_with_no_index_built::indexed_is_refused_at_every_door, a_search_is_exact_with_no_index_built::no_cycle_or_commit_builds_or_writes_an_index, a_search_is_exact_with_no_index_built::declared_index_policy_is_recorded_and_has_no_effect -->
+
+Every `VECTOR(N)` column can be queried with `<=>`; see [the vector reference](docs/query-language.md#vector-similarity-search).
+<!-- enforced by: a_search_is_exact_with_no_index_built::an_auto_find_answers_exactly_after_commit_with_no_maintenance, a_search_is_exact_with_no_index_built::indexed_is_refused_at_every_door, a_search_is_exact_with_no_index_built::no_cycle_or_commit_builds_or_writes_an_index, a_search_is_exact_with_no_index_built::declared_index_policy_is_recorded_and_has_no_effect -->
 
 ## What It Does
 
@@ -275,7 +282,11 @@ per-column storage footprint; omitted quantization defaults to `F32`.
 
 **Graph (SQL/PGQ-style)** — `GRAPH_TABLE(... MATCH ...)` following SQL/PGQ conventions for bounded BFS, typed edges, variable-length paths (`{1,3}`), and direction control. DAG constraint enforcement prevents cycles. State propagation cascades changes along graph edges.
 
-**Vector (pgvector conventions)** — Cosine similarity search via `<=>`. Query with a bound vector, vector literal, or `ROW_VECTOR('table', 'column', key)` to reuse a persisted row vector as the query vector. Construction and repair of each column's index run only through maintenance ([query-language reference](docs/query-language.md#vector-similarity-search)), and a column can be partitioned by key so a search looks only inside the partitions it names: `SHOW VECTOR_INDEXES` returns one summary row per vector column, and `SHOW VECTOR_PARTITIONS FOR table.column` shows each partition's state. `AUTO_INDEX_AT` and HNSW settings are declared per column; leaving them unset keeps the defaults. Pre-filtered search narrows candidates before scoring. <!-- enforced by: sql_surface_other::prv_03_row_vector_query_matches_literal_vector_parity_for_trace_and_results, vector_maintained_lifecycle_contract::engine_owned_file_maintenance_publishes_a_durable_indexed_route_for_a_reopened_reader, vector_partition_query_contract::equality_on_every_partition_component_selects_one_named_tuple, vector_partition_sync_inspection_contract::show_vector_partitions_supports_all_sql_forms, vector_policy_resolver_contract::declared_vector_policy_resolves_consistently_at_default_and_declared_boundaries, tests/integration/hnsw_tests.rs::h08_prefiltered_search_respects_candidate_bitmap -->
+**Vector (pgvector conventions)** — Cosine similarity via `<=>`, with a bound vector, literal, or persisted `ROW_VECTOR`.
+
+This release ships exact vector search only. `AUTO` and `EXACT` compare allowed stored vectors within the active budgets; `INDEXED` returns `VectorIndexedRouteUnavailable`. The clustered index is switched off: commits and maintenance do not build or write it, and queries and inspection do not read it. Index policy declarations are retained but do not enable an index.
+<!-- enforced by: a_search_is_exact_with_no_index_built::an_auto_find_answers_exactly_after_commit_with_no_maintenance, a_search_is_exact_with_no_index_built::indexed_is_refused_at_every_door, a_search_is_exact_with_no_index_built::no_cycle_or_commit_builds_or_writes_an_index, a_search_is_exact_with_no_index_built::declared_index_policy_is_recorded_and_has_no_effect -->
+
 
 **Unified transactions** — One transaction atomically updates relational rows, graph adjacency structures, and vector indexes. One read snapshot sees consistent state across all three. MVCC with consistent snapshots — readers never block writers.
 
@@ -310,7 +321,7 @@ Full documentation is available at [contextdb.tech/docs](https://contextdb.tech/
 
 ## Architecture
 
-11-crate Rust workspace:
+10-crate Rust workspace:
 
 | Crate | Role |
 |-------|------|
@@ -318,8 +329,7 @@ Full documentation is available at [contextdb.tech/docs](https://contextdb.tech/
 | `contextdb-tx` | MVCC transaction manager with deferred-apply write sets |
 | `contextdb-relational` | Relational executor (scan, insert, upsert, delete) |
 | `contextdb-graph` | Graph executor (bounded BFS, adjacency index, DAG enforcement) |
-| `contextdb-vector` | Vector executor (cosine similarity, HNSW, pre-filtered search) |
-| `contextdb-hnsw` | HNSW graph index used by the vector executor |
+| `contextdb-vector` | Vector executor (cosine similarity, exact search, pre-filtered search) |
 | `contextdb-parser` | SQL parser (pest grammar with GRAPH_TABLE + vector extensions) |
 | `contextdb-planner` | Rule-based query planner |
 | `contextdb-engine` | Database engine — wires all subsystems, plugin API, subscriptions |

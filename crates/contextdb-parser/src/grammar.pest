@@ -2,6 +2,8 @@ WHITESPACE = _{ " " | "\t" | "\r" | "\n" | line_comment | block_comment }
 line_comment = _{ "--" ~ (!"\n" ~ ANY)* }
 block_comment = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
 
+read_cache_share_statement = { SOI ~ (set_read_cache_share | show_read_cache_share) ~ semicolon? ~ EOI }
+
 statement = { SOI ~ stmt ~ semicolon? ~ EOI }
 semicolon = _{ ";" }
 
@@ -34,14 +36,19 @@ stmt = _{
     | show_sync_conflict_policy
     | show_vector_indexes_stmt
     | show_vector_partitions_stmt
+    | set_read_cache_share
+    | show_read_cache_share
     | set_memory_limit
     | show_memory_limit
     | set_disk_limit
     | show_disk_limit
+    | show_content_size
     | set_maintenance_poll_interval
     | show_maintenance_poll_interval
     | set_vector_serving_cache
     | show_vector_serving_cache
+    | set_storage_compaction
+    | show_storage_compaction
     | select_stmt
 }
 
@@ -64,11 +71,17 @@ show_vector_partitions_stmt = {
 }
 show_vector_partitions_target = { identifier ~ "." ~ identifier }
 show_vector_partitions_paging = { ^"LIMIT" ~ integer ~ (^"OFFSET" ~ integer)? }
-set_memory_limit = { ^"SET" ~ ^"MEMORY_LIMIT" ~ ("'" ~ memory_limit_value ~ "'" | memory_limit_value) }
+set_read_cache_share = { ^"SET" ~ ^"READ_CACHE_SHARE" ~ setting_assignment ~ read_cache_share_value }
+read_cache_share_value = @{ string | (!(";" | WHITESPACE) ~ ANY)+ }
+setting_assignment = _{ "="? }
+show_read_cache_share = { ^"SHOW" ~ ^"READ_CACHE_SHARE" }
+
+set_memory_limit = { ^"SET" ~ ^"MEMORY_LIMIT" ~ setting_assignment ~ ("'" ~ memory_limit_value ~ "'" | memory_limit_value) }
 show_memory_limit = { ^"SHOW" ~ ^"MEMORY_LIMIT" }
 memory_limit_value = { ^"none" | size_with_unit }
-set_disk_limit = { ^"SET" ~ ^"DISK_LIMIT" ~ ("'" ~ disk_limit_value ~ "'" | disk_limit_value) }
+set_disk_limit = { ^"SET" ~ ^"DISK_LIMIT" ~ setting_assignment ~ ("'" ~ disk_limit_value ~ "'" | disk_limit_value) }
 show_disk_limit = { ^"SHOW" ~ ^"DISK_LIMIT" }
+show_content_size = { ^"SHOW" ~ ^"CONTENT_SIZE" }
 disk_limit_value = { ^"none" | size_with_unit }
 set_maintenance_poll_interval = {
     ^"SET" ~ ^"MAINTENANCE_POLL_INTERVAL"
@@ -87,6 +100,23 @@ show_vector_serving_cache = { ^"SHOW" ~ ^"VECTOR_SERVING_CACHE" }
 // suffixed size still parses as one.
 vector_serving_cache_value = { ^"none" | size_with_unit | integer }
 size_with_unit = { ASCII_DIGIT+ ~ ("G" | "M" | "K") }
+set_storage_compaction = {
+    ^"SET" ~ ^"STORAGE_COMPACTION" ~ (storage_compaction_default | storage_compaction_clause+)
+}
+show_storage_compaction = { ^"SHOW" ~ ^"STORAGE_COMPACTION" }
+storage_compaction_default = { ^"DEFAULT" }
+storage_compaction_clause = _{
+    storage_compaction_start_ratio
+    | storage_compaction_min_interval
+    | storage_compaction_stop_ratio
+    | storage_compaction_max_sweeps
+}
+storage_compaction_start_ratio = { ^"START_RATIO" ~ storage_compaction_ratio }
+storage_compaction_stop_ratio = { ^"STOP_RATIO" ~ storage_compaction_ratio }
+storage_compaction_ratio = { float | integer }
+storage_compaction_min_interval = { ^"MIN_INTERVAL" ~ integer ~ storage_compaction_interval_unit }
+storage_compaction_interval_unit = { ^"MILLISECONDS" | ^"SECONDS" | ^"MINUTES" | ^"HOURS" }
+storage_compaction_max_sweeps = { ^"MAX_SWEEPS" ~ integer }
 
 begin_stmt = { ^"BEGIN" }
 commit_stmt = { ^"COMMIT" }
@@ -104,6 +134,8 @@ select_core = {
     ~ from_clause?
     ~ join_clause*
     ~ where_clause?
+    ~ group_by_clause?
+    ~ named_window_clause?
     ~ order_by_clause?
     ~ use_vector_clause?
     ~ use_rank_clause?
@@ -116,15 +148,23 @@ star = { "*" }
 select_item = { expr ~ (^"AS" ~ identifier)? }
 
 from_clause = { ^"FROM" ~ from_item ~ ("," ~ from_item)* }
-join_clause = { join_type ~ join_table_ref ~ ^"ON" ~ expr ~ &(join_type | where_start | order_by_start | use_vector_start | use_rank_start | limit_start | clause_end) }
+join_clause = { join_type ~ join_table_ref ~ ^"ON" ~ expr ~ &(join_type | where_start | group_by_start | order_by_start | use_vector_start | use_rank_start | limit_start | clause_end) }
 join_table_ref = { identifier ~ (^"AS" ~ identifier | identifier ~ &(^"ON"))? }
-join_type = { (^"LEFT" ~ ^"JOIN") | (^"INNER" ~ ^"JOIN") }
+// INNER is optional: a bare JOIN is an inner join, as in standard SQL. The bare
+// keyword must end at a word boundary so an alias such as `joiner` still parses.
+join_type = { (^"LEFT" ~ ^"JOIN") | (^"INNER" ~ ^"JOIN") | bare_join_kw }
+bare_join_kw = @{ ^"JOIN" ~ !ident_char }
 from_item = { graph_table | table_ref }
 table_ref = { identifier ~ ((^"AS")? ~ table_alias)? }
-table_alias = { !(join_type | where_start | order_by_start | use_vector_start | use_rank_start | limit_start | clause_end) ~ identifier }
+table_alias = { !(join_type | where_start | group_by_start | named_window_start | order_by_start | use_vector_start | use_rank_start | limit_start | clause_end) ~ identifier }
 
-where_clause = { ^"WHERE" ~ expr ~ &(order_by_start | use_vector_start | use_rank_start | limit_start | clause_end) }
+where_clause = { ^"WHERE" ~ expr ~ &(group_by_start | named_window_start | order_by_start | use_vector_start | use_rank_start | limit_start | clause_end) }
 where_start = _{ ^"WHERE" }
+// Parsed in every SELECT; `parse` admits only COUNT(*) grouped by plain columns
+// and refuses every other statement that names GROUP BY.
+group_by_clause = { group_by_start ~ expr ~ ("," ~ expr)* ~ &(named_window_start | order_by_start | use_vector_start | use_rank_start | limit_start | clause_end) }
+group_by_start = _{ ^"GROUP" ~ ^"BY" }
+named_window_start = _{ ^"WINDOW" }
 order_by_start = _{ ^"ORDER" ~ ^"BY" }
 use_vector_start = _{ ^"USE" ~ ^"VECTOR" }
 use_rank_start = _{ ^"USE" ~ ^"RANK" }
@@ -139,7 +179,7 @@ cosine_rhs = { row_vector_source | additive_expr }
 row_vector_source = { ^"ROW_VECTOR" ~ "(" ~ string ~ "," ~ string ~ "," ~ row_vector_key ~ ")" }
 row_vector_key = { parameter | bool_lit | float | integer | string }
 
-use_vector_clause = { ^"USE" ~ ^"VECTOR" ~ vector_search_mode }
+use_vector_clause = { ^"USE" ~ ^"VECTOR" ~ vector_search_mode ~ vector_query_options? }
 use_rank_clause = { ^"USE" ~ ^"RANK" ~ identifier }
 
 limit_clause = { ^"LIMIT" ~ integer }
@@ -203,6 +243,7 @@ foreign_key_table_constraint = {
     ~ identifier
     ~ ("," ~ identifier)*
     ~ ")"
+    ~ follows_parent_purge?
 }
 
 alter_table_stmt = { ^"ALTER" ~ ^"TABLE" ~ identifier ~ alter_action }
@@ -211,12 +252,13 @@ alter_column_action = {
     ^"ALTER"
     ~ ^"COLUMN"
     ~ identifier
-    ~ (alter_column_set_max_partitions | alter_column_set_search_mode | alter_column_set_auto_index_at | alter_column_set_hnsw | alter_column_set_consolidation)
+    ~ (alter_column_set_search | alter_column_set_ivf | alter_column_set_with | alter_column_reset_with | alter_column_set_max_partitions | alter_column_set_search_mode | alter_column_set_auto_index_at | alter_column_set_auto_expansion_ceiling | alter_column_set_flat_below | alter_column_set_consolidation)
 }
 alter_column_set_max_partitions = { ^"SET" ~ ^"MAX_PARTITIONS" ~ max_partitions_literal }
 alter_column_set_search_mode = { ^"SET" ~ ^"SEARCH_MODE" ~ vector_search_mode }
 alter_column_set_auto_index_at = { ^"SET" ~ ^"AUTO_INDEX_AT" ~ vector_policy_value }
-alter_column_set_hnsw = { ^"SET" ~ ^"HNSW" ~ (^"DEFAULT" | hnsw_options) }
+alter_column_set_auto_expansion_ceiling = { ^"SET" ~ ^"AUTO_EXPANSION_CEILING" ~ vector_policy_value }
+alter_column_set_flat_below = { ^"SET" ~ ^"FLAT_BELOW" ~ vector_policy_value }
 alter_column_set_consolidation = { ^"SET" ~ ^"CONSOLIDATION" ~ (^"DEFAULT" | consolidation_none | consolidation_options) }
 set_retain_action = { ^"SET" ~ ^"RETAIN" ~ integer ~ retain_unit ~ sync_safe_option? }
 drop_retain_action = { ^"DROP" ~ ^"RETAIN" }
@@ -258,12 +300,26 @@ vector_type = {
     ~ vector_max_partitions_clause?
     ~ vector_search_mode_clause?
     ~ vector_auto_index_at_clause?
-    ~ vector_hnsw_clause?
+    ~ vector_auto_expansion_ceiling_clause?
+    ~ vector_flat_below_clause?
+    ~ vector_search_clause?
+    ~ vector_ivf_clause?
     ~ vector_consolidation_clause?
 }
-vector_quantization_clause = {
-    ^"WITH" ~ "(" ~ ^"quantization" ~ "=" ~ vector_quantization_value ~ ")"
-}
+vector_quantization_clause = { ^"WITH" ~ vector_policy_group }
+vector_search_clause = { ^"SEARCH" ~ vector_policy_group }
+vector_ivf_clause = { ^"IVF" ~ vector_policy_group }
+alter_column_set_search = { ^"SET" ~ ^"SEARCH" ~ (^"DEFAULT" | vector_policy_group) }
+alter_column_set_ivf = { ^"SET" ~ ^"IVF" ~ (^"DEFAULT" | vector_policy_group) }
+alter_column_set_with = { ^"SET" ~ ^"WITH" ~ vector_policy_group }
+alter_column_reset_with = { ^"RESET" ~ ^"WITH" ~ "(" ~ identifier ~ ("," ~ identifier)* ~ ")" }
+vector_query_options = { vector_policy_group }
+vector_policy_group = { "(" ~ vector_policy_member ~ ("," ~ vector_policy_member)* ~ ")" }
+vector_policy_member = { identifier ~ "=" ~ vector_engine_value }
+vector_engine_value = { vector_policy_list | vector_policy_reference | string | vector_policy_literal }
+vector_policy_list = { "[" ~ vector_policy_literal ~ ("," ~ vector_policy_literal)* ~ "]" }
+vector_policy_reference = { identifier ~ "." ~ identifier }
+vector_policy_literal = @{ ^"DEFAULT" | ("+" | "-")? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? ~ (("e" | "E") ~ ("+" | "-")? ~ ASCII_DIGIT+)? }
 vector_quantization_value = @{ "'" ~ ("F32" | "SQ8" | "SQ4") ~ "'" }
 vector_partition_key_clause = {
     ^"PARTITION_KEY" ~ "(" ~ identifier ~ ("," ~ identifier)* ~ ")"
@@ -273,12 +329,10 @@ vector_search_mode_clause = { ^"SEARCH_MODE" ~ vector_search_mode }
 vector_search_mode = @{ ^"AUTO" | ^"EXACT" | ^"INDEXED" }
 max_partitions_literal = @{ "-"? ~ ASCII_DIGIT+ }
 vector_auto_index_at_clause = { ^"AUTO_INDEX_AT" ~ vector_policy_value }
-vector_hnsw_clause = { ^"HNSW" ~ hnsw_options }
+vector_auto_expansion_ceiling_clause = { ^"AUTO_EXPANSION_CEILING" ~ vector_policy_value }
+vector_flat_below_clause = { ^"FLAT_BELOW" ~ vector_policy_value }
 vector_consolidation_clause = { ^"CONSOLIDATION" ~ (consolidation_none | consolidation_options) }
 consolidation_none = { ^"NONE" }
-hnsw_options = { "(" ~ hnsw_option ~ ("," ~ hnsw_option)* ~ ")" }
-hnsw_option = { hnsw_option_name ~ "=" ~ vector_policy_value }
-hnsw_option_name = @{ ^"M" | ^"EF_CONSTRUCTION" | ^"EF_SEARCH" }
 consolidation_options = { "(" ~ consolidation_option ~ ("," ~ consolidation_option)* ~ ")" }
 consolidation_option = { consolidation_option_name ~ "=" ~ vector_policy_value }
 consolidation_option_name = @{ ^"CHANGE_PERCENT" | ^"TOMBSTONE_PERCENT" }
@@ -315,7 +369,9 @@ nullable_marker = { ^"NULL" }
 primary_key = { ^"PRIMARY" ~ ^"KEY" }
 unique = { ^"UNIQUE" }
 default_clause = { ^"DEFAULT" ~ expr }
-references_clause = { ^"REFERENCES" ~ identifier ~ "(" ~ identifier ~ ")" }
+references_clause = { ^"REFERENCES" ~ identifier ~ "(" ~ identifier ~ ")" ~ follows_parent_purge? }
+/// A child row is erased with the parent row it references, by PURGE only.
+follows_parent_purge = { ^"FOLLOWS" ~ ^"PARENT" ~ ^"PURGE" }
 rank_policy_clause = {
     ^"RANK_POLICY"
     ~ "("
@@ -564,7 +620,7 @@ and_op = @{ ^"AND" ~ !ident_char }
 unary_bool_expr = { not_op* ~ comparison_expr }
 not_op = @{ ^"NOT" ~ !ident_char }
 
-comparison_expr = { (row_value | additive_expr) ~ comparison_suffix? }
+comparison_expr = { additive_expr ~ comparison_suffix? }
 // ISO SQL row-value constructor. Two or more elements, so it can never be read
 // as a parenthesised scalar expression.
 row_value = { "(" ~ expr ~ ("," ~ expr)+ ~ ")" }
@@ -585,7 +641,8 @@ unary_math_expr = { unary_minus* ~ primary_expr }
 unary_minus = { "-" }
 
 primary_expr = {
-    function_call
+    window_call
+    | function_call
     | parameter
     | null_lit
     | bool_lit
@@ -594,10 +651,18 @@ primary_expr = {
     | string
     | vector_lit
     | column_ref
-    | "(" ~ expr ~ ")"
+    | parenthesized_expr
 }
+// Parse the first expression once before choosing a scalar or row constructor.
+parenthesized_expr = { "(" ~ expr ~ ("," ~ expr)* ~ ")" }
 vector_lit = { "[" ~ vector_component ~ ("," ~ vector_component)* ~ "]" }
 vector_component = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
+window_call = { function_call ~ ^"OVER" ~ (window_spec | identifier) }
+window_spec = { "(" ~ window_reference? ~ window_partition? ~ order_by_clause? ~ window_frame? ~ ")" }
+window_reference = { !(^"PARTITION" | ^"ORDER" | ^"ROWS" | ^"RANGE" | ^"GROUPS") ~ identifier }
+named_window_clause = { ^"WINDOW" ~ identifier ~ ^"AS" ~ window_spec ~ ("," ~ identifier ~ ^"AS" ~ window_spec)* }
+window_partition = { ^"PARTITION" ~ ^"BY" ~ expr ~ ("," ~ expr)* }
+window_frame = { (^"ROWS" | ^"RANGE" | ^"GROUPS") ~ (!")" ~ ANY)* }
 function_call = { identifier ~ "(" ~ (star | (expr ~ ("," ~ expr)*))? ~ ")" }
 column_ref = { identifier ~ ("." ~ identifier)? }
 

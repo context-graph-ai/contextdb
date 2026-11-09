@@ -13,9 +13,7 @@
 //! and every schema change is issued as real SQL through `Database::execute`.
 
 use contextdb_core::Value;
-use contextdb_core::read_contract::{
-    DeadlineClock, DeadlineWait, OwnerReadCancellation, ReadLimits,
-};
+use contextdb_core::read_contract::{OwnerReadCancellation, ReadLimits};
 use contextdb_engine::Database;
 use contextdb_engine::executor::bounded_read_test_support as bounded;
 use std::collections::HashMap;
@@ -46,20 +44,7 @@ const RELEASED_OBSERVATION: Duration = Duration::from_secs(30);
 /// Cursor expiry is driven by the injected clock, never by wall time, so a
 /// cursor held open across another session's schema change cannot expire and
 /// let that change through by accident.
-#[derive(Clone, Copy)]
-struct FrozenClock;
-
-impl DeadlineClock for FrozenClock {
-    fn now_ms(&self) -> u64 {
-        0
-    }
-
-    fn wait_until(&self, _deadline_ms: u64) -> DeadlineWait<'_> {
-        // These cursor journeys are synchronous; the immediately-completing
-        // future satisfies the shared transport-facing clock trait.
-        Box::pin(async {})
-    }
-}
+use contextdb_engine::local_transport::ManualDeadlineClock;
 
 fn roomy_limits() -> ReadLimits {
     ReadLimits {
@@ -114,7 +99,7 @@ fn vector_request(table: &str) -> bounded::BoundedReadRequest {
         format!("SELECT id FROM {table} ORDER BY embedding <=> $query LIMIT 4"),
         HashMap::from([("query".to_owned(), Value::Vector(unit_vector(0)))]),
         roomy_limits(),
-        Arc::new(FrozenClock),
+        Arc::new(ManualDeadlineClock::at(0)),
     )
 }
 
@@ -124,7 +109,7 @@ fn vector_request(table: &str) -> bounded::BoundedReadRequest {
 fn live_vector_cursor(db: Arc<Database>, table: &str) -> bounded::TestCursor {
     let opened = bounded::open_cursor(db, &vector_request(table)).expect("open a vector cursor");
     assert!(
-        opened.first_page.has_more,
+        opened.first_page.has_more(),
         "an inspection cursor must stay open past its first page so it is still \
          reading when a schema change arrives"
     );
@@ -133,7 +118,7 @@ fn live_vector_cursor(db: Arc<Database>, table: &str) -> bounded::TestCursor {
         .fetch(None, OwnerReadCancellation::new())
         .expect("page the open cursor once");
     assert!(
-        !paged.page.rows.is_empty(),
+        !paged.page.rows().is_empty(),
         "paging an open inspection cursor must return rows, so the cursor is \
          demonstrably mid-inspection"
     );
@@ -161,7 +146,7 @@ fn open_and_report(
     let schema_change_had_completed = schema_change_completed.load(Ordering::SeqCst);
     match outcome {
         Ok(opened) => AdmissionReport {
-            opened_rows: Some(opened.first_page.rows.len()),
+            opened_rows: Some(opened.first_page.rows().len()),
             refusal: None,
             engine_error: None,
             schema_change_had_completed,

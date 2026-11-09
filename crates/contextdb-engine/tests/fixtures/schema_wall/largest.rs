@@ -8,12 +8,24 @@ use contextdb_engine::{Database, sync_types::ChangeSet};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_is_proportional_to_affected_tables, read"
+)]
 pub type Calls = Arc<Mutex<Vec<Value>>>;
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_is_proportional_to_affected_tables, read"
+)]
 pub fn affected_tables() -> BTreeSet<String> {
     (0..100).map(|i| format!("schema_{i:03}")).collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_is_proportional_to_affected_tables, read"
+)]
 pub fn vector(ordinal: usize) -> Value {
     let mut values = vec![0.0; 768];
     values[0] = 1.0;
@@ -21,6 +33,14 @@ pub fn vector(ordinal: usize) -> Value {
     Value::Vector(values)
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_is_proportional_to_affected_tables, read"
+)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn prepare_existing_rows_and_vectors(db: &Database) -> Calls {
     let calls = Arc::new(Mutex::new(Vec::new()));
     db.register_trigger_callback("schema_099_insert_trigger", {
@@ -57,15 +77,23 @@ pub fn prepare_existing_rows_and_vectors(db: &Database) -> Calls {
     calls
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_is_proportional_to_affected_tables"
+)]
 pub fn author_migration(db: &Database) -> ChangeSet {
     let since = db.current_lsn();
     db.execute("ALTER TABLE schema_000 ADD COLUMN revised TEXT", &empty())
         .unwrap();
     // The root's transitive FK closure is all 100 existing tables. Listing 100
     // ADD COLUMN entries would hide a broken dependency-closure calculation.
-    db.changes_since(since)
+    db.changes_since(since).expect("read the declared changes")
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_is_proportional_to_affected_tables, read"
+)]
 pub fn rows_and_vectors(db: &Database) -> Vec<Vec<Vec<Value>>> {
     (0..100)
         .map(|ordinal| {
@@ -76,7 +104,8 @@ pub fn rows_and_vectors(db: &Database) -> Vec<Vec<Vec<Value>>> {
                     &empty(),
                 )
                 .unwrap()
-                .rows;
+                .rows()
+                .to_vec();
             assert_eq!(
                 result,
                 vec![vec![
@@ -94,7 +123,7 @@ pub fn rows_and_vectors(db: &Database) -> Vec<Vec<Vec<Value>>> {
                     &query
                 )
                 .unwrap()
-                .rows,
+                .rows(),
                 vec![vec![Value::Int64(1)]],
                 "the affected table's vector remains searchable"
             );
@@ -103,6 +132,10 @@ pub fn rows_and_vectors(db: &Database) -> Vec<Vec<Vec<Value>>> {
         .collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_is_proportional_to_affected_tables"
+)]
 pub fn assert_constraints_and_callback(db: &Database, calls: &Calls) {
     db.execute(
         "CREATE EVENT TYPE schema_099_notice WHEN INSERT ON schema_099",
@@ -131,7 +164,7 @@ pub fn assert_constraints_and_callback(db: &Database, calls: &Calls) {
     assert!(
         db.execute("SELECT id FROM schema_099 WHERE id = 3", &empty())
             .unwrap()
-            .rows
+            .rows()
             .is_empty(),
         "refused observation leaves no durable record"
     );
@@ -152,7 +185,7 @@ pub fn assert_constraints_and_callback(db: &Database, calls: &Calls) {
     assert_eq!(
         db.execute("SELECT id FROM schema_099 WHERE id = 2", &empty())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(2)]],
         "accepted observation is durable"
     );

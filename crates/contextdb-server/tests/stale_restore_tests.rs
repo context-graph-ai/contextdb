@@ -40,7 +40,8 @@ async fn start_server(
             contextdb_core::TenantId::from(tenant),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let flag = shutdown.clone();
@@ -65,6 +66,7 @@ fn edge_client(db: Arc<Database>, fabric: &InProcessBroker, tenant: &str) -> Syn
         contextdb_core::TenantId::from(tenant),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 async fn stop_server(server_gen: ServerGen) {
@@ -113,17 +115,17 @@ fn row_set(db: &Database) -> BTreeSet<(Uuid, String)> {
         .execute("SELECT id, v FROM t", &HashMap::new())
         .expect("SELECT id, v FROM t must succeed");
     let id_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "id")
         .expect("result must project column 'id'");
     let v_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "v")
         .expect("result must project column 'v'");
     let mut set = BTreeSet::new();
-    for row in &result.rows {
+    for row in result.rows() {
         let id = match &row[id_idx] {
             Value::Uuid(u) => *u,
             other => panic!("id column must be UUID, got {other:?}"),

@@ -423,7 +423,9 @@ fn a_declared_history_policy_travels_through_the_real_changeset() {
     let receiver = Database::open_memory();
     receiver
         .apply_changes(
-            source.changes_since(Lsn(0)),
+            source
+                .changes_since(Lsn(0))
+                .expect("read the declared changes"),
             &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
         )
         .expect("the receiving machine must accept the definition");

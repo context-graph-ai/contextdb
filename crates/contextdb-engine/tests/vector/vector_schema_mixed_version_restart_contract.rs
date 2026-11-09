@@ -44,10 +44,10 @@ fn params(pairs: impl IntoIterator<Item = (&'static str, Value)>) -> HashMap<Str
 
 fn text_column(result: QueryResult) -> Vec<String> {
     result
-        .rows
-        .into_iter()
-        .map(|row| match row.into_iter().next() {
-            Some(Value::Text(value)) => value,
+        .rows()
+        .iter()
+        .map(|row| match row.iter().next() {
+            Some(Value::Text(value)) => value.clone(),
             value => panic!("expected one text value, got {value:?}"),
         })
         .collect()
@@ -137,7 +137,8 @@ async fn start_server(
             TenantId::from(tenant),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -391,7 +392,8 @@ async fn newer_hub_restart_keeps_the_holdback_and_recovers_it_in_bounded_pages()
         transport,
         TenantId::from(PULL_TENANT),
         receiver_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     first_server
         .server
         .set_peer_vector_schema_support_for_test(&receiver_node_id, false);
@@ -444,7 +446,7 @@ async fn newer_hub_restart_keeps_the_holdback_and_recovers_it_in_bounded_pages()
     let recovered = receiver
         .execute("SELECT id FROM partitioned_notes", &empty())
         .expect("held table and rows arrive");
-    assert_eq!(recovered.rows.len(), RECOVERY_ROWS);
+    assert_eq!(recovered.rows().len(), RECOVERY_ROWS);
     assert!(
         page_stats.content_pages.load(Ordering::SeqCst) >= 2,
         "a 501-row held image must be paged rather than buffered into one response"
@@ -483,7 +485,8 @@ async fn newer_edge_restart_keeps_private_progress_and_does_not_resend_healthy_h
         broker.client_as(&edge_node_id),
         TenantId::from(PUSH_TENANT),
         edge_identity.clone(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     first_client.set_peer_vector_schema_support_for_test(false);
     first_client
         .push()
@@ -503,7 +506,8 @@ async fn newer_edge_restart_keeps_private_progress_and_does_not_resend_healthy_h
         broker.client_as(&edge_node_id),
         TenantId::from(PUSH_TENANT),
         edge_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     restarted_client.set_peer_vector_schema_support_for_test(false);
     assert_eq!(
         restarted_client.schema_sync_holdbacks(),
@@ -542,7 +546,7 @@ async fn newer_edge_restart_keeps_private_progress_and_does_not_resend_healthy_h
     assert_eq!(
         hub.execute("SELECT id FROM partitioned_notes", &empty())
             .expect("held row arrives")
-            .rows
+            .rows()
             .len(),
         1
     );
@@ -581,7 +585,8 @@ async fn a_lost_held_table_reply_requires_its_authenticated_echo_beside_the_olde
         transport.clone(),
         TenantId::from(LOST_ACK_TENANT),
         edge_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client.set_peer_vector_schema_support_for_test(false);
     client
         .push()
@@ -619,7 +624,7 @@ async fn a_lost_held_table_reply_requires_its_authenticated_echo_beside_the_olde
     assert_eq!(
         hub.execute("SELECT id FROM partitioned_notes", &empty())
             .expect("recovered row committed before its acknowledgement was lost")
-            .rows
+            .rows()
             .len(),
         1
     );

@@ -6,7 +6,6 @@ use contextdb_engine::plugin::{CommitSource, DatabasePlugin};
 use contextdb_tx::WriteSet;
 use std::collections::HashMap;
 use std::env;
-use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -100,11 +99,31 @@ fn t19_02_cross_process_concurrent_open_returns_typed_database_locked() {
     let stdin = child.stdin.as_mut().unwrap();
     use std::io::Write;
     stdin
-        .write_all(b"CREATE TABLE t (id UUID PRIMARY KEY)\n")
+        .write_all(b"CREATE TABLE t (id UUID PRIMARY KEY);\n")
         .unwrap();
     stdin.flush().unwrap();
-    // Give the child a moment to commit and hold the lock.
-    std::thread::sleep(Duration::from_millis(500));
+    // The child answers its first statement only after its open has completed and
+    // published the holder's companion record, so that answer is the readiness
+    // signal. A watchdog bounds a child that never answers; it asserts no timing.
+    let child_stdout = child.stdout.take().unwrap();
+    let (answered, first_answer) = std::sync::mpsc::channel();
+    let answer_reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut stdout = std::io::BufReader::new(child_stdout);
+        let mut line = String::new();
+        let read = stdout.read_line(&mut line);
+        let _ = answered.send((read.map(|_| line), ()));
+        stdout
+    });
+    let (first, ()) = first_answer
+        .recv_timeout(Duration::from_secs(120))
+        .expect("the child answers its first statement");
+    let first = first.expect("read the child's first answer");
+    assert!(
+        first.starts_with("ok"),
+        "the child committed its first statement before the second open: {first:?}"
+    );
+    let _child_stdout = answer_reader.join().unwrap();
 
     let result = Database::open(&path);
     let err = assert_error(result, "concurrent cross-process open must be rejected");
@@ -408,10 +427,12 @@ fn t19_09_closed_handle_rejects_normal_reads() {
         matches!(&err, Error::Other(msg) if msg.contains("closed")),
         "expected closed-handle error, got: {err:?}"
     );
-    let changes = std::panic::catch_unwind(AssertUnwindSafe(|| db.changes_since(Lsn(0))));
+    let changes = db
+        .changes_since(Lsn(0))
+        .expect_err("closed changes_since refuses stale state");
     assert!(
-        changes.is_err(),
-        "closed changes_since must not serve stale in-memory state"
+        matches!(changes, Error::Other(ref message) if message.contains("closed")),
+        "closed changes_since returns the typed closed-handle error: {changes:?}"
     );
 
     let _reopened = Database::open(&path).expect("released path can be reopened");
@@ -430,10 +451,13 @@ impl DatabasePlugin for CrossHandleClosedReadPlugin {
                 *self.observed_closed.lock().unwrap() = true;
                 Ok(())
             }
-            Ok(rows) => Err(Error::Other(format!(
-                "closed cross-handle scan unexpectedly returned {} rows",
-                rows.len()
-            ))),
+            Ok(rows) => Err(Error::Other(
+                format!(
+                    "closed cross-handle scan unexpectedly returned {} rows",
+                    rows.len()
+                )
+                .into(),
+            )),
             Err(err) => Err(err),
         }
     }

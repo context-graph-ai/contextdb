@@ -1,5 +1,6 @@
 //! Partition only the ordinary remainder of a custody envelope.
 //! The normal apply seam still owns arbitration and dependency-complete refusal.
+
 use super::*;
 
 pub(crate) fn references(db: &Database, child: &RowChange, parent: &RowChange) -> bool {

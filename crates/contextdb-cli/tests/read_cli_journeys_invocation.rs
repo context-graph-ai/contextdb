@@ -5,7 +5,7 @@
 //! only way to authorize creation and mutation. Everything else in this file is
 //! the surface that promise implies — the removed spellings, the operational
 //! commands that must be visible, the two bootstrap environment names, the
-//! `:memory:` exception, and the configuration that is refused before open.
+//! `:memory:` refusal, and the configuration that is refused before open.
 
 mod read_cli_support;
 
@@ -324,55 +324,48 @@ fn an_explicit_path_wins_over_the_bootstrap_database_path_variable() {
     );
 }
 
+// Regression observed 2026-10-30: these two tests asserted that `:memory:` was an
+// always-writable store with no read route and an owner state of
+// `not_applicable`. contextdb is a durable database and has no in-memory mode,
+// so the premise is reversed: `:memory:` names no database and is refused as
+// a usage error before anything is opened. Rewritten in place, not deleted.
 #[test]
-fn memory_store_is_writable_without_the_flag_and_accepts_the_flag_as_a_no_op() {
+fn memory_path_is_refused_because_contextdb_has_no_in_memory_mode() {
     let script = "CREATE TABLE scratch (id INTEGER PRIMARY KEY);\n\
                   INSERT INTO scratch (id) VALUES (7);\n\
                   SELECT id FROM scratch;\n";
 
-    let implicit = run(&[":memory:", "--json"], script);
-    assert_eq!(
-        implicit.code,
-        Some(0),
-        "`:memory:` is always writable; mutation needs no flag.\n{}",
-        implicit.describe()
-    );
-
-    let explicit = run(&[":memory:", "--write", "--json"], script);
-    assert_eq!(
-        explicit.code,
-        Some(0),
-        "an explicit `--write` on `:memory:` is an accepted no-op.\n{}",
-        explicit.describe()
-    );
+    for args in [
+        &[":memory:", "--json"][..],
+        &[":memory:", "--write", "--json"][..],
+    ] {
+        let outcome = run(args, script);
+        assert_eq!(
+            outcome.code,
+            Some(2),
+            "`:memory:` is not a database path and is a usage error, with or without `--write`.\n{}",
+            outcome.describe()
+        );
+        assert!(
+            outcome.stdout_docs().is_empty(),
+            "a refused invocation runs nothing, so it prints no result.\n{}",
+            outcome.describe()
+        );
+        assert!(
+            outcome.route_notices().is_empty(),
+            "a refused invocation reports no read route.\n{}",
+            outcome.describe()
+        );
+        assert!(
+            outcome.stderr.contains("no in-memory mode"),
+            "the refusal says why, in plain words.\n{}",
+            outcome.describe()
+        );
+    }
 }
 
 #[test]
-fn memory_store_emits_no_route_notice_and_reports_owner_state_not_applicable() {
-    let outcome = run(&[":memory:", "--json"], "SELECT 1;\n.owner status\n");
-
-    assert!(
-        outcome.route_notices().is_empty(),
-        "`:memory:` has no route to report, so it emits no read_route notice.\n{}",
-        outcome.describe()
-    );
-    let docs = outcome.stdout_docs();
-    let owner = expect_document(&docs, "owner", "`.owner status` on :memory:");
-    assert_eq!(
-        owner.get("state").and_then(|s| s.as_str()),
-        Some("not_applicable"),
-        "an in-memory database has no file-backed owner: {owner}"
-    );
-    assert_eq!(
-        outcome.code,
-        Some(0),
-        "`not_applicable` is a successful report.\n{}",
-        outcome.describe()
-    );
-}
-
-#[test]
-fn read_and_owner_read_flags_are_invalid_with_a_memory_store() {
+fn read_and_owner_read_flags_do_not_make_a_memory_path_acceptable() {
     for flag in [
         "--read-result-rows",
         "--read-result-bytes",
@@ -384,7 +377,7 @@ fn read_and_owner_read_flags_are_invalid_with_a_memory_store() {
         assert_eq!(
             outcome.code,
             Some(2),
-            "{flag} is invalid with `:memory:` and is refused before any work.\n{}",
+            "{flag} does not make `:memory:` a database path; it is refused before any work.\n{}",
             outcome.describe()
         );
     }
@@ -393,7 +386,7 @@ fn read_and_owner_read_flags_are_invalid_with_a_memory_store() {
     assert_eq!(
         disabled.code,
         Some(2),
-        "`--no-owner-reads` is invalid with `:memory:`.\n{}",
+        "`--no-owner-reads` does not make `:memory:` a database path.\n{}",
         disabled.describe()
     );
 }

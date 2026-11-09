@@ -19,16 +19,16 @@ fn schema(db: &Database, table: &str) -> String {
 
 fn column(result: &contextdb_engine::QueryResult, name: &str) -> usize {
     result
-        .columns
+        .columns()
         .iter()
         .position(|candidate| candidate == name)
-        .unwrap_or_else(|| panic!("inspection includes {name}: {:?}", result.columns))
+        .unwrap_or_else(|| panic!("inspection includes {name}: {:?}", result.columns()))
 }
 
 fn integer_partition_keys(result: &contextdb_engine::QueryResult) -> Vec<i64> {
     let key = column(result, "partition_key");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(key) {
             Some(Value::Json(value)) => value
@@ -135,8 +135,8 @@ fn consolidation_and_maintenance_poll_declarations_round_trip_and_reset() {
     let shown = db
         .execute("SHOW MAINTENANCE_POLL_INTERVAL", &empty())
         .expect("inspect the declared maintenance cadence");
-    assert_eq!(shown.columns, vec!["milliseconds"]);
-    assert_eq!(shown.rows, vec![vec![Value::Int64(250)]]);
+    assert_eq!(shown.columns(), vec!["milliseconds"]);
+    assert_eq!(shown.rows(), vec![vec![Value::Int64(250)]]);
     assert_eq!(db.maintenance_poll_interval(), Duration::from_millis(250));
     let declared = schema(&db, "maintained_items");
     assert!(
@@ -179,7 +179,7 @@ fn consolidation_and_maintenance_poll_declarations_round_trip_and_reset() {
     assert_eq!(vector.consolidation_tombstone_percent, Some(31));
     let thresholds = reopened.execute("SHOW VECTOR_INDEXES", &empty()).unwrap();
     assert_eq!(
-        thresholds.rows[0][column(&thresholds, "declared_consolidation_mode")],
+        thresholds.rows()[0][column(&thresholds, "declared_consolidation_mode")],
         Value::Text("thresholds".to_owned())
     );
     let threshold_partitions = reopened
@@ -189,18 +189,19 @@ fn consolidation_and_maintenance_poll_declarations_round_trip_and_reset() {
         )
         .unwrap();
     assert_eq!(
-        threshold_partitions.rows[0][column(&threshold_partitions, "declared_consolidation_mode")],
+        threshold_partitions.rows()[0]
+            [column(&threshold_partitions, "declared_consolidation_mode")],
         Value::Text("thresholds".to_owned())
     );
     assert_eq!(
-        threshold_partitions.rows[0][column(
+        threshold_partitions.rows()[0][column(
             &threshold_partitions,
             "declared_consolidation_change_percent"
         )],
         Value::Int64(11)
     );
     assert_eq!(
-        threshold_partitions.rows[0][column(
+        threshold_partitions.rows()[0][column(
             &threshold_partitions,
             "declared_consolidation_tombstone_percent"
         )],
@@ -222,18 +223,18 @@ fn consolidation_and_maintenance_poll_declarations_round_trip_and_reset() {
         .execute("SHOW VECTOR_INDEXES", &empty())
         .expect("inspect the disabled consolidation policy");
     assert_eq!(
-        disabled.rows[0][column(&disabled, "declared_consolidation_mode")],
+        disabled.rows()[0][column(&disabled, "declared_consolidation_mode")],
         Value::Text("none".to_owned())
     );
     assert_eq!(
-        disabled.rows[0][column(&disabled, "effective_consolidation_mode")],
+        disabled.rows()[0][column(&disabled, "effective_consolidation_mode")],
         Value::Text("none".to_owned())
     );
     for name in [
         "effective_consolidation_change_percent",
         "effective_consolidation_tombstone_percent",
     ] {
-        assert_eq!(disabled.rows[0][column(&disabled, name)], Value::Null);
+        assert_eq!(disabled.rows()[0][column(&disabled, name)], Value::Null);
     }
     let disabled_partitions = reopened
         .execute(
@@ -251,19 +252,19 @@ fn consolidation_and_maintenance_poll_declarations_round_trip_and_reset() {
     ] {
         assert!(
             disabled_partitions
-                .columns
+                .columns()
                 .iter()
                 .any(|column| column == name),
             "partition inspection exposes {name}"
         );
     }
-    assert_eq!(disabled_partitions.rows.len(), 1);
+    assert_eq!(disabled_partitions.rows().len(), 1);
     assert_eq!(
-        disabled_partitions.rows[0][column(&disabled_partitions, "declared_consolidation_mode")],
+        disabled_partitions.rows()[0][column(&disabled_partitions, "declared_consolidation_mode")],
         Value::Text("none".to_owned())
     );
     assert_eq!(
-        disabled_partitions.rows[0][column(&disabled_partitions, "effective_consolidation_mode")],
+        disabled_partitions.rows()[0][column(&disabled_partitions, "effective_consolidation_mode")],
         Value::Text("none".to_owned())
     );
     reopened.close().expect("persist CONSOLIDATION NONE");
@@ -291,19 +292,19 @@ fn consolidation_and_maintenance_poll_declarations_round_trip_and_reset() {
     );
     let defaulted = reopened.execute("SHOW VECTOR_INDEXES", &empty()).unwrap();
     assert_eq!(
-        defaulted.rows[0][column(&defaulted, "declared_consolidation_mode")],
+        defaulted.rows()[0][column(&defaulted, "declared_consolidation_mode")],
         Value::Null
     );
     assert_eq!(
-        defaulted.rows[0][column(&defaulted, "effective_consolidation_mode")],
+        defaulted.rows()[0][column(&defaulted, "effective_consolidation_mode")],
         Value::Text("thresholds".to_owned())
     );
     assert_eq!(
-        defaulted.rows[0][column(&defaulted, "effective_consolidation_change_percent")],
+        defaulted.rows()[0][column(&defaulted, "effective_consolidation_change_percent")],
         Value::Int64(20)
     );
     assert_eq!(
-        defaulted.rows[0][column(&defaulted, "effective_consolidation_tombstone_percent")],
+        defaulted.rows()[0][column(&defaulted, "effective_consolidation_tombstone_percent")],
         Value::Int64(10)
     );
     let defaulted_partitions = reopened
@@ -312,18 +313,24 @@ fn consolidation_and_maintenance_poll_declarations_round_trip_and_reset() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(defaulted_partitions.rows.len(), 1);
+    assert_eq!(defaulted_partitions.rows().len(), 1);
     assert_eq!(
-        defaulted_partitions.rows[0][column(&defaulted_partitions, "declared_consolidation_mode")],
+        defaulted_partitions.rows()[0]
+            [column(&defaulted_partitions, "declared_consolidation_mode")],
         Value::Null
     );
     assert_eq!(
-        defaulted_partitions.rows[0][column(&defaulted_partitions, "effective_consolidation_mode")],
+        defaulted_partitions.rows()[0]
+            [column(&defaulted_partitions, "effective_consolidation_mode")],
         Value::Text("thresholds".to_owned())
     );
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn concurrent_maintenance_poll_interval_setters_keep_live_worker_and_reopen_consistent() {
     let root = tempfile::tempdir().expect("scratch directory");
     let path = root.path().join("concurrent-maintenance-policy.db");
@@ -601,7 +608,7 @@ fn nullable_partitioned_vector_added_to_existing_rows_starts_null() {
         .execute("SELECT embedding FROM vector_items", &empty())
         .expect("read the added vector column");
     assert_eq!(
-        result.rows,
+        result.rows(),
         vec![vec![Value::Null]],
         "existing rows must receive NULL and create no vector membership"
     );
@@ -796,7 +803,7 @@ fn missing_insert_parameters_keep_the_existing_typed_refusal() {
         assert!(
             db.execute("SELECT id FROM required_parameters", &empty())
                 .unwrap()
-                .rows
+                .rows()
                 .is_empty()
         );
         assert!(
@@ -805,7 +812,7 @@ fn missing_insert_parameters_keep_the_existing_typed_refusal() {
                 &empty()
             )
             .unwrap()
-            .rows
+            .rows()
             .is_empty()
         );
     }
@@ -820,7 +827,7 @@ fn missing_insert_parameters_keep_the_existing_typed_refusal() {
     assert_eq!(
         db.execute("SELECT scope FROM required_parameters", &empty())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(-2)]]
     );
 }

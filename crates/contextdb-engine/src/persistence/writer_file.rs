@@ -1,5 +1,9 @@
 //! Physical writer ownership is independent of a redb allocator/cache generation.
 
+#[cfg(any(test, feature = "test-seams"))]
+use super::read_persistence_test_scaffold::{
+    WriterFileIoKindForTest as IoKindForTest, note_writer_io_for_test, writer_read_fault_for_test,
+};
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -28,7 +32,7 @@ thread_local! {
     static LAST_DISK_GROWTH_REFUSAL: std::cell::Cell<Option<DiskGrowthRefusal>> = const {
         std::cell::Cell::new(None)
     };
-    static LAST_READER_COORDINATION_REFUSAL: std::cell::RefCell<Option<PathBuf>> = const {
+    static LAST_READER_COORDINATION_REFUSAL: std::cell::RefCell<Option<(PathBuf, String)>> = const {
         std::cell::RefCell::new(None)
     };
 }
@@ -37,28 +41,8 @@ pub(super) fn take_disk_growth_refusal() -> Option<DiskGrowthRefusal> {
     LAST_DISK_GROWTH_REFUSAL.take()
 }
 
-pub(super) fn take_reader_coordination_refusal() -> Option<PathBuf> {
+pub(super) fn take_reader_coordination_refusal() -> Option<(PathBuf, String)> {
     LAST_READER_COORDINATION_REFUSAL.with(|slot| slot.borrow_mut().take())
-}
-
-/// A provider scan met a trusted, occupied registry lock. Carry this marker
-/// inside the storage I/O error instead of classifying every WouldBlock as busy.
-#[derive(Debug)]
-struct ReaderRegistryScanContention;
-
-impl std::fmt::Display for ReaderRegistryScanContention {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("reader snapshot registry scan is held by another operation")
-    }
-}
-
-impl std::error::Error for ReaderRegistryScanContention {}
-
-pub(super) fn is_reader_registry_scan_contention(error: &redb::TransactionError) -> bool {
-    matches!(error,
-        redb::TransactionError::Storage(redb::StorageError::Io(error))
-            if error.get_ref().is_some_and(|cause| cause.is::<ReaderRegistryScanContention>())
-    )
 }
 
 /// The sole owner of the data-file lock. It is exclusive while writing and
@@ -66,6 +50,7 @@ pub(super) fn is_reader_registry_scan_contention(error: &redb::TransactionError)
 /// Backend views never unlock it.
 pub(super) struct LockedWriterFile {
     file: File,
+    sync_mode: WriterSyncMode,
     runtime_dir: Option<PathBuf>,
     #[cfg(unix)]
     identity: (u64, u64),
@@ -80,9 +65,74 @@ pub(super) struct LockedWriterFile {
     live_views: std::sync::atomic::AtomicUsize,
 }
 
+/// Durability is per commit for every live writer. Only an unpublished export
+/// artifact may defer intermediate barriers to its mandatory final sync_all.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum WriterSyncMode {
+    PerCommit,
+    UnpublishedExport,
+}
+
+/// Only temporary, positively identified contention permits optional deferral.
+pub(super) enum ReaderAuditOutcome {
+    Proven(ReaderAudit),
+    Busy(PathBuf),
+    Refused(PathBuf, io::Error),
+}
+
+#[cfg(target_os = "linux")]
+pub(super) struct ReaderAdmissionHold {
+    _file: File,
+    identity: (u64, u64),
+}
+
+#[cfg(target_os = "linux")]
+impl ReaderAdmissionHold {
+    fn new(file: File, identity: (u64, u64)) -> Self {
+        Self {
+            _file: file,
+            identity,
+        }
+    }
+
+    pub(super) fn identity(&self) -> (u64, u64) {
+        self.identity
+    }
+}
+
+pub(super) struct ReaderAudit {
+    pub(super) registry: super::ReaderSnapshotRegistry,
+    pub(super) unknown: bool,
+    // Closing this independent description releases only this audit's H.
+    #[cfg(target_os = "linux")]
+    _hold: ReaderAdmissionHold,
+    _owner: Arc<LockedWriterFile>,
+}
+
+#[cfg(target_os = "linux")]
+impl ReaderAudit {
+    /// The exclusive reader hold this audit keeps for as long as it lives.
+    pub(super) fn admission_hold(&self) -> &ReaderAdmissionHold {
+        &self._hold
+    }
+}
+
 impl LockedWriterFile {
+    /// The boot and exact data file this writer holds, for its published run.
+    pub(super) fn boot_binding(&self) -> Option<super::WriterBootBinding> {
+        super::WriterBootBinding::of_data_file(&self.file)
+    }
+
     /// Consume a descriptor already locked by the writer admission path.
     pub(super) fn from_locked(file: File, runtime_dir: Option<&Path>) -> io::Result<Arc<Self>> {
+        Self::from_locked_with_sync(file, runtime_dir, WriterSyncMode::PerCommit)
+    }
+
+    fn from_locked_with_sync(
+        file: File,
+        runtime_dir: Option<&Path>,
+        sync_mode: WriterSyncMode,
+    ) -> io::Result<Arc<Self>> {
         #[cfg(unix)]
         let identity = {
             use std::os::unix::fs::MetadataExt as _;
@@ -91,6 +141,7 @@ impl LockedWriterFile {
         };
         Ok(Arc::new(Self {
             file,
+            sync_mode,
             runtime_dir: runtime_dir.map(Path::to_path_buf),
             #[cfg(unix)]
             identity,
@@ -108,8 +159,43 @@ impl LockedWriterFile {
         file: File,
         runtime_dir: Option<&Path>,
     ) -> Result<Arc<Self>, redb::DatabaseError> {
+        Self::lock_with_sync(file, runtime_dir, WriterSyncMode::PerCommit)
+    }
+
+    pub(super) fn lock_with_sync(
+        file: File,
+        runtime_dir: Option<&Path>,
+        sync_mode: WriterSyncMode,
+    ) -> Result<Arc<Self>, redb::DatabaseError> {
+        // Without waiting: the claim, then the data lock. The waiting
+        // acquisition for an existing store is `acquire_writer_file`.
+        #[cfg(unix)]
+        {
+            use super::physical_admission::{
+                ByteLock, CLAIM_OFFSET, Granted, release_byte, try_byte, try_data,
+            };
+            match try_byte(&file, CLAIM_OFFSET, ByteLock::Exclusive) {
+                Ok(Granted::Yes) => {}
+                Ok(Granted::HeldByAnother) => return Err(redb::DatabaseError::DatabaseAlreadyOpen),
+                Err(error) => return Err(error.into()),
+            }
+            match try_data(&file, ByteLock::Exclusive) {
+                Ok(Granted::Yes) => {
+                    Self::from_locked_with_sync(file, runtime_dir, sync_mode).map_err(Into::into)
+                }
+                Ok(Granted::HeldByAnother) => {
+                    let _ = release_byte(&file, CLAIM_OFFSET);
+                    Err(redb::DatabaseError::DatabaseAlreadyOpen)
+                }
+                Err(error) => {
+                    let _ = release_byte(&file, CLAIM_OFFSET);
+                    Err(error.into())
+                }
+            }
+        }
+        #[cfg(not(unix))]
         match fs2::FileExt::try_lock_exclusive(&file) {
-            Ok(()) => Self::from_locked(file, runtime_dir).map_err(Into::into),
+            Ok(()) => Self::from_locked_with_sync(file, runtime_dir, sync_mode).map_err(Into::into),
             Err(error)
                 if error.kind() == io::ErrorKind::WouldBlock
                     || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
@@ -131,14 +217,23 @@ impl LockedWriterFile {
         }
     }
 
+    /// Invocation-local working storage has the same directory provenance as
+    /// allocator scratch. It carries no published root or recovery authority.
+    pub(super) fn scratch_backend(&self) -> io::Result<Box<dyn redb::ScratchBackend>> {
+        let path = self.file_path();
+        let directory = path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "writer file has no directory")
+        })?;
+        redb::scratch_backend_in_directory(directory)
+    }
+
     #[cfg(unix)]
     pub(super) fn identity(&self) -> (u64, u64) {
         self.identity
     }
 
     pub(super) fn retain_reader_snapshots(
-        &self,
-        snapshots: super::ReaderSnapshotRegistry,
+        self: &Arc<Self>,
         database_identity: Option<contextdb_core::read_contract::DatabaseIdentity>,
     ) -> io::Result<()> {
         self.reader_database_identity
@@ -146,6 +241,13 @@ impl LockedWriterFile {
             .map_err(|_| {
                 io::Error::other("writer reader-snapshot database identity was already captured")
             })?;
+        let snapshots = match self.audit_reader_snapshots_under_hold() {
+            ReaderAuditOutcome::Proven(audit) => audit.registry.clone(),
+            ReaderAuditOutcome::Busy(path) => super::ReaderSnapshotRegistry::Contended(path),
+            ReaderAuditOutcome::Refused(path, _) => {
+                super::ReaderSnapshotRegistry::Indeterminate(path)
+            }
+        };
         self.reader_snapshots
             .set(snapshots)
             .map_err(|_| io::Error::other("writer reader-snapshot registry was already captured"))
@@ -179,107 +281,23 @@ impl LockedWriterFile {
     }
 
     /// The owning database has stopped every writer and reclaimer. Convert
-    /// this descriptor's exclusive flock to a shared one atomically so a
-    /// fresh direct reader can load the committed root during owner drain.
-    /// The separate companion lock still excludes another ContextDB writer.
+    /// this descriptor's exclusive data lock to a shared one atomically, then
+    /// give back the physical claim, so a fresh direct reader can load the
+    /// committed root during owner drain.
     pub(super) fn make_quiescent(&self) -> io::Result<()> {
-        fs2::FileExt::lock_shared(&self.file)
+        #[cfg(unix)]
+        {
+            super::physical_admission::writer_becomes_quiescent(&self.file)
+        }
+        #[cfg(not(unix))]
+        {
+            fs2::FileExt::lock_shared(&self.file)
+        }
     }
 
     #[cfg(any(test, feature = "test-seams"))]
     pub(super) fn projected_growth_bytes(&self) -> u64 {
         *self.projected_growth_bytes.lock().unwrap()
-    }
-
-    fn storage_snapshot_identities(
-        &self,
-        registry: super::ReaderSnapshotRegistry,
-    ) -> io::Result<Vec<redb::StorageSnapshotIdentity>> {
-        match registry {
-            super::ReaderSnapshotRegistry::Complete(snapshots) => {
-                #[cfg(target_os = "linux")]
-                let unknown = super::reader_presence::has_unknown(
-                    &self.file,
-                    snapshots
-                        .iter()
-                        .filter(|snapshot| self.recognized_reader_snapshot(snapshot))
-                        .map(|snapshot| snapshot.handle_identity),
-                )
-                .inspect_err(|_| {
-                    LAST_READER_COORDINATION_REFUSAL.with(|slot| {
-                        *slot.borrow_mut() = Some(self.file_path());
-                    });
-                })?;
-                let mut identities: Vec<_> = snapshots
-                    .into_iter()
-                    .filter(|snapshot| self.recognized_reader_snapshot(snapshot))
-                    .map(|snapshot| snapshot.storage_snapshot)
-                    .collect();
-                #[cfg(target_os = "linux")]
-                if unknown {
-                    // A root unknown to this writer may hold any old page.
-                    // Ordinary commits remain possible but cannot reclaim it.
-                    identities.push(redb::StorageSnapshotIdentity {
-                        transaction_id: 0,
-                        user_root: None,
-                    });
-                }
-                #[cfg(all(unix, not(target_os = "linux")))]
-                if super::default_reader_runtime_directory().is_none() {
-                    // Without OFD locks or a common platform root, an
-                    // unconfigured reader root cannot be ruled out.
-                    identities.push(redb::StorageSnapshotIdentity {
-                        transaction_id: 0,
-                        user_root: None,
-                    });
-                }
-                Ok(identities)
-            }
-            super::ReaderSnapshotRegistry::Contended(path) => {
-                LAST_READER_COORDINATION_REFUSAL.with(|slot| {
-                    *slot.borrow_mut() = Some(path);
-                });
-                Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    ReaderRegistryScanContention,
-                ))
-            }
-            super::ReaderSnapshotRegistry::Indeterminate(path) => {
-                LAST_READER_COORDINATION_REFUSAL.with(|slot| {
-                    *slot.borrow_mut() = Some(path);
-                });
-                Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "authenticated reader snapshot registry is indeterminate",
-                ))
-            }
-            super::ReaderSnapshotRegistry::Unavailable => {
-                // No candidate directory exists. A regular file supplied as a
-                // channel directory cannot hold reader registrations, and
-                // channel startup failure does not veto ordinary store work.
-                #[cfg(target_os = "linux")]
-                if super::reader_presence::has_unknown(&self.file, std::iter::empty()).inspect_err(
-                    |_| {
-                        LAST_READER_COORDINATION_REFUSAL.with(|slot| {
-                            *slot.borrow_mut() = Some(self.file_path());
-                        });
-                    },
-                )? {
-                    return Ok(vec![redb::StorageSnapshotIdentity {
-                        transaction_id: 0,
-                        user_root: None,
-                    }]);
-                }
-                #[cfg(all(unix, not(target_os = "linux")))]
-                if super::default_reader_runtime_directory().is_none() {
-                    return Ok(vec![redb::StorageSnapshotIdentity {
-                        transaction_id: 0,
-                        user_root: None,
-                    }]);
-                }
-                Ok(Vec::new())
-            }
-        }
     }
 
     #[cfg(target_os = "linux")]
@@ -354,11 +372,67 @@ impl LockedWriterFile {
                     path.display()
                 ),
             )),
-            super::ReaderSnapshotRegistry::Indeterminate(path) => Err(io::Error::other(format!(
-                "candidate reader registry is indeterminate: {}",
-                path.display()
-            ))),
+            super::ReaderSnapshotRegistry::Indeterminate(path) => {
+                Err(super::reader_registry_indeterminate_error(path))
+            }
         }
+    }
+
+    pub(super) fn audit_reader_snapshots_under_hold(self: &Arc<Self>) -> ReaderAuditOutcome {
+        #[cfg(target_os = "linux")]
+        let hold = {
+            use super::physical_admission::{
+                ByteLock, Granted, READER_HOLD_OFFSET, reopen_independent, try_byte,
+            };
+            let hold = match reopen_independent(&self.file, true) {
+                Ok(hold) => hold,
+                Err(error) => return ReaderAuditOutcome::Refused(self.file_path(), error),
+            };
+            match try_byte(&hold, READER_HOLD_OFFSET, ByteLock::Exclusive) {
+                Ok(Granted::Yes) => ReaderAdmissionHold::new(hold, self.identity),
+                Ok(Granted::HeldByAnother) => return ReaderAuditOutcome::Busy(self.file_path()),
+                Err(error) => return ReaderAuditOutcome::Refused(self.file_path(), error),
+            }
+        };
+        #[cfg(target_os = "linux")]
+        let registry = super::capture_reader_snapshot_registry_under_admission_hold(
+            self.identity,
+            self.runtime_dir.as_deref(),
+            &hold,
+        );
+        #[cfg(all(unix, not(target_os = "linux")))]
+        let registry =
+            super::capture_reader_snapshot_registry(self.identity, self.runtime_dir.as_deref());
+        #[cfg(not(unix))]
+        let registry = super::ReaderSnapshotRegistry::Unavailable;
+        match &registry {
+            super::ReaderSnapshotRegistry::Contended(path) => {
+                return ReaderAuditOutcome::Busy(path.clone());
+            }
+            super::ReaderSnapshotRegistry::Indeterminate(path) => {
+                return ReaderAuditOutcome::Refused(
+                    path.clone(),
+                    super::reader_registry_indeterminate_error(path),
+                );
+            }
+            _ => {}
+        }
+        #[cfg(all(test, target_os = "linux"))]
+        super::owner_cursor_admission_tests::before_physical_presence_probe();
+        #[cfg(target_os = "linux")]
+        let unknown = match self.unknown_reader_presence(&registry) {
+            Ok(unknown) => unknown,
+            Err(error) => return ReaderAuditOutcome::Refused(self.file_path(), error),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let unknown = false;
+        ReaderAuditOutcome::Proven(ReaderAudit {
+            registry,
+            unknown,
+            #[cfg(target_os = "linux")]
+            _hold: hold,
+            _owner: Arc::clone(self),
+        })
     }
 
     pub(super) fn external_snapshot_provider(self: &Arc<Self>) -> redb::ExternalSnapshotProvider {
@@ -371,14 +445,42 @@ impl LockedWriterFile {
                     "writer file ownership is closed",
                 )
             })?;
-            #[cfg(unix)]
-            let registry = super::capture_reader_snapshot_registry(
-                owner.identity,
-                owner.runtime_dir.as_deref(),
-            );
-            #[cfg(not(unix))]
-            let registry = super::ReaderSnapshotRegistry::Unavailable;
-            owner.storage_snapshot_identities(registry)
+            match owner.audit_reader_snapshots_under_hold() {
+                ReaderAuditOutcome::Proven(audit) => {
+                    // The probe and registry are one observation; no second probe.
+                    let mut identities = match &audit.registry {
+                        super::ReaderSnapshotRegistry::Complete(snapshots) => snapshots
+                            .iter()
+                            .filter(|snapshot| owner.recognized_reader_snapshot(snapshot))
+                            .filter(|snapshot| {
+                                !super::snapshot_is_failed(&snapshot.storage_snapshot)
+                            })
+                            .map(|snapshot| snapshot.storage_snapshot)
+                            .collect::<Vec<_>>(),
+                        _ => Vec::new(),
+                    };
+                    if audit.unknown
+                        || cfg!(all(unix, not(target_os = "linux")))
+                            && super::default_reader_runtime_directory().is_none()
+                    {
+                        identities.push(redb::StorageSnapshotIdentity {
+                            transaction_id: 0,
+                            user_root: None,
+                        });
+                    }
+                    Ok(identities)
+                }
+                ReaderAuditOutcome::Busy(_) => Ok(vec![redb::StorageSnapshotIdentity {
+                    transaction_id: 0,
+                    user_root: None,
+                }]),
+                ReaderAuditOutcome::Refused(path, error) => {
+                    LAST_READER_COORDINATION_REFUSAL.with(|slot| {
+                        *slot.borrow_mut() = Some((path, error.to_string()));
+                    });
+                    Err(error)
+                }
+            }
         })
     }
 
@@ -427,6 +529,9 @@ impl Drop for LockedWriterFile {
         // The outer holder closes redb before releasing this owner. Any I/O
         // already in progress keeps its temporary strong borrow until it returns.
         // File's own drop also releases the descriptor if explicit unlock fails.
+        #[cfg(unix)]
+        super::physical_admission::release_writer(&self.file);
+        #[cfg(not(unix))]
         let _ = fs2::FileExt::unlock(&self.file);
     }
 }
@@ -443,6 +548,12 @@ impl WriterFileView {
         self.owner
             .upgrade()
             .ok_or_else(|| io::Error::other("writer file ownership is closed"))
+    }
+
+    fn native_owner(&self) -> Result<Arc<LockedWriterFile>, redb::NativeBackendError> {
+        self.owner.upgrade().ok_or(redb::NativeBackendError::Closed(
+            redb::NativeIoCause::WriterOwnerClosed,
+        ))
     }
 
     #[cfg(any(test, feature = "test-seams"))]
@@ -465,41 +576,95 @@ impl Drop for WriterFileView {
 }
 
 impl redb::StorageBackend for WriterFileView {
+    fn scratch_backend(&self) -> io::Result<Option<Box<dyn redb::ScratchBackend>>> {
+        self.owner()?.scratch_backend().map(Some)
+    }
+
     fn len(&self) -> io::Result<u64> {
-        self.owner()?.file.metadata().map(|metadata| metadata.len())
+        redb::NativeStorageBackend::native_len(self).map_err(legacy_writer_error)
+    }
+    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        redb::NativeStorageBackend::native_read(self, offset, out).map_err(legacy_writer_error)
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        redb::NativeStorageBackend::native_write(self, offset, data).map_err(legacy_writer_error)
+    }
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        redb::NativeStorageBackend::native_set_len(self, len).map_err(legacy_writer_error)
+    }
+    fn sync_data(&self) -> io::Result<()> {
+        redb::NativeStorageBackend::native_sync_data(self).map_err(legacy_writer_error)
+    }
+    fn close(&self) -> io::Result<()> {
+        // The view owns no descriptor or lock. A closed redb transaction may
+        // retain its cache object; it must not retain physical writer ownership.
+        #[cfg(any(test, feature = "test-seams"))]
+        self.note_closed();
+        Ok(())
+    }
+}
+
+impl redb::NativeStorageBackend for WriterFileView {
+    fn native_len(&self) -> Result<u64, redb::NativeBackendError> {
+        self.native_owner()?
+            .file
+            .metadata()
+            .map(|metadata| metadata.len())
+            .map_err(Into::into)
     }
 
     #[cfg(unix)]
-    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+    fn native_read(&self, offset: u64, out: &mut [u8]) -> Result<(), redb::NativeBackendError> {
         use std::os::unix::fs::FileExt as _;
-        self.owner()?.file.read_exact_at(out, offset)
+        #[cfg(any(test, feature = "test-seams"))]
+        note_writer_io_for_test(IoKindForTest::ReadBegin, offset, out.len(), None);
+        #[cfg(any(test, feature = "test-seams"))]
+        if let Some(error) = writer_read_fault_for_test() {
+            return Err(error.into());
+        }
+        let result = self.native_owner()?.file.read_exact_at(out, offset);
+        #[cfg(any(test, feature = "test-seams"))]
+        note_writer_io_for_test(
+            IoKindForTest::ReadEnd,
+            offset,
+            out.len(),
+            Some(result.is_ok()),
+        );
+        result.map_err(Into::into)
     }
 
     #[cfg(windows)]
-    fn read(&self, mut offset: u64, mut out: &mut [u8]) -> io::Result<()> {
+    fn native_read(
+        &self,
+        mut offset: u64,
+        mut out: &mut [u8],
+    ) -> Result<(), redb::NativeBackendError> {
         use std::os::windows::fs::FileExt as _;
-        let owner = self.owner()?;
+        let owner = self.native_owner()?;
         while !out.is_empty() {
             match owner.file.seek_read(out, offset) {
-                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(0) => {
+                    return Err(redb::NativeBackendError::Io(
+                        io::ErrorKind::UnexpectedEof.into(),
+                    ));
+                }
                 Ok(count) => {
                     offset += count as u64;
                     out = &mut out[count..];
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             }
         }
         Ok(())
     }
 
-    fn set_len(&self, len: u64) -> io::Result<()> {
+    fn native_set_len(&self, len: u64) -> Result<(), redb::NativeBackendError> {
         LAST_DISK_GROWTH_REFUSAL.set(None);
-        let owner = self.owner()?;
-        let mut reserved = owner
-            .projected_growth_bytes
-            .lock()
-            .map_err(|_| io::Error::other("projected file-growth reservation was poisoned"))?;
+        let owner = self.native_owner()?;
+        let mut reserved = owner.projected_growth_bytes.lock().map_err(|_| {
+            redb::NativeBackendError::Closed(redb::NativeIoCause::ProjectedGrowthPoisoned)
+        })?;
         let current = owner.file.metadata()?.len();
         *reserved = len.saturating_sub(current);
         let result = if *reserved > 0 {
@@ -511,50 +676,92 @@ impl redb::StorageBackend for WriterFileView {
                     limit_bytes: limit,
                 };
                 LAST_DISK_GROWTH_REFUSAL.set(Some(refusal));
-                Err(io::Error::new(io::ErrorKind::QuotaExceeded, refusal))
+                Err(redb::NativeBackendError::Closed(
+                    redb::NativeIoCause::DiskGrowthRefused {
+                        current_bytes: current,
+                        projected_bytes: len,
+                        limit_bytes: limit,
+                    },
+                ))
             } else {
-                owner.file.set_len(len)
+                owner.file.set_len(len).map_err(Into::into)
             }
         } else {
-            owner.file.set_len(len)
+            owner.file.set_len(len).map_err(Into::into)
         };
         *reserved = 0;
         result
     }
 
-    fn sync_data(&self) -> io::Result<()> {
-        self.owner()?.file.sync_data()
+    fn native_sync_data(&self) -> Result<(), redb::NativeBackendError> {
+        let owner = self.native_owner()?;
+        if owner.sync_mode == WriterSyncMode::UnpublishedExport {
+            // Logical commits still write and validate every page. This private
+            // file has no reader/publication until close + final sync_all.
+            return Ok(());
+        }
+        #[cfg(any(test, feature = "test-seams"))]
+        note_writer_io_for_test(IoKindForTest::SyncBegin, 0, 0, None);
+        #[cfg(any(test, feature = "test-seams"))]
+        super::read_persistence_test_scaffold::note_writer_data_sync_for_test();
+        let result = owner.file.sync_data();
+        #[cfg(any(test, feature = "test-seams"))]
+        note_writer_io_for_test(IoKindForTest::SyncEnd, 0, 0, Some(result.is_ok()));
+        #[cfg(feature = "in-process-test-seams")]
+        if result.is_ok() {
+            crate::writer_commit_test_seams::reached(
+                crate::writer_commit_test_seams::CommitBoundary::DuringRedbSync,
+            );
+        }
+        result.map_err(Into::into)
     }
 
     #[cfg(unix)]
-    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+    fn native_write(&self, offset: u64, data: &[u8]) -> Result<(), redb::NativeBackendError> {
         use std::os::unix::fs::FileExt as _;
-        self.owner()?.file.write_all_at(data, offset)
+        #[cfg(any(test, feature = "test-seams"))]
+        note_writer_io_for_test(IoKindForTest::WriteBegin, offset, data.len(), None);
+        #[cfg(any(test, feature = "test-seams"))]
+        if !super::read_persistence_test_scaffold::note_writer_data_write_for_test(
+            offset,
+            data.len(),
+        ) {
+            return Ok(());
+        }
+        let result = self.native_owner()?.file.write_all_at(data, offset);
+        #[cfg(any(test, feature = "test-seams"))]
+        note_writer_io_for_test(
+            IoKindForTest::WriteEnd,
+            offset,
+            data.len(),
+            Some(result.is_ok()),
+        );
+        result.map_err(Into::into)
     }
 
     #[cfg(windows)]
-    fn write(&self, mut offset: u64, mut data: &[u8]) -> io::Result<()> {
+    fn native_write(
+        &self,
+        mut offset: u64,
+        mut data: &[u8],
+    ) -> Result<(), redb::NativeBackendError> {
         use std::os::windows::fs::FileExt as _;
-        let owner = self.owner()?;
+        let owner = self.native_owner()?;
         while !data.is_empty() {
             match owner.file.seek_write(data, offset) {
-                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(0) => {
+                    return Err(redb::NativeBackendError::Io(
+                        io::ErrorKind::WriteZero.into(),
+                    ));
+                }
                 Ok(count) => {
                     offset += count as u64;
                     data = &data[count..];
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             }
         }
-        Ok(())
-    }
-
-    fn close(&self) -> io::Result<()> {
-        // The view owns no descriptor or lock. A closed redb transaction may
-        // retain its cache object; it must not retain physical writer ownership.
-        #[cfg(any(test, feature = "test-seams"))]
-        self.note_closed();
         Ok(())
     }
 }
@@ -563,4 +770,57 @@ impl redb::StorageBackend for WriterFileView {
 pub(super) struct OpenedWriterDatabase {
     pub(super) database: redb::Database,
     pub(super) owner: Arc<LockedWriterFile>,
+}
+
+// Preserve the original public StorageBackend payloads as well as kind/text.
+fn legacy_writer_error(error: redb::NativeBackendError) -> io::Error {
+    match error {
+        redb::NativeBackendError::Io(error) => error,
+        redb::NativeBackendError::Closed(redb::NativeIoCause::WriterOwnerClosed) => {
+            io::Error::other("writer file ownership is closed")
+        }
+        redb::NativeBackendError::Closed(redb::NativeIoCause::ProjectedGrowthPoisoned) => {
+            io::Error::other("projected file-growth reservation was poisoned")
+        }
+        redb::NativeBackendError::Closed(redb::NativeIoCause::DiskGrowthRefused {
+            current_bytes,
+            projected_bytes,
+            limit_bytes,
+        }) => io::Error::new(
+            io::ErrorKind::QuotaExceeded,
+            DiskGrowthRefusal {
+                current_bytes,
+                projected_bytes,
+                limit_bytes,
+            },
+        ),
+    }
+}
+
+#[cfg(test)]
+#[path = "writer_native_io_contract_tests.rs"]
+mod native_io_contract_tests;
+
+/// Borrow the real physical owner for synchronous disk-admission tests.
+#[cfg(feature = "test-seams")]
+#[derive(Clone)]
+pub struct NativeIvfPhysicalDiskOwnerForTest(Arc<LockedWriterFile>);
+#[cfg(feature = "test-seams")]
+impl NativeIvfPhysicalDiskOwnerForTest {
+    pub(super) fn new(owner: Arc<LockedWriterFile>) -> Self {
+        Self(owner)
+    }
+    pub fn identity(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+    pub fn ceiling(&self) -> Option<u64> {
+        let limit = self.0.disk_limit.load(std::sync::atomic::Ordering::SeqCst);
+        (limit != 0).then_some(limit)
+    }
+    pub fn set_ceiling(&self, limit: Option<u64>) -> io::Result<()> {
+        self.0.set_disk_limit(limit)
+    }
+    pub fn file_len(&self) -> io::Result<u64> {
+        self.0.file.metadata().map(|m| m.len())
+    }
 }

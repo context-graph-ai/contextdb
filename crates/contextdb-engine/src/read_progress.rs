@@ -16,7 +16,9 @@
 //! read.
 
 use serde::{Deserialize, Serialize};
-use std::cell::{Cell, RefCell};
+#[cfg(any(test, feature = "test-seams"))]
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::sync::Arc;
 
 /// Which part of a read a report describes.
@@ -105,6 +107,7 @@ pub(crate) const WORK_REPORTING_INTERVAL: u64 = 1_000;
 /// reports, one per page's worth -- the shipped row ceiling, which is what a
 /// caller's own sense of "a lot of rows" is scaled to.
 pub(crate) const ROW_REPORTING_INTERVAL: u64 = 500;
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) const HYDRATION_REPORTING_INTERVAL: u64 = 1024 * 1024;
 
 /// The observer of the read this thread is running, and what hydration has
@@ -117,7 +120,9 @@ pub(crate) const HYDRATION_REPORTING_INTERVAL: u64 = 1024 * 1024;
 /// did not ask for, and no report can arrive once the operation has returned.
 struct ActiveRead {
     observer: Arc<dyn ReadProgressObserver>,
+    #[cfg(any(test, feature = "test-seams"))]
     loaded_bytes: Cell<u64>,
+    #[cfg(any(test, feature = "test-seams"))]
     reported_loaded_bytes: Cell<u64>,
 }
 
@@ -153,7 +158,9 @@ pub(crate) fn with_progress_observer<T>(
     #[allow(clippy::arc_with_non_send_sync)]
     let previous = install(Some(Arc::new(ActiveRead {
         observer: Arc::clone(observer),
+        #[cfg(any(test, feature = "test-seams"))]
         loaded_bytes: Cell::new(0),
+        #[cfg(any(test, feature = "test-seams"))]
         reported_loaded_bytes: Cell::new(0),
     })));
     let _restore = Restore { previous };
@@ -176,6 +183,7 @@ pub(crate) fn observer_for_this_read() -> Option<Arc<dyn ReadProgressObserver>> 
 /// and the bytes it expects to load are not known before it has loaded them --
 /// a store file's length counts space the image does not occupy -- so those
 /// counters are reported as zero and the expected total as absent.
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn note_hydrated_bytes(bytes: u64) {
     let report = ACTIVE_READ.with(|slot| {
         let borrowed = slot.borrow();
@@ -295,7 +303,7 @@ mod final_accounting_proofs {
         let answer = session
             .execute("SELECT label FROM counted ORDER BY id", &HashMap::new())
             .expect("the committed file answers");
-        assert_eq!(answer.rows.len(), 3);
+        assert_eq!(answer.rows().len(), 3);
 
         assert!(
             recorder
@@ -337,7 +345,7 @@ mod final_accounting_proofs {
         let answer = session
             .execute("SELECT COUNT(*) FROM counted", &HashMap::new())
             .expect("the committed file folds the count");
-        assert_eq!(answer.rows.len(), 1, "an aggregate answers one row");
+        assert_eq!(answer.rows().len(), 1, "an aggregate answers one row");
 
         let totals = recorder.totals();
         assert_eq!(
@@ -368,7 +376,7 @@ mod final_accounting_proofs {
         let cursor = session
             .open_cursor("SELECT label FROM counted ORDER BY id", &HashMap::new())
             .expect("the committed file opens a cursor");
-        let published = cursor.first_page().rows.len();
+        let published = cursor.first_page().rows().len();
         assert!(published > 0, "the first page hands back rows");
 
         let totals = recorder.totals();
@@ -418,7 +426,7 @@ mod final_accounting_proofs {
         let answer = session
             .execute("SELECT COUNT(*) FROM counted", &HashMap::new())
             .expect("the live store folds the count");
-        assert_eq!(answer.rows.len(), 1, "an aggregate answers one row");
+        assert_eq!(answer.rows().len(), 1, "an aggregate answers one row");
 
         let totals = recorder.totals();
         assert_eq!(
@@ -437,7 +445,7 @@ mod final_accounting_proofs {
         let cursor = session
             .open_cursor("SELECT label FROM counted ORDER BY id", &HashMap::new())
             .expect("the live store opens a cursor");
-        let published = cursor.first_page().rows.len();
+        let published = cursor.first_page().rows().len();
         assert!(published > 0, "the first page hands back rows");
         let paged = recorder.totals();
         let examined = paged.iter().map(|total| total.work).max().unwrap_or(0);
@@ -466,7 +474,7 @@ mod final_accounting_proofs {
         let answer = session
             .execute("SELECT label FROM counted ORDER BY id", &HashMap::new())
             .expect("an empty table answers");
-        assert!(answer.rows.is_empty(), "there is nothing to find");
+        assert!(answer.rows().is_empty(), "there is nothing to find");
 
         assert_eq!(
             recorder.totals().len(),
@@ -496,7 +504,7 @@ mod final_accounting_proofs {
         let answer = session
             .execute("SELECT COUNT(*) FROM counted", &HashMap::new())
             .expect("the committed file folds the count");
-        assert_eq!(answer.rows.len(), 1);
+        assert_eq!(answer.rows().len(), 1);
 
         let liveness = recorder.liveness();
         assert!(
@@ -532,6 +540,6 @@ mod final_accounting_proofs {
         let answer = session
             .execute("SELECT label FROM counted ORDER BY id", &HashMap::new())
             .expect("the committed file answers");
-        assert_eq!(answer.rows.len(), 2, "the read is unaffected by the seam");
+        assert_eq!(answer.rows().len(), 2, "the read is unaffected by the seam");
     }
 }

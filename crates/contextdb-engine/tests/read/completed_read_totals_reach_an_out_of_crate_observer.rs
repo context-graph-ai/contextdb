@@ -109,7 +109,7 @@ fn a_short_read_says_nothing_about_liveness_and_still_accounts_for_itself() {
     let answer = session
         .execute("SELECT label FROM counted ORDER BY id", &HashMap::new())
         .expect("the committed file answers");
-    assert_eq!(answer.rows.len(), ROWS);
+    assert_eq!(answer.rows().len(), ROWS);
 
     assert!(
         watching.liveness().is_empty(),
@@ -154,7 +154,7 @@ fn an_observer_that_only_wanted_liveness_hears_nothing_new() {
     let answer = session
         .execute("SELECT label FROM counted ORDER BY id", &HashMap::new())
         .expect("the committed file answers");
-    assert_eq!(answer.rows.len(), ROWS);
+    assert_eq!(answer.rows().len(), ROWS);
 
     assert_eq!(
         watching.reports.load(Ordering::SeqCst),

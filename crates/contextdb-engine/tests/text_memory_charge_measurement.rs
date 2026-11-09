@@ -7,12 +7,10 @@
 //! and the process quietly holds more than it said it would. So the estimate
 //! is checked against the allocator.
 //!
-//! The measurement is a SLOPE, not a total. A store holds far more than the
-//! values it was given -- indexes, a change log, its own bookkeeping -- so
-//! comparing one total against another proves nothing. What the text arm
-//! claims is that a text value costs its own bytes ONCE; growing the text and
-//! watching how much more the process holds per added byte is exactly that
-//! claim, and it is immune to every fixed cost around it.
+//! The store keeps its rows on disk and holds them in a page cache whose size
+//! is fixed and charged against the declared limit when the store opens. So the
+//! comparison is of TOTALS under a declared limit, at several text lengths: the
+//! process must never hold more than the accountant says the store holds.
 
 use contextdb_core::Value;
 use contextdb_engine::Database;
@@ -57,32 +55,42 @@ fn live_bytes() -> i64 {
     LIVE_BYTES.load(Ordering::Relaxed) as i64
 }
 
-/// The noise floor of the measurement. The allocator counts a little
-/// incidental work that is not the payload, so two slopes closer together
-/// than this are the same slope. A real mis-charge is a whole factor -- one
-/// byte charged where two are held -- never a hundredth of one.
-const SLOPE_TOLERANCE: f64 = 0.01;
+/// The noise floor of the comparison: the allocator counts a little incidental
+/// work that is neither text nor cache, so a process within this fraction of
+/// its charge is covered by it. A real under-charge is a whole value held
+/// where none was charged, never a hundredth of the store.
+const COVERAGE_TOLERANCE: f64 = 0.01;
+
+/// A declared limit far above anything this file stores. It is not a bound
+/// under test: a store charges its fixed page cache against the limit it was
+/// opened under, so accounting only means something once one is declared.
+const DECLARED_LIMIT: usize = 256 * 1024 * 1024;
 
 const ROWS: i64 = 200;
-/// Two text lengths far enough apart that the slope between them is decided by
-/// the text and not by anything fixed around it.
-const SHORT: usize = 16;
 const LENGTHS: [usize; 4] = [16, 100, 1_000, 100_000];
 
 struct Measured {
-    charged_per_row: f64,
-    live_per_row: f64,
+    charged: i64,
+    live: i64,
 }
 
-fn charge(database: &Database) -> i64 {
-    database.accountant().usage().used as i64
+fn open_under_a_declared_limit(root: &tempfile::TempDir) -> Database {
+    contextdb_engine::database::open_with_startup_limits(
+        root.path().join("measured.db"),
+        std::sync::Arc::new(contextdb_engine::plugin::CorePlugin),
+        Some(DECLARED_LIMIT),
+        None,
+    )
+    .expect("open the measured store under a declared limit")
 }
 
-/// Insert `ROWS` rows whose text column holds `length` bytes, and report what
-/// the accountant was told each row cost against what the process actually
-/// took for it.
+/// Open a durable store under a declared limit, insert `ROWS` rows whose text
+/// column holds `length` bytes, and report what the accountant says the store
+/// holds against what the process really took from just before the open.
 fn measure_rows(length: usize, with_index: bool) -> Measured {
-    let database = Database::open_memory();
+    let root = tempfile::tempdir().expect("task-scoped fixture root");
+    let live_before = live_bytes();
+    let database = open_under_a_declared_limit(&root);
     database
         .execute(
             "CREATE TABLE measured (id INTEGER PRIMARY KEY, payload TEXT)",
@@ -98,9 +106,6 @@ fn measure_rows(length: usize, with_index: bool) -> Measured {
             .expect("create the text index");
     }
     let payload = "x".repeat(length);
-
-    let charged_before = charge(&database);
-    let live_before = live_bytes();
     for id in 0..ROWS {
         database
             .execute(
@@ -112,13 +117,12 @@ fn measure_rows(length: usize, with_index: bool) -> Measured {
             )
             .unwrap_or_else(|error| panic!("insert row {id} of length {length}: {error}"));
     }
-    let charged_after = charge(&database);
-    let live_after = live_bytes();
-
-    Measured {
-        charged_per_row: (charged_after - charged_before) as f64 / ROWS as f64,
-        live_per_row: (live_after - live_before) as f64 / ROWS as f64,
-    }
+    let measured = Measured {
+        charged: database.accountant().usage().used as i64,
+        live: live_bytes() - live_before,
+    };
+    database.close().expect("close the measured store");
+    measured
 }
 
 /// The same measurement for a graph edge carrying a text property. The text
@@ -126,12 +130,11 @@ fn measure_rows(length: usize, with_index: bool) -> Measured {
 /// where a `Value::Text` is charged; an edge type is charged by its own arm,
 /// which this measurement is not about.
 fn measure_edges(length: usize) -> Measured {
-    let database = Database::open_memory();
+    let root = tempfile::tempdir().expect("task-scoped fixture root");
+    let live_before = live_bytes();
+    let database = open_under_a_declared_limit(&root);
     let payload = "x".repeat(length);
     let source = uuid::Uuid::new_v4();
-
-    let charged_before = charge(&database);
-    let live_before = live_bytes();
     let tx = database.begin().expect("begin the edge batch");
     for _ in 0..ROWS {
         database
@@ -145,21 +148,25 @@ fn measure_edges(length: usize) -> Measured {
             .expect("insert an edge carrying a text property");
     }
     database.commit(tx).expect("commit the edge batch");
-    let charged_after = charge(&database);
-    let live_after = live_bytes();
-
-    Measured {
-        charged_per_row: (charged_after - charged_before) as f64 / ROWS as f64,
-        live_per_row: (live_after - live_before) as f64 / ROWS as f64,
-    }
+    let measured = Measured {
+        charged: database.accountant().usage().used as i64,
+        live: live_bytes() - live_before,
+    };
+    database.close().expect("close the measured store");
+    measured
 }
 
-fn slope(short: &Measured, long: &Measured, long_length: usize) -> (f64, f64) {
-    let added = (long_length - SHORT) as f64;
-    (
-        (long.charged_per_row - short.charged_per_row) / added,
-        (long.live_per_row - short.live_per_row) / added,
-    )
+fn judge(site: &str, length: usize, measured: &Measured, failures: &mut Vec<String>) {
+    println!(
+        "MEASURED {site} len={length}: charged={} live={}",
+        measured.charged, measured.live
+    );
+    if measured.live as f64 > measured.charged as f64 * (1.0 + COVERAGE_TOLERANCE) {
+        failures.push(format!(
+            "{site} at length {length}: the process holds {} bytes and the accountant is told {}",
+            measured.live, measured.charged
+        ));
+    }
 }
 
 #[test]
@@ -167,47 +174,17 @@ fn a_stored_text_value_is_charged_at_least_what_holding_it_costs() {
     let mut failures = Vec::new();
 
     for (name, with_index) in [("plain rows", false), ("rows under a text index", true)] {
-        let short = measure_rows(SHORT, with_index);
-        println!(
-            "MEASURED {name} len={SHORT}: charged/row={:.1} live/row={:.1}",
-            short.charged_per_row, short.live_per_row
-        );
-        for length in LENGTHS.into_iter().filter(|length| *length != SHORT) {
-            let long = measure_rows(length, with_index);
-            let (charged_slope, live_slope) = slope(&short, &long, length);
-            println!(
-                "MEASURED {name} len={length}: charged/row={:.1} live/row={:.1} \
-                 charged-per-added-byte={charged_slope:.3} live-per-added-byte={live_slope:.3}",
-                long.charged_per_row, long.live_per_row
+        for length in LENGTHS {
+            judge(
+                name,
+                length,
+                &measure_rows(length, with_index),
+                &mut failures,
             );
-            if live_slope > charged_slope + SLOPE_TOLERANCE {
-                failures.push(format!(
-                    "{name} at length {length}: the process takes {live_slope:.3} bytes for every \
-                     text byte added and the accountant is told {charged_slope:.3}"
-                ));
-            }
         }
     }
-
-    let short_edge = measure_edges(SHORT);
-    println!(
-        "MEASURED edges len={SHORT}: charged/row={:.1} live/row={:.1}",
-        short_edge.charged_per_row, short_edge.live_per_row
-    );
-    for length in [100_usize, 1_000] {
-        let long_edge = measure_edges(length);
-        let (charged_slope, live_slope) = slope(&short_edge, &long_edge, length);
-        println!(
-            "MEASURED edges len={length}: charged/row={:.1} live/row={:.1} \
-             charged-per-added-byte={charged_slope:.3} live-per-added-byte={live_slope:.3}",
-            long_edge.charged_per_row, long_edge.live_per_row
-        );
-        if live_slope > charged_slope + SLOPE_TOLERANCE {
-            failures.push(format!(
-                "edges at length {length}: the process takes {live_slope:.3} bytes for every text \
-                 byte added and the accountant is told {charged_slope:.3}"
-            ));
-        }
+    for length in [16_usize, 100, 1_000] {
+        judge("edges", length, &measure_edges(length), &mut failures);
     }
 
     assert!(

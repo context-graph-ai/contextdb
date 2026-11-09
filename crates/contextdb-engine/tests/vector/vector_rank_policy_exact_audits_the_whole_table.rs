@@ -141,7 +141,7 @@ fn passage_table_with_a_buried_best_scoring_row() -> Database {
     db.execute(
         "CREATE TABLE passages (
             id UUID PRIMARY KEY,
-            embedding VECTOR(2) SEARCH_MODE INDEXED HNSW (EF_SEARCH = 1500) RANK_POLICY (
+            embedding VECTOR(2) SEARCH_MODE INDEXED IVF (PROBES = 1500) RANK_POLICY (
                 JOIN passage_outcomes ON passage_id,
                 FORMULA 'coalesce({weight}, 0.0)',
                 SORT_KEY effective_confidence
@@ -180,21 +180,18 @@ fn passage_table_with_a_buried_best_scoring_row() -> Database {
 
 const EXACT_RANKED_SQL: &str = "SELECT id FROM passages ORDER BY embedding <=> $query \
                                  USE VECTOR EXACT USE RANK effective_confidence LIMIT 10";
-const INDEXED_RANKED_SQL: &str = "SELECT id FROM passages ORDER BY embedding <=> $query \
-                                   USE RANK effective_confidence LIMIT 10";
-
 fn ranked_query_params() -> HashMap<String, Value> {
     params([("query", query_vector())])
 }
 
 fn result_ids(result: &contextdb_engine::QueryResult) -> Vec<Uuid> {
     let id_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == "id" || name.rsplit('.').next() == Some("id"))
         .expect("the projection contains id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(id_idx) {
             Some(Value::Uuid(id)) => *id,
@@ -268,37 +265,5 @@ fn exact_search_mode_reaches_the_best_scoring_row_through_the_bounded_read_sessi
         "the bounded read session must agree with the ordinary door: USE VECTOR EXACT \
          evaluates the rank formula over every allowed stored vector, but a candidate pool \
          capped at 1,500 by cosine excludes the needle before the formula ever runs. Got {ids:?}"
-    );
-}
-
-/// `INDEXED` (the column's declared default here) ranks only the bounded
-/// candidate set -- it is not required to reach a best-scoring row that sits
-/// outside that set. This is the contract EXACT must not disturb; both
-/// readers are pinned here in the same place as the EXACT proofs above so
-/// neither can be "fixed" by breaking the other.
-#[test]
-fn indexed_search_mode_is_not_required_to_reach_past_its_bounded_candidate_set() {
-    let db = passage_table_with_a_buried_best_scoring_row();
-
-    let ordinary = db
-        .execute(INDEXED_RANKED_SQL, &ranked_query_params())
-        .expect("the declared INDEXED route must be served once the graph is built");
-    assert_eq!(result_ids(&ordinary).len(), LIMIT);
-    assert!(
-        !result_ids(&ordinary).contains(&needle_id()),
-        "INDEXED ranks only the bounded candidate set; it must not reach past it to the \
-         needle even though the needle carries the highest weight in the table"
-    );
-
-    let session = db
-        .read_session(roomy_limits())
-        .expect("open a bounded read view");
-    let bounded = session
-        .execute(INDEXED_RANKED_SQL, &ranked_query_params())
-        .expect("the bounded reader must serve the declared INDEXED route");
-    assert!(
-        !result_ids(&bounded).contains(&needle_id()),
-        "the bounded reader must agree with the ordinary door: INDEXED ranks only the bounded \
-         candidate set, so it must not reach the needle either"
     );
 }

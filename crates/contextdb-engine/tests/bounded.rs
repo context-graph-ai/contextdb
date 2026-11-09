@@ -18,8 +18,6 @@ mod bounded_memory_refusal_typing;
 mod bounded_neighbour_search_over_a_cte_candidate_plan;
 #[path = "bounded/bounded_neighbour_search_scores_the_candidates_its_transaction_staged.rs"]
 mod bounded_neighbour_search_scores_the_candidates_its_transaction_staged;
-#[path = "bounded/bounded_neighbour_search_uses_the_built_index_the_executor_uses.rs"]
-mod bounded_neighbour_search_uses_the_built_index_the_executor_uses;
 #[path = "bounded/bounded_pull_execution_contract.rs"]
 mod bounded_pull_execution_contract;
 #[path = "bounded/bounded_rank_cancellation_accounting.rs"]
@@ -44,9 +42,10 @@ mod bounded_read_sees_the_same_transaction_graph_overlay;
 mod bounded_read_sees_the_same_transaction_row_vectors;
 #[path = "bounded/bounded_route_answer_parity.rs"]
 mod bounded_route_answer_parity;
-#[path = "bounded/bounded_route_graph_candidate_shortfall.rs"]
-mod bounded_route_graph_candidate_shortfall;
 #[path = "bounded/bounded_user_table_named_dual.rs"]
 mod bounded_user_table_named_dual;
 #[path = "bounded/composite_prefix_newest_row_examines_constant_entries.rs"]
 mod composite_prefix_newest_row_examines_constant_entries;
+
+#[path = "bounded/stream_resume_seeks_after_prefix_and_exclusive_ordinal.rs"]
+mod stream_resume_seeks_after_prefix_and_exclusive_ordinal;

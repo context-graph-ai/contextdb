@@ -44,20 +44,123 @@ fn cargo_fixture(path: &Path, command: &str, feature: Option<&str>, args: &[&str
             .expect("contextdb root")
             .join("target/public-api-surface-fixture"),
     };
+    // Compiler completion is the setup event. Compilation can be cold, so
+    // its completion must not be judged by the executable's liveness bound.
     let mut cargo = Command::new("cargo");
     cargo
-        .arg(command)
+        .arg(if command == "run" { "build" } else { command })
         .args(["--offline", "--locked", "--quiet", "--target-dir"])
-        .arg(target)
+        .arg(&target)
         .arg("--manifest-path")
         .arg(path.join("Cargo.toml"));
     if let Some(feature) = feature {
         cargo.args(["--features", feature]);
     }
     if command == "run" {
-        cargo.arg("--").args(args);
+        cargo.arg("--message-format=json");
     }
-    bounded_command_output(cargo, "fixture cargo command")
+    let built = cargo.output().expect("fixture compilation completes");
+    if command != "run" || !built.status.success() {
+        return built;
+    }
+
+    let binary = String::from_utf8_lossy(&built.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find_map(|message| {
+            let is_fixture = message.get("reason").and_then(|value| value.as_str())
+                == Some("compiler-artifact")
+                && message
+                    .get("target")
+                    .and_then(|target| target.get("name"))
+                    .and_then(|name| name.as_str())
+                    == Some("public-api-allowed");
+            is_fixture
+                .then(|| {
+                    message
+                        .get("executable")
+                        .and_then(|value| value.as_str())
+                        .map(PathBuf::from)
+                })
+                .flatten()
+        })
+        .expect("fixture build reports its executable");
+    let mut executable = Command::new(binary);
+    executable.args(args);
+    bounded_command_output(executable, "fixture executable")
+}
+
+// Observe process exit without reaping it; the owner can still kill and reap
+// the child if the liveness watchdog expires.
+#[cfg(unix)]
+fn child_exit_event(child: &std::process::Child) -> std::thread::JoinHandle<std::io::Result<()>> {
+    let pid = child.id();
+    std::thread::spawn(move || {
+        loop {
+            // SAFETY: waitid initializes siginfo on success; the child remains
+            // owned by the caller and WNOWAIT leaves it available for Child::wait.
+            let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+            let status = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if status == 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    })
+}
+
+#[cfg(windows)]
+fn child_exit_event(child: &std::process::Child) -> std::thread::JoinHandle<std::io::Result<()>> {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn WaitForSingleObject(handle: *mut std::ffi::c_void, milliseconds: u32) -> u32;
+    }
+    let handle = child.as_raw_handle() as usize;
+    std::thread::spawn(move || {
+        // SAFETY: the caller owns the child until this thread has joined.
+        let result = unsafe { WaitForSingleObject(handle as *mut std::ffi::c_void, u32::MAX) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    })
+}
+
+fn wait_for_child_event(
+    child: &mut std::process::Child,
+    name: &str,
+    bound: std::time::Duration,
+) -> std::process::ExitStatus {
+    let waiter = child_exit_event(child);
+    let (events, event_rx) = std::sync::mpsc::channel();
+    let relay = std::thread::spawn(move || {
+        let result = waiter.join().expect("child exit observer join");
+        let _ = events.send(result);
+    });
+    let observed = event_rx.recv_timeout(bound);
+    if matches!(observed, Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
+        let _ = child.kill();
+        let _ = child.wait();
+        relay.join().expect("child exit relay join");
+        panic!("{name} exit never delivered");
+    }
+    observed
+        .expect("child exit event channel closed")
+        .expect("observe child exit");
+    relay.join().expect("child exit relay join");
+    child.wait().expect("reap observed child")
 }
 
 fn bounded_command_output(mut command: Command, name: &str) -> Output {
@@ -78,18 +181,7 @@ fn bounded_command_output(mut command: Command, name: &str) -> Output {
         let _ = std::io::BufReader::new(stderr).read_to_end(&mut bytes);
         bytes
     });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
-    let status = loop {
-        match child.try_wait().expect("poll fixture cargo") {
-            Some(status) => break status,
-            None if std::time::Instant::now() < deadline => std::thread::yield_now(),
-            None => {
-                child.kill().expect("stop overdue fixture cargo");
-                let _ = child.wait();
-                panic!("{name} did not exit within 300 seconds");
-            }
-        }
-    };
+    let status = wait_for_child_event(&mut child, name, std::time::Duration::from_secs(300));
     Output {
         status,
         stdout: stdout_reader.join().expect("fixture stdout reader"),
@@ -273,14 +365,14 @@ fn callerless_applied_push_writer_is_absent() {
 
 #[test]
 fn visibility_changing_macro_definitions_match_the_audited_contract() {
-    const TEST_SEAM_PUBLIC: &str = r#"#[cfg(feature = "test-seams")]
+    const TEST_SEAM_PUBLIC: &str = r#"#[cfg(any(test, feature = "test-seams"))]
 macro_rules! sync_test_seam {
     ($(#[$attr:meta])* fn $($item:tt)*) => {
         $(#[$attr])*
         pub fn $($item)*
     };
 }"#;
-    const TEST_SEAM_CRATE_PRIVATE: &str = r#"#[cfg(not(feature = "test-seams"))]
+    const TEST_SEAM_CRATE_PRIVATE: &str = r#"#[cfg(not(any(test, feature = "test-seams")))]
 macro_rules! sync_test_seam {
     ($(#[$attr:meta])* fn $($item:tt)*) => {
         $(#[$attr])*
@@ -432,6 +524,137 @@ fn database_public_methods(engine: &Path) -> Vec<ImplItemFn> {
         .collect()
 }
 
+// Inventory every declared method, but normal-build reachability also honors
+// the enclosing out-of-line module's test-only gate.
+fn database_normal_public_methods(engine: &Path) -> Vec<ImplItemFn> {
+    let root = engine.join("src/database.rs");
+    let source = std::fs::read_to_string(&root).expect("read Database module declarations");
+    let file = syn::parse_file(&source).expect("parse Database module declarations");
+    let gated = file
+        .items
+        .iter()
+        .filter_map(|item| {
+            let Item::Mod(module) = item else {
+                return None;
+            };
+            module
+                .attrs
+                .iter()
+                .any(cfg_is_test_only)
+                .then(|| module.ident.to_string())
+        })
+        .collect::<BTreeSet<_>>();
+    let mut paths = vec![root];
+    collect_rust_files(&engine.join("src/database"), &mut paths);
+    // A test-only module can be declared from a nested file using #[path].
+    // Resolve those exact files instead of treating every collected file as
+    // an unconditional production module.
+    let mut nested_gated_paths = BTreeSet::new();
+    let mut nested_public_paths = BTreeSet::new();
+    for path in &paths {
+        let source = std::fs::read_to_string(path).expect("read Database module source");
+        let file = syn::parse_file(&source).expect("parse Database module source");
+        for item in file.items {
+            let Item::Mod(module) = item else {
+                continue;
+            };
+            let path_attr = module.attrs.iter().find_map(|attr| {
+                let Meta::NameValue(value) = &attr.meta else {
+                    return None;
+                };
+                if !value.path.is_ident("path") {
+                    return None;
+                }
+                let syn::Expr::Lit(value) = &value.value else {
+                    return None;
+                };
+                let syn::Lit::Str(value) = &value.lit else {
+                    return None;
+                };
+                Some(value.value())
+            });
+            // `mod name;` without #[path] lives beside its declaring file, in
+            // the directory named for it: database/vector_ivf.rs declares
+            // database/vector_ivf/name.rs.
+            let resolved = match path_attr {
+                Some(path_attr) => path.parent().expect("module parent").join(path_attr),
+                None if module.content.is_none() => path
+                    .parent()
+                    .expect("module parent")
+                    .join(path.file_stem().expect("module file name"))
+                    .join(format!("{}.rs", module.ident)),
+                None => continue,
+            };
+            if module.attrs.iter().any(cfg_is_test_only) {
+                nested_gated_paths.insert(resolved);
+            } else {
+                nested_public_paths.insert(resolved);
+            }
+        }
+    }
+    // A second ungated module can reference the same file: keep it visible.
+    nested_gated_paths.retain(|path| !nested_public_paths.contains(path));
+    paths
+        .iter()
+        .filter(|path| !nested_gated_paths.contains(*path))
+        .filter(|path| {
+            let Ok(relative) = path.strip_prefix(engine.join("src/database")) else {
+                return true;
+            };
+            let first = relative
+                .components()
+                .next()
+                .expect("module path")
+                .as_os_str();
+            let module = Path::new(first)
+                .file_stem()
+                .expect("module name")
+                .to_str()
+                .expect("UTF-8 module");
+            !gated.contains(module)
+        })
+        .flat_map(|path| public_impl_methods(path, "Database"))
+        .collect()
+}
+
+#[test]
+fn normal_database_inventory_keeps_ungated_nested_public_methods() {
+    let root = tempfile::tempdir().expect("inventory fixture");
+    let engine = root.path();
+    let source = engine.join("src");
+    let database = source.join("database");
+    std::fs::create_dir_all(&database).unwrap();
+    std::fs::write(source.join("database.rs"), "mod event_bus;").unwrap();
+    std::fs::write(database.join("event_bus.rs"),
+        "#[cfg(any(test, feature = \"test-seams\"))] #[path = \"test_child.rs\"] mod test_child; #[path = \"public_child.rs\"] mod public_child;").unwrap();
+    std::fs::write(
+        database.join("test_child.rs"),
+        "impl Database { pub fn hidden_test_child(&self) {} }",
+    )
+    .unwrap();
+    std::fs::write(
+        database.join("public_child.rs"),
+        "impl Database { pub fn visible_public_child(&self) {} }",
+    )
+    .unwrap();
+    let names = method_names(&database_normal_public_methods(engine));
+    assert_eq!(names, BTreeSet::from(["visible_public_child".to_string()]));
+    // The ordinary frozen equality must reject this new public method.
+    assert_ne!(names, BTreeSet::new());
+    // Even a file also referenced by a gated module remains visible when an
+    // ungated declaration references it as well.
+    std::fs::write(database.join("event_bus.rs"),
+        "#[cfg(any(test, feature = \"test-seams\"))] #[path = \"test_child.rs\"] mod test_child; #[path = \"test_child.rs\"] mod public_alias; #[path = \"public_child.rs\"] mod public_child;").unwrap();
+    let names = method_names(&database_normal_public_methods(engine));
+    assert_eq!(
+        names,
+        BTreeSet::from([
+            "hidden_test_child".to_string(),
+            "visible_public_child".to_string(),
+        ])
+    );
+}
+
 fn collect_rust_files(directory: &Path, paths: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(directory).expect("read Database implementation directory") {
         let path = entry.expect("Database implementation entry").path();
@@ -485,6 +708,7 @@ fn method_mentions(method: &ImplItemFn, wanted: &str) -> bool {
 }
 
 #[test]
+#[allow(clippy::needless_borrow)] // Preserve the existing test expression and assertion contract.
 fn durable_public_mutation_surface_matches_the_frozen_allowlist() {
     let engine = engine_root();
     let root = engine.ancestors().nth(2).expect("contextdb root");
@@ -497,6 +721,13 @@ fn durable_public_mutation_surface_matches_the_frozen_allowlist() {
         .expect("read server reexports");
 
     let database_names = method_names(&database);
+    let database_normal_names = method_names(&database_normal_public_methods(&engine));
+    for name in database_names.difference(&database_normal_names) {
+        assert!(
+            is_test_door(name),
+            "only test seams may disappear without their cfg: {name}"
+        );
+    }
     let client_names = method_names(&client);
     let server_names = method_names(&server);
     let accountant = public_impl_methods(
@@ -533,8 +764,21 @@ fn durable_public_mutation_surface_matches_the_frozen_allowlist() {
         .iter()
         .find(|method| method.sig.ident == "new")
         .expect("safe SyncServer::new constructor remains public");
+    let explicit_server_new = server
+        .iter()
+        .find(|method| method.sig.ident == "new_with_read_budget_provider")
+        .expect("the server host constructor accepts its declared request provider");
+    let safe_client_new = client
+        .iter()
+        .find(|method| method.sig.ident == "new")
+        .expect("safe SyncClient::new constructor remains public");
+    let explicit_client_new = client
+        .iter()
+        .find(|method| method.sig.ident == "new_with_read_memory")
+        .expect("the client host constructor accepts its executing read owner");
+    assert_embedder_read_owner_facades(&root);
     assert_eq!(
-        database_names,
+        database_normal_names,
         frozen_names(include_str!("../fixtures/public_api_database_names.txt")),
         "Database public impl-name inventory drifted from the frozen durable surface"
     );
@@ -568,7 +812,7 @@ fn durable_public_mutation_surface_matches_the_frozen_allowlist() {
         "SyncClient methods still expose policy, direction, or arbitrary transport types: {client_sensitive_reachability:?}"
     );
     for (surface, names) in [
-        ("Database", &database_names),
+        ("Database", &database_normal_names),
         ("SyncClient", &client_names),
         ("SyncServer", &server_names),
         ("MemoryAccountant", &accountant_names),
@@ -586,8 +830,29 @@ fn durable_public_mutation_surface_matches_the_frozen_allowlist() {
         !method_mentions(safe_server_new, "ConflictPolicies")
             && !method_mentions(safe_server_new, "ConflictPolicy")
             && !method_mentions(safe_server_new, "ServerTransport")
+            && !method_mentions(safe_server_new, "ReadRequestBudgetProvider")
+            && method_mentions(safe_server_new, "Result")
             && safe_server_new.sig.inputs.len() == 3,
         "SyncServer::new must remain the typed production constructor without policy or arbitrary transport arguments"
+    );
+
+    assert!(
+        method_mentions(explicit_server_new, "ReadRequestBudgetProvider")
+            && method_mentions(explicit_server_new, "Result")
+            && !method_mentions(explicit_server_new, "ConflictPolicies")
+            && !method_mentions(explicit_server_new, "ConflictPolicy")
+            && !method_mentions(explicit_server_new, "ServerTransport")
+            && explicit_server_new.sig.inputs.len() == 4,
+        "the explicit server constructor requires a request provider without arbitration or transport injection"
+    );
+    assert!(
+        !method_mentions(safe_client_new, "ReadMemoryBudget")
+            && method_mentions(safe_client_new, "Result")
+            && safe_client_new.sig.inputs.len() == 3
+            && method_mentions(explicit_client_new, "ReadMemoryOwner")
+            && method_mentions(explicit_client_new, "Result")
+            && explicit_client_new.sig.inputs.len() == 4,
+        "the client keeps its original constructor inputs and requires a read owner only on the host variant"
     );
     for forbidden_reexport in [
         "pub use sync_types::*",
@@ -600,4 +865,95 @@ fn durable_public_mutation_surface_matches_the_frozen_allowlist() {
             "role-relative arbitration types must not remain reachable through public reexports: {forbidden_reexport}"
         );
     }
+}
+
+#[derive(serde::Deserialize)]
+struct ReadOwnerFacade {
+    source: String,
+    name: String,
+    inputs: String,
+    explicit: String,
+    budget: String,
+    top_level: bool,
+}
+
+fn public_declaration_inputs(source: &str, name: &str, top_level: bool) -> String {
+    let mut start = None;
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        let declaration = if top_level { line } else { line.trim_start() };
+        for prefix in [format!("pub fn {name}"), format!("pub async fn {name}")] {
+            if let Some(suffix) = declaration.strip_prefix(&prefix)
+                && (suffix.starts_with('(') || suffix.starts_with('<'))
+            {
+                let parenthesis = line.find('(').expect("function input list");
+                start = Some(offset + parenthesis + 1);
+                break;
+            }
+        }
+        if start.is_some() {
+            break;
+        }
+        offset += line.len();
+    }
+    let start = start.unwrap_or_else(|| panic!("public declaration {name} is absent"));
+    let mut depth = 1;
+    for (offset, character) in source[start..].char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 {
+            let inputs: String = source[start..start + offset]
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect();
+            return inputs.trim_end_matches(',').to_owned();
+        }
+    }
+    panic!("public declaration {name} has no closing input list")
+}
+
+fn assert_embedder_read_owner_facades(root: &Path) {
+    let facades: Vec<ReadOwnerFacade> = serde_json::from_str(include_str!(
+        "../fixtures/public_api_read_owner_facades.json"
+    ))
+    .expect("parse declared embedder inputs");
+    assert_eq!(facades.len(), 48);
+    for facade in facades {
+        let source =
+            std::fs::read_to_string(root.join(&facade.source)).expect("read facade source");
+        syn::parse_file(&source).expect("facade declarations parse");
+        assert_eq!(
+            public_declaration_inputs(&source, &facade.name, facade.top_level),
+            facade.inputs,
+            "{}::{} must keep its original embedder inputs",
+            facade.source,
+            facade.name,
+        );
+        let explicit = public_declaration_inputs(&source, &facade.explicit, facade.top_level);
+        assert!(
+            explicit.contains(&facade.budget),
+            "{}::{} requires the host's declared read capability",
+            facade.source,
+            facade.explicit,
+        );
+    }
+}
+
+// Acceptance: embedders construct QueryResult from its five public parts and read them back.
+#[test]
+fn external_embedder_constructs_query_result_from_its_five_parts() {
+    let result = contextdb_engine::QueryResult::new(
+        vec!["id".to_owned()],
+        vec![vec![contextdb_core::Value::Int64(7)]],
+        0,
+        contextdb_engine::QueryTrace::default(),
+        None,
+    );
+    assert_eq!(result.columns(), vec!["id"]);
+    assert_eq!(result.rows(), vec![vec![contextdb_core::Value::Int64(7)]]);
+    assert_eq!(result.rows_affected(), 0);
+    assert!(result.cascade().is_none());
 }

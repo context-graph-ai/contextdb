@@ -42,12 +42,14 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-/// Run the CLI over `:memory:` with the given extra args, feeding `stdin_sql`
+/// Run the CLI over a fresh database file with the given extra args, feeding `stdin_sql`
 /// on stdin (scripted, non-interactive — stdin is piped, not a terminal).
 /// Returns (success, stdout, stderr).
 fn run_cli(extra_args: &[&str], stdin_sql: &str) -> (bool, String, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_contextdb"));
-    cmd.arg(":memory:");
+    let session_dir = tempfile::tempdir().expect("session directory");
+    cmd.arg(session_dir.path().join("session.db"))
+        .arg("--write");
     for a in extra_args {
         cmd.arg(a);
     }

@@ -16,8 +16,9 @@ use contextdb_core::read_contract::{
     DeadlineClock, DeadlineWait, OwnerReadCancellation, ReadLimits,
 };
 use contextdb_engine::Database;
+use contextdb_engine::database::open_with_startup_limits;
 use contextdb_engine::executor::bounded_read_test_support as bounded;
-use contextdb_engine::memory_accounting::MemoryAccountant;
+use contextdb_engine::plugin::CorePlugin;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -170,12 +171,18 @@ const RANKED_SQL: &str = "SELECT id, note FROM ranked_decisions \
 /// attempt still has its whole budget.
 #[test]
 fn repeatedly_cancelled_ranked_reads_return_every_byte_they_abandon() {
-    let accountant = Arc::new(MemoryAccountant::no_limit());
-    let db = Arc::new(Database::open_memory_with_accountant(Arc::clone(
-        &accountant,
-    )));
+    let root = tempfile::TempDir::new().expect("durable fixture directory");
+    let db = Arc::new(
+        open_with_startup_limits(
+            root.path().join("ranked.db"),
+            Arc::new(CorePlugin),
+            None,
+            None,
+        )
+        .expect("open a durable database with no memory limit"),
+    );
     ranked_fixture(&db);
-    let settled = accountant.usage().used;
+    let settled = db.accountant().usage().used;
 
     let mut reached_rank = 0_u64;
     for attempt in 1..=16_u64 {
@@ -203,7 +210,7 @@ fn repeatedly_cancelled_ranked_reads_return_every_byte_they_abandon() {
         }
         reached_rank = reached_rank.max(probe.rank_candidates());
         assert_eq!(
-            accountant.usage().used,
+            db.accountant().usage().used,
             settled,
             "attempt {attempt}: a cancelled ranked read must give the database back \
              every byte it charged; the row it abandoned mid-rank is still charged"

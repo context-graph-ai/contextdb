@@ -27,7 +27,7 @@ PERFORMANCE_METADATA = frozenset({
 })
 MAINTAINER_METADATA = frozenset({
     ".gitignore", ".dockerignore",
-    "crates/contextdb-hnsw/MAINTENANCE.md", "crates/contextdb-redb/MAINTENANCE.md",
+    "crates/contextdb-redb/MAINTENANCE.md",
 })
 RUNTIME_OR_INTEGRATION = ("crates/", "tests/", "scripts/", ".github/workflows/")
 BUILD_INPUTS = frozenset({"Cargo.toml", "Cargo.lock", "rust-toolchain.toml",
@@ -85,12 +85,15 @@ def main():
     result = impact(paths)
     required = result["integration_required"]
     print(json.dumps({**result, "paths": paths}))
+    # Keep the complete map off process environments and GitHub job outputs.
+    classes_file = Path(os.environ['RUNNER_TEMP']) / 'ci-impact' / 'path-classes.json'
+    classes_file.parent.mkdir(parents=True, exist_ok=True)
+    classes_file.write_text(json.dumps(result['path_impact'], ensure_ascii=True) + '\n')
     with open(os.environ["GITHUB_OUTPUT"], "a") as output:
         output.write(f"integration_required={str(required).lower()}\n")
         output.write(f"impact_reason={result['reason']}\n")
         output.write(f"performance_qualification={result['performance_qualification']}\n")
-        # JSON escapes newlines in fork-controlled paths; no output injection.
-        output.write(f"path_classes={json.dumps(result['path_impact'], ensure_ascii=True)}\n")
+        output.write(f"path_classes_file={classes_file}\n")
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a") as output:

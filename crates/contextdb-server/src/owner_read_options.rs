@@ -122,32 +122,6 @@ impl OwnerConfiguration {
 }
 
 impl OwnerReadOptions {
-    /// Whether any owner-read ceiling, deadline, or switch was named on this
-    /// command line. An in-memory database has no route, no channel, and no
-    /// ceilings to declare, so naming one there is an invalid invocation
-    /// rather than a value that quietly does nothing.
-    #[must_use]
-    pub fn declared_any(&self) -> bool {
-        self.no_owner_reads
-            || self.owner_read_runtime_dir.is_some()
-            || [
-                self.owner_read_result_rows,
-                self.owner_read_result_bytes,
-                self.owner_read_work,
-                self.owner_read_active_ms,
-                self.owner_read_memory,
-                self.owner_read_cursor_page_rows,
-                self.owner_read_cursor_page_bytes,
-                self.owner_read_cursor_idle_ms,
-                self.owner_read_cursor_lifetime_ms,
-                self.owner_read_concurrency,
-                self.owner_read_request_ms,
-                self.owner_read_shutdown_drain_ms,
-            ]
-            .iter()
-            .any(Option::is_some)
-    }
-
     /// This command line resolved over the shipped defaults.
     #[must_use]
     pub fn resolve(&self) -> OwnerConfiguration {

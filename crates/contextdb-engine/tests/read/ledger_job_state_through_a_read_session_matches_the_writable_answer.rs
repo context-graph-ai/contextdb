@@ -258,6 +258,10 @@ fn assert_published_declarations_match_installer() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn ledger_job_state_through_a_read_session_matches_the_writable_answer() {
     let file_directory = tempfile::tempdir().expect("task-scoped file-route directory");
     let file_path = file_directory.path().join("ledger-file.db");

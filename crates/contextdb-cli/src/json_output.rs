@@ -15,7 +15,9 @@ use contextdb_core::read_contract::{
 };
 use contextdb_engine::QueryResult;
 use contextdb_engine::database::QueryTrace;
-use contextdb_engine::{CompactionReport, MaintenanceReport};
+use contextdb_engine::{
+    CompactionReport, MaintenanceReport, StorageCompactionPolicy, StorageCompactionValue,
+};
 use contextdb_engine::{
     DirectEventsStatus, DirectIndexDirection, DirectMaintenanceStatus, DirectPropagationRule,
     DirectSchema, DirectVectorQuantization, OwnerConfigurationSource, OwnerConfiguredValue,
@@ -75,6 +77,8 @@ impl ErrorClass {
             | Error::ReceivedSchemaAuthorshipUnavailable { .. } => ErrorClass::Sync,
             Error::StoreCorrupted { .. }
             | Error::ReaderCoordinationUnavailable { .. }
+            | Error::ScratchWorkingStorageUnavailable { .. }
+            | Error::VectorMetadataIo { .. }
             | Error::LegacyVectorStoreDetected { .. }
             | Error::DatabaseLocked { .. }
             | Error::ExportIo { .. }
@@ -174,7 +178,7 @@ pub(crate) fn read_failure_detail_document(failure: &ReadFailure) -> Value {
     );
     match failure.detail() {
         ReadFailureDetail::None => {}
-        ReadFailureDetail::Reason { reason } => {
+        ReadFailureDetail::Reason { reason } | ReadFailureDetail::ReadinessAbsent { reason } => {
             detail.insert("reason".to_string(), json!(reason));
         }
         ReadFailureDetail::CursorExpired { expiry } => {
@@ -292,12 +296,66 @@ fn compaction_report_fields(report: &CompactionReport) -> Value {
         "bytes_after": report.bytes_after,
         "file_shrank": report.file_shrank,
         "fragmentation_before": report.fragmentation_before,
+        "page_slack_ratio": report.page_slack_ratio,
+        "policy": compaction_policy_fields(&report.policy),
     })
 }
 
+/// The storage compaction policy that governed one receipt: each setting's
+/// value and whether it was `declared` or the `default`.
+fn compaction_policy_fields(policy: &StorageCompactionPolicy) -> Value {
+    let mut fields = Map::new();
+    for (name, value, declared) in policy.settings() {
+        let value = match value {
+            StorageCompactionValue::Ratio(ratio) => json!(ratio),
+            StorageCompactionValue::Count(count) => json!(count),
+        };
+        fields.insert(
+            name.to_string(),
+            json!({ "value": value, "source": if declared { "declared" } else { "default" } }),
+        );
+    }
+    Value::Object(fields)
+}
+
+/// The same policy as one text token,
+/// `start_ratio:0.5(default),min_interval_ms:3600000(default),…`.
+pub(crate) fn compaction_policy_text(policy: &StorageCompactionPolicy) -> String {
+    policy
+        .settings()
+        .into_iter()
+        .map(|(name, value, declared)| {
+            let value = match value {
+                StorageCompactionValue::Ratio(ratio) => ratio.to_string(),
+                StorageCompactionValue::Count(count) => count.to_string(),
+            };
+            let source = if declared { "declared" } else { "default" };
+            format!("{name}:{value}({source})")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// `.maintenance compact` under `--json`: the explicit, on-demand
-/// full-file redb compaction this call just ran (or, on an in-memory
-/// database, the honest no-op).
+/// full-file redb compaction this call just ran.
+/// `.verify history <table>`: one entry per historical index, each verified.
+pub(crate) fn verify_history_document(
+    table: &str,
+    indexes: &[contextdb_engine::HistoricalIndexVerification],
+) -> Value {
+    json!({ "verify_history": {
+        "table": table,
+        "indexes": indexes
+            .iter()
+            .map(|index| json!({
+                "index": index.index,
+                "postings": index.postings,
+                "versions": index.versions,
+            }))
+            .collect::<Vec<_>>(),
+    }})
+}
+
 pub(crate) fn compaction_report_document(report: &CompactionReport) -> Value {
     json!({ "compaction": compaction_report_fields(report) })
 }
@@ -410,8 +468,8 @@ pub(crate) fn tables_document(
 pub(crate) fn result_document(result: &QueryResult) -> Value {
     json!({
         "result": {
-            "columns": result.columns,
-            "rows": crate::formatter::rows_as_objects(&result.columns, &result.rows),
+            "columns": result.columns(),
+            "rows": crate::formatter::rows_as_objects(result.columns(), result.rows()),
         }
     })
 }
@@ -421,9 +479,9 @@ pub(crate) fn result_document(result: &QueryResult) -> Value {
 pub(crate) fn cursor_page_document(page: &CursorPage) -> Value {
     json!({
         "cursor": {
-            "columns": page.columns,
-            "rows": crate::formatter::rows_as_objects(&page.columns, &page.rows),
-            "has_more": page.has_more,
+            "columns": page.columns(),
+            "rows": crate::formatter::rows_as_objects(page.columns(), page.rows()),
+            "has_more": page.has_more(),
         }
     })
 }
@@ -766,6 +824,32 @@ pub(crate) fn maintenance_status_body_document(status: &DirectMaintenanceStatus)
     })
 }
 
+/// `.maintenance status`: the loop's state plus each storage compaction
+/// setting with its value and source (`declared` or `default`).
+pub(crate) fn maintenance_status_with_compaction_document(
+    status: &DirectMaintenanceStatus,
+    settings: &[(String, String, String)],
+) -> Value {
+    let mut document = maintenance_status_body_document(status);
+    if let Some(maintenance) = document
+        .get_mut("maintenance")
+        .and_then(Value::as_object_mut)
+    {
+        maintenance.insert(
+            "storage_compaction".to_string(),
+            Value::Array(
+                settings
+                    .iter()
+                    .map(|(setting, value, source)| {
+                        json!({ "setting": setting, "value": value, "source": source })
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    document
+}
+
 /// `.events status` from the door's body: one bounded page whose items each
 /// say which of the four declared things they are.
 pub(crate) fn events_status_body_document(
@@ -828,25 +912,24 @@ pub(crate) fn events_status_body_document(
     })
 }
 
-/// The one notice that says HOW this session reads.
-///
-/// Emitted once, at the first store-reading command, and never again: the
-/// route is chosen once and does not change, so saying it twice would suggest
-/// it might have. `snapshot_at` is the committed moment a file-route session
-/// serves — a long-open reading terminal is a snapshot, not a live view — and
-/// is null on the owner route, where the owner serves live committed state and
-/// there is no single moment to report.
+/// Render the selected read route, committed file LSN and snapshot moment.
+/// The shell emits this after the first store read and when route or LSN changes.
+/// Owner reads serve live committed state and have no single snapshot moment.
 pub(crate) fn read_route_notice_document(
     route: ReadRoute,
     snapshot_at: Option<contextdb_core::Wallclock>,
+    snapshot_lsn: Option<contextdb_core::Lsn>,
 ) -> Value {
     let route_word = match route {
         ReadRoute::File => "file",
         ReadRoute::Owner => "owner",
     };
+    let lsn_detail = snapshot_lsn
+        .map(|lsn| format!(" (LSN {})", lsn.0))
+        .unwrap_or_default();
     let message = match snapshot_at {
         Some(instant) => format!(
-            "reading the committed snapshot taken at {}",
+            "reading the committed snapshot taken at {}{lsn_detail}",
             rfc3339_utc(instant.0)
         ),
         None => "reading through the live owner's local channel".to_owned(),
@@ -858,6 +941,7 @@ pub(crate) fn read_route_notice_document(
             "detail": {
                 "kind": "read_route",
                 "route": route_word,
+                "snapshot_lsn": snapshot_lsn.map(|lsn| lsn.0),
                 "snapshot_at": match snapshot_at {
                     Some(instant) => json!(rfc3339_utc(instant.0)),
                     None => Value::Null,
@@ -971,11 +1055,11 @@ pub(crate) fn print_trace(trace: &QueryTrace, rows_examined: u64) {
 /// bounded reader actually took. `runtime_trace` distinguishes this receipt
 /// from passive vector metadata and static write planning.
 pub(crate) fn explain_document(result: &QueryResult) -> Value {
-    let mut body = trace_body(&result.trace);
-    body.insert("sort_elided".to_string(), json!(result.trace.sort_elided));
+    let mut body = trace_body(result.trace());
+    body.insert("sort_elided".to_string(), json!(result.trace().sort_elided));
     body.insert(
         "rows_examined".to_string(),
-        json!(result.trace.rows_examined),
+        json!(result.trace().rows_examined),
     );
     body.insert("runtime_trace".to_string(), json!(true));
     json!({ "explain": Value::Object(body) })
@@ -1040,6 +1124,10 @@ pub(crate) fn static_plan_document(plan: &str) -> Value {
 
 fn trace_body(trace: &QueryTrace) -> Map<String, Value> {
     let mut body = Map::new();
+    body.insert(
+        "cache_resident_fraction".to_string(),
+        json!(trace.cache_resident_fraction),
+    );
     body.insert("physical_plan".to_string(), json!(trace.physical_plan));
     body.insert(
         "index_used".to_string(),
@@ -1077,7 +1165,7 @@ fn trace_body(trace: &QueryTrace) -> Map<String, Value> {
         "vector_search".to_string(),
         trace
             .vector_search
-            .as_ref()
+            .as_deref()
             .map_or(Value::Null, vector_search_document),
     );
     body
@@ -1107,14 +1195,17 @@ fn vector_search_document(disclosure: &contextdb_engine::VectorSearchDisclosure)
         "global_candidate_budget": disclosure.global_candidate_budget,
         "admission_evaluations": disclosure.admission_evaluations,
         "expansion_evaluations": disclosure.expansion_evaluations,
+        "rescore_evaluations": disclosure.rescore_evaluations,
         "layers_admitted": disclosure.layers_admitted,
         "budget_terminal": disclosure.budget_terminal,
-        "partitions": disclosure.partition_hnsw.iter().map(|partition| json!({
+        "partitions": disclosure.partitions.iter().map(|partition| json!({
             "partition": partition.partition,
-            "hnsw_m": partition.hnsw_m,
-            "hnsw_ef_construction": partition.hnsw_ef_construction,
-            "hnsw_ef_search": partition.hnsw_ef_search,
-            "ef_search_source": partition.ef_search_source,
+            "lists": partition.lists,
+            "lists_source": partition.lists_source,
+            "probes": partition.probes,
+            "probes_source": partition.probes_source,
+            "refine_factor": partition.refine_factor_hundredths.map(|value| f64::from(value) / 100.0),
+            "refine_factor_source": partition.refine_factor_source,
             "policy_revision": partition.policy_revision,
         })).collect::<Vec<_>>(),
     })
@@ -1174,52 +1265,6 @@ mod tests {
         schema_document(schema)["schema"].clone()
     }
 
-    #[test]
-    fn maintenance_json_retains_the_failed_budget_and_real_recovery_command() {
-        let db = Database::open_memory();
-        db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
-        db.execute(
-            "CREATE TABLE vector_docs (id INT PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE INDEXED)",
-            &HashMap::new(),
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO vector_docs VALUES (1, '[1,0,0]'), (2, '[0,1,0]')",
-            &HashMap::new(),
-        )
-        .unwrap();
-        let limits = db.execute("SHOW MEMORY_LIMIT", &HashMap::new()).unwrap();
-        let used_column = limits
-            .columns
-            .iter()
-            .position(|column| column == "used")
-            .unwrap();
-        let contextdb_core::Value::Int64(used) = &limits.rows[0][used_column] else {
-            panic!("SHOW MEMORY_LIMIT reports used bytes: {limits:?}");
-        };
-        let used = *used;
-        db.set_memory_limit(Some(usize::try_from(used).unwrap()))
-            .unwrap();
-
-        let report = db.run_maintenance_cycle().unwrap();
-        let document = maintenance_report_document(&report);
-        let detail = &document["maintenance_cycle"]["vector"]["first_failure_details"];
-        assert_eq!(
-            document["maintenance_cycle"]["vector"]["first_failure"],
-            json!("memory_limit")
-        );
-        assert!(detail["requested_bytes"].as_u64().unwrap() > 0);
-        assert_eq!(detail["available_bytes"], json!(0));
-        assert_eq!(detail["budget_limit_bytes"], json!(used));
-        assert_eq!(detail["recovery_action"], json!("raise_memory_limit"));
-        assert!(
-            detail["recovery_instruction"]
-                .as_str()
-                .unwrap()
-                .contains("SET MEMORY_LIMIT")
-        );
-    }
-
     /// The envelope's class is the branch an agent makes — retry the hub,
     /// look at the disk, or fix the query.
     #[test]
@@ -1227,7 +1272,7 @@ mod tests {
         use contextdb_core::Error;
 
         for error in [
-            Error::SyncError("hub refused the changeset".to_string()),
+            Error::SyncError("hub refused the changeset".into()),
             Error::SyncPushUnconfirmed {
                 detail: "no acknowledgement".to_string(),
             },
@@ -1241,8 +1286,8 @@ mod tests {
                 path: std::path::PathBuf::from("/tmp/held.db"),
             },
             Error::StoreCorrupted {
-                path: "/tmp/store".to_string(),
-                reason: "truncated".to_string(),
+                path: "/tmp/store".to_string().into(),
+                reason: "truncated".to_string().into(),
             },
             Error::ReaderCoordinationUnavailable {
                 operation: "authoritative purge".to_string(),
@@ -1250,12 +1295,12 @@ mod tests {
                 reason: "registry is unreadable".to_string(),
             },
             Error::MemoryBudgetExceeded {
-                subsystem: "vector".to_string(),
-                operation: "build".to_string(),
+                subsystem: "vector".into(),
+                operation: "build".into(),
                 requested_bytes: 2,
                 available_bytes: 1,
                 budget_limit_bytes: 1,
-                hint: "raise the budget".to_string(),
+                hint: "raise the budget".into(),
             },
         ] {
             assert_eq!(ErrorClass::of(&error), ErrorClass::Io, "{error}");

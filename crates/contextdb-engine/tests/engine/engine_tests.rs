@@ -235,7 +235,7 @@ fn test_file_backed_delete_delta_matches_after_reopen() {
     )
     .unwrap();
 
-    let live = db.changes_since(Lsn(3));
+    let live = db.changes_since(Lsn(3)).expect("read the declared changes");
     assert_eq!(
         live.rows.len(),
         1,
@@ -253,7 +253,9 @@ fn test_file_backed_delete_delta_matches_after_reopen() {
     drop(db);
 
     let reopened = Database::open(&path).unwrap();
-    let persisted = reopened.changes_since(Lsn(3));
+    let persisted = reopened
+        .changes_since(Lsn(3))
+        .expect("read the declared changes");
     assert_eq!(
         persisted.rows.len(),
         1,
@@ -631,6 +633,67 @@ fn test_observation_immutability() {
     let result = eng.delete_row(tx2, "observations", rid);
     assert!(matches!(result, Err(Error::ImmutableTable(_))));
     eng.rollback(tx2).unwrap();
+
+    // Replacing only a row's vector is accepted and commits; the rest of the row
+    // stays immutable and the row stays undeletable.
+    let id = Uuid::new_v4();
+    let tx3 = eng.begin_or_panic();
+    let embedded = eng
+        .insert_row(
+            tx3,
+            "observations",
+            make_values(vec![
+                ("id", Value::Uuid(id)),
+                ("data", Value::Text("kept".into())),
+                ("embedding", Value::Vector(vec![1.0, 0.0, 0.0])),
+            ]),
+        )
+        .unwrap();
+    eng.commit(tx3).unwrap();
+
+    let tx4 = eng.begin_or_panic();
+    eng.insert_vector(
+        tx4,
+        VectorIndexRef::new("observations", "embedding"),
+        embedded,
+        vec![0.0, 1.0, 0.0],
+    )
+    .expect("a vector replacement on an immutable table's row is accepted");
+    eng.commit(tx4).expect("the vector replacement commits");
+
+    let by_id = HashMap::from([("id".to_string(), Value::Uuid(id))]);
+    let read_back = eng
+        .execute("SELECT embedding FROM observations WHERE id = $id", &by_id)
+        .unwrap();
+    assert_eq!(
+        read_back.rows(),
+        vec![vec![Value::Vector(vec![0.0, 1.0, 0.0])]],
+        "the row reads back the replaced vector"
+    );
+    let nearest = eng
+        .execute(
+            "SELECT id FROM observations WHERE data = 'kept' ORDER BY embedding <=> $q USE VECTOR EXACT LIMIT 1",
+            &HashMap::from([("q".to_string(), Value::Vector(vec![0.0, 1.0, 0.0]))]),
+        )
+        .unwrap();
+    assert_eq!(
+        nearest.rows(),
+        vec![vec![Value::Uuid(id)]],
+        "exact search for the new vector returns the row first"
+    );
+    let update = eng.execute(
+        "UPDATE observations SET data = 'changed' WHERE id = $id",
+        &by_id,
+    );
+    assert!(
+        matches!(update, Err(Error::ImmutableTable(_))),
+        "the other columns stay immutable: {update:?}"
+    );
+    let delete = eng.execute("DELETE FROM observations WHERE id = $id", &by_id);
+    assert!(
+        matches!(delete, Err(Error::ImmutableTable(_))),
+        "the row stays undeletable: {delete:?}"
+    );
 }
 
 #[test]

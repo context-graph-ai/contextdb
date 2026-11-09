@@ -184,6 +184,16 @@ fn setup_backlog_fixture(bind_spec: &str, ticket: &str) -> BacklogFixture {
 }
 
 fn server_sync_system(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function("sync_system/push_100_rows_single_edge", |_| {});
+        c.bench_function("sync_system/pull_100_rows_single_edge", |_| {});
+        c.bench_function("sync_system/fan_in_4_edges_x_50_rows", |_| {});
+        c.bench_function(
+            "sync_system/backlog_push_after_server_restart_100_rows",
+            |_| {},
+        );
+        return;
+    }
     let rt = tokio::runtime::Runtime::new().unwrap();
     let sync = rt.block_on(start_sync_fixture());
     let mut group = c.benchmark_group("sync_system");

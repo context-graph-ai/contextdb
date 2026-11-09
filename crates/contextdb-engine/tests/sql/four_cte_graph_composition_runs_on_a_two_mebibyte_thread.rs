@@ -85,6 +85,10 @@ fn fixture() -> (Arc<Database>, Uuid, BTreeSet<Uuid>) {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn four_cte_graph_composition_runs_on_a_two_mebibyte_thread() {
     let (database, entity, expected) = fixture();
     let snapshot = database.snapshot();
@@ -104,7 +108,7 @@ fn four_cte_graph_composition_runs_on_a_two_mebibyte_thread() {
         .expect("the engine does not overflow the 2 MiB debug thread")
         .expect("execute the actual four-CTE Context Graph discovery statement");
     let returned = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.as_slice() {
             [Value::Uuid(id)] => *id,

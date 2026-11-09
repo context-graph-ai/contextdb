@@ -72,22 +72,22 @@ fn ascending_order_elides_through_the_composite_index() {
         )
         .expect("the ascending read must succeed");
     assert_eq!(
-        result.rows,
+        result.rows(),
         vec![
             vec![Value::Int64(1)],
             vec![Value::Int64(2)],
             vec![Value::Int64(3)]
         ],
         "{:?}",
-        result.trace
+        result.trace()
     );
     assert_eq!(
-        result.trace.index_used.as_deref(),
+        result.trace().index_used.as_deref(),
         Some(COMPOSITE_INDEX),
         "{:?}",
-        result.trace
+        result.trace()
     );
-    assert!(result.trace.sort_elided, "{:?}", result.trace);
+    assert!(result.trace().sort_elided, "{:?}", result.trace());
 }
 
 /// A descending `ORDER BY` must select the same composite index, walked
@@ -103,26 +103,26 @@ fn descending_order_elides_through_the_same_composite_index_walked_backward() {
         )
         .expect("the descending read must succeed");
     assert_eq!(
-        result.rows,
+        result.rows(),
         vec![
             vec![Value::Int64(3)],
             vec![Value::Int64(2)],
             vec![Value::Int64(1)]
         ],
         "rows must arrive in descending seq order: {:?}",
-        result.trace
+        result.trace()
     );
     assert_eq!(
-        result.trace.index_used.as_deref(),
+        result.trace().index_used.as_deref(),
         Some(COMPOSITE_INDEX),
         "a descending ORDER BY must still select the composite index, walked backward, not the \
          whole-key index: {:?}",
-        result.trace
+        result.trace()
     );
     assert!(
-        result.trace.sort_elided,
+        result.trace().sort_elided,
         "the backward walk already answers the order, so no separate sort should run: {:?}",
-        result.trace
+        result.trace()
     );
 }
 
@@ -138,16 +138,16 @@ fn descending_order_with_limit_takes_the_correct_end_of_the_backward_walk() {
         )
         .expect("the limited descending read must succeed");
     assert_eq!(
-        result.rows,
+        result.rows(),
         vec![vec![Value::Int64(3)], vec![Value::Int64(2)]],
         "LIMIT 2 after ORDER BY seq DESC must be the two highest-seq rows: {:?}",
-        result.trace
+        result.trace()
     );
     assert_eq!(
-        result.trace.index_used.as_deref(),
+        result.trace().index_used.as_deref(),
         Some(COMPOSITE_INDEX),
         "{:?}",
-        result.trace
+        result.trace()
     );
-    assert!(result.trace.sort_elided, "{:?}", result.trace);
+    assert!(result.trace().sort_elided, "{:?}", result.trace());
 }

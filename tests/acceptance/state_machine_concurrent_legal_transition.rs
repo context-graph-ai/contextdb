@@ -48,7 +48,7 @@ fn invalidation_status(db: &Database, id: Uuid) -> String {
             &[("id".to_string(), Value::Uuid(id))].into_iter().collect(),
         )
         .unwrap();
-    match &row.rows[0][0] {
+    match &row.rows()[0][0] {
         Value::Text(s) => s.clone(),
         other => panic!("expected text status, got {other:?}"),
     }
@@ -78,7 +78,7 @@ fn t23_01_two_parallel_writers_different_legal_targets_one_winner() {
                     .collect(),
                 )
                 .unwrap()
-                .rows_affected;
+                .rows_affected();
                 (terminal, affected)
             }));
         }
@@ -116,7 +116,7 @@ fn t23_02_post_race_row_is_in_one_terminal_state() {
                 .collect(),
             )
             .unwrap();
-        assert_eq!(staged.rows_affected, 1);
+        assert_eq!(staged.rows_affected(), 1);
     }
     db.commit(resolved_tx)
         .expect("first terminal transition commits");
@@ -160,7 +160,7 @@ fn t23_03_six_parallel_writers_three_legal_targets_one_winner() {
                     .collect(),
                 )
                 .unwrap()
-                .rows_affected;
+                .rows_affected();
                 (terminal, affected)
             }));
         }
@@ -190,12 +190,12 @@ fn t23_04_sequential_second_transition_with_stale_source_returns_zero() {
             &[("id".to_string(), Value::Uuid(id))].into_iter().collect(),
         )
         .unwrap();
-    assert_eq!(first.rows_affected, 1);
+    assert_eq!(first.rows_affected(), 1);
     let second = db
         .execute(
             "UPDATE invalidations SET status = 'dismissed' WHERE id = $id AND status = 'acknowledged'",
             &[("id".to_string(), Value::Uuid(id))].into_iter().collect(),
         )
         .unwrap();
-    assert_eq!(second.rows_affected, 0);
+    assert_eq!(second.rows_affected(), 0);
 }

@@ -12,6 +12,10 @@ description = "Relational executor for contextdb — scan, insert, upsert, delet
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+# writer_reopen_and_doubling_keep_a_fixed_resident_envelope observes private expiry ownership.
+test-seams = []
+
 [dependencies]
 contextdb-core = { path = "../contextdb-core", version = "1.0" }
 contextdb-tx = { path = "../contextdb-tx", version = "1.0" }

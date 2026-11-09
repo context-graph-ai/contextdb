@@ -100,8 +100,6 @@ impl Operation {
             Open for writing, creating the database if it does not exist.\n\n  \
         echo \"SELECT * FROM decisions LIMIT 5\" | contextdb mydata.db\n    \
             Pipe one or more SQL statements in non-interactively and exit.\n\n  \
-        contextdb :memory:\n    \
-            Open a throwaway in-memory database (always writable).\n\n  \
         contextdb mydata.db --write --sync-endpoint <server-ticket> --tenant-id acme\n    \
             Open for writing and connect to a contextdb-server using the enrollment\n    \
             ticket it printed (see `contextdb-server --help`).\n\n  \
@@ -109,7 +107,7 @@ impl Operation {
             Show the PROPAGATE DDL grammar with a worked example."
 )]
 struct Args {
-    /// Database path (:memory: for in-memory). Use `.help vector` for vector index syntax.
+    /// Database path. Use `.help vector` for vector index syntax.
     ///
     /// This is one of the two environment names the CLI reads at all, and the
     /// path on the command line always wins over it.
@@ -241,31 +239,6 @@ struct ReadConfiguration {
 }
 
 impl Args {
-    /// Whether any read ceiling, owner-read ceiling, or owner-read switch was
-    /// named on this command line. An in-memory database has no route, no
-    /// channel, and no ceilings to declare, so naming one there is an invalid
-    /// invocation rather than a value that quietly does nothing.
-    fn declared_any_read_setting(&self) -> bool {
-        self.owner_read.declared_any()
-            || [
-                self.read_result_rows,
-                self.read_result_bytes,
-                self.read_work,
-                self.read_active_ms,
-                self.read_memory,
-                self.read_cursor_page_rows,
-                self.read_cursor_page_bytes,
-                self.read_cursor_idle_ms,
-                self.read_cursor_lifetime_ms,
-                self.read_hydration_notice_ms,
-                self.read_owner_connect_ms,
-                self.read_owner_routing_retry_ms,
-                self.read_owner_response_ms,
-            ]
-            .iter()
-            .any(Option::is_some)
-    }
-
     fn read_configuration(&self) -> ReadConfiguration {
         let shipped = ReadLimits::default();
         let deadlines = ReadClientTimeouts::default();
@@ -324,25 +297,16 @@ fn refuse_invocation(json: bool, message: &str) -> ! {
 /// Every configuration answer that must be settled before the store is opened.
 ///
 /// A ceiling that is not positive, a cursor page larger than the result it
-/// pages, an idle window longer than the lifetime containing it, or any read
-/// setting at all on an in-memory database are all wrong about the invocation
-/// rather than about the data — so they are answered here, before an open
+/// pages, an idle window longer than the lifetime containing it, or a path
+/// that names no file are all wrong about the invocation rather than about the
+/// data — so they are answered here, before an open
 /// could create or touch anything.
 fn validated_configuration(args: &Args, path: &str) -> (ReadConfiguration, OwnerConfiguration) {
-    if path == ":memory:" && args.declared_any_read_setting() {
+    if path == ":memory:" {
         refuse_invocation(
             args.json,
-            "an in-memory database has no read route, no owner channel, and no ceilings to \
-             declare, so --read-*, --owner-read-*, --no-owner-reads, and \
-             --owner-read-runtime-dir are invalid with `:memory:`",
-        );
-    }
-
-    if path == ":memory:" && args.disk_limit.is_some() {
-        refuse_invocation(
-            args.json,
-            "an in-memory database has no file to bound, so --disk-limit is invalid with \
-             `:memory:`",
+            "`:memory:` is not a database path: contextdb is a durable database and has no \
+             in-memory mode; pass the path of a database file",
         );
     }
 
@@ -352,8 +316,7 @@ fn validated_configuration(args: &Args, path: &str) -> (ReadConfiguration, Owner
             "invalid maintenance configuration: --maintenance-poll-ms must be positive",
         );
     }
-    if path != ":memory:"
-        && !args.write
+    if !args.write
         && (args.maintenance_poll_ms.is_some()
             || !matches!(args.maintenance, MaintenanceMode::EngineOwned))
     {
@@ -388,6 +351,10 @@ fn validated_configuration(args: &Args, path: &str) -> (ReadConfiguration, Owner
     (read, owner)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn main() {
     let args = Args::parse();
 
@@ -413,17 +380,26 @@ fn main() {
             canonical_help_signatures().contains(&operation.spelling()),
             "every operational spelling is part of the one discovery surface"
         );
-        let exit_code =
-            contextdb_cli::ops::run_operational(operation.spelling(), operation.arguments())
-                .expect("the command tree only resolves spellings the operations answer to");
+        let exit_code = contextdb_cli::ops::run_operational(
+            operation.spelling(),
+            operation.arguments(),
+            || {
+                let read_parent =
+                    contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                        args.read_configuration().limits.memory,
+                    )?;
+                let operation = read_parent.child()?;
+                Ok((operation, read_parent))
+            },
+        )
+        .expect("the command tree only resolves spellings the operations answer to");
         std::process::exit(exit_code);
     }
 
     let Some(path) = args.path.clone() else {
         refuse_invocation(
             args.json,
-            "a database path is required: pass one, or set CONTEXTDB_DB_PATH; \
-             use `:memory:` for an ephemeral in-memory database",
+            "a database path is required: pass one, or set CONTEXTDB_DB_PATH",
         );
     };
 
@@ -432,11 +408,7 @@ fn main() {
     // going to run.
     let (read, owner) = validated_configuration(&args, &path);
 
-    // `:memory:` is always writable: it creates no file, so there is nothing
-    // for a flag to authorize, and an explicit `--write` there is an accepted
-    // no-op rather than the thing that turns mutation on.
-    let memory_backed = path == ":memory:";
-    let writes_permitted = args.write || memory_backed;
+    let writes_permitted = args.write;
 
     if !writes_permitted && args.tenant_id.is_some() {
         refuse_invocation(
@@ -471,6 +443,17 @@ fn main() {
         .unwrap_or_else(|err| {
             refuse_invocation(args.json, &format!("invalid --disk-limit: {err}"));
         });
+
+    let read_memory =
+        match contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+            read.limits.memory,
+        ) {
+            Ok(root) => root,
+            Err(error) => {
+                output.report_error(ErrorClass::of(&error), &error.to_string());
+                std::process::exit(EXIT_ERROR);
+            }
+        };
 
     if !writes_permitted {
         // A reading session opens no database at all. There is no handle here
@@ -512,7 +495,7 @@ fn main() {
             }
         };
         let exit_code = run(
-            &Session::reading(reader, std::path::PathBuf::from(&path)),
+            &Session::reading(reader, std::path::PathBuf::from(&path), read_memory.clone()),
             None,
             None,
             None,
@@ -549,15 +532,10 @@ fn main() {
         };
         // A bare ticket gets the edge's own fabric identity pinned to it
         // (derived from the database path), so this machine dials as its
-        // enrolled identity instead of an ephemeral key. In-memory databases
-        // have no data root and stay ephemeral.
+        // enrolled identity instead of an ephemeral key.
         use contextdb_server::transport::iroh::EndpointSpec;
         match EndpointSpec::parse(&endpoint) {
-            Some(spec)
-                if spec.dial_ticket().is_some()
-                    && spec.identity_path().is_none()
-                    && path != ":memory:" =>
-            {
+            Some(spec) if spec.dial_ticket().is_some() && spec.identity_path().is_none() => {
                 format!(
                     "iroh:?to={}&identity={}.fabric-identity.key",
                     spec.dial_ticket().expect("checked above"),
@@ -570,9 +548,7 @@ fn main() {
 
     debug!(path = %path, "opening database");
     // One writable-open configuration, so the owner-reading policy this
-    // session advertises is the policy it was asked for. An in-memory database
-    // has no file to bound and no channel to serve, which the argument parser
-    // has already refused above.
+    // session advertises is the policy it was asked for.
     let opened = contextdb_engine::Database::open_with_options(
         std::path::Path::new(&path),
         DatabaseOpenOptions {
@@ -588,7 +564,7 @@ fn main() {
                 None => Arc::new(contextdb_engine::plugin::CorePlugin),
             },
             memory_limit,
-            disk_limit: if memory_backed { None } else { disk_limit },
+            disk_limit,
             maintenance_policy: args.maintenance.into(),
             maintenance_poll_interval: args.maintenance_poll_ms.map(Duration::from_millis),
             ..DatabaseOpenOptions::default()
@@ -625,11 +601,25 @@ fn main() {
         let endpoint = sync_endpoint
             .clone()
             .expect("an endpoint is resolved whenever --tenant-id is present");
-        let client = Arc::new(contextdb_server::SyncClient::new(
-            db.clone(),
-            &endpoint,
-            contextdb_core::TenantId::from(tenant_id.as_str()),
-        ));
+        let constructed = read_memory.child().and_then(|request_memory| {
+            contextdb_server::SyncClient::new_with_read_memory(
+                db.clone(),
+                &endpoint,
+                contextdb_core::TenantId::from(tenant_id.as_str()),
+                request_memory,
+            )
+        });
+        let client = Arc::new(match constructed {
+            Ok(client) => client,
+            Err(contextdb_core::Error::ReadFailure(failure)) => {
+                output.report_read_failure(&failure, None);
+                std::process::exit(EXIT_ERROR);
+            }
+            Err(error) => {
+                output.report_error(ErrorClass::of(&error), &error.to_string());
+                std::process::exit(EXIT_ERROR);
+            }
+        });
         (rt, client)
     });
 
@@ -662,6 +652,7 @@ fn main() {
     // Spawn background debounced push task if sync is configured.
     let push_handle = if let (Some(rt_ref), Some(client), Some(rx)) = (rt, sync_client, push_rx) {
         let client_clone = Arc::clone(client);
+        let push_read_memory = read_memory.clone();
         let plugin_clone = sync_plugin_arc.clone().expect("sync plugin configured");
         let config = auto_sync::AutoSyncConfig {
             debounce: Duration::from_millis(args.sync_debounce_ms),
@@ -672,9 +663,10 @@ fn main() {
             config,
             move || {
                 let client = client_clone.clone();
+                let read_memory = push_read_memory.clone();
                 let plugin = plugin_clone.clone();
                 async move {
-                    let result = match client.push().await {
+                    let result = match async { client.push_with_read_memory(read_memory.child()?).await }.await {
                         Ok(result) => result,
                         Err(contextdb_core::Error::SyncPushUnconfirmed { detail }) => {
                             // Interrupted after the batch was sent: the data may
@@ -744,7 +736,7 @@ fn main() {
     // push never downgrades a 1.
     // A writing session still reads through a bounded view over its own live
     // database, so a writer's SELECTs are bounded exactly like anyone else's.
-    let session = match Session::writing(db.clone(), read.limits) {
+    let session = match Session::writing(db.clone(), read.limits, read_memory.clone()) {
         Ok(session) => session,
         Err(error) => {
             output.report_error(
@@ -772,7 +764,9 @@ fn main() {
     // Graceful shutdown: stop background notifications, wait for any in-flight
     // auto-sync work to finish, then do one final flush before closing the DB.
     if let Some((rt, client)) = rt_and_client {
-        if let Err(err) = db.execute("ROLLBACK", &std::collections::HashMap::new()) {
+        if let Err(err) = read_memory.child().and_then(|root| {
+            db.execute_with_read_memory("ROLLBACK", &std::collections::HashMap::new(), root)
+        }) {
             output.report_error(
                 ErrorClass::of(&err),
                 &format!("Final transaction rollback failed: {err}"),
@@ -794,7 +788,10 @@ fn main() {
             exit_code = EXIT_ERROR;
         }
         match client.has_pending_push_changes() {
-            Ok(true) => match rt.block_on(client.push()) {
+            Ok(true) => match read_memory
+                .child()
+                .and_then(|root| rt.block_on(client.push_with_read_memory(root)))
+            {
                 Ok(_) => {}
                 Err(contextdb_core::Error::SyncPushUnconfirmed { detail }) => {
                     // Interrupted after send: the data may already have landed.
@@ -832,6 +829,14 @@ fn main() {
                             "Final sync push re-offered {table} {key:?}, which the hub already \
                              converged on as deleted; nothing to do."
                         ),
+                    );
+                }
+                Err(contextdb_core::Error::SyncError(detail))
+                    if detail.contains("schema mismatch for table ") =>
+                {
+                    output.report_notice(
+                        ErrorClass::Sync,
+                        &format!("Final sync push conflict: {detail}"),
                     );
                 }
                 Err(err) => {

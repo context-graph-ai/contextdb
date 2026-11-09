@@ -130,12 +130,12 @@ fn scenario4_hybrid_query_returns_rows_once_traversal_has_data() {
     );
 
     assert_eq!(
-        r.rows.len(),
+        r.rows().len(),
         1,
         "expected exactly one joined row (the decision, its basis entity), got {:?}",
-        r.rows
+        r.rows()
     );
-    let row = &r.rows[0];
+    let row = &r.rows()[0];
     assert_eq!(row[0], Value::Uuid(decision_id), "sd.id");
     assert_eq!(
         row[1],
@@ -166,7 +166,7 @@ fn scenario4_hybrid_query_returns_empty_on_empty_tables() {
     );
 
     let r = result.expect("Scenario 4 query against empty tables must succeed with zero rows");
-    assert_eq!(r.rows.len(), 0);
+    assert_eq!(r.rows().len(), 0);
 }
 
 // ============================================================================
@@ -214,7 +214,7 @@ fn select_where_bare_true_returns_all_rows() {
     let r = db
         .execute("SELECT v FROM g WHERE TRUE", &empty())
         .expect("WHERE TRUE must succeed and return every row");
-    let mut got: Vec<i64> = r.rows.iter().map(|row| int_col(&row[0])).collect();
+    let mut got: Vec<i64> = r.rows().iter().map(|row| int_col(&row[0])).collect();
     got.sort();
     assert_eq!(got, vec![10, 20, 30]);
 }
@@ -239,7 +239,7 @@ fn select_where_bare_false_returns_no_rows() {
     let r = db
         .execute("SELECT v FROM g WHERE FALSE", &empty())
         .expect("WHERE FALSE must succeed");
-    assert_eq!(r.rows.len(), 0, "got {:?}", r.rows);
+    assert_eq!(r.rows().len(), 0, "got {:?}", r.rows());
 }
 
 fn seed_generic_join_tables(db: &Database, left: &[i64], right: &[i64]) {
@@ -286,13 +286,13 @@ fn inner_join_on_true_produces_full_cartesian_product() {
         .execute("SELECT gl.v, gr.w FROM gl INNER JOIN gr ON TRUE", &empty())
         .expect("INNER JOIN ... ON TRUE must succeed");
     assert_eq!(
-        r.rows.len(),
+        r.rows().len(),
         6,
         "2 left rows x 3 right rows must Cartesian-product to 6 rows, got {:?}",
-        r.rows
+        r.rows()
     );
     let mut got: Vec<(i64, i64)> = r
-        .rows
+        .rows()
         .iter()
         .map(|row| (int_col(&row[0]), int_col(&row[1])))
         .collect();
@@ -320,15 +320,15 @@ fn left_join_on_false_produces_one_null_extended_row_per_left_row() {
         .execute("SELECT gl.v, gr.w FROM gl LEFT JOIN gr ON FALSE", &empty())
         .expect("LEFT JOIN ... ON FALSE must succeed");
     assert_eq!(
-        r.rows.len(),
+        r.rows().len(),
         2,
         "must produce exactly one null-extended row per left row (2), got {:?}",
-        r.rows
+        r.rows()
     );
-    let mut got_v: Vec<i64> = r.rows.iter().map(|row| int_col(&row[0])).collect();
+    let mut got_v: Vec<i64> = r.rows().iter().map(|row| int_col(&row[0])).collect();
     got_v.sort();
     assert_eq!(got_v, vec![0, 1]);
-    for row in &r.rows {
+    for row in r.rows() {
         assert_eq!(
             row[1],
             Value::Null,
@@ -349,5 +349,5 @@ fn inner_join_on_false_produces_no_rows() {
     let r = db
         .execute("SELECT gl.v, gr.w FROM gl INNER JOIN gr ON FALSE", &empty())
         .expect("INNER JOIN ... ON FALSE must succeed");
-    assert_eq!(r.rows.len(), 0, "got {:?}", r.rows);
+    assert_eq!(r.rows().len(), 0, "got {:?}", r.rows());
 }

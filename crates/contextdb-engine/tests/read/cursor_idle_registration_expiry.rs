@@ -13,15 +13,13 @@
 
 use contextdb_core::Value;
 use contextdb_core::read_contract::{
-    CursorExpiryKind, CursorPage, DeadlineClock, DeadlineWait, OwnerReadCancellation, ReadFailure,
-    ReadLimits,
+    CursorExpiryKind, CursorPage, OwnerReadCancellation, ReadFailure, ReadLimits,
 };
 use contextdb_engine::executor::bounded_read_test_support as bounded;
 use contextdb_engine::{Database, MaintenancePolicy};
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
 
 /// The promise this file protects, quoted in every failure.
@@ -33,26 +31,7 @@ const NEVER: i64 = i64::MAX;
 const ALREADY: i64 = -1;
 const IDLE_MS: u64 = 10_000;
 
-#[derive(Clone, Default)]
-struct ManualClock {
-    now_ms: Arc<AtomicU64>,
-}
-
-impl ManualClock {
-    fn set(&self, now_ms: u64) {
-        self.now_ms.store(now_ms, Ordering::SeqCst);
-    }
-}
-
-impl DeadlineClock for ManualClock {
-    fn now_ms(&self) -> u64 {
-        self.now_ms.load(Ordering::SeqCst)
-    }
-
-    fn wait_until(&self, _deadline_ms: u64) -> DeadlineWait<'_> {
-        Box::pin(async {})
-    }
-}
+use contextdb_engine::local_transport::ManualDeadlineClock;
 
 fn params(pairs: impl IntoIterator<Item = (&'static str, Value)>) -> HashMap<String, Value> {
     pairs
@@ -78,13 +57,13 @@ fn paged_limits(page_rows: usize) -> ReadLimits {
 fn request(
     sql: impl Into<String>,
     limits: ReadLimits,
-    clock: &ManualClock,
+    clock: &ManualDeadlineClock,
 ) -> bounded::BoundedReadRequest {
     bounded::BoundedReadRequest::new(sql, HashMap::new(), limits, Arc::new(clock.clone()))
 }
 
 fn page_target_count(page: &CursorPage) -> usize {
-    page.rows.len()
+    page.rows().len()
 }
 
 /// A source with eight outgoing edges, two of whose target rows are already
@@ -155,14 +134,14 @@ fn retention_reclaims_rows_a_cursor_stopped_being_entitled_to_when_its_idle_wind
     let journey = "graph edge cursor abandoned past its idle window, retention cycle";
     let (db, expiring) = open_graph_fixture();
 
-    let clock = ManualClock::default();
+    let clock = ManualDeadlineClock::default();
     let mut opened = bounded::open_cursor(
         Arc::clone(&db),
         &request(GRAPH_SQL, paged_limits(2), &clock),
     )
     .expect("open a bounded cursor over the whole edge set");
     assert!(
-        opened.first_page.has_more,
+        opened.first_page.has_more(),
         "{journey}: the fixture must leave the cursor open past its first page"
     );
     assert_eq!(
@@ -175,7 +154,7 @@ fn retention_reclaims_rows_a_cursor_stopped_being_entitled_to_when_its_idle_wind
         .fetch(NonZeroUsize::new(2), OwnerReadCancellation::new())
         .expect("page the graph cursor a second time");
     assert!(
-        second.page.has_more,
+        second.page.has_more(),
         "{journey}: the cursor must still be mid-adjacency when it is abandoned"
     );
 
@@ -191,7 +170,7 @@ fn retention_reclaims_rows_a_cursor_stopped_being_entitled_to_when_its_idle_wind
     );
 
     // The reader walks away. Only the clock moves — no fetch, no close.
-    clock.set(IDLE_MS + 1);
+    clock.advance_to(IDLE_MS + 1);
 
     let after_idle = db
         .run_pruning_cycle_checked()
@@ -219,7 +198,7 @@ fn retention_reclaims_rows_a_cursor_stopped_being_entitled_to_when_its_idle_wind
         other => panic!(
             "{journey}: {IDLE_PROMISE}. An abandoned cursor past its idle window must be refused, \
              got {other:?}",
-            other = other.map(|fetched| fetched.page.rows.len())
+            other = other.map(|fetched| fetched.page.rows().len())
         ),
     }
 }
@@ -231,18 +210,18 @@ fn a_cursor_left_past_its_idle_window_is_refused_its_next_page() {
     let journey = "cursor idle deadline, next page";
     let (db, _expiring) = open_graph_fixture();
 
-    let clock = ManualClock::default();
+    let clock = ManualDeadlineClock::default();
     let mut opened = bounded::open_cursor(
         Arc::clone(&db),
         &request(GRAPH_SQL, paged_limits(2), &clock),
     )
     .expect("open a bounded cursor over the whole edge set");
     assert!(
-        opened.first_page.has_more,
+        opened.first_page.has_more(),
         "{journey}: the fixture must leave the cursor open past its first page"
     );
 
-    clock.set(IDLE_MS + 1);
+    clock.advance_to(IDLE_MS + 1);
     match opened
         .cursor
         .fetch(NonZeroUsize::new(2), OwnerReadCancellation::new())
@@ -254,7 +233,7 @@ fn a_cursor_left_past_its_idle_window_is_refused_its_next_page() {
         ),
         other => panic!(
             "{journey}: a cursor past its idle window must be refused, got {other:?}",
-            other = other.map(|fetched| fetched.page.rows.len())
+            other = other.map(|fetched| fetched.page.rows().len())
         ),
     }
 }

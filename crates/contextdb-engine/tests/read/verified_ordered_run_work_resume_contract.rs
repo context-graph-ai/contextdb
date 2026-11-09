@@ -1,4 +1,3 @@
-#![allow(dead_code)] // Existing compatibility and test seam shape.
 //! A retained ordered run is physical work: building it cannot pass a caller's
 //! work ceiling, and a cursor whose working window is evicted continues from
 //! the posting it last proved.
@@ -13,7 +12,7 @@
 //! still each receive their whole range exactly once.
 
 use contextdb_core::Value;
-use contextdb_core::read_contract::{DeadlineClock, DeadlineWait, ReadFailureDetail, ReadLimits};
+use contextdb_core::read_contract::{ReadFailureDetail, ReadLimits};
 use contextdb_engine::Database;
 use contextdb_engine::direct_file_reader::test_seams::{
     DirectFileReaderError, DirectReaderConfig, ReadWorkCounters, ReadWorkObservationScope,
@@ -24,17 +23,7 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-struct FrozenClock;
-
-impl DeadlineClock for FrozenClock {
-    fn now_ms(&self) -> u64 {
-        0
-    }
-
-    fn wait_until(&self, _: u64) -> DeadlineWait<'_> {
-        Box::pin(async {})
-    }
-}
+use contextdb_engine::local_transport::ManualDeadlineClock;
 
 fn limits() -> ReadLimits {
     ReadLimits {
@@ -91,8 +80,11 @@ fn open(
     path: &std::path::Path,
     limits: ReadLimits,
 ) -> contextdb_engine::direct_file_reader::test_seams::DirectFileReader {
-    open_for_test(path, DirectReaderConfig::new(limits, Arc::new(FrozenClock)))
-        .expect("open retained direct reader")
+    open_for_test(
+        path,
+        DirectReaderConfig::new(limits, Arc::new(ManualDeadlineClock::at(0))),
+    )
+    .expect("open retained direct reader")
 }
 
 /// A reader that declares a session memory limit, which is what gives the
@@ -104,7 +96,7 @@ fn open_declaring_memory(
     limits: ReadLimits,
     memory_limit: usize,
 ) -> contextdb_engine::direct_file_reader::test_seams::DirectFileReader {
-    let mut config = DirectReaderConfig::new(limits, Arc::new(FrozenClock));
+    let mut config = DirectReaderConfig::new(limits, Arc::new(ManualDeadlineClock::at(0)));
     config.memory_limit = Some(memory_limit);
     open_for_test(path, config).expect("open retained direct reader")
 }
@@ -116,7 +108,7 @@ const DECLARED_SESSION_MEMORY: usize = 32 * 1024 * 1024;
 
 fn ids(result: &contextdb_engine::QueryResult) -> Vec<i64> {
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.as_slice() {
             [Value::Int64(id)] => *id,
@@ -149,10 +141,10 @@ fn verified_ordered_runs_charge_cold_builds_and_continue_after_forced_eviction()
         .expect("cached direct vector query completes");
     let warm_work = warm_scope.counters();
     drop(warm_scope);
-    assert_eq!(warm.result.rows, expected.result.rows);
+    assert_eq!(warm.result.rows(), expected.result.rows());
     assert_eq!(
         cold_work.decoded_rows,
-        expected.result.rows.len() as u64,
+        expected.result.rows().len() as u64,
         "the cold range proof does not decode posting row bodies: {cold_work:?}"
     );
     assert_eq!(warm_work.decoded_rows, cold_work.decoded_rows);
@@ -161,7 +153,7 @@ fn verified_ordered_runs_charge_cold_builds_and_continue_after_forced_eviction()
         "the cached run reuses authenticated posting pages: cold={cold_work:?}, warm={warm_work:?}"
     );
     assert!(
-        warm.result.trace.rows_examined >= 5,
+        warm.result.trace().rows_examined >= 5,
         "cached postings still count as examined work"
     );
     drop(cold);
@@ -201,7 +193,7 @@ fn verified_ordered_runs_charge_cold_builds_and_continue_after_forced_eviction()
     let resumed_work = resumed_scope.counters();
     drop(resumed_scope);
     arm_verified_ordered_run_eviction_for_test(&resumed, 0);
-    assert_eq!(actual.result.rows, expected.result.rows);
+    assert_eq!(actual.result.rows(), expected.result.rows());
     assert_eq!(ids(&actual.result), vec![0, 1, 2, 3, 4]);
     // Each identity is delivered exactly once, from the authenticated walk, and
     // never from the physical index: the resume decodes no row body the cold
@@ -231,8 +223,7 @@ fn verified_ordered_runs_charge_cold_builds_and_continue_after_forced_eviction()
     // a cold build fits in, found here, and the same ceiling must then refuse a
     // read that also has to re-prove after eviction.
     let smallest_ceiling = |evicted: bool| -> Option<u64> {
-        let mut ceiling = 1;
-        while ceiling <= limits().work {
+        let fits = |ceiling| {
             let mut probe = limits();
             probe.work = ceiling;
             let reader = open(&path, probe);
@@ -241,13 +232,41 @@ fn verified_ordered_runs_charge_cold_builds_and_continue_after_forced_eviction()
             }
             let answer = reader.execute(statement(), &params());
             arm_verified_ordered_run_eviction_for_test(&reader, 0);
-            if let Ok(answer) = answer {
-                assert_eq!(ids(&answer.result), vec![0, 1, 2, 3, 4]);
-                return Some(ceiling);
+            match answer {
+                Ok(answer) => {
+                    assert_eq!(ids(&answer.result), vec![0, 1, 2, 3, 4]);
+                    true
+                }
+                Err(DirectFileReaderError::ReadFailure(failure)) => {
+                    assert!(
+                        matches!(failure.detail(), ReadFailureDetail::OwnerLimitExceeded(detail)
+                        if detail.limit == contextdb_core::read_contract::ReadFailureLimit::Work)
+                    );
+                    false
+                }
+                Err(error) => panic!("work-ceiling search encountered another refusal: {error:?}"),
             }
-            ceiling *= 2;
+        };
+        let (mut refused, mut admitted) = (0, 1);
+        loop {
+            if fits(admitted) {
+                break;
+            }
+            refused = admitted;
+            if admitted == limits().work {
+                return None;
+            }
+            admitted = admitted.saturating_mul(2).min(limits().work);
         }
-        None
+        while admitted - refused > 1 {
+            let midpoint = refused + (admitted - refused) / 2;
+            if fits(midpoint) {
+                admitted = midpoint;
+            } else {
+                refused = midpoint;
+            }
+        }
+        Some(admitted)
     };
     let cold_ceiling = smallest_ceiling(false).expect("a cold build fits some work ceiling");
     let resumed_ceiling = smallest_ceiling(true).expect("a continuing read fits some work ceiling");
@@ -279,9 +298,9 @@ fn verified_ordered_runs_charge_cold_builds_and_continue_after_forced_eviction()
         "verified run work: cold={cold_work:?} warm={warm_work:?} resumed={resumed_work:?}; \
          examined cold={} warm={} resumed={}; work ceiling cold={cold_ceiling} \
          resumed={resumed_ceiling}",
-        expected.result.trace.rows_examined,
-        warm.result.trace.rows_examined,
-        actual.result.trace.rows_examined
+        expected.result.trace().rows_examined,
+        warm.result.trace().rows_examined,
+        actual.result.trace().rows_examined
     );
 }
 
@@ -294,14 +313,6 @@ fn verified_ordered_runs_charge_cold_builds_and_continue_after_forced_eviction()
 /// about a constant. Every row carries the same label, so one equality
 /// predicate names one run of `rows` postings.
 const WIDE_LABEL_BYTES: usize = 8 * 1024;
-
-/// A narrower key for the cursor fixture below. It still makes a working window
-/// a countable number of postings while keeping each delivered row small.
-const CURSOR_LABEL_BYTES: usize = 1024;
-
-fn wide_label() -> String {
-    "w".repeat(WIDE_LABEL_BYTES)
-}
 
 fn seed_wide(path: &std::path::Path, rows: i64) {
     seed_labelled(path, rows, WIDE_LABEL_BYTES, 'w', 0);
@@ -357,13 +368,6 @@ fn wide_params() -> HashMap<String, Value> {
     group_params('w')
 }
 
-fn labelled_params(label_bytes: usize) -> HashMap<String, Value> {
-    HashMap::from([
-        ("query".to_owned(), Value::Vector(vec![1.0, 0.0])),
-        ("label".to_owned(), Value::Text("w".repeat(label_bytes))),
-    ])
-}
-
 fn wide_statement(limit: usize) -> String {
     format!(
         "SELECT id FROM wide_runs WHERE label = $label ORDER BY embedding <=> $query LIMIT {limit}"
@@ -388,13 +392,11 @@ fn wide_limits(rows: usize) -> ReadLimits {
 /// measured by the authenticated-page counters alone.
 #[derive(Debug, Clone, Copy)]
 struct PagedMeasurement {
-    rows: usize,
     counters: ReadWorkCounters,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct ScaleMeasurement {
-    rows: usize,
     counters: ReadWorkCounters,
     examined: u64,
 }
@@ -417,7 +419,7 @@ fn measure_scale(rows: usize) -> ScaleMeasurement {
     drop(scope);
     arm_verified_ordered_run_eviction_for_test(&reader, 0);
     assert_eq!(
-        answer.result.rows.len(),
+        answer.result.rows().len(),
         rows,
         "every row of the range is delivered exactly once"
     );
@@ -429,9 +431,8 @@ fn measure_scale(rows: usize) -> ScaleMeasurement {
         "no identity is dropped or repeated across window boundaries"
     );
     ScaleMeasurement {
-        rows,
         counters,
-        examined: answer.result.trace.rows_examined,
+        examined: answer.result.trace().rows_examined,
     }
 }
 
@@ -497,10 +498,10 @@ fn a_result_limited_read_succeeds_when_the_whole_matching_range_exceeds_the_budg
         .expect("a result-limited read is answered from a bounded working window");
     let counters = scope.counters();
     drop(scope);
-    assert_eq!(answer.result.rows.len(), 3);
+    assert_eq!(answer.result.rows().len(), 3);
     eprintln!(
         "result-limited read over {rows} wide postings: {counters:?} examined={}",
-        answer.result.trace.rows_examined
+        answer.result.trace().rows_examined
     );
     // The answer is authenticated, so it costs proof work, and it costs far
     // less than proving the whole range would.
@@ -531,6 +532,10 @@ const FORCE_PAGED_DRAINS_SEQUENTIAL: bool = false;
 /// Returns the interleaved measurement and, beside it, the same two cursors
 /// drained one after the other as the undisturbed control, plus the number of
 /// capacity displacements observed while both cursors were live.
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn measure_paged_scale(rows: usize) -> (PagedMeasurement, PagedMeasurement, usize) {
     let root = tempfile::tempdir().expect("task-scoped wide fixture");
     let path = root.path().join(format!("paged-{rows}.redb"));
@@ -593,26 +598,26 @@ fn measure_paged_scale(rows: usize) -> (PagedMeasurement, PagedMeasurement, usiz
         let mut second = reader
             .open_cursor(&wide_statement(rows), &group_params('b'), page)
             .expect("open the second paged cursor");
-        let mut first_ids = cursor_page_ids(&first.first_page.page.rows);
-        let mut second_ids = cursor_page_ids(&second.first_page.page.rows);
-        let mut first_more = first.first_page.page.has_more;
-        let mut second_more = second.first_page.page.has_more;
+        let mut first_ids = cursor_page_ids(&first.first_page.page_for_test().rows);
+        let mut second_ids = cursor_page_ids(&second.first_page.page_for_test().rows);
+        let mut first_more = first.first_page.page_for_test().has_more;
+        let mut second_more = second.first_page.page_for_test().has_more;
         while first_more || second_more {
             if first_more {
                 let fetched = first
                     .cursor
                     .fetch(Some(page))
                     .expect("the first paged cursor fetches its next page");
-                first_ids.extend(cursor_page_ids(&fetched.page.rows));
-                first_more = fetched.page.has_more;
+                first_ids.extend(cursor_page_ids(&fetched.page_for_test().rows));
+                first_more = fetched.page_for_test().has_more;
             }
             if second_more {
                 let fetched = second
                     .cursor
                     .fetch(Some(page))
                     .expect("the second paged cursor fetches its next page");
-                second_ids.extend(cursor_page_ids(&fetched.page.rows));
-                second_more = fetched.page.has_more;
+                second_ids.extend(cursor_page_ids(&fetched.page_for_test().rows));
+                second_more = fetched.page_for_test().has_more;
             }
         }
         first.cursor.close().expect("the first paged cursor closes");
@@ -629,14 +634,8 @@ fn measure_paged_scale(rows: usize) -> (PagedMeasurement, PagedMeasurement, usiz
         check(group, ids, "interleaved");
     }
     (
-        PagedMeasurement {
-            rows,
-            counters: control,
-        },
-        PagedMeasurement {
-            rows,
-            counters: walk,
-        },
+        PagedMeasurement { counters: control },
+        PagedMeasurement { counters: walk },
         displacements,
     )
 }
@@ -769,11 +768,22 @@ fn interleaved_cursors_continue_correctly_when_their_windows_are_evicted() {
         |cursors: &mut Vec<contextdb_engine::direct_file_reader::test_seams::DirectCursorOpen>| {
             let mut collected = cursors
                 .iter()
-                .map(|opened| opened.first_page.page.rows.clone())
+                .map(|opened| {
+                    opened
+                        .first_page
+                        .try_clone_page_for_test(
+                            reader
+                                .request_read_memory_for_test()
+                                .expect("admit the fixture page copy reader"),
+                        )
+                        .expect("share the admitted first page")
+                        .rows()
+                        .to_vec()
+                })
                 .collect::<Vec<_>>();
             let mut more = cursors
                 .iter()
-                .map(|opened| opened.first_page.page.has_more)
+                .map(|opened| opened.first_page.page_for_test().has_more)
                 .collect::<Vec<_>>();
             while more.iter().any(|has_more| *has_more) {
                 for (index, opened) in cursors.iter_mut().enumerate() {
@@ -784,8 +794,15 @@ fn interleaved_cursors_continue_correctly_when_their_windows_are_evicted() {
                         .cursor
                         .fetch(Some(page))
                         .expect("a cursor continues after its window is evicted");
-                    collected[index].extend(fetched.page.rows.clone());
-                    more[index] = fetched.page.has_more;
+                    let terminal = fetched
+                        .try_clone_page_for_test(
+                            reader
+                                .request_read_memory_for_test()
+                                .expect("admit the fetched fixture page copy"),
+                        )
+                        .expect("publish the fetched fixture page");
+                    collected[index].extend(terminal.rows().iter().cloned());
+                    more[index] = terminal.has_more();
                 }
             }
             collected
@@ -866,19 +883,23 @@ fn interleaved_cursors_continue_correctly_when_their_windows_are_evicted() {
 
 /// Drain one open cursor page by page, returning every id it delivered in the
 /// order it delivered them.
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn drain_cursor(
     opened: &mut contextdb_engine::direct_file_reader::test_seams::DirectCursorOpen,
     page: NonZeroUsize,
 ) -> Vec<i64> {
-    let mut delivered = cursor_page_ids(&opened.first_page.page.rows);
-    let mut more = opened.first_page.page.has_more;
+    let mut delivered = cursor_page_ids(&opened.first_page.page_for_test().rows);
+    let mut more = opened.first_page.page_for_test().has_more;
     while more {
         let fetched = opened
             .cursor
             .fetch(Some(page))
             .expect("a paged cursor fetches its next page");
-        delivered.extend(cursor_page_ids(&fetched.page.rows));
-        more = fetched.page.has_more;
+        delivered.extend(cursor_page_ids(&fetched.page_for_test().rows));
+        more = fetched.page_for_test().has_more;
     }
     delivered
 }

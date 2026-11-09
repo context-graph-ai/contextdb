@@ -52,7 +52,8 @@ async fn decoded_old_pull_row_cannot_apply_after_a_destination_move() {
             TenantId::from(TENANT),
             hub_node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_task = tokio::spawn({
@@ -71,7 +72,8 @@ async fn decoded_old_pull_row_cannot_apply_after_a_destination_move() {
             broker.client_as(&edge_node_id),
             TenantId::from(TENANT),
             edge_identity,
-        ),
+        )
+        .expect("construct SyncClient fixture"),
     );
     let pause = client.pause_after_pull_response_for_test();
     let mut pull = tokio::spawn({
@@ -98,12 +100,14 @@ async fn decoded_old_pull_row_cannot_apply_after_a_destination_move() {
     assert!(
         edge.execute("SELECT * FROM notes WHERE id = 41", &HashMap::new())
             .expect("inspect edge after rejected old pull")
-            .rows
+            .rows()
             .is_empty(),
         "the decoded old-hub row cannot become visible after the move"
     );
     assert!(
-        !edge.row_version_arrived_by_sync("notes", &pulled_key),
+        !edge
+            .row_version_arrived_by_sync("notes", &pulled_key)
+            .expect("read row_version_arrived_by_sync fixture"),
         "the decoded old-hub row cannot leave pulled provenance after the move"
     );
     assert_eq!(
@@ -153,7 +157,8 @@ async fn decoded_pull_row_obeys_sync_off_declared_before_apply() {
             TenantId::from(TENANT),
             hub_node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_task = tokio::spawn({
@@ -172,7 +177,8 @@ async fn decoded_pull_row_obeys_sync_off_declared_before_apply() {
             broker.client_as(&edge_node_id),
             TenantId::from(TENANT),
             edge_identity,
-        ),
+        )
+        .expect("construct SyncClient fixture"),
     );
 
     let pause = client.pause_after_pull_response_for_test();
@@ -196,7 +202,7 @@ async fn decoded_pull_row_obeys_sync_off_declared_before_apply() {
     assert!(
         edge.execute("SELECT * FROM notes WHERE id = 42", &HashMap::new())
             .expect("inspect edge after SYNC OFF")
-            .rows
+            .rows()
             .is_empty(),
         "a row decoded before SYNC OFF must still obey the declaration current at apply"
     );
@@ -206,16 +212,27 @@ async fn decoded_pull_row_obeys_sync_off_declared_before_apply() {
 
 #[test]
 fn in_memory_destination_move_selects_held_sync_arrivals_for_one_epoch() {
-    let db = Arc::new(Database::open_memory());
+    let root = tempfile::tempdir().expect("durable scratch stores");
+    let source = Database::open(root.path().join("source.db")).expect("source scratch store");
+    declare(&source);
+    let declared_through = source.current_lsn();
+    source
+        .execute(
+            "INSERT INTO notes (id, body) VALUES (1, 'inherited')",
+            &HashMap::new(),
+        )
+        .expect("author one remote row");
+    let db = Arc::new(Database::open(root.path().join("edge.db")).expect("edge scratch store"));
     declare(&db);
-    db.execute(
-        "INSERT INTO notes (id, body) VALUES (1, 'inherited')",
-        &HashMap::new(),
+    db.apply_changes(
+        source
+            .changes_since(declared_through)
+            .expect("remote row changes"),
+        &contextdb_engine::sync_types::ConflictPolicies::uniform(
+            contextdb_engine::sync_types::ConflictPolicy::LatestWins,
+        ),
     )
-    .expect("install one row");
-    let key = NaturalKey::single("id".to_string(), Value::Int64(1));
-    db.mark_row_arrived_by_sync_for_test("notes", &key, Lsn(40))
-        .expect("mark row as inherited");
+    .expect("receive the remote row into the durable scratch store");
 
     let old_broker = InProcessBroker::new();
     let _old_hub_transport = old_broker.server_as("old-hub");
@@ -226,7 +243,8 @@ fn in_memory_destination_move_selects_held_sync_arrivals_for_one_epoch() {
         old_broker.client_as(&edge_node_id),
         TenantId::from(TENANT),
         edge_identity.clone(),
-    );
+    )
+    .expect("construct SyncClient fixture");
     let ordinary = client
         .pending_push_change_count()
         .expect("ordinary pending count");
@@ -245,7 +263,8 @@ fn in_memory_destination_move_selects_held_sync_arrivals_for_one_epoch() {
         new_broker.client_as(&edge_node_id),
         TenantId::from(TENANT),
         edge_identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     assert!(
         db.destination_reupload_frontier(&TenantId::from(TENANT), "new-hub")
             .expect("read memory epoch")
@@ -288,7 +307,8 @@ fn old_same_hub_completion_cannot_retire_a_later_destination_epoch() {
         old_broker.client_as(&edge_node_id),
         TenantId::from(TENANT),
         edge_identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
 
     client
         .change_destination("hub-h")
@@ -341,7 +361,8 @@ fn destination_change_clears_old_hub_lost_ack_state_in_memory_and_on_disk() {
         broker.client_as(&edge_node_id),
         TenantId::from(TENANT),
         edge_identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     assert_eq!(
         client.pending_push_confirmation_for_test(),
         Lsn(77),
@@ -501,7 +522,9 @@ async fn old_hub_reply_finishing_after_move_cannot_restore_its_frontier() {
     edge.execute_in_tx(tx, "DELETE FROM notes WHERE id = 2", &HashMap::new())
         .expect("delete refused sibling");
     edge.commit(tx).expect("commit same-position source batch");
-    let batch = edge.changes_since(declaration_lsn);
+    let batch = edge
+        .changes_since(declaration_lsn)
+        .expect("read changes_since fixture");
     let row_lsn = batch
         .rows
         .iter()
@@ -558,7 +581,8 @@ async fn old_hub_reply_finishing_after_move_cannot_restore_its_frontier() {
             transport,
             TenantId::from(TENANT),
             identity.clone(),
-        ),
+        )
+        .expect("construct SyncClient fixture"),
     );
     assert_eq!(
         client
@@ -580,7 +604,8 @@ async fn old_hub_reply_finishing_after_move_cannot_restore_its_frontier() {
         broker.client_as(&edge_node_id),
         TenantId::from(TENANT),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     mover
         .change_destination("new-hub")
         .expect("move through the original handle after the scoped reply decoded");
@@ -616,7 +641,12 @@ async fn old_hub_reply_finishing_after_move_cannot_restore_its_frontier() {
     );
     assert!(
         !edge
-            .has_terminal_refusal_markers_for_test(&TenantId::from(TENANT), "old-hub")
+            .has_terminal_refusal_markers_for_test(
+                &TenantId::from(TENANT),
+                "old-hub",
+                edge.declared_reader_memory()
+                    .expect("declare refusal fixture reader")
+            )
             .expect("inspect stale refusal markers"),
         "the late old-hub refusal cannot leave reconciliation state"
     );
@@ -625,9 +655,12 @@ async fn old_hub_reply_finishing_after_move_cannot_restore_its_frontier() {
             .expect("inspect delete obligation after stale reply"),
         "the late old-hub refusal cannot retire the delete obligation"
     );
-    let (_, arrivals) = edge.changes_since_with_arrivals(Lsn(0));
+    let (_, arrivals) = edge
+        .changes_since_with_arrivals(Lsn(0))
+        .expect("read fixture changes and arrivals");
     let live = edge
         .changes_since(Lsn(0))
+        .expect("read changes_since fixture")
         .rows
         .into_iter()
         .find(|row| !row.deleted && row.natural_key == live_key)
@@ -653,7 +686,8 @@ fn post_move_schema_is_refused_until_received_origin_is_available() {
         broker.client_as(&edge_node_id),
         TenantId::from(TENANT),
         edge_identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     client
         .change_destination("new-hub")
         .expect("move destination");

@@ -346,6 +346,117 @@ async fn f35b_state_propagation_effects_sync_correctly() {
     );
 }
 
+/// Rows written with ordinary SQL on one store and received by another through
+/// sync leave the receiving store's history readable: what a push from the
+/// writer delivers, the receiver applies, and the receiver can then hand on its
+/// own outbound history -- what a further pull or push reads -- carrying each
+/// row's final state, never a refusal that its historical root does not match
+/// what it captured. Applying a received change set in process is a test seam;
+/// in a production build only the sync client applies one, which
+/// `f35b_state_propagation_effects_sync_correctly` drives end to end.
+#[cfg(feature = "test-seams")]
+fn assert_received_history_readable(name: &str, propagate: bool) {
+    let tmp = TempDir::new().expect("tempdir");
+    let parent_id = Uuid::from_u128(0x35e1);
+    let child_ids = [Uuid::from_u128(0x35e2), Uuid::from_u128(0x35e3)];
+    let writer = Database::open(temp_db_file(&tmp, &format!("{name}-writer.db")))
+        .expect("open the writing store");
+    let run = |sql: &str, bindings: &[(&str, Uuid)]| {
+        writer
+            .execute(
+                sql,
+                &bindings
+                    .iter()
+                    .map(|(name, id)| (name.to_string(), Value::Uuid(*id)))
+                    .collect(),
+            )
+            .unwrap_or_else(|error| panic!("{sql}: {error}"));
+    };
+    run(
+        "CREATE TABLE parents (id UUID PRIMARY KEY, status TEXT STATE_MACHINE(status: active -> archived)) SYNC CONFLICT KEEP LATEST",
+        &[],
+    );
+    run(
+        "CREATE TABLE children (id UUID PRIMARY KEY, parent_id UUID REFERENCES parents(id) ON STATE archived PROPAGATE SET archived, status TEXT STATE_MACHINE(status: active -> archived)) SYNC CONFLICT KEEP LATEST",
+        &[],
+    );
+    run(
+        "INSERT INTO parents (id, status) VALUES ($id, 'active')",
+        &[("id", parent_id)],
+    );
+    if propagate {
+        for child in child_ids {
+            run(
+                "INSERT INTO children (id, parent_id, status) VALUES ($id, $parent, 'active')",
+                &[("id", child), ("parent", parent_id)],
+            );
+        }
+    }
+    run(
+        "UPDATE parents SET status = 'archived' WHERE id = $id",
+        &[("id", parent_id)],
+    );
+    let pushed = writer
+        .changes_since(contextdb_core::Lsn(0))
+        .expect("the writer's outbound history is readable");
+    writer.close().expect("close the writing store");
+
+    let receiver = Database::open(temp_db_file(&tmp, &format!("{name}-receiver.db")))
+        .expect("open the receiving store");
+    receiver
+        .apply_changes(
+            pushed,
+            &contextdb_engine::sync_types::ConflictPolicies::uniform(
+                contextdb_engine::sync_types::ConflictPolicy::LatestWins,
+            ),
+        )
+        .expect("the receiving store applies what the writer pushed");
+    let onward = receiver
+        .changes_since(contextdb_core::Lsn(0))
+        .expect("the receiving store's own outbound history is readable after it applied the push");
+    let final_status = |table: &str, id: Uuid| {
+        onward
+            .rows
+            .iter()
+            .filter(|row| {
+                row.table == table && !row.deleted && row.values.get("id") == Some(&Value::Uuid(id))
+            })
+            .max_by_key(|row| row.lsn)
+            .and_then(|row| row.values.get("status").cloned())
+    };
+    assert_eq!(
+        final_status("parents", parent_id),
+        Some(Value::Text("archived".into())),
+        "the receiver hands on the parent's final state"
+    );
+    if propagate {
+        for child in child_ids {
+            assert_eq!(
+                final_status("children", child),
+                Some(Value::Text("archived".into())),
+                "the receiver hands on each child's propagated state"
+            );
+        }
+    }
+    receiver.close().expect("close the receiving store");
+}
+
+/// I archived a row with an ordinary UPDATE and pushed it, and the store that received it
+/// could hand its history on.
+#[cfg(feature = "test-seams")]
+#[test]
+fn f35e_a_received_ordinary_state_update_leaves_readable_history() {
+    assert_received_history_readable("f35e", false);
+}
+
+/// I archived a parent whose children archive with it and pushed it, and the store that
+/// received it could hand its history on with every propagated child state.
+#[cfg(feature = "test-seams")]
+#[test]
+fn f35f_a_received_propagated_state_update_leaves_readable_history() {
+    assert_received_history_readable("f35f", true);
+}
+
 /// I inserted entities and graph edges in a transaction, rolled it back, and neither the rows nor the edges existed afterward.
 #[test]
 fn f35c_graph_structure_atomicity_in_transactions() {
@@ -483,13 +594,13 @@ async fn f109_sync_preserves_graph_vector_relational_atomicity_end_to_end() {
             &empty_params(),
         )
         .expect("ANN query");
-    assert_eq!(ann_result.rows.len(), 1, "ANN query should return 1 row");
+    assert_eq!(ann_result.rows().len(), 1, "ANN query should return 1 row");
     let id_col_idx = ann_result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "id")
         .expect("id column in ANN result");
-    let returned_id = &ann_result.rows[0][id_col_idx];
+    let returned_id = &ann_result.rows()[0][id_col_idx];
     assert_eq!(
         *returned_id,
         Value::Uuid(Uuid::parse_str(id1).expect("uuid")),

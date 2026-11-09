@@ -137,6 +137,10 @@ fn seed_store(path: &Path) {
     database.close().expect("the fixture writer closes cleanly");
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn find_the_needles(session: &ReadSession) -> Result<contextdb_engine::QueryResult> {
     session.execute(
         "SELECT id FROM progress_rows WHERE marker = $marker",
@@ -176,7 +180,7 @@ fn a_scan_reports_the_answer_it_has_assembled_while_it_is_still_assembling_it() 
 
     let answered = find_the_needles(&session).expect("the scan answers");
     assert_eq!(
-        answered.rows.len(),
+        answered.rows().len(),
         NEEDLES.len(),
         "the fixture's findable rows are all found"
     );
@@ -252,7 +256,7 @@ fn opening_a_large_store_loads_no_row_bodies_before_the_first_read() {
         )
         .expect("the on-demand point read answers within the unchanged read budget");
     assert_eq!(
-        answered.rows,
+        answered.rows(),
         vec![vec![
             Value::Text("needle".to_owned()),
             Value::Text(payload(NEEDLES[2]))
@@ -307,7 +311,7 @@ fn every_read_a_session_runs_is_reported_not_only_its_first() {
 
     recorder.clear();
     let page = cursor.fetch(None).expect("fetch the cursor's next page");
-    assert!(!page.rows.is_empty(), "a later needle is on a later page");
+    assert!(!page.rows().is_empty(), "a later needle is on a later page");
     assert!(
         !recorder.of_phase(ReadPhase::Executing).is_empty(),
         "fetching a page reports its progress too, not only the open that preceded it"

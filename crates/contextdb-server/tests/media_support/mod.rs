@@ -6,7 +6,6 @@
 //! this module with `#[path = "media_support/mod.rs"] mod media_support;` and
 //! `use media_support::*;`. (The reclaim-driver test deliberately builds its
 //! `blob_job` WITHOUT `submitted_at_ms`, so it keeps its own local variant.)
-#![allow(dead_code)]
 
 use contextdb_engine::Database;
 use contextdb_engine::work_ledger::{

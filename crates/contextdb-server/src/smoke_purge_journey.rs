@@ -67,7 +67,8 @@ impl Hub {
                     .map_err(|_| "cannot declare purge verifier hub table".to_string())?;
             }
         }
-        let server = SyncServer::new(db.clone(), &endpoint, TenantId::from(tenant));
+        let server = SyncServer::new(db.clone(), &endpoint, TenantId::from(tenant))
+            .map_err(|e| format!("cannot construct smoke server: {e}"))?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn({
             let shutdown = shutdown.clone();
@@ -133,7 +134,8 @@ fn open_edge(
         db.clone(),
         &peer_dial_spec(ticket, &identity),
         TenantId::from(tenant),
-    );
+    )
+    .map_err(|e| format!("cannot construct smoke client: {e}"))?;
     Ok(Edge {
         db,
         client,
@@ -173,14 +175,13 @@ fn edit_note(db: &Database, id: Uuid, body: &str) -> Result<(), String> {
 }
 
 fn note_body(db: &Database, id: Uuid) -> Result<Option<String>, String> {
-    let rows = db
+    let result = db
         .execute(
             "SELECT body FROM notes WHERE id = $id",
             &HashMap::from([("id".to_string(), Value::Uuid(id))]),
         )
-        .map_err(|_| "cannot read purge verifier note".to_string())?
-        .rows;
-    match rows.as_slice() {
+        .map_err(|_| "cannot read purge verifier note".to_string())?;
+    match result.rows() {
         [] => Ok(None),
         [row] => match row.as_slice() {
             [Value::Text(body)] => Ok(Some(body.clone())),
@@ -209,8 +210,8 @@ fn work_job_ids(db: &Database) -> Result<Vec<String>, String> {
         &HashMap::new(),
     )
     .map_err(|_| "cannot read purge verifier work jobs".to_string())?
-    .rows
-    .into_iter()
+    .rows()
+    .iter()
     .map(|row| match row.as_slice() {
         [Value::Text(job_id)] => Ok(job_id.clone()),
         _ => Err("purge verifier work job has the wrong key type".to_string()),
@@ -223,9 +224,17 @@ fn inspect_snapshot_key(
     table: &str,
     column: &str,
     value: Value,
+    inspection_memory: &contextdb_engine::vector_read_memory::DeclaredReadRoot,
 ) -> Result<KeyInspection, String> {
     inspector
-        .inspect_key(table, &NaturalKey::single(column.to_string(), value), &[])
+        .inspect_key(
+            table,
+            &NaturalKey::single(column.to_string(), value),
+            &[],
+            inspection_memory
+                .child()
+                .map_err(|e| format!("cannot admit smoke key inspection: {e}"))?,
+        )
         .map_err(|_| "cannot inspect purge key state".to_string())
 }
 
@@ -238,9 +247,17 @@ fn export_key(
 ) -> Result<KeyInspection, String> {
     db.export_snapshot(artifact)
         .map_err(|_| "cannot export purge inspection snapshot".to_string())?;
-    let inspector = SnapshotInspector::open(artifact)
+    let inspection_memory =
+        contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+            db.owner_read_config().limits.limits.memory,
+        )
+        .map_err(|error| error.to_string())?;
+    let inspection_read = inspection_memory
+        .child()
+        .map_err(|e| format!("cannot admit smoke snapshot inspection: {e}"))?;
+    let inspector = SnapshotInspector::open(artifact, inspection_read, inspection_memory.clone())
         .map_err(|_| "cannot open purge inspection snapshot".to_string())?;
-    let report = inspect_snapshot_key(&inspector, table, column, value)?;
+    let report = inspect_snapshot_key(&inspector, table, column, value, &inspection_memory)?;
     inspector
         .close()
         .map_err(|_| "cannot close purge key inspector".to_string())?;
@@ -250,7 +267,15 @@ fn export_key(
 fn export_blob(db: &Database, artifact: &Path, hash: &BlobHash) -> Result<BlobInspection, String> {
     db.export_snapshot(artifact)
         .map_err(|_| "cannot export blob inspection snapshot".to_string())?;
-    let inspector = SnapshotInspector::open(artifact)
+    let inspection_memory =
+        contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+            db.owner_read_config().limits.limits.memory,
+        )
+        .map_err(|error| error.to_string())?;
+    let inspection_read = inspection_memory
+        .child()
+        .map_err(|e| format!("cannot admit smoke snapshot inspection: {e}"))?;
+    let inspector = SnapshotInspector::open(artifact, inspection_read, inspection_memory)
         .map_err(|_| "cannot open blob inspection snapshot".to_string())?;
     let report = inspector
         .inspect_blob(hash.as_bytes())
@@ -536,7 +561,7 @@ async fn run_copy_erasure(root: &Path) -> Result<(), String> {
             ]),
         )
         .map_err(|_| "cannot execute authoritative multi-row purge".to_string())?;
-    if purged_rows.rows_affected != 2 {
+    if purged_rows.rows_affected() != 2 {
         return Err("multi-row purge did not commit both selected rows".to_string());
     }
     let stale_commit = hub
@@ -557,7 +582,7 @@ async fn run_copy_erasure(root: &Path) -> Result<(), String> {
             &HashMap::new(),
         )
         .map_err(|_| "cannot purge selected detection job".to_string())?;
-    if purged_job.rows_affected != 1 {
+    if purged_job.rows_affected() != 1 {
         return Err("detection-job purge did not select exactly one job".to_string());
     }
     within(edge_a.client.pull_default())
@@ -681,8 +706,17 @@ async fn run_copy_erasure(root: &Path) -> Result<(), String> {
     hub.db
         .export_snapshot(&post_purge)
         .map_err(|_| "cannot export post-purge backup".to_string())?;
-    let backup_inspector = SnapshotInspector::open(&post_purge)
-        .map_err(|_| "cannot inspect post-purge backup".to_string())?;
+    let inspection_memory =
+        contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+            hub.db.owner_read_config().limits.limits.memory,
+        )
+        .map_err(|error| error.to_string())?;
+    let inspection_read = inspection_memory
+        .child()
+        .map_err(|e| format!("cannot admit smoke snapshot inspection: {e}"))?;
+    let backup_inspector =
+        SnapshotInspector::open(&post_purge, inspection_read, inspection_memory.clone())
+            .map_err(|_| "cannot inspect post-purge backup".to_string())?;
     for (name, table, column, value) in [
         ("first selected row", "notes", "id", Value::Uuid(selected)),
         (
@@ -698,7 +732,8 @@ async fn run_copy_erasure(root: &Path) -> Result<(), String> {
             Value::Text("selected-detection-job".to_string()),
         ),
     ] {
-        let report = inspect_snapshot_key(&backup_inspector, table, column, value)?;
+        let report =
+            inspect_snapshot_key(&backup_inspector, table, column, value, &inspection_memory)?;
         require_purged_key(&report, &format!("post-purge backup {name}"))?;
     }
     let backup_blob = backup_inspector
@@ -819,7 +854,8 @@ async fn run_recreated_generation(root: &Path) -> Result<(), String> {
         restored.clone(),
         &peer_dial_spec(&hub.ticket, &source.identity),
         TenantId::from(tenant),
-    );
+    )
+    .map_err(|e| format!("cannot construct smoke client: {e}"))?;
     let replay = within(client.push())
         .await?
         .map_err(|_| "old-generation replay did not return a result".to_string())?;
@@ -909,7 +945,15 @@ async fn run_recreated_generation(root: &Path) -> Result<(), String> {
 fn sync_state(db: &Database, artifact: &Path) -> Result<JsonValue, String> {
     db.export_snapshot(artifact)
         .map_err(|_| "cannot export purge state fingerprint".to_string())?;
-    let inspector = SnapshotInspector::open(artifact)
+    let inspection_memory =
+        contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+            db.owner_read_config().limits.limits.memory,
+        )
+        .map_err(|error| error.to_string())?;
+    let inspection_read = inspection_memory
+        .child()
+        .map_err(|e| format!("cannot admit smoke snapshot inspection: {e}"))?;
+    let inspector = SnapshotInspector::open(artifact, inspection_read, inspection_memory)
         .map_err(|_| "cannot open purge state fingerprint".to_string())?;
     let state = inspector
         .inspect_sync_apply_state()
@@ -1066,14 +1110,13 @@ async fn run_stale_and_fresh(root: &Path) -> Result<(), String> {
 }
 
 fn push_only_body(db: &Database, id: Uuid) -> Result<Option<String>, String> {
-    let rows = db
+    let result = db
         .execute(
             "SELECT body FROM push_only_notes WHERE id = $id",
             &HashMap::from([("id".to_string(), Value::Uuid(id))]),
         )
-        .map_err(|_| "cannot read push-only purge row".to_string())?
-        .rows;
-    match rows.as_slice() {
+        .map_err(|_| "cannot read push-only purge row".to_string())?;
+    match result.rows() {
         [] => Ok(None),
         [row] => match row.as_slice() {
             [Value::Text(body)] => Ok(Some(body.clone())),
@@ -1162,7 +1205,8 @@ async fn run_push_only(root: &Path) -> Result<(), String> {
         stale_db.clone(),
         &peer_dial_spec(&hub.ticket, &edge.identity),
         TenantId::from(tenant),
-    );
+    )
+    .map_err(|e| format!("cannot construct smoke client: {e}"))?;
     let refusal = within(stale_client.push())
         .await?
         .map_err(|_| "stale push-only replay did not return a result".to_string())?;
@@ -1231,9 +1275,9 @@ async fn run_shared_blob(root: &Path) -> Result<(), String> {
             &HashMap::new(),
         )
         .map_err(|_| "cannot purge one shared-media referent".to_string())?;
-    let report = serde_json::to_string(&first.rows)
+    let report = serde_json::to_string(first.rows())
         .map_err(|_| "cannot serialize shared-media purge report".to_string())?;
-    if first.rows_affected != 1 || !report.contains("remaining-job") {
+    if first.rows_affected() != 1 || !report.contains("remaining-job") {
         return Err("shared-media purge did not name the surviving referent".to_string());
     }
     if work_job_ids(&hub.db)? != vec!["remaining-job".to_string()] {
@@ -1255,7 +1299,7 @@ async fn run_shared_blob(root: &Path) -> Result<(), String> {
             &HashMap::new(),
         )
         .map_err(|_| "cannot purge final shared-media referent".to_string())?;
-    if final_purge.rows_affected != 1 || !work_job_ids(&hub.db)?.is_empty() {
+    if final_purge.rows_affected() != 1 || !work_job_ids(&hub.db)?.is_empty() {
         return Err("final shared-media purge did not remove the remaining job".to_string());
     }
     let destroyed = export_blob(&hub.db, &case.join("shared-destroyed.snapshot"), &hash)?;
@@ -1441,7 +1485,8 @@ async fn run_wrong_hub(root: &Path) -> Result<(), String> {
         edge.db.clone(),
         &peer_dial_spec(&wrong.ticket, &edge.identity),
         TenantId::from(tenant),
-    );
+    )
+    .map_err(|e| format!("cannot construct smoke client: {e}"))?;
     within(wrong_client.ensure_connected())
         .await?
         .map_err(|_| "cannot authenticate wrong-hub fixture".to_string())?;
@@ -1502,7 +1547,11 @@ async fn run_forged_push(root: &Path) -> Result<(), String> {
         vec![0.0, 1.0, 0.0],
     )?;
     let push_watermark = edge.client.push_watermark();
-    let mut changeset = WireChangeSet::from(edge.db.changes_since(push_watermark));
+    let mut changeset = WireChangeSet::from(
+        edge.db
+            .changes_since(push_watermark)
+            .map_err(|e| format!("cannot read smoke changes: {e}"))?,
+    );
     if changeset.rows.is_empty() {
         return Err("forged-push fixture has no ordinary sibling row".to_string());
     }
@@ -1552,7 +1601,10 @@ async fn run_forged_push(root: &Path) -> Result<(), String> {
         return Err("forged push partially mutated hub payload or progress".to_string());
     }
     let hub_state_after = sync_state(&hub.db, &case.join("after-forged-push.snapshot"))?;
-    let contact_changes = hub.db.change_log_since(hub_lsn_before);
+    let contact_changes = hub
+        .db
+        .change_log_since(hub_lsn_before)
+        .map_err(|error| format!("cannot read change log after forged push: {error}"))?;
     if !contact_changes.iter().all(|entry| {
         matches!(
             entry,

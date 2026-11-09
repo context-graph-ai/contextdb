@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -46,7 +46,8 @@ fn assert_has_tables(db: &Database, tables: &[&str], what: &str) {
 fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
     db.execute(sql, &p())
         .unwrap_or_else(|e| panic!("query `{sql}` failed: {e}"))
-        .rows
+        .rows()
+        .to_vec()
 }
 
 fn dir_names(dir: &Path) -> Vec<String> {
@@ -281,7 +282,8 @@ fn ce04_vectors_round_trip_search_results_equal() {
             &params(vec![("q", Value::Vector(vec![1.0_f32, 0.0, 0.0]))]),
         )
         .unwrap_or_else(|e| panic!("vector search failed: {e}"))
-        .rows
+        .rows()
+        .to_vec()
         .into_iter()
         .map(|mut r| r.remove(0))
         .collect()
@@ -312,19 +314,19 @@ fn ce04_vectors_round_trip_search_results_equal() {
             "search_mode",
             "declared_auto_index_at",
             "effective_auto_index_at",
-            "declared_hnsw_m",
-            "declared_hnsw_ef_construction",
-            "declared_hnsw_ef_search",
+            "declared_lists",
+            "declared_probes",
+            "declared_refine_factor",
         ];
         let positions = stable_catalog_columns.map(|name| {
             result
-                .columns
+                .columns()
                 .iter()
                 .position(|column| column == name)
                 .unwrap_or_else(|| panic!("SHOW VECTOR_INDEXES omitted {name}"))
         });
         result
-            .rows
+            .rows()
             .iter()
             .map(|row| {
                 format!(
@@ -394,28 +396,30 @@ fn ce06_persisted_config_round_trip_disk_limit() {
     let expected_bytes = Value::Int64(1024 * 1024 * 1024);
     let before = src.execute("SHOW DISK_LIMIT", &p()).unwrap();
     assert_eq!(
-        before.rows[0][0], expected_bytes,
+        before.rows()[0][0],
+        expected_bytes,
         "precondition: source SHOW DISK_LIMIT must reflect the set limit at the `limit` cell: {:?}",
-        before.rows
+        before.rows()
     );
 
     src.export_snapshot(&dest).unwrap();
     let artifact = Database::open(&dest).unwrap();
     let after = artifact.execute("SHOW DISK_LIMIT", &p()).unwrap();
     assert_eq!(
-        after.columns,
+        after.columns(),
         vec!["limit", "used", "available", "startup_ceiling"],
         "SHOW DISK_LIMIT column shape on the artifact"
     );
     assert_eq!(
-        after.rows.len(),
+        after.rows().len(),
         1,
         "SHOW DISK_LIMIT returns exactly one row"
     );
     assert_eq!(
-        after.rows[0][0], expected_bytes,
+        after.rows()[0][0],
+        expected_bytes,
         "persisted DISK_LIMIT must survive export at the exact `limit` cell; artifact row: {:?}",
-        after.rows
+        after.rows()
     );
 }
 
@@ -423,7 +427,17 @@ fn ce06_persisted_config_round_trip_disk_limit() {
 // CE07 — cron schedule round-trip: fires on the artifact. RED.
 // ---------------------------------------------------------------------------
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn ce07_cron_schedule_round_trip_fires_on_artifact() {
+    let _tickler = Database::suppress_cron_tickler_for_test();
+    let now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let now = now.clone();
+        contextdb_core::Wallclock::test_clock_guard(move || now.load(Ordering::SeqCst))
+    };
     let (_tmp, src, dest) = new_export_fixture();
 
     src.execute("CREATE TABLE cron_log (id UUID PRIMARY KEY)", &p())
@@ -460,18 +474,16 @@ fn ce07_cron_schedule_round_trip_fires_on_artifact() {
         })
         .unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut count = baseline;
-    while Instant::now() < deadline {
-        count = artifact
-            .scan("cron_log", artifact.snapshot())
-            .map(|r| r.len())
-            .unwrap_or(0);
-        if count > baseline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    now.fetch_add(201, Ordering::SeqCst);
+    let read_memory = artifact.declared_reader_memory().unwrap();
+    let mut copy_owner = contextdb_engine::vector_read_memory::admission(read_memory.clone());
+    artifact
+        .cron_dispatch_due_without_wait_for_test(&mut copy_owner, read_memory)
+        .unwrap();
+    let count = artifact
+        .scan("cron_log", artifact.snapshot())
+        .map(|r| r.len())
+        .unwrap_or(0);
     assert!(
         count > baseline,
         "exported CREATE SCHEDULE must fire on the reopened artifact; baseline {baseline}, count {count}"
@@ -482,6 +494,10 @@ fn ce07_cron_schedule_round_trip_fires_on_artifact() {
 // CE08 — trigger declaration round-trip: registers and fires on artifact. RED.
 // ---------------------------------------------------------------------------
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn ce08_trigger_declaration_round_trip_fires_on_artifact() {
     let (_tmp, src, dest) = new_export_fixture();
 
@@ -519,15 +535,7 @@ fn ce08_trigger_declaration_round_trip_fires_on_artifact() {
         )
         .unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut audit_rows = Vec::new();
-    while Instant::now() < deadline {
-        audit_rows = rows(&artifact, "SELECT id, kind FROM audit");
-        if !audit_rows.is_empty() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let audit_rows = rows(&artifact, "SELECT id, kind FROM audit");
     assert_eq!(
         audit_rows,
         vec![vec![Value::Uuid(row_id), Value::Text("measurement".into())]],
@@ -581,8 +589,10 @@ fn ce09_event_bus_definitions_and_durable_queue_round_trip() {
 
     let received: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let received_cb = received.clone();
+    let (delivered_tx, delivered_rx) = std::sync::mpsc::channel();
     let reg = artifact.register_sink("slack", None, move |event| {
         received_cb.lock().unwrap().push(event.clone());
+        delivered_tx.send(()).unwrap();
         Ok(())
     });
     assert!(
@@ -590,10 +600,9 @@ fn ce09_event_bus_definitions_and_durable_queue_round_trip() {
         "sink definition must survive export; registration failed: {reg:?}"
     );
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && received.lock().unwrap().is_empty() {
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    delivered_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("sink delivery never delivered");
     {
         let events = received.lock().unwrap();
         assert_eq!(
@@ -617,10 +626,9 @@ fn ce09_event_bus_definitions_and_durable_queue_round_trip() {
             &p(),
         )
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && received.lock().unwrap().len() < 2 {
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    delivered_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("sink delivery never delivered");
     let events = received.lock().unwrap();
     assert_eq!(
         events.len(),
@@ -674,7 +682,7 @@ fn ce10_retention_metadata_round_trip_artifact_prunes_after_ttl() {
 
     // Advance 3 s past the row's stamped time — beyond the 2 s TTL.
     mock_now.fetch_add(3_000, AtomicOrdering::SeqCst);
-    let pruned = artifact.run_pruning_cycle();
+    let pruned = artifact.run_pruning_cycle().unwrap();
     assert!(
         pruned > 0,
         "RETAIN metadata must survive export: artifact pruning must delete the expired row, pruned {pruned}"
@@ -726,7 +734,7 @@ fn ce11_expired_unpruned_row_exported_and_source_pruning_resumes() {
     src.export_snapshot(&dest).unwrap();
 
     // Positive arm: retention on the source works right after export.
-    let pruned = src.run_pruning_cycle();
+    let pruned = src.run_pruning_cycle().unwrap();
     assert!(
         pruned > 0,
         "source pruning must resume after export, pruned {pruned}"
@@ -751,7 +759,12 @@ fn ce11_expired_unpruned_row_exported_and_source_pruning_resumes() {
 // boundary, no torn insert/update pairs, writer never blocked. RED.
 // ---------------------------------------------------------------------------
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn ce12_export_under_concurrent_writers_lands_on_single_commit_boundary() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
     let (_tmp, src, dest) = new_export_fixture();
 
     src.execute("CREATE TABLE pair_a (id INTEGER PRIMARY KEY, v TEXT)", &p())
@@ -770,8 +783,20 @@ fn ce12_export_under_concurrent_writers_lands_on_single_commit_boundary() {
     let lsn_pre = src.current_lsn();
     let stop = AtomicBool::new(false);
     let committed = AtomicU64::new(0);
+    let pause = src.pause_after_export_snapshot_capture_for_test();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel();
+    let (landed_tx, landed_rx) = std::sync::mpsc::channel();
+    let (finish_tx, finish_rx) = std::sync::mpsc::channel();
     let report = std::thread::scope(|scope| {
-        let writer = scope.spawn(|| {
+        let writer_src = &src;
+        let writer_stop = &stop;
+        let writer_committed = &committed;
+        let writer = scope.spawn(move || {
+            let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
+            let src = writer_src;
+            let stop = writer_stop;
+            let committed = writer_committed;
             // Each commit inserts pair i ('orig') AND seals pair i-1, all in
             // one transaction. Committed state after commit i is therefore
             // exactly: ids 0..=i, v == 'sealed' for id < i, 'orig' for id == i.
@@ -805,20 +830,47 @@ fn ce12_export_under_concurrent_writers_lands_on_single_commit_boundary() {
                 .expect("writer update in pair_b");
                 src.commit(tx)
                     .expect("writer commits must not be blocked or fail during export");
-                committed.fetch_add(1, Ordering::SeqCst);
+                let count = committed.fetch_add(1, Ordering::SeqCst) + 1;
+                if count == 5 {
+                    ready_tx.send(()).unwrap();
+                    go_rx
+                        .recv_timeout(Duration::from_secs(60))
+                        .expect("export capture release never delivered");
+                } else if count == 7 {
+                    landed_tx.send(()).unwrap();
+                    finish_rx
+                        .recv_timeout(Duration::from_secs(60))
+                        .expect("writer finish never delivered");
+                }
             }
         });
-        // Forced overlap: wait until the writer is demonstrably committing,
-        // export while it is still running, stop it only AFTER export returns.
-        while committed.load(Ordering::SeqCst) < 5 {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        ready_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("writer readiness never delivered");
         let committed_at_export_start = committed.load(Ordering::SeqCst);
-        let report = src
-            .export_snapshot(&dest)
+        let exporter = scope.spawn(|| {
+            let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
+            src.export_snapshot(&dest)
+        });
+        assert!(
+            pause.wait_until_reached(Duration::from_secs(60)),
+            "export capture never delivered"
+        );
+        go_tx.send(()).unwrap();
+        if landed_rx.recv_timeout(Duration::from_secs(60)).is_err() {
+            stop.store(true, Ordering::SeqCst);
+            pause.release();
+            let _ = finish_tx.send(());
+            panic!("two writer commits never delivered");
+        }
+        pause.release();
+        let report = exporter
+            .join()
+            .expect("export thread completes")
             .expect("export under concurrent writers must succeed");
         let committed_at_export_end = committed.load(Ordering::SeqCst);
         stop.store(true, Ordering::SeqCst);
+        finish_tx.send(()).unwrap();
         assert!(
             committed_at_export_end >= committed_at_export_start + 2,
             "commits must keep landing WHILE export runs (got {} -> {}); \
@@ -877,7 +929,12 @@ fn ce12_export_under_concurrent_writers_lands_on_single_commit_boundary() {
 // committed in one tx are never torn across relational and graph stores. RED.
 // ---------------------------------------------------------------------------
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn ce13_export_under_concurrent_writers_never_tears_row_edge_commits() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
     let (_tmp, src, dest) = new_export_fixture();
 
     src.execute("CREATE TABLE nodes (id UUID PRIMARY KEY)", &p())
@@ -897,8 +954,20 @@ fn ce13_export_under_concurrent_writers_never_tears_row_edge_commits() {
 
     let stop = AtomicBool::new(false);
     let committed = AtomicU64::new(0);
+    let pause = src.pause_after_export_snapshot_capture_for_test();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel();
+    let (landed_tx, landed_rx) = std::sync::mpsc::channel();
+    let (finish_tx, finish_rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
-        let writer = scope.spawn(|| {
+        let writer_src = &src;
+        let writer_stop = &stop;
+        let writer_committed = &committed;
+        let writer = scope.spawn(move || {
+            let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
+            let src = writer_src;
+            let stop = writer_stop;
+            let committed = writer_committed;
             let mut i: u128 = 0;
             while !stop.load(Ordering::SeqCst) {
                 let node = Uuid::from_u128(0xCE13_1000 + i);
@@ -914,19 +983,47 @@ fn ce13_export_under_concurrent_writers_never_tears_row_edge_commits() {
                     .expect("writer insert edge");
                 src.commit(tx)
                     .expect("writer commits must not be blocked or fail during export");
-                committed.fetch_add(1, Ordering::SeqCst);
+                let count = committed.fetch_add(1, Ordering::SeqCst) + 1;
+                if count == 5 {
+                    ready_tx.send(()).unwrap();
+                    go_rx
+                        .recv_timeout(Duration::from_secs(60))
+                        .expect("export capture release never delivered");
+                } else if count == 7 {
+                    landed_tx.send(()).unwrap();
+                    finish_rx
+                        .recv_timeout(Duration::from_secs(60))
+                        .expect("writer finish never delivered");
+                }
             }
         });
-        // Forced overlap: export only once the writer is demonstrably
-        // committing; stop it only AFTER export returns.
-        while committed.load(Ordering::SeqCst) < 5 {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        ready_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("writer readiness never delivered");
         let committed_at_export_start = committed.load(Ordering::SeqCst);
-        src.export_snapshot(&dest)
+        let exporter = scope.spawn(|| {
+            let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
+            src.export_snapshot(&dest)
+        });
+        assert!(
+            pause.wait_until_reached(Duration::from_secs(60)),
+            "export capture never delivered"
+        );
+        go_tx.send(()).unwrap();
+        if landed_rx.recv_timeout(Duration::from_secs(60)).is_err() {
+            stop.store(true, Ordering::SeqCst);
+            pause.release();
+            let _ = finish_tx.send(());
+            panic!("two writer commits never delivered");
+        }
+        pause.release();
+        let _report = exporter
+            .join()
+            .expect("export thread completes")
             .expect("export under concurrent writers must succeed");
         let committed_at_export_end = committed.load(Ordering::SeqCst);
         stop.store(true, Ordering::SeqCst);
+        finish_tx.send(()).unwrap();
         assert!(
             committed_at_export_end >= committed_at_export_start + 2,
             "row+edge commits must keep landing WHILE export runs (got {} -> {})",
@@ -966,6 +1063,10 @@ fn ce13_export_under_concurrent_writers_never_tears_row_edge_commits() {
 // CE14 — in-memory source round-trip: rows, vectors, edges. RED.
 // ---------------------------------------------------------------------------
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn ce14_in_memory_source_round_trip() {
     let tmp = TempDir::new().unwrap();
     let dest = tmp.path().join("artifact.db");
@@ -1023,7 +1124,7 @@ fn ce14_in_memory_source_round_trip() {
         )
         .unwrap_or_else(|e| panic!("artifact vector search failed: {e}"));
     assert_eq!(
-        near.rows,
+        near.rows(),
         vec![vec![Value::Int64(2)]],
         "vector search on the artifact must find the in-memory source's nearest row"
     );
@@ -1565,10 +1666,14 @@ fn ce21_export_during_open_transaction_excludes_uncommitted_state() {
 // ---------------------------------------------------------------------------
 // CE22 — vector completeness at scale: 999 vectors round-trip with exact
 // searchable id set and pinned beacon neighbors. RED.
-// (999, not 1000: HNSW_THRESHOLD is 1000, so 999 keeps both sides on the
+// (999, not 1000: the default AUTO_INDEX_AT is 1000, so 999 keeps both sides on the
 // brute-force-exact search path and the full-recall assertion deterministic.)
 // ---------------------------------------------------------------------------
 #[test]
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn ce22_vector_index_completeness_at_scale() {
     let (_tmp, src, dest) = new_export_fixture();
 
@@ -1621,7 +1726,7 @@ fn ce22_vector_index_completeness_at_scale() {
             )]),
         )
         .unwrap_or_else(|e| panic!("{what}: wide vector query failed: {e}"))
-        .rows
+        .rows()
         .into_iter()
         .map(|r| match &r[0] {
             Value::Uuid(u) => *u,
@@ -1630,18 +1735,18 @@ fn ce22_vector_index_completeness_at_scale() {
         .collect()
     };
     let top1 = |db: &Database, axis: usize, what: &str| -> Value {
-        let mut result = db
+        let result = db
             .execute(
                 "SELECT id FROM corpus ORDER BY embedding <=> $q LIMIT 1",
                 &params(vec![("q", Value::Vector(beacon(axis)))]),
             )
             .unwrap_or_else(|e| panic!("{what}: beacon query failed: {e}"));
         assert_eq!(
-            result.rows.len(),
+            result.rows().len(),
             1,
             "{what}: beacon query must return exactly one row"
         );
-        result.rows.remove(0).remove(0)
+        result.rows().to_vec().remove(0).remove(0)
     };
     let expected_ids: BTreeSet<Uuid> = (0..999_u128).map(uuid_for).collect();
 
@@ -1714,7 +1819,7 @@ fn checkpoint_preserves_current_and_historical_vectors_in_every_quantization() {
     let artifact = Database::open(&dest).unwrap();
     let sql = "SELECT f32, sq8, sq4 FROM vector_history WHERE id = 1";
     assert_eq!(
-        artifact.execute(sql, &p()).unwrap().rows,
+        artifact.execute(sql, &p()).unwrap().rows(),
         vec![vec![
             stored_vector(&current, VectorQuantization::F32),
             stored_vector(&current, VectorQuantization::SQ8),
@@ -1725,7 +1830,7 @@ fn checkpoint_preserves_current_and_historical_vectors_in_every_quantization() {
         artifact
             .execute_at_snapshot(sql, &p(), old_snapshot)
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![
             stored_vector(&old, VectorQuantization::F32),
             stored_vector(&old, VectorQuantization::SQ8),
@@ -1735,6 +1840,10 @@ fn checkpoint_preserves_current_and_historical_vectors_in_every_quantization() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn checkpoint_uses_one_pinned_durable_source_while_history_pruning_waits() {
     let (_tmp, src, dest) = new_export_fixture();
     src.execute(
@@ -1751,7 +1860,7 @@ fn checkpoint_uses_one_pinned_durable_source_while_history_pruning_waits() {
     )
     .unwrap();
     let old_snapshot = src.snapshot();
-    let old_pin = src.pin_snapshot(old_snapshot);
+    let old_pin = src.pin_snapshot(old_snapshot).unwrap();
     src.execute(
         "UPDATE checkpoint_history SET embedding = $embedding WHERE id = 1",
         &params(vec![("embedding", Value::Vector(captured.to_vec()))]),
@@ -1802,7 +1911,7 @@ fn checkpoint_uses_one_pinned_durable_source_while_history_pruning_waits() {
     let artifact = Database::open(&dest).unwrap();
     let sql = "SELECT embedding FROM checkpoint_history WHERE id = 1";
     assert_eq!(
-        artifact.execute(sql, &p()).unwrap().rows,
+        artifact.execute(sql, &p()).unwrap().rows(),
         vec![vec![Value::Vector(captured.to_vec())]],
         "the artifact uses the durable source captured before the later commit"
     );
@@ -1810,12 +1919,12 @@ fn checkpoint_uses_one_pinned_durable_source_while_history_pruning_waits() {
         artifact
             .execute_at_snapshot(sql, &p(), old_snapshot)
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Vector(first.to_vec())]],
         "the registered historical version remains usable in the artifact"
     );
     assert_eq!(
-        src.execute(sql, &p()).unwrap().rows,
+        src.execute(sql, &p()).unwrap().rows(),
         vec![vec![Value::Vector(later.to_vec())]],
         "the source continued past the checkpoint boundary"
     );

@@ -55,9 +55,9 @@ fn run_filtered_query(db: &Database, rows_examined_limit: u64) {
             ]),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 500);
-    assert_eq!(result.trace.physical_plan, "IndexScan");
-    assert!(result.trace.sort_elided);
+    assert_eq!(result.rows().len(), 500);
+    assert_eq!(result.trace().physical_plan, "IndexScan");
+    assert!(result.trace().sort_elided);
     assert!(
         db.__rows_examined() <= rows_examined_limit,
         "IndexScan must not examine the full 5K table; got {}",
@@ -86,6 +86,10 @@ fn timed_queries_and_assert(db: &Database) {
 }
 
 fn bench_entity_list_filter_under_budget(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function("entity_list_filter_under_budget", |_| {});
+        return;
+    }
     seed_and_assert();
     c.bench_function("entity_list_filter_under_budget", |b| {
         b.iter_batched(

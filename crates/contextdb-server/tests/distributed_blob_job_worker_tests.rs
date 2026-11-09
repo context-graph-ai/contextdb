@@ -110,7 +110,8 @@ async fn blob_ref_job_resolves_and_executes_via_worker_loop() {
             broker.client_as(&holder_node),
             contextdb_core::TenantId::from(tenant),
             holder_identity,
-        ),
+        )
+        .expect("construct SyncClient fixture"),
     );
     let holder_blob_store = BlobStore::new(
         holder_db.clone(),
@@ -138,9 +139,12 @@ async fn blob_ref_job_resolves_and_executes_via_worker_loop() {
     // Binding + serving registers the holder's ticket in the peer
     // directory too, which rides the next push like any other coordination
     // row.
-    let holder_endpoint = within(holder_blob_store.bind_and_serve_for_test(&holder_key))
-        .await
-        .expect("bind holder endpoint");
+    let holder_endpoint = within(
+        holder_blob_store
+            .bind_and_serve_for_test(&holder_key, holder_db.declared_read_request_provider()),
+    )
+    .await
+    .expect("bind holder endpoint");
 
     submit_job(
         &holder_db,
@@ -165,7 +169,8 @@ async fn blob_ref_job_resolves_and_executes_via_worker_loop() {
         broker.client_as(&worker_node),
         contextdb_core::TenantId::from(tenant),
         worker_identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     let worker_blob_store = Arc::new(BlobStore::new(
         worker_db.clone(),
         MovementPolicy {

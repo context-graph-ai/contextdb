@@ -143,8 +143,8 @@ fn vector_policy_spellings_preserve_values_and_defaults_on_create_add_and_alter(
     use contextdb_parser::{AlterAction, VectorPolicyValue, VectorSearchMode};
 
     for declaration in [
-        "VECTOR(3) WITH (quantization = 'SQ8') PARTITION_KEY (scope_id) MAX_PARTITIONS 8 SEARCH_MODE INDEXED AUTO_INDEX_AT 17 HNSW (EF_SEARCH = DEFAULT, M = 12, EF_CONSTRUCTION = 64)",
-        "vector(3) with (quantization = 'SQ8') partition_key (scope_id) max_partitions 8 search_mode indexed auto_index_at 17 hnsw (ef_search = default, m = 12, ef_construction = 64)",
+        "VECTOR(3) WITH (quantization = 'SQ8') PARTITION_KEY (scope_id) MAX_PARTITIONS 8 SEARCH_MODE INDEXED AUTO_INDEX_AT 17 IVF (PROBES = DEFAULT)",
+        "vector(3) with (quantization = 'SQ8') partition_key (scope_id) max_partitions 8 search_mode indexed auto_index_at 17 IVF (PROBES = default)",
     ] {
         for sql in [
             format!(
@@ -164,12 +164,9 @@ fn vector_policy_spellings_preserve_values_and_defaults_on_create_add_and_alter(
             assert_eq!(column.max_partitions.as_deref(), Some("8"));
             assert_eq!(column.search_mode, Some(VectorSearchMode::Indexed));
             assert_eq!(column.auto_index_at.as_deref(), Some("17"));
-            assert_eq!(column.hnsw.m, Some(VectorPolicyValue::Value("12".into())));
-            assert_eq!(
-                column.hnsw.ef_construction,
-                Some(VectorPolicyValue::Value("64".into()))
-            );
-            assert_eq!(column.hnsw.ef_search, Some(VectorPolicyValue::Default));
+            assert_eq!(column.ivf.lists, None);
+            assert_eq!(column.ivf.probes, Some(VectorPolicyValue::Default));
+            assert_eq!(column.ivf.refine_factor, None);
         }
     }
     for (suffix, expected) in [
@@ -186,31 +183,31 @@ fn vector_policy_spellings_preserve_values_and_defaults_on_create_add_and_alter(
         };
         assert_eq!(auto_index_at.as_deref(), expected);
     }
-    let Statement::AlterTable(table) = parse_sql(
-        "ALTER TABLE vector_items ALTER COLUMN embedding SET hnsw (ef_search = default, M = 12)",
-    ) else {
+    let Statement::AlterTable(table) =
+        parse_sql("ALTER TABLE vector_items ALTER COLUMN embedding SET IVF (PROBES = default)")
+    else {
         panic!("expected ALTER TABLE")
     };
-    let AlterAction::SetVectorHnsw {
-        hnsw: Some(policy), ..
+    let AlterAction::SetVectorIvf {
+        ivf: Some(policy), ..
     } = table.action
     else {
-        panic!("expected grouped HNSW change")
+        panic!("expected grouped IVF change")
     };
-    assert_eq!(policy.m, Some(VectorPolicyValue::Value("12".into())));
     assert_eq!(
-        policy.ef_construction, None,
+        policy.lists, None,
         "omission keeps the existing declaration"
     );
-    assert_eq!(policy.ef_search, Some(VectorPolicyValue::Default));
+    assert_eq!(policy.probes, Some(VectorPolicyValue::Default));
+    assert_eq!(policy.refine_factor, None);
     let Statement::AlterTable(table) =
-        parse_sql("ALTER TABLE vector_items ALTER COLUMN embedding SET HNSW DEFAULT")
+        parse_sql("ALTER TABLE vector_items ALTER COLUMN embedding SET IVF DEFAULT")
     else {
         panic!("expected ALTER TABLE")
     };
     assert!(matches!(
         table.action,
-        AlterAction::SetVectorHnsw { hnsw: None, .. }
+        AlterAction::SetVectorIvf { ivf: None, .. }
     ));
 }
 
@@ -221,14 +218,14 @@ fn vector_declarations_and_queries_reject_reordered_or_repeated_clauses() {
         "MAX_PARTITIONS 8 PARTITION_KEY (scope_id)",
         "PARTITION_KEY (scope_id) SEARCH_MODE AUTO MAX_PARTITIONS 8",
         "AUTO_INDEX_AT 17 SEARCH_MODE AUTO",
-        "HNSW (M = 12) AUTO_INDEX_AT 17",
+        "IVF (PROBES = 12) AUTO_INDEX_AT 17",
         "AUTO_INDEX_AT 17 AUTO_INDEX_AT 18",
-        "HNSW (M = 12) HNSW (EF_SEARCH = 17)",
-        "HNSW ()",
-        "HNSW (M = 12, m = 16)",
-        "HNSW (UNKNOWN = 12)",
-        "HNSW (M 12)",
-        "HNSW (M = 12 EF_SEARCH = 17)",
+        "IVF (PROBES = 12) IVF (REFINE_FACTOR = 2)",
+        "IVF ()",
+        "IVF (PROBES = 12, probes = 16)",
+        "IVF (UNKNOWN = 12)",
+        "IVF (PROBES 12)",
+        "IVF (PROBES = 12 REFINE_FACTOR = 2)",
     ] {
         for sql in [
             format!(

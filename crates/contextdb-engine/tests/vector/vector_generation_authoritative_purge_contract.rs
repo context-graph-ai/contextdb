@@ -1,19 +1,17 @@
-//! Authoritative-purge cleanup contract for maintained vector generations.
+//! Authoritative-purge contract for partitioned vector columns.
 //!
 //! The public `PURGE` door permanently removes one selected lineage.  For a
-//! partitioned vector index, that removal must retire saved graph state only
-//! for the partition whose last vector was purged.  A neighbour partition is
-//! still entitled to keep and use its already-maintained route.
+//! partitioned vector column, that removal must remove the vectors of the
+//! selected partition only.  A neighbour partition keeps every vector and its
+//! answers, before and after a clean reopen.
 
-use contextdb_core::{Value, VectorIndexRef, VectorPartitionKey};
-use contextdb_engine::{Database, MaintenancePolicy, QueryResult};
-use contextdb_vector::VectorPartitionRef;
+use contextdb_core::Value;
+use contextdb_engine::{Database, QueryResult};
 use std::collections::HashMap;
 use tempfile::TempDir;
 use uuid::Uuid;
 
 const ROWS_PER_PARTITION: usize = 8;
-const MAX_MAINTENANCE_CYCLES: usize = 16;
 
 fn empty() -> HashMap<String, Value> {
     HashMap::new()
@@ -26,42 +24,14 @@ fn params(pairs: impl IntoIterator<Item = (&'static str, Value)>) -> HashMap<Str
         .collect()
 }
 
-fn index() -> VectorIndexRef {
-    VectorIndexRef::new("purge_generation_items", "embedding")
-}
-
-fn partition(scope: Uuid) -> VectorPartitionKey {
-    VectorPartitionKey::from_values(&[Value::Uuid(scope)])
-        .expect("one UUID partition component has one canonical key")
-}
-
-fn graph_available(db: &Database, scope: Uuid) -> bool {
-    db.vector_store_for_test()
-        .partition_info(&index(), &partition(scope))
-        .is_some_and(|info| info.graph_available)
-}
-
-fn graph_serial(db: &Database, scope: Uuid) -> Option<u64> {
-    db.vector_store_for_test()
-        .raw_hnsw_build_serial_for_partition_for_test(&index(), &partition(scope))
-}
-
-fn saved_generation_status(
-    db: &Database,
-    scope: Uuid,
-) -> Option<contextdb_vector::store::VectorGraphGenerationStatus> {
-    db.vector_store_for_test()
-        .partition_graph_generation_status(&VectorPartitionRef::new(index(), partition(scope)))
-}
-
 fn ids(result: &QueryResult) -> Vec<Uuid> {
     let id_column = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "id" || column.rsplit('.').next() == Some("id"))
         .expect("vector search projects id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(id_column) {
             Some(Value::Uuid(id)) => *id,
@@ -70,17 +40,17 @@ fn ids(result: &QueryResult) -> Vec<Uuid> {
         .collect()
 }
 
-fn indexed_search(db: &Database, scope: Uuid, query: Vec<f32>) -> Vec<Uuid> {
+fn exact_search(db: &Database, scope: Uuid, query: Vec<f32>) -> Vec<Uuid> {
     ids(&db
         .execute(
             "SELECT id FROM purge_generation_items WHERE scope_id = $scope \
-             ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 1",
+             ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 1",
             &params([
                 ("scope", Value::Uuid(scope)),
                 ("query", Value::Vector(query)),
             ]),
         )
-        .unwrap_or_else(|error| panic!("indexed search for partition {scope}: {error}")))
+        .unwrap_or_else(|error| panic!("exact search for partition {scope}: {error}")))
 }
 
 fn create_table(db: &Database) {
@@ -88,7 +58,7 @@ fn create_table(db: &Database) {
         "CREATE TABLE purge_generation_items (\
          id UUID PRIMARY KEY, \
          scope_id UUID NOT NULL, \
-         embedding VECTOR(3) PARTITION_KEY (scope_id) MAX_PARTITIONS 4 SEARCH_MODE INDEXED\
+         embedding VECTOR(3) PARTITION_KEY (scope_id) MAX_PARTITIONS 4 SEARCH_MODE EXACT\
          )",
         &empty(),
     )
@@ -120,29 +90,11 @@ fn seed_partition(db: &Database, scope: Uuid, first: Uuid, leading_axis: usize) 
     }
 }
 
-fn drive_maintenance_until_all_ready(db: &Database, scopes: &[Uuid]) {
-    for _ in 0..MAX_MAINTENANCE_CYCLES {
-        if scopes
-            .iter()
-            .copied()
-            .all(|scope| graph_available(db, scope))
-        {
-            return;
-        }
-        db.run_maintenance_cycle()
-            .expect("one finite caller-driven maintenance cycle returns");
-    }
-    panic!(
-        "caller-driven maintenance did not publish every partition route within \
-         {MAX_MAINTENANCE_CYCLES} finite cycles"
-    );
-}
-
-/// Purging every lineage in alpha permanently removes alpha's vector and its
-/// saved route.  It must not throw away bravo's saved route merely because
-/// both partitions share one declared vector column.
+/// Purging every lineage in alpha permanently removes alpha's vectors.  It
+/// must not touch bravo's merely because both partitions share one declared
+/// vector column.
 #[test]
-fn authoritative_purge_retires_only_the_selected_partitions_saved_generation_after_reopen() {
+fn authoritative_purge_removes_only_the_selected_partitions_vectors_after_reopen() {
     let root = TempDir::new().expect("temporary store directory");
     let path = root.path().join("authoritative-purge-generation.db");
     let alpha = Uuid::from_u128(0xA110);
@@ -152,18 +104,19 @@ fn authoritative_purge_retires_only_the_selected_partitions_saved_generation_aft
 
     {
         let db = Database::open(&path).expect("open file-backed purge fixture");
-        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
         create_table(&db);
         seed_partition(&db, alpha, alpha_first, 0);
         seed_partition(&db, bravo, bravo_first, 1);
-        drive_maintenance_until_all_ready(&db, &[alpha, bravo]);
 
-        let bravo_generation = graph_serial(&db, bravo)
-            .expect("the unrelated partition has a maintained generation before PURGE");
         assert_eq!(
-            indexed_search(&db, bravo, vec![0.0, 1.0, 0.0]),
+            exact_search(&db, alpha, vec![1.0, 0.0, 0.0]),
+            vec![alpha_first],
+            "the selected partition answers before PURGE"
+        );
+        assert_eq!(
+            exact_search(&db, bravo, vec![0.0, 1.0, 0.0]),
             vec![bravo_first],
-            "the unrelated partition has a usable indexed answer before PURGE"
+            "the unrelated partition has a usable answer before PURGE"
         );
 
         let purged = db
@@ -173,52 +126,32 @@ fn authoritative_purge_retires_only_the_selected_partitions_saved_generation_aft
             )
             .expect("the public authoritative PURGE removes alpha's complete lineage");
         assert_eq!(
-            purged.rows_affected, ROWS_PER_PARTITION as u64,
+            purged.rows_affected(),
+            ROWS_PER_PARTITION as u64,
             "the public purge selected every vector lineage in alpha and no bravo lineage"
         );
         assert_eq!(
-            indexed_search(&db, alpha, vec![1.0, 0.0, 0.0]),
+            exact_search(&db, alpha, vec![1.0, 0.0, 0.0]),
             Vec::<Uuid>::new(),
-            "no indexed query may return a permanently purged vector"
-        );
-        assert!(
-            saved_generation_status(&db, alpha).is_none(),
-            "the selected partition retains no live saved-generation address after PURGE"
+            "no query may return a permanently purged vector"
         );
         assert_eq!(
-            graph_serial(&db, bravo),
-            Some(bravo_generation),
-            "purging alpha must leave bravo's maintained generation identity unchanged"
-        );
-        assert_eq!(
-            indexed_search(&db, bravo, vec![0.0, 1.0, 0.0]),
+            exact_search(&db, bravo, vec![0.0, 1.0, 0.0]),
             vec![bravo_first],
-            "bravo remains queryable through its maintained route before close"
+            "bravo remains queryable before close"
         );
         db.close().expect("close the purged store cleanly");
     }
 
     let db = Database::open(&path).expect("clean reopen after authoritative PURGE");
-    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     assert_eq!(
-        indexed_search(&db, alpha, vec![1.0, 0.0, 0.0]),
+        exact_search(&db, alpha, vec![1.0, 0.0, 0.0]),
         Vec::<Uuid>::new(),
         "clean reopen must not restore a query-addressable purged vector"
     );
-    assert!(
-        saved_generation_status(&db, alpha).is_none(),
-        "clean reopen must not restore a saved-generation address for the purged partition"
-    );
-    let bravo_before_query = graph_serial(&db, bravo)
-        .expect("the unrelated partition retains its saved generation after clean reopen");
     assert_eq!(
-        indexed_search(&db, bravo, vec![0.0, 1.0, 0.0]),
+        exact_search(&db, bravo, vec![0.0, 1.0, 0.0]),
         vec![bravo_first],
-        "the unrelated partition keeps its indexed result after clean reopen"
-    );
-    assert_eq!(
-        graph_serial(&db, bravo),
-        Some(bravo_before_query),
-        "the first reopened bravo query uses its saved generation rather than rebuilding it"
+        "the unrelated partition keeps its result after clean reopen"
     );
 }

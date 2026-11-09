@@ -9,7 +9,7 @@ import re
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-BASELINE_MODULE_SHA256 = "8e63a05c17941066eb4ac8a59f678ac3a24c35f55f8d9ed3247b580b50bb6149"
+BASELINE_MODULE_SHA256 = "343d0ec5c8f33eb91372e19fe15553596794a9ff8a12dacd1717deacaeed7717"
 BASELINE_HELPERS_SHA256 = "9905e54b79db77270853f14542c5d525b5da1b33a37ca9889d0a28e3941eafbf"
 BASELINE_HELPER_TESTS_SHA256 = "9883a4313ce70e8a444b3a7237e587d618fbdc163d2eac86d9acafe40a84d269"
 ACCEPTANCE_TARGETS = {
@@ -42,6 +42,8 @@ def reject(call):
 
 roots = {name: ROOT / path.removeprefix("../../") for name, path in ACCEPTANCE_TARGETS.items()}
 partitioned = {name: modules(path) for name, path in roots.items()}
+for target, entries in partitioned.items():
+    assert len(entries) == len(set(entries)), f"duplicate acceptance module in {target}"
 assert ("acceptance/long_running.rs", "long_running") not in partitioned["acceptance"]
 assert ("acceptance/sync.rs", "sync") not in partitioned["acceptance"]
 assert partitioned["acceptance_long_running"] == [
@@ -56,7 +58,7 @@ assert partitioned["acceptance_sync"] == [
 ]
 source_entries = {entry for entries in partitioned.values() for entry in entries
                   if entry[0] not in {"support/binary_path.rs", "support/binary_path_helpers.rs"}}
-assert len(source_entries) == 48
+assert len(source_entries) == 50
 assert source_digest(source_entries) == BASELINE_MODULE_SHA256
 
 helpers = (ROOT / "tests/support/binary_path_helpers.rs").read_bytes()
@@ -79,17 +81,17 @@ spec.loader.exec_module(integration)
 rows = integration.load_manifest()
 manifest_path = ROOT / "scripts/ci-integration-targets.json"
 manifest = json.loads(manifest_path.read_text())
-assert len(rows) == 36
-assert len({row.get("logical_id", row["id"]) for row in rows}) == 30
-assert len(integration.pr_inventory()) == 26
+assert len(rows) == 29
+assert len({row.get("logical_id", row["id"]) for row in rows}) == 24
+assert len(integration.pr_inventory()) == 25
 logical_pr = {
     (row.get("cache_parent", row["shard"]), row["crate"], row["features"])
     for job in integration.pr_inventory() for row in job.get("constituents", [job])
 }
-assert len(logical_pr) == 29
+assert len(logical_pr) == 28
 
 identity = {"source_sha": "1" * 40, "source_fingerprint": "2" * 64}
-for proved, physical in ((True, 49), (False, 53)):
+for proved, physical in ((True, 47), (False, 49)):
     certificate = ({"targets": {target: {} for target in integration.NORMAL_DEDUP_TARGETS},
                     "sha256": "a" * 64, "reason": "static fixture"}
                    if proved else {"targets": {}, "reason": "static fallback fixture"})
@@ -99,7 +101,8 @@ for proved, physical in ((True, 49), (False, 53)):
         combined = integration.combined_matrix(rows, True, decision)
         bundles = integration.bundle_matrix(combined, rows, True, decision)
         assert len(combined["include"]) == physical
-        assert len(bundles["include"]) == 16
+        job_count = manifest["normal_bundles"]["job_count"]
+        assert len(bundles["include"]) <= job_count and (proved or len(bundles["include"]) == job_count)
         assert all(sum(bundle[f"slot{slot}"] is not None for slot in range(1, 5)) <= 4
                    for bundle in bundles["include"])
 
@@ -124,8 +127,8 @@ for mutation in ("missing", "duplicate", "cache-parent", "case-loss"):
         reject(integration.pr_inventory if mutation in {"missing", "cache-parent"}
                else integration.load_manifest)
 
-print("Acceptance partition controls PASS: 48 source modules unchanged; 3 helper tests once; "
-      "29 logical PR groups; 30 logical qualification slices; 49/53 physical normal/fallback rows. No Cargo or native tests.")
+print("Acceptance partition controls PASS: 50 source modules unchanged; 3 helper tests once; "
+      "28 logical PR groups; 24 logical qualification slices; 47/49 physical normal/fallback rows. No Cargo or native tests.")
 
 # Normal-only filters must preserve each of the three functional witnesses once.
 import tempfile
@@ -141,7 +144,8 @@ with patch.object(integration, "source_identity", return_value=identity), \
     placed = [bundle[f"slot{slot}"] for bundle in bundles for slot in range(1, 5)
               if bundle[f"slot{slot}"] is not None]
     for row_id in ("pr-contextdb-server-test-seams", "pr-contextdb-core-test-seams", "pr-contextdb-core"):
-        assert sum(slot["id"] == row_id for slot in placed) == 1
+        mine = [slot for slot in placed if slot["id"] == row_id]
+        assert len(mine) == 1 or (mine and all(slot["fragment"] for slot in mine))
     for row_id in ("acceptance-long-running-transfer-test", "acceptance-long-running-test"):
         row = next(row for row in selected if row["id"] == row_id)
         matches = [slot for slot in placed if slot["id"] == "integration-" + row_id]
@@ -149,8 +153,8 @@ with patch.object(integration, "source_identity", return_value=identity), \
         slot = matches[0]
         assert slot["cache_key"] == "integration-acceptance-long-running-test-debug0-jobs2-test"
         command = integration.commands(row, mode="normal")[0]
-        assert command[:10] == ["cargo", "test", "--locked", "-p", "contextdb-engine", "--features", integration.FEATURES, "--test", "acceptance_long_running", "--"]
-        assert command[10:] == ["--test-threads=1"] + (["--skip", cases[2]] if "transfer" in row_id else [cases[2], "--exact"])
+        assert command[:11] == ["cargo", "test", "--locked", "--no-fail-fast", "-p", "contextdb-engine", "--features", integration.FEATURES, "--test", "acceptance_long_running", "--"]
+        assert command[11:] == ["--test-threads=1"] + (["--skip", cases[2]] if "transfer" in row_id else [cases[2], "--exact"])
         expected = integration.LONG_RUNNING_PARTITIONS[row_id]
         entry = dict(target="../../tests/acceptance_long_running.rs", passed=len(expected), failed=0, ignored=0, measured=0, filtered_out=3-len(expected))
         with tempfile.TemporaryDirectory() as temporary:

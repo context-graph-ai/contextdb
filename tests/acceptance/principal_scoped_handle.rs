@@ -85,7 +85,7 @@ fn t9_01_unprincipalled_handle_refused_on_acl_table() {
     // handle that opted into principal-mode.
     let admin_rows = h.execute("SELECT body FROM memos", &empty()).unwrap();
     assert_eq!(
-        admin_rows.rows.len(),
+        admin_rows.rows().len(),
         2,
         "plain open is admin and bypasses ACL gating"
     );
@@ -209,8 +209,8 @@ fn t9_02_principal_a_sees_only_granted_rows() {
     seed_acl_db(&path);
     let h = Database::open_as_principal(&path, Principal::Agent("a1".into())).unwrap();
     let r = h.execute("SELECT id FROM memos", &empty()).unwrap();
-    assert_eq!(r.rows.len(), 1, "agent a1 sees exactly 1 row");
-    assert_eq!(r.rows[0][0], Value::Uuid(Uuid::from_u128(1)));
+    assert_eq!(r.rows().len(), 1, "agent a1 sees exactly 1 row");
+    assert_eq!(r.rows()[0][0], Value::Uuid(Uuid::from_u128(1)));
     let direct = h.scan("memos", h.snapshot()).unwrap();
     assert_eq!(
         direct.len(),
@@ -234,14 +234,14 @@ fn t9_03_principal_a_does_not_see_principal_b_rows() {
     let a_row = Uuid::from_u128(1);
     let b_row = Uuid::from_u128(2);
     let saw_a = r
-        .rows
+        .rows()
         .iter()
         .any(|r| matches!(&r[0], Value::Uuid(u) if *u == a_row));
     assert!(
         saw_a,
         "a1's row must be visible (rules out vacuous-empty pass)"
     );
-    for row in &r.rows {
+    for row in r.rows() {
         if let Value::Uuid(u) = &row[0] {
             assert_ne!(*u, b_row, "B's row leaked");
         }
@@ -306,7 +306,8 @@ fn t9_04_principal_a_cannot_write_to_b_row() {
         .execute("UPDATE memos SET body = $body WHERE id = $id", &p)
         .unwrap();
     assert_eq!(
-        update.rows_affected, 0,
+        update.rows_affected(),
+        0,
         "UPDATE predicate targeting an ACL-denied row must behave as no visible match"
     );
     let mut flip = HashMap::new();
@@ -325,7 +326,8 @@ fn t9_04_principal_a_cannot_write_to_b_row() {
     );
     let delete = h.execute("DELETE FROM memos WHERE id = $id", &p).unwrap();
     assert_eq!(
-        delete.rows_affected, 0,
+        delete.rows_affected(),
+        0,
         "DELETE predicate targeting an ACL-denied row must behave as no visible match"
     );
 
@@ -335,27 +337,27 @@ fn t9_04_principal_a_cannot_write_to_b_row() {
         .execute("SELECT id, body, acl_id FROM memos", &empty())
         .unwrap();
     assert!(
-        !r.rows
+        !r.rows()
             .iter()
             .any(|row| row[0] == Value::Uuid(Uuid::from_u128(3))),
         "denied INSERT under acl_b must not persist row 3; rows={:?}",
-        r.rows
+        r.rows()
     );
     assert!(
-        r.rows.iter().any(|row| {
+        r.rows().iter().any(|row| {
             row[0] == Value::Uuid(target_row) && row[1] == Value::Text("body-2".into())
         }),
         "denied UPDATE must leave acl_b row unchanged; rows={:?}",
-        r.rows
+        r.rows()
     );
     assert!(
-        r.rows.iter().any(|row| {
+        r.rows().iter().any(|row| {
             row[0] == Value::Uuid(granted_row)
                 && row[1] == Value::Text("body-1".into())
                 && row[2] == Value::Uuid(granted_acl)
         }),
         "denied ACL flip must leave granted row in acl_a with its original body; rows={:?}",
-        r.rows
+        r.rows()
     );
 }
 
@@ -426,20 +428,20 @@ fn t9_05_graph_traversal_excludes_acl_denied_rows() {
     let a_row_behind_b = Uuid::from_u128(3);
     let a_allowed_neighbor = Uuid::from_u128(4);
     let saw_a = r
-        .rows
+        .rows()
         .iter()
         .any(|r| matches!(&r[0], Value::Uuid(u) if *u == a_row));
     assert!(saw_a, "a1's node must be visible in graph traversal");
     let saw_allowed_neighbor = r
-        .rows
+        .rows()
         .iter()
         .any(|r| matches!(&r[0], Value::Uuid(u) if *u == a_allowed_neighbor));
     assert!(
         saw_allowed_neighbor,
         "ACL graph traversal must follow at least one allowed edge; rows={:?}",
-        r.rows
+        r.rows()
     );
-    for row in &r.rows {
+    for row in r.rows() {
         if let Value::Uuid(u) = &row[0] {
             assert_ne!(*u, b_row, "ACL-denied node leaked");
             assert_ne!(
@@ -596,19 +598,19 @@ fn t9_06_vector_query_excludes_acl_denied_rows() {
         .unwrap();
     let a_row = Uuid::from_u128(12);
     assert_eq!(
-        r.rows.len(),
+        r.rows().len(),
         1,
         "ACL vector gating must happen before LIMIT"
     );
     let saw_a = r
-        .rows
+        .rows()
         .iter()
         .any(|r| matches!(&r[0], Value::Uuid(u) if *u == a_row));
     assert!(
         saw_a,
         "nearest ACL-granted row must be present in vector ranking"
     );
-    for row in &r.rows {
+    for row in r.rows() {
         if let Value::Uuid(u) = &row[0] {
             assert!(
                 !(2..12).contains(&u.as_u128()),
@@ -741,9 +743,9 @@ fn t9_07_non_acl_table_unaffected() {
     }
     let h = Database::open_as_principal(&path, Principal::Agent("a1".into())).unwrap();
     let r = h.execute("SELECT v, acl_id FROM plain", &empty()).unwrap();
-    assert_eq!(r.rows.len(), 1);
-    assert_eq!(r.rows[0][0], Value::Text("ok".into()));
-    assert_eq!(r.rows[0][1], Value::Uuid(Uuid::from_u128(0xBAD)));
+    assert_eq!(r.rows().len(), 1);
+    assert_eq!(r.rows()[0][0], Value::Text("ok".into()));
+    assert_eq!(r.rows()[0][1], Value::Uuid(Uuid::from_u128(0xBAD)));
 }
 
 /// RED — t9_08
@@ -805,14 +807,14 @@ fn t9_08_principal_variant_drives_acl_via_schema() {
     }
     let h_agent = Database::open_as_principal(&path, Principal::Agent("a1".into())).unwrap();
     let r1 = h_agent.execute("SELECT id FROM memos", &empty()).unwrap();
-    assert_eq!(r1.rows.len(), 1);
-    assert_eq!(r1.rows[0][0], Value::Uuid(Uuid::from_u128(1)));
+    assert_eq!(r1.rows().len(), 1);
+    assert_eq!(r1.rows()[0][0], Value::Uuid(Uuid::from_u128(1)));
     drop(h_agent);
 
     let h_human = Database::open_as_principal(&path, Principal::Human("alice@x".into())).unwrap();
     let r2 = h_human.execute("SELECT id FROM memos", &empty()).unwrap();
-    assert_eq!(r2.rows.len(), 1);
-    assert_eq!(r2.rows[0][0], Value::Uuid(Uuid::from_u128(2)));
+    assert_eq!(r2.rows().len(), 1);
+    assert_eq!(r2.rows()[0][0], Value::Uuid(Uuid::from_u128(2)));
     drop(h_human);
 
     let shared_agent =
@@ -821,7 +823,7 @@ fn t9_08_principal_variant_drives_acl_via_schema() {
         .execute("SELECT id FROM memos", &empty())
         .unwrap();
     assert_eq!(
-        agent_rows.rows,
+        agent_rows.rows(),
         vec![vec![Value::Uuid(Uuid::from_u128(3))]],
         "Agent(shared) must match only Agent/shared grants, not Human/shared"
     );
@@ -833,7 +835,7 @@ fn t9_08_principal_variant_drives_acl_via_schema() {
         .execute("SELECT id FROM memos", &empty())
         .unwrap();
     assert_eq!(
-        human_rows.rows,
+        human_rows.rows(),
         vec![vec![Value::Uuid(Uuid::from_u128(4))]],
         "Human(shared) must match only Human/shared grants, not Agent/shared"
     );
@@ -887,7 +889,7 @@ fn t9_08_principal_variant_drives_acl_via_schema() {
         .execute("SELECT id, body FROM records", &empty())
         .unwrap();
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![vec![
             Value::Uuid(Uuid::from_u128(10)),
             Value::Text("visible".into())
@@ -930,22 +932,22 @@ fn t9_09_principal_a_writes_granted_row() {
     .expect("a1 must be able to insert a new row under a1-granted ACL");
     let r = h.execute("SELECT id, body FROM memos", &empty()).unwrap();
     assert!(
-        r.rows.iter().any(|row| {
+        r.rows().iter().any(|row| {
             row.len() == 2
                 && row[0] == Value::Uuid(Uuid::from_u128(1))
                 && row[1] == Value::Text("updated".into())
         }),
         "granted row must be updated and visible; rows={:?}",
-        r.rows
+        r.rows()
     );
     assert!(
-        r.rows.iter().any(|row| {
+        r.rows().iter().any(|row| {
             row.len() == 2
                 && row[0] == Value::Uuid(Uuid::from_u128(10))
                 && row[1] == Value::Text("inserted".into())
         }),
         "new row inserted under a granted ACL must be visible; rows={:?}",
-        r.rows
+        r.rows()
     );
 }
 
@@ -1037,7 +1039,7 @@ fn t9_11_acl_grant_rows_respect_context_constraints() {
     .unwrap();
     let r = h.execute("SELECT body FROM memos", &empty()).unwrap();
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![vec![Value::Text("visible-grant".into())]],
         "out-of-context ACL grant row must not authorize protected data"
     );

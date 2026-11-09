@@ -102,6 +102,10 @@ fn two_file_sessions_opened_at_different_moments_say_so() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_session_reading_a_live_owner_has_no_snapshot_instant_to_report() {
     let directory = tempfile::TempDir::new().expect("task-scoped snapshot directory");
     let runtime_root = secure_runtime_root(directory.path(), "live-snapshot-runtime");

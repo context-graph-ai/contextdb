@@ -237,8 +237,8 @@ fn linux_runtime_resolution_and_preparation_fail_closed_for_every_invalid_native
         };
         let expected = Err(LocalTransportError::RuntimeRoot(violation));
         assert_eq!(
-            resolve_runtime_directory_with_environment(&request, &inspector, &environment),
-            expected.clone()
+            resolve_runtime_directory_with_environment(&request, &inspector, &environment).as_ref(),
+            expected.as_ref()
         );
         assert_eq!(
             prepare_runtime_directory_with_environment(&request, &inspector, &environment),
@@ -284,8 +284,8 @@ fn linux_runtime_resolution_and_preparation_fail_closed_for_every_invalid_native
         };
         let expected = Err(LocalTransportError::RuntimeRoot(violation));
         assert_eq!(
-            resolve_runtime_directory_with_environment(&request, &inspector, &environment),
-            expected.clone()
+            resolve_runtime_directory_with_environment(&request, &inspector, &environment).as_ref(),
+            expected.as_ref()
         );
         assert_eq!(
             prepare_runtime_directory_with_environment(&request, &inspector, &environment),

@@ -66,7 +66,7 @@ fn body_of(db: &Database, id: i64) -> Option<String> {
     let result = db
         .execute("SELECT body FROM notes WHERE id = $id", &params)
         .expect("scan");
-    result.rows.first().map(|row| match &row[0] {
+    result.rows().first().map(|row| match &row[0] {
         Value::Text(t) => t.clone(),
         other => panic!("body must be text, got {other:?}"),
     })
@@ -97,7 +97,8 @@ fn start_hub(broker: &InProcessBroker, ddl: &str) -> RunningHub {
             TenantId::from(TENANT),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -123,6 +124,7 @@ fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, _role: &str) -> Syn
         TenantId::from(TENANT),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 #[tokio::test]

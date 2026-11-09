@@ -159,7 +159,15 @@ fn breadcrumb_default_writer_probe_child() {
     if child_role().as_deref() != Some("default-writer-probe") {
         return;
     }
-    match Database::open(child_store()) {
+    // The parent releases the held reader only after this probe answers.
+    // An expired caller deadline requests the immediate holder diagnosis.
+    let options = DatabaseOpenOptions {
+        reader_wait_deadline: Some(contextdb_engine::ReaderWaitDeadline::after(
+            std::time::Duration::ZERO,
+        )),
+        ..DatabaseOpenOptions::default()
+    };
+    match Database::open_with_options(child_store(), options) {
         Ok(database) => {
             database.close().expect("close the successful writer probe");
             println!("{PROBE}acquired");

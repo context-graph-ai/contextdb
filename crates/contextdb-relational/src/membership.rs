@@ -1,14 +1,16 @@
 //! Immutable current index membership. Updates copy only an AVL search path;
 //! readers keep an owned root and never visit retired postings.
 use crate::store::IndexEntry;
-use contextdb_core::read_memory::{ReadCredit, ReadMemoryBudget};
+use contextdb_core::read_memory::ReadCredit;
+#[cfg(test)]
+use contextdb_core::read_memory::ReadMemoryBudget;
 use contextdb_core::{DirectedValue, IndexKey, Result, RowId, SnapshotId, TxId};
 use std::cmp::Ordering;
 use std::ops::Bound;
 use std::sync::Arc;
 
 type Link = Option<Arc<Node>>;
-type Budget = Option<Arc<dyn ReadMemoryBudget>>;
+type Budget = Option<contextdb_core::read_memory::ReadMemoryOwner>;
 const HINT: &str = "Release old readers or raise MEMORY_LIMIT before changing indexed rows.";
 
 #[derive(Debug)]
@@ -27,6 +29,10 @@ struct Node {
     _credit: Option<ReadCredit>,
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn credit(budget: &Budget, bytes: usize) -> Result<Option<ReadCredit>> {
     budget
         .as_ref()
@@ -63,6 +69,10 @@ fn height(link: &Link) -> u16 {
     link.as_ref().map_or(0, |n| n.height)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn node(
     key: Arc<Key>,
     entry: IndexEntry,
@@ -84,6 +94,10 @@ fn node(
     }))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn balance(
     key: Arc<Key>,
     entry: IndexEntry,
@@ -140,6 +154,10 @@ fn balance(
     node(key, entry, left, right, budget)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn insert(root: &Link, key: Arc<Key>, entry: IndexEntry, budget: &Budget) -> Result<Arc<Node>> {
     let Some(n) = root else {
         return node(key, entry, None, None, budget);
@@ -169,6 +187,10 @@ fn insert(root: &Link, key: Arc<Key>, entry: IndexEntry, budget: &Budget) -> Res
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn remove(root: &Link, key: &IndexKey, row: RowId, budget: &Budget) -> Result<Link> {
     let Some(n) = root else { return Ok(None) };
     Ok(Some(
@@ -224,7 +246,11 @@ pub struct MembershipImage {
 }
 
 impl MembershipImage {
-    pub(crate) fn with_budget(budget: Arc<dyn ReadMemoryBudget>) -> Self {
+    pub(crate) fn with_budget(
+        budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Self {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
         Self {
             budget: Some(budget),
             ..Self::default()
@@ -239,6 +265,10 @@ impl MembershipImage {
         snapshot.0 >= self.since.0
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn insert(&mut self, key: &IndexKey, entry: IndexEntry) -> Result<()> {
         let since = self
             .since
@@ -259,6 +289,10 @@ impl MembershipImage {
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn remove(&mut self, key: &IndexKey, row: RowId, tx: TxId) -> Result<()> {
         let root = remove(&self.root, key, row, &self.budget)?;
         self.root = root;
@@ -335,7 +369,16 @@ impl MembershipImage {
     }
 
     /// Admit an image built by a detached loader before it is published.
-    pub fn admit(&mut self, budget: Arc<dyn ReadMemoryBudget>) -> Result<()> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn admit(
+        &mut self,
+        budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<()> {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
         if self.budget.is_some() {
             return Ok(());
         }
@@ -487,12 +530,12 @@ mod tests {
             let limit = self.limit.load(AtomicOrdering::SeqCst);
             if bytes > limit.saturating_sub(self.used()) {
                 return Err(Error::MemoryBudgetExceeded {
-                    subsystem: subsystem.to_owned(),
-                    operation: operation.to_owned(),
+                    subsystem: subsystem.to_owned().into(),
+                    operation: operation.to_owned().into(),
                     requested_bytes: bytes,
                     available_bytes: limit.saturating_sub(self.used()),
                     budget_limit_bytes: limit,
-                    hint: hint.to_owned(),
+                    hint: hint.to_owned().into(),
                 });
             }
             self.used.fetch_add(bytes, AtomicOrdering::SeqCst);

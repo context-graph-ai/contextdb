@@ -43,7 +43,7 @@ fn f38_help_on_both_binaries_explains_all_options_clearly() {
         .arg("--help")
         .output()
         .expect("CLI --help");
-    let server = Command::new(server_bin())
+    let server = server_command()
         .arg("--help")
         .output()
         .expect("server --help");

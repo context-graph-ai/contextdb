@@ -12,12 +12,13 @@ import sys
 import unittest
 from unittest.mock import patch
 sys.dont_write_bytecode = True
+import tempfile
 import yaml
 
 spec = importlib.util.spec_from_file_location('required', Path(__file__).with_name('ci-required.py'))
 r = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(r)
-REQUIRED = {'lint', 'lint-macos', 'test-bundles', 'build', 'features',
+REQUIRED = {'lint', 'lint-macos', 'test-builds', 'test-bundles', 'build', 'features',
             'installed-smoke', 'cross-compile', 'impact', 'integration'}
 WRITE = {'contents': 'write', 'actions': 'read'}
 CALLER = {'needs': ['required'],
@@ -49,10 +50,13 @@ def invoke(doc, needs=None):
     workflow = re.sub(r'    needs:\n(?:    - [\w-]+\n)+',
                       lambda m: '    needs: [' + ', '.join(re.findall(r'    - ([\w-]+)', m[0])) + ']\n', workflow)
     needs = {name: {'result': 'success'} for name in REQUIRED} if needs is None else needs
-    with patch.object(r.Path, 'read_text', return_value=workflow), \
-         patch.dict(os.environ, {'CI_NEEDS': json.dumps(needs)}, clear=True), \
-         contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        return r.main()
+    with tempfile.TemporaryDirectory() as directory:
+        needs_file = Path(directory) / 'needs.json'
+        needs_file.write_text(json.dumps(needs))
+        with patch.object(r.Path, 'read_text', return_value=workflow), \
+             patch.dict(os.environ, {'CI_NEEDS_FILE': str(needs_file)}, clear=True), \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return r.main()
 
 
 class RequiredControls(unittest.TestCase):
@@ -60,7 +64,7 @@ class RequiredControls(unittest.TestCase):
         doc = current()
         self.assertEqual(r.REQUIRED, REQUIRED)
         self.assertEqual(doc['jobs']['required']['needs'],
-                         ['lint', 'lint-macos', 'test-bundles', 'build', 'features',
+                         ['lint', 'lint-macos', 'test-builds', 'test-bundles', 'build', 'features',
                           'installed-smoke', 'cross-compile', 'impact', 'integration'])
         release = load(RELEASE_JOB)['build']
         self.assertEqual(doc['jobs']['build']['steps'], release['steps'])
@@ -70,8 +74,9 @@ class RequiredControls(unittest.TestCase):
         self.assertEqual(aggregate['name'], 'PR checks')
         self.assertEqual(aggregate['if'], 'always()')
         step = aggregate['steps'][-1]
-        self.assertEqual(step['env']['CI_NEEDS'], '${{ toJSON(needs) }}')
-        self.assertEqual(step['run'], 'python3 scripts/ci-required.py')
+        # The context is written from the script text; one environment string cannot hold about seventy jobs.
+        self.assertEqual(step['env'], {'CI_NEEDS_FILE': '${{ runner.temp }}/needs.json'})
+        self.assertEqual(step['run'], "cat > \"$CI_NEEDS_FILE\" <<'CI_JSON_END'\n${{ toJSON(needs) }}\nCI_JSON_END\npython3 scripts/ci-required.py\n")
 
     def test_actual_ci_has_exact_same_commit_delivery_caller(self):
         doc = current()
@@ -139,8 +144,12 @@ class RequiredControls(unittest.TestCase):
         mutations = [lambda d: d['jobs']['integration'].update(needs=['impact']),
                      lambda d: d['jobs']['integration'].update(**{'if': 'false'}),
                      lambda d: d['jobs']['integration'].update(**{'continue-on-error': True}),
-                     lambda d: d['jobs']['integration']['steps'][-1]['env'].pop('CI_COMBINED_MATRIX'),
-                     lambda d: d['jobs']['integration']['steps'][-1]['env'].pop('CI_BUNDLE_MATRIX'),
+                     lambda d: d['jobs']['integration']['steps'][-1].update(
+                         run=d['jobs']['integration']['steps'][-1]['run'].replace('needs.impact.outputs.combined_matrix', 'x')),
+                     lambda d: d['jobs']['integration']['steps'][-1].update(
+                         run=d['jobs']['integration']['steps'][-1]['run'].replace('needs.impact.outputs.bundle_matrix', 'x')),
+                     lambda d: d['jobs']['integration']['steps'][-1].update(
+                         run=d['jobs']['integration']['steps'][-1]['run'].replace('needs.impact.outputs.build_matrix', 'x')),
                      lambda d: d['jobs']['integration']['steps'][-1].update(run='true')]
         for mutate in mutations:
             doc = candidate()

@@ -126,6 +126,10 @@ fn received(owner: &Database) -> u64 {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_read_that_panics_in_the_owner_is_answered_and_leaves_the_connection_usable() {
     let directory = tempfile::TempDir::new().expect("task-scoped owner-panic directory");
     let path = directory.path().join("panicking.db");
@@ -157,7 +161,7 @@ fn a_read_that_panics_in_the_owner_is_answered_and_leaves_the_connection_usable(
         Err(error) => error,
         Ok(result) => panic!(
             "a read whose owner died mid-flight is answered with a failure, not with {} rows",
-            result.rows.len()
+            result.rows().len()
         ),
     };
     let rendered = failure.to_string();
@@ -177,7 +181,7 @@ fn a_read_that_panics_in_the_owner_is_answered_and_leaves_the_connection_usable(
         .execute(&format!("SELECT id FROM {TABLE}"), &empty())
         .expect("the same session's next statement is served on the same connection");
     assert_eq!(
-        next.rows.len(),
+        next.rows().len(),
         1,
         "and it answers with the row it was asked for"
     );

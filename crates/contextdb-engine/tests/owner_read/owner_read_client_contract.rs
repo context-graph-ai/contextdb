@@ -1,3 +1,4 @@
+use super::wire_fixture_test_support::encode_query_result;
 use contextdb_core::Value;
 use contextdb_core::read_contract::{ReadFailure, ReadFailureDetail, ReadFailureKind, ReadLimits};
 use contextdb_engine::local_transport::{
@@ -6,8 +7,9 @@ use contextdb_engine::local_transport::{
     ResultReceiveOutcome, ResultReceiveState, split_canonical_result,
 };
 use contextdb_engine::owner_read::{OwnerClient, OwnerReadScaffoldError};
-use contextdb_engine::read_contract::encode_query_result;
-use contextdb_engine::{QueryResult, QueryTrace};
+
+use super::wire_fixture_test_support::QueryFixture as QueryResult;
+use contextdb_engine::QueryTrace;
 use std::collections::BTreeMap;
 
 fn limits() -> ReadLimits {
@@ -82,8 +84,11 @@ fn oversized_custom_request_is_refused_by_production_framing_before_carrier_writ
             payload: vec![0x51; MAX_FRAME_BYTES + 1],
         },
     };
-    let error = OwnerClient::encode_envelope(&envelope)
-        .expect_err("the complete encoded request cannot cross the frame ceiling");
+    let error = OwnerClient::encode_envelope(
+        &envelope,
+        super::wire_fixture_test_support::owner_for_serialized(&envelope, 4),
+    )
+    .expect_err("the complete encoded request cannot cross the frame ceiling");
     assert!(matches!(
         error,
         OwnerReadScaffoldError::Refused(failure)
@@ -98,12 +103,14 @@ fn multiple_chunks_remain_private_until_terminal_success() {
     // that are not a canonical result are refused at terminal assembly by the
     // same framing contract this journey lives beside, so staging them would
     // make the journey prove nothing about privacy-until-terminal-success.
-    let result = QueryResult {
-        columns: vec!["payload".to_owned()],
-        rows: vec![vec![Value::Text("x".repeat(MAX_FRAME_BYTES + 512))]],
-        rows_affected: 0,
-        trace: QueryTrace::scan(),
-        cascade: None,
+    let result = {
+        let mut query_fixture = QueryResult::empty();
+        query_fixture.columns = vec!["payload".to_owned()];
+        query_fixture.rows = vec![vec![Value::Text("x".repeat(MAX_FRAME_BYTES + 512))]];
+        query_fixture.rows_affected = 0;
+        query_fixture.trace = QueryTrace::scan();
+        query_fixture.cascade = None;
+        query_fixture
     };
     let canonical = encode_query_result(&result).expect("encode the route-neutral result");
     let responses =
@@ -212,14 +219,17 @@ fn client_source_has_only_real_carrier_framing_and_named_deadline_paths() {
     let source = include_str!("../../src/owner_read/client.rs");
     for required in [
         "UnixLocalCarrier",
-        ".connect(",
-        "handshake_with_deadline",
+        ".connect_funded(",
+        "crate::local_transport::deadline_operation_funded(",
+        "crate::local_transport::DeadlineStage::Handshake",
         "LocalOutboundMessage::Handshake",
         "LocalProtocolBoundary",
         "UnixLocalCarrier::write_request(",
         "UnixLocalCarrier::receive_response(",
-        "OrdinaryResultReceiver::with_effective_ceilings",
-        ".receive(response.clone())",
+        "OrdinaryResultReceiver::with_query_memory",
+        "envelope.limits.result_bytes",
+        "envelope.limits.memory",
+        ".receive_funded(response)",
         ".disconnect()",
         "receive_frame_preserving_refusal",
         "encode_frame",
@@ -227,6 +237,76 @@ fn client_source_has_only_real_carrier_framing_and_named_deadline_paths() {
         assert!(
             source.contains(required),
             "the thin client must retain production journey seam {required}",
+        );
+    }
+    // Inspect the shipping connection bodies, not the retained unfunded test
+    // helper or its import. The carrier owns native connect readiness; both
+    // waits retain this connection's original reader payer and deadline.
+    let carrier = include_str!("../../src/local_transport/carrier.rs");
+    let connection_paths = |client: &str, carrier: &str| {
+        let client_connect = client
+            .split_once("pub async fn connect(")
+            .expect("the production client connection entry")
+            .1
+            .split_once("let mut client = Self {")
+            .expect("the client is built after its handshake")
+            .0;
+        let carrier_connect = carrier
+            .split_once("pub(crate) fn connect_funded")
+            .expect("the funded carrier connection entry")
+            .1
+            .split_once("pub fn connect")
+            .expect("the retained unfunded carrier helper follows")
+            .0;
+        [
+            ".connect_funded(&channel_path, clock.as_ref(), deadline_ms, owner.clone())",
+            "crate::local_transport::deadline_operation_funded(",
+            "crate::local_transport::DeadlineStage::Handshake",
+            "UnixLocalCarrier::send_message(",
+            "LocalOutboundMessage::Handshake(&presented_handshake)",
+            "boundary.set_query_funding(Some(owner.clone()))",
+        ]
+        .into_iter()
+        .all(|required| client_connect.contains(required))
+            && [
+                "super::deadline_operation_funded(",
+                "super::DeadlineStage::Connect",
+                "deadline_ms,",
+                "owner,",
+                "let connect = connect_readiness(path)",
+                "connect?.await?",
+            ]
+            .into_iter()
+            .all(|required| carrier_connect.contains(required))
+    };
+    assert!(connection_paths(source, carrier));
+    for (client_control, carrier_control) in [
+        (
+            source.replace(".connect_funded(", ".connect("),
+            carrier.to_owned(),
+        ),
+        (
+            source.replace("DeadlineStage::Handshake", "DeadlineStage::Connect"),
+            carrier.to_owned(),
+        ),
+        (
+            source.to_owned(),
+            carrier.replace(
+                "super::DeadlineStage::Connect",
+                "super::DeadlineStage::Handshake",
+            ),
+        ),
+        (
+            source.replace(
+                "boundary.set_query_funding(Some(owner.clone()))",
+                "boundary.set_query_funding(None)",
+            ),
+            carrier.to_owned(),
+        ),
+    ] {
+        assert!(
+            !connection_paths(&client_control, &carrier_control),
+            "removing funded connection, named deadline, or original payer must fail the audit",
         );
     }
     for forbidden in [
@@ -258,10 +338,19 @@ fn client_source_has_only_real_carrier_framing_and_named_deadline_paths() {
         },
     ];
     for request in dynamic {
-        OwnerClient::encode_envelope(&LocalRequestEnvelope {
-            limits: limits(),
-            request,
-        })
+        OwnerClient::encode_envelope(
+            &LocalRequestEnvelope {
+                limits: limits(),
+                request: request.clone(),
+            },
+            super::wire_fixture_test_support::owner_for_serialized(
+                &LocalRequestEnvelope {
+                    limits: limits(),
+                    request,
+                },
+                4,
+            ),
+        )
         .expect("every dynamic request uses the canonical production codec");
     }
 }

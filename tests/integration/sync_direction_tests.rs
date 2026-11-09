@@ -66,6 +66,10 @@ fn assert_renders_exactly_direction(rendered: &str, expected: &str) {
 
 /// A table definition arriving from another machine, applied through the public
 /// sync door exactly as a peer's changeset would deliver it.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn arrive_create_table(
     db: &Database,
     name: &str,
@@ -450,7 +454,9 @@ fn c1f_a_retained_two_way_definition_travels_from_one_machine_to_another() {
     let receiver = Database::open_memory();
     receiver
         .apply_changes(
-            source.changes_since(Lsn(0)),
+            source
+                .changes_since(Lsn(0))
+                .expect("read the declared changes"),
             &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
         )
         .expect("the receiving machine must accept the definition");
@@ -678,7 +684,9 @@ fn c1d_declared_directions_travel_through_the_real_changeset_on_create() {
     let receiver = Database::open_memory();
     receiver
         .apply_changes(
-            source.changes_since(Lsn(0)),
+            source
+                .changes_since(Lsn(0))
+                .expect("read the declared changes"),
             &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
         )
         .expect("the receiving machine must accept every definition");
@@ -711,7 +719,8 @@ async fn receive_changed_policy(source: Arc<Database>, alter: &str) -> String {
             tenant.clone(),
             hub_identity.node_id(),
             hub_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -732,7 +741,8 @@ async fn receive_changed_policy(source: Arc<Database>, alter: &str) -> String {
         fabric.client_as(&edge_identity.node_id()),
         tenant,
         edge_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let initial = client
         .push()
         .await
@@ -744,9 +754,14 @@ async fn receive_changed_policy(source: Arc<Database>, alter: &str) -> String {
         .execute(alter, &p())
         .expect("source changes its declaration");
     assert!(
-        source.changes_since(before_alter).ddl.iter().any(
-            |change| matches!(change, DdlChange::AlterTable { name, .. } if name == "windows")
-        ),
+        source
+            .changes_since(before_alter)
+            .expect("read the declared changes")
+            .ddl
+            .iter()
+            .any(
+                |change| matches!(change, DdlChange::AlterTable { name, .. } if name == "windows")
+            ),
         "the source's real changeset must carry the altered table"
     );
     let changed = client
@@ -800,6 +815,10 @@ async fn c1b_an_altered_retention_travels_and_leaves_the_direction_alone() {
 // ---------------------------------------------------------------------------
 
 /// A table definition CHANGE arriving from another machine.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn arrive_alter_table(
     db: &Database,
     name: &str,
@@ -985,7 +1004,9 @@ fn c1f_a_retained_two_way_table_without_the_delivery_promise_is_accepted() {
     let receiver = Database::open_memory();
     receiver
         .apply_changes(
-            local.changes_since(Lsn(0)),
+            local
+                .changes_since(Lsn(0))
+                .expect("read the declared changes"),
             &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
         )
         .expect("the same declaration must be accepted when it arrives from another machine");

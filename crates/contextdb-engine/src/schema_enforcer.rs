@@ -4,6 +4,10 @@ use contextdb_parser::ast::{Expr, Literal, UnaryOp};
 use contextdb_planner::PhysicalPlan;
 use std::collections::HashMap;
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn validate_dml(
     plan: &PhysicalPlan,
     db: &Database,
@@ -25,10 +29,13 @@ pub fn validate_dml(
             // (2) Unknown-column check on every SET target.
             for (col_name, _) in &p.assignments {
                 if !table_meta.columns.iter().any(|c| c.name == *col_name) {
-                    return Err(Error::Other(format!(
-                        "column '{}' does not exist on table '{}'",
-                        col_name, p.table
-                    )));
+                    return Err(Error::Other(
+                        (format!(
+                            "column '{}' does not exist on table '{}'",
+                            col_name, p.table
+                        ))
+                        .into(),
+                    ));
                 }
             }
 
@@ -75,10 +82,13 @@ pub fn validate_dml(
             // Validate that all INSERT columns exist in the table schema
             for col_name in &columns {
                 if !table_meta.columns.iter().any(|c| c.name == *col_name) {
-                    return Err(Error::Other(format!(
-                        "column '{}' does not exist in table '{}'",
-                        col_name, p.table
-                    )));
+                    return Err(Error::Other(
+                        (format!(
+                            "column '{}' does not exist in table '{}'",
+                            col_name, p.table
+                        ))
+                        .into(),
+                    ));
                 }
             }
 
@@ -97,16 +107,19 @@ pub fn validate_dml(
                                 resolve_required_expr(expr, params, &p.table, &column.name)
                             })?;
                         if value == Value::Null {
-                            return Err(Error::Other(format!(
-                                "NOT NULL constraint violated: {}.{}",
-                                p.table, column.name
-                            )));
+                            return Err(Error::Other(
+                                (format!(
+                                    "NOT NULL constraint violated: {}.{}",
+                                    p.table, column.name
+                                ))
+                                .into(),
+                            ));
                         }
                     } else if column.default.is_none() {
-                        return Err(Error::Other(format!(
-                            "NOT NULL constraint violated: {}.{}",
-                            p.table, column.name
-                        )));
+                        return Err(Error::Other(
+                            (format!("NOT NULL constraint violated: {}.{}", p.table, column.name))
+                                .into(),
+                        ));
                     }
                 }
             }
@@ -121,6 +134,10 @@ pub fn validate_dml(
 /// before staging the row. Expressions that need a row are deliberately
 /// rejected here with the destination column, rather than being reported as
 /// an unrelated unsupported-expression implementation detail.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn resolve_required_expr(
     expr: &Expr,
     params: &HashMap<String, Value>,
@@ -151,17 +168,17 @@ fn resolve_required_expr(
             operand,
         } => match resolve_required_expr(operand, params, table, column)? {
             Value::Int64(value) => value.checked_neg().map(Value::Int64).ok_or_else(|| {
-                Error::Other(format!(
+                Error::Other((format!(
                     "cannot resolve required INSERT value for {table}.{column}: integer literal is out of range"
-                ))
+                )).into())
             }),
             Value::Float64(value) => Ok(Value::Float64(-value)),
-            _ => Err(Error::Other(format!(
+            _ => Err(Error::Other((format!(
                 "cannot resolve required INSERT value for {table}.{column}: unary - requires an INTEGER or REAL literal or parameter"
-            ))),
+            )).into())),
         },
-        _ => Err(Error::Other(format!(
+        _ => Err(Error::Other((format!(
             "cannot resolve required INSERT value for {table}.{column}: this expression requires row context; use a literal or bound parameter"
-        ))),
+        )).into())),
     }
 }

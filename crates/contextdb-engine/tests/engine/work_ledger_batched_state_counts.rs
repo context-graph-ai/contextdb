@@ -347,7 +347,7 @@ fn batched_counts_are_scoped_to_the_batch() {
         .execute("SELECT job_id FROM work_jobs", &HashMap::new())
         .expect("read every job the ledger holds");
     assert_eq!(
-        everything.rows.len(),
+        everything.rows().len(),
         OTHER_FAMILY_JOBS + PER_STATE * 5,
         "the fixture ledger holds the other family as well as the batch"
     );
@@ -559,10 +559,10 @@ fn paged_walk(session: &ReadSession, recorder: &Arc<Recorder>) -> Vec<WorkTold> 
         )
         .expect("open a cursor over the findable rows");
     let mut told = vec![WorkTold {
-        rows: cursor.first_page().rows.len(),
+        rows: cursor.first_page().rows().len(),
         work: recorder.work_reached(),
     }];
-    let mut more = cursor.first_page().has_more;
+    let mut more = cursor.first_page().has_more();
     while more {
         assert!(
             told.len() < NEEDLES.len() * 4 + 16,
@@ -572,10 +572,10 @@ fn paged_walk(session: &ReadSession, recorder: &Arc<Recorder>) -> Vec<WorkTold> 
         recorder.clear();
         let page = cursor.fetch(None).expect("fetch the next page of the walk");
         told.push(WorkTold {
-            rows: page.rows.len(),
+            rows: page.rows().len(),
             work: recorder.work_reached(),
         });
-        more = page.has_more;
+        more = page.has_more();
     }
     cursor.close().expect("close the walk");
     told
@@ -589,13 +589,13 @@ fn paged_total(session: &ReadSession, recorder: &Arc<Recorder>) -> (Value, Vec<W
         .open_cursor("SELECT COUNT(*) FROM walk_rows", &HashMap::new())
         .expect("open the total as a cursor");
     let mut told = vec![WorkTold {
-        rows: cursor.first_page().rows.len(),
+        rows: cursor.first_page().rows().len(),
         work: recorder.work_reached(),
     }];
-    let mut more = cursor.first_page().has_more;
+    let mut more = cursor.first_page().has_more();
     let mut answer = cursor
         .first_page()
-        .rows
+        .rows()
         .first()
         .and_then(|row| row.first())
         .cloned();
@@ -610,13 +610,13 @@ fn paged_total(session: &ReadSession, recorder: &Arc<Recorder>) -> (Value, Vec<W
             .fetch(None)
             .expect("fetch the next page of the total");
         told.push(WorkTold {
-            rows: page.rows.len(),
+            rows: page.rows().len(),
             work: recorder.work_reached(),
         });
-        if let Some(row) = page.rows.first() {
+        if let Some(row) = page.rows().first() {
             answer = row.first().cloned();
         }
-        more = page.has_more;
+        more = page.has_more();
     }
     cursor.close().expect("close the total");
     (
@@ -707,7 +707,7 @@ fn embedded_session_progress_is_present_on_every_fetch() {
     );
 
     let mut fetches = 0usize;
-    let mut more = cursor.first_page().has_more;
+    let mut more = cursor.first_page().has_more();
     while more {
         recorder.clear();
         let page = cursor.fetch(None).expect("fetch the next page");
@@ -724,7 +724,7 @@ fn embedded_session_progress_is_present_on_every_fetch() {
                 .all(|progress| progress.work > 0),
             "fetch {fetches} reports the items it examined"
         );
-        more = page.has_more;
+        more = page.has_more();
         assert!(fetches < 64, "the cursor never ended");
     }
     assert!(

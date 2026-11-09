@@ -30,14 +30,14 @@ fn seed_and_assert() {
     let probe = db
         .__probe_constraint_check("t", "id", Value::Uuid(id))
         .unwrap();
-    assert_eq!(probe.trace.physical_plan, "IndexScan");
+    assert_eq!(probe.trace().physical_plan, "IndexScan");
     let result = db
         .execute(
             "SELECT a FROM t WHERE id = $id",
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(result.rows, vec![vec![Value::Int64(SAMPLE)]]);
+    assert_eq!(result.rows(), vec![vec![Value::Int64(SAMPLE)]]);
 }
 
 fn timed_seed_and_assert() {
@@ -51,6 +51,10 @@ fn timed_seed_and_assert() {
 }
 
 fn bench_pk01_pk_inserts_routes_through_index(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function("pk01_pk_inserts_routes_through_index", |_| {});
+        return;
+    }
     seed_and_assert();
     c.bench_function("pk01_pk_inserts_routes_through_index", |b| {
         b.iter(timed_seed_and_assert)

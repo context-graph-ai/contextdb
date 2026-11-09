@@ -241,6 +241,13 @@ fn assert_contention_report(report: &ContentionReport) {
 }
 
 fn bench_atomic_visibility_under_contention(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function(
+            "tier1_atomic_visibility_under_contention/8_readers_2_writers_1000_commits",
+            |_| {},
+        );
+        return;
+    }
     let pre_gate = run_contention_fixture(1, 1, 50, 1);
     assert_contention_report(&pre_gate);
 

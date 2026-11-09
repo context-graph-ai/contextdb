@@ -9,12 +9,14 @@
 //! index and a length are each a single byte below 251 — not by printing what
 //! the encoder produced.
 
+use super::wire_fixture_test_support::FixtureFrame;
+use super::wire_fixture_test_support::encode_message;
 use contextdb_core::read_contract::{ReadFailure, ReadFailureDetail, ReadFailureKind, ReadLimits};
 use contextdb_core::{Error, Value};
 use contextdb_engine::local_transport::{
-    FrameBufferAllocator, FrameReader, LocalEngineFailure, LocalInboundKind, LocalInboundMessage,
-    LocalOutboundMessage, LocalProtocolBoundary, LocalRequest, LocalRequestEnvelope, LocalResponse,
-    LocalResponseExpectation, LocalTransportError, decode_message_exact, encode_message,
+    FrameBufferAllocator, FrameReader, LocalInboundKind, LocalInboundMessage, LocalOutboundMessage,
+    LocalProtocolBoundary, LocalRequest, LocalRequestEnvelope, LocalResponse,
+    LocalResponseExpectation, LocalTransportError, decode_message_exact,
 };
 
 /// The caller limits every request carries, ahead of the request itself.
@@ -106,7 +108,7 @@ fn assert_request_boundary(envelope: &LocalRequestEnvelope, fixture: &[u8]) {
     framed.extend_from_slice(fixture);
     assert_eq!(
         boundary
-            .encode_frame(LocalOutboundMessage::Request(envelope))
+            .encode_fixture_frame(LocalOutboundMessage::Request(envelope))
             .expect("encode the interrupt through the production boundary"),
         framed,
     );
@@ -129,7 +131,7 @@ fn assert_response_boundary(response: &LocalResponse, fixture: &[u8]) {
     framed.extend_from_slice(fixture);
     assert_eq!(
         boundary
-            .encode_frame(LocalOutboundMessage::Response {
+            .encode_fixture_frame(LocalOutboundMessage::Response {
                 response,
                 expectation: &LocalResponseExpectation::Custom,
             })
@@ -152,7 +154,7 @@ fn assert_response_boundary(response: &LocalResponse, fixture: &[u8]) {
 
 fn engine_answer(error: Error) -> LocalResponse {
     LocalResponse::EngineFailure {
-        failure: LocalEngineFailure::from_error(&error),
+        failure: super::wire_fixture_test_support::engine_failure(&error),
     }
 }
 
@@ -233,12 +235,12 @@ fn every_class_a_read_can_meet_survives_the_round_trip_unchanged() {
         Error::UnboundedTraversal,
         Error::UnboundedVectorSearch,
         Error::MemoryBudgetExceeded {
-            subsystem: "vector".to_owned(),
-            operation: "candidate materialization".to_owned(),
+            subsystem: "vector".to_owned().into(),
+            operation: "candidate materialization".to_owned().into(),
             requested_bytes: 4096,
             available_bytes: 128,
             budget_limit_bytes: 8192,
-            hint: "raise --read-memory".to_owned(),
+            hint: "raise --read-memory".to_owned().into(),
         },
         // The caller may not see it.
         Error::PrincipalRequired {
@@ -257,15 +259,15 @@ fn every_class_a_read_can_meet_survives_the_round_trip_unchanged() {
         ),
         // The store underneath is the problem, not the query.
         Error::StoreCorrupted {
-            path: "/store/widgets.db".to_owned(),
-            reason: "commit index missing".to_owned(),
+            path: "/store/widgets.db".to_owned().into(),
+            reason: "commit index missing".to_owned().into(),
         },
         Error::DatabaseLocked {
             holder_pid: 4321,
             path: std::path::PathBuf::from("/store/widgets.db"),
         },
         // Prose, the last resort, still arrives as prose.
-        Error::Other("the owner could not say more".to_owned()),
+        Error::Other("the owner could not say more".to_owned().into()),
     ];
 
     for answer in answers {
@@ -307,18 +309,17 @@ fn an_answer_outside_the_read_surface_arrives_named_rather_than_lost() {
         panic!("an unnamed class arrives as prose, got {rebuilt:?}");
     };
     assert!(
-        prose.starts_with("SyncReplayOfAcceptedDelete: ") && prose.ends_with(&words),
+        prose.starts_with("SyncReplayOfAcceptedDelete: ") && prose.to_string().ends_with(&words),
         "the prose names the class and repeats the words: {prose}",
     );
 }
 
-/// An engine answer is admitted by its length against the ceiling the caller
-/// declared, before the buffer that would hold it exists. A caller that asked
-/// to be kept inside a small budget is not handed an unbounded decode because
-/// the thing being decoded happens to be an error.
+/// An engine answer's encoded input coexists with its decoded document and
+/// native decoder controls. The declared ceiling covers that complete working
+/// set; errors do not bypass receive admission.
 #[test]
 fn an_engine_answer_is_admitted_against_the_ceiling_the_caller_declared() {
-    let long = Error::Other("w".repeat(4_096));
+    let long = Error::Other("w".repeat(4_096).into());
     let frame = engine_answer(long);
     let bytes = encode_message(&frame).expect("encode the long engine answer");
     let mut framed = u32::try_from(bytes.len())
@@ -327,30 +328,47 @@ fn an_engine_answer_is_admitted_against_the_ceiling_the_caller_declared() {
         .to_vec();
     framed.extend_from_slice(&bytes);
 
-    let roomy = boundary();
-    let mut reader = LiteralFrameReader::new(&bytes);
-    let mut allocator = PlainAllocator;
-    roomy
-        .receive_frame(
-            LocalInboundKind::Response(LocalResponseExpectation::Custom),
-            &mut reader,
-            &mut allocator,
-        )
-        .expect("a declared ceiling with room for the answer admits it");
+    let receive = |memory| {
+        let roomy = LocalProtocolBoundary::with_effective_limits(ReadLimits {
+            memory,
+            ..fixture_limits()
+        });
+        let mut reader = LiteralFrameReader::new(&bytes);
+        roomy
+            .receive_frame(
+                LocalInboundKind::Response(LocalResponseExpectation::Custom),
+                &mut reader,
+                &mut PlainAllocator,
+            )
+            .expect("the complete admitted receive footprint fits its declared ceiling");
+    };
+    let memory = super::wire_fixture_test_support::measured_receive_memory(&receive);
+    receive(memory);
+    assert!(
+        memory > bytes.len() as u64,
+        "encoded input alone is not the native decoder's full working set"
+    );
 
     let mut narrow = fixture_limits();
     narrow.memory = 64;
     let cramped = LocalProtocolBoundary::with_effective_limits(narrow);
     let mut reader = LiteralFrameReader::new(&bytes);
     let mut allocator = PlainAllocator;
+    let outcome = cramped.receive_frame(
+        LocalInboundKind::Response(LocalResponseExpectation::Custom),
+        &mut reader,
+        &mut allocator,
+    );
     assert!(
-        cramped
-            .receive_frame(
-                LocalInboundKind::Response(LocalResponseExpectation::Custom),
-                &mut reader,
-                &mut allocator,
-            )
-            .is_err(),
-        "an answer larger than the declared ceiling is refused before it is held",
+        matches!(
+            outcome,
+            Err(LocalTransportError::Payload(
+                contextdb_engine::local_transport::PayloadViolation::MemoryCeilingExceeded {
+                    ceiling: 64,
+                    required: None,
+                }
+            ))
+        ),
+        "an over-budget engine answer keeps its typed refusal: {outcome:?}"
     );
 }

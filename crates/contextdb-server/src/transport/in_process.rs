@@ -107,7 +107,7 @@ impl ClientTransport for InProcessClient {
                 .await?;
 
                 let response_bytes = reply_rx.await.map_err(|_| {
-                    TransportError::Other("responder dropped without replying".to_string())
+                    TransportError::Other(("responder dropped without replying".to_string()).into())
                 })?;
 
                 inner

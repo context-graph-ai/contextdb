@@ -10,6 +10,10 @@ cargo build --workspace
 
 ## Running Tests
 
+Local and CI test builds use the package settings in Cargo.toml. The CI
+engine-seams shard compiles the maintenance journey before running its exact
+case under a 600-second process limit; see [the CI guide](.github/CI.md).
+
 ```bash
 cargo test --workspace
 cargo test --manifest-path crates/contextdb-redb/Cargo.toml --locked

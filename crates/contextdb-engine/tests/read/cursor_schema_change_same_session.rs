@@ -13,7 +13,7 @@
 //! session thread.
 
 use contextdb_core::Value;
-use contextdb_core::read_contract::{DeadlineClock, DeadlineWait, ReadLimits};
+use contextdb_core::read_contract::ReadLimits;
 use contextdb_engine::Database;
 use contextdb_engine::executor::bounded_read_test_support as bounded;
 use std::collections::HashMap;
@@ -31,20 +31,7 @@ const SELF_BLOCK_WATCH: Duration = Duration::from_secs(30);
 
 /// Cursor expiry is driven by the injected clock, never by wall time, so a
 /// retained cursor cannot expire while its own session is mid-statement.
-#[derive(Clone, Copy)]
-struct FrozenClock;
-
-impl DeadlineClock for FrozenClock {
-    fn now_ms(&self) -> u64 {
-        0
-    }
-
-    fn wait_until(&self, _deadline_ms: u64) -> DeadlineWait<'_> {
-        // These cursor journeys are synchronous; the immediately-completing
-        // future satisfies the shared transport-facing clock trait.
-        Box::pin(async {})
-    }
-}
+use contextdb_engine::local_transport::ManualDeadlineClock;
 
 fn roomy_limits() -> ReadLimits {
     ReadLimits {
@@ -101,11 +88,11 @@ fn retained_vector_cursor(db: Arc<Database>, table: &str) -> bounded::TestCursor
         format!("SELECT id FROM {table} ORDER BY embedding <=> $query LIMIT 4"),
         HashMap::from([("query".to_owned(), Value::Vector(unit_vector(0)))]),
         roomy_limits(),
-        Arc::new(FrozenClock),
+        Arc::new(ManualDeadlineClock::at(0)),
     );
     let opened = bounded::open_cursor(db, &request).expect("open a vector cursor");
     assert!(
-        opened.first_page.has_more,
+        opened.first_page.has_more(),
         "a vector cursor must stay open past its first page so it keeps holding \
          its schema read guard"
     );

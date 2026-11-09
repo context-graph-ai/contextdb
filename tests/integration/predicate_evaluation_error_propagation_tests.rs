@@ -127,21 +127,21 @@ fn delete_predicate_evaluation_error_propagates_as_statement_error() {
             let remaining = db
                 .execute("SELECT a FROM t", &empty())
                 .expect("count remaining rows")
-                .rows
+                .rows()
                 .len();
             panic!(
                 "DELETE FROM t WHERE -tag > 0 must fail with a statement error \
                  (negating a TEXT column cannot evaluate), never succeed \
                  silently: rows_affected={}, {remaining} of 2 rows remain. \
                  Full result: {r:?}",
-                r.rows_affected,
+                r.rows_affected(),
             );
         }
     }
     let remaining = db
         .execute("SELECT a FROM t", &empty())
         .expect("count remaining rows after the refused DELETE")
-        .rows
+        .rows()
         .len();
     assert_eq!(
         remaining, 2,
@@ -168,20 +168,20 @@ fn update_predicate_evaluation_error_propagates_as_statement_error() {
             let rewritten = db
                 .execute("SELECT a FROM t WHERE a = 999", &empty())
                 .expect("count rows rewritten to a = 999")
-                .rows
+                .rows()
                 .len();
             panic!(
                 "UPDATE t SET a = 999 WHERE -tag > 0 must fail with a statement \
                  error, never succeed silently: rows_affected={}, {rewritten} \
                  rows now have a=999. Full result: {r:?}",
-                r.rows_affected,
+                r.rows_affected(),
             );
         }
     }
     let rewritten = db
         .execute("SELECT a FROM t WHERE a = 999", &empty())
         .expect("count rows rewritten to a = 999 after the refused UPDATE")
-        .rows
+        .rows()
         .len();
     assert_eq!(
         rewritten, 0,
@@ -255,7 +255,7 @@ fn select_where_real_null_value_excludes_row_without_error() {
         .execute("SELECT tag FROM t WHERE a = 5", &empty())
         .expect("a real NULL value compared with `=` must exclude the row, not error");
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![vec![Value::Text("r2".to_string())]],
         "only the row with a = 5 must match; the NULL row is correctly excluded"
     );
@@ -355,7 +355,7 @@ fn where_qualifier_naming_the_actual_alias_still_works() {
     let r = db
         .execute("SELECT t1.a FROM t AS t1 WHERE t1.a = 1", &empty())
         .expect("a qualifier naming the query's own alias must keep working");
-    assert_eq!(r.rows, vec![vec![Value::Int64(1)]]);
+    assert_eq!(r.rows(), vec![vec![Value::Int64(1)]]);
 }
 
 // ============================================================================
@@ -378,7 +378,7 @@ fn join_on_qualifier_naming_a_real_joined_table_still_works() {
     let r = db
         .execute("SELECT t.a FROM t INNER JOIN s ON t.a = s.x", &empty())
         .expect("a real joined-table qualifier must keep working");
-    assert_eq!(r.rows, vec![vec![Value::Int64(7)]]);
+    assert_eq!(r.rows(), vec![vec![Value::Int64(7)]]);
 }
 
 // ============================================================================

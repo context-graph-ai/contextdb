@@ -369,12 +369,13 @@ fn assert_count(db: &Database, table: &str, expected: i64) {
     let rows = db
         .execute(&format!("SELECT COUNT(*) FROM {table}"), &empty_params())
         .unwrap()
-        .rows;
+        .rows()
+        .to_vec();
     assert_eq!(rows[0][0], Value::Int64(expected));
 }
 
 fn single_text_value(db: &Database, sql: &str) -> String {
-    let rows = db.execute(sql, &empty_params()).unwrap().rows;
+    let rows = db.execute(sql, &empty_params()).unwrap().rows().to_vec();
     assert_eq!(rows.len(), 1, "expected one row for {sql}, got {rows:?}");
     match &rows[0][0] {
         Value::Text(value) => value.clone(),
@@ -696,7 +697,8 @@ fn commit_failed_observer_receives_vector_and_relational_write_set_with_byte_equ
             &params(vec![("q", Value::Vector(loser_vector.clone()))]),
         )
         .unwrap()
-        .rows;
+        .rows()
+        .to_vec();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0], text("winner"));
     assert_eq!(rows[0][1], Value::Vector(winner_vector));
@@ -884,7 +886,9 @@ fn commit_failed_observer_fires_on_pre_commit_rejection_during_sync_pull_apply()
     let db_a = Database::open_memory();
     exec_empty(&db_a, "CREATE TABLE items (id TEXT PRIMARY KEY)");
     exec_empty(&db_a, "INSERT INTO items (id) VALUES ('A')");
-    let mut changes = db_a.changes_since(Lsn(0));
+    let mut changes = db_a
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     changes.ddl.clear();
     changes.ddl_lsn.clear();
     assert_eq!(changes.rows.len(), 1, "sender changeset must carry one row");

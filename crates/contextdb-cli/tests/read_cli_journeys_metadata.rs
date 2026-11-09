@@ -293,6 +293,29 @@ fn maintenance_status_and_explain_keep_their_own_document_keys() {
     assert_eq!(maintenance["retention_enabled"], false);
     assert_eq!(maintenance["currency_compaction_enabled"], false);
     assert_eq!(maintenance["active_maintenance_loops"], 0);
+    let storage_compaction = maintenance["storage_compaction"]
+        .as_array()
+        .expect("`.maintenance status` lists the storage compaction settings");
+    let settings: Vec<(&str, &str, &str)> = storage_compaction
+        .iter()
+        .map(|setting| {
+            (
+                setting["setting"].as_str().unwrap(),
+                setting["value"].as_str().unwrap(),
+                setting["source"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        settings,
+        vec![
+            ("start_ratio", "0.5", "default"),
+            ("min_interval_ms", "3600000", "default"),
+            ("stop_ratio", "0.05", "default"),
+            ("max_sweeps", "8", "default"),
+        ],
+        "an undeclared store shows today's defaults with their source"
+    );
     expect_document(&docs, "explain", "`.explain` under --json");
 
     let text = run(&[store.path_str()], ".maintenance status\n");
@@ -303,6 +326,8 @@ fn maintenance_status_and_explain_keep_their_own_document_keys() {
         "currency_compaction_enabled=false",
         "active_maintenance_loops=0",
         "policy=engine_owned",
+        "storage_compaction start_ratio=0.5(default) min_interval_ms=3600000(default) \
+         stop_ratio=0.05(default) max_sweeps=8(default)",
     ] {
         assert!(
             text.stdout.contains(field),
@@ -310,6 +335,87 @@ fn maintenance_status_and_explain_keep_their_own_document_keys() {
             text.describe()
         );
     }
+}
+
+#[test]
+fn a_declared_storage_compaction_shows_its_source_through_both_read_routes() {
+    let store = store_with(&format!(
+        "{}SET STORAGE_COMPACTION START_RATIO 0.4 MAX_SWEEPS 3;\n",
+        create_seeded_table("subject", 2)
+    ));
+    let declared = vec![
+        (
+            "start_ratio".to_owned(),
+            "0.4".to_owned(),
+            "declared".to_owned(),
+        ),
+        (
+            "min_interval_ms".to_owned(),
+            "3600000".to_owned(),
+            "default".to_owned(),
+        ),
+        (
+            "stop_ratio".to_owned(),
+            "0.05".to_owned(),
+            "default".to_owned(),
+        ),
+        (
+            "max_sweeps".to_owned(),
+            "3".to_owned(),
+            "declared".to_owned(),
+        ),
+    ];
+    let settings = |outcome: &Outcome| -> Vec<(String, String, String)> {
+        let docs = outcome.stdout_docs();
+        let maintenance = expect_document(&docs, "maintenance", "`.maintenance status`");
+        maintenance["storage_compaction"]
+            .as_array()
+            .expect("`.maintenance status` lists the storage compaction settings")
+            .iter()
+            .map(|setting| {
+                (
+                    setting["setting"].as_str().unwrap().to_owned(),
+                    setting["value"].as_str().unwrap().to_owned(),
+                    setting["source"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    };
+    let route = |outcome: &Outcome| {
+        outcome
+            .route_notices()
+            .first()
+            .and_then(|notice| notice["detail"]["route"].as_str().map(str::to_owned))
+    };
+
+    let idle = run(&[store.path_str(), "--json"], ".maintenance status\n");
+    assert_eq!(idle.code, Some(0), "{}", idle.describe());
+    assert_ne!(
+        route(&idle).as_deref(),
+        Some("owner"),
+        "{}",
+        idle.describe()
+    );
+    assert_eq!(
+        settings(&idle),
+        declared,
+        "the committed file shows the declaration and its source"
+    );
+
+    let _owner = live_owner(&store.path, "");
+    let owned = run(&[store.path_str(), "--json"], ".maintenance status\n");
+    assert_eq!(owned.code, Some(0), "{}", owned.describe());
+    assert_eq!(
+        route(&owned).as_deref(),
+        Some("owner"),
+        "{}",
+        owned.describe()
+    );
+    assert_eq!(
+        settings(&owned),
+        declared,
+        "the live owner shows the same declaration and source"
+    );
 }
 
 #[test]
@@ -412,5 +518,33 @@ fn a_metadata_item_that_cannot_fit_even_an_empty_page_refuses_the_same_way() {
                 .and_then(|s| s.as_str())
                 .is_some(),
         "with the identical required_bytes / required_setting detail: {error}"
+    );
+}
+
+#[test]
+fn verify_history_checks_each_historical_index_from_a_read_session() {
+    let store = store_with(
+        "CREATE TABLE tagged (id INTEGER PRIMARY KEY, tag TEXT) HISTORY ALL;\n\
+         CREATE INDEX tagged_by_tag ON tagged (tag);\n\
+         INSERT INTO tagged VALUES (1, 'a');\n\
+         UPDATE tagged SET tag = 'b' WHERE id = 1;\n",
+    );
+    let outcome = run(&[store.path_str(), "--json"], ".verify history tagged\n");
+
+    let docs = outcome.stdout_docs();
+    let verified = expect_document(&docs, "verify_history", "`.verify history` under --json");
+    let by_tag = verified["indexes"]
+        .as_array()
+        .and_then(|indexes| {
+            indexes
+                .iter()
+                .find(|index| index["index"] == "tagged_by_tag")
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("the declared index is verified: {verified}"));
+    assert_eq!(
+        (by_tag["postings"].as_u64(), by_tag["versions"].as_u64()),
+        (Some(2), Some(2)),
+        "two key runs over two row versions: {by_tag}"
     );
 }

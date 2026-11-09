@@ -39,6 +39,10 @@ pub(super) enum LargeRequestControl {
 }
 
 impl LargeRequestControl {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn encode(&self) -> TransportResult<Vec<u8>> {
         let (kind, body) = match self {
             Self::BeginV1(begin) => (BEGIN_KIND, rmp_serde::to_vec_named(begin)),
@@ -65,6 +69,10 @@ impl LargeRequestControl {
         Ok(encoded)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn decode(encoded: &[u8]) -> TransportResult<Self> {
         let Some((&version, rest)) = encoded
             .strip_prefix(CONTROL_MAGIC)
@@ -130,6 +138,10 @@ pub(super) struct LargeRequestBegin {
 }
 
 impl LargeRequestBegin {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn new(
         subject: &str,
         unit_digest: [u8; blake3::OUT_LEN],
@@ -161,6 +173,10 @@ impl LargeRequestBegin {
         })
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn validate(&self) -> TransportResult<()> {
         if self.subject.is_empty() || self.subject == CONTROL_SUBJECT || self.total_fragments < 2 {
             return Err(TransportError::Other(
@@ -188,6 +204,10 @@ impl LargeRequestBegin {
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn descriptor_digest(&self) -> TransportResult<[u8; blake3::OUT_LEN]> {
         let bytes = rmp_serde::to_vec_named(self).map_err(|err| {
             TransportError::Other(format!("cannot encode oversized request descriptor: {err}"))
@@ -211,6 +231,10 @@ pub(super) enum LargeRequestControlReply {
 }
 
 impl LargeRequestControlReply {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn encode(&self) -> TransportResult<Vec<u8>> {
         let (kind, progress) = match self {
             Self::BeginProgressV1(progress) => (BEGIN_PROGRESS_KIND, progress),
@@ -256,6 +280,10 @@ pub(super) struct LargeRequestFragment {
 }
 
 impl LargeRequestFragment {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn encode(
         subject: &str,
         unit_digest: [u8; blake3::OUT_LEN],
@@ -311,7 +339,105 @@ struct StageManifest {
     transfer_digest: [u8; blake3::OUT_LEN],
 }
 
-#[derive(Debug)]
+/// Funds reassembling a complete oversized request from the receiver's own
+/// budget. The serving side installs it; a transport without one assembles
+/// unfunded, as before.
+pub(crate) trait LargeRequestAdmission: Send + Sync {
+    /// Refuse at once, without reserving anything, a request whose assembly
+    /// could never fit the funding budget's limit.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn preflight(&self, bytes: usize) -> std::result::Result<(), contextdb_core::Error>;
+    /// Charge `bytes` before they are allocated. The credit is held until the
+    /// request's handler returns.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn admit(
+        &self,
+        bytes: usize,
+    ) -> std::result::Result<Box<dyn AssemblyCredit>, contextdb_core::Error>;
+}
+
+/// A held reassembly charge.
+pub(crate) trait AssemblyCredit: Send {
+    /// Release all but `bytes` of the charge.
+    fn shrink_to(&mut self, bytes: usize);
+}
+
+/// A typed refusal as it travels in an admission-refused reply.
+#[derive(Debug, Serialize, Deserialize)]
+enum WireAdmissionRefusal {
+    Memory {
+        subsystem: String,
+        operation: String,
+        requested_bytes: u64,
+        available_bytes: u64,
+        budget_limit_bytes: u64,
+        hint: String,
+    },
+    Other(String),
+}
+
+pub(crate) fn encode_admission_refusal(error: &contextdb_core::Error) -> Vec<u8> {
+    let refusal = match error {
+        contextdb_core::Error::MemoryBudgetExceeded {
+            subsystem,
+            operation,
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            hint,
+        } => WireAdmissionRefusal::Memory {
+            subsystem: subsystem.to_string(),
+            operation: operation.to_string(),
+            requested_bytes: *requested_bytes as u64,
+            available_bytes: *available_bytes as u64,
+            budget_limit_bytes: *budget_limit_bytes as u64,
+            hint: hint.to_string(),
+        },
+        other => WireAdmissionRefusal::Other(other.to_string()),
+    };
+    rmp_serde::to_vec(&refusal).unwrap_or_default()
+}
+
+pub(crate) fn decode_admission_refusal(bytes: &[u8]) -> contextdb_core::Error {
+    let saturate = |value: u64| usize::try_from(value).unwrap_or(usize::MAX);
+    match rmp_serde::from_slice::<WireAdmissionRefusal>(bytes) {
+        Ok(WireAdmissionRefusal::Memory {
+            subsystem,
+            operation,
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            hint,
+        }) => contextdb_core::Error::MemoryBudgetExceeded {
+            subsystem: subsystem.into(),
+            operation: operation.into(),
+            requested_bytes: saturate(requested_bytes),
+            available_bytes: saturate(available_bytes),
+            budget_limit_bytes: saturate(budget_limit_bytes),
+            hint: hint.into(),
+        },
+        Ok(WireAdmissionRefusal::Other(detail)) => contextdb_core::Error::SyncError(detail.into()),
+        Err(err) => contextdb_core::Error::SyncError(
+            (format!("the receiver refused the request with an unreadable reason: {err}")).into(),
+        ),
+    }
+}
+
+/// A complete request's payload and, when an admission funded it, its charge.
+type AssembledRequest = (Vec<u8>, Option<Box<dyn AssemblyCredit>>);
+
+/// The bytes a complete request's assembly holds at its peak: every staged
+/// fragment read back plus the assembled payload.
+pub(crate) fn assembly_peak_bytes(total_bytes: usize) -> usize {
+    total_bytes.saturating_mul(2)
+}
+
 pub(super) enum StageOutcome {
     Pending {
         next_missing: u32,
@@ -320,7 +446,32 @@ pub(super) enum StageOutcome {
         subject: String,
         payload: Vec<u8>,
         completed_path: PathBuf,
+        /// The assembled payload's charge, when an admission funded it.
+        credit: Option<Box<dyn AssemblyCredit>>,
     },
+}
+
+impl std::fmt::Debug for StageOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending { next_missing } => f
+                .debug_struct("Pending")
+                .field("next_missing", next_missing)
+                .finish(),
+            Self::Complete {
+                subject,
+                payload,
+                completed_path,
+                credit,
+            } => f
+                .debug_struct("Complete")
+                .field("subject", subject)
+                .field("payload_bytes", &payload.len())
+                .field("completed_path", completed_path)
+                .field("funded", &credit.is_some())
+                .finish(),
+        }
+    }
 }
 
 #[cfg(any(test, feature = "test-seams"))]
@@ -346,11 +497,30 @@ pub(super) fn fragment_count(total_bytes: usize) -> usize {
     total_bytes.div_ceil(FRAGMENT_BYTES)
 }
 
+#[cfg(test)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn accept_descriptor_fragment(
     stage_root: &Path,
     authenticated_node_id: &str,
     begin: &LargeRequestBegin,
     fragment: &LargeRequestFragment,
+) -> TransportResult<StageOutcome> {
+    accept_descriptor_fragment_admitted(stage_root, authenticated_node_id, begin, fragment, None)
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(super) fn accept_descriptor_fragment_admitted(
+    stage_root: &Path,
+    authenticated_node_id: &str,
+    begin: &LargeRequestBegin,
+    fragment: &LargeRequestFragment,
+    admission: Option<&dyn LargeRequestAdmission>,
 ) -> TransportResult<StageOutcome> {
     begin.validate()?;
     let manifest = stage_manifest(authenticated_node_id, begin);
@@ -374,10 +544,14 @@ pub(super) fn accept_descriptor_fragment(
         ));
     }
     persist_manifest_at(&stage, &manifest)?;
-    accept_fragment_at_stage(&stage, &completed_path, &manifest, fragment)
+    accept_fragment_at_stage(&stage, &completed_path, &manifest, fragment, admission)
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn accept_fragment(
     stage_root: &Path,
     authenticated_node_id: &str,
@@ -397,12 +571,42 @@ pub(super) fn accept_fragment(
     accept_descriptor_fragment(stage_root, authenticated_node_id, &begin, &fragment)
 }
 
+#[cfg(test)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn begin_request(
     stage_root: &Path,
     authenticated_node_id: &str,
     begin: &LargeRequestBegin,
 ) -> TransportResult<StageOutcome> {
+    begin_request_admitted(stage_root, authenticated_node_id, begin, None)
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(super) fn begin_request_admitted(
+    stage_root: &Path,
+    authenticated_node_id: &str,
+    begin: &LargeRequestBegin,
+    admission: Option<&dyn LargeRequestAdmission>,
+) -> TransportResult<StageOutcome> {
     begin.validate()?;
+    // A request whose assembly can never fit the receiver's budget is refused
+    // before anything is staged, so no transfer is spent on it.
+    if let Some(admission) = admission {
+        let total_bytes = usize::try_from(begin.total_bytes).map_err(|_| {
+            TransportError::Other(
+                "oversized request length cannot be represented on this platform".to_string(),
+            )
+        })?;
+        admission
+            .preflight(assembly_peak_bytes(total_bytes))
+            .map_err(TransportError::Refused)?;
+    }
     let manifest = stage_manifest(authenticated_node_id, begin);
     let completed_path = stage_path(stage_root, &manifest);
     let stage = stage_dir(
@@ -416,11 +620,12 @@ pub(super) fn begin_request(
     if next_missing != manifest.total_fragments {
         return Ok(StageOutcome::Pending { next_missing });
     }
-    let payload = assemble_complete_stage_at(&stage, &manifest)?;
+    let (payload, credit) = assemble_complete_stage_at(&stage, &manifest, admission)?;
     Ok(StageOutcome::Complete {
         subject: begin.subject.clone(),
         payload,
         completed_path,
+        credit,
     })
 }
 
@@ -436,11 +641,16 @@ fn stage_manifest(authenticated_node_id: &str, begin: &LargeRequestBegin) -> Sta
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn accept_fragment_at_stage(
     stage: &StageDir,
     completed_path: &Path,
     manifest: &StageManifest,
     fragment: &LargeRequestFragment,
+    admission: Option<&dyn LargeRequestAdmission>,
 ) -> TransportResult<StageOutcome> {
     validate_fragment(manifest, fragment)?;
     let next_missing = repair_request_fragment_prefix_at(stage, manifest)?;
@@ -458,14 +668,19 @@ fn accept_fragment_at_stage(
         return Ok(StageOutcome::Pending { next_missing });
     }
 
-    let payload = assemble_complete_stage_at(stage, manifest)?;
+    let (payload, credit) = assemble_complete_stage_at(stage, manifest, admission)?;
     Ok(StageOutcome::Complete {
         subject: manifest.subject.clone(),
         payload,
         completed_path: completed_path.to_path_buf(),
+        credit,
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn remove_completed_stage(root: &Path, path: &Path) -> TransportResult<()> {
     let Some(root_dir) = stage_root_dir_optional(root)? else {
         return Ok(());
@@ -473,6 +688,10 @@ pub(super) fn remove_completed_stage(root: &Path, path: &Path) -> TransportResul
     remove_completed_stage_at_root(&root_dir, root, path)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn remove_completed_stage_at_root(
     root: &StageDir,
     root_path: &Path,
@@ -495,6 +714,13 @@ fn remove_completed_stage_at_root(
 }
 
 #[cfg(feature = "test-seams")]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(super) fn snapshot_stage(
     stage_root: &Path,
     authenticated_node_id: &str,
@@ -598,6 +824,13 @@ pub(super) fn snapshot_stage(
 /// endpoint's private staging root. This is test-only observability: it never
 /// exposes a stage path or changes staged media.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(super) fn snapshot_all_stages(stage_root: &Path) -> TransportResult<Vec<StageSnapshot>> {
     let mut snapshots = Vec::new();
     let Some(root) = stage_root_dir_optional(stage_root)? else {
@@ -614,6 +847,13 @@ pub(super) fn snapshot_all_stages(stage_root: &Path) -> TransportResult<Vec<Stag
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn snapshot_all_stages_at(
     directory: &StageDir,
     depth: usize,
@@ -670,6 +910,10 @@ fn snapshot_all_stages_at(
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validate_fragment(
     manifest: &StageManifest,
     fragment: &LargeRequestFragment,
@@ -791,6 +1035,10 @@ struct StageDir {
 
 #[cfg(unix)]
 impl StageDir {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn open_anchor(path: &Path, what: &str) -> TransportResult<Self> {
         let c_path = CString::new(path.as_os_str().as_bytes())
             .map_err(|_| TransportError::IncompleteReply(format!("{what} has an invalid path")))?;
@@ -823,6 +1071,10 @@ impl StageDir {
         })
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn private(file: File, display: PathBuf, what: &str) -> TransportResult<Self> {
         let metadata = file
             .metadata()
@@ -846,6 +1098,10 @@ impl StageDir {
         Ok(dir)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn name(name: &str, what: &str) -> TransportResult<CString> {
         if name.is_empty() || name.as_bytes().contains(&b'/') || name == "." || name == ".." {
             return Err(TransportError::IncompleteReply(format!(
@@ -856,6 +1112,10 @@ impl StageDir {
             .map_err(|_| TransportError::IncompleteReply(format!("{what} has an invalid path")))
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn name_os(name: &std::ffi::OsStr, what: &str) -> TransportResult<CString> {
         let bytes = name.as_bytes();
         if bytes.is_empty() || bytes.contains(&b'/') || bytes == b"." || bytes == b".." {
@@ -867,11 +1127,19 @@ impl StageDir {
             .map_err(|_| TransportError::IncompleteReply(format!("{what} has an invalid path")))
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn child_existing(&self, name: &str, what: &str) -> TransportResult<Self> {
         let child = self.child_raw(name, what)?;
         Self::private(child.file, child.display, what)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn child_existing_optional(&self, name: &str, what: &str) -> TransportResult<Option<Self>> {
         let name_c = Self::name(name, what)?;
         let fd = unsafe {
@@ -901,6 +1169,10 @@ impl StageDir {
         .map(Some)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn child_raw(&self, name: &str, what: &str) -> TransportResult<Self> {
         let name_c = Self::name(name, what)?;
         let fd = unsafe {
@@ -924,6 +1196,10 @@ impl StageDir {
         })
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn child_private(&self, name: &str, what: &str) -> TransportResult<Self> {
         let name_c = Self::name(name, what)?;
         #[cfg(test)]
@@ -983,6 +1259,10 @@ impl StageDir {
         Ok(child)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn child_private_os(&self, name: &std::ffi::OsStr, what: &str) -> TransportResult<Self> {
         let name_c = Self::name_os(name, what)?;
         let display = self.display.join(name);
@@ -1058,6 +1338,10 @@ impl StageDir {
         Ok(child)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn child_existing_os_optional(
         &self,
         name: &std::ffi::OsStr,
@@ -1087,6 +1371,10 @@ impl StageDir {
         Self::private(unsafe { File::from_raw_fd(fd) }, display, what).map(Some)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn relative_existing(&self, relative: &Path, what: &str) -> TransportResult<Self> {
         let mut current = self.file.try_clone().map_err(|err| {
             stage_io_error(&self.display, &format!("cannot clone {what} root"), err)
@@ -1112,6 +1400,10 @@ impl StageDir {
         Self::private(current, display, what)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn relative_private(&self, relative: &Path, what: &str) -> TransportResult<Self> {
         let mut current = self.file.try_clone().map_err(|err| {
             stage_io_error(&self.display, &format!("cannot clone {what} root"), err)
@@ -1137,12 +1429,20 @@ impl StageDir {
         Self::private(current, display, what)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn sync(&self) -> TransportResult<()> {
         self.file.sync_all().map_err(|err| {
             stage_io_error(&self.display, "cannot sync durable stage directory", err)
         })
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn read_file(&self, name: &str, max: Option<usize>, what: &str) -> TransportResult<Vec<u8>> {
         let name_c = Self::name(name, what)?;
         #[cfg(test)]
@@ -1202,6 +1502,10 @@ impl StageDir {
         Ok(bytes)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn read_optional(
         &self,
         name: &str,
@@ -1237,6 +1541,10 @@ impl StageDir {
         self.read_file(name, max, what).map(Some)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn persist_new(&self, name: &str, bytes: &[u8], what: &str) -> TransportResult<()> {
         let target = Self::name(name, what)?;
         let temporary_name = format!(".{name}.tmp-{}", uuid::Uuid::new_v4());
@@ -1302,6 +1610,10 @@ impl StageDir {
         result
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn move_regular_new(
         &self,
         source: &str,
@@ -1354,6 +1666,10 @@ impl StageDir {
         self.sync()
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn unlink_file(&self, name: &str, what: &str) -> TransportResult<()> {
         let name_c = Self::name(name, what)?;
         let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
@@ -1396,6 +1712,10 @@ impl StageDir {
         self.sync()
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn remove_held_tree_child(
         &self,
         name: &str,
@@ -1405,6 +1725,10 @@ impl StageDir {
         self.remove_held_tree_child_at_pause(name, child, what, PausePoint::Cleanup)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn remove_held_tree_child_at_pause(
         &self,
         name: &str,
@@ -1460,6 +1784,10 @@ impl StageDir {
         self.sync()
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn remove_tree_contents(&self, what: &str) -> TransportResult<()> {
         let duplicate = unsafe { libc::dup(self.file.as_raw_fd()) };
         if duplicate < 0 {
@@ -1542,6 +1870,10 @@ impl StageDir {
         self.sync()
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn entries(&self, what: &str) -> TransportResult<Vec<(String, libc::stat)>> {
         let duplicate = unsafe { libc::dup(self.file.as_raw_fd()) };
         if duplicate < 0 {
@@ -1612,6 +1944,10 @@ impl StageDir {
         Ok(entries)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn directory_bytes(&self, what: &str) -> TransportResult<u64> {
         let mut total = 0u64;
         for (name, stat) in self.entries(what)? {
@@ -1631,6 +1967,10 @@ impl StageDir {
         Ok(total)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn unlink_regular_if_same(
         &self,
         name: &str,
@@ -1738,11 +2078,22 @@ fn reset_errno() {
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn reset_errno() {}
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PausePoint {
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: constructed only by unit tests and the test-seams build"
+    )]
     CreateDirectory,
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: constructed only by unit tests and the test-seams build"
+    )]
     Publish,
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: constructed only by unit tests and the test-seams build"
+    )]
     Read,
     Cleanup,
     Pressure,
@@ -1876,6 +2227,10 @@ fn arm_pinned_parent_pause_for_test(point: PausePoint) -> PinnedParentPauseGuard
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn stage_root_parent_and_name(root: &Path) -> TransportResult<(StageDir, &std::ffi::OsStr)> {
     let parent = root.parent().unwrap_or_else(|| Path::new("."));
     let name = root.file_name().ok_or_else(|| {
@@ -1886,18 +2241,30 @@ fn stage_root_parent_and_name(root: &Path) -> TransportResult<(StageDir, &std::f
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn stage_root_dir_create(root: &Path) -> TransportResult<StageDir> {
     let (parent, name) = stage_root_parent_and_name(root)?;
     parent.child_private_os(name, "durable staging root")
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn stage_root_dir_optional(root: &Path) -> TransportResult<Option<StageDir>> {
     let (parent, name) = stage_root_parent_and_name(root)?;
     parent.child_existing_os_optional(name, "durable staging root")
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn stage_root_dir_existing(root: &Path) -> TransportResult<StageDir> {
     stage_root_dir_optional(root)?.ok_or_else(|| {
         TransportError::IncompleteReply("durable staging root is missing".to_string())
@@ -1905,6 +2272,10 @@ fn stage_root_dir_existing(root: &Path) -> TransportResult<StageDir> {
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn stage_dir(root: &Path, path: &Path, create: bool, what: &str) -> TransportResult<StageDir> {
     let relative = path
         .strip_prefix(root)
@@ -1922,6 +2293,10 @@ fn stage_dir(root: &Path, path: &Path, create: bool, what: &str) -> TransportRes
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn stage_dir_from_root(
     root: &StageDir,
     root_path: &Path,
@@ -1940,6 +2315,13 @@ fn stage_dir_from_root(
 }
 
 #[cfg(all(unix, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn stage_dir_optional_from_root(
     root: &StageDir,
     root_path: &Path,
@@ -1973,6 +2355,10 @@ fn stage_dir_optional_from_root(
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn parent_and_leaf_from_root(
     root: &StageDir,
     root_path: &Path,
@@ -2014,6 +2400,10 @@ fn parent_and_leaf_from_root(
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn parent_and_leaf_optional_from_root(
     root: &StageDir,
     root_path: &Path,
@@ -2053,6 +2443,10 @@ fn parent_and_leaf_optional_from_root(
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn open_tree_unit_from_root(
     root: &StageDir,
     root_path: &Path,
@@ -2069,6 +2463,10 @@ compile_error!(
     "durable large-request staging requires Unix descriptor-relative filesystem operations"
 );
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn persist_manifest_at(stage: &StageDir, manifest: &StageManifest) -> TransportResult<()> {
     let encoded = rmp_serde::to_vec_named(manifest).map_err(|err| {
         TransportError::Other(format!("cannot encode oversized request manifest: {err}"))
@@ -2086,6 +2484,10 @@ fn persist_manifest_at(stage: &StageDir, manifest: &StageManifest) -> TransportR
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn persist_fragment_at(stage: &StageDir, fragment: &LargeRequestFragment) -> TransportResult<()> {
     let stem = format!("{:08}", fragment.sequence);
     let part = format!("{stem}.part");
@@ -2117,6 +2519,10 @@ fn persist_fragment_at(stage: &StageDir, fragment: &LargeRequestFragment) -> Tra
     )
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn repair_request_fragment_prefix_at(
     stage: &StageDir,
     manifest: &StageManifest,
@@ -2147,6 +2553,10 @@ fn repair_request_fragment_prefix_at(
     Ok(manifest.total_fragments)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn request_fragment_bytes(manifest: &StageManifest, sequence: u32) -> TransportResult<usize> {
     let total = usize::try_from(manifest.total_bytes).map_err(|_| {
         TransportError::Other(
@@ -2160,6 +2570,10 @@ fn request_fragment_bytes(manifest: &StageManifest, sequence: u32) -> TransportR
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn discard_request_fragment_suffix_at(
     stage: &StageDir,
     from: u32,
@@ -2174,15 +2588,26 @@ fn discard_request_fragment_suffix_at(
     stage.sync()
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn assemble_complete_stage_at(
     stage: &StageDir,
     manifest: &StageManifest,
-) -> TransportResult<Vec<u8>> {
+    admission: Option<&dyn LargeRequestAdmission>,
+) -> TransportResult<AssembledRequest> {
     let total_bytes = usize::try_from(manifest.total_bytes).map_err(|_| {
         TransportError::Other(
             "oversized request length cannot be represented on this platform".to_string(),
         )
     })?;
+    // Charged before any fragment is read back. A refusal leaves every staged
+    // fragment in place, so the sender's retry resumes the same stage.
+    let mut credit = admission
+        .map(|admission| admission.admit(assembly_peak_bytes(total_bytes)))
+        .transpose()
+        .map_err(TransportError::Refused)?;
     let mut fragments = Vec::new();
     for sequence in 0..manifest.total_fragments {
         let path = format!("{sequence:08}.part");
@@ -2222,7 +2647,11 @@ fn assemble_complete_stage_at(
             "complete oversized request failed integrity validation".to_string(),
         ));
     }
-    Ok(payload)
+    // The read-back fragments are gone; only the assembled payload stays held.
+    if let Some(credit) = credit.as_mut() {
+        credit.shrink_to(total_bytes);
+    }
+    Ok((payload, credit))
 }
 
 fn stage_io_error(_path: &Path, action: &str, _err: std::io::Error) -> TransportError {
@@ -2318,16 +2747,28 @@ impl LargeResponseManifest {
             .then_some(manifest)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn encode(&self) -> TransportResult<Vec<u8>> {
         rmp_serde::to_vec_named(self).map_err(|err| {
             TransportError::Other(format!("cannot encode oversized response manifest: {err}"))
         })
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn transfer_digest(&self) -> TransportResult<[u8; blake3::OUT_LEN]> {
         Ok(*blake3::hash(&self.encode()?).as_bytes())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn validate_for(
         &self,
         node: &str,
@@ -2361,6 +2802,10 @@ impl LargeResponseManifest {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn stage_large_response(
     root: &Path,
     authenticated_node_id: &str,
@@ -2379,6 +2824,10 @@ pub(super) fn stage_large_response(
     )
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn stage_large_response_with_budget(
     root: &Path,
     authenticated_node_id: &str,
@@ -2411,6 +2860,10 @@ struct ResponseStageAdmission<'a> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn stage_large_response_with_nonce(
     root: &Path,
     authenticated_node_id: &str,
@@ -2433,6 +2886,10 @@ fn stage_large_response_with_nonce(
     )
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn stage_large_response_with_nonce_and_budget(
     root: &Path,
     authenticated_node_id: &str,
@@ -2527,6 +2984,10 @@ fn stage_large_response_with_nonce_and_budget(
     Ok(manifest)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn response_chunk(
     root: &Path,
     authenticated_node_id: &str,
@@ -2575,6 +3036,10 @@ pub(super) fn response_chunk(
 /// Records completion before deleting bytes.  A retry after the server has
 /// accepted completion but its reply was lost finds this tombstone and returns
 /// the same success without re-running the original request handler.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn validate_large_response_completion(
     root: &Path,
     authenticated_node_id: &str,
@@ -2619,6 +3084,10 @@ pub(super) fn validate_large_response_completion(
 
 /// Durably records completion before deleting response bytes. A retry after
 /// the acknowledgement is lost validates and reuses the retained receipt.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn complete_large_response(
     root: &Path,
     authenticated_node_id: &str,
@@ -2711,6 +3180,10 @@ pub(super) fn complete_large_response(
 /// caller invokes this only after releasing the final in-memory logical
 /// transfer reference, so an identical concurrent transfer cannot lose bytes
 /// it is still reading.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn abandon_large_response(
     root: &Path,
     authenticated_node_id: &str,
@@ -2742,6 +3215,10 @@ pub(super) fn abandon_large_response(
 /// The client sends this only after receiving the durable completion
 /// acknowledgement. A lost release leaves a retry receipt, while a duplicate
 /// release is harmless.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn release_large_response(
     root: &Path,
     authenticated_node_id: &str,
@@ -2795,6 +3272,13 @@ pub(super) fn release_large_response(
 /// Test-seam-only receipt inspection, performed while the response-stage lock
 /// is held by the caller so the observation has no completion race.
 #[cfg(feature = "test-seams")]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(super) fn response_completion_receipt_exists(
     root: &Path,
     manifest: &LargeResponseManifest,
@@ -2857,6 +3341,10 @@ pub(super) fn response_completion_path(root: &Path, manifest: &LargeResponseMani
         .join(format!("{}.msgpack", scope))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn read_exact_at(
     stage: &StageDir,
     name: &str,
@@ -2872,6 +3360,10 @@ fn read_exact_at(
     Ok(bytes)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn persist_response_manifest_at(
     stage: &StageDir,
     manifest: &LargeResponseManifest,
@@ -2890,6 +3382,10 @@ fn persist_response_manifest_at(
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn persist_response_chunk_at(
     stage: &StageDir,
     manifest: &LargeResponseManifest,
@@ -2934,6 +3430,10 @@ fn persist_response_chunk_at(
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validate_response_stage_at(
     stage: &StageDir,
     node: &str,
@@ -2964,6 +3464,10 @@ fn validate_response_stage_at(
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn response_chunk_len(manifest: &LargeResponseManifest, sequence: u64) -> TransportResult<usize> {
     let sequence = usize::try_from(sequence).map_err(|_| {
         TransportError::IncompleteReply(
@@ -2994,6 +3498,10 @@ fn response_chunk_len(manifest: &LargeResponseManifest, sequence: u64) -> Transp
 /// Applies the server-local Policy 12 storage pressure setting only to
 /// abandoned oversized-response transport data. It never changes sync
 /// progress, request staging, or an explicitly protected active unit.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn enforce_response_stage_budget(
     root: &Path,
     budget: u64,
@@ -3002,6 +3510,10 @@ pub(super) fn enforce_response_stage_budget(
     reserve_response_stage_budget(root, budget, protected, 0)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn reserve_response_stage_budget(
     root: &Path,
     budget: u64,
@@ -3070,6 +3582,13 @@ fn reserve_response_stage_budget(
 /// deliberately unavailable in production builds: it must not become a
 /// transport control surface.
 #[cfg(feature = "test-seams")]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(super) fn response_stage_counts(root: &Path) -> TransportResult<(usize, usize)> {
     let Some(root_dir) = stage_root_dir_optional(root)? else {
         return Ok((0, 0));
@@ -3102,6 +3621,10 @@ struct PressureUnit {
     directory: bool,
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn collect_response_stage_units_at(
     root: &StageDir,
     relative: PathBuf,
@@ -3134,6 +3657,10 @@ fn collect_response_stage_units_at(
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn collect_response_receipts_at(
     root: &StageDir,
     relative: PathBuf,
@@ -3171,6 +3698,10 @@ fn collect_response_receipts_at(
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn evict_pressure_unit(root: &StageDir, unit: &PressureUnit) -> TransportResult<()> {
     let full = root.display.join(&unit.relative);
     let (parent, leaf) = parent_and_leaf_from_root(
@@ -3235,6 +3766,10 @@ fn evict_pressure_unit(root: &StageDir, unit: &PressureUnit) -> TransportResult<
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn canonical_raw_stat_identity<D, I>(dev: D, ino: I, what: &str) -> TransportResult<(u64, u64)>
 where
     D: TryInto<u64>,
@@ -3375,6 +3910,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial_test::serial(safe_fs_pause)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn pinned_parent_create_directory_and_chmod_stay_in_the_original_tree() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -3442,6 +3981,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial_test::serial(safe_fs_pause)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn pinned_parent_request_response_and_receipt_publication_stay_in_the_original_tree() {
         let temp = tempfile::tempdir().expect("tempdir");
         let outside = tempfile::tempdir().expect("outside");
@@ -3570,6 +4113,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial_test::serial(safe_fs_pause)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn pinned_parent_response_read_uses_the_original_stage_after_a_visible_swap() {
         let temp = tempfile::tempdir().expect("tempdir");
         let outside = tempfile::tempdir().expect("outside");
@@ -3610,6 +4157,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial_test::serial(safe_fs_pause)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn pinned_parent_request_and_response_cleanup_never_delete_the_swapped_outside_tree() {
         let temp = tempfile::tempdir().expect("tempdir");
         let outside = tempfile::tempdir().expect("outside");
@@ -3701,6 +4252,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial_test::serial(safe_fs_pause)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn pinned_parent_pressure_eviction_cannot_follow_a_swapped_visible_ancestor() {
         let temp = tempfile::tempdir().expect("tempdir");
         let outside = tempfile::tempdir().expect("outside");

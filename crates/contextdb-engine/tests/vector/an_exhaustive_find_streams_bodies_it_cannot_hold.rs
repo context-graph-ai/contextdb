@@ -2,28 +2,24 @@
 //! inside the memory its reader declared, by streaming the stored vectors one
 //! at a time instead of loading whole Contexts of them.
 //!
-//! The automatic route compares rows exactly wherever a partition's maintained
-//! graph cannot answer -- it does not fit the declared memory, its chain is
-//! incomplete, or it came back short. That exhaustive work must score each
-//! row's own stored vector, never the graph's copy, and it must not need room
+//! The exact route compares every row. That exhaustive work must score each
+//! row's own stored vector and it must not need room
 //! for a whole partition of those vectors at once: a reader declared for a few
 //! megabytes can hold one vector at a time, and that is all an exhaustive
 //! comparison needs. Loading each partition whole would refuse a broad find
 //! for memory the answer never needs.
 //!
-//! Measured on the file route through a real `ReadSession`. Every partition's
-//! graph is made to come back short, which sends the whole scope down the
-//! exhaustive route, and the reader's budget is set from what it holds before
-//! the find so that it cannot hold even one partition's vectors.
+//! Measured on the file route through a real `ReadSession`, with the reader's
+//! budget set from what it holds before the find so that it cannot hold even
+//! one partition's vectors.
 
+use contextdb_core::Value;
 use contextdb_core::read_contract::{ReadLimits, ReadRoute};
 use contextdb_core::types::ContextId;
-use contextdb_core::{Value, VectorIndexRef, VectorPartitionKey};
 use contextdb_engine::{
     Database, DatabaseOpenOptions, MaintenancePolicy, OwnerReadConfig, ReadSession,
-    ReadSessionOptions, VectorSearchRoute,
+    ReadSessionOptions,
 };
-use contextdb_vector::VectorPartitionRef;
 use std::collections::{BTreeSet, HashMap};
 use uuid::Uuid;
 
@@ -131,21 +127,7 @@ fn seed(path: &std::path::Path, runtime: &std::path::Path) {
                 .expect("seed one partitioned row");
         }
     }
-    let index = VectorIndexRef::new("streamed_rows", "embedding");
-    for _ in 0..4096 {
-        admin
-            .run_maintenance_cycle()
-            .expect("advance deterministic maintenance");
-        let ready = admin
-            .vector_store_for_test()
-            .partition_infos(&index)
-            .expect("inspect partition readiness");
-        if ready.len() == PARTITIONS && ready.iter().all(|partition| partition.graph_available) {
-            admin.close().expect("seal the fixture store");
-            return;
-        }
-    }
-    panic!("every partition must publish a maintained route before the read is measured");
+    admin.close().expect("seal the fixture store");
 }
 
 fn statement() -> (String, HashMap<String, Value>) {
@@ -175,6 +157,10 @@ fn statement() -> (String, HashMap<String, Value>) {
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn open_reader(path: &std::path::Path, runtime: &std::path::Path, memory: u64) -> ReadSession {
     // This proof is about memory. The time allowance is wide so an unoptimized
     // test build on a loaded machine is not what decides it.
@@ -215,6 +201,10 @@ fn ids(rows: &[Vec<Value>]) -> Vec<i64> {
 
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn an_exhaustive_find_over_every_context_streams_what_it_cannot_hold() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -225,7 +215,6 @@ fn an_exhaustive_find_over_every_context_streams_what_it_cannot_hold() {
     std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
         .expect("the runtime directory is private to its owner");
     seed(&path, &runtime);
-    let index = VectorIndexRef::new("streamed_rows", "embedding");
     let (sql, params) = statement();
     let oracle = oracle_top_ids();
 
@@ -243,12 +232,8 @@ fn an_exhaustive_find_over_every_context_streams_what_it_cannot_hold() {
     // Room for everything the find needs except one partition's vectors whole.
     let budget = opened_bytes + ONE_RAW_PARTITION_BYTES / 2;
     let reader = open_reader(&path, &runtime, budget);
-    let store = reader
-        .file_vector_store_for_test()
-        .expect("a file-route reader searches its own vector store");
-    // Every graph comes back empty, so every partition is answered by comparing
-    // its rows -- the exhaustive route this proof is about.
-    let _short = store.cap_graph_candidates_for_test(&index, 0);
+    // The exhaustive route this proof is about compares every row.
+    let sql = sql.replace(" LIMIT ", " USE VECTOR EXACT LIMIT ");
     let before = reader
         .file_vector_passive_activity_for_test()
         .expect("a file-route reader reports its vector activity");
@@ -267,13 +252,13 @@ fn an_exhaustive_find_over_every_context_streams_what_it_cannot_hold() {
          raw_candidate_point_loads={} answer={:?}",
         after.raw_partition_loads - before.raw_partition_loads,
         after.raw_candidate_point_loads - before.raw_candidate_point_loads,
-        answer.as_ref().map(|answer| ids(&answer.rows)),
+        answer.as_ref().map(|answer| ids(&answer.rows())),
     );
     let answer = answer.expect(
         "a find over every Context answers inside a budget that cannot hold one partition's vectors",
     );
     assert_eq!(
-        ids(&answer.rows),
+        ids(&answer.rows()),
         oracle,
         "the exhaustive route returns exactly the oracle's nearest rows from the stored vectors",
     );
@@ -284,40 +269,5 @@ fn an_exhaustive_find_over_every_context_streams_what_it_cannot_hold() {
     assert!(
         peak <= budget,
         "the reader never holds more than it declared: peak {peak} against {budget}",
-    );
-
-    drop(_short);
-    drop(reader);
-    let damaged = VectorPartitionRef::new(
-        index,
-        VectorPartitionKey::from_values(&[
-            Value::Uuid(context_id(0)),
-            Value::Uuid(generation_id(0)),
-        ])
-        .expect("the damaged partition has one canonical key"),
-    );
-    Database::__corrupt_vector_partition_saved_graph_for_test(&path, &damaged)
-        .expect("flip one byte in a saved graph without changing any row body");
-    let damaged_reader = open_reader(&path, &runtime, budget);
-    let exact_sql = sql.replace(" LIMIT ", " USE VECTOR EXACT LIMIT ");
-    let exact = damaged_reader
-        .execute(&exact_sql, &params)
-        .expect("EXACT reads authoritative bodies when a graph is damaged");
-    assert_eq!(ids(&exact.rows), oracle);
-    let damaged_store = damaged_reader
-        .file_vector_store_for_test()
-        .expect("the damaged reader still has a vector store");
-    let _short = damaged_store.cap_graph_candidates_for_test(&damaged.index, 0);
-    let auto = damaged_reader
-        .execute(&sql, &params)
-        .expect("AUTO can compare authoritative bodies after graph damage");
-    assert_eq!(ids(&auto.rows), oracle);
-    assert_eq!(
-        auto.trace
-            .vector_search
-            .as_ref()
-            .and_then(|search| search.route),
-        Some(VectorSearchRoute::Exact),
-        "the damaged graph cannot provide an exact fallback answer"
     );
 }

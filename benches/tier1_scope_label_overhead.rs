@@ -53,12 +53,18 @@ fn hot_selects(
     let started = Instant::now();
     for _ in 0..iterations {
         let result = db.execute(sql, params).unwrap();
-        std::hint::black_box(result.rows[0][0].clone());
+        std::hint::black_box(result.rows()[0][0].clone());
     }
     started.elapsed()
 }
 
 fn bench_scope_label_overhead(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function("tier1_scope_label_overhead/ungated", |_| {});
+        c.bench_function("tier1_scope_label_overhead/ratio_guard", |_| {});
+        c.bench_function("tier1_scope_label_overhead/gated", |_| {});
+        return;
+    }
     let tmp = TempDir::new().unwrap();
     let admin_path = tmp.path().join("scope-label-admin.redb");
     let gated_path = tmp.path().join("scope-label-gated.redb");
@@ -73,14 +79,14 @@ fn bench_scope_label_overhead(c: &mut Criterion) {
         admin
             .execute("SELECT id FROM signatures", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         rows as usize
     );
     c.bench_function("tier1_scope_label_overhead/ungated", |b| {
         b.iter(|| {
             let result = admin.execute(hot_sql, &hot_params).unwrap();
-            std::hint::black_box(result.rows[0][0].clone());
+            std::hint::black_box(result.rows()[0][0].clone());
         });
     });
 
@@ -91,7 +97,7 @@ fn bench_scope_label_overhead(c: &mut Criterion) {
         gated
             .execute("SELECT id, scope_label FROM signatures", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         (rows / 2) as usize
     );
@@ -99,7 +105,7 @@ fn bench_scope_label_overhead(c: &mut Criterion) {
         gated
             .execute("SELECT scope_label FROM signatures", &empty())
             .unwrap()
-            .rows
+            .rows()
             .iter()
             .all(|row| row[0] == Value::Text("edge".into()))
     );
@@ -121,7 +127,7 @@ fn bench_scope_label_overhead(c: &mut Criterion) {
     c.bench_function("tier1_scope_label_overhead/gated", |b| {
         b.iter(|| {
             let result = gated.execute(hot_sql, &hot_params).unwrap();
-            std::hint::black_box(result.rows[0][0].clone());
+            std::hint::black_box(result.rows()[0][0].clone());
         });
     });
 }

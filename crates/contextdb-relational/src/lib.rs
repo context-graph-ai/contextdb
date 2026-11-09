@@ -1,6 +1,7 @@
 pub mod mem;
 #[doc(hidden)]
 pub mod membership;
+pub mod source;
 pub mod store;
 
 pub use mem::MemRelationalExecutor;
@@ -10,3 +11,6 @@ pub use store::{
     UnauthorisedCandidateWork, UnauthorisedCandidateWorkKind, index_key_for_row,
     index_key_from_values,
 };
+
+#[doc(hidden)]
+pub mod schema_generation;

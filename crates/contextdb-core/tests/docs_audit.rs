@@ -106,7 +106,7 @@ fn docs_query_language_lists_txid_column_type() {
 //   `crates/*/tests/<file_stem>/main.rs`, or `crates/*/tests/*/<file_stem>.rs`
 //   defines a test `fn test_fn`;
 // - `<path>.rs::test_fn` — a repository-relative test file (for example
-//   `tests/integration/hnsw_tests.rs::h04_hnsw_recall_is_at_least_ninety_five_percent`)
+//   `tests/integration/clustered_index_tests.rs::h04_indexed_recall_is_at_least_ninety_five_percent`)
 //   defines a test `fn test_fn`;
 // - `<crate>::<file_stem>` — the whole test target
 //   `crates/<crate>/tests/<file_stem>.rs` enforces the claim.
@@ -118,7 +118,7 @@ use std::path::{Path, PathBuf};
 
 #[path = "audit_support/mod.rs"]
 mod audit_support;
-use audit_support::workspace_root;
+use audit_support::{rust_scope_text, workspace_root};
 
 const BINDING_TAG: &str = "enforced by:";
 
@@ -184,8 +184,10 @@ const CAPABILITY_WORDS: &[&str] = &["vector", "partition", "maintenance", "purge
 /// genuinely shrink.
 const PAGE_BINDING_FLOORS: &[(&str, usize)] = &[
     ("README.md", 11),
-    ("skills/vector-search/SKILL.md", 40),
-    ("docs/capability-index.md", 17),
+    // The vector skill covers exact search; the index route is not shipped in this release.
+    ("skills/vector-search/SKILL.md", 20),
+    // The capability index omits index-route claims because that route is not shipped in this release.
+    ("docs/capability-index.md", 12),
     ("docs/query-language.md", 65),
     ("docs/architecture.md", 72),
     ("docs/getting-started.md", 12),
@@ -572,90 +574,6 @@ fn nearest_guard_match(root: &Path, crate_dir: &Path, name: &str) -> String {
         .min_by(|a, b| a.cmp(b))
         .map(|(_, path, test)| format!("{}::{test}", relative_display(root, &path)))
         .unwrap_or_else(|| "no nearby test".to_string())
-}
-
-/// Blank comments and literals before counting scopes. Preserve offsets/newlines so
-/// braces or apparent module declarations in test data cannot change identity.
-fn rust_scope_text(source: &str) -> String {
-    let bytes = source.as_bytes();
-    let mut masked = bytes.to_vec();
-    let mut i = 0;
-    while i < bytes.len() {
-        let start = i;
-        if bytes[i..].starts_with(b"//") {
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-        } else if bytes[i..].starts_with(b"/*") {
-            i += 2;
-            let mut depth = 1;
-            while i < bytes.len() && depth > 0 {
-                if bytes[i..].starts_with(b"/*") {
-                    depth += 1;
-                    i += 2;
-                } else if bytes[i..].starts_with(b"*/") {
-                    depth -= 1;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-        } else if bytes[i] == b'r' {
-            let mut quote = i + 1;
-            while quote < bytes.len() && bytes[quote] == b'#' {
-                quote += 1;
-            }
-            if bytes.get(quote) != Some(&b'"') {
-                i += 1;
-                continue;
-            }
-            let hashes = quote - i - 1;
-            i = quote + 1;
-            while i < bytes.len() {
-                if bytes[i] == b'"'
-                    && bytes
-                        .get(i + 1..i + 1 + hashes)
-                        .is_some_and(|tail| tail.iter().all(|b| *b == b'#'))
-                {
-                    i += 1 + hashes;
-                    break;
-                }
-                i += 1;
-            }
-        } else if bytes[i] == b'"' || bytes[i] == b'\'' {
-            let quote = bytes[i];
-            // A lifetime is not a character literal. Character literals end
-            // after one UTF-8 scalar or an escape (possibly a Unicode escape).
-            if quote == b'\'' {
-                let tail = &source[i + 1..];
-                let char_len = tail.chars().next().map_or(0, char::len_utf8);
-                if !tail.starts_with('\\') && bytes.get(i + 1 + char_len) != Some(&b'\'') {
-                    i += 1;
-                    continue;
-                }
-            }
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == b'\\' {
-                    i = (i + 2).min(bytes.len());
-                } else if bytes[i] == quote {
-                    i += 1;
-                    break;
-                } else {
-                    i += 1;
-                }
-            }
-        } else {
-            i += 1;
-            continue;
-        }
-        for byte in &mut masked[start..i] {
-            if *byte != b'\n' {
-                *byte = b' ';
-            }
-        }
-    }
-    String::from_utf8(masked).expect("masking whole literals preserves UTF-8")
 }
 
 fn immediate_scope(source: &str) -> String {

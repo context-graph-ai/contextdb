@@ -7,7 +7,7 @@ fn empty() -> HashMap<String, Value> {
 }
 
 fn body(result: &QueryResult) -> &str {
-    match &result.rows[0][0] {
+    match &result.rows()[0][0] {
         Value::Text(value) => value.as_str(),
         other => panic!("expected text body, got {other:?}"),
     }
@@ -76,7 +76,7 @@ fn disk_backed_rows_keep_writes_rollback_snapshots_and_reopen_coherent() {
     assert_eq!(
         db.execute("SELECT id FROM docs WHERE unique_key = 'one'", &empty())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1)]]
     );
 
@@ -87,7 +87,7 @@ fn disk_backed_rows_keep_writes_rollback_snapshots_and_reopen_coherent() {
     assert_eq!(
         db.execute("SELECT id FROM docs WHERE id = 1", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         1
     );
@@ -133,7 +133,7 @@ fn disk_backed_rows_keep_writes_rollback_snapshots_and_reopen_coherent() {
         reopened
             .execute("SELECT id FROM docs WHERE id = 1", &empty())
             .unwrap()
-            .rows
+            .rows()
             .is_empty()
     );
     reopened.close().unwrap();

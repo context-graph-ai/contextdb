@@ -8,6 +8,7 @@
 //! the cursor the caller opened before the interrupt must still hand back its
 //! next page.
 
+use super::owner_cursor_test_support;
 use contextdb_core::read_contract::{
     DeadlineClock, LocalUserIdentity, OwnerReadCancellation, OwnerRequestHandler,
     ReadClientTimeouts, ReadLimits,
@@ -18,7 +19,8 @@ use contextdb_engine::local_transport::{
 };
 use contextdb_engine::owner_read::{OwnerClient, OwnerReadScaffoldError};
 use contextdb_engine::persistence::read_persistence_test_scaffold::inspect_companion_record_for_test;
-use contextdb_engine::read_contract::decode_cursor_page;
+use owner_cursor_test_support::decode_owner_cursor_page as decode_cursor_page;
+
 use contextdb_engine::{Database, DatabaseOpenOptions};
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -222,6 +224,10 @@ fn run_owner_process() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_second_process_interrupt_ends_only_the_request_it_names() {
     if std::env::var_os(OWNER_ROLE).is_some() {
         run_owner_process();
@@ -272,6 +278,9 @@ fn a_second_process_interrupt_ends_only_the_request_it_names() {
                 response_ms: 120_000,
             },
             clock,
+            super::wire_fixture_test_support::owner_for_bytes(
+                ReadLimits::default().memory as usize,
+            ),
         ))
         .expect("reach the independent owner over its real channel"),
     ));

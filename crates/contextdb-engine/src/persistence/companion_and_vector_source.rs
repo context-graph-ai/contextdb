@@ -1,0 +1,1384 @@
+use super::*;
+
+impl Drop for CompanionGuard {
+    fn drop(&mut self) {
+        if let Ok(state) = self.state.lock() {
+            release_companion_range_lock(&state.file, COMPANION_OWNER_LOCK_OFFSET);
+            release_companion_range_lock(&state.file, COMPANION_CLAIM_WINDOW_LOCK_OFFSET);
+            unlock_file(&state.file);
+        }
+    }
+}
+
+pub(super) fn write_companion_region(
+    file: &mut File,
+    offset: u64,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(bytes)
+}
+
+/// Durable companion updates use this primitive for the inactive slot's
+/// payload. The crash checkpoint cannot be moved away from the write without
+/// replacing the operation the companion writer is required to call.
+pub(super) fn write_companion_slot_payload(
+    file: &mut File,
+    offset: u64,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    write_companion_region(file, offset, payload)?;
+    #[cfg(any(test, feature = "test-seams"))]
+    read_persistence_test_scaffold::companion_write_checkpoint(
+        read_persistence_test_scaffold::CompanionWriteBoundary::SlotPayloadWrite,
+    );
+    Ok(())
+}
+
+pub(super) fn sync_companion_slot_payload(file: &File) -> std::io::Result<()> {
+    file.sync_data()?;
+    #[cfg(any(test, feature = "test-seams"))]
+    read_persistence_test_scaffold::companion_write_checkpoint(
+        read_persistence_test_scaffold::CompanionWriteBoundary::SlotPayloadSync,
+    );
+    Ok(())
+}
+
+pub(super) fn write_companion_slot_checksum(
+    file: &mut File,
+    offset: u64,
+    checksum: &[u8; 32],
+) -> std::io::Result<()> {
+    write_companion_region(file, offset, checksum)?;
+    #[cfg(any(test, feature = "test-seams"))]
+    read_persistence_test_scaffold::companion_write_checkpoint(
+        read_persistence_test_scaffold::CompanionWriteBoundary::SlotChecksumWrite,
+    );
+    Ok(())
+}
+
+pub(super) fn sync_companion_slot_checksum(file: &File) -> std::io::Result<()> {
+    file.sync_data()?;
+    #[cfg(any(test, feature = "test-seams"))]
+    read_persistence_test_scaffold::companion_write_checkpoint(
+        read_persistence_test_scaffold::CompanionWriteBoundary::SlotChecksumSync,
+    );
+    Ok(())
+}
+
+pub(super) fn write_companion_active_slot(
+    file: &mut File,
+    offset: u64,
+    active_slot: &[u8],
+) -> std::io::Result<()> {
+    write_companion_region(file, offset, active_slot)?;
+    #[cfg(any(test, feature = "test-seams"))]
+    read_persistence_test_scaffold::companion_write_checkpoint(
+        read_persistence_test_scaffold::CompanionWriteBoundary::ActiveSlotWrite,
+    );
+    Ok(())
+}
+
+pub(super) fn sync_companion_active_slot(file: &File) -> std::io::Result<()> {
+    file.sync_data()?;
+    #[cfg(any(test, feature = "test-seams"))]
+    read_persistence_test_scaffold::companion_write_checkpoint(
+        read_persistence_test_scaffold::CompanionWriteBoundary::ActiveSlotSync,
+    );
+    Ok(())
+}
+
+pub(super) fn write_companion_record(
+    file: &mut File,
+    slot: usize,
+    record: &EncodedCompanionRecord,
+) -> std::io::Result<()> {
+    #[cfg(any(test, feature = "test-seams"))]
+    crate::read_probe::note_persistence_companion_mutation();
+    let slot_offset = companion_slot_offset(slot)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let payload_length = u32::try_from(record.checksummed_payload.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "companion payload is too large",
+        )
+    })?;
+    if record.checksummed_payload.len() > COMPANION_SLOT_PAYLOAD_CAPACITY {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "companion payload exceeds its fixed slot",
+        ));
+    }
+    let mut slot_payload = vec![0_u8; 4 + COMPANION_SLOT_PAYLOAD_CAPACITY];
+    slot_payload[..4].copy_from_slice(&payload_length.to_le_bytes());
+    slot_payload[4..4 + record.checksummed_payload.len()]
+        .copy_from_slice(&record.checksummed_payload);
+    write_companion_slot_payload(file, slot_offset as u64, &slot_payload)?;
+    sync_companion_slot_payload(file)?;
+    write_companion_slot_checksum(
+        file,
+        (slot_offset + 4 + COMPANION_SLOT_PAYLOAD_CAPACITY) as u64,
+        &record.stored_checksum,
+    )?;
+    sync_companion_slot_checksum(file)?;
+    let selector = companion_selector_bytes(slot, record.fields.generation)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    write_companion_active_slot(file, COMPANION_SELECTOR_OFFSET as u64, &selector)?;
+    sync_companion_active_slot(file)
+}
+
+pub(super) fn write_companion_slot_without_selector(
+    file: &mut File,
+    slot: usize,
+    payload: &[u8],
+    checksum: &[u8; 32],
+) -> std::io::Result<()> {
+    let slot_offset = companion_slot_offset(slot)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let payload_length = u32::try_from(payload.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "companion payload is too large",
+        )
+    })?;
+    if payload.len() > COMPANION_SLOT_PAYLOAD_CAPACITY {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "companion payload exceeds its fixed slot",
+        ));
+    }
+    let mut slot_payload = vec![0_u8; 4 + COMPANION_SLOT_PAYLOAD_CAPACITY];
+    slot_payload[..4].copy_from_slice(&payload_length.to_le_bytes());
+    slot_payload[4..4 + payload.len()].copy_from_slice(payload);
+    write_companion_region(file, slot_offset as u64, &slot_payload)?;
+    file.sync_data()?;
+    write_companion_region(
+        file,
+        (slot_offset + 4 + COMPANION_SLOT_PAYLOAD_CAPACITY) as u64,
+        checksum,
+    )?;
+    file.sync_data()
+}
+
+pub(super) fn write_companion_pending_slot(
+    file: &mut File,
+    slot: usize,
+    pending: &PendingReplacement,
+) -> std::io::Result<()> {
+    write_companion_slot_without_selector(
+        file,
+        slot,
+        &pending.checksummed_payload,
+        &pending.stored_checksum,
+    )
+}
+
+pub(super) fn write_companion_record_copy(
+    file: &mut File,
+    slot: usize,
+    record: &EncodedCompanionRecord,
+) -> std::io::Result<()> {
+    write_companion_slot_without_selector(
+        file,
+        slot,
+        &record.checksummed_payload,
+        &record.stored_checksum,
+    )
+}
+
+impl CacheInstallation {
+    pub(super) fn record(&self, capacity: usize, reserve: usize) {
+        self.reserve
+            .store(reserve, std::sync::atomic::Ordering::Release);
+        self.capacity
+            .store(capacity, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(super) fn capacity(&self) -> Option<usize> {
+        Some(self.capacity.load(std::sync::atomic::Ordering::Acquire)).filter(|bytes| *bytes != 0)
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
+    pub(super) fn reserve(&self) -> usize {
+        self.reserve.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// The exact fixed source reservation, independent of the page-cache declaration.
+pub(crate) fn read_source_fixed_reservation_bytes() -> usize {
+    64 * 1024
+        + content_identity::READ_VERIFIER_MEMORY_BYTES
+        + std::mem::size_of::<Lsn>()
+        + std::mem::size_of::<content_identity::ValidatedHistoryOpenControl>()
+}
+
+/// File-reader cache policy. The displayed default is 14%; its exact capacity
+/// is one seventh of the budget left after fixed source reservations. Explicit
+/// percentages select a share of that same remainder, without a fixed byte cap.
+pub(crate) fn redb_reader_cache_bytes(budget: usize, percent: Option<u8>) -> usize {
+    let available = budget.saturating_sub(read_source_fixed_reservation_bytes());
+    match percent {
+        None => available / 7,
+        Some(percent) => {
+            // Decompose before multiplying so valid percentages cannot overflow.
+            // Invalid declarations are refused before any storage open.
+            let percent = usize::from(percent.min(100));
+            available / 100 * percent + available % 100 * percent / 100
+        }
+    }
+}
+
+pub(crate) fn redb_cache_bytes_for_limit(limit: Option<usize>) -> usize {
+    let budget = limit.unwrap_or_else(|| {
+        usize::try_from(
+            crate::read_session::ReadSessionOptions::default()
+                .limits
+                .memory,
+        )
+        .unwrap_or(usize::MAX)
+    });
+    redb_reader_cache_bytes(budget, None)
+}
+
+/// A declared writer uses the reader share of its own budget. An undeclared
+/// writer keeps the bounded default cache, independent of the process ceiling.
+/// Dirty source pages keep their separate original writer payer.
+pub(crate) fn redb_writer_cache_bytes_for_limit(limit: Option<usize>) -> usize {
+    limit.map_or(REDB_CACHE_BYTES, |budget| {
+        redb_reader_cache_bytes(budget, None)
+    })
+}
+
+/// Read-only test seam exposing the writer's page-cache reserve for a
+/// declared `MEMORY_LIMIT`, so a test that opens two databases under
+/// different budgets can account for their different reserves instead of
+/// assuming they cancel. Production code never calls this; it calls
+/// `redb_writer_cache_bytes_for_limit` directly.
+#[cfg(any(test, feature = "test-seams"))]
+pub fn redb_writer_cache_bytes_for_limit_for_test(limit: Option<usize>) -> usize {
+    redb_writer_cache_bytes_for_limit(limit)
+}
+
+/// Exact existing page-cap and fixed source-reservation components.
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub fn read_source_cache_reservation_for_limit_for_test(limit: Option<usize>) -> (usize, usize) {
+    (
+        redb_cache_bytes_for_limit(limit),
+        read_source_fixed_reservation_bytes(),
+    )
+}
+
+pub(super) fn redb_builder() -> redb::Builder {
+    redb_builder_with_cache(REDB_CACHE_BYTES)
+}
+
+pub(super) fn redb_builder_with_cache(cache_bytes: usize) -> redb::Builder {
+    let mut builder = redb::Builder::new();
+    builder.set_cache_size(cache_bytes);
+    builder.set_deferred_free_budget(
+        STORAGE_MAINTENANCE_PAGE_BATCH,
+        STORAGE_MAINTENANCE_PAGE_BATCH,
+    );
+    // An active writer reclaims at least what each commit frees, so a long-lived writer with no
+    // maintenance worker cannot accumulate an ever-growing deferred-free backlog.
+    builder.set_keep_pace_reclaim(true);
+    builder
+}
+
+/// Arm the one-shot test injection seam: the NEXT `compact()` call on THIS
+/// thread fails to reopen after closing the handle. Production-dead —
+/// nothing but a test calls it.
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) fn arm_handle_recycle_reopen_fault_for_test() {
+    HANDLE_RECYCLE_REOPEN_FAULT.with(|f| f.set(true));
+}
+
+/// Consume the armed injection flag, if any. Reads a thread-local that is
+/// never set outside a test, so the production path takes the `false` arm.
+pub(super) fn take_handle_recycle_reopen_fault_for_test() -> bool {
+    HANDLE_RECYCLE_REOPEN_FAULT.with(|f| f.replace(false))
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) fn arm_received_schema_pre_commit_fault_for_test() {
+    RECEIVED_SCHEMA_PRE_COMMIT_FAULT.with(|fault| fault.set(true));
+}
+
+pub(super) fn take_received_schema_pre_commit_fault_for_test() -> bool {
+    RECEIVED_SCHEMA_PRE_COMMIT_FAULT.with(|fault| fault.replace(false))
+}
+
+/// Arm the one-shot received-schema side-effect checkpoint fault for this
+/// test thread. This seam is absent from production builds.
+#[cfg(test)]
+pub(crate) fn arm_received_schema_side_effect_persistence_fault_for_test() {
+    RECEIVED_SCHEMA_SIDE_EFFECT_PERSISTENCE_FAULT.with(|fault| fault.set(true));
+}
+
+#[cfg(test)]
+pub(super) fn take_received_schema_side_effect_persistence_fault_for_test() -> bool {
+    RECEIVED_SCHEMA_SIDE_EFFECT_PERSISTENCE_FAULT.with(|fault| fault.replace(false))
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) fn arm_authoritative_purge_point_remove_persistence_failure_for_test() {
+    AUTHORITATIVE_PURGE_PRE_COMMIT_FAULT.with(|fault| fault.set(true));
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+pub(super) fn take_authoritative_purge_point_remove_persistence_failure_for_test() -> bool {
+    AUTHORITATIVE_PURGE_PRE_COMMIT_FAULT.with(|fault| fault.replace(false))
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from fixtures.rs"
+    )
+)]
+pub(crate) fn arm_erasure_first_table_fault_for_test() {
+    ERASURE_FIRST_TABLE_FAULT.with(|state| state.set((true, false)));
+}
+#[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from fixtures.rs"
+    )
+)]
+pub(crate) fn erasure_first_table_fault_reached_for_test() -> bool {
+    ERASURE_FIRST_TABLE_FAULT.with(|state| state.get().1)
+}
+#[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
+pub(super) fn erasure_first_table_staged_for_test() -> Result<()> {
+    let armed = ERASURE_FIRST_TABLE_FAULT.with(|state| {
+        let (armed, reached) = state.get();
+        if armed {
+            state.set((false, true));
+        } else {
+            state.set((false, reached));
+        }
+        armed
+    });
+    if armed {
+        Err(Error::Other(
+            "storage error: erasure first table staged fault injected".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn policy_hold_index_key(key: &str) -> bool {
+    key.starts_with("sync_policy_hold_select.v1.")
+        || key.starts_with("sync_policy_hold_indexed.v1.")
+        || key.starts_with("sync_policy_hold_released.v1.")
+}
+
+pub(super) fn sync_source_kind_to_u8(kind: SyncSourceKind) -> u8 {
+    match kind {
+        SyncSourceKind::Pulled => 0,
+        SyncSourceKind::AcceptedLocal => 1,
+        SyncSourceKind::AcceptedLocalPending => 2,
+    }
+}
+impl PersistenceBytes {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn try_new_for(
+        accountant: crate::memory_accounting::AccountantHandle,
+        bytes: usize,
+        component: &str,
+        operation: &str,
+        hint: &str,
+    ) -> Result<Self> {
+        accountant.try_allocate_for(bytes, component, operation, hint)?;
+        Ok(Self { accountant, bytes })
+    }
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(super) fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+impl Drop for PersistenceBytes {
+    fn drop(&mut self) {
+        self.accountant.release(self.bytes);
+    }
+}
+impl PersistenceProofOwner {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn prepare(
+        accountant: crate::memory_accounting::StoreAccountantHandle,
+    ) -> Result<Arc<Self>> {
+        debug_assert!(accountant.is_writer(), "only raw writers prepare an owner");
+        let mut owner = Self {
+            // The original tagged handle is the sole counted custody. Keep
+            // the existing field/layout without a duplicate writer use.
+            writer_use: None,
+            accountant: Some(accountant),
+            control: None,
+        };
+        let bytes = crate::memory_accounting::writer_adapter_layout(&owner).size();
+        owner.control = Some(crate::memory_accounting::ControlCredit::admit_from_handle(
+            owner
+                .accountant
+                .as_ref()
+                .expect("prepared owner has its funder"),
+            bytes,
+            "vector_maintenance",
+            "persistence_proof_control",
+            "Raise MEMORY_LIMIT for this fixed writer control.",
+        )?);
+        Ok(Arc::new(owner))
+    }
+}
+impl Drop for PersistenceProofOwner {
+    fn drop(&mut self) {
+        struct Cleanup<'a> {
+            owner: &'a mut PersistenceProofOwner,
+            next: u8,
+            refund: Option<crate::memory_accounting::PendingControlRefund>,
+        }
+        impl Cleanup<'_> {
+            fn finish(&mut self) {
+                while self.next < 3 {
+                    let step = self.next;
+                    self.next += 1;
+                    match step {
+                        0 => {
+                            drop(self.owner.accountant.take());
+                            #[cfg(test)]
+                            RETURNED_LOADER_OWNER_DROP_PANIC_FOR_TEST.with(|flag| {
+                                if flag.replace(false) {
+                                    panic!("original-owner cleanup unwind");
+                                }
+                            });
+                        }
+                        1 => drop(self.owner.writer_use.take()),
+                        2 => drop(self.refund.take()),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                self.finish();
+            }
+        }
+        let refund = self
+            .control
+            .take()
+            .map(crate::memory_accounting::ControlCredit::prepare);
+        let mut cleanup = Cleanup {
+            owner: self,
+            next: 0,
+            refund,
+        };
+        cleanup.finish();
+    }
+}
+impl ProofAccountantSlot {
+    pub(super) const MASK: usize = 0b11;
+    pub(super) const RAW_READER: usize = 0;
+    pub(super) const RAW_WRITER: usize = 1;
+    pub(super) const READY_WRITER: usize = 2;
+
+    pub(super) fn attached(accountant: crate::memory_accounting::AccountantHandle) -> Self {
+        // Role discovery and checked retention are one exclusive-domain-gate
+        // snapshot. Into-raw moves that exact Arc/use into the slot. A rejected
+        // OnceLock set drops only this attempted slot after the gate is gone.
+        let handle = crate::memory_accounting::StoreAccountantHandle::new(accountant);
+        Self(std::sync::atomic::AtomicPtr::new(
+            handle.into_owned_raw().cast(),
+        ))
+    }
+
+    pub(super) fn raw_handle_pointer(
+        pointer: *mut (),
+    ) -> *mut crate::memory_accounting::MemoryAccountant {
+        debug_assert!(matches!(
+            pointer.addr() & Self::MASK,
+            Self::RAW_READER | Self::RAW_WRITER
+        ));
+        // Bits 0/1 already match StoreAccountantHandle's immutable role tag.
+        pointer.cast()
+    }
+
+    pub(super) fn ready_pointer(pointer: *mut ()) -> *mut PersistenceProofOwner {
+        debug_assert_eq!(pointer.addr() & Self::MASK, Self::READY_WRITER);
+        pointer.map_addr(|address| address & !Self::MASK).cast()
+    }
+
+    pub(super) fn accountant(&self) -> crate::memory_accounting::AccountantHandle {
+        let pointer = self.0.load(Ordering::Acquire);
+        match pointer.addr() & Self::MASK {
+            Self::READY_WRITER => {
+                // Ready is terminal. Borrowing self keeps this owner live.
+                unsafe {
+                    (&*Self::ready_pointer(pointer))
+                        .accountant
+                        .as_ref()
+                        .expect("ready owner has its funder")
+                        .as_handle()
+                }
+            }
+            Self::RAW_READER | Self::RAW_WRITER => {
+                // A writer winner owns this same accountant before publishing
+                // and consuming raw custody. A reader never transitions.
+                let original = std::mem::ManuallyDrop::new(unsafe {
+                    crate::memory_accounting::StoreAccountantHandle::from_owned_raw(
+                        Self::raw_handle_pointer(pointer),
+                    )
+                });
+                original.as_handle()
+            }
+            _ => unreachable!("invalid proof-accountant slot state"),
+        }
+    }
+
+    pub(super) fn original_handle_for(
+        &self,
+        accountant: &crate::memory_accounting::AccountantHandle,
+    ) -> Option<crate::memory_accounting::StoreAccountantHandle> {
+        let pointer = self.0.load(Ordering::Acquire);
+        match pointer.addr() & Self::MASK {
+            Self::READY_WRITER => {
+                let handle = unsafe {
+                    (&*Self::ready_pointer(pointer))
+                        .accountant
+                        .as_ref()
+                        .expect("ready owner has its funder")
+                };
+                handle.same_accountant(accountant).then(|| handle.clone())
+            }
+            Self::RAW_READER | Self::RAW_WRITER => {
+                let decoded = pointer
+                    .map_addr(|address| address & !0b111)
+                    .cast::<crate::memory_accounting::MemoryAccountant>();
+                if !std::ptr::eq(decoded, accountant.as_ptr()) {
+                    return None;
+                }
+                // Even a delayed observation after publication is pinned by
+                // the winner's same-accountant, same-original-epoch chain.
+                Some(unsafe {
+                    crate::memory_accounting::StoreAccountantHandle::borrow_owned_raw(
+                        Self::raw_handle_pointer(pointer),
+                    )
+                })
+            }
+            _ => unreachable!("invalid proof-accountant slot state"),
+        }
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn prepare(&self) -> Result<()> {
+        let old = self.0.load(Ordering::Acquire);
+        match old.addr() & Self::MASK {
+            Self::RAW_READER | Self::READY_WRITER => return Ok(()),
+            Self::RAW_WRITER => {}
+            _ => unreachable!("invalid proof-accountant slot state"),
+        }
+        #[cfg(test)]
+        RETURNED_LOADER_AFTER_RAW_OBSERVATION_FOR_TEST.with(|hook| {
+            let callback = hook.borrow_mut().take();
+            if let Some(callback) = callback {
+                callback();
+            }
+        });
+        // Clone precisely the observed role; never rediscover a current
+        // writer association. The domain gate ends before control admission.
+        let attempt = unsafe {
+            crate::memory_accounting::StoreAccountantHandle::borrow_owned_raw(
+                Self::raw_handle_pointer(old),
+            )
+        };
+        let owner = PersistenceProofOwner::prepare(attempt)?;
+        let raw = Arc::into_raw(owner).cast_mut().cast::<()>();
+        let tagged = raw.map_addr(|address| address | Self::READY_WRITER);
+        match self
+            .0
+            .compare_exchange(old, tagged, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {
+                // The published winner already owns the same original Arc
+                // and counted epoch. Consume exactly the former raw ownership.
+                unsafe {
+                    drop(
+                        crate::memory_accounting::StoreAccountantHandle::from_owned_raw(
+                            Self::raw_handle_pointer(old),
+                        ),
+                    );
+                }
+            }
+            Err(_) => {
+                // Lose only the admitted attempt. The old raw ownership was
+                // consumed by its winner and is never consumed by a loser.
+                unsafe {
+                    drop(Arc::from_raw(raw.cast::<PersistenceProofOwner>()));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+impl Drop for ProofAccountantSlot {
+    fn drop(&mut self) {
+        let pointer = *self.0.get_mut();
+        match pointer.addr() & Self::MASK {
+            Self::READY_WRITER => unsafe {
+                drop(Arc::from_raw(Self::ready_pointer(pointer)));
+            },
+            Self::RAW_READER | Self::RAW_WRITER => unsafe {
+                drop(
+                    crate::memory_accounting::StoreAccountantHandle::from_owned_raw(
+                        Self::raw_handle_pointer(pointer),
+                    ),
+                );
+            },
+            _ => unreachable!("invalid proof-accountant slot state"),
+        }
+    }
+}
+impl std::fmt::Display for DiagnosticIndexName<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut hash = blake3::Hasher::new();
+        hash.update(self.table.as_bytes());
+        hash.update(&[0]);
+        hash.update(self.index.as_bytes());
+        write!(f, "__rel_index_{}", hash.finalize().to_hex())
+    }
+}
+
+pub(super) fn digest_field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(super) fn digest_redb_table<K: RedbKey + 'static, V: RedbValue + 'static>(
+    read_txn: &redb::ReadTransaction,
+    definition: TableDefinition<K, V>,
+    label: &str,
+    hasher: &mut blake3::Hasher,
+) -> Result<u64> {
+    digest_field(hasher, label.as_bytes());
+    let table = match read_txn.open_table(definition) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+        Err(err) => {
+            return Err(Error::Other(
+                (format!("snapshot digest table open failed: {err}")).into(),
+            ));
+        }
+    };
+    let mut count = 0_u64;
+    for entry in table.iter().map_err(|err| {
+        Error::Other((format!("snapshot digest table iteration failed: {err}")).into())
+    })? {
+        let (key, value) = entry.map_err(|err| {
+            Error::Other((format!("snapshot digest entry read failed: {err}")).into())
+        })?;
+        let key_value = key.value();
+        let value_value = value.value();
+        let key_bytes = K::as_bytes(&key_value);
+        let value_bytes = V::as_bytes(&value_value);
+        digest_field(hasher, key_bytes.as_ref());
+        digest_field(hasher, value_bytes.as_ref());
+        count = count.saturating_add(1);
+    }
+    Ok(count)
+}
+
+impl RetainedReadSource {}
+impl std::fmt::Display for IndexValidationFailure<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "durable index {} posting ", self.declaration.name)?;
+        if let Some(parts) = self.parts {
+            write!(
+                f,
+                "has {parts} key parts where the declaration has {}",
+                self.declaration.columns.len()
+            )
+        } else {
+            let (column, prefix) = self.column.expect("column validation detail");
+            write!(f, "{prefix}{column}{}", self.suffix)
+        }
+    }
+}
+
+impl VectorPartitionRecordIndex for VectorPartitionMembershipRecord {
+    fn vector_partition_record_index(&self) -> &VectorIndexRef {
+        &self.index
+    }
+}
+impl VectorPartitionRecordIndex for VectorPartitionTombstoneRecord {
+    fn vector_partition_record_index(&self) -> &VectorIndexRef {
+        &self.membership.index
+    }
+}
+impl VectorPartitionRecordIndex for VectorPartitionJournalRecord {
+    fn vector_partition_record_index(&self) -> &VectorIndexRef {
+        &self.index
+    }
+}
+impl std::ops::Deref for ReceivedRowsGuard<'_> {
+    type Target = HashMap<String, Vec<VersionedRow>>;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(rows) => rows,
+            Self::Private(rows) => rows,
+        }
+    }
+}
+impl ReceivedSchemaPersistenceProjection {
+    /// Consumers that need one record do not retain an array position into
+    /// the private image. This borrow never creates a second row/body list.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn visit_rows(
+        &self,
+        mut visit: impl FnMut(&str, &VersionedRow) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(records) = &self.row_records {
+            return records.visit(&self.vector_image_memory, visit);
+        }
+        let image = self.rows_image();
+        for (table, rows) in &*image {
+            if !self.affected_tables.contains(table) {
+                continue;
+            }
+            for row in rows {
+                visit(table, row)?;
+            }
+        }
+        Ok(())
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn visit_rows_original(
+        &self,
+        original: &OriginalPersistenceFrame<'_>,
+        mut visit: impl FnMut(&str, &VersionedRow) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(records) = &self.row_records {
+            records.visit_original(original, visit)
+        } else {
+            let image = self.rows_image();
+            for (table, rows) in &*image {
+                if self.affected_tables.contains(table) {
+                    for row in rows {
+                        visit(table, row)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn visit_table_rows_original(
+        &self,
+        original: &OriginalPersistenceFrame<'_>,
+        table: &str,
+        mut visit: impl FnMut(&VersionedRow) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(records) = &self.row_records {
+            records.visit_table_original(original, table, visit)
+        } else {
+            if let Some(rows) = self.rows_image().get(table) {
+                for row in rows {
+                    visit(row)?;
+                }
+            }
+            Ok(())
+        }
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn materialize_rows_compatibility(
+        &self,
+    ) -> Result<HashMap<String, Vec<VersionedRow>>> {
+        let mut rows = HashMap::<String, Vec<VersionedRow>>::new();
+        self.visit_rows(|table, row| {
+            self.vector_image_memory.reserve(
+                row.estimated_bytes()
+                    .saturating_mul(8)
+                    .saturating_add(table.len())
+                    .saturating_add(std::mem::size_of::<VersionedRow>()),
+            )?;
+            rows.entry(table.to_owned()).or_default().push(row.clone());
+            Ok(())
+        })?;
+        Ok(rows)
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn visit_vector_bodies(
+        &self,
+        mut visit: impl FnMut(&VectorEntry) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(records) = &self.vector_records {
+            records.bodies.visit(&self.vector_image_memory, visit)
+        } else {
+            for body in &self.vectors {
+                visit(body)?;
+            }
+            Ok(())
+        }
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn visit_vector_bodies_original(
+        &self,
+        original: &OriginalPersistenceFrame<'_>,
+        mut visit: impl FnMut(&VectorEntry) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(records) = &self.vector_records {
+            records.bodies.visit_original(original, visit)
+        } else {
+            for body in &self.vectors {
+                visit(body)?;
+            }
+            Ok(())
+        }
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn visit_vector_memberships(
+        &self,
+        mut visit: impl FnMut(&VectorPartitionMembershipRecord) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(records) = &self.vector_records {
+            records.memberships.visit(&self.vector_image_memory, visit)
+        } else {
+            for member in &self.vector_memberships {
+                visit(member)?;
+            }
+            Ok(())
+        }
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn visit_vector_memberships_original(
+        &self,
+        original: &OriginalPersistenceFrame<'_>,
+        mut visit: impl FnMut(&VectorPartitionMembershipRecord) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(records) = &self.vector_records {
+            records.memberships.visit_original(original, visit)
+        } else {
+            for member in &self.vector_memberships {
+                visit(member)?;
+            }
+            Ok(())
+        }
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn visit_sync_sources(
+        &self,
+        mut visit: impl FnMut(&str, RowId, Lsn, u8) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(records) = &self.sync_source_records {
+            records.visit(&self.vector_image_memory, visit)
+        } else {
+            for (table, row, lsn, kind) in &self.sync_sources {
+                visit(table, *row, *lsn, sync_source_kind_to_u8(*kind))?;
+            }
+            Ok(())
+        }
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn visit_sync_sources_original(
+        &self,
+        frame: &OriginalPersistenceFrame<'_>,
+        mut visit: impl FnMut(&str, RowId, Lsn, u8) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(records) = &self.sync_source_records {
+            records.visit_original(frame, visit)
+        } else {
+            for (table, row, lsn, kind) in &self.sync_sources {
+                visit(table, *row, *lsn, sync_source_kind_to_u8(*kind))?;
+            }
+            Ok(())
+        }
+    }
+    pub(crate) fn rows_image(&self) -> ReceivedRowsGuard<'_> {
+        match &self.private_rows {
+            Some(store) => ReceivedRowsGuard::Private(store.tables.read()),
+            None => ReceivedRowsGuard::Owned(&self.rows),
+        }
+    }
+}
+
+/// One SQ8 component as `PersistedVector::to_f32` reconstructs it; the
+/// verification projection streams the same values, so both call this.
+#[inline]
+pub(crate) fn sq8_component(min: f32, max: f32, byte: u8) -> f32 {
+    let range = max - min;
+    if range <= f32::EPSILON {
+        min
+    } else {
+        min + ((byte as f32) / 255.0) * range
+    }
+}
+
+/// One SQ4 component (a nibble, high first) as `PersistedVector::to_f32`
+/// reconstructs it.
+#[inline]
+pub(crate) fn sq4_component(min: f32, max: f32, nibble: u8) -> f32 {
+    let range = max - min;
+    if range <= f32::EPSILON {
+        min
+    } else {
+        min + ((nibble as f32) / 15.0) * range
+    }
+}
+
+impl PersistedVector {
+    pub(super) fn quantization(&self) -> VectorQuantization {
+        match self {
+            Self::F32(_) => VectorQuantization::F32,
+            Self::SQ8 { .. } => VectorQuantization::SQ8,
+            Self::SQ4 { .. } => VectorQuantization::SQ4,
+        }
+    }
+
+    pub(super) fn decoded_bytes(&self) -> usize {
+        let len = match self {
+            Self::F32(values) => values.len(),
+            Self::SQ8 { len, payload, .. } => (*len as usize).min(payload.len()),
+            Self::SQ4 { len, payload, .. } => (*len as usize).min(payload.len().saturating_mul(2)),
+        };
+        len.saturating_mul(std::mem::size_of::<f32>())
+    }
+    pub(super) fn from_f32(vector: &[f32], quantization: VectorQuantization) -> Self {
+        match quantization {
+            VectorQuantization::F32 => PersistedVector::F32(vector.to_vec()),
+            VectorQuantization::SQ8 => {
+                let (min, max) = vector_min_max(vector);
+                let range = max - min;
+                let payload = if range <= f32::EPSILON {
+                    vec![0; vector.len()]
+                } else {
+                    vector
+                        .iter()
+                        .map(|value| {
+                            (((*value - min) / range) * 255.0).round().clamp(0.0, 255.0) as u8
+                        })
+                        .collect()
+                };
+                PersistedVector::SQ8 {
+                    min,
+                    max,
+                    len: vector.len() as u32,
+                    payload,
+                }
+            }
+            VectorQuantization::SQ4 => {
+                let (min, max) = vector_min_max(vector);
+                let range = max - min;
+                let mut payload = Vec::with_capacity(vector.len().div_ceil(2));
+                let quantized = if range <= f32::EPSILON {
+                    vec![0; vector.len()]
+                } else {
+                    vector
+                        .iter()
+                        .map(|value| {
+                            (((*value - min) / range) * 15.0).round().clamp(0.0, 15.0) as u8
+                        })
+                        .collect::<Vec<_>>()
+                };
+                for pair in quantized.chunks(2) {
+                    let hi = pair[0] & 0x0f;
+                    let lo = pair.get(1).copied().unwrap_or(0) & 0x0f;
+                    payload.push((hi << 4) | lo);
+                }
+                PersistedVector::SQ4 {
+                    min,
+                    max,
+                    len: vector.len() as u32,
+                    payload,
+                }
+            }
+        }
+    }
+
+    pub(super) fn to_f32(&self) -> Vec<f32> {
+        match self {
+            PersistedVector::F32(vector) => vector.clone(),
+            PersistedVector::SQ8 {
+                min,
+                max,
+                len,
+                payload,
+            } => payload
+                .iter()
+                .take(*len as usize)
+                .map(|byte| sq8_component(*min, *max, *byte))
+                .collect(),
+            PersistedVector::SQ4 {
+                min,
+                max,
+                len,
+                payload,
+            } => {
+                // A malformed durable length must not reserve independently
+                // of the bytes that can actually decode. Callers validate
+                // the reconstructed dimension and classify a short payload.
+                let mut values =
+                    Vec::with_capacity(payload.len().saturating_mul(2).min(*len as usize));
+                for byte in payload {
+                    for q in [byte >> 4, byte & 0x0f] {
+                        if values.len() == *len as usize {
+                            break;
+                        }
+                        values.push(sq4_component(*min, *max, q));
+                    }
+                }
+                values
+            }
+        }
+    }
+}
+
+pub(super) fn vector_min_max(vector: &[f32]) -> (f32, f32) {
+    let Some((first, rest)) = vector.split_first() else {
+        return (0.0, 0.0);
+    };
+    rest.iter()
+        .copied()
+        .fold((*first, *first), |(min, max), value| {
+            (min.min(value), max.max(value))
+        })
+}
+
+impl From<LegacyColumnDefV1> for contextdb_core::ColumnDef {
+    fn from(legacy: LegacyColumnDefV1) -> Self {
+        contextdb_core::ColumnDef {
+            search_target_accuracy_hundredths: None,
+            search_expected_vectors: None,
+            ivf_lists: None,
+            ivf_probes: None,
+            ivf_refine_factor_hundredths: None,
+            vector_engine_policy: Default::default(),
+            name: legacy.name,
+            column_type: legacy.column_type,
+            nullable: legacy.nullable,
+            primary_key: legacy.primary_key,
+            unique: legacy.unique,
+            default: legacy.default,
+            references: legacy.references,
+            expires: legacy.expires,
+            immutable: legacy.immutable,
+            quantization: legacy.quantization,
+            rank_policy: legacy.rank_policy,
+            // Fields v1.0.0 never wrote: honest, unset defaults.
+            context_id: false,
+            scope_label: None,
+            acl_ref: None,
+            partition_key_columns: None,
+            max_partitions: None,
+            search_mode: contextdb_core::VectorSearchMode::Auto,
+            auto_index_at: None,
+            flat_below: None,
+            auto_expansion_ceiling: None,
+            vector_policy_revision: contextdb_core::DEFAULT_VECTOR_POLICY_REVISION,
+            consolidation_change_percent: None,
+            consolidation_tombstone_percent: None,
+            consolidation_disabled: false,
+        }
+    }
+}
+
+impl From<LegacyTableMetaV1> for TableMeta {
+    fn from(legacy: LegacyTableMetaV1) -> Self {
+        TableMeta {
+            columns: legacy.columns.into_iter().map(Into::into).collect(),
+            immutable: legacy.immutable,
+            state_machine: legacy.state_machine,
+            dag_edge_types: legacy.dag_edge_types,
+            unique_constraints: legacy.unique_constraints,
+            natural_key_column: legacy.natural_key_column,
+            propagation_rules: legacy.propagation_rules,
+            default_ttl_seconds: legacy.default_ttl_seconds,
+            sync_safe: legacy.sync_safe,
+            expires_column: legacy.expires_column,
+            indexes: legacy.indexes,
+            // Fields v1.0.0 never wrote: honest, unset defaults.
+            composite_foreign_keys: Vec::new(),
+            sync_direction: None,
+            retain_declared_unit: None,
+            primary_key_columns: Vec::new(),
+            conflict_policy: None,
+            history_policy: None,
+            delivery_manifest_tables: None,
+            edge_discard: None,
+            maintained_counts: None,
+        }
+    }
+}
+
+pub(super) fn replacement_temp_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(
+        ".replacement-{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    PathBuf::from(name)
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(super) fn create_replacement_placeholder(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    options.open(path).map_err(RedbPersistence::storage_error)
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(super) fn sync_database_parent(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(RedbPersistence::storage_error)
+}
+
+impl RedbPersistence {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn f32_witness_index<'a>(
+        ws: &'a WriteSet,
+        batch: Option<&'a PreparedVectorPartitionMutationBatch>,
+        quantization: &HashMap<VectorIndexRef, VectorQuantization>,
+        mut admit: impl FnMut(usize) -> Result<()>,
+    ) -> Result<F32WitnessIndex<'a>> {
+        let carried = batch.map_or(0, |batch| {
+            batch
+                .mutations
+                .iter()
+                .map(|mutation| match mutation {
+                    PreparedVectorPartitionMutation::Delete { .. } => 1usize,
+                    PreparedVectorPartitionMutation::Move { .. } => 2,
+                    PreparedVectorPartitionMutation::Insert { .. } => 0,
+                })
+                .sum::<usize>()
+        });
+        let capacity = ws
+            .vector_inserts
+            .len()
+            .checked_add(carried)
+            .ok_or_else(|| Error::Other("F32 witness directory overflow".into()))?;
+        admit(
+            crate::memory_accounting::native_map_plan::<F32WitnessKey<'_>, F32Witness<'_>>(
+                capacity,
+            )?
+            .layout
+            .size(),
+        )?;
+        let mut witnesses = HashMap::with_capacity(capacity);
+        for entry in &ws.vector_inserts {
+            if quantization.get(&entry.index) == Some(&VectorQuantization::F32) {
+                // Preserve the existing last-entry rule for this exact occurrence/column.
+                witnesses.insert(
+                    (
+                        entry.index.table.as_str(),
+                        entry.row_id,
+                        entry.created_tx,
+                        entry.lsn,
+                        entry.index.column.as_str(),
+                    ),
+                    F32Witness::Staged(&entry.vector),
+                );
+            }
+        }
+        if let Some(batch) = batch {
+            for mutation in &batch.mutations {
+                let (index, before, after) = match mutation {
+                    PreparedVectorPartitionMutation::Delete { index, before, .. } => {
+                        (index, before, None)
+                    }
+                    PreparedVectorPartitionMutation::Move {
+                        index,
+                        before,
+                        after,
+                        ..
+                    } => (index, before, Some(after)),
+                    PreparedVectorPartitionMutation::Insert { .. } => continue,
+                };
+                if quantization.get(index) != Some(&VectorQuantization::F32) {
+                    continue;
+                }
+                let witness = F32Witness::Durable(
+                    index,
+                    before.row.row_id,
+                    before.vector_created_tx,
+                    before.vector_lsn,
+                );
+                witnesses.insert(
+                    (
+                        index.table.as_str(),
+                        before.row.row_id,
+                        before.row.created_tx,
+                        before.row.lsn,
+                        index.column.as_str(),
+                    ),
+                    witness,
+                );
+                if let Some(after) = after {
+                    witnesses.insert(
+                        (
+                            index.table.as_str(),
+                            after.row.row_id,
+                            after.row.created_tx,
+                            after.row.lsn,
+                            index.column.as_str(),
+                        ),
+                        witness,
+                    );
+                }
+            }
+        }
+        Ok(witnesses)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn overlay_f32_witnesses<'a>(
+        &self,
+        write: &redb::WriteTransaction,
+        witnesses: &F32WitnessIndex<'a>,
+        table: &str,
+        row: &VersionedRow,
+        overlay: &mut F32RowOverlay<'a>,
+        mut admit: impl FnMut(usize) -> Result<()>,
+        mut decode: impl FnMut(&[u8]) -> Result<VectorEntry>,
+    ) -> Result<()> {
+        // Grow the destination only after its whole native table and copied keys fit.
+        let count = overlay
+            .len()
+            .checked_add(row.values.len())
+            .ok_or_else(|| Error::Other("row F32 overlay overflow".into()))?;
+        admit(
+            crate::memory_accounting::native_map_plan::<String, std::borrow::Cow<'_, [f32]>>(
+                count,
+            )?
+            .layout
+            .size()
+            .saturating_add(row.values.keys().map(String::len).sum::<usize>()),
+        )?;
+        overlay.reserve(row.values.len());
+        for column in row.values.keys() {
+            let Some(witness) =
+                witnesses.get(&(table, row.row_id, row.created_tx, row.lsn, column.as_str()))
+            else {
+                continue;
+            };
+            let value = match witness {
+                F32Witness::Staged(vector) => std::borrow::Cow::Borrowed(*vector),
+                F32Witness::Durable(index, row_id, created_tx, lsn) => {
+                    admit(
+                        index
+                            .table
+                            .len()
+                            .saturating_add(index.column.len())
+                            .saturating_add(32),
+                    )?;
+                    let key = Self::vector_identity_key(index, *row_id, *created_tx, *lsn);
+                    let vectors = content_size::open_vectors(write).map_err(Self::storage_error)?;
+                    let stored = vectors
+                        .get(key.as_slice())
+                        .map_err(Self::storage_error)?
+                        .ok_or_else(|| {
+                            self.vector_partition_corruption(
+                                "a prepared row publication has no durable source vector",
+                            )
+                        })?;
+                    let entry = decode(stored.value())?;
+                    if entry.index != **index
+                        || entry.row_id != *row_id
+                        || entry.created_tx != *created_tx
+                        || entry.lsn != *lsn
+                    {
+                        return Err(self.vector_partition_corruption(
+                            "a prepared row witness disagrees with its exact durable source",
+                        ));
+                    }
+                    std::borrow::Cow::Owned(entry.vector)
+                }
+            };
+            overlay.insert(column.clone(), value);
+        }
+        Ok(())
+    }
+}

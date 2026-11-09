@@ -14,10 +14,12 @@ impl DeadlineClock for Clock {
     }
 }
 
-// Independent scalar native F32 reference, including accumulator order.
+// Independent scalar reference: the canonical cosine, accumulated in f64 and
+// rounded once to the f32 the exact route reports.
 fn native_score(query: &[f32], vector: &[f32]) -> f32 {
-    let (mut dot, mut q2, mut v2) = (0.0_f32, 0.0_f32, 0.0_f32);
+    let (mut dot, mut q2, mut v2) = (0.0_f64, 0.0_f64, 0.0_f64);
     for (&q, &v) in query.iter().zip(vector) {
+        let (q, v) = (f64::from(q), f64::from(v));
         dot += q * v;
         q2 += q * q;
         v2 += v * v;
@@ -25,7 +27,7 @@ fn native_score(query: &[f32], vector: &[f32]) -> f32 {
     if q2 == 0.0 || v2 == 0.0 {
         0.0
     } else {
-        dot / (q2.sqrt() * v2.sqrt())
+        (dot / (q2.sqrt() * v2.sqrt())) as f32
     }
 }
 fn generated(seed: u64) -> Vec<f32> {
@@ -79,9 +81,6 @@ fn held_out_unfiltered_native_reference_recovers_the_required_neighbors() {
             }
             db.execute("COMMIT", &HashMap::new()).unwrap();
         }
-        for _ in 0..4 {
-            db.run_maintenance_cycle().unwrap();
-        }
         (db, vectors, queries, "receipt_items")
     } else {
         let db = Database::open_memory();
@@ -106,9 +105,6 @@ fn held_out_unfiltered_native_reference_recovers_the_required_neighbors() {
             .unwrap();
         }
         db.execute("COMMIT", &HashMap::new()).unwrap();
-        for _ in 0..4 {
-            db.run_maintenance_cycle().unwrap();
-        }
         (
             db,
             vectors,
@@ -126,7 +122,7 @@ fn held_out_unfiltered_native_reference_recovers_the_required_neighbors() {
         reference.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let params = HashMap::from([("query".into(), Value::Vector(query.clone()))]);
         let sql = format!(
-            "SELECT id, score FROM {table} ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 10"
+            "SELECT id, score FROM {table} ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 10"
         );
         let ordinary = db.execute(&sql, &params).unwrap();
         let limits = ReadLimits {
@@ -139,9 +135,21 @@ fn held_out_unfiltered_native_reference_recovers_the_required_neighbors() {
             &bounded::BoundedReadRequest::new(&sql, params, limits, Arc::new(Clock)),
         )
         .unwrap();
-        assert_eq!(ordinary.rows, bounded.result.rows);
-        assert_eq!(ordinary.rows.len(), 10);
-        for row in &ordinary.rows {
+        assert_eq!(ordinary.rows(), bounded.result.rows());
+        assert_eq!(ordinary.rows().len(), 10);
+        // Exact search returns the reference's ten nearest, in the reference's
+        // order: nearest first, ties broken by row id.
+        let returned: Vec<i64> = ordinary
+            .rows()
+            .iter()
+            .map(|row| match row[0] {
+                Value::Int64(id) => id,
+                ref other => panic!("integer identity, got {other:?}"),
+            })
+            .collect();
+        let expected: Vec<i64> = reference[..10].iter().map(|r| r.0).collect();
+        assert_eq!(returned, expected, "exact neighbours in reference order");
+        for row in ordinary.rows() {
             let Value::Int64(id) = row[0] else {
                 panic!("integer identity");
             };
@@ -156,9 +164,9 @@ fn held_out_unfiltered_native_reference_recovers_the_required_neighbors() {
         queries.len(),
         queries.len() * 10
     );
-    assert!(
-        recovered * 100 >= queries.len() * 10 * 95,
-        "held-out native recall {recovered}/{}",
-        queries.len() * 10
+    assert_eq!(
+        recovered,
+        queries.len() * 10,
+        "exact search recovers every one of the reference's neighbours"
     );
 }

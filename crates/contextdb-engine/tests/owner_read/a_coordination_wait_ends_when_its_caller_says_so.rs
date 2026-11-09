@@ -318,6 +318,10 @@ fn park_a_reader(path: &Path, runtime: &Path) -> (Arc<ParkingReader>, std::threa
 /// a declared time value like every other one here: it is proven by moving the
 /// clock, never by waiting for real time to pass.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_claim_window_expires_on_the_manual_clock_and_not_on_real_time() {
     let directory = tempfile::TempDir::new().expect("task-scoped coordination directory");
     let runtime_root = secure_runtime_root(directory.path(), "manual-clock-runtime");

@@ -180,9 +180,9 @@ fn nv07b_sync_apply_routes_to_matching_index() {
             &params(vec![("q", Value::Vector(vec![1.0, 0.0, 0.0, 0.0]))]),
         )
         .expect("text search");
-    let id_idx = text_hits.columns.iter().position(|c| c == "id").unwrap();
-    assert_eq!(text_hits.rows.len(), 1);
-    assert_eq!(text_hits.rows[0][id_idx], Value::Uuid(id));
+    let id_idx = text_hits.columns().iter().position(|c| c == "id").unwrap();
+    assert_eq!(text_hits.rows().len(), 1);
+    assert_eq!(text_hits.rows()[0][id_idx], Value::Uuid(id));
 
     let vision_hits = receiver
         .execute(
@@ -193,8 +193,8 @@ fn nv07b_sync_apply_routes_to_matching_index() {
             )]),
         )
         .expect("vision search");
-    assert_eq!(vision_hits.rows.len(), 1);
-    assert_eq!(vision_hits.rows[0][id_idx], Value::Uuid(id));
+    assert_eq!(vision_hits.rows().len(), 1);
+    assert_eq!(vision_hits.rows()[0][id_idx], Value::Uuid(id));
 
     // Wrong-dim probe against vision must fire VectorIndexDimensionMismatch with the right index identity —
     // proves apply registered the vector against the vision index, not against vector_text or a global slot.
@@ -289,7 +289,9 @@ fn nv07c_receiver_promoted_to_leader_emits_correct_index_keyed_envelopes() {
 
     // The promoted leader's outgoing changeset must carry both (table, column) pairs — not a default,
     // not inferred from "first match per row_id", not coalesced into a single envelope.
-    let outgoing = receiver.changes_since(leader_lsn_before);
+    let outgoing = receiver
+        .changes_since(leader_lsn_before)
+        .expect("read the declared changes");
     let by_index: std::collections::HashSet<&VectorIndexRef> =
         outgoing.vectors.iter().map(|c| &c.index).collect();
     assert!(
@@ -358,8 +360,8 @@ fn nv07c_receiver_promoted_to_leader_emits_correct_index_keyed_envelopes() {
             &params(vec![("q", Value::Vector(new_text_vec))]),
         )
         .expect("downstream text search");
-    let id_idx = text_hits.columns.iter().position(|c| c == "id").unwrap();
-    assert_eq!(text_hits.rows[0][id_idx], Value::Uuid(new_id));
+    let id_idx = text_hits.columns().iter().position(|c| c == "id").unwrap();
+    assert_eq!(text_hits.rows()[0][id_idx], Value::Uuid(new_id));
     let vision_hits = downstream
         .execute(
             "SELECT id FROM evidence ORDER BY vector_vision <=> $q LIMIT 1",
@@ -367,7 +369,7 @@ fn nv07c_receiver_promoted_to_leader_emits_correct_index_keyed_envelopes() {
         )
         .expect("downstream vision search");
     assert_eq!(
-        vision_hits.rows[0][id_idx],
+        vision_hits.rows()[0][id_idx],
         Value::Uuid(new_id),
         "downstream receiver must materialize promoted-leader vector_vision payload from the generated envelope"
     );

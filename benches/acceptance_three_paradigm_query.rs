@@ -136,8 +136,8 @@ fn run_query_and_assert(db: &Database) {
             &params(vec![("query_vec", Value::Vector(vec![1.0, 0.0, 0.0]))]),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    let desc = match &result.rows[0][1] {
+    assert_eq!(result.rows().len(), 1);
+    let desc = match &result.rows()[0][1] {
         Value::Text(value) => value,
         other => panic!("expected Text for description, got: {other:?}"),
     };
@@ -160,6 +160,10 @@ fn timed_query_and_assert(db: &Database) {
 }
 
 fn bench_three_paradigm_recall_under_50ms(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function("three_paradigm_recall_under_50ms", |_| {});
+        return;
+    }
     let db = seed_fixture();
     run_query_and_assert(&db);
     c.bench_function("three_paradigm_recall_under_50ms", |b| {

@@ -10,7 +10,6 @@
 //! Both must answer a full page while a full page of eligible rows exists.
 
 use contextdb_core::Value;
-use contextdb_core::VectorIndexRef;
 use contextdb_core::read_contract::{DeadlineClock, DeadlineWait, ReadLimits};
 use contextdb_core::types::Principal;
 use contextdb_engine::executor::bounded_read_test_support as bounded;
@@ -86,28 +85,13 @@ fn answer(db: &Database, sql: &str, params: &HashMap<String, Value>) -> Vec<i64>
     bounded::execute(db, &request)
         .expect("the bounded read succeeds")
         .result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.first() {
             Some(Value::Int64(id)) => *id,
             other => panic!("the projection returns one integer id, got {other:?}"),
         })
         .collect()
-}
-
-fn maintain(db: &Database, index: &VectorIndexRef) {
-    for _ in 0..512 {
-        db.run_maintenance_cycle()
-            .expect("advance deterministic maintenance");
-        let ready = db
-            .vector_store_for_test()
-            .partition_infos(index)
-            .expect("inspect partition readiness");
-        if !ready.is_empty() && ready.iter().all(|partition| partition.graph_available) {
-            return;
-        }
-    }
-    panic!("maintenance did not publish a graph before the read is measured");
 }
 
 /// A grant-lookup table keeps the row route: the candidate source reads and
@@ -161,7 +145,6 @@ fn a_grant_gated_find_answers_a_full_page() {
         )
         .expect("seed one grant-gated row");
     }
-    maintain(&db, &VectorIndexRef::new("granted_rows", "embedding"));
 
     let reader = db.scoped_with_constraints(
         Some(
@@ -227,7 +210,6 @@ fn a_find_inside_a_transaction_that_retired_a_row_answers_a_full_page() {
         )
         .expect("seed one row");
     }
-    maintain(&db, &VectorIndexRef::new("staged_rows", "embedding"));
 
     let reader = db.scoped_with_contexts(
         [contextdb_core::types::ContextId::new(context_id())]

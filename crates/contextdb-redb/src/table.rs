@@ -60,7 +60,7 @@ impl TableStats {
 
 /// A table containing key-value mappings
 pub struct Table<'txn, K: Key + 'static, V: Value + 'static> {
-    name: String,
+    name: Box<str>,
     transaction: &'txn WriteTransaction,
     tree: BtreeMut<'txn, K, V>,
 }
@@ -81,7 +81,7 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
         transaction: &'txn WriteTransaction,
     ) -> Table<'txn, K, V> {
         Table {
-            name: name.to_string(),
+            name: Box::from(name),
             transaction,
             tree: BtreeMut::new(
                 table_root,
@@ -91,11 +91,6 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
                 allocated_pages,
             ),
         }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn print_debug(&self, include_values: bool) -> Result {
-        self.tree.print_debug(include_values)
     }
 
     /// Returns an accessor, which allows mutation, to the value corresponding to the given key
@@ -289,6 +284,103 @@ impl<K: Key + 'static, V: MutInPlaceValue + 'static> Table<'_, K, V> {
         #[cfg(feature = "test-seams")]
         {
             let result = self.tree.insert_reserve(key.borrow(), value_length);
+            if result.is_ok() {
+                self.transaction.record_table_write_for_test(
+                    &self.name,
+                    crate::TableWriteOperationForTest::Insert,
+                    K::as_bytes(key.borrow()).as_ref(),
+                    value_length,
+                );
+            }
+            result
+        }
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl Table<'_, u64, &'static [u8]> {
+    /// Read a root-pinned singleton location with its exact native checksum.
+    /// The caller owns and maintains the handle's binding to this table/root.
+    #[doc(hidden)]
+    pub fn singleton_u64_at(
+        &self,
+        handle: [u8; 24],
+        key: u64,
+        value_len: usize,
+    ) -> Result<AccessGuard<'_, &'static [u8]>> {
+        self.tree.singleton_u64_at(handle, key, value_len)
+    }
+}
+#[cfg(feature = "contextdb-internal")]
+impl ReadOnlyTable<u64, &'static [u8]> {
+    pub(crate) fn new_singleton(
+        name: String,
+        root: Option<BtreeHeader>,
+        hint: PageHint,
+        guard: Arc<TransactionGuard>,
+        mem: Arc<TransactionalMemory>,
+    ) -> Self {
+        Self {
+            name,
+            tree: Btree::new_lazy(root, hint, guard.clone(), mem),
+            transaction_guard: guard,
+        }
+    }
+
+    /// Read a root-pinned singleton location with its exact native checksum.
+    /// The retained table keeps the captured read root alive.
+    #[doc(hidden)]
+    pub fn singleton_u64_at(
+        &self,
+        handle: [u8; 24],
+        key: u64,
+        value_len: usize,
+    ) -> Result<AccessGuard<'static, &'static [u8]>> {
+        self.tree.singleton_u64_at(handle, key, value_len)
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl<K: Key + 'static> Table<'_, K, &'static [u8]> {
+    /// Exact byte-value capacity of a singleton base-page leaf with this key.
+    #[doc(hidden)]
+    pub fn inline_value_capacity(&self, key_bytes: usize) -> usize {
+        self.tree.inline_value_capacity(key_bytes)
+    }
+
+    /// Largest accepted byte-value length with this key.
+    #[doc(hidden)]
+    pub fn maximum_value_length(&self, key_bytes: usize) -> usize {
+        MAX_VALUE_LENGTH.min(MAX_PAIR_LENGTH.saturating_sub(key_bytes))
+    }
+
+    /// Reserve a zero-filled byte value without a value-sized temporary buffer.
+    ///
+    /// Replaces any existing value, with the same limits as insert_reserve.
+    /// Failure while filling the borrowed destination must abort the transaction.
+    #[doc(hidden)]
+    pub fn insert_zeroed_reserve<'a>(
+        &mut self,
+        key: impl Borrow<K::SelfType<'a>>,
+        value_length: usize,
+    ) -> Result<AccessGuardMutInPlace<'_, &'static [u8]>> {
+        if value_length > MAX_VALUE_LENGTH {
+            return Err(StorageError::ValueTooLarge(value_length));
+        }
+        let key_len = K::as_bytes(key.borrow()).as_ref().len();
+        if key_len > MAX_VALUE_LENGTH {
+            return Err(StorageError::ValueTooLarge(key_len));
+        }
+        if value_length + key_len > MAX_PAIR_LENGTH {
+            return Err(StorageError::ValueTooLarge(value_length + key_len));
+        }
+        #[cfg(not(feature = "test-seams"))]
+        {
+            self.tree.insert_zeroed_reserve(key.borrow(), value_length)
+        }
+        #[cfg(feature = "test-seams")]
+        {
+            let result = self.tree.insert_zeroed_reserve(key.borrow(), value_length);
             if result.is_ok() {
                 self.transaction.record_table_write_for_test(
                     &self.name,
@@ -528,6 +620,13 @@ impl<K: Key + 'static, V: Value + 'static> TableHandle for ReadOnlyTable<K, V> {
 }
 
 impl<K: Key + 'static, V: Value + 'static> ReadOnlyTable<K, V> {
+    /// Exact byte-value capacity of a singleton base-page leaf with this key.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn inline_value_capacity(&self, key_bytes: usize) -> usize {
+        self.tree.inline_value_capacity(key_bytes)
+    }
+
     pub(crate) fn new(
         name: String,
         root_page: Option<BtreeHeader>,
@@ -739,7 +838,7 @@ impl ReadOnlyTable<&'static [u8], &'static [u8]> {
         }
     }
     #[doc(hidden)]
-    pub fn cursor_bounded(&self) -> crate::BoundedByteCursor<'_> {
+    pub fn cursor_bounded(&self) -> crate::BoundedByteCursor<'static> {
         self.tree.cursor_bounded()
     }
     #[doc(hidden)]
@@ -765,6 +864,15 @@ impl ReadOnlyTable<&'static [u8], &'static [u8]> {
 
 #[cfg(feature = "contextdb-internal")]
 impl Table<'_, &'static [u8], &'static [u8]> {
+    /// Internal synchronous source loan over this write's current table root.
+    /// The table borrow prevents mutation of this family until all loans and
+    /// their materialized page guards drop.
+    #[doc(hidden)]
+    pub fn cursor_authenticated(&self) -> crate::BoundedByteCursor<'_> {
+        self.tree
+            .cursor_authenticated(self.transaction.transaction_guard().clone())
+    }
+
     #[doc(hidden)]
     pub fn get_bounded(&self, key: &[u8]) -> Result<Option<AccessGuard<'_, &'static [u8]>>> {
         self.tree.get_bounded(key)

@@ -135,13 +135,17 @@ fn insert_row(db: &Database, id: i64, body: &str) {
         .unwrap_or_else(|err| panic!("insert row {id}: {err}"));
 }
 
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn only_body(db: &Database, id: i64) -> Option<String> {
     let mut params = p();
     params.insert("id".to_string(), Value::Int64(id));
     let result = db
         .execute("SELECT body FROM notes WHERE id = $id", &params)
         .expect("notes scan");
-    result.rows.into_iter().next().map(|row| match &row[0] {
+    result.rows().into_iter().next().map(|row| match &row[0] {
         Value::Text(body) => body.clone(),
         other => panic!("expected a text body, got {other:?}"),
     })
@@ -153,7 +157,7 @@ fn row_exists(db: &Database, id: i64) -> bool {
     let result = db
         .execute("SELECT id FROM notes WHERE id = $id", &params)
         .expect("notes scan");
-    !result.rows.is_empty()
+    !result.rows().is_empty()
 }
 
 struct HubGen {
@@ -182,7 +186,8 @@ fn start_hub_as(
             TenantId::from(tenant),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -206,6 +211,7 @@ fn edge_client_as(
         TenantId::from(tenant),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 fn edge_client_on_transport(
@@ -220,6 +226,7 @@ fn edge_client_on_transport(
         TenantId::from(tenant),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 // ---------------------------------------------------------------------------
@@ -597,7 +604,10 @@ async fn a_schema_carrying_page_takes_its_cursor_from_the_schema_position() {
             &p(),
         )
         .expect("ddl");
-    let expected_cursor = hub_db.changes_since(before_ddl).max_lsn();
+    let expected_cursor = hub_db
+        .changes_since(before_ddl)
+        .expect("read changes_since fixture")
+        .max_lsn();
     assert!(
         expected_cursor.is_some(),
         "fixture: a DDL-only changeset must carry a max_lsn derived from the \

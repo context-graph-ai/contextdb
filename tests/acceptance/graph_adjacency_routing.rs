@@ -1,22 +1,38 @@
-use contextdb_core::{ContextId, Error, Value};
+#[cfg(feature = "test-seams")]
+use contextdb_core::ContextId;
+#[cfg(feature = "test-seams")]
+use contextdb_core::Error;
+#[cfg(feature = "test-seams")]
+use contextdb_core::Value;
+#[cfg(feature = "test-seams")]
 use contextdb_engine::Database;
-use std::collections::{BTreeSet, HashMap};
+#[cfg(feature = "test-seams")]
+use std::collections::BTreeSet;
+#[cfg(feature = "test-seams")]
+use std::collections::HashMap;
+#[cfg(feature = "test-seams")]
 use std::path::Path;
+#[cfg(feature = "test-seams")]
 use tempfile::TempDir;
+#[cfg(feature = "test-seams")]
 use uuid::Uuid;
 
+#[cfg(feature = "test-seams")]
 fn empty() -> HashMap<String, Value> {
     HashMap::new()
 }
 
+#[cfg(feature = "test-seams")]
 fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
     pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
 }
 
+#[cfg(feature = "test-seams")]
 fn ga_uuid(n: u128) -> Uuid {
     Uuid::from_u128(0xB000_0000_0000_0000_0000_0000_0000_0000 + n)
 }
 
+#[cfg(feature = "test-seams")]
 fn create_graph_tables(db: &Database) {
     db.execute(
         "CREATE TABLE nodes (id UUID PRIMARY KEY, label TEXT, context_id UUID CONTEXT_ID)",
@@ -30,6 +46,7 @@ fn create_graph_tables(db: &Database) {
     .unwrap();
 }
 
+#[cfg(feature = "test-seams")]
 fn insert_node(db: &Database, id: Uuid, label: &str, ctx: Uuid) {
     db.execute(
         "INSERT INTO nodes (id, label, context_id) VALUES ($id, $label, $ctx)",
@@ -42,6 +59,7 @@ fn insert_node(db: &Database, id: Uuid, label: &str, ctx: Uuid) {
     .unwrap();
 }
 
+#[cfg(feature = "test-seams")]
 fn insert_edge(db: &Database, source: Uuid, target: Uuid, edge_type: &str) {
     db.execute(
         "INSERT INTO edges (id, source_id, target_id, edge_type) VALUES ($id, $source, $target, $edge_type)",
@@ -55,14 +73,15 @@ fn insert_edge(db: &Database, source: Uuid, target: Uuid, edge_type: &str) {
     .unwrap();
 }
 
+#[cfg(feature = "test-seams")]
 fn uuid_column_set(result: &contextdb_engine::QueryResult, column: &str) -> BTreeSet<Uuid> {
     let idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == column || c.rsplit('.').next() == Some(column))
-        .unwrap_or_else(|| panic!("column {column} not found in {:?}", result.columns));
+        .unwrap_or_else(|| panic!("column {column} not found in {:?}", result.columns()));
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[idx] {
             Value::Uuid(id) => *id,
@@ -71,6 +90,7 @@ fn uuid_column_set(result: &contextdb_engine::QueryResult, column: &str) -> BTre
         .collect()
 }
 
+#[cfg(feature = "test-seams")]
 fn forward_probe(db: &Database, x: Uuid) -> contextdb_engine::QueryResult {
     db.execute(
         "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $x COLUMNS (b.id AS t))",
@@ -79,6 +99,7 @@ fn forward_probe(db: &Database, x: Uuid) -> contextdb_engine::QueryResult {
     .unwrap()
 }
 
+#[cfg(feature = "test-seams")]
 fn seed_reopen_fixture(path: &Path) -> (Uuid, BTreeSet<Uuid>) {
     let db = Database::open(path).unwrap();
     create_graph_tables(&db);
@@ -102,6 +123,7 @@ fn seed_reopen_fixture(path: &Path) -> (Uuid, BTreeSet<Uuid>) {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga15_context_scoped_forward_probe_reports_visible_degree_only() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("ga15.redb");
@@ -160,8 +182,8 @@ fn ga15_context_scoped_forward_probe_reports_visible_degree_only() {
             "ctx-b target {leaked} leaked into ctx-a-scoped graph probe"
         );
     }
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().index_used.as_deref(), Some("forward_adj"));
     assert_eq!(visible_examined, 4);
     match hidden_start_result {
         Err(Error::ContextScopeViolation { requested, allowed }) => {
@@ -176,6 +198,7 @@ fn ga15_context_scoped_forward_probe_reports_visible_degree_only() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga20_file_backed_reopen_preserves_forward_probe_trace_and_accounting() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("ga20.redb");
@@ -192,10 +215,10 @@ fn ga20_file_backed_reopen_preserves_forward_probe_trace_and_accounting() {
 
     assert_eq!(uuid_column_set(&before, "t"), targets);
     assert_eq!(uuid_column_set(&after, "t"), targets);
-    assert_eq!(before.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(after.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(before.trace.index_used.as_deref(), Some("forward_adj"));
-    assert_eq!(after.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(before.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(after.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(before.trace().index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(after.trace().index_used.as_deref(), Some("forward_adj"));
     assert_eq!(before_examined, 5);
     assert_eq!(after_examined, 5);
 }

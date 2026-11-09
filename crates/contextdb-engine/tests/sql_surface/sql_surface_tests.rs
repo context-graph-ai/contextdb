@@ -6,7 +6,6 @@
 use contextdb_core::{Error, Value};
 use contextdb_engine::Database;
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
@@ -24,10 +23,10 @@ fn exec(db: &Database, sql: &str, row: &str) -> contextdb_engine::QueryResult {
 
 fn col(result: &contextdb_engine::QueryResult, name: &str) -> usize {
     result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == name)
-        .unwrap_or_else(|| panic!("column {name} not in {:?}", result.columns))
+        .unwrap_or_else(|| panic!("column {name} not in {:?}", result.columns()))
 }
 
 fn seed_text(db: &Database, table: &str, column: &str, values: &[&str], row: &str) {
@@ -84,7 +83,7 @@ fn assert_contains(
     row: &str,
 ) {
     let idx = col(result, column);
-    let got: Vec<&Value> = result.rows.iter().map(|r| &r[idx]).collect();
+    let got: Vec<&Value> = result.rows().iter().map(|r| &r[idx]).collect();
     for cell in expected {
         let value = cell.value();
         assert!(
@@ -106,7 +105,7 @@ enum Projected {
 fn project(result: &contextdb_engine::QueryResult, columns: &[&str]) -> Vec<Vec<Value>> {
     let idx: Vec<usize> = columns.iter().map(|c| col(result, c)).collect();
     result
-        .rows
+        .rows()
         .iter()
         .map(|r| idx.iter().map(|i| r[*i].clone()).collect())
         .collect()
@@ -468,12 +467,12 @@ fn comparison_logical_expression_and_shaping_operators() {
         (row.seed)(&db, row.name);
         let result = exec(&db, row.sql, row.name);
         assert_eq!(
-            result.rows.len(),
+            result.rows().len(),
             row.count,
             "{}: expected {} rows, got {}",
             row.name,
             row.count,
-            result.rows.len()
+            result.rows().len()
         );
         for (column, values) in row.contains {
             assert_contains(&result, column, values, row.name);
@@ -560,7 +559,7 @@ fn expr_03_in_subquery() {
         "SELECT * FROM employees WHERE dept IN (SELECT name FROM departments)",
         "expr_03_in_subquery",
     );
-    assert_eq!(result.rows.len(), 2, "expr_03_in_subquery");
+    assert_eq!(result.rows().len(), 2, "expr_03_in_subquery");
     assert_contains(
         &result,
         "name",
@@ -604,8 +603,8 @@ fn expr_08_is_null() {
         "SELECT * FROM optional WHERE note IS NULL",
         "expr_08_is_null",
     );
-    assert_eq!(result.rows.len(), 1, "expr_08_is_null");
-    assert_eq!(result.rows[0][col(&result, "id")], Value::Uuid(null_id));
+    assert_eq!(result.rows().len(), 1, "expr_08_is_null");
+    assert_eq!(result.rows()[0][col(&result, "id")], Value::Uuid(null_id));
 }
 
 #[test]
@@ -643,13 +642,13 @@ fn log_04_null_propagation() {
         "SELECT * FROM nullcheck WHERE a = 'missing' AND b = 'x'",
         "log_04_null_propagation",
     );
-    assert_eq!(r1.rows.len(), 0, "log_04_null_propagation AND");
+    assert_eq!(r1.rows().len(), 0, "log_04_null_propagation AND");
     let r2 = exec(
         &db,
         "SELECT * FROM nullcheck WHERE a = 'y' OR b = 'x'",
         "log_04_null_propagation",
     );
-    assert_eq!(r2.rows.len(), 2, "log_04_null_propagation OR");
+    assert_eq!(r2.rows().len(), 2, "log_04_null_propagation OR");
 }
 
 #[test]
@@ -662,9 +661,9 @@ fn join_shapes_inner_left_and_disambiguated() {
                 "SELECT a.name, b.title FROM authors a INNER JOIN books b ON a.id = b.author_id",
                 row,
             );
-            assert_eq!(result.rows.len(), 2, "jn_01_inner_join");
+            assert_eq!(result.rows().len(), 2, "jn_01_inner_join");
             let name_idx = col(&result, "name");
-            for row in &result.rows {
+            for row in result.rows() {
                 assert_eq!(
                     row[name_idx],
                     Value::Text("alice".into()),
@@ -685,11 +684,11 @@ fn join_shapes_inner_left_and_disambiguated() {
                 "SELECT a.name, b.title FROM authors a LEFT JOIN books b ON a.id = b.author_id",
                 row,
             );
-            assert_eq!(result.rows.len(), 3, "jn_02_left_join_unmatched_nulls");
+            assert_eq!(result.rows().len(), 3, "jn_02_left_join_unmatched_nulls");
             let name_idx = col(&result, "name");
             let title_idx = col(&result, "title");
             let bob: Vec<_> = result
-                .rows
+                .rows()
                 .iter()
                 .filter(|r| r[name_idx] == Value::Text("bob".into()))
                 .collect();
@@ -734,14 +733,14 @@ fn join_shapes_inner_left_and_disambiguated() {
                 "SELECT l.val, r.val FROM left_t l INNER JOIN right_t r ON l.id = r.left_id",
                 row,
             );
-            assert_eq!(result.rows.len(), 1, "jn_03_disambiguated_columns");
+            assert_eq!(result.rows().len(), 1, "jn_03_disambiguated_columns");
             assert_eq!(
-                result.rows[0][0],
+                result.rows()[0][0],
                 Value::Text("left_val".into()),
                 "jn_03_disambiguated_columns"
             );
             assert_eq!(
-                result.rows[0][1],
+                result.rows()[0][1],
                 Value::Text("right_val".into()),
                 "jn_03_disambiguated_columns"
             );
@@ -823,10 +822,10 @@ fn aggregation_count_and_mixed_refusal() {
         "agg_01_count_star",
     );
     let star = exec(&db, "SELECT COUNT(*) FROM counttable", "agg_01_count_star");
-    assert_eq!(star.rows.len(), 1, "agg_01_count_star");
-    assert_eq!(star.rows[0][0], Value::Int64(3), "agg_01_count_star");
+    assert_eq!(star.rows().len(), 1, "agg_01_count_star");
+    assert_eq!(star.rows()[0][0], Value::Int64(3), "agg_01_count_star");
     assert!(
-        star.columns.iter().any(|c| c == "COUNT"),
+        star.columns().iter().any(|c| c == "COUNT"),
         "agg_01_count_star column name must preserve SQL case"
     );
 
@@ -867,9 +866,9 @@ fn aggregation_count_and_mixed_refusal() {
         "SELECT COUNT(val) FROM nullcount",
         "agg_02_count_expr_excludes_nulls",
     );
-    assert_eq!(counted.rows.len(), 1, "agg_02_count_expr_excludes_nulls");
+    assert_eq!(counted.rows().len(), 1, "agg_02_count_expr_excludes_nulls");
     assert_eq!(
-        counted.rows[0][0],
+        counted.rows()[0][0],
         Value::Int64(2),
         "agg_02_count_expr_excludes_nulls"
     );
@@ -917,14 +916,14 @@ fn query_shaping_alias_and_order_by() {
         "shp_02_column_alias",
     );
     assert!(
-        aliased.columns.contains(&"person_name".to_string()),
+        aliased.columns().contains(&"person_name".to_string()),
         "shp_02_column_alias"
     );
     assert!(
-        !aliased.columns.contains(&"name".to_string()),
+        !aliased.columns().contains(&"name".to_string()),
         "shp_02_column_alias original name should not appear"
     );
-    assert_eq!(aliased.rows[0][0], Value::Text("alice".into()));
+    assert_eq!(aliased.rows()[0][0], Value::Text("alice".into()));
 
     let db = Database::open_memory();
     db.execute(
@@ -941,9 +940,9 @@ fn query_shaping_alias_and_order_by() {
     let num_idx = col(&ordered, "num");
     assert_eq!(
         (
-            ordered.rows[0][num_idx].clone(),
-            ordered.rows[1][num_idx].clone(),
-            ordered.rows[2][num_idx].clone()
+            ordered.rows()[0][num_idx].clone(),
+            ordered.rows()[1][num_idx].clone(),
+            ordered.rows()[2][num_idx].clone()
         ),
         (Value::Int64(10), Value::Int64(20), Value::Int64(30)),
         "shp_03_order_by_asc"
@@ -974,42 +973,42 @@ fn query_shaping_alias_and_order_by() {
     let g_idx = col(&mixed, "group_name");
     let s_idx = col(&mixed, "score");
     assert_eq!(
-        mixed.rows[0][g_idx],
+        mixed.rows()[0][g_idx],
         Value::Text("alpha".into()),
         "shp_04_order_by_multi_column_mixed"
     );
     assert_eq!(
-        mixed.rows[0][s_idx],
+        mixed.rows()[0][s_idx],
         Value::Int64(20),
         "shp_04_order_by_multi_column_mixed"
     );
     assert_eq!(
-        mixed.rows[1][g_idx],
+        mixed.rows()[1][g_idx],
         Value::Text("alpha".into()),
         "shp_04_order_by_multi_column_mixed"
     );
     assert_eq!(
-        mixed.rows[1][s_idx],
+        mixed.rows()[1][s_idx],
         Value::Int64(10),
         "shp_04_order_by_multi_column_mixed"
     );
     assert_eq!(
-        mixed.rows[2][g_idx],
+        mixed.rows()[2][g_idx],
         Value::Text("beta".into()),
         "shp_04_order_by_multi_column_mixed"
     );
     assert_eq!(
-        mixed.rows[2][s_idx],
+        mixed.rows()[2][s_idx],
         Value::Int64(20),
         "shp_04_order_by_multi_column_mixed"
     );
     assert_eq!(
-        mixed.rows[3][g_idx],
+        mixed.rows()[3][g_idx],
         Value::Text("beta".into()),
         "shp_04_order_by_multi_column_mixed"
     );
     assert_eq!(
-        mixed.rows[3][s_idx],
+        mixed.rows()[3][s_idx],
         Value::Int64(10),
         "shp_04_order_by_multi_column_mixed"
     );
@@ -1059,9 +1058,9 @@ fn query_shaping_alias_and_order_by() {
         .unwrap();
         let result = exec(&db, sql, name);
         let val_idx = col(&result, "val");
-        assert_eq!(result.rows[0][val_idx], first, "{name}");
-        assert_eq!(result.rows[1][val_idx], second, "{name}");
-        assert_eq!(result.rows[2][val_idx], third, "{name}");
+        assert_eq!(result.rows()[0][val_idx], first, "{name}");
+        assert_eq!(result.rows()[1][val_idx], second, "{name}");
+        assert_eq!(result.rows()[2][val_idx], third, "{name}");
     }
 }
 
@@ -1183,14 +1182,7 @@ fn constraint_rows_refuse_or_accept_as_declared() {
 fn assert_now_is_recent(value: &Value, row: &str) {
     match value {
         Value::Timestamp(ts) => {
-            let now_secs = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64;
-            assert!(
-                (now_secs - ts).abs() < 5,
-                "{row}: NOW() should be within 5s of system time, got {ts}"
-            );
+            assert_eq!(*ts, 1_000, "{row}: NOW() should equal the frozen clock")
         }
         other => panic!("{row}: expected Timestamp, got {other:?}"),
     }
@@ -1226,25 +1218,27 @@ fn fn_01_coalesce_first_non_null() {
         "SELECT COALESCE(a, b, c) FROM coaltable ORDER BY id ASC",
         "fn_01_coalesce_first_non_null",
     );
-    assert_eq!(result.rows.len(), 2, "fn_01_coalesce_first_non_null");
-    let values: Vec<&Value> = result.rows.iter().map(|r| &r[0]).collect();
+    assert_eq!(result.rows().len(), 2, "fn_01_coalesce_first_non_null");
+    let values: Vec<&Value> = result.rows().iter().map(|r| &r[0]).collect();
     assert!(values.contains(&&Value::Text("fallback".into())));
     assert!(values.contains(&&Value::Text("second".into())));
 }
 
 #[test]
 fn fn_02_now_without_from() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
     let result = exec(
         &Database::open_memory(),
         "SELECT NOW()",
         "fn_02_now_without_from",
     );
-    assert_eq!(result.rows.len(), 1, "fn_02_now_without_from");
-    assert_now_is_recent(&result.rows[0][0], "fn_02_now_without_from");
+    assert_eq!(result.rows().len(), 1, "fn_02_now_without_from");
+    assert_now_is_recent(&result.rows()[0][0], "fn_02_now_without_from");
 }
 
 #[test]
 fn fn_03_now_with_from() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
     let db = Database::open_memory();
     db.execute("CREATE TABLE dummy (id UUID PRIMARY KEY)", &empty())
         .unwrap();
@@ -1254,8 +1248,8 @@ fn fn_03_now_with_from() {
     )
     .unwrap();
     let result = exec(&db, "SELECT NOW() FROM dummy", "fn_03_now_with_from");
-    assert_eq!(result.rows.len(), 1, "fn_03_now_with_from");
-    assert_now_is_recent(&result.rows[0][0], "fn_03_now_with_from");
+    assert_eq!(result.rows().len(), 1, "fn_03_now_with_from");
+    assert_now_is_recent(&result.rows()[0][0], "fn_03_now_with_from");
 }
 
 #[test]
@@ -1279,11 +1273,11 @@ fn sql_01_default_now_produces_timestamp() {
         )
         .unwrap();
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "sql_01_default_now_produces_timestamp"
     );
-    match &result.rows[0][0] {
+    match &result.rows()[0][0] {
         Value::Timestamp(ts) => assert!(
             *ts > 1_700_000_000,
             "sql_01_default_now_produces_timestamp created_at should be a recent unix timestamp, got {ts}"
@@ -1325,8 +1319,8 @@ fn a_boolean_column_predicate_selects_the_same_rows_on_a_scan_and_on_a_join() {
     let scan = db
         .execute("SELECT id FROM flags WHERE flag", &empty())
         .expect("a scan WHERE on a boolean column is a legal predicate");
-    assert_eq!(scan.rows.len(), 1, "WHERE flag keeps only flag = TRUE");
-    assert_eq!(scan.rows[0][0], Value::Uuid(yes));
+    assert_eq!(scan.rows().len(), 1, "WHERE flag keeps only flag = TRUE");
+    assert_eq!(scan.rows()[0][0], Value::Uuid(yes));
 
     let cte = db
         .execute(
@@ -1335,7 +1329,8 @@ fn a_boolean_column_predicate_selects_the_same_rows_on_a_scan_and_on_a_join() {
         )
         .expect("a CTE WHERE on a boolean column uses the same predicate rules as a scan");
     assert_eq!(
-        cte.rows, scan.rows,
+        cte.rows(),
+        scan.rows(),
         "the CTE filter path must keep the same row the scan path kept"
     );
 
@@ -1346,7 +1341,8 @@ fn a_boolean_column_predicate_selects_the_same_rows_on_a_scan_and_on_a_join() {
         )
         .expect("JOIN ON a boolean column uses the same predicate rules as a scan WHERE");
     assert_eq!(
-        joined.rows, scan.rows,
+        joined.rows(),
+        scan.rows(),
         "the JOIN ON path must keep the same row the scan path kept"
     );
 }
@@ -1374,5 +1370,5 @@ fn idx_01_create_index_accepted() {
         "SELECT * FROM indexed WHERE name = 'alice'",
         "idx_01_create_index_accepted",
     );
-    assert_eq!(q.rows.len(), 1, "idx_01_create_index_accepted");
+    assert_eq!(q.rows().len(), 1, "idx_01_create_index_accepted");
 }

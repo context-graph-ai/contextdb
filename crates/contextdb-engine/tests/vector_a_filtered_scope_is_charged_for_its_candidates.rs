@@ -4,3 +4,5 @@
 mod a_filtered_scope_is_charged_for_its_candidates;
 #[path = "fixtures/maintained_search/mod.rs"]
 mod maintained_search;
+#[path = "fixtures/retained_query_rows.rs"]
+mod retained_query_rows;

@@ -72,12 +72,12 @@ fn only_table_body(db: &Database, table: &str, id: i64) -> String {
         .execute(&format!("SELECT body FROM {table} WHERE id = $id"), &params)
         .expect("table scan");
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "exactly one {table} row must carry id {id}, got {:?}",
-        result.rows
+        result.rows()
     );
-    match &result.rows[0][0] {
+    match &result.rows()[0][0] {
         Value::Text(body) => body.clone(),
         other => panic!("expected a text body, got {other:?}"),
     }
@@ -120,7 +120,8 @@ fn start_hub_with_ddls(broker: &InProcessBroker, ddls: &[&str]) -> RunningHub {
             TenantId::from(TENANT),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -152,6 +153,7 @@ fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, _role: &str) -> Syn
         TenantId::from(TENANT),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 /// An UNDECLARED table takes the non-overwriting default: a re-send of an
@@ -312,7 +314,9 @@ async fn mixed_group_stamps_the_accepted_sibling_before_refusal_reconciliation()
 
     let accepted_key =
         contextdb_engine::sync_types::NaturalKey::single("id".to_string(), Value::Int64(9));
-    let (changes, arrivals) = edge.changes_since_with_arrivals(Lsn(0));
+    let (changes, arrivals) = edge
+        .changes_since_with_arrivals(Lsn(0))
+        .expect("read fixture changes and arrivals");
     let accepted = changes
         .rows
         .iter()
@@ -324,7 +328,9 @@ async fn mixed_group_stamps_the_accepted_sibling_before_refusal_reconciliation()
          its transaction also had a refused key"
     );
     assert!(
-        !edge.row_version_arrived_by_sync("accepted", &accepted_key),
+        !edge
+            .row_version_arrived_by_sync("accepted", &accepted_key)
+            .expect("read row_version_arrived_by_sync fixture"),
         "AcceptedLocal is acknowledged provenance, not a pulled echo: it stays \
          eligible for outbound repair if the hub later regresses"
     );
@@ -398,7 +404,9 @@ async fn accepted_delete_and_insert_from_one_source_transaction_share_one_hub_co
         Lsn(before.0 + 1),
         "the hub must accept the delete and insert in one commit, not split by staging order"
     );
-    let (changes, arrivals) = hub.changes_since_with_arrivals(before);
+    let (changes, arrivals) = hub
+        .changes_since_with_arrivals(before)
+        .expect("read fixture changes and arrivals");
     let group = changes
         .rows
         .iter()
@@ -422,7 +430,7 @@ async fn accepted_delete_and_insert_from_one_source_transaction_share_one_hub_co
         .execute("SELECT id, body FROM notes", &p())
         .expect("hub read");
     assert_eq!(
-        rows.rows,
+        rows.rows(),
         vec![vec![Value::Int64(2), Value::Text("new".to_string())]]
     );
 }

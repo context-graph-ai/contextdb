@@ -17,7 +17,51 @@
 
 use std::path::{Path, PathBuf};
 
-const ATTRIBUTE: &str = "#[cfg(feature = \"test-seams\")]";
+/// Whether a line opens a `cfg` attribute that a build without `test-seams`
+/// (and not under `cargo test`) compiles out: the literal
+/// `#[cfg(feature = "test-seams")]`, or an `any(..)` or `all(..)` whose every
+/// arm is `test` or `feature = "test-seams"`. Any other arm -- a different
+/// feature, a negation, a nested predicate -- is not a guard.
+fn is_seam_guard(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("#[cfg(") else {
+        return false;
+    };
+    let mut depth = 1i32;
+    let mut end = None;
+    for (index, character) in rest.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(index);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(end) = end else {
+        return false;
+    };
+    if !rest[end..].starts_with(")]") {
+        return false;
+    }
+    let seam_arm = |arm: &str| arm == "test" || arm == "feature = \"test-seams\"";
+    let predicate = rest[..end].trim();
+    match predicate
+        .strip_prefix("any(")
+        .or_else(|| predicate.strip_prefix("all("))
+    {
+        Some(arms) => {
+            let Some(arms) = arms.strip_suffix(')') else {
+                return false;
+            };
+            arms.split(',').all(|arm| seam_arm(arm.trim()))
+        }
+        None => predicate == "feature = \"test-seams\"",
+    }
+}
 
 /// The seam calls a production path makes, each qualified enough that an
 /// unrelated API of the same name is not mistaken for one.
@@ -72,12 +116,12 @@ fn brackets_only(line: &str) -> String {
     kept
 }
 
-/// The lines `#[cfg(feature = "test-seams")]` guards: the item or statement
+/// The lines a seam-only `cfg` attribute guards: the item or statement
 /// that follows it, to the point where every bracket it opened is closed.
 fn guarded_lines(lines: &[&str]) -> Vec<bool> {
     let mut guarded = vec![false; lines.len()];
     for (at, line) in lines.iter().enumerate() {
-        if !line.trim().starts_with(ATTRIBUTE) {
+        if !is_seam_guard(line.trim()) {
             continue;
         }
         // Other attributes and doc comments may stand between the guard and
