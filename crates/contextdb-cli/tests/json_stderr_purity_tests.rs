@@ -38,6 +38,14 @@ fn run(args: &[&str], stdin_sql: &str) -> (Option<i32>, String, String) {
     )
 }
 
+/// A database path in a fresh directory. The directory lives as long as the
+/// returned guard.
+fn session_db() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("session directory");
+    let path = dir.path().join("session.db").to_string_lossy().into_owned();
+    (dir, path)
+}
+
 fn assert_every_line_is_json(stderr: &str, context: &str) {
     for line in stderr.lines().filter(|l| !l.trim().is_empty()) {
         serde_json::from_str::<serde_json::Value>(line.trim()).unwrap_or_else(|e| {
@@ -49,7 +57,8 @@ fn assert_every_line_is_json(stderr: &str, context: &str) {
 // (a) — a plain in-REPL SQL error under --json.
 #[test]
 fn json_stderr_pure_for_in_repl_sql_error() {
-    let (code, _stdout, stderr) = run(&["--json", ":memory:"], "SELET bad;\n.quit\n");
+    let (_dir, db) = session_db();
+    let (code, _stdout, stderr) = run(&["--json", &db, "--write"], "SELET bad;\n.quit\n");
     assert_eq!(code, Some(1), "stderr:\n{stderr}");
     assert!(!stderr.trim().is_empty(), "expected an error on stderr");
     assert_every_line_is_json(&stderr, "in-REPL SQL error");
@@ -59,7 +68,8 @@ fn json_stderr_pure_for_in_repl_sql_error() {
 // value parser, which runs before the REPL loop starts at all.
 #[test]
 fn json_stderr_pure_for_startup_usage_error() {
-    let (code, _stdout, stderr) = run(&["--json", "--memory-limit", "12Q", ":memory:"], "");
+    let (_dir, db) = session_db();
+    let (code, _stdout, stderr) = run(&["--json", "--memory-limit", "12Q", &db, "--write"], "");
     assert_eq!(code, Some(2), "stderr:\n{stderr}");
     assert!(
         !stderr.trim().is_empty(),
@@ -72,6 +82,7 @@ fn json_stderr_pure_for_startup_usage_error() {
 // error, both in the same stderr stream.
 #[test]
 fn json_stderr_pure_across_notices_and_an_error() {
+    let (_dir, db) = session_db();
     let (code, _stdout, stderr) = run(
         &[
             "--json",
@@ -79,7 +90,8 @@ fn json_stderr_pure_across_notices_and_an_error() {
             "acme",
             "--sync-endpoint",
             "iroh:invalid-test-ticket",
-            ":memory:",
+            &db,
+            "--write",
         ],
         "SELET bad;\n.quit\n",
     );
@@ -100,7 +112,8 @@ fn json_stderr_pure_across_notices_and_an_error() {
 // not either copy of the doc text.)
 #[test]
 fn json_help_emits_single_document_on_stderr() {
-    let (code, stdout, stderr) = run(&["--json", ":memory:"], ".help\n.quit\n");
+    let (_dir, db) = session_db();
+    let (code, stdout, stderr) = run(&["--json", &db, "--write"], ".help\n.quit\n");
     assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
         stdout.trim().is_empty(),

@@ -31,7 +31,8 @@ use contextdb_core::Value;
 use contextdb_core::read_contract::{OwnerReadCancellation, ReadRoute};
 use contextdb_engine::local_transport::{channel_socket_path, derive_channel_address};
 use contextdb_engine::persistence::read_persistence_test_scaffold::{
-    RawRedbWriterOpenObservation, ReaderSourceStartPause, pause_readers_at_source_start_for_test,
+    RawRedbWriterOpenObservation, ReaderSourceStartPause,
+    canonical_reader_breadcrumb_directory_for_test, pause_readers_at_source_start_for_test,
     reader_breadcrumb_runtime_root_for_test, try_raw_redb_writer_open_for_test,
 };
 use contextdb_engine::persistence::{ReaderReleaseWait, wait_for_reader_release_in_runtime_dir};
@@ -64,25 +65,27 @@ fn readers_runtime_directory(inside: &Path) -> PathBuf {
     std::fs::canonicalize(&root).expect("resolve it the way the store will")
 }
 
-/// Make this store's diagnostic notes unpublishable without invalidating the
-/// supplied runtime root. The root itself must stay owner-only so the reader
-/// can open and hold the store; its per-store breadcrumb directory is readable
-/// but not owner-only, so breadcrumb publication is refused.
-///
-/// The production-selected coordination directory is passed here: the
-/// platform directory when available, else the reader's supplied directory.
-fn make_breadcrumbs_unpublishable(runtime_root: &Path, store: &Path) -> PathBuf {
-    let address = derive_channel_address(store).expect("derive this store's registry address");
-    let name = address
-        .0
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let directory = runtime_root.join(name);
-    std::fs::create_dir(&directory).expect("create the store's breadcrumb directory");
-    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o750))
-        .expect("make the store's breadcrumb directory refuse publication");
-    directory
+/// A task-owned file occupies the exact directory where diagnostic
+/// breadcrumbs would be published. The valid runtime root and authoritative
+/// reader hold remain usable; directory preparation cannot chmod this file
+/// into a directory when a fallback runtime is available.
+struct BreadcrumbObstruction(PathBuf);
+
+impl Drop for BreadcrumbObstruction {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn make_breadcrumbs_unpublishable(runtime_root: &Path, store: &Path) -> BreadcrumbObstruction {
+    let path = canonical_reader_breadcrumb_directory_for_test(store, runtime_root)
+        .expect("resolve the engine's diagnostic publication directory");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .expect("occupy only this store's diagnostic directory with a regular file");
+    BreadcrumbObstruction(path)
 }
 
 /// A runtime root an operator never created.
@@ -132,9 +135,9 @@ fn idle_store(directory: &Path, name: &str) -> PathBuf {
     path
 }
 
-/// A real direct reader, stopped where its read-image source starts -- the
-/// first production point inside the load-time hold, before any registration
-/// is published -- and let go when the journey says so.
+/// A real direct reader, stopped where its read-image source starts while
+/// the store hold is live, and let go when the journey says so. Diagnostic
+/// breadcrumb publication is obstructed separately by the fixture.
 ///
 /// Nothing here manufactures a holder. The reader is an ordinary one, holding
 /// the store exactly as any reader does; the store simply stops it at that
@@ -219,20 +222,34 @@ fn the_wait_follows_the_hold_despite(root_kind: &str, make_root: fn(&Path) -> Pa
     let directory = tempfile::TempDir::new().expect("task-scoped bad-root directory");
     let readers_runtime = readers_runtime_directory(directory.path());
     let path = idle_store(directory.path(), "bad-root.db");
-    let coordination_runtime =
-        reader_breadcrumb_runtime_root_for_test().unwrap_or_else(|| readers_runtime.clone());
-    let breadcrumb_directory = make_breadcrumbs_unpublishable(&coordination_runtime, &path);
+    let mut registration_roots = vec![readers_runtime.clone()];
+    if let Some(default) = reader_breadcrumb_runtime_root_for_test()
+        && !registration_roots.contains(&default)
+    {
+        registration_roots.push(default);
+    }
+    let obstructions = registration_roots
+        .iter()
+        .map(|runtime| make_breadcrumbs_unpublishable(runtime, &path))
+        .collect::<Vec<_>>();
     let root = make_root(directory.path());
 
     let (parking, holding) = park_a_reader(&path, &readers_runtime);
     assert_really_held(&path, "a reader parked inside its load");
-    assert_eq!(
-        std::fs::read_dir(&breadcrumb_directory)
-            .expect("inspect the obstructed breadcrumb directory")
-            .count(),
-        0,
-        "the parked reader must not have published a breadcrumb into this store's registry"
-    );
+    for obstruction in &obstructions {
+        assert!(
+            std::fs::symlink_metadata(&obstruction.0)
+                .expect("inspect the deliberate registration obstruction")
+                .file_type()
+                .is_file(),
+            "the parked reader cannot publish a breadcrumb below a regular file"
+        );
+        assert_eq!(
+            std::fs::read_dir(&obstruction.0).unwrap_err().kind(),
+            std::io::ErrorKind::NotADirectory,
+            "no diagnostic reader registration can exist at this publication path"
+        );
+    }
 
     let heard = wait_in_thread(&path, root.clone());
     if let Ok(early) = heard.recv_timeout(PARKED) {
@@ -257,12 +274,6 @@ fn the_wait_follows_the_hold_despite(root_kind: &str, make_root: fn(&Path) -> Pa
          answered {}",
         describe(&answer),
     );
-    std::fs::set_permissions(
-        &breadcrumb_directory,
-        std::fs::Permissions::from_mode(0o700),
-    )
-    .expect("restore the breadcrumb directory after the wait");
-    std::fs::remove_dir(&breadcrumb_directory).expect("remove the empty breadcrumb obstruction");
 }
 
 /// Hand a deliberately unreadable fixture back before the task-scoped

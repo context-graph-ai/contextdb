@@ -255,18 +255,18 @@ fn assert_mixed_landed(db: &Database, n: usize, history_rows: usize) {
             &empty(),
         )
         .expect("select invalidated parents");
-    assert_eq!(invalidated.rows.len(), n);
+    assert_eq!(invalidated.rows().len(), n);
     assert_eq!(
         db.execute("SELECT id FROM child", &empty())
             .expect("select children")
-            .rows
+            .rows()
             .len(),
         history_rows + n
     );
     assert_eq!(
         db.execute("SELECT id FROM edges", &empty())
             .expect("select edges")
-            .rows
+            .rows()
             .len(),
         history_rows + n
     );
@@ -278,7 +278,7 @@ fn assert_upsert_landed(db: &Database, n: usize, upsert_hits: usize) {
         .execute("SELECT tag FROM child", &empty())
         .expect("select child tags");
     let updated = rows
-        .rows
+        .rows()
         .iter()
         .filter(|row| matches!(&row[0], Value::Text(tag) if tag.starts_with("updated-")))
         .count();
@@ -373,6 +373,10 @@ fn measure_upsert_cascade(n: usize) -> CommitMeasurement {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn setup_trigger_case(n: usize) -> (Database, Vec<(Uuid, i64)>) {
     let db = Database::open_memory();
     declare_mixed_schema(&db);
@@ -571,6 +575,32 @@ fn run_budget_gates() -> BudgetReport {
 }
 
 fn bench(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        for n in WRITE_VOLUME_N {
+            c.bench_function(
+                &format!("commit_write_volume_scaling/write_volume/{n}"),
+                |_| {},
+            );
+        }
+        for n in WRITE_VOLUME_N {
+            c.bench_function(&format!("commit_write_volume_scaling/upsert/{n}"), |_| {});
+        }
+        for rows in [HISTORY_SMALL, HISTORY_LARGE] {
+            c.bench_function(
+                &format!("commit_write_volume_scaling/history/{rows}"),
+                |_| {},
+            );
+        }
+        c.bench_function(
+            "commit_write_volume_scaling/trigger/trigger_staged_n_100",
+            |_| {},
+        );
+        c.bench_function(
+            "commit_write_volume_scaling/file_backed/file_backed_n_100",
+            |_| {},
+        );
+        return;
+    }
     let budget = run_budget_gates();
     black_box(&budget);
 

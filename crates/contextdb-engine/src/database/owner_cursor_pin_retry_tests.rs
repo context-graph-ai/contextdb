@@ -44,12 +44,17 @@ fn busy_cursor_pin_retries_outside_commit_and_recaptures_the_complete_root() {
                 });
                 let clock: Arc<dyn DeadlineClock> = Arc::new(ManualDeadlineClock::at(0));
                 let budget = ReadRegistrationBudget::new(Arc::clone(&clock), 0, 10_000);
+                let fixture_operation_reader_1 = reader_db
+                    .declared_reader_memory()
+                    .expect("admit the actual fixture reader");
+
                 reader_db
                     .bounded_cursor_snapshot_registration(
                         clock,
                         10_000,
                         &budget,
                         &OwnerReadCancellation::new(),
+                        fixture_operation_reader_1.clone(),
                     )
                     .unwrap()
                     .unwrap()
@@ -82,7 +87,7 @@ fn busy_cursor_pin_retries_outside_commit_and_recaptures_the_complete_root() {
     assert_eq!(
         db.execute_at_snapshot("SELECT body FROM items", &HashMap::new(), snapshot)
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("replacement".to_owned())]],
     );
     drop((storage, registration));
@@ -90,6 +95,13 @@ fn busy_cursor_pin_retries_outside_commit_and_recaptures_the_complete_root() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn busy_cursor_pin_cancellation_and_deadline_finish_before_handle_release() {
     for cancelled in [false, true] {
         let directory = tempfile::tempdir().unwrap();
@@ -115,12 +127,17 @@ fn busy_cursor_pin_cancellation_and_deadline_finish_before_handle_release() {
                     });
                     let clock: Arc<dyn DeadlineClock> = reader_clock;
                     let budget = ReadRegistrationBudget::new(Arc::clone(&clock), 0, 10_000);
+                    let fixture_operation_reader_2 = reader_db
+                        .declared_reader_memory()
+                        .expect("admit the actual fixture reader");
+
                     reader_db
                         .bounded_cursor_snapshot_registration(
                             clock,
                             10_000,
                             &budget,
                             &reader_withdrawn,
+                            fixture_operation_reader_2.clone(),
                         )
                         .map(|pin| pin.is_some())
                 });
@@ -160,10 +177,18 @@ enum RegistryWaitOutcome {
 #[derive(Clone, Copy)]
 enum RegistryWaitPhase {
     Registration,
-    ProviderScan,
+    FirstRoot,
+    SecondRoot,
 }
 
 #[cfg(all(unix, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWaitPhase) {
     use crate::local_transport::{
         LocalHandshake, LocalRequest, LocalRequestEnvelope, LocalResponse,
@@ -185,34 +210,60 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
         cursor_page_rows: 1,
         ..ReadLimits::default()
     };
-    let db = Database::open_with_options(
-        &path,
-        DatabaseOpenOptions {
-            owner_reads: OwnerReadConfig {
-                runtime_dir: Some(runtime_dir),
-                limits: OwnerReadLimits {
-                    limits,
-                    ..OwnerReadLimits::default()
+    struct RequestRetired(std::sync::mpsc::Sender<()>);
+    impl crate::owner_read::OwnerBoundedExecutionObserver for RequestRetired {
+        fn before_operation(
+            &self,
+            _: crate::owner_read::OwnerBoundedOperation,
+            _: ReadLimits,
+            _: OwnerReadCancellation,
+        ) {
+        }
+        fn before_work(
+            &self,
+            _: crate::executor::bounded_read_test_support::TestWorkSource,
+            _: u64,
+        ) {
+        }
+        fn cancellation_observed(&self, _: u64) {}
+        fn carrier_request_retired(&self) {
+            let _ = self.0.send(());
+        }
+    }
+    let (finished_owner, owner_finished) = std::sync::mpsc::channel();
+    let db = crate::owner_read::OwnerServiceSpec::with_execution_observer_during_start_for_test(
+        Arc::new(RequestRetired(finished_owner)),
+        || {
+            Database::open_with_options(
+                &path,
+                DatabaseOpenOptions {
+                    owner_reads: OwnerReadConfig {
+                        runtime_dir: Some(runtime_dir.clone()),
+                        limits: OwnerReadLimits {
+                            limits,
+                            ..OwnerReadLimits::default()
+                        },
+                        timeouts: OwnerServiceTimeouts {
+                            request_ms: 600_000,
+                            ..OwnerServiceTimeouts::default()
+                        },
+                        test_hooks: Some(crate::OwnerReadTestHooks {
+                            clock: clock.clone(),
+                            drain_started,
+                            active_request_registered: None,
+                            accept_thread_exited: None,
+                            accept_thread_joined: None,
+                            service_dropped: None,
+                            quiescent_stop: None,
+                        }),
+                        ..OwnerReadConfig::default()
+                    },
+                    ..DatabaseOpenOptions::default()
                 },
-                timeouts: OwnerServiceTimeouts {
-                    request_ms: 600_000,
-                    ..OwnerServiceTimeouts::default()
-                },
-                test_hooks: Some(crate::OwnerReadTestHooks {
-                    clock: clock.clone(),
-                    drain_started,
-                    active_request_registered: None,
-                    accept_thread_exited: None,
-                    accept_thread_joined: None,
-                    service_dropped: None,
-                    quiescent_stop: None,
-                }),
-                ..OwnerReadConfig::default()
-            },
-            ..DatabaseOpenOptions::default()
+            )
+            .unwrap()
         },
-    )
-    .unwrap();
+    );
     db.execute(
         "CREATE TABLE items (id INTEGER PRIMARY KEY)",
         &HashMap::new(),
@@ -238,6 +289,7 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
                 ..ReadClientTimeouts::default()
             },
             clock.clone(),
+            db.declared_reader_memory().unwrap(),
         ))
         .unwrap();
     let cancelled = OwnerReadCancellation::new();
@@ -246,12 +298,6 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
         db.snapshot_registry.owner_cursor_busy_test_pause.clone(),
     );
     let (finished, completed) = std::sync::mpsc::sync_channel(1);
-    let scan_pause = matches!(phase, RegistryWaitPhase::ProviderScan).then(|| {
-        crate::persistence::read_persistence_test_scaffold::pause_reader_snapshot_registry_scan_for_test(
-            &path,
-        )
-        .unwrap()
-    });
     let start_reader = || {
         std::thread::spawn(move || {
             let result = executor.block_on(client.request_watching(
@@ -268,70 +314,97 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
             finished.send(result).unwrap();
         })
     };
-    let mut start_reader = Some(start_reader);
-    let scan_reader = scan_pause.as_ref().map(|scan| {
-        let reader = start_reader.take().unwrap()();
-        scan.wait_until_inspected_for_test();
-        reader
+    let persistence = db.persistence.as_ref().unwrap();
+    let registry_paths = persistence.owner_cursor_registry_paths_for_test();
+    let root_index = match phase {
+        RegistryWaitPhase::FirstRoot => Some(0),
+        RegistryWaitPhase::SecondRoot => Some(1),
+        _ => None,
+    };
+    let held_root = root_index.map(|index| {
+        assert_eq!(
+            registry_paths.len(),
+            2,
+            "private platform plus supplied root fixture"
+        );
+        let stable_root = if index == 0 {
+            registry_paths[index]
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .to_path_buf()
+        } else {
+            registry_paths[index].parent().unwrap().to_path_buf()
+        };
+        let root = std::fs::File::open(stable_root).unwrap();
+        fs2::FileExt::lock_exclusive(&root).unwrap();
+        root
     });
-    let reader = db
-        .persistence
-        .as_ref()
-        .unwrap()
-        .with_owner_cursor_registry_locked_for_test(|| {
-            let reader = match scan_reader {
-                Some(reader) => {
-                    scan_pause.as_ref().unwrap().resume_for_test();
-                    reader
-                }
-                None => start_reader.take().unwrap()(),
-            };
-            assert!(
-                pause.wait_until_reached(Duration::from_secs(30)),
-                "the actual owner request meets the held registry"
-            );
-            assert!(
-                db.tx_mgr
-                    .try_with_commit_lock_for(Duration::ZERO, || ())
-                    .is_some(),
-                "registry retries release the commit boundary"
-            );
-            assert!(db.snapshot_registry.state.lock().active.is_empty());
+    let wait_while_contended = || {
+        let reader = start_reader();
+        assert!(
+            pause.wait_until_reached(Duration::from_secs(30)),
+            "the actual owner request meets the held registry"
+        );
+        assert!(
+            db.tx_mgr
+                .try_with_commit_lock_for(Duration::ZERO, || ())
+                .is_some(),
+            "registry retries release the commit boundary"
+        );
+        assert!(db.snapshot_registry.state.lock().active.is_empty());
+        match outcome {
+            RegistryWaitOutcome::Released => (),
+            RegistryWaitOutcome::Deadline => clock.advance_to(limits.active_ms + 1),
+            RegistryWaitOutcome::Cancelled => cancelled.cancel(),
+        }
+        if !matches!(outcome, RegistryWaitOutcome::Released) {
+            pause.release();
+            let result = completed
+                .recv_timeout(Duration::from_secs(30))
+                .expect("withdrawal answers while the registry is still held");
             match outcome {
-                RegistryWaitOutcome::Released => (),
-                RegistryWaitOutcome::Deadline => clock.advance_to(limits.active_ms + 1),
-                RegistryWaitOutcome::Cancelled => cancelled.cancel(),
-            }
-            if !matches!(outcome, RegistryWaitOutcome::Released) {
-                pause.release();
-                let result = completed
-                    .recv_timeout(Duration::from_secs(30))
-                    .expect("withdrawal answers while the registry is still held");
-                match outcome {
-                    RegistryWaitOutcome::Deadline => assert!(
-                        matches!(&result,
+                RegistryWaitOutcome::Deadline => assert!(
+                    matches!(&result,
                     Err(OwnerReadScaffoldError::Database(Error::ReadFailure(failure)))
                     | Err(OwnerReadScaffoldError::Refused(failure))
                         if failure.kind() == ReadFailureKind::OwnerLimitExceeded
                         && matches!(failure.detail(), ReadFailureDetail::OwnerLimitExceeded(detail)
                             if detail.limit == ReadFailureLimit::ActiveMs)),
-                        "typed active-time refusal: {result:?}"
+                    "typed active-time refusal: {result:?}"
+                ),
+                RegistryWaitOutcome::Cancelled => assert!(
+                    matches!(
+                        &result,
+                        Err(OwnerReadScaffoldError::Database(Error::ReadCancelled))
                     ),
-                    RegistryWaitOutcome::Cancelled => assert!(
-                        matches!(
-                            &result,
-                            Err(OwnerReadScaffoldError::Database(Error::ReadCancelled))
-                        ),
-                        "typed cancellation refusal: {result:?}"
-                    ),
-                    RegistryWaitOutcome::Released => unreachable!(),
-                }
-                assert!(db.snapshot_registry.state.lock().active.is_empty());
+                    "typed cancellation refusal: {result:?}"
+                ),
+                RegistryWaitOutcome::Released => unreachable!(),
             }
-            reader
-        });
+            if matches!(outcome, RegistryWaitOutcome::Cancelled) {
+                owner_finished
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("cancelled owner worker retirement event never delivered");
+            }
+            assert!(db.snapshot_registry.state.lock().active.is_empty());
+        }
+        reader
+    };
+    let reader = if held_root.is_some() {
+        wait_while_contended()
+    } else {
+        persistence.with_owner_cursor_registry_locked_for_test(wait_while_contended)
+    };
+    if let Some(root) = held_root {
+        fs2::FileExt::unlock(&root).unwrap();
+    }
     if matches!(outcome, RegistryWaitOutcome::Released) {
-        let expected_first = if matches!(phase, RegistryWaitPhase::ProviderScan) {
+        let expected_first = if matches!(
+            phase,
+            RegistryWaitPhase::FirstRoot | RegistryWaitPhase::SecondRoot
+        ) {
             // The failed scan releases every pin and the commit boundary.
             // Retry must capture the whole root after this intervening commit.
             db.execute("UPDATE items SET id = 3 WHERE id = 1", &HashMap::new())
@@ -348,15 +421,42 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
         let [LocalResponse::CursorOpened { opened }] = responses.as_slice() else {
             panic!("expected owner cursor page: {responses:?}");
         };
-        let page = crate::read_contract::decode_cursor_page(&opened.payload).unwrap();
-        assert_eq!(page.rows, vec![vec![expected_first]]);
+        let page = crate::read_contract::decode_observed_cursor_page(
+            &opened.payload,
+            ReadLimits::SHIPPED_MEMORY,
+        )
+        .unwrap()
+        .page;
+        assert_eq!(&*page.rows, vec![vec![expected_first]]);
         assert!(page.has_more);
     }
     reader.join().unwrap();
-    if let Some(scan) = scan_pause {
-        scan.finish_for_test();
-    }
     db.close().unwrap();
+    if root_index.is_some() {
+        let inventory = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = inventory.clone();
+        let reopened = crate::persistence::read_persistence_test_scaffold::observe_writer_reader_snapshots_for_test(
+            Arc::new(move |records| sink.lock().unwrap().push(records)),
+            || Database::open_with_options(&path, DatabaseOpenOptions {
+                owner_reads: OwnerReadConfig { enabled: false, runtime_dir: Some(runtime_dir.clone()), ..OwnerReadConfig::default() },
+                ..DatabaseOpenOptions::default()
+            }),
+        ).unwrap();
+        assert_eq!(*inventory.lock().unwrap(), vec![
+            crate::persistence::read_persistence_test_scaffold::WriterReaderSnapshotRegistryObservation::Complete(Vec::new())
+        ], "both configured roots have no live failed-admission registrations");
+        assert_eq!(
+            reopened
+                .persistence
+                .as_ref()
+                .unwrap()
+                .external_snapshot_retention_for_test()
+                .unwrap(),
+            Default::default(),
+            "authenticated inventory reclaims failed partial publication; no live floor remains"
+        );
+        reopened.close().unwrap();
+    }
 }
 
 #[cfg(all(unix, feature = "test-seams"))]
@@ -389,28 +489,19 @@ fn owner_channel_cursor_registry_contention_obeys_cancellation() {
 #[cfg(all(unix, feature = "test-seams"))]
 #[test]
 fn owner_channel_cursor_retries_registry_scan_contention_until_release() {
-    owner_channel_registry_wait(
-        RegistryWaitOutcome::Released,
-        RegistryWaitPhase::ProviderScan,
-    );
+    owner_channel_registry_wait(RegistryWaitOutcome::Released, RegistryWaitPhase::FirstRoot);
 }
 
 #[cfg(all(unix, feature = "test-seams"))]
 #[test]
 fn owner_channel_cursor_registry_scan_contention_obeys_active_deadline() {
-    owner_channel_registry_wait(
-        RegistryWaitOutcome::Deadline,
-        RegistryWaitPhase::ProviderScan,
-    );
+    owner_channel_registry_wait(RegistryWaitOutcome::Deadline, RegistryWaitPhase::FirstRoot);
 }
 
 #[cfg(all(unix, feature = "test-seams"))]
 #[test]
 fn owner_channel_cursor_registry_scan_contention_obeys_cancellation() {
-    owner_channel_registry_wait(
-        RegistryWaitOutcome::Cancelled,
-        RegistryWaitPhase::ProviderScan,
-    );
+    owner_channel_registry_wait(RegistryWaitOutcome::Cancelled, RegistryWaitPhase::FirstRoot);
 }
 
 #[test]
@@ -425,18 +516,25 @@ fn healthy_registry_scan_contention_never_refuses_concurrent_cursors() {
     db.execute("INSERT INTO facts VALUES (1)", &HashMap::new())
         .unwrap();
     let barrier = Arc::new(std::sync::Barrier::new(10));
+    // Never advanced: the default active-time limit stays in force and cannot
+    // expire because the host is busy.
+    let clock: Arc<dyn contextdb_core::read_contract::DeadlineClock> =
+        Arc::new(ManualDeadlineClock::at(0));
     let threads: Vec<_> = (0..10)
         .map(|worker| {
             let db = Arc::clone(&db);
             let barrier = Arc::clone(&barrier);
+            let clock = Arc::clone(&clock);
             std::thread::spawn(move || {
-                let session = db.read_session(ReadLimits::default()).unwrap();
+                let session = db
+                    .read_session_with_clock_for_test(ReadLimits::default(), clock)
+                    .unwrap();
                 barrier.wait();
                 let mut failures = Vec::new();
                 for round in 0..100 {
                     match session.open_cursor("SELECT id FROM facts", &HashMap::new()) {
                         Ok(cursor) => {
-                            assert_eq!(cursor.first_page().rows, vec![vec![Value::Int64(1)]]);
+                            assert_eq!(cursor.first_page().rows(), vec![vec![Value::Int64(1)]]);
                             cursor.close().unwrap();
                         }
                         Err(error) => failures.push((worker, round, error)),
@@ -550,6 +648,7 @@ fn owner_channel_registry_teardown(outcome: RegistryTeardownOutcome) {
                 ..ReadClientTimeouts::default()
             },
             clock.clone(),
+            db.declared_reader_memory().unwrap(),
         ))
         .unwrap();
     let cancelled = OwnerReadCancellation::new();
@@ -562,9 +661,6 @@ fn owner_channel_registry_teardown(outcome: RegistryTeardownOutcome) {
         ReaderRegistrationLockPhase::DescriptorOpened,
     )
     .unwrap();
-    let busy_pause = ApplyPhasePauseGuard::arm_for_test(
-        db.snapshot_registry.owner_cursor_busy_test_pause.clone(),
-    );
     let (finished, completed) = std::sync::mpsc::sync_channel(1);
     let reader = std::thread::spawn(move || {
         let result = executor.block_on(client.request_watching(
@@ -585,6 +681,7 @@ fn owner_channel_registry_teardown(outcome: RegistryTeardownOutcome) {
         "real owner admission opens the registry descriptor before validation"
     );
     let parked = registry_paths[0].with_extension("parked");
+    let mut departure = None;
     if matches!(outcome, RegistryTeardownOutcome::Replaced) {
         // Keep the original descriptor linked: replacement must never look like
         // a trusted last-reader departure, even when the new file is private.
@@ -598,30 +695,19 @@ fn owner_channel_registry_teardown(outcome: RegistryTeardownOutcome) {
             .set_permissions(std::fs::Permissions::from_mode(0o600))
             .unwrap();
     } else {
-        drop(last_reader.take());
-        assert!(
-            registry_paths.iter().all(|path| !path.exists()),
-            "the last real registration unlinks its registry lock"
+        let root = std::fs::File::open(std::env::var_os("XDG_RUNTIME_DIR").unwrap()).unwrap();
+        assert_eq!(
+            fs2::FileExt::try_lock_exclusive(&root).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "owner publication excludes a last leaver until its root is published"
         );
-    }
-    descriptor_pause.stop_pausing_for_test();
-    if !matches!(outcome, RegistryTeardownOutcome::Replaced) {
-        assert!(
-            busy_pause.wait_until_reached(Duration::from_secs(30)),
-            "trusted departure yields to the outer bounded retry"
-        );
-        assert!(
-            db.tx_mgr
-                .try_with_commit_lock_for(Duration::ZERO, || ())
-                .is_some(),
-            "teardown retries release the commit boundary"
-        );
-        assert!(db.snapshot_registry.state.lock().active.is_empty());
+        let leaving = last_reader.take();
+        departure = Some(std::thread::spawn(move || drop(leaving)));
         if matches!(outcome, RegistryTeardownOutcome::Cancelled) {
             cancelled.cancel();
         }
     }
-    busy_pause.release();
+    descriptor_pause.stop_pausing_for_test();
     let result = completed.recv_timeout(Duration::from_secs(30)).unwrap();
     match outcome {
         RegistryTeardownOutcome::Released => {
@@ -629,12 +715,18 @@ fn owner_channel_registry_teardown(outcome: RegistryTeardownOutcome) {
             let [LocalResponse::CursorOpened { opened }] = responses.as_slice() else {
                 panic!("expected owner cursor page: {responses:?}");
             };
-            let page = crate::read_contract::decode_cursor_page(&opened.payload).unwrap();
-            assert_eq!(page.rows, vec![vec![Value::Int64(1)]]);
+            let page = crate::read_contract::decode_observed_cursor_page(
+                &opened.payload,
+                ReadLimits::SHIPPED_MEMORY,
+            )
+            .unwrap()
+            .page;
+            assert_eq!(&*page.rows, vec![vec![Value::Int64(1)]]);
             assert!(page.has_more);
-            assert!(
-                descriptor_pause.attempts_for_test() >= 2,
-                "successful admission reopens rather than using the departed descriptor"
+            assert_eq!(
+                descriptor_pause.attempts_for_test(),
+                registry_paths.len() as u64,
+                "owner publication acquires each root once without a departure retry"
             );
         }
         RegistryTeardownOutcome::Cancelled => {
@@ -643,7 +735,7 @@ fn owner_channel_registry_teardown(outcome: RegistryTeardownOutcome) {
                     &result,
                     Err(OwnerReadScaffoldError::Database(Error::ReadCancelled))
                 ),
-                "typed cancellation during the teardown retry: {result:?}"
+                "typed cancellation during serialized registration: {result:?}"
             );
             assert!(db.snapshot_registry.state.lock().active.is_empty());
         }
@@ -666,6 +758,9 @@ fn owner_channel_registry_teardown(outcome: RegistryTeardownOutcome) {
         }
     }
     reader.join().unwrap();
+    if let Some(departure) = departure {
+        departure.join().unwrap();
+    }
     drop(last_reader);
     db.close().unwrap();
 }
@@ -722,4 +817,19 @@ fn owner_channel_registry_teardown_child() {
         "replaced" => RegistryTeardownOutcome::Replaced,
         other => panic!("unknown registry teardown outcome {other}"),
     });
+    if outcome != "replaced" {
+        for phase in [RegistryWaitPhase::FirstRoot, RegistryWaitPhase::SecondRoot] {
+            owner_channel_registry_wait(
+                if outcome == "released" {
+                    RegistryWaitOutcome::Released
+                } else {
+                    RegistryWaitOutcome::Cancelled
+                },
+                phase,
+            );
+            if outcome == "cancelled" {
+                owner_channel_registry_wait(RegistryWaitOutcome::Deadline, phase);
+            }
+        }
+    }
 }

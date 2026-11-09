@@ -134,7 +134,7 @@ fn assert_refused_as_missing(error: &Error, named_by: &[PathBuf], context: &str)
     let Error::StoreMissing { path } = error else {
         panic!("{context}: expected the typed missing refusal, got: {error}");
     };
-    let named = PathBuf::from(path);
+    let named = PathBuf::from(path.to_string());
     assert!(
         named_by.contains(&named),
         "{context}: the refusal must name the store it could not open; it named {named:?}, none \
@@ -350,12 +350,12 @@ fn an_existing_store_opens_for_change_and_the_writes_land() {
     reopened.close().expect("let the store go again");
 
     assert_eq!(
-        answer.rows.len(),
+        answer.rows().len(),
         2,
         "both the seeded row and the row written through the existing-only open must be there",
     );
     assert_eq!(
-        answer.rows[1][0],
+        answer.rows()[1][0],
         Value::Text("second".to_owned()),
         "the write made through the existing-only open must have landed",
     );

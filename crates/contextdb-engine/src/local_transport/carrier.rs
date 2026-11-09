@@ -1,15 +1,17 @@
 #[cfg(unix)]
 use super::FinalStaleIdentityObservation;
 #[cfg(unix)]
+use super::query_funding::Funded;
+#[cfg(unix)]
 use super::stale::{observe_final_stale_identity, remove_channel_if_identity_matches};
 #[cfg(unix)]
 use super::{
     DeadlineOperationWait, FrameViolation, LivenessEvidence, LocalDeadlineOperation,
     LocalHandshake, LocalInboundKind, LocalInboundMessage, LocalOutboundMessage,
     LocalProtocolBoundary, LocalRequestEnvelope, LocalResponse, LocalResponseExpectation,
-    LocalTransportError, MAX_FRAME_BYTES, StaleChannelAction, StaleChannelEvidence,
-    StaleFilesystemEvidence, StaleIdentityEvidence, connect_with_deadline, frame_read_refusal,
-    invalid_channel_data, owner_disconnected, receive_response_with_deadline,
+    LocalTransportError, MAX_FRAME_BYTES, PayloadViolation, StaleChannelAction,
+    StaleChannelEvidence, StaleFilesystemEvidence, StaleIdentityEvidence, connect_with_deadline,
+    frame_read_refusal, invalid_channel_data, owner_disconnected, receive_response_with_deadline,
     response_decode_refusal, retry_route_with_deadline, write_request_with_deadline,
 };
 #[cfg(unix)]
@@ -41,6 +43,10 @@ std::thread_local! {
 #[cfg(unix)]
 #[doc(hidden)]
 pub trait StaleRemovalInterlock: Send + Sync {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn after_final_identity_inspection(
         &self,
         path: &std::path::Path,
@@ -76,6 +82,10 @@ impl UnixLocalCarrier {
         FRAME_READINESS_CREATIONS.with(std::cell::Cell::get)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn listen(
         &self,
         path: &std::path::Path,
@@ -107,6 +117,39 @@ impl UnixLocalCarrier {
         Ok(listener)
     }
 
+    pub(crate) fn connect_funded<'a>(
+        &'a self,
+        path: &'a std::path::Path,
+        clock: &'a dyn DeadlineClock,
+        deadline_ms: u64,
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> DeadlineOperationWait<'a, std::os::unix::net::UnixStream> {
+        super::deadline_operation_funded(
+            clock,
+            super::DeadlineStage::Connect,
+            deadline_ms,
+            owner,
+            || {
+                let connect = connect_readiness(path);
+                async move {
+                    match connect?.await? {
+                        ConnectAttempt::Connected(stream) => Ok(stream),
+                        ConnectAttempt::NoListener | ConnectAttempt::AddressAbsent => {
+                            Err(super::refusal(ReadFailureKind::OwnerNotRunning))
+                        }
+                    }
+                }
+            },
+        )
+    }
+
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub fn connect<'a>(
         &'a self,
         path: &'a std::path::Path,
@@ -134,6 +177,10 @@ impl UnixLocalCarrier {
         connect_with_deadline(clock, deadline_ms, operation)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn send_message(
         &self,
         stream: &mut std::os::unix::net::UnixStream,
@@ -147,7 +194,7 @@ impl UnixLocalCarrier {
                 ..
             } if *expectation == LocalResponseExpectation::OrdinaryResult
         );
-        let frame = boundary.encode_frame(message)?;
+        let frame = boundary.encode_frame_funded(message)?;
         let result = write_readiness(stream, frame).and_then(|write| write.wait());
         if result.is_err() && ordinary_response {
             boundary.reset_ordinary_outbound();
@@ -155,12 +202,17 @@ impl UnixLocalCarrier {
         result
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn send_message_async<'a>(
         &'a self,
         stream: &'a std::os::unix::net::UnixStream,
         boundary: &'a LocalProtocolBoundary,
         message: LocalOutboundMessage<'_>,
-    ) -> LocalDeadlineOperation<'a> {
+        allow_write: impl Fn() -> Result<(), LocalTransportError> + Send + 'static,
+    ) -> impl Future<Output = Result<(), LocalTransportError>> + Send + 'a {
         let ordinary_response = matches!(
             message,
             LocalOutboundMessage::Response {
@@ -168,22 +220,32 @@ impl UnixLocalCarrier {
                 ..
             } if *expectation == LocalResponseExpectation::OrdinaryResult
         );
-        let operation: LocalDeadlineOperation<'a> = match boundary.encode_frame(message) {
-            Ok(frame) => match write_readiness(stream, frame) {
-                Ok(write) => Box::pin(write),
-                Err(error) => Box::pin(std::future::ready(Err(error))),
-            },
-            Err(error) => Box::pin(std::future::ready(Err(error))),
-        };
-        Box::pin(async move {
-            let result = operation.await;
+        let operation = boundary
+            .encode_frame_funded(message)
+            .and_then(|frame| guarded_write_readiness(stream, frame, allow_write));
+        async move {
+            let result = match operation {
+                Ok(operation) => operation.await,
+                Err(error) => Err(error),
+            };
             if result.is_err() && ordinary_response {
                 boundary.reset_ordinary_outbound();
             }
             result
-        })
+        }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_service_contract.rs"
+        )
+    )]
     pub fn receive_message(
         &self,
         stream: &mut std::os::unix::net::UnixStream,
@@ -198,6 +260,10 @@ impl UnixLocalCarrier {
             .map_err(|_| invalid_channel_data())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn write_request<'a>(
         &'a self,
         stream: &'a mut std::os::unix::net::UnixStream,
@@ -206,7 +272,21 @@ impl UnixLocalCarrier {
         clock: &'a dyn DeadlineClock,
         deadline_ms: u64,
     ) -> DeadlineOperationWait<'a> {
-        let operation = match boundary.encode_frame(LocalOutboundMessage::Request(request)) {
+        if let Some(owner) = boundary.query_funding() {
+            return super::deadline_operation_funded(
+                clock,
+                super::DeadlineStage::RequestWrite,
+                deadline_ms,
+                owner,
+                || {
+                    let operation = boundary
+                        .encode_frame_funded(LocalOutboundMessage::Request(request))
+                        .and_then(|frame| write_readiness(stream, frame));
+                    async move { operation?.await }
+                },
+            );
+        }
+        let operation = match boundary.encode_frame_funded(LocalOutboundMessage::Request(request)) {
             Ok(frame) => match write_readiness(stream, frame) {
                 Ok(write) => Box::pin(write) as LocalDeadlineOperation<'a>,
                 Err(error) => Box::pin(std::future::ready(Err(error))),
@@ -216,6 +296,10 @@ impl UnixLocalCarrier {
         write_request_with_deadline(clock, deadline_ms, operation)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn receive_response<'a>(
         &'a self,
         stream: &'a mut std::os::unix::net::UnixStream,
@@ -224,11 +308,43 @@ impl UnixLocalCarrier {
         clock: &'a dyn DeadlineClock,
         deadline_ms: u64,
     ) -> DeadlineOperationWait<'a, LocalResponse> {
+        if let Some(owner) = boundary.query_funding() {
+            return super::deadline_operation_funded(
+                clock,
+                super::DeadlineStage::Response,
+                deadline_ms,
+                owner,
+                || {
+                    let admission_reset = OrdinaryInboundReset::new(
+                        boundary,
+                        expectation == LocalResponseExpectation::OrdinaryResult,
+                    );
+                    let reader = boundary
+                        .cursor_frame_allowance()
+                        .and_then(|memory| frame_readiness_with_memory(stream, memory));
+                    async move {
+                        let mut admission_reset = admission_reset;
+                        let payload = reader?.await.map_err(frame_read_refusal)?;
+                        let LocalInboundMessage::Response(response) = boundary
+                            .decode_payload(LocalInboundKind::Response(expectation), &payload)
+                            .map_err(response_decode_refusal)?
+                        else {
+                            return Err(invalid_channel_data());
+                        };
+                        admission_reset.disarm();
+                        Ok(response)
+                    }
+                },
+            );
+        }
         let admission_reset = OrdinaryInboundReset::new(
             boundary,
             expectation == LocalResponseExpectation::OrdinaryResult,
         );
-        let operation: LocalDeadlineOperation<'a, LocalResponse> = match frame_readiness(stream) {
+        let reader = boundary
+            .cursor_frame_allowance()
+            .and_then(|memory| frame_readiness_with_memory(stream, memory));
+        let operation: LocalDeadlineOperation<'a, LocalResponse> = match reader {
             Ok(reader) => Box::pin(async move {
                 let mut admission_reset = admission_reset;
                 let payload = reader.await.map_err(frame_read_refusal)?;
@@ -249,6 +365,55 @@ impl UnixLocalCarrier {
         receive_response_with_deadline(clock, deadline_ms, operation)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn receive_query_response<'a>(
+        &'a self,
+        stream: &'a mut std::os::unix::net::UnixStream,
+        boundary: &'a LocalProtocolBoundary,
+        memory: crate::read_image_memory::ImageMemoryHandle,
+        clock: &'a dyn DeadlineClock,
+        deadline_ms: u64,
+    ) -> DeadlineOperationWait<'a, Funded<LocalResponse>> {
+        let owner = memory.owner();
+        super::deadline_operation_funded(
+            clock,
+            super::DeadlineStage::Response,
+            deadline_ms,
+            owner,
+            || {
+                let admission_reset = OrdinaryInboundReset::new(boundary, true);
+                let allocator_memory = memory.clone();
+                let ceiling = boundary.effective_limits().memory;
+                let reader = frame_readiness_allocating(stream, None, move |length| {
+                    Funded::allocate_owned(Some(allocator_memory.owner()), length, || {
+                        vec![0_u8; length]
+                    })
+                    .map_err(|error| super::query_funding::transport_error(error, ceiling))
+                });
+                async move {
+                    let mut admission_reset = admission_reset;
+                    let payload = reader?.await.map_err(frame_read_refusal)?;
+                    let response = boundary
+                        .decode_query_response(&payload.value, &memory)
+                        .map_err(response_decode_refusal)?;
+                    drop(payload);
+                    admission_reset.disarm();
+                    Ok(response)
+                }
+            },
+        )
+    }
+
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_deadlines.rs"
+        )
+    )]
     pub fn retry_connect<'a>(
         &'a self,
         path: &'a std::path::Path,
@@ -271,6 +436,17 @@ impl UnixLocalCarrier {
         retry_route_with_deadline(clock, deadline_ms, operation)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_stale.rs"
+        )
+    )]
     pub fn probe_stale(
         &self,
         path: &std::path::Path,
@@ -334,6 +510,99 @@ impl UnixLocalCarrier {
         }
     }
 
+    /// Engine startup keeps this probe on its admitted caller frame. The
+    /// existing supplied clock owns the deadline and the native wake cell;
+    /// no std Thread handle is materialized on a callback-owned pthread.
+    #[cfg(target_os = "linux")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn probe_stale_funded(
+        &self,
+        path: &std::path::Path,
+        expected_owner: &LocalHandshake,
+        clock: &std::sync::Arc<dyn DeadlineClock>,
+        deadline_ms: u64,
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> crate::owner_read::OwnerReadScaffoldResult<StaleChannelEvidence> {
+        let probe_owner = owner.clone();
+        let future = async move {
+            let owner = probe_owner;
+            let result: Result<StaleChannelEvidence, LocalTransportError> = async {
+                use std::os::unix::fs::FileTypeExt;
+
+                let metadata = std::fs::symlink_metadata(path)
+                    .map_err(|_| LocalTransportError::StaleChannelUnverifiable)?;
+                if !metadata.file_type().is_socket() {
+                    return Err(LocalTransportError::StaleChannelUnverifiable);
+                }
+                let filesystem = StaleFilesystemEvidence::Exact(
+                    super::channel_filesystem_identity(path)
+                        .map_err(|_| LocalTransportError::StaleChannelUnverifiable)?,
+                );
+                let attempt = super::deadline_operation_funded(
+                    clock.as_ref(),
+                    super::DeadlineStage::StaleProbe,
+                    deadline_ms,
+                    owner.clone(),
+                    || async { connect_readiness(path)?.await },
+                )
+                .await;
+                let stream = match attempt {
+                    Ok(ConnectAttempt::Connected(stream)) => stream,
+                    Ok(ConnectAttempt::NoListener) => {
+                        return Ok(StaleChannelEvidence {
+                            identity: StaleIdentityEvidence::VerifiedOwner,
+                            liveness: LivenessEvidence::NoResponderBeforeDeadline,
+                            filesystem,
+                        });
+                    }
+                    Ok(ConnectAttempt::AddressAbsent) => {
+                        return Err(LocalTransportError::StaleChannelUnverifiable);
+                    }
+                    Err(error) if error == super::owner_timeout() => {
+                        return Ok(StaleChannelEvidence {
+                            identity: StaleIdentityEvidence::VerifiedOwner,
+                            liveness: LivenessEvidence::NoResponderBeforeDeadline,
+                            filesystem,
+                        });
+                    }
+                    Err(error) => return Err(error),
+                };
+                let mut stream = stream;
+                match super::authenticate_framed_stream_handshake_funded(
+                    &mut stream,
+                    expected_owner,
+                    clock.as_ref(),
+                    deadline_ms,
+                    owner.clone(),
+                )
+                .await
+                {
+                    Ok(_) => Ok(StaleChannelEvidence {
+                        identity: StaleIdentityEvidence::VerifiedOwner,
+                        liveness: LivenessEvidence::LiveResponder,
+                        filesystem,
+                    }),
+                    Err(error) if error == super::owner_timeout() => Ok(StaleChannelEvidence {
+                        identity: StaleIdentityEvidence::VerifiedOwner,
+                        liveness: LivenessEvidence::NoResponderBeforeDeadline,
+                        filesystem,
+                    }),
+                    Err(error) => Err(error),
+                }
+            }
+            .await;
+            result.map_err(crate::owner_read::OwnerReadScaffoldError::from_local)
+        };
+        super::deadlines::drive_local(future, clock, owner)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn remove_after_proven_stale(
         &self,
         path: &std::path::Path,
@@ -343,6 +612,10 @@ impl UnixLocalCarrier {
     }
 
     #[doc(hidden)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn remove_after_proven_stale_with_interlock(
         &self,
         path: &std::path::Path,
@@ -429,6 +702,10 @@ impl<T: Send + 'static> UnixReadiness<T> {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn spawn(
         name: &'static str,
         cancellation: std::os::unix::net::UnixStream,
@@ -472,6 +749,10 @@ impl<T: Send + 'static> UnixReadiness<T> {
         })
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn wait(mut self) -> Result<T, LocalTransportError> {
         let result = {
             let (state, completion) = &*self.shared;
@@ -556,6 +837,10 @@ impl<T> Drop for UnixReadiness<T> {
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn cloned_blocking_streams(
     stream: &std::os::unix::net::UnixStream,
 ) -> Result<
@@ -578,9 +863,38 @@ fn cloned_blocking_streams(
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn frame_readiness(
     stream: &std::os::unix::net::UnixStream,
 ) -> Result<UnixReadiness<Vec<u8>>, LocalTransportError> {
+    frame_readiness_with_memory(stream, None)
+}
+
+#[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn frame_readiness_with_memory(
+    stream: &std::os::unix::net::UnixStream,
+    memory: Option<u64>,
+) -> Result<UnixReadiness<Vec<u8>>, LocalTransportError> {
+    frame_readiness_allocating(stream, memory, |length| Ok(vec![0_u8; length]))
+}
+
+#[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn frame_readiness_allocating<T: AsMut<[u8]> + Send + 'static>(
+    stream: &std::os::unix::net::UnixStream,
+    memory: Option<u64>,
+    allocate: impl FnOnce(usize) -> Result<T, LocalTransportError> + Send + 'static,
+) -> Result<UnixReadiness<T>, LocalTransportError> {
     let (mut worker_stream, cancellation) = cloned_blocking_streams(stream)?;
     #[cfg(feature = "test-seams")]
     FRAME_READINESS_CREATIONS.with(|creations| {
@@ -601,29 +915,177 @@ pub(crate) fn frame_readiness(
                 FrameViolation::LengthExceedsMaximum,
             ));
         }
-        let mut payload = vec![0_u8; length];
-        worker_stream.read_exact(&mut payload).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                LocalTransportError::Frame(FrameViolation::TruncatedPayload)
-            } else {
-                owner_disconnected()
-            }
-        })?;
+        // The prefix is the only response allocation needed to refuse a
+        // cursor frame that cannot coexist with its retained state.
+        if let Some(ceiling) = memory
+            && length as u64 > ceiling
+        {
+            return Err(LocalTransportError::Payload(
+                PayloadViolation::MemoryCeilingExceeded {
+                    ceiling,
+                    required: Some(length as u64),
+                },
+            ));
+        }
+        let mut payload = allocate(length)?;
+        worker_stream
+            .read_exact(payload.as_mut())
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                    LocalTransportError::Frame(FrameViolation::TruncatedPayload)
+                } else {
+                    owner_disconnected()
+                }
+            })?;
         Ok(payload)
     })
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn write_readiness(
     stream: &std::os::unix::net::UnixStream,
-    frame: Vec<u8>,
+    frame: Funded<Vec<u8>>,
 ) -> Result<UnixReadiness<()>, LocalTransportError> {
     let (mut worker_stream, cancellation) = cloned_blocking_streams(stream)?;
     UnixReadiness::spawn("contextdb-local-write", cancellation, move || {
         worker_stream
-            .write_all(&frame)
+            .write_all(&frame.value)
             .map_err(|_| owner_disconnected())
     })
+}
+
+/// A complete frame and its completion flag publish under one state guard.
+/// The syscall cannot wait for a slow peer; readiness waits release that guard,
+/// so deadline cancellation still interrupts a partially written frame.
+#[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn guarded_write_readiness(
+    stream: &std::os::unix::net::UnixStream,
+    frame: Funded<Vec<u8>>,
+    allow_write: impl Fn() -> Result<(), LocalTransportError> + Send + 'static,
+) -> Result<UnixReadiness<()>, LocalTransportError> {
+    use nix::errno::Errno;
+    use nix::sys::socket::{MsgFlags, send};
+    use std::os::fd::AsRawFd;
+
+    let (worker_stream, cancellation) = cloned_blocking_streams(stream)?;
+    let shared = std::sync::Arc::new((
+        std::sync::Mutex::new(ReadinessState {
+            result: None,
+            waker: None,
+            cancelled: false,
+        }),
+        std::sync::Condvar::new(),
+    ));
+    let worker_shared = shared.clone();
+    let worker = std::thread::Builder::new()
+        .name("contextdb-local-write".to_owned())
+        .spawn(move || {
+            let (state, completion) = &*worker_shared;
+            let mut offset = 0;
+            let mut readiness_error = None;
+            loop {
+                let mut state = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if state.cancelled {
+                    return;
+                }
+                let mut wait_for_socket = false;
+                let outcome = if let Some(error) = readiness_error.take() {
+                    Some(Err(error))
+                } else if offset == frame.value.len() {
+                    Some(Ok(()))
+                } else if let Err(error) = allow_write() {
+                    Some(Err(error))
+                } else {
+                    let flags = MsgFlags::MSG_DONTWAIT;
+                    #[cfg(any(
+                        target_os = "linux",
+                        target_os = "android",
+                        target_os = "freebsd",
+                        target_os = "dragonfly",
+                        target_os = "netbsd",
+                        target_os = "openbsd",
+                        target_os = "solaris",
+                        target_os = "illumos",
+                        target_os = "fuchsia",
+                        target_os = "haiku"
+                    ))]
+                    let flags = flags | MsgFlags::MSG_NOSIGNAL;
+                    match send(worker_stream.as_raw_fd(), &frame.value[offset..], flags) {
+                        Ok(0) => Some(Err(owner_disconnected())),
+                        Ok(written) => {
+                            offset += written;
+                            (offset == frame.value.len()).then_some(Ok(()))
+                        }
+                        Err(Errno::EINTR) => None,
+                        Err(Errno::EAGAIN) => {
+                            wait_for_socket = true;
+                            None
+                        }
+                        Err(_) => Some(Err(owner_disconnected())),
+                    }
+                };
+                if let Some(result) = outcome {
+                    // A reader may receive the last bytes immediately. Its
+                    // next clock advance must see this completion, even if the
+                    // write worker is descheduled before waking the owner.
+                    state.result = Some(result);
+                    let waker = state.waker.take();
+                    completion.notify_all();
+                    drop(state);
+                    if let Some(waker) = waker {
+                        waker.wake();
+                    }
+                    return;
+                }
+                drop(state);
+                if wait_for_socket {
+                    readiness_error = wait_for_write_ready(&worker_stream).err();
+                }
+            }
+        })
+        .map_err(|error| LocalTransportError::FilesystemInspection(error.to_string()))?;
+    Ok(UnixReadiness {
+        shared,
+        cancellation: Some(cancellation),
+        worker: Some(worker),
+        completed: false,
+    })
+}
+
+#[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn wait_for_write_ready(
+    stream: &std::os::unix::net::UnixStream,
+) -> Result<(), LocalTransportError> {
+    use nix::errno::Errno;
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use std::os::fd::AsFd;
+
+    loop {
+        let mut readiness = [PollFd::new(
+            stream.as_fd(),
+            PollFlags::POLLOUT | PollFlags::POLLERR | PollFlags::POLLHUP,
+        )];
+        match poll(&mut readiness, PollTimeout::NONE) {
+            Ok(0) => return Err(owner_disconnected()),
+            Ok(_) => return Ok(()),
+            Err(Errno::EINTR) => continue,
+            Err(_) => return Err(owner_disconnected()),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -707,6 +1169,10 @@ fn configure_new_socket(socket: &std::os::fd::OwnedFd) -> nix::Result<()> {
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn connect_readiness(
     path: &std::path::Path,
 ) -> Result<UnixReadiness<ConnectAttempt>, LocalTransportError> {
@@ -753,6 +1219,10 @@ fn connect_readiness(
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn wait_for_nonblocking_connect(
     stream: std::os::unix::net::UnixStream,
     cancellation: std::os::unix::net::UnixStream,
@@ -806,6 +1276,10 @@ fn wait_for_nonblocking_connect(
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn wait_for_backlog_cancellation(
     _retained_stream: std::os::unix::net::UnixStream,
     cancellation: std::os::unix::net::UnixStream,
@@ -835,6 +1309,10 @@ fn wait_for_backlog_cancellation(
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn finish_nonblocking_connect(
     stream: std::os::unix::net::UnixStream,
 ) -> Result<ConnectAttempt, LocalTransportError> {
@@ -845,6 +1323,10 @@ fn finish_nonblocking_connect(
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn pending_socket_error(
     stream: &std::os::unix::net::UnixStream,
 ) -> Result<Option<nix::errno::Errno>, LocalTransportError> {
@@ -856,6 +1338,10 @@ fn pending_socket_error(
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn verify_connected_stream(
     stream: std::os::unix::net::UnixStream,
 ) -> Result<ConnectAttempt, LocalTransportError> {
@@ -871,6 +1357,10 @@ fn verify_connected_stream(
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn classify_connect_error(error: nix::errno::Errno) -> Result<ConnectAttempt, LocalTransportError> {
     match error {
         nix::errno::Errno::ECONNREFUSED => Ok(ConnectAttempt::NoListener),
@@ -880,6 +1370,13 @@ fn classify_connect_error(error: nix::errno::Errno) -> Result<ConnectAttempt, Lo
 }
 
 #[cfg(unix)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 fn wait_for_wake<T>(future: impl Future<Output = T>) -> T {
     struct ThreadWake(std::thread::Thread);
 

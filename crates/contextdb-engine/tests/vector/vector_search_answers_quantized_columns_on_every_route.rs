@@ -127,23 +127,28 @@ fn search_sql(order_by: &str) -> String {
 
 /// Every row a search answered carries both quantized columns, holding the
 /// quantizer's own answer for the vector that row was given.
-fn assert_answers_the_quantized_columns(result: &QueryResult, route: &str, shape: &str) {
+fn assert_answers_the_quantized_columns(
+    physical_plan: &str,
+    rows: &[&Vec<Value>],
+    route: &str,
+    shape: &str,
+) {
     // Prove the read took the route this file is about. A vector search that
     // quietly fell back to a table scan reads the column from the row, which
     // is the one place it is never missing -- so a pass would say nothing.
     assert!(
-        result.trace.physical_plan.contains("Search"),
+        physical_plan.contains("Search"),
         "the {shape} search on the {route} route is answered by a vector search, not by {}",
-        result.trace.physical_plan
+        physical_plan
     );
     assert_eq!(
-        result.rows.len(),
+        rows.len(),
         SEARCH_LIMIT,
         "the {shape} search on the {route} route answers with the candidates it asked for"
     );
     let by_id: HashMap<Uuid, Vec<f32>> = fixture_rows().into_iter().collect();
 
-    for row in &result.rows {
+    for row in rows {
         let id = match row.first() {
             Some(Value::Uuid(id)) => *id,
             other => panic!("the {route} route answers with an id-leading row, got {other:?}"),
@@ -172,14 +177,55 @@ fn assert_answers_the_quantized_columns(result: &QueryResult, route: &str, shape
     }
 }
 
+// Retain every funded answer/page through the unchanged row assertions.
+trait QuantizedAnswer {
+    fn check(&self, route: &str, shape: &str);
+}
+impl QuantizedAnswer for QueryResult {
+    #[expect(
+        clippy::needless_borrow,
+        reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+    )]
+    fn check(&self, route: &str, shape: &str) {
+        let rows: Vec<_> = self.rows().iter().collect();
+        assert_answers_the_quantized_columns(&self.trace().physical_plan, &rows, route, shape);
+    }
+}
+struct CursorAnswer {
+    traced: QueryResult,
+    cursor: contextdb_engine::ReadCursor,
+    pages: Vec<contextdb_engine::CursorPage>,
+}
+impl QuantizedAnswer for CursorAnswer {
+    #[expect(
+        clippy::needless_borrow,
+        reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+    )]
+    fn check(&self, route: &str, shape: &str) {
+        let rows: Vec<_> = self
+            .cursor
+            .first_page()
+            .rows()
+            .iter()
+            .chain(self.pages.iter().flat_map(|page| page.rows().iter()))
+            .collect();
+        assert_answers_the_quantized_columns(
+            &self.traced.trace().physical_plan,
+            &rows,
+            route,
+            shape,
+        );
+    }
+}
+
 /// Both search shapes, on one route.
-fn assert_route_answers(route: &str, mut run: impl FnMut(&str) -> QueryResult) {
+fn assert_route_answers<R: QuantizedAnswer>(route: &str, mut run: impl FnMut(&str) -> R) {
     for (shape, order_by) in [
         ("ordinary-column", "plain"),
         ("quantized-column", "compact"),
     ] {
         let result = run(&search_sql(order_by));
-        assert_answers_the_quantized_columns(&result, route, shape);
+        result.check(route, shape);
     }
 }
 
@@ -230,27 +276,24 @@ fn a_cursor_answers_the_quantized_columns_a_search_projects() {
             .execute(sql, &params(vec![("query", query_vector())]))
             .expect("the same statement is served in one shot");
         assert!(
-            traced.trace.physical_plan.contains("Search"),
+            traced.trace().physical_plan.contains("Search"),
             "the statement this cursor is opened for is answered by a vector search, not by {}",
-            traced.trace.physical_plan
+            traced.trace().physical_plan
         );
         let mut cursor = session
             .open_cursor(sql, &params(vec![("query", query_vector())]))
             .expect("open a cursor over a vector search");
-        let columns = cursor.first_page().columns.clone();
-        let mut rows = cursor.first_page().rows.clone();
-        let mut more = cursor.first_page().has_more;
+        let mut pages = Vec::new();
+        let mut more = cursor.first_page().has_more();
         while more {
             let page = cursor.fetch(None).expect("a cursor page arrives");
-            rows.extend(page.rows.iter().cloned());
-            more = page.has_more;
+            more = page.has_more();
+            pages.push(page);
         }
-        QueryResult {
-            columns,
-            rows,
-            rows_affected: 0,
-            trace: traced.trace,
-            cascade: None,
+        CursorAnswer {
+            traced,
+            cursor,
+            pages,
         }
     });
     database.close().expect("the writer closes cleanly");

@@ -40,6 +40,10 @@ fn p() -> HashMap<String, Value> {
     HashMap::new()
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn open_audited_db(path: &std::path::Path) -> Database {
     let db = Database::open(path).expect("open file-backed db");
     db.execute("CREATE TABLE fire (id INTEGER PRIMARY KEY)", &p())
@@ -172,6 +176,10 @@ fn a_declared_short_trigger_audit_retention_prunes_on_the_next_cycle() {
 /// test-only knob, so the test does not wait a real 7-day (or even
 /// 1-minute) window to observe a prune.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_declared_trigger_audit_retention_reaches_an_already_running_engine_owned_loop() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("audited-running-loop.db");

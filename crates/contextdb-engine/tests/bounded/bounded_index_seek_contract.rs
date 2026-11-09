@@ -129,7 +129,7 @@ fn an_indexed_equality_read_reaches_its_key_instead_of_walking_the_index() {
     .expect("an indexed equality read must be served");
 
     assert_eq!(
-        outcome.result.rows.len(),
+        outcome.result.rows().len(),
         1,
         "the equality predicate names exactly one stored entry"
     );
@@ -168,7 +168,7 @@ fn an_indexed_equality_read_is_served_under_a_work_ceiling_sized_for_its_match()
             limits.work
         ),
     };
-    assert_eq!(served.result.rows.len(), 1);
+    assert_eq!(served.result.rows().len(), 1);
 }
 
 /// A range predicate names where the answer ends. A source that keeps reading
@@ -188,7 +188,7 @@ fn an_indexed_range_read_stops_at_the_end_of_the_range_it_names() {
     .expect("an indexed range read must be served");
 
     assert_eq!(
-        outcome.result.rows.len(),
+        outcome.result.rows().len(),
         matches as usize,
         "the range predicate names exactly the leading entries"
     );
@@ -217,13 +217,14 @@ fn the_trace_of_an_indexed_equality_read_reports_the_entries_it_examined() {
     .expect("an indexed equality read must be served");
 
     assert_eq!(
-        outcome.result.trace.physical_plan, "IndexScan",
+        outcome.result.trace().physical_plan,
+        "IndexScan",
         "the equality predicate is answered through the declared index"
     );
     assert!(
-        outcome.result.trace.rows_examined <= SEEK_ENTRY_BUDGET,
+        outcome.result.trace().rows_examined <= SEEK_ENTRY_BUDGET,
         "the trace of an index seek must report the entries the seek examined; it reports \
          {} examined against {STORED_ROWS} stored entries for a one-row answer",
-        outcome.result.trace.rows_examined
+        outcome.result.trace().rows_examined
     );
 }

@@ -22,6 +22,25 @@ and edge-type filtering, prepared DAG declaration publication
 (`PreparedDagEdgeTypes`), and the parked-traversal continuation that survives
 adjacency reclaim.
 
+`src/source.rs` owns storage-neutral adjacency reads (`GraphReadSource`, `GraphSnapshot`,
+`GraphCursor`, `GraphEdgeWindow`, `GraphQuery`, `GraphOverlay`): the engine supplies a pinned
+durable root, each edge window keeps its admission owner until dropped, and a historical logical
+snapshot filters that one physical root by retained MVCC intervals instead of loading newer edges.
+`MemGraphExecutor` reads through this seam, with uncommitted edges layered on as an overlay.
+
+`neighbors` projects one visible triad. Its properties come from the first visible witness in
+canonical oriented `(triad, owner)` order: standalone first, then the UTF-8 table name prefixed by
+its u32 byte length, generation, row identity, creation transaction and LSN, exactly as in the durable
+row graph key. Memory uses `None` before row owners; file merges put raw witnesses first on triad ties.
+Both-direction self-loops appear once. SQL single-hop cursors explicitly preserve physical edge
+bindings instead. Changes to memory or source merge ordering require review of this representative
+rule and reader-route parity.
+
+Bounded BFS merges committed adjacency and the canonical sorted staged producer before logical
+coalescing, retaining one admitted head per lane. Each physical witness passes visibility and owner
+authorization before coalescing; source windows retain their typed credit and staged carriers retain
+their producer credit across refusals and cursor drops. Staged resume positions are producer ranks.
+
 Must not own: durability (the engine's `persistence.rs` writes redb; this crate
 is memory only), the commit gate (the engine sequences prepare → durable commit
 → publish), SQL grammar or planning, or row storage.
@@ -44,18 +63,21 @@ is memory only), the commit gate (the engine sequences prepare → durable commi
 | A snapshot never sees later committed edges | `tests/graph_tests.rs::bfs_respects_mvcc_snapshot` |
 | `max_depth` 1 returns only the first hop | `tests/graph_tests.rs::accepts_max_depth_one` |
 | Crossing the visited ceiling is a typed error | `tests/graph_tests.rs::bfs_visited_limit_error` |
+| Logical neighbours select one first-visible canonical witness, standalone first | `tests/row_owned_edges.rs::logical_neighbors_use_the_first_visible_canonical_witness` |
 | Incoming and Both directions return the matching neighbours | `tests/graph_tests.rs::direction_incoming_and_both` |
 | An edge-type filter ignores other types; an empty graph returns nothing | `tests/graph_tests.rs::edge_type_filtering_and_empty_graph` |
 | A parked traversal still emits every visible neighbour after reclaim | `tests/bounded_traversal_survives_adjacency_compaction.rs::a_parked_traversal_emits_every_visible_neighbour_when_all_the_entries_it_consumed_are_reclaimed`, `::a_parked_traversal_emits_every_visible_neighbour_when_a_consumed_entry_survives_the_reclaim` |
 | A million-entry traversal queue is released on a small stack | `tests/long_traversal_queue_drops_iteratively.rs::a_traversal_queue_holding_a_million_entries_is_released_on_a_small_stack` |
 | A `DAG`-declared edge type refuses a cycle insert, including a self-loop | `crates/contextdb-engine/tests/sql_surface/sql_surface_other.rs::dag_01_cycle_rejected_via_insert_sql`, `::dag_02_self_loop_rejected_via_insert_sql` |
 | A received ordinary edge-table drop removes its links, including after restart | `crates/contextdb-engine/tests/sync/a_received_drop_of_an_edge_table_takes_its_links.rs::a_received_drop_of_an_ordinary_edge_table_removes_its_links_now_and_after_a_restart`, `::an_authenticated_received_drop_of_an_ordinary_edge_table_removes_its_links` |
+| A graph delete seeks only its own edge identity and decodes no unrelated edges | `crates/contextdb-engine/tests/engine_seams/graph_delete_seeks_only_its_edge_identity.rs` → `graph_delete_seeks_only_its_edge_identity` |
 
 ## Where a change lives
 
 | Change | Where it lands |
 |---|---|
 | Adjacency layout, whole-schema or affected-edge publication | `src/store.rs` |
+| Reading adjacency from a pinned durable root, edge windows and the staged overlay | `src/source.rs`, consumed by `src/mem.rs` and `src/store.rs`; the engine implements the source. |
 | BFS, visited ceiling, DAG cycle check and prepared declaration publication, direction/type filters | `src/mem.rs`; export public types from `src/lib.rs` |
 | `GRAPH_TABLE` grammar | Parser crate |
 | Plan shape for `GraphBfs` | Planner crate |

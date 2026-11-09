@@ -74,10 +74,10 @@ fn windows(db: &Database) -> Vec<(String, String, String, i64, i64)> {
         .expect("metric_windows scan");
     let idx = |name: &str| {
         result
-            .columns
+            .columns()
             .iter()
             .position(|column| column == name)
-            .unwrap_or_else(|| panic!("column {name} must be selected, got {:?}", result.columns))
+            .unwrap_or_else(|| panic!("column {name} must be selected, got {:?}", result.columns()))
     };
     let (machine, sensor, metric, window_start, value) = (
         idx("machine_id"),
@@ -95,7 +95,7 @@ fn windows(db: &Database) -> Vec<(String, String, String, i64, i64)> {
         other => panic!("expected an integer, got {other:?}"),
     };
     let mut rows: Vec<(String, String, String, i64, i64)> = result
-        .rows
+        .rows()
         .iter()
         .map(|row| {
             (
@@ -115,12 +115,12 @@ fn windows(db: &Database) -> Vec<(String, String, String, i64, i64)> {
 fn note_bodies(db: &Database) -> Vec<String> {
     let result = db.execute("SELECT * FROM notes", &p()).expect("notes scan");
     let body = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "body")
         .expect("body column must be selected");
     let mut bodies: Vec<String> = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[body] {
             Value::Text(text) => text.clone(),
@@ -152,6 +152,7 @@ fn rows_only(
 /// from sync (the general keyless-skip).
 fn emitted_identities(db: &Database, table: &str) -> Vec<(String, Value)> {
     db.changes_since(contextdb_core::Lsn(0))
+        .expect("read the declared changes")
         .rows
         .into_iter()
         .filter(|row| row.table == table)
@@ -169,7 +170,11 @@ fn replicate(source: &Database) -> Database {
     target.execute(WINDOWS_DDL, &p()).expect("target table");
     target
         .apply_changes(
-            rows_only(source.changes_since(contextdb_core::Lsn(0))),
+            rows_only(
+                source
+                    .changes_since(contextdb_core::Lsn(0))
+                    .expect("read the declared changes"),
+            ),
             &ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists),
         )
         .expect("apply the source changeset");
@@ -406,7 +411,11 @@ fn c5b_a_delete_removes_only_the_row_whose_whole_key_matches() {
 
     replica
         .apply_changes(
-            rows_only(source.changes_since(before_delete)),
+            rows_only(
+                source
+                    .changes_since(before_delete)
+                    .expect("read the declared changes"),
+            ),
             &ConflictPolicies::uniform(ConflictPolicy::EdgeWins),
         )
         .expect("apply the delete");
@@ -504,7 +513,11 @@ fn c5d_guard_a_single_column_primary_key_replicates_unchanged() {
         .expect("target table");
     target
         .apply_changes(
-            rows_only(source.changes_since(contextdb_core::Lsn(0))),
+            rows_only(
+                source
+                    .changes_since(contextdb_core::Lsn(0))
+                    .expect("read the declared changes"),
+            ),
             &ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists),
         )
         .expect("replicate notes");
@@ -527,6 +540,10 @@ fn c5d_guard_a_single_column_primary_key_replicates_unchanged() {
 /// keys, or vector keys; composite FOREIGN KEY behavior is separately
 /// pinned in `tests/integration/composite_foreign_key_tests.rs`.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn c5d_guard_a_multi_column_unique_constraint_is_not_an_identity() {
     let db = Database::open_memory();
     db.execute(
@@ -577,7 +594,7 @@ fn c5d_guard_a_multi_column_unique_constraint_is_not_an_identity() {
         .execute("SELECT id, value FROM readings", &p())
         .expect("readings scan");
     let mut kept: Vec<(i64, i64)> = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match (&row[0], &row[1]) {
             (Value::Int64(id), Value::Int64(value)) => (*id, *value),
@@ -650,7 +667,11 @@ fn c5d_guard_a_multi_column_index_is_not_an_identity() {
         .expect("target table");
     target
         .apply_changes(
-            rows_only(source.changes_since(contextdb_core::Lsn(0))),
+            rows_only(
+                source
+                    .changes_since(contextdb_core::Lsn(0))
+                    .expect("read the declared changes"),
+            ),
             &ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists),
         )
         .expect("replicate indexed rows");
@@ -658,7 +679,7 @@ fn c5d_guard_a_multi_column_index_is_not_an_identity() {
     let mut ids: Vec<i64> = target
         .execute("SELECT id FROM indexed_readings", &p())
         .expect("scan")
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[0] {
             Value::Int64(id) => *id,
@@ -744,8 +765,8 @@ fn c5d_a_vector_column_is_addressed_by_the_key_and_is_never_the_identity() {
             &params,
         )
         .expect("a ROW_VECTOR query keyed by the natural key must resolve");
-    assert_eq!(result.rows.len(), 3, "the ranked query returns every row");
-    for row in &result.rows {
+    assert_eq!(result.rows().len(), 3, "the ranked query returns every row");
+    for row in result.rows() {
         assert!(
             matches!(row[0], Value::Uuid(_)),
             "ROW_VECTOR results are identities, not vectors: {row:?}"
@@ -781,7 +802,11 @@ fn c5b_guard_a_keyless_id_table_replicates_unchanged() {
     let after_insert = source.current_lsn();
     target
         .apply_changes(
-            rows_only(source.changes_since(contextdb_core::Lsn(0))),
+            rows_only(
+                source
+                    .changes_since(contextdb_core::Lsn(0))
+                    .expect("read the declared changes"),
+            ),
             &policies,
         )
         .expect("apply inserts");
@@ -793,13 +818,20 @@ fn c5b_guard_a_keyless_id_table_replicates_unchanged() {
         .execute("DELETE FROM keyless WHERE id = 1", &p())
         .expect("delete row 1");
     target
-        .apply_changes(rows_only(source.changes_since(after_insert)), &policies)
+        .apply_changes(
+            rows_only(
+                source
+                    .changes_since(after_insert)
+                    .expect("read the declared changes"),
+            ),
+            &policies,
+        )
         .expect("apply update and delete");
 
     let mut rows: Vec<(i64, String)> = target
         .execute("SELECT id, body FROM keyless", &p())
         .expect("scan")
-        .rows
+        .rows()
         .iter()
         .map(|row| match (&row[0], &row[1]) {
             (Value::Int64(id), Value::Text(body)) => (*id, body.clone()),
@@ -862,7 +894,9 @@ fn c5c_a_composite_key_sync_safe_table_arrives_by_synced_ddl() {
     let receiver = Database::open_memory();
     receiver
         .apply_changes(
-            source.changes_since(contextdb_core::Lsn(0)),
+            source
+                .changes_since(contextdb_core::Lsn(0))
+                .expect("read the declared changes"),
             &ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists),
         )
         .expect("the composite-key SYNC SAFE definition must be accepted on arrival");
@@ -879,7 +913,7 @@ fn c5c_a_composite_key_sync_safe_table_arrives_by_synced_ddl() {
     let mut windows: Vec<i64> = receiver
         .execute("SELECT window_start FROM arrived_windows", &p())
         .expect("scan")
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[0] {
             Value::Int64(w) => *w,

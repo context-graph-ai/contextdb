@@ -114,36 +114,39 @@ fn eager_execution_never_claims_to_elide_a_descending_sort_it_still_runs() {
         &db,
         "SELECT id FROM desc_disclosure WHERE parent_id = 1 ORDER BY seq DESC",
         &empty(),
+        db.declared_reader_memory()
+            .expect("admit the eager fixture reader"),
     )
     .expect("eager execution must succeed");
     assert_eq!(
-        result.rows,
+        result.rows(),
         vec![
             vec![Value::Int64(3)],
             vec![Value::Int64(2)],
             vec![Value::Int64(1)],
         ],
         "rows must still arrive in descending seq order: {:?}",
-        result.trace
+        result.trace()
     );
     assert!(
-        !result.trace.sort_elided,
+        !result.trace().sort_elided,
         "the eager executor cannot walk an index backward, so it actually ran a sort here; it \
          must not claim otherwise: {:?}",
-        result.trace
+        result.trace()
     );
     if let Some(fk) = result
-        .trace
+        .trace()
         .indexes_considered
         .iter()
         .find(|c| c.name == FK_INDEX)
     {
         assert_ne!(
-            fk.rejected_reason, ONE_ROW_REASON,
+            fk.rejected_reason,
+            ONE_ROW_REASON,
             "the eager executor picked whichever index it did honestly, having never claimed a \
              reverse elision it cannot deliver; its own considered-candidate reasons must not \
              say otherwise: {:?}",
-            result.trace
+            result.trace()
         );
     }
 }
@@ -157,23 +160,25 @@ fn eager_execution_still_elides_an_ascending_sort() {
         &db,
         "SELECT id FROM desc_disclosure WHERE parent_id = 1 ORDER BY seq ASC",
         &empty(),
+        db.declared_reader_memory()
+            .expect("admit the eager fixture reader"),
     )
     .expect("eager execution must succeed");
     assert_eq!(
-        result.rows,
+        result.rows(),
         vec![
             vec![Value::Int64(1)],
             vec![Value::Int64(2)],
             vec![Value::Int64(3)],
         ],
         "{:?}",
-        result.trace
+        result.trace()
     );
     assert_eq!(
-        result.trace.index_used.as_deref(),
+        result.trace().index_used.as_deref(),
         Some(COMPOSITE_INDEX),
         "{:?}",
-        result.trace
+        result.trace()
     );
-    assert!(result.trace.sort_elided, "{:?}", result.trace);
+    assert!(result.trace().sort_elided, "{:?}", result.trace());
 }

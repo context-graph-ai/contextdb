@@ -16,9 +16,13 @@ use crate::Database;
 use crate::transfer_receipts::{TransferDirection, TransferLedger, TransferPlane, TransferReceipt};
 use crate::transport::adapter::{self, BlobStoreHandle, FetchFailure, FetchVerdict};
 use crate::transport::iroh::IrohServer;
+use crate::vector_read_memory::ReadRequestBudgetProvider;
 use crate::work_ledger::{
-    BlobHash, MovementPolicy, any_node_holds_claim_for_blob, blob_ref_retention_eligible,
-    node_claim_permits_movement, node_holds_claim_for_blob,
+    BlobHash, MovementPolicy,
+    any_node_holds_claim_for_blob_with_read_memory as any_node_holds_claim_for_blob,
+    blob_ref_retention_eligible_with_read_memory as blob_ref_retention_eligible,
+    node_claim_permits_movement_with_read_memory as node_claim_permits_movement,
+    node_holds_claim_for_blob_with_read_memory as node_holds_claim_for_blob,
 };
 use contextdb_core::{Error, Result, Wallclock};
 #[cfg(any(test, feature = "test-seams"))]
@@ -107,6 +111,8 @@ pub struct BlobStore {
     db: Arc<Database>,
     policy: MovementPolicy,
     identity_path: PathBuf,
+    #[cfg(any(test, feature = "test-seams"))]
+    reclaim_sweep_observer: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     /// Lazily opened content-addressed store (under the identity's
     /// directory); an open failure surfaces typed at the first use.
     store: OnceLock<std::result::Result<Arc<BlobStoreHandle>, String>>,
@@ -169,12 +175,23 @@ impl PausedProviderGenerationForTest {
         self.payload_bytes_emitted.load(Ordering::SeqCst)
     }
 
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn resume_from_stale_generation_for_test(&self) -> Result<()> {
         let session = self.repository.open_read(self.hash)?.ok_or_else(|| {
-            Error::Other("blob provider generation was retired by authoritative purge".to_string())
+            Error::Other(
+                ("blob provider generation was retired by authoritative purge".to_string()).into(),
+            )
         })?;
         if session.generation() != self.generation {
-            return Err(Error::Other("blob provider generation changed".to_string()));
+            return Err(Error::Other(
+                ("blob provider generation changed".to_string()).into(),
+            ));
         }
         let bytes = session.read_payload_at(0, 1)?;
         self.payload_bytes_emitted
@@ -207,14 +224,21 @@ impl PausedWriterGenerationForTest {
         self.guard.lock().expect("writer generation guard").take();
     }
 
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn complete_from_stale_generation_for_test(&self) -> Result<()> {
         let guard = self.repository.begin_write_generation(self.hash)?;
         if guard.generation() != self.generation {
-            return Err(Error::Other(format!(
+            return Err(Error::Other((format!(
                 "blob writer generation {} was retired by authoritative purge; current generation is {}",
                 self.generation,
                 guard.generation()
-            )));
+            )).into()));
         }
         let partial = crate::blob_repository::BlobPartialState::from_exact_indices(
             0..self.payload_chunk_count,
@@ -240,11 +264,12 @@ impl PausedWriterGenerationForTest {
     }
 }
 
-/// Why a resolve failed. Seven outcomes the caller must tell apart: five
-/// pre-transfer refusals/misses, a mid-stream abort, and a local sink
-/// failure.
+/// Why a resolve failed: source read failures, authorization refusals,
+/// content misses, transfer failures and local sink failures remain distinct.
 #[derive(Debug)]
 pub enum ResolveError {
+    /// A ledger source read refused or failed; preserves the core error.
+    LedgerRead(Error),
     /// The holder found no ledger claim entitling the caller to this blob.
     Unentitled,
     /// The holder's movement policy forbids this input from leaving.
@@ -280,6 +305,7 @@ pub enum ResolveError {
 impl std::fmt::Display for ResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ResolveError::LedgerRead(err) => write!(f, "blob ledger read failed: {err}"),
             ResolveError::Unentitled => {
                 write!(f, "the holder's ledger does not entitle this node")
             }
@@ -311,6 +337,7 @@ impl std::error::Error for ResolveError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ResolveError::SinkWrite(err) => Some(err),
+            ResolveError::LedgerRead(err) => Some(err),
             _ => None,
         }
     }
@@ -322,6 +349,8 @@ impl BlobStore {
             db,
             policy,
             identity_path,
+            #[cfg(any(test, feature = "test-seams"))]
+            reclaim_sweep_observer: Mutex::new(None),
             store: OnceLock::new(),
             test_clock: Arc::new(Mutex::new(None)),
             claim_refresh: Arc::new(Mutex::new(None)),
@@ -329,6 +358,17 @@ impl BlobStore {
             fetch_policy: Mutex::new(BlobFetchPolicy::default()),
             wedge_next_fetch_for_test: AtomicBool::new(false),
         }
+    }
+
+    /// Observe the next completed owned-driver sweep.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn observe_next_reclaim_sweep_for_test(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        *self
+            .reclaim_sweep_observer
+            .lock()
+            .expect("reclaim observer lock") = Some(sender);
+        receiver
     }
 
     /// Declare the whole-fetch-attempt bound this instance's
@@ -364,6 +404,10 @@ impl BlobStore {
         *self.claim_refresh.lock().expect("claim refresh lock") = hook;
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn store(&self) -> Result<Arc<BlobStoreHandle>> {
         self.store
             .get_or_init(|| {
@@ -372,7 +416,7 @@ impl BlobStore {
                     .map_err(|e| e.to_string())
             })
             .clone()
-            .map_err(Error::Other)
+            .map_err(|error| Error::Other(error.into()))
     }
 
     /// The resolve-time "now": the per-instance injected cell, else the
@@ -387,12 +431,20 @@ impl BlobStore {
 
     /// Content-address `bytes` into the local store and make them servable;
     /// the returned name IS `BlobHash::of(bytes)`. Idempotent.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn ingest_bytes(&self, bytes: &[u8]) -> Result<BlobHash> {
         self.store()?.ingest_bytes(bytes).map(BlobHash::from_bytes)
     }
 
     /// Content-address the file at `path` (streamed, never buffered whole)
     /// and make it servable.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn ingest_file(&self, path: &Path) -> Result<BlobHash> {
         self.store()?.ingest_file(path).map(BlobHash::from_bytes)
     }
@@ -401,20 +453,60 @@ impl BlobStore {
     /// endpoint — the blob door, answering from the ledger against the
     /// authenticated caller's peer identity BEFORE any payload bytes move —
     /// and enroll this node's ticket in the fabric peer directory so
-    /// consumers can discover it.
-    pub fn serve_on(&self, endpoint: &IrohServer) {
-        let Ok(store) = self.store() else {
-            // A store that cannot open cannot serve. The local error
-            // re-surfaces, typed, on this holder's next ingest/reclaim call;
-            // remote consumers see the protocol as absent.
-            return;
-        };
+    /// consumers can discover it. Each request receives its own child of the
+    /// store's declared reader memory. Directory
+    /// registration and store-open errors propagate before handler publication.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn serve_on(&self, endpoint: &IrohServer) -> Result<()> {
+        self.serve_on_with_provider(endpoint, self.db.declared_read_request_provider())
+    }
+
+    /// Serve using the host's declared request budget provider.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn serve_on_with_read_budget_provider(
+        &self,
+        endpoint: &IrohServer,
+        read_budgets: Arc<dyn ReadRequestBudgetProvider>,
+    ) -> Result<()> {
+        self.serve_on_with_provider(endpoint, read_budgets.into())
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn serve_on_with_provider(
+        &self,
+        endpoint: &IrohServer,
+        read_budgets: crate::vector_read_memory::ReadRequestProvider,
+    ) -> Result<()> {
+        let store = self.store()?;
+        // Enroll before publishing the handler: registration failure is a
+        // failed host operation, rather than a silently absent directory row.
+        let identity = crate::FabricIdentity::load_or_generate(&self.identity_path)?;
+        let registration_memory = read_budgets.request_budget()?;
+        crate::peer_directory::install_peer_directory_schema_with_read_memory(
+            &self.db,
+            registration_memory.clone(),
+        )?;
+        crate::peer_directory::register_peer_ticket_with_read_memory(
+            &self.db,
+            &identity.node_id(),
+            &endpoint.ticket(),
+            self.now_ms(),
+            registration_memory,
+        )?;
         let db = self.db.clone();
         let policy = self.policy;
         let clock = self.test_clock.clone();
         let claim_refresh = self.claim_refresh.clone();
         let receipts = self.receipts.clone();
-        // One completed serve, attributed to the peer that asked for it.
         let served: adapter::ServedObserver = Arc::new(move |node_id: &str, moved: u64| {
             receipts.record(
                 Some(node_id),
@@ -424,66 +516,64 @@ impl BlobStore {
                 moved,
             );
         });
-        // The ledger's verdict for one authenticated fetch: entitlement
-        // first (the claim), then the movement-policy re-check — two
-        // DISTINCT gates with two distinct refusals. A ledger read failure
-        // fails CLOSED.
         let verdict: adapter::VerdictFn = Arc::new(move |node_id, hash| {
             let hash = BlobHash::from_bytes(*hash);
             let node_id = node_id.to_string();
             let db = db.clone();
             let clock = clock.clone();
             let claim_refresh = claim_refresh.clone();
+            let read_budgets = read_budgets.clone();
             Box::pin(async move {
+                let read_memory = match read_budgets.request_budget() {
+                    Ok(memory) => memory,
+                    Err(err) => return FetchVerdict::SourceError(err),
+                };
                 let now = clock
                     .lock()
                     .expect("clock lock")
                     .unwrap_or_else(|| Wallclock::now().0 as i64);
-                let mut entitled = matches!(
-                    node_holds_claim_for_blob(&db, &node_id, &hash, now),
-                    Ok(true)
-                );
-                if !entitled {
-                    // A miss may just mean this holder's own ledger mirror
-                    // hasn't yet caught the claimant's claim landing on the
-                    // hub. Give the installed refresh hook ONE chance to
-                    // catch it up, then re-check ONCE more — never polled,
-                    // never retried beyond this single extra look.
-                    let hook = claim_refresh.lock().expect("claim refresh lock").clone();
-                    if let Some(hook) = hook {
-                        hook().await;
-                        entitled = matches!(
-                            node_holds_claim_for_blob(&db, &node_id, &hash, now),
-                            Ok(true)
-                        );
+                // Keep the captured ledger root and output credits until both
+                // authorization gates finish. A refresh awaits outside the
+                // same-thread root scope, then captures its updated root once.
+                let authorize = || -> Result<Option<FetchVerdict>> {
+                    let _read = db.writer_temporary_output_scope(read_memory.clone())?;
+                    if !node_holds_claim_for_blob(&db, &node_id, &hash, now, read_memory.clone())? {
+                        return Ok(None);
+                    }
+                    Ok(Some(
+                        if node_claim_permits_movement(
+                            &db,
+                            &node_id,
+                            &hash,
+                            policy,
+                            now,
+                            read_memory.clone(),
+                        )? {
+                            FetchVerdict::Allow(read_memory.clone())
+                        } else {
+                            FetchVerdict::PolicyForbidden
+                        },
+                    ))
+                };
+                match authorize() {
+                    Ok(Some(verdict)) => return verdict,
+                    Err(err) => return FetchVerdict::SourceError(err),
+                    Ok(None) => {}
+                }
+                let hook = claim_refresh.lock().expect("claim refresh lock").clone();
+                if let Some(hook) = hook {
+                    hook().await;
+                    match authorize() {
+                        Ok(Some(verdict)) => return verdict,
+                        Err(err) => return FetchVerdict::SourceError(err),
+                        Ok(None) => {}
                     }
                 }
-                if !entitled {
-                    return FetchVerdict::Unentitled;
-                }
-                // Movement-policy re-check: the submitter always reads its
-                // own input; a non-submitter needs propagation on AND every
-                // input in the job in the movable allowlist — a mixed
-                // blob_ref/local_path job never auto-propagates, even to an
-                // otherwise entitled claimant.
-                match node_claim_permits_movement(&db, &node_id, &hash, policy, now) {
-                    Ok(true) => FetchVerdict::Allow,
-                    Ok(false) | Err(_) => FetchVerdict::PolicyForbidden,
-                }
+                FetchVerdict::Unentitled
             })
         });
         store.serve_on(endpoint, verdict, served);
-        // v1 holder discovery: the serving node registers its OWN ticket;
-        // the row syncs through the hub like any coordination row.
-        if let Ok(identity) = crate::FabricIdentity::load_or_generate(&self.identity_path) {
-            let _ = crate::peer_directory::install_peer_directory_schema(&self.db);
-            let _ = crate::peer_directory::register_peer_ticket(
-                &self.db,
-                &identity.node_id(),
-                &endpoint.ticket(),
-                self.now_ms(),
-            );
-        }
+        Ok(())
     }
 
     /// Test-only convenience: binds a real local peer endpoint for
@@ -496,12 +586,16 @@ impl BlobStore {
     /// `serve_on` takes; callers only need its existing public methods
     /// (`ticket()`, `close()`, ...).
     #[cfg(any(test, feature = "test-seams"))]
-    pub async fn bind_and_serve_for_test(&self, identity_path: &Path) -> Result<IrohServer> {
+    pub async fn bind_and_serve_for_test(
+        &self,
+        identity_path: &Path,
+        read_budgets: impl Into<crate::vector_read_memory::ReadRequestProvider>,
+    ) -> Result<IrohServer> {
         let spec = format!("iroh:?identity={}", identity_path.display());
         let endpoint = IrohServer::bind(&spec)
             .await
-            .map_err(|err| Error::Other(err.to_string()))?;
-        self.serve_on(&endpoint);
+            .map_err(|err| Error::Other((err.to_string()).into()))?;
+        self.serve_on_with_provider(&endpoint, read_budgets.into())?;
         Ok(endpoint)
     }
 
@@ -527,8 +621,13 @@ impl BlobStore {
     /// UNCONDITIONALLY before the local-store short-circuit below — local
     /// presence never waives entitlement.
     ///
+    /// `read_memory` is the executing caller's actual READ owner, retained
+    /// through ledger authorization and transfer.
+    ///
     /// # Errors
     ///
+    /// - [`ResolveError::LedgerRead`] — a ledger source read refused or failed;
+    ///   carries the core error from the local reader or the holder.
     /// - [`ResolveError::Unentitled`] — no ledger claim (local mirror or
     ///   the holder's own check) entitles this node to the blob.
     /// - [`ResolveError::PolicyForbidden`] — the holder's movement policy
@@ -558,6 +657,24 @@ impl BlobStore {
         holder_ticket: &str,
         sink: &mut (dyn Write + Send),
     ) -> std::result::Result<u64, ResolveError> {
+        let read_memory = self
+            .db
+            .declared_reader_memory()
+            .map_err(ResolveError::LedgerRead)?;
+        self.resolve_blob_ref_with_read_memory(read_memory, hash, holder_ticket, sink)
+            .await
+    }
+
+    /// Resolve using the executing host operation's READ owner.
+    pub async fn resolve_blob_ref_with_read_memory(
+        &self,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        hash: &BlobHash,
+        holder_ticket: &str,
+        sink: &mut (dyn Write + Send),
+    ) -> std::result::Result<u64, ResolveError> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // Client-side pre-check on the consumer's OWN local ledger mirror: a
         // pure optimization to skip a wasted dial when this node has never
         // even mirrored a live claim for this hash. It does NOT check
@@ -565,9 +682,17 @@ impl BlobStore {
         // claimant field, which a forged local row could lie about); the
         // holder's own `node_holds_claim_for_blob` check against the
         // authenticated peer identity is the actual security boundary.
-        match any_node_holds_claim_for_blob(&self.db, hash, self.now_ms()) {
+        let entitled = {
+            let _read = self
+                .db
+                .writer_temporary_output_scope(read_memory.clone())
+                .map_err(ResolveError::LedgerRead)?;
+            any_node_holds_claim_for_blob(&self.db, hash, self.now_ms(), read_memory.clone())
+        };
+        match entitled {
             Ok(true) => {}
-            Ok(false) | Err(_) => return Err(ResolveError::Unentitled),
+            Ok(false) => return Err(ResolveError::Unentitled),
+            Err(err) => return Err(ResolveError::LedgerRead(err)),
         }
         let store = self
             .store()
@@ -611,6 +736,7 @@ impl BlobStore {
         let fetch_identity = self.identity_path.clone();
         let fetch_ticket = holder_ticket.to_string();
         let fetch_hash = hash.as_bytes();
+        let fetch_read_memory = read_memory.clone();
         let handle = tokio::spawn(async move {
             if wedged {
                 // Harness seam: stand in for an unbounded internal wedge
@@ -624,6 +750,7 @@ impl BlobStore {
                 fetch_identity,
                 fetch_ticket,
                 fetch_hash,
+                fetch_read_memory,
             )
             .await
         });
@@ -682,6 +809,13 @@ impl BlobStore {
     /// content-address to it — the consumer's verification is what must
     /// catch the lie.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn serve_wrong_bytes_for_test(&self, claimed: &BlobHash, bytes: &[u8]) -> Result<()> {
         self.store()?.arm_tamper(&claimed.as_bytes(), bytes)
     }
@@ -730,10 +864,13 @@ impl BlobStore {
     #[cfg(any(test, feature = "test-seams"))]
     pub async fn attempt_authorization_bypass_for_test(
         &self,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         hash: &BlobHash,
         holder_ticket: &str,
         sink: &mut (dyn Write + Send),
     ) -> std::result::Result<u64, ResolveError> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let store = self
             .store()
             .map_err(|_| ResolveError::LocalStoreUnavailable)?;
@@ -742,6 +879,7 @@ impl BlobStore {
             &self.identity_path,
             holder_ticket,
             &hash.as_bytes(),
+            read_memory,
             sink,
             None,
             None,
@@ -780,14 +918,21 @@ impl BlobStore {
 
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn pause_authorized_provider_stream_after_shared_hash_guard_for_test(
         &self,
         hash: &BlobHash,
     ) -> Result<PausedProviderGenerationForTest> {
         let repository = self.db.blob_repository();
-        let session = repository
-            .open_read(hash.as_bytes())?
-            .ok_or_else(|| Error::Other("blob provider has no canonical object".to_string()))?;
+        let session = repository.open_read(hash.as_bytes())?.ok_or_else(|| {
+            Error::Other(("blob provider has no canonical object".to_string()).into())
+        })?;
         Ok(PausedProviderGenerationForTest {
             repository,
             hash: hash.as_bytes(),
@@ -799,6 +944,13 @@ impl BlobStore {
 
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn pause_partial_blob_writer_after_shared_hash_guard_for_test(
         &self,
         hash: &BlobHash,
@@ -905,11 +1057,43 @@ impl BlobStore {
     /// whose EVERY referencing job is terminal past `grace_ms` (and any blob
     /// no job references at all) becomes unservable immediately — a later
     /// entitled resolve gets BlobNotFound — and its bytes free at the
-    /// store's GC interval. Returns the count reclaimed.
+    /// store's GC interval. Returns the count reclaimed. One operation child
+    /// funds the captured ledger root throughout the sweep.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn reclaim_unreferenced(&self, now_ms: i64, grace_ms: i64) -> Result<usize> {
+        self.reclaim_unreferenced_with_read_memory(
+            self.db.declared_reader_memory()?,
+            now_ms,
+            grace_ms,
+        )
+    }
+
+    /// Reclaim using the executing host operation's READ owner.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn reclaim_unreferenced_with_read_memory(
+        &self,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        now_ms: i64,
+        grace_ms: i64,
+    ) -> Result<usize> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let db = self.db.clone();
+        let _read = db.writer_temporary_output_scope(read_memory.clone())?;
         self.store()?.reclaim(|hash| {
-            blob_ref_retention_eligible(&db, &BlobHash::from_bytes(*hash), now_ms, grace_ms)
+            blob_ref_retention_eligible(
+                &db,
+                &BlobHash::from_bytes(*hash),
+                now_ms,
+                grace_ms,
+                read_memory.clone(),
+            )
         })
     }
 
@@ -921,16 +1105,52 @@ impl BlobStore {
     /// stays public for a host that prefers to drive reclaim opportunistically
     /// (e.g. after each import). The returned handle owns the loop; drop or
     /// abort it to stop. The unit suites drive reclaim explicitly and do not
-    /// spawn this; hosts (the server embedder, the live smoke) do.
+    /// spawn this; hosts (the server embedder, the live smoke) do. The host
+    /// may supply an explicit READ provider through the companion variant; the
+    /// default uses the store's declared reader parent, with one child per sweep.
     pub fn spawn_reclaim_driver(self: Arc<Self>, grace_ms: i64) -> tokio::task::JoinHandle<()> {
+        let read_budgets = self.db.declared_read_request_provider();
+        self.spawn_reclaim_driver_with_provider(read_budgets, grace_ms)
+    }
+
+    /// Run reclaim using the host's existing provider, with one child per sweep.
+    pub fn spawn_reclaim_driver_with_read_budget_provider(
+        self: Arc<Self>,
+        read_budgets: Arc<dyn ReadRequestBudgetProvider>,
+        grace_ms: i64,
+    ) -> tokio::task::JoinHandle<()> {
+        self.spawn_reclaim_driver_with_provider(read_budgets.into(), grace_ms)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn spawn_reclaim_driver_with_provider(
+        self: Arc<Self>,
+        read_budgets: crate::vector_read_memory::ReadRequestProvider,
+        grace_ms: i64,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(RECLAIM_INTERVAL);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticker.tick().await;
                 let now = Wallclock::now().0 as i64;
-                if let Err(err) = self.reclaim_unreferenced(now, grace_ms) {
+                let result = read_budgets.request_budget().and_then(|read_memory| {
+                    self.reclaim_unreferenced_with_read_memory(read_memory, now, grace_ms)
+                });
+                if let Err(err) = result {
                     tracing::warn!("blob reclaim sweep failed: {err}");
+                }
+                #[cfg(any(test, feature = "test-seams"))]
+                if let Some(observer) = self
+                    .reclaim_sweep_observer
+                    .lock()
+                    .expect("reclaim observer lock")
+                    .take()
+                {
+                    let _ = observer.send(());
                 }
             }
         })
@@ -946,10 +1166,13 @@ impl BlobStore {
     #[cfg(any(test, feature = "test-seams"))]
     pub async fn resume_bytes_moved_for_test(
         &self,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         hash: &BlobHash,
         holder_ticket: &str,
         sink: &mut Vec<u8>,
     ) -> std::result::Result<u64, ResolveError> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let store = self
             .store()
             .map_err(|e| ResolveError::SinkWrite(std::io::Error::other(e.to_string())))?;
@@ -958,6 +1181,7 @@ impl BlobStore {
             &self.identity_path,
             holder_ticket,
             &hash.as_bytes(),
+            read_memory,
             sink,
         )
         .await
@@ -967,6 +1191,7 @@ impl BlobStore {
 
 fn map_failure(failure: FetchFailure, expected: &BlobHash) -> ResolveError {
     match failure {
+        FetchFailure::SourceError(err) => ResolveError::LedgerRead(err),
         FetchFailure::Unentitled => ResolveError::Unentitled,
         FetchFailure::PolicyForbidden => ResolveError::PolicyForbidden,
         FetchFailure::NotFound => ResolveError::BlobNotFound,

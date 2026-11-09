@@ -78,7 +78,7 @@ fn body(db: &Database, id: Uuid) -> Option<String> {
         &HashMap::from([("id".to_string(), Value::Uuid(id))]),
     )
     .expect("read exact note")
-    .rows
+    .rows()
     .first()
     .map(|row| match &row[0] {
         Value::Text(value) => value.clone(),
@@ -114,7 +114,8 @@ async fn start_hub(root: &Path, tenant: &str) -> Hub {
             TenantId::from(tenant),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -153,7 +154,8 @@ fn edge(
         db.clone(),
         &peer_dial_spec(ticket, &identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     (db, client, identity)
 }
 
@@ -173,7 +175,8 @@ fn reopen_edge(
         db.clone(),
         &peer_dial_spec(ticket, identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     (db, client)
 }
 

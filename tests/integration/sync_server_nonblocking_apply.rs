@@ -363,6 +363,10 @@ impl CapturingSignedPushTransport {
         bytes
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn capture_or_forward<'a>(
         &'a self,
         subject: &'a str,
@@ -470,7 +474,8 @@ impl SignedRawClient {
             capture.clone(),
             contextdb_core::TenantId::from(tenant_id),
             identity,
-        );
+        )
+        .expect("construct the authenticated sync endpoint");
         client
             .pull_default()
             .await
@@ -684,7 +689,8 @@ fn run_server_until(
                 contextdb_core::TenantId::from(&tenant_id),
                 hub_node_id,
                 hub_identity,
-            );
+            )
+            .expect("construct the authenticated sync endpoint");
             server.run_until(thread_shutdown).await;
         });
     });
@@ -764,7 +770,7 @@ fn insert_large_edge_rows(db: &Database, count: usize, payload_len: usize) -> Ve
 }
 
 fn assert_client_push_fixture_uses_chunking(db: &Database) {
-    let changeset = db.changes_since(Lsn(0));
+    let changeset = db.changes_since(Lsn(0)).expect("read the declared changes");
     let batches = contextdb_server::split_changeset_for_test(changeset);
     assert!(
         batches.iter().any(|batch| {
@@ -1309,7 +1315,8 @@ async fn ss06a_chunked_apply_correctness_preserved() {
         fabric.client_as(&edge_node_id),
         contextdb_core::TenantId::from(&tenant_id),
         edge_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client.pull_default().await.expect("edge learns hub schema");
     let ids = insert_large_edge_rows(&edge_db, 2, 600_000);
     assert_client_push_fixture_uses_chunking(&edge_db);
@@ -1342,7 +1349,8 @@ async fn ss06b_chunked_apply_does_not_freeze_event_loop() {
         transport_client.clone(),
         contextdb_core::TenantId::from(&tenant_id),
         edge_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client.pull_default().await.expect("edge learns hub schema");
     let ids = insert_large_edge_rows(&edge_db, 2, 600_000);
     assert_client_push_fixture_uses_chunking(&edge_db);

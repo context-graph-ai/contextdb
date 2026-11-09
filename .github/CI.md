@@ -1,13 +1,45 @@
 # contextdb CI
 
-The normal gate publishes one source-bound inventory containing 29 unchanged logical PR
-command/feature tuples in 26 physical rows and 22 certified integration rows (26 on the
-fail-closed certificate fallback). It dispatches the resulting 49 or 53 physical
-rows in 16 reviewed execution bundles after `impact`. Each bundle contains at most
-four rows and attempts every constituent even after an earlier failure. Every
+The normal gate publishes one source-bound inventory containing 28 unchanged logical PR
+command/feature tuples in 25 physical rows and 22 certified integration rows (24 on the
+fail-closed certificate fallback). It dispatches the resulting 47 or 49 physical
+rows in 54 reviewed execution jobs after `impact` (the count is `job_count` in
+`ci-integration-targets.json`). Each job contains at most four slots, each a whole
+row or a fragment of one, and attempts every slot even after an earlier failure. Every
 failed, cancelled, skipped or missing bundle still fails the validator and stable
 `PR checks` aggregate. When integration is classified inactive, the same mapping
-retains all 26 physical PR rows and omits only empty integration-only bundles.
+retains all 25 physical PR rows and omits only empty integration-only bundles.
+Normal mode skips three slow cases that full qualification and nightly keep: the oversized
+schema transport journey, `bounded_pull_execution_contract::unrestricted_graph_traversal_obeys_request_budget_beyond_legacy_visited_ceiling`
+in the `bounded` binary, and `gate_a_primitives::a3_11_bfs_max_visited_limit` in the `integration`
+binary. The mapping is `NORMAL_RELOCATED` in `scripts/ci-integration.py`; both the shard runner and the
+integration commands read it, and the faster variants of the same promises run in every gate.
+
+Compile cost is shared. Slots whose crate, features and profile match a shared build
+(the engine with `test-seams,iroh`, the engine with the integration features in the test and
+release profiles, and the server with and without `test-seams`) do not compile for themselves.
+One `test-builds` job per shared build runs `scripts/ci-integration.py build-run`, which builds
+the CLI and server and the crate's library, binaries and one small probe test with the exact
+feature set, then `scripts/ci-shared-build.sh pack` archives `target/` (receipts and incremental
+data excluded) as `build-<crate>~<features>~<profile>-<hash of Cargo.lock and rust-toolchain.toml>`
+with one day of retention. Each test job downloads the archive it needs, unpacks it at the same
+path and gives every tracked source one fixed old modification time, so Cargo finds the library
+units fresh and compiles only the test binaries its slot names. If a download or unpack fails
+or the target is not fresh, Cargo simply rebuilds, so results do not depend on the sharing.
+A job summary line, `Shared build reuse: N crate compile lines`, records how many crates a job
+still compiled (0 means the restored target was fresh). The published `build_matrix` is derived
+from the bundle matrix and validated with it.
+
+A row measured to exceed twenty minutes is split into fragments, each a job slot with
+a `part` number. A fragment names the cargo targets it runs and, for a target too slow to run
+whole, a test slice: `only` lists exact test names, and exactly one slice per target is
+`except`, running every test the `only` slices do not name. A test the layout never named
+therefore runs once, in the `except` slice. The planner proves that the fragments of a row
+place every target exactly once and that the slices of a target are disjoint and complete,
+and refuses the plan otherwise. The published matrix names a fragment only by its row and
+part (`CI_FRAGMENT`); the runner reads the targets and tests from the reviewed layout and
+accepts only a part the layout names for that row. A fragment's receipt
+artifact carries a `-part<N>` suffix so fragments of one row never collide.
 Three jobs share setup and cache: transactions (default/internal) with relational
 storage; vector retrieval (default/internal) with nearest-neighbor index and graph;
 and SQL parser with query planning and redb. Each invokes the existing shard runner
@@ -16,7 +48,7 @@ retains `target/redb`; features and profiles are never combined. A failed consti
 is retained while later constituents still run; missing receipts also fail it. Receipt upload includes every
 constituent directory, including evidence from a failed bundle. Single-shard local
 commands are unchanged. The impact job publishes the source-bound plan and all
-16 bundles once; the integration validator checks their disjoint canonical union,
+54 jobs once; the integration validator checks their disjoint canonical union,
 exact inner payloads, and successful bundle matrix result. Each constituent
 disables automatic job-ID suffixing and carries the historical `-test` suffix in
 its per-row cache key, preserving each old cache namespace; feature sets and
@@ -53,15 +85,20 @@ fails the same full result. Receipts record each exact command. Qualification on
 different SHA supplies no verdict on the PR SHA. Hardware latency qualification
 remains the existing dormant/manual path.
 
-Seven named engine assertions are temporarily declared but ignored while their rc2
-work lands on `dev`: the four corpus profile assertions (CDB-160), the indexed-route
-and saved-graph work assertions (CDB-161/CDB-162), and the oversized authenticated
-schema journey (CDB-163). They remain discoverable in their original targets and the
-full qualification receipt must show them as ignored, not executed. The CI guard
-allows only these seven declarations plus the pre-existing CDB-154 exception; it
-rejects a changed target, case, issue ID, reason, or extra quarantine. The owner
-removes all seven when rc2 lands on `dev`; pending campaign fixes are not claimed as
-resolved by this waiver.
+The optional production-release route runs the mixed `acceptance` target with
+`nightly-tests,test-seams`, because its private observation fixtures require that
+feature. The public `acceptance_long_running` and `acceptance_sync` targets keep
+`nightly-tests` without `test-seams`; the optional production Cargo-default route
+also keeps `nightly-tests`. Each target retains its own command and receipt.
+
+Deferred assertions remain discoverable in their original targets. Every qualification
+receipt must report them as ignored rather than executed. The source guard validates
+every ignored test by its registered path, case and reason, and rejects missing,
+changed, duplicate or unregistered declarations. These checks cover the unshipped vector index route and construction,
+received-schema re-upload, fixed-memory legacy replay, owned-host received application,
+concurrent staged deletion, allocator paging measurements and inherited storage
+assertions. Ignored checks do not establish that their promises are met. Their source
+attributes state the concrete reason each remains disabled.
 
 Normal integration has 18 slices after the certified omissions below. It substitutes the 14-case bounded schema root
 for the three original full roots and omits only the four full recall corpora.
@@ -129,6 +166,20 @@ flaky-test issue. It is diagnostic, not a gate.
 
 ## PR checks (`ci.yml`)
 
+Cargo.toml owns the test optimisation and checked-arithmetic settings for local,
+PR, rc2 and integration builds. CI does not override them with
+CARGO_PROFILE_TEST_OPT_LEVEL, CARGO_PROFILE_TEST_DEBUG_ASSERTIONS or
+CARGO_PROFILE_TEST_OVERFLOW_CHECKS. The manifest-binding test checks manifest
+text; external Cargo configuration and environment can still override a local build.
+
+The PR/integration engine-seams shard and the rc2 engine test-seams shard run the initial-build/replacement/reclamation journey
+once through `scripts/ci-maintenance-journey.sh`, outside the ordinary libtest
+invocation. The helper compiles first, then applies a 600-second process limit
+with a five-second forced-cleanup grace to that exact case. Both logs and the helper’s exact
+exit status (`maintenance.exit`) are retained in the shard receipt. The ordinary invocation skips
+only that same case. This CI runner limit detects regressions; hosted duration
+is not controlled-hardware performance qualification.
+
 Every job uses `ubuntu-latest`. The shared
 environment is all runner cores, no debug info, no incremental builds and an
 empty `RUSTFLAGS`; jobs that compile with warnings-as-errors set it per command.
@@ -138,12 +189,12 @@ Superseded PR runs are cancelled; push runs are not.
 |---|---|---|
 | `impact` | `python3 scripts/ci-inventory.py`, then `python3 scripts/ci-impact.py` (CI only) | Two steps in this order. The inventory step runs locally too: every workspace package and the redb fork is covered by a test shard with the right feature closure (fails closed otherwise). The impact step then classifies changed paths for integration (see below); it needs the GitHub Actions event file (`GITHUB_EVENT_PATH`), the `GITHUB_OUTPUT` file and a full-history checkout, so it is not a standalone local command. |
 | `lint` | `bash scripts/verify pr lint` | The job installs `ripgrep` before the offline controls. `python3 -B scripts/ci-build-tests.py`, `python3 -B scripts/ci-required-tests.py` and `python3 -B scripts/ci-inventory-tests.py` run in the lint job before `scripts/verify pr lint`: offline delivery, aggregate, target-inventory and timing-receipt regression controls, then `cargo fmt` and `clippy -D warnings` for the workspace **and** the separately-built redb fork. |
-| `test / bundle <number> / <behavior families>` — 16 bundles | `CI_CRATE=… CI_SHARD=… CI_FEATURES=… bash scripts/verify pr shard` | The bundles expand to the original 29 logical PR command/feature tuples plus every active integration row. Acceptance runs as separate remaining-module, long-running, and replication targets; vector decoding and delivery, many-context search, and layer search are separate work units. Their physical rows reuse the original logical parent's cache key and preserve its profile and feature closure. The normal plan has 49 physical rows when the source-bound dedup certificate applies and 53 in the conservative fallback. Default builds use parallel libtest execution; `test-seams` builds use one test thread. The engine's `test-seams,iroh` coverage is partitioned into seventeen physical rows by [`ci-shard-targets.txt`](../scripts/ci-shard-targets.txt). The inventory guard rejects missing or repeated targets and changed parent bindings. The lib shard alone covers examples and doctests within the split group. The redb fork retains its own target directory. |
+| `test / bundle <number> / <behavior families>` — 54 jobs | `CI_CRATE=… CI_SHARD=… CI_FEATURES=… bash scripts/verify pr shard` | The bundles expand to the original 28 logical PR command/feature tuples plus every active integration row. Acceptance runs as separate remaining-module, long-running, and replication targets; vector decoding and delivery, many-context search, and layer search are separate work units. Their physical rows reuse the original logical parent's cache key and preserve its profile and feature closure. The normal plan has 47 physical rows when the source-bound dedup certificate applies and 49 in the conservative fallback. Engine unit builds and `test-seams` builds use one test thread because their proof observers and counters are process-wide; other default builds use parallel libtest execution. The engine's `test-seams,iroh` coverage is partitioned into sixteen physical rows by [`ci-shard-targets.txt`](../scripts/ci-shard-targets.txt). The inventory guard rejects missing or repeated targets and changed parent bindings. The lib shard alone covers examples and doctests within the split group. The redb fork retains its own target directory. |
 | `build` | `bash scripts/verify pr build` | Release build of the workspace, then [`verify-packaged-engine.sh`](../scripts/verify-packaged-engine.sh) builds the engine only from packaged crate archives. |
 | `features` | `bash scripts/verify pr features` | Supported standalone feature shapes: engine default, engine `mdns`, server `mdns,production-smoke-driver`, plus `cargo doc` for the workspace. |
 | `lint-macos` | `bash scripts/verify pr lint` on `macos-latest` | The same `cargo fmt` and `clippy -D warnings` lint entry as `lint`, run natively on macOS in parallel so macOS-only build and lint breaks fail the PR. |
 | `installed-smoke` | `bash scripts/verify pr installed` | Installs release CLI and server binaries into a temporary root and runs [`installed-release-durable-sync-smoke.sh`](../scripts/installed-release-durable-sync-smoke.sh), the installed-binary durability and sync smoke over real files and ticketed Iroh. |
-| `cross-compile (<target>)` | `CI_TARGET=<target> bash scripts/verify pr cross` | Release build of CLI and server for `aarch64-unknown-linux-gnu`. The macOS targets are set aside until CDB-153 (the engine uses Linux-only `pipe2`/`SOCK_CLOEXEC`) is fixed. |
+| `cross-compile (<target>)` | `CI_TARGET=<target> bash scripts/verify pr cross` | Release build of CLI and server for `aarch64-unknown-linux-gnu`. The macOS targets are set aside until the engine replaces its Linux-only `pipe2`/`SOCK_CLOEXEC` usage with platform implementations. |
 | `integration / engine / test-profile / acceptance` and named families | see Extended integration | Nightly-only fixtures when the change affects runtime or integration paths; otherwise the job still runs and records why it was not required. |
 | **`PR checks`** | — | Stable aggregate. [`ci-required.py`](../scripts/ci-required.py) fails unless every job above reports `success`, and validates the exact inventory plus the sole development-delivery exception. |
 
@@ -190,7 +241,7 @@ Rules apply in this order; the first match wins.
   `scripts/ci-performance.py` → performance only. These match before the
   `scripts/` and `.github/workflows/` rule below.
 - A short allowlist of maintainer files (`.gitignore`, `.dockerignore`, the
-  `MAINTENANCE.md` notes of the vendored hnsw and redb crates) → maintainer
+  `MAINTENANCE.md` note of the vendored redb crate) → maintainer
   metadata, which needs neither integration nor performance measurement.
 - Markdown under `docs/` or `skills/`, top-level Markdown, `LICENSE`, `NOTICE`
   → documentation only.
@@ -229,30 +280,29 @@ CLI binary environment, then runs its own Cargo command.
 The canonical full manifest preserves 30 logical slices as 36 physical slices, including
 four optional default-suite slices; the normal routing view selects 22 physical slices
 when the source-bound dedup certificate applies and 26 in its conservative fallback.
-**Vector default search-breadth calibration** retains the existing
-`vector_graph_route_profile_quality` target and its single calibration test.
-Four full-qualification **vector graph recall** jobs each cover one complete corpus:
+Fourteen registered engine targets also run in these existing families and shards;
+no qualification job is added. The partition-key and partition-insert tests use
+family/shard 8; float equality and the two planner targets use family/shard 2;
+in-transaction count and the two native allocator targets use family/shard 1.
+Tied index probes, cycle cost and reclaim use family 4 and PR shard 5.
+`seed_commit_memory` runs only in full/nightly family 3 with `test-seams` and
+`nightly-tests`, preserving its 100,000-row, 768-dimension workload.
 
-| Vectors per context | Corpus | Explicit target / slice ID |
-|---:|---|---|
-| 5,000 | anisotropic | `vector_graph_recall_5000_anisotropic_per_context` / `vector-graph-recall-5000-anisotropic` |
-| 5,001 | topic-clustered | `vector_graph_recall_5001_topic_clusters_per_context` / `vector-graph-recall-5001-topic-clusters` |
-| 50,000 | isotropic | `vector_graph_recall_50000_isotropic_per_context` / `vector-graph-recall-50000-isotropic` |
-| 50,001 | anisotropic | `vector_graph_recall_50001_anisotropic_per_context` / `vector-graph-recall-50001-anisotropic` |
-
-The former `selected_f32_build_switches_pass_the_affected_policy_matrix` case
-maps to four `selected_f32_build_switches_pass_<rows>_<shape>_per_context` cases
-in module `graph_route_profile_quality`, in the targets above. Each builds one
-fixture, then keeps the two filters and three scopes together in their original
-order. Every corpus retains all six cells, 100 probes per cell and the 95% recall
-assertion, for 24 cells across four independently required full-qualification jobs. The canonical
-profile list, explicit target registrations, wrapper indices and named job mapping
-are checked before scheduling; missing, duplicate or combined jobs fail closed.
-The selected build choice remains `(false, false)`. Nightly declaration count is
-expected to increase by three (one matrix case becomes four); ordinary case count
-is unchanged because all five profile sources require `nightly-tests`. All four corpus targets remain in PR shard 12 under `test-seams,iroh`, where
-they compile their ordinary layout and run/list zero cases. Their nightly-feature
-24 cells remain full qualification. No PR shard is added.
+The `custody` and `vector` aggregate binaries use family/shard 12. Each runs in
+its own Cargo command with one test thread. Shared module prefixes are skipped
+only in the aggregate; their existing standalone owners still execute them.
+The reviewed `ci-aggregate-routing.json` certificate binds module names, source
+closures, wrapper features, cfg guards and allocator semantics. Source drift,
+missing or duplicated unique modules, changed owners and changed skip filters
+fail closed. The normal and full feature tuples are checked separately. The
+full-feature compile/list inventory contains 60 custody and 475 vector cases.
+The aggregate filters select one custody case and 94 vector cases, including
+eight existing ignored vector cases. Together with the 38 standalone cases,
+full qualification selects 133 listed cases. The PR feature tuple selects zero
+custody cases, 93 vector cases (eight ignored) and 35 standalone cases; the seed
+is absent. Every compiled name was checked against libtest's substring skip
+semantics, with no missing unique case or shared case left in the aggregate.
+These compile/list results do not establish runtime passes.
 
 **Indexed-search work and latency** and **held-out vector recall and native-score
 reference** retain their separate targets. All required engine slices preserve
@@ -273,7 +323,7 @@ use the single bounded target:
 **schema replay contracts**, **schema replay / work limited to affected tables**, and
 **schema replay / identical schema avoids rebuilding data**. The full cases retain
 their assertions and canonical shared helpers. The existing **schema replay
-contracts** job also requires `custody_schema_replay_bounded_contract` (14 cases: 13 canonical oracles at a one-row unrelated fixture plus one unique
+contracts** job also requires `custody_schema_replay_bounded_contract` (16 cases: 15 canonical oracles at a one-row unrelated fixture plus one unique
 receipt/contact replication twin) in both PR and extended coverage; no job is added. The proposed normal mode selects only the bounded root; full mode retains all original roots. Compile/list checks do not establish gate timing.
 The hard thirty-minute end-to-end correctness budget remains unmet; full-scale qualification relocation requires owner policy approval; hosted acceptance remains pending.
 
@@ -390,6 +440,10 @@ Which checks GitHub *requires* before merging is a repository setting, not
 something this directory controls. `PR checks` is designed to be the single
 required context; until the owner sets it, a green run is evidence, not a merge
 rule.
+
+The installed oversized-transfer smoke declares a 512 MiB read budget for its
+snapshot and key-inspection observers, which read the fixture's 64 MiB row.
+The transport workload, crash checkpoints and durable-state comparisons are unchanged.
 
 ## Prerequisites for local runs
 
@@ -530,12 +584,45 @@ measurement including cold setup and disclosed queue behavior. Policy adoption r
 pending owner approval.
 
 Normal integration alone partitions the three unchanged long-running acceptance cases:
-transfer runs exactly f25 and f26 in bundle14 slot1; incremental pull runs exactly
-f27 in bundle08 slot1. Source fingerprints and receipt case names/counts fail
-closed on inventory drift. Both retain the old long-running test cache binding.
-Server internal checks run in bundle06 slot2; core internal checks run in bundle06
-slot1 and default core runs in bundle15 slot1. Full qualification, release and PR acceptance commands
-remain unchanged, and all three functional oracles remain required. The 16 bundles
+transfer runs exactly f25 and f26; incremental pull runs exactly f27. Source
+fingerprints and receipt case names/counts fail closed on inventory drift. Both retain
+the old long-running test cache binding. Where each row runs is the reviewed job layout
+in `ci-integration-targets.json`. Full qualification, release and PR acceptance commands
+remain unchanged, and all three functional oracles remain required. The 54 jobs
 still use at most four slots. The observed 1,555 seconds before f27 is partial
 cost evidence, not a completion bound; a complete hosted pass within 30 minutes
 remains unproved.
+
+The existing full redb integration slice first runs its unchanged default-feature
+suite, then runs six registered feature-gated targets in separate commands.
+`named_root_capture_contract`, `reclaim_step_contract`,
+`open_table_registry_allocations` and `admission_reads_are_bounded_by_the_format`
+use exactly `contextdb-internal,test-seams`; `growth_after_compaction_contract` and `cache_residency`
+use exactly `contextdb-internal`. All retain the same isolated redb target
+directory, locked manifest and one test thread. Registration and ownership checks
+reject missing, duplicate or wrongly featured targets. This adds no job and does
+not establish a runtime pass.
+
+Full qualification retains one execution owner per feature tuple for the 13
+main schema replay cases: the dedicated full schema target. Its bounded sibling
+runs separately and skips only that identical namespace in full mode, retaining
+its one-row witness and its other workload-specific namespaces. Normal mode
+keeps the main namespace in the bounded target because the full target is absent.
+The main shared source hardcodes its 10,000-row fixture and does not consume the
+wrappers' different row-count constants; the other bounded modules keep those
+constants and their distinct workloads. The `maintained_search` shared module
+is a helper with no test cases and needs no additional execution selection.
+
+The impact classifier writes the complete path-class map to a JSON file. The planner
+reads `PATH_CLASSES_FILE`; job outputs carry only its artifact locator. Cross-job
+consumers download that artifact, and reusable integration accepts its name through
+`path_classes_artifact`. No path-class payload is passed through an environment
+variable, workflow input, or job output. Manual integration needs no artifact.
+
+The `rc2-tests` workflow runs on pushes and pull requests to `main` or `dev`,
+and through manual dispatch. Each shard executes library, binary and integration-test
+targets with its original feature selection. Examples and benches compile with
+`cargo test --examples --benches --no-run`; Criterion benchmarks are not executed
+on shared hosted runners. Compilation failures still fail the shard.
+Every ignored test in the source tree must match
+one registered path, test name and reason; conditional ignores are included.

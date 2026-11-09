@@ -32,7 +32,7 @@ fn limits() -> ReadLimits {
 
 fn assert_primary_key_prefix(result: &contextdb_engine::QueryResult) {
     assert_eq!(
-        result.rows,
+        result.rows(),
         vec![
             vec![Value::Int64(0)],
             vec![Value::Int64(1)],
@@ -41,16 +41,17 @@ fn assert_primary_key_prefix(result: &contextdb_engine::QueryResult) {
         "the primary-key prefix returns this passage's three source links"
     );
     assert_eq!(
-        result.trace.index_used.as_deref(),
+        result.trace().index_used.as_deref(),
         Some("__pk_context_id_passage_id_source_order")
     );
     assert_eq!(
-        result.trace.predicates_pushed.len(),
+        result.trace().predicates_pushed.len(),
         2,
         "both equality columns of the primary-key prefix are pushed"
     );
     assert_eq!(
-        result.trace.rows_examined, 3,
+        result.trace().rows_examined,
+        3,
         "one passage lookup must not scan a 30,000-link context"
     );
 }
@@ -64,17 +65,22 @@ fn composite_primary_key_serves_its_prefix() {
         &empty(),
     )
     .unwrap();
-    for passage in 0..10_000_i64 {
-        for source_order in 0..3_i64 {
-            db.execute(
-                "INSERT INTO passage_links VALUES (7, $passage, $source_order)",
-                &HashMap::from([
-                    ("passage".into(), Value::Int64(passage)),
-                    ("source_order".into(), Value::Int64(source_order)),
-                ]),
-            )
-            .unwrap();
+    for first_passage in (0..10_000_i64).step_by(1_000) {
+        let tx = db.begin().unwrap();
+        for passage in first_passage..first_passage + 1_000 {
+            for source_order in 0..3_i64 {
+                db.execute_in_tx(
+                    tx,
+                    "INSERT INTO passage_links VALUES (7, $passage, $source_order)",
+                    &HashMap::from([
+                        ("passage".into(), Value::Int64(passage)),
+                        ("source_order".into(), Value::Int64(source_order)),
+                    ]),
+                )
+                .unwrap();
+            }
         }
+        db.commit(tx).unwrap();
     }
     let sql = "SELECT source_order FROM passage_links WHERE context_id = 7 AND passage_id = 4242";
     let ordinary = db.execute(sql, &empty()).unwrap();
@@ -86,16 +92,16 @@ fn composite_primary_key_serves_its_prefix() {
     )
     .expect("the bounded production kernel serves the same primary-key prefix");
     assert_primary_key_prefix(&bounded.result);
-    assert_eq!(bounded.result.rows, ordinary.rows);
+    assert_eq!(bounded.result.rows(), ordinary.rows());
     println!(
         "wall_search_pk ordinary={{index:{:?},pushed:{},examined:{},rows:{:?}}} bounded={{index:{:?},pushed:{},examined:{},rows:{:?}}}",
-        ordinary.trace.index_used.as_deref(),
-        ordinary.trace.predicates_pushed.len(),
-        ordinary.trace.rows_examined,
-        ordinary.rows,
-        bounded.result.trace.index_used.as_deref(),
-        bounded.result.trace.predicates_pushed.len(),
-        bounded.result.trace.rows_examined,
-        bounded.result.rows,
+        ordinary.trace().index_used.as_deref(),
+        ordinary.trace().predicates_pushed.len(),
+        ordinary.trace().rows_examined,
+        ordinary.rows(),
+        bounded.result.trace().index_used.as_deref(),
+        bounded.result.trace().predicates_pushed.len(),
+        bounded.result.trace().rows_examined,
+        bounded.result.rows(),
     );
 }

@@ -1911,7 +1911,7 @@ fn b6_09_update_nonexistent_entity() {
     );
     // The update should succeed but affect 0 rows
     match result {
-        Ok(qr) => assert_eq!(qr.rows_affected, 0, "no rows should be affected"),
+        Ok(qr) => assert_eq!(qr.rows_affected(), 0, "no rows should be affected"),
         Err(_) => {
             // If the API returns an error for updating nonexistent rows, that's also acceptable
             let lookup = db

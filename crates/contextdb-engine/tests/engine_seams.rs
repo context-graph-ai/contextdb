@@ -1,6 +1,5 @@
 /// Harness filter for a child process of this test binary: `--exact` needs
 /// the module-qualified test name.
-#[allow(dead_code)]
 pub(crate) fn child_test_filter(module_path: &str, fn_name: &str) -> String {
     match module_path.split_once("::") {
         Some((_, rest)) => format!("{rest}::{fn_name}"),
@@ -8,16 +7,53 @@ pub(crate) fn child_test_filter(module_path: &str, fn_name: &str) -> String {
     }
 }
 
+#[path = "engine_seams/a_bounded_search_beside_a_vector_removal_pass_reads_the_published_image.rs"]
+mod a_bounded_search_beside_a_vector_removal_pass_reads_the_published_image;
+#[path = "engine_seams/a_bounded_search_waiting_for_a_commit_keeps_its_active_time.rs"]
+mod a_bounded_search_waiting_for_a_commit_keeps_its_active_time;
+#[path = "engine_seams/a_corrupt_received_declaration_is_refused_without_holding_the_received_history.rs"]
+mod a_corrupt_received_declaration_is_refused_without_holding_the_received_history;
 #[path = "engine_seams/a_count_a_constraint_already_bounds_is_not_maintained.rs"]
 mod a_count_a_constraint_already_bounds_is_not_maintained;
 #[path = "engine_seams/a_declared_count_is_the_only_count_an_append_writes.rs"]
 mod a_declared_count_is_the_only_count_an_append_writes;
+#[path = "engine_seams/a_destination_reupload_resends_local_groups_and_holds_none_of_what_it_suppresses.rs"]
+mod a_destination_reupload_resends_local_groups_and_holds_none_of_what_it_suppresses;
+#[path = "engine_seams/a_destination_reupload_resends_what_the_edge_held_and_holds_none_of_what_it_suppresses.rs"]
+mod a_destination_reupload_resends_what_the_edge_held_and_holds_none_of_what_it_suppresses;
+#[path = "engine_seams/a_first_push_after_a_first_pull_suppresses_received_declarations_without_holding_them.rs"]
+mod a_first_push_after_a_first_pull_suppresses_received_declarations_without_holding_them;
 #[path = "engine_seams/a_held_savepoint_makes_every_commit_list_its_allocated_pages.rs"]
 mod a_held_savepoint_makes_every_commit_list_its_allocated_pages;
+#[path = "engine_seams/a_historical_index_read_costs_its_rows_and_dead_groups.rs"]
+mod a_historical_index_read_costs_its_rows_and_dead_groups;
+#[path = "engine_seams/a_historical_read_costs_the_same_per_returned_row_as_rows_and_history_grow.rs"]
+mod a_historical_read_costs_the_same_per_returned_row_as_rows_and_history_grow;
+#[path = "engine_seams/a_large_journal_cleanup_is_charged_to_the_writer.rs"]
+mod a_large_journal_cleanup_is_charged_to_the_writer;
+#[path = "engine_seams/a_maintenance_cycle_that_prunes_nothing_walks_no_storage_statistics.rs"]
+mod a_maintenance_cycle_that_prunes_nothing_walks_no_storage_statistics;
+#[path = "engine_seams/a_pending_read_after_a_pull_holds_none_of_the_received_declarations_it_suppresses.rs"]
+mod a_pending_read_after_a_pull_holds_none_of_the_received_declarations_it_suppresses;
+#[path = "engine_seams/a_push_after_a_pull_holds_none_of_the_received_declarations_it_suppresses.rs"]
+mod a_push_after_a_pull_holds_none_of_the_received_declarations_it_suppresses;
+#[path = "engine_seams/a_push_never_sends_an_older_key_version_after_sync_closes.rs"]
+mod a_push_never_sends_an_older_key_version_after_sync_closes;
+#[path = "engine_seams/a_push_sends_local_groups_around_suppressed_ones_with_their_ordinals_and_skips_superseded_ones.rs"]
+mod a_push_sends_local_groups_around_suppressed_ones_with_their_ordinals_and_skips_superseded_ones;
+#[path = "engine_seams/a_scoped_sink_receives_and_counts_only_its_own_events.rs"]
+mod a_scoped_sink_receives_and_counts_only_its_own_events;
+#[path = "engine_seams/a_store_whose_allocator_save_was_refused_repairs_on_the_next_writer_open.rs"]
+mod a_store_whose_allocator_save_was_refused_repairs_on_the_next_writer_open;
 #[path = "engine_seams/aggregate_reads_complete_across_bounded_pages.rs"]
 mod aggregate_reads_complete_across_bounded_pages;
 #[path = "engine_seams/an_arriving_count_declaration_meets_the_same_door_a_local_one_does.rs"]
 mod an_arriving_count_declaration_meets_the_same_door_a_local_one_does;
+#[cfg(target_os = "linux")]
+#[path = "engine_seams/an_authoritative_purge_is_not_refused_by_another_stores_reader.rs"]
+mod an_authoritative_purge_is_not_refused_by_another_stores_reader;
+#[path = "engine_seams/an_ownerless_writer_decode_is_charged_to_the_declared_writer_limit.rs"]
+mod an_ownerless_writer_decode_is_charged_to_the_declared_writer_limit;
 #[path = "engine_seams/an_undeclared_prefix_count_still_answers_exactly.rs"]
 mod an_undeclared_prefix_count_still_answers_exactly;
 #[path = "engine_seams/append_measurement_costs_a_build_that_did_not_ask_for_it_nothing.rs"]
@@ -39,20 +75,28 @@ mod each_published_digest_covers_exactly_its_own_content;
 mod edge_property_write_contract;
 #[path = "engine_seams/graph_cursor_survives_genuine_shrink.rs"]
 mod graph_cursor_survives_genuine_shrink;
+#[path = "engine_seams/historical_index_postings_must_cover_their_row_versions.rs"]
+mod historical_index_postings_must_cover_their_row_versions;
 #[path = "engine_seams/in_list_cursor_pending_runs_are_charged.rs"]
 mod in_list_cursor_pending_runs_are_charged;
 #[path = "engine_seams/indexed_read_in_a_transaction_traces_its_real_work.rs"]
 mod indexed_read_in_a_transaction_traces_its_real_work;
+#[path = "fixtures/isolated_process.rs"]
+mod isolated_process;
 #[path = "engine_seams/memory_accounting_lifecycle_contract.rs"]
 mod memory_accounting_lifecycle_contract;
 #[path = "engine_seams/one_event_append_cost_by_stream_depth.rs"]
 mod one_event_append_cost_by_stream_depth;
 #[path = "engine_seams/one_event_append_work_by_family.rs"]
 mod one_event_append_work_by_family;
+#[path = "engine_seams/one_large_received_schema_commit_is_suppressed_without_being_held.rs"]
+mod one_large_received_schema_commit_is_suppressed_without_being_held;
 #[path = "engine_seams/one_vector_append_does_not_rescan_the_directory.rs"]
 mod one_vector_append_does_not_rescan_the_directory;
-#[path = "engine_seams/per_index_independent_progress_tests.rs"]
-mod per_index_independent_progress_tests;
+#[path = "engine_seams/outbound_declaration_walk_support.rs"]
+mod outbound_declaration_walk_support;
+#[path = "engine_seams/pinning_a_sync_incarnation_holds_across_reopen_and_refuses_a_second_pin.rs"]
+mod pinning_a_sync_incarnation_holds_across_reopen_and_refuses_a_second_pin;
 #[path = "engine_seams/pruning_report_names_reader_deferred_rows.rs"]
 mod pruning_report_names_reader_deferred_rows;
 #[path = "engine_seams/rank_policy_joined_row_sees_staged_access_changes.rs"]
@@ -63,13 +107,20 @@ mod recover_uncommitted_commit_index_tail;
 mod retention_respects_edge_visibility;
 #[path = "engine_seams/snapshot_visible_posting_membership_contract.rs"]
 mod snapshot_visible_posting_membership_contract;
+#[path = "engine_seams/storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown.rs"]
+mod storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown;
 #[path = "engine_seams/storage_compaction_online.rs"]
 mod storage_compaction_online;
+#[cfg(target_os = "linux")]
+#[path = "engine_seams/the_custody_tenant_mirror_is_charged_to_its_writer.rs"]
+mod the_custody_tenant_mirror_is_charged_to_its_writer;
 #[path = "engine_seams/uncapped_graph_read_charges_the_frontier_it_resolves.rs"]
 mod uncapped_graph_read_charges_the_frontier_it_resolves;
 #[cfg(unix)]
 #[path = "engine_seams/writable_open_of_a_corrupt_file_names_the_next_step.rs"]
 mod writable_open_of_a_corrupt_file_names_the_next_step;
+#[path = "engine_seams/writer_checkpoint_receipts_follow_commits_and_close.rs"]
+mod writer_checkpoint_receipts_follow_commits_and_close;
 
 #[path = "engine_seams/what_each_declared_index_costs_one_event_append.rs"]
 mod what_each_declared_index_costs_one_event_append;
@@ -88,3 +139,165 @@ mod writer_recycle_baseline_cost;
 #[cfg(unix)]
 #[path = "engine_seams/writer_file_ownership_survives_recycle.rs"]
 mod writer_file_ownership_survives_recycle;
+
+#[path = "engine_seams/a_custody_commit_validates_the_last_write_of_each_key.rs"]
+mod a_custody_commit_validates_the_last_write_of_each_key;
+#[path = "engine_seams/a_damaged_delivered_terminal_is_refused_never_excluded.rs"]
+mod a_damaged_delivered_terminal_is_refused_never_excluded;
+#[cfg(target_os = "linux")]
+#[path = "engine_seams/a_long_decoder_error_is_bounded_before_it_is_built.rs"]
+mod a_long_decoder_error_is_bounded_before_it_is_built;
+#[path = "engine_seams/a_malformed_custody_record_refuses_with_the_custody_codec_diagnostic.rs"]
+mod a_malformed_custody_record_refuses_with_the_custody_codec_diagnostic;
+#[path = "engine_seams/a_partial_closure_never_certifies_custody_evidence.rs"]
+mod a_partial_closure_never_certifies_custody_evidence;
+#[path = "engine_seams/an_incomplete_custody_index_refuses_without_loading_the_journal.rs"]
+mod an_incomplete_custody_index_refuses_without_loading_the_journal;
+#[path = "engine_seams/buffer_pool_share_evicts_and_recharges_under_the_writer_budget.rs"]
+mod buffer_pool_share_evicts_and_recharges_under_the_writer_budget;
+#[cfg(target_os = "linux")]
+#[path = "engine_seams/custody_admissions_are_bracketed_and_refusable.rs"]
+mod custody_admissions_are_bracketed_and_refusable;
+#[path = "engine_seams/custody_commit_validation_admits_before_it_allocates.rs"]
+mod custody_commit_validation_admits_before_it_allocates;
+#[cfg(target_os = "linux")]
+#[path = "engine_seams/custody_decoding_charges_what_it_allocates.rs"]
+mod custody_decoding_charges_what_it_allocates;
+#[path = "engine_seams/custody_durable_selection_matches_the_resident_journal.rs"]
+mod custody_durable_selection_matches_the_resident_journal;
+#[path = "engine_seams/custody_fixture.rs"]
+mod custody_fixture;
+#[cfg(target_os = "linux")]
+#[path = "engine_seams/custody_history_commits_do_not_hydrate_the_delivery_journal.rs"]
+mod custody_history_commits_do_not_hydrate_the_delivery_journal;
+#[path = "engine_seams/custody_long_key_fixture.rs"]
+mod custody_long_key_fixture;
+#[cfg(target_os = "linux")]
+#[path = "engine_seams/custody_reads_admit_every_buffer_before_allocating.rs"]
+mod custody_reads_admit_every_buffer_before_allocating;
+#[path = "engine_seams/custody_reads_stay_on_the_operations_captured_root.rs"]
+mod custody_reads_stay_on_the_operations_captured_root;
+#[path = "engine_seams/delivery_status_answers_exactly_on_an_admitted_custody_fixture.rs"]
+mod delivery_status_answers_exactly_on_an_admitted_custody_fixture;
+#[path = "engine_seams/durable_custody_reads_refuse_missing_or_tampered_companions.rs"]
+mod durable_custody_reads_refuse_missing_or_tampered_companions;
+#[path = "engine_seams/durable_reads_validate_the_whole_evidence_closure.rs"]
+mod durable_reads_validate_the_whole_evidence_closure;
+#[path = "engine_seams/history_sync_and_commit_cursors_reload_without_full_directories.rs"]
+mod history_sync_and_commit_cursors_reload_without_full_directories;
+#[path = "engine_seams/identity_preparation_refusal_leaves_the_store_unchanged.rs"]
+mod identity_preparation_refusal_leaves_the_store_unchanged;
+#[path = "engine_seams/native_delivery_is_served_after_transaction_repair_and_reopen.rs"]
+mod native_delivery_is_served_after_transaction_repair_and_reopen;
+#[path = "engine_seams/native_membership_parent_peak_guard.rs"]
+mod native_membership_parent_peak_guard;
+#[path = "engine_seams/paged_initial_replacement_and_reclamation_progress_under_writes.rs"]
+mod paged_initial_replacement_and_reclamation_progress_under_writes;
+#[path = "engine_seams/pending_delivery_pages_resume_without_gaps.rs"]
+mod pending_delivery_pages_resume_without_gaps;
+#[path = "engine_seams/pending_delivery_reads_only_the_pending_tail.rs"]
+mod pending_delivery_reads_only_the_pending_tail;
+#[path = "engine_seams/pending_maintenance_stays_flat_as_delivered_history_grows.rs"]
+mod pending_maintenance_stays_flat_as_delivered_history_grows;
+#[path = "engine_seams/retired_custody_keys_stay_funded_until_the_write_set_drops.rs"]
+mod retired_custody_keys_stay_funded_until_the_write_set_drops;
+#[cfg(target_os = "linux")]
+#[path = "engine_seams/the_closure_memo_frees_its_entries_before_refunding_them.rs"]
+mod the_closure_memo_frees_its_entries_before_refunding_them;
+#[path = "engine_seams/unpartitioned_vector_membership_pages_reload_at_constant_residency.rs"]
+mod unpartitioned_vector_membership_pages_reload_at_constant_residency;
+#[path = "engine_seams/version_pruning_and_compaction_resume_finite_safe_batches.rs"]
+mod version_pruning_and_compaction_resume_finite_safe_batches;
+#[cfg(target_os = "linux")]
+#[path = "engine_seams/writer_reopen_and_doubling_keep_a_fixed_resident_envelope.rs"]
+mod writer_reopen_and_doubling_keep_a_fixed_resident_envelope;
+
+#[path = "engine_seams/aggregate_auto_threshold_decides_the_route_and_keeps_scope.rs"]
+mod aggregate_auto_threshold_decides_the_route_and_keeps_scope;
+#[path = "engine_seams/crash_cutpoints_recover_one_complete_row_index_vector_log_commit.rs"]
+mod crash_cutpoints_recover_one_complete_row_index_vector_log_commit;
+#[path = "engine_seams/graph_delete_seeks_only_its_edge_identity.rs"]
+mod graph_delete_seeks_only_its_edge_identity;
+#[path = "engine_seams/paged_constraints_preserve_staging_and_competing_commit_conflicts.rs"]
+mod paged_constraints_preserve_staging_and_competing_commit_conflicts;
+#[path = "engine_seams/writable_open_never_touches_history_families.rs"]
+mod writable_open_never_touches_history_families;
+#[path = "engine_seams/writer_reader_root_survives_commit_eviction_and_cleanup.rs"]
+mod writer_reader_root_survives_commit_eviction_and_cleanup;
+
+#[path = "engine_seams/resident_history_support.rs"]
+mod resident_history_support;
+
+#[path = "engine_seams/retention_expiry_and_prune_examine_fixed_work_as_unrelated_edges_and_rows_grow.rs"]
+mod retention_expiry_and_prune_examine_fixed_work_as_unrelated_edges_and_rows_grow;
+
+#[path = "engine_seams/bounded_graph_where_charge_is_independent_of_rejected_candidates.rs"]
+mod bounded_graph_where_charge_is_independent_of_rejected_candidates;
+
+#[path = "engine_seams/outbound_sync_refuses_typed_when_provenance_sidecar_read_fails.rs"]
+mod outbound_sync_refuses_typed_when_provenance_sidecar_read_fails;
+
+#[path = "engine_seams/incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows.rs"]
+mod incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows;
+
+#[path = "engine_seams/bounded_graph_where_metadata_authorization_charges_request_limits.rs"]
+mod bounded_graph_where_metadata_authorization_charges_request_limits;
+
+#[path = "consumer_declared_count_and_pending_seek_contract.rs"]
+mod consumer_declared_count_and_pending_seek_contract;
+
+#[path = "grouped_session_top_n_contract.rs"]
+mod grouped_session_top_n_contract;
+
+#[path = "engine_seams/a_vector_search_decodes_under_its_request_owner.rs"]
+mod a_vector_search_decodes_under_its_request_owner;
+#[path = "engine_seams/opening_a_store_charges_the_reader_the_same_however_long_its_history.rs"]
+mod opening_a_store_charges_the_reader_the_same_however_long_its_history;
+#[path = "engine_seams/opening_a_store_does_a_bounded_vector_journal_cleanup.rs"]
+mod opening_a_store_does_a_bounded_vector_journal_cleanup;
+#[path = "engine_seams/opening_a_store_holds_a_bounded_window_of_queued_events.rs"]
+mod opening_a_store_holds_a_bounded_window_of_queued_events;
+#[path = "engine_seams/opening_a_store_read_only_does_not_grow_with_history.rs"]
+mod opening_a_store_read_only_does_not_grow_with_history;
+#[path = "engine_seams/reads_and_writes_are_charged_to_their_own_declared_limits.rs"]
+mod reads_and_writes_are_charged_to_their_own_declared_limits;
+#[path = "engine_seams/trigger_audit_history_is_charged_once_to_the_declared_reader.rs"]
+mod trigger_audit_history_is_charged_once_to_the_declared_reader;
+
+#[path = "engine_seams/reads_are_answered_while_a_maintenance_commit_holds_the_commit_gate.rs"]
+mod reads_are_answered_while_a_maintenance_commit_holds_the_commit_gate;
+
+#[path = "engine_seams/a_reads_erasure_check_does_fixed_work_however_much_history_there_is.rs"]
+mod a_reads_erasure_check_does_fixed_work_however_much_history_there_is;
+
+#[path = "engine_seams/allocator_foreign_events.rs"]
+mod allocator_foreign_events;
+
+#[path = "engine_seams/an_exact_identity_search_stays_inside_its_work_ceiling.rs"]
+mod an_exact_identity_search_stays_inside_its_work_ceiling;
+
+#[path = "engine_seams/storage_journeys_keep_the_measured_test_profile.rs"]
+mod storage_journeys_keep_the_measured_test_profile;
+
+#[path = "engine_seams/every_writer_checkpoint_names_every_charged_byte.rs"]
+mod every_writer_checkpoint_names_every_charged_byte;
+#[path = "engine_seams/primitive_work_support.rs"]
+mod primitive_work_support;
+#[path = "engine_seams/saved_search_and_append_work_ceiling.rs"]
+mod saved_search_and_append_work_ceiling;
+#[path = "engine_seams/settled_maintenance.rs"]
+mod settled_maintenance;
+
+#[path = "engine_seams/census_samples_around_maintenance_name_every_writer_byte.rs"]
+mod census_samples_around_maintenance_name_every_writer_byte;
+
+#[path = "engine_seams/a_census_sample_holds_off_maintenance_planted_inside_its_collection.rs"]
+mod a_census_sample_holds_off_maintenance_planted_inside_its_collection;
+
+#[path = "engine_seams/a_captured_file_root_survives_partition_retirement.rs"]
+mod a_captured_file_root_survives_partition_retirement;
+#[path = "engine_seams/reader_peak_covers_the_complete_query.rs"]
+mod reader_peak_covers_the_complete_query;
+
+#[path = "engine_seams/outbound_selection_regressions.rs"]
+mod outbound_selection_regressions;

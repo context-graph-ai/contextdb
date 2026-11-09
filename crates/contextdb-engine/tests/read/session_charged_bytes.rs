@@ -4,18 +4,23 @@ use std::collections::HashMap;
 
 fn exercise(reader: &ReadSession, route: ReadRoute) {
     assert_eq!(reader.route(), route);
+    reader
+        .open_cursor("SELECT id FROM charged_rows", &HashMap::new())
+        .expect("warm session deadline driver")
+        .close()
+        .expect("close warmup cursor");
     let baseline = reader.charged_bytes().expect("read accountant baseline");
     let query = "SELECT id, payload FROM charged_rows";
     let first = reader
         .open_cursor(query, &HashMap::new())
         .expect("first cursor");
-    assert!(first.first_page().has_more, "three rows exceed one page");
+    assert!(first.first_page().has_more(), "three rows exceed one page");
     let one = reader.charged_bytes().expect("first cursor charge");
     assert!(one > baseline, "hydrated rows retain a nonzero charge");
     let second = reader
         .open_cursor(query, &HashMap::new())
         .expect("second cursor");
-    assert!(second.first_page().has_more);
+    assert!(second.first_page().has_more());
     let two = reader.charged_bytes().expect("both cursor charges");
     assert!(
         two >= one,
@@ -58,7 +63,19 @@ fn public_charged_bytes_reports_and_releases_cursor_hydration_on_both_routes() {
     exercise(&owner_reader, ReadRoute::Owner);
     drop(owner_reader);
     writer.close().expect("close writer for file route");
+    let before_session = contextdb_engine::memory_accounting::process_aggregate_bytes_for_test();
     let file_reader =
         ReadSession::open_with_options(&path, options).expect("open committed file route");
     exercise(&file_reader, ReadRoute::File);
+    let (_, _, _, physical) = file_reader
+        .file_memory_for_test()
+        .expect("file account observation");
+    drop(file_reader);
+    assert_eq!(
+        contextdb_engine::memory_accounting::process_aggregate_bytes_for_test(),
+        before_session,
+        "dropping the session releases its complete parent charge"
+    );
+    assert!(physical.is_physically_freed());
+    assert!(physical.accountant_is_physically_freed());
 }

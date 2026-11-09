@@ -42,7 +42,7 @@ fn body(db: &Database, id: Uuid) -> Option<String> {
         &HashMap::from([("id".to_string(), Value::Uuid(id))]),
     )
     .expect("read exact note")
-    .rows
+    .rows()
     .first()
     .map(|row| match &row[0] {
         Value::Text(body) => body.clone(),
@@ -88,7 +88,8 @@ fn open_edge(
         db.clone(),
         &peer_dial_spec(hub_ticket, &identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     (db, client)
 }
 
@@ -108,11 +109,10 @@ async fn start_hub(root: &Path, tenant: &str) -> Hub {
     let db = Arc::new(Database::open(root.join("hub.db")).expect("open file-backed hub"));
     db.execute(DDL, &HashMap::new())
         .expect("hub solely declares the two-way notes table");
-    let server = Arc::new(SyncServer::new(
-        db.clone(),
-        &endpoint,
-        TenantId::from(tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::new(db.clone(), &endpoint, TenantId::from(tenant))
+            .expect("construct SyncServer fixture"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -159,7 +159,8 @@ async fn fresh_same_key_insert_after_authoritative_purge_starts_new_lineage_and_
         edge.clone(),
         &peer_dial_spec(&hub.ticket, &edge_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
 
     within(client.pull_default())
         .await
@@ -373,7 +374,7 @@ async fn fresh_same_key_insert_after_authoritative_purge_starts_new_lineage_and_
             &HashMap::from([("id".to_string(), Value::Uuid(selected_id))]),
         )
         .expect("the hub purges the new life at the purged key");
-    assert_eq!(second_purge.rows_affected, 1);
+    assert_eq!(second_purge.rows_affected(), 1);
     assert_eq!(body(&hub.db, selected_id), None);
     assert_eq!(
         hub.db

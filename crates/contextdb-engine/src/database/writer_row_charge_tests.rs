@@ -19,7 +19,15 @@ fn repeated_trigger_bound_replacement_releases_prior_staged_row_charge() {
         ]),
     )
     .unwrap();
-    let row_id = db.relational_store.tables.read()["generation"][0].row_id;
+    let row_id = db
+        .row_id_for_natural_key_full(
+            "generation",
+            &NaturalKey::single("id".into(), Value::Uuid(id)),
+            db.snapshot_for_read(),
+            db.declared_reader_memory().unwrap(),
+        )
+        .unwrap()
+        .expect("the committed durable row exists");
     let meta = db.table_meta("generation").unwrap();
     assert_eq!(
         db.writer_memory_ownership_receipt_for_test()

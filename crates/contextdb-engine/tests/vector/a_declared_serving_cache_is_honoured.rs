@@ -19,9 +19,9 @@ fn shown(db: &Database) -> Value {
     let result = db
         .execute("SHOW VECTOR_SERVING_CACHE", &empty())
         .expect("the declared serving cache size is inspectable");
-    assert_eq!(result.columns, vec!["bytes"]);
+    assert_eq!(result.columns(), vec!["bytes"]);
     result
-        .rows
+        .rows()
         .first()
         .and_then(|row| row.first())
         .cloned()

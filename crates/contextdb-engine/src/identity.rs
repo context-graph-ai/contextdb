@@ -13,13 +13,19 @@ use std::path::Path;
 
 /// A machine's fabric identity: a persisted ed25519 keypair.
 pub struct FabricIdentity {
+    #[cfg_attr(not(feature = "sync-orchestration"), allow(dead_code))]
     seed: [u8; 32],
 }
 
+#[cfg_attr(not(feature = "sync-orchestration"), allow(dead_code))]
 impl FabricIdentity {
     /// Load the identity stored at `path`, or generate one and persist it
     /// there (owner-only file permissions). The same path always yields the
     /// same identity.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn load_or_generate(path: &Path) -> contextdb_core::Result<Self> {
         if path.exists() {
             return Self::load(path);
@@ -29,24 +35,36 @@ impl FabricIdentity {
         Ok(identity)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn load(path: &Path) -> contextdb_core::Result<Self> {
-        let bytes = std::fs::read(path)
-            .map_err(|_| Error::SyncError("cannot read fabric identity file".to_string()))?;
+        let bytes = std::fs::read(path).map_err(|_| {
+            Error::SyncError(("cannot read fabric identity file".to_string()).into())
+        })?;
         let seed: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-            Error::SyncError(format!(
-                "fabric identity file is corrupt: expected 32 secret-seed bytes, found {}",
-                bytes.len()
-            ))
+            Error::SyncError(
+                (format!(
+                    "fabric identity file is corrupt: expected 32 secret-seed bytes, found {}",
+                    bytes.len()
+                ))
+                .into(),
+            )
         })?;
         Ok(Self { seed })
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn persist(&self, path: &Path) -> contextdb_core::Result<()> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
             std::fs::create_dir_all(parent).map_err(|_| {
-                Error::SyncError("cannot create fabric identity directory".to_string())
+                Error::SyncError(("cannot create fabric identity directory".to_string()).into())
             })?;
         }
         let mut options = std::fs::OpenOptions::new();
@@ -56,11 +74,12 @@ impl FabricIdentity {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options
-            .open(path)
-            .map_err(|_| Error::SyncError("cannot create fabric identity file".to_string()))?;
-        file.write_all(&self.seed)
-            .map_err(|_| Error::SyncError("cannot write fabric identity file".to_string()))?;
+        let mut file = options.open(path).map_err(|_| {
+            Error::SyncError(("cannot create fabric identity file".to_string()).into())
+        })?;
+        file.write_all(&self.seed).map_err(|_| {
+            Error::SyncError(("cannot write fabric identity file".to_string()).into())
+        })?;
         Ok(())
     }
 
@@ -94,10 +113,22 @@ impl FabricIdentity {
     pub(crate) fn sign_lineage(&self, bytes: &[u8]) -> Vec<u8> {
         use ed25519_dalek::Signer as _;
 
+        #[cfg(test)]
+        PAGING_SIGNATURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         ed25519_dalek::SigningKey::from_bytes(&self.seed)
             .sign(bytes)
             .to_bytes()
             .to_vec()
+    }
+
+    /// Native sibling: the original fabric seed, with a stack-only signature.
+    pub(crate) fn sign_lineage_fixed(&self, bytes: &[u8]) -> [u8; 64] {
+        use ed25519_dalek::Signer as _;
+        #[cfg(test)]
+        PAGING_SIGNATURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ed25519_dalek::SigningKey::from_bytes(&self.seed)
+            .sign(bytes)
+            .to_bytes()
     }
 
     /// Sign as this identity from a test that stands in for a peer holding
@@ -111,6 +142,10 @@ impl FabricIdentity {
     /// Verify a lineage signature using the creator identity carried on the
     /// wire.  `node_id` is the lowercase hex Ed25519 public key used by the
     /// fabric, so verification never needs a local key registry.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn verify_lineage_by_node_id(
         node_id: &str,
         bytes: &[u8],
@@ -120,25 +155,43 @@ impl FabricIdentity {
 
         let public_bytes = hex_node_id(node_id)?;
         let verifying = ed25519_dalek::VerifyingKey::from_bytes(&public_bytes).map_err(|err| {
-            Error::SyncError(format!("invalid lineage author node identity: {err}"))
+            Error::SyncError((format!("invalid lineage author node identity: {err}")).into())
         })?;
         let signature = ed25519_dalek::Signature::from_slice(signature).map_err(|err| {
-            Error::SyncError(format!("invalid lineage signature encoding: {err}"))
+            Error::SyncError((format!("invalid lineage signature encoding: {err}")).into())
         })?;
+        let proof =
+            crate::custody::signature_work::digest(&public_bytes, bytes, &signature.to_bytes());
+        if crate::custody::signature_work::known(&proof) {
+            return Ok(());
+        }
+        #[cfg(test)]
+        PAGING_VERIFICATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         verifying.verify(bytes, &signature).map_err(|_| {
             Error::SyncError(
-                "wire row lineage signature does not verify for its author".to_string(),
+                ("wire row lineage signature does not verify for its author".to_string()).into(),
             )
+        })?;
+        crate::custody::signature_work::remember(proof).map_err(|failure| match failure {
+            crate::custody::native_selection::Failure::Refused(refusal) => {
+                Error::NativeEngineOther(refusal)
+            }
+            _ => Error::Other("signature proof admission failed".into()),
         })
     }
 
     /// The raw ed25519 secret seed, handed only to this crate's transport
     /// adapter. Never logged, synced, or exposed to embedding callers.
+    #[cfg(feature = "sync-orchestration")]
     pub(crate) fn secret_seed(&self) -> [u8; 32] {
         self.seed
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn hex_node_id(node_id: &str) -> contextdb_core::Result<[u8; 32]> {
     if node_id.len() != 64
         || !node_id
@@ -146,17 +199,70 @@ fn hex_node_id(node_id: &str) -> contextdb_core::Result<[u8; 32]> {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
     {
         return Err(Error::SyncError(
-            "lineage author node identity must be 32 lowercase hex bytes".to_string(),
+            ("lineage author node identity must be 32 lowercase hex bytes".to_string()).into(),
         ));
     }
     let mut bytes = [0u8; 32];
     for (index, pair) in node_id.as_bytes().chunks_exact(2).enumerate() {
         let text = std::str::from_utf8(pair).map_err(|_| {
-            Error::SyncError("lineage author node identity is not valid hex".to_string())
+            Error::SyncError(("lineage author node identity is not valid hex".to_string()).into())
         })?;
         bytes[index] = u8::from_str_radix(text, 16).map_err(|_| {
-            Error::SyncError("lineage author node identity is not valid hex".to_string())
+            Error::SyncError(("lineage author node identity is not valid hex".to_string()).into())
         })?;
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+pub(crate) static PAGING_SIGNATURES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static PAGING_VERIFICATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+static PAGING_WORK_LIMIT: std::sync::Mutex<Option<(usize, usize, usize, usize)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) struct PagingWorkLimit;
+#[cfg(test)]
+impl PagingWorkLimit {
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn arm(
+        sign_start: usize,
+        verify_start: usize,
+        records: usize,
+        verify_limit: usize,
+    ) -> Self {
+        let mut limit = PAGING_WORK_LIMIT.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(limit.is_none(), "only one paging work guard is active");
+        *limit = Some((sign_start, verify_start, records, verify_limit));
+        Self
+    }
+}
+#[cfg(test)]
+impl Drop for PagingWorkLimit {
+    fn drop(&mut self) {
+        *PAGING_WORK_LIMIT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+#[cfg(test)]
+pub(crate) fn check_paging_work_limit() {
+    let limit = *PAGING_WORK_LIMIT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((sign_start, verify_start, records, verify_limit)) = limit {
+        let verifications =
+            PAGING_VERIFICATIONS.load(std::sync::atomic::Ordering::Relaxed) - verify_start;
+        let signatures = PAGING_SIGNATURES.load(std::sync::atomic::Ordering::Relaxed) - sign_start;
+        assert!(
+            verifications <= verify_limit,
+            "bounded signed-component verifications: {verifications} > {verify_limit}"
+        );
+        assert!(
+            signatures <= records,
+            "one certificate signing per delivered record: {signatures} for {records}"
+        );
+    }
 }

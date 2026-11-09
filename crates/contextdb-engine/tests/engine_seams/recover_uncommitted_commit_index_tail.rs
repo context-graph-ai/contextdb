@@ -50,7 +50,7 @@ fn writable_recovery_truncates_only_commit_index_entries_past_the_committed_lsn(
         recovered
             .execute("SELECT id FROM rows", &HashMap::new())
             .expect("committed row remains readable")
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(7)]]
     );
     recovered.close().expect("close recovered owner");
@@ -58,7 +58,7 @@ fn writable_recovery_truncates_only_commit_index_entries_past_the_committed_lsn(
     assert_eq!(
         file.execute("SELECT id FROM rows", &HashMap::new())
             .expect("complete file read after recovery")
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(7)]]
     );
 }

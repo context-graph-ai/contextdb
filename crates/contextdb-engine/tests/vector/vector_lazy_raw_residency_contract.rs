@@ -5,6 +5,10 @@
 use contextdb_core::read_contract::{DeadlineClock, DeadlineWait, ReadLimits};
 use contextdb_core::{ContextId, Error, RowId, Value, VectorIndexRef, VectorPartitionKey};
 use contextdb_engine::executor::bounded_read_test_support as bounded;
+use contextdb_engine::vector_read_memory::{
+    take_reader_budget_ledger_for_test as take_budget_ledger_for_test,
+    watch_reader_budget_ledger_for_test as watch_budget_ledger_for_test,
+};
 use contextdb_engine::{Database, MaintenancePolicy, QueryResult};
 use serial_test::serial;
 use std::collections::{BTreeSet, HashMap};
@@ -16,7 +20,6 @@ const ROWS_PER_PARTITION: usize = 24;
 const MANY_PARTITIONS: usize = 6;
 const MANY_ROWS_PER_PARTITION: usize = 200;
 const MANY_VECTOR_DIMENSION: usize = 128;
-const MAX_MAINTENANCE_CYCLES: usize = 64;
 
 /// Scopes seeded for the two-column lang-filtered candidate-derivation
 /// fixture below (`open_lang_residency_fixture`).
@@ -87,24 +90,6 @@ fn seed_partition(db: &Database, scope: Uuid, first: Uuid, axis: usize) {
     }
 }
 
-fn drive_maintenance_until_ready(db: &Database, expected_partitions: usize) {
-    for _ in 0..MAX_MAINTENANCE_CYCLES {
-        let infos = db
-            .vector_store_for_test()
-            .partition_infos(&index())
-            .unwrap();
-        if infos.len() == expected_partitions && infos.iter().all(|info| info.graph_available) {
-            return;
-        }
-        db.run_maintenance_cycle()
-            .expect("one finite caller-driven maintenance cycle returns");
-    }
-    panic!(
-        "maintenance did not publish {expected_partitions} routes within \
-         {MAX_MAINTENANCE_CYCLES} cycles"
-    );
-}
-
 fn bounded_request(sql: &str, bound: HashMap<String, Value>) -> bounded::BoundedReadRequest {
     bounded::BoundedReadRequest::new(
         sql,
@@ -126,29 +111,18 @@ fn bounded_request(sql: &str, bound: HashMap<String, Value>) -> bounded::Bounded
 
 fn result_ids(result: &QueryResult) -> Vec<Uuid> {
     let id_column = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "id" || column.ends_with(".id"))
         .expect("vector result projects its id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(id_column) {
             Some(Value::Uuid(id)) => *id,
             other => panic!("vector result id is UUID, got {other:?}"),
         })
         .collect()
-}
-
-fn row_id_for_uuid(db: &Database, id: Uuid) -> RowId {
-    db.scan("raw_residency_items", db.snapshot())
-        .expect("scan the deterministic relational fixture")
-        .into_iter()
-        .find_map(|row| match row.values.get("id") {
-            Some(Value::Uuid(found)) if *found == id => Some(row.row_id),
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("raw-residency row {id} exists"))
 }
 
 fn many_scope(ordinal: usize) -> Uuid {
@@ -209,13 +183,13 @@ fn search(db: &Database, scope: Uuid, axis: usize, mode: &str) {
             ]),
         )
         .unwrap_or_else(|error| panic!("{mode} selected-partition search failed: {error}"));
-    assert_eq!(result.rows.len(), 3);
+    assert_eq!(result.rows().len(), 3);
     let embedding = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "embedding" || column.ends_with(".embedding"))
         .expect("projected embedding column exists");
-    assert!(result.rows.iter().all(|row| {
+    assert!(result.rows().iter().all(|row| {
         matches!(row.get(embedding), Some(Value::Vector(vector)) if vector.len() == 32)
     }));
 }
@@ -242,7 +216,6 @@ fn reopen_and_selected_queries_keep_raw_vector_residency_partition_local() {
         .expect("create partitioned raw-vector fixture");
         seed_partition(&db, alpha, Uuid::from_u128(0xA100_0000), 0);
         seed_partition(&db, bravo, Uuid::from_u128(0xB200_0000), 1);
-        drive_maintenance_until_ready(&db, 2);
         db.close().expect("close maintained fixture");
     }
 
@@ -258,18 +231,21 @@ fn reopen_and_selected_queries_keep_raw_vector_residency_partition_local() {
     );
 
     search(&db, alpha, 0, "EXACT");
-    assert!(raw_resident(&db, alpha));
+    assert!(
+        !raw_resident(&db, alpha),
+        "EXACT streams the selected bodies"
+    );
     assert!(!raw_resident(&db, bravo));
     assert_eq!(
         db.vector_store_for_test()
             .resident_raw_partition_count_for_test(),
-        1
+        0
     );
 
     assert!(
-        db.vector_store_for_test()
+        !db.vector_store_for_test()
             .evict_raw_partition_for_test(&index(), &partition(alpha)),
-        "an idle raw partition returns its resident body and charge"
+        "a streamed read leaves no whole partition to evict"
     );
     assert!(!raw_resident(&db, alpha));
     assert_eq!(
@@ -279,7 +255,7 @@ fn reopen_and_selected_queries_keep_raw_vector_residency_partition_local() {
     );
 
     let activity_before_indexed = db.__vector_passive_activity_counters_for_test();
-    search(&db, bravo, 1, "INDEXED");
+    search(&db, bravo, 1, "AUTO");
     let activity_after_indexed = db.__vector_passive_activity_counters_for_test();
     assert!(!raw_resident(&db, alpha));
     assert!(!raw_resident(&db, bravo));
@@ -287,281 +263,18 @@ fn reopen_and_selected_queries_keep_raw_vector_residency_partition_local() {
         db.vector_store_for_test()
             .resident_raw_partition_count_for_test(),
         0,
-        "INDEXED keeps both selected and sibling raw partitions directory-only"
+        "AUTO keeps both selected and sibling raw partitions directory-only"
     );
     assert_eq!(
         activity_after_indexed.raw_partition_loads, activity_before_indexed.raw_partition_loads,
-        "INDEXED must not disguise candidate scoring as one complete partition load"
+        "AUTO must not disguise candidate scoring as one complete partition load"
     );
-}
-
-#[test]
-#[serial]
-fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
-    let root = TempDir::new().expect("temporary many-partition store directory");
-    let path = root.path().join("indexed-candidate-point-load.redb");
-    let replaced = many_id(0, 0);
-    let stable_nearest = many_id(0, 1);
-
-    {
-        let db = Database::open(&path).expect("open many-partition fixture");
-        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-        db.execute(
-            &format!(
-                "CREATE TABLE raw_residency_items (\
-                 id UUID PRIMARY KEY, \
-                 scope_id UUID NOT NULL, \
-                 embedding VECTOR({MANY_VECTOR_DIMENSION}) PARTITION_KEY (scope_id) \
-                    MAX_PARTITIONS 8 SEARCH_MODE AUTO AUTO_INDEX_AT 1000\
-                 )"
-            ),
-            &empty(),
-        )
-        .expect("create the many-partition vector table");
-        for partition_ordinal in 0..MANY_PARTITIONS {
-            seed_many_partition(&db, partition_ordinal);
-        }
-        drive_maintenance_until_ready(&db, MANY_PARTITIONS);
-        db.close().expect("close the maintained fixture");
-    }
-
-    let db = Database::open(&path).expect("reopen with dormant raw bodies and graph generations");
-    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-    for partition_ordinal in 0..MANY_PARTITIONS {
-        let route = contextdb_vector::VectorPartitionRef::new(
-            index(),
-            partition(many_scope(partition_ordinal)),
-        );
-        assert!(
-            db.vector_store_for_test()
-                .preload_dormant_partition_generation(&route, true)
-                .expect("preload one saved base graph"),
-            "partition {partition_ordinal} starts with one dormant saved base"
-        );
-    }
-    assert_eq!(
-        db.vector_store_for_test()
-            .resident_raw_partition_count_for_test(),
-        0,
-        "loading graph generations does not load raw vectors"
-    );
-
-    let replaced_row_id = row_id_for_uuid(&db, replaced);
-    let old_snapshot = db.snapshot();
-    let old_pin = db.pin_snapshot(old_snapshot);
-    db.execute(
-        "UPDATE raw_residency_items SET embedding = $embedding WHERE id = $id",
-        &params([
-            ("embedding", Value::Vector(many_vector(1))),
-            ("id", Value::Uuid(replaced)),
-        ]),
-    )
-    .expect("replace the nearest vector after retaining its old snapshot");
-    let new_snapshot = db.snapshot();
-
-    let query = params([("query", Value::Vector(many_vector(0)))]);
-    let exact_sql = "SELECT id FROM raw_residency_items \
-                     ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 2";
-    let old_exact = db
-        .execute_at_snapshot(exact_sql, &query, old_snapshot)
-        .expect("exact old-snapshot control reads the original body");
-    let new_exact = db
-        .execute_at_snapshot(exact_sql, &query, new_snapshot)
-        .expect("exact current-snapshot control reads the replacement body");
-    assert_eq!(result_ids(&old_exact).first(), Some(&replaced));
-    assert_eq!(result_ids(&new_exact).first(), Some(&stable_nearest));
-
-    let evicted = db.vector_store_for_test().evict_reloadable_raw_partitions();
-    assert_eq!(evicted, MANY_PARTITIONS);
-    assert_eq!(
-        db.vector_store_for_test()
-            .resident_raw_partition_count_for_test(),
-        0
-    );
-
-    let reloaded_old_exact = db
-        .execute_at_snapshot(exact_sql, &query, old_snapshot)
-        .expect("bulk exact reload preserves the historical replacement body");
-    let reloaded_new_exact = db
-        .execute_at_snapshot(exact_sql, &query, new_snapshot)
-        .expect("bulk exact reload preserves the current replacement body");
-    assert_eq!(reloaded_old_exact.rows, old_exact.rows);
-    assert_eq!(reloaded_new_exact.rows, new_exact.rows);
-    assert_eq!(
-        db.vector_store_for_test()
-            .resident_raw_partition_count_for_test(),
-        MANY_PARTITIONS
-    );
-    assert_eq!(
-        db.vector_store_for_test().evict_reloadable_raw_partitions(),
-        MANY_PARTITIONS
-    );
-
-    let bytes_per_f32_body = MANY_VECTOR_DIMENSION * std::mem::size_of::<f32>();
-    let minimum_bulk_reservation =
-        MANY_ROWS_PER_PARTITION * bytes_per_f32_body * 2 + bytes_per_f32_body * 2;
-    let point_reservation = bytes_per_f32_body * 4;
-    assert!(
-        point_reservation < minimum_bulk_reservation,
-        "one point body must fit where no complete partition can"
-    );
-    let settled_usage = db.accountant().usage().used;
-    db.set_memory_limit(Some(settled_usage + minimum_bulk_reservation - 1))
-        .expect("leave enough database memory for point scoring but not a bulk raw load");
-    let settled_usage = db.accountant().usage().used;
-    let activity_before = db.__vector_passive_activity_counters_for_test();
-    let ownership_before = db.vector_memory_ownership_receipt_for_test();
-    let mut observed_graph_candidates = 0_u64;
-    let mut observed_unique_candidates = 0_u64;
-
-    // Check the raw-load refusal while the fixture still owns every preloaded
-    // graph. Broad indexed reads below release that ownership as they finish,
-    // making the same memory cap less restrictive for later ordinary work.
-    let bulk_error = db
-        .execute_at_snapshot(exact_sql, &query, new_snapshot)
-        .expect_err("the same memory ceiling must reject every complete raw-partition load");
-    assert!(
-        matches!(
-            &bulk_error,
-            Error::MemoryBudgetExceeded { operation, .. }
-                if operation == "load_raw_vector_partition"
-        ),
-        "the control must fail specifically at bulk raw-vector admission: {bulk_error:?}"
-    );
-
-    for (snapshot, exact) in [(old_snapshot, &old_exact), (new_snapshot, &new_exact)] {
-        for mode in ["AUTO", "INDEXED"] {
-            let sql = format!(
-                "SELECT id FROM raw_residency_items \
-                 ORDER BY embedding <=> $query USE VECTOR {mode} LIMIT 2"
-            );
-
-            db.__reset_last_query_vector_trace_for_test();
-            let ordinary = db
-                .execute_at_snapshot(&sql, &query, snapshot)
-                .unwrap_or_else(|error| panic!("ordinary {mode} candidate search failed: {error}"));
-            let ordinary_trace = db
-                .__take_last_query_vector_trace_for_test()
-                .expect("ordinary indexed route publishes a trace");
-            assert_eq!(ordinary.rows, exact.rows);
-            assert!(
-                ordinary_trace.used_hnsw,
-                "{mode} must use all maintained graphs"
-            );
-            assert!(
-                ordinary_trace
-                    .hnsw_candidate_row_ids
-                    .contains(&replaced_row_id),
-                "the old base must still nominate the replaced row"
-            );
-            observed_graph_candidates = observed_graph_candidates
-                .saturating_add(ordinary_trace.hnsw_candidate_row_ids.len() as u64);
-            observed_unique_candidates = observed_unique_candidates.saturating_add(
-                ordinary_trace
-                    .hnsw_candidate_row_ids
-                    .iter()
-                    .collect::<std::collections::HashSet<_>>()
-                    .len() as u64,
-            );
-
-            db.__reset_last_query_vector_trace_for_test();
-            let bounded = db
-                .__with_snapshot_override_for_test(snapshot, || {
-                    bounded::execute(&db, &bounded_request(&sql, query.clone()))
-                })
-                .unwrap_or_else(|error| {
-                    panic!("bounded {mode} candidate search failed: {error:?}")
-                });
-            let bounded_trace = db
-                .__take_last_query_vector_trace_for_test()
-                .expect("bounded indexed route publishes a trace");
-            assert_eq!(bounded.result.rows, exact.rows);
-            assert_eq!(bounded.result.rows, ordinary.rows);
-            assert!(
-                bounded_trace.used_hnsw,
-                "bounded {mode} must use maintained graphs"
-            );
-            observed_graph_candidates = observed_graph_candidates
-                .saturating_add(bounded_trace.hnsw_candidate_row_ids.len() as u64);
-            observed_unique_candidates = observed_unique_candidates.saturating_add(
-                bounded_trace
-                    .hnsw_candidate_row_ids
-                    .iter()
-                    .collect::<std::collections::HashSet<_>>()
-                    .len() as u64,
-            );
-        }
-    }
-
-    let activity_after = db.__vector_passive_activity_counters_for_test();
-    let point_loads = activity_after
-        .raw_candidate_point_loads
-        .saturating_sub(activity_before.raw_candidate_point_loads);
-    let point_body_bytes = activity_after
-        .raw_candidate_point_body_bytes
-        .saturating_sub(activity_before.raw_candidate_point_body_bytes);
-    assert_eq!(
-        activity_after.raw_partition_loads,
-        activity_before.raw_partition_loads
-    );
-    assert!(
-        point_loads > 0,
-        "the versioned graph candidate must use the point loader"
-    );
-    // The one search scores its candidates nearest first and stops once the
-    // page cannot change, so it point-loads the rows it returns and never more
-    // than the distinct candidates its graph walk handed back, each once.
-    assert!(
-        (1..=observed_unique_candidates).contains(&point_loads),
-        "native scoring point-loads only distinct visible graph candidates, each once: \
-         {point_loads} point loads for {observed_unique_candidates} distinct candidates"
-    );
-    assert!(
-        point_loads <= observed_graph_candidates,
-        "point reads are bounded by graph candidates: {point_loads} > {observed_graph_candidates}"
-    );
-    assert_eq!(point_body_bytes, point_loads * bytes_per_f32_body as u64);
-    assert_eq!(
-        db.vector_store_for_test()
-            .resident_raw_partition_count_for_test(),
-        0,
-        "candidate scoring never installs a complete raw partition"
-    );
-    let ownership_after = db.vector_memory_ownership_receipt_for_test();
-    assert_eq!(ownership_after.raw_vector_bodies, 0);
-    assert_eq!(
-        ownership_after.temporary_workspace,
-        ownership_before.temporary_workspace
-    );
-    let graph_bytes =
-        |ownership: &contextdb_engine::database::VectorMemoryOwnershipReceiptForTest| {
-            ownership.base_graph
-                + ownership.change_graph
-                + ownership.mutable_tail
-                + ownership.retired_pinned_graph_bytes
-        };
-    assert_eq!(
-        graph_bytes(&ownership_after),
-        graph_bytes(&ownership_before),
-        "without a memory limit, broad reads keep their reusable graphs resident"
-    );
-    assert_eq!(db.accountant().usage().used, settled_usage);
-    eprintln!(
-        "indexed_candidate_memory_receipt partitions={MANY_PARTITIONS} rows={} \
-         graph_candidates={observed_graph_candidates} unique_candidates={observed_unique_candidates} \
-         point_loads={point_loads} point_body_bytes={point_body_bytes} raw_partition_load_delta=0 \
-         resident_raw_partitions=0 bulk_reservation_bytes={minimum_bulk_reservation}",
-        MANY_PARTITIONS * MANY_ROWS_PER_PARTITION,
-    );
-    drop(old_pin);
 }
 
 /// When the automatic route compares rows exhaustively, it answers inside the
 /// memory the database declared by reading each stored vector through its own
 /// point read, instead of loading a whole partition of vectors it has no room
-/// for. An exhaustive search the caller asked for outright is the control:
-/// the same ceiling refuses its complete-partition load with the typed memory
-/// refusal, which proves no whole partition fits.
+/// for. Explicit EXACT has the same streamed-body and bounded-score contract.
 #[test]
 #[serial]
 fn auto_exhaustive_find_answers_inside_memory_that_cannot_hold_a_partition() {
@@ -613,32 +326,67 @@ fn auto_exhaustive_find_answers_inside_memory_that_cannot_hold_a_partition() {
     );
 
     let bytes_per_f32_body = MANY_VECTOR_DIMENSION * std::mem::size_of::<f32>();
-    let minimum_bulk_reservation =
-        MANY_ROWS_PER_PARTITION * bytes_per_f32_body * 2 + bytes_per_f32_body * 2;
+    const QUERY_WORKSPACE_BYTES: usize = 64 * 1024;
+    assert_eq!(MANY_ROWS_PER_PARTITION * bytes_per_f32_body, 102400);
     let settled_usage = db.accountant().usage().used;
-    db.set_memory_limit(Some(settled_usage + minimum_bulk_reservation - 1))
+    db.set_memory_limit(Some(settled_usage))
         .expect("leave room for one stored vector at a time but not a whole partition");
     let settled_usage = db.accountant().usage().used;
 
-    let refused = db
+    let activity_before = db.__vector_passive_activity_counters_for_test();
+    watch_budget_ledger_for_test();
+    let streamed_exact = db
+        .read_session(ReadLimits {
+            memory: QUERY_WORKSPACE_BYTES as u64,
+            ..ReadLimits::default()
+        })
+        .unwrap()
         .execute(exact_sql, &query)
-        .expect_err("no whole partition fits under this ceiling");
-    assert!(
-        matches!(
-            &refused,
-            Error::MemoryBudgetExceeded { operation, .. }
-                if operation == "load_raw_vector_partition"
-        ),
-        "the control is refused at the complete-partition load: {refused:?}"
-    );
+        .expect("EXACT streams inside the body and score workspace");
+    let exact_ledger = take_budget_ledger_for_test();
+    assert_streamed_body_charges(&exact_ledger, 1200);
+    assert_score_workspace(&exact_ledger, true);
+    assert_eq!(streamed_exact.rows(), exact.rows());
+    watch_budget_ledger_for_test();
 
-    let auto = db.execute(auto_sql, &query).unwrap_or_else(|error| {
-        panic!(
-            "the automatic exhaustive find must answer inside the declared memory by reading \
+    let auto = db
+        .read_session(ReadLimits {
+            memory: QUERY_WORKSPACE_BYTES as u64,
+            ..ReadLimits::default()
+        })
+        .unwrap()
+        .execute(auto_sql, &query)
+        .unwrap_or_else(|error| {
+            panic!(
+                "the automatic exhaustive find must answer inside the declared memory by reading \
              one stored vector at a time, not load a whole partition: {error:?}"
-        )
-    });
-    assert_eq!(auto.rows, exact.rows, "the automatic route answers exactly");
+            )
+        });
+    let auto_ledger = take_budget_ledger_for_test();
+    assert_streamed_body_charges(&auto_ledger, 1200);
+    assert_score_workspace(&auto_ledger, true);
+    let activity_after = db.__vector_passive_activity_counters_for_test();
+    assert_eq!(
+        activity_after.raw_partition_loads,
+        activity_before.raw_partition_loads
+    );
+    assert_eq!(
+        activity_after.raw_candidate_point_loads - activity_before.raw_candidate_point_loads,
+        2400
+    );
+    assert_eq!(
+        activity_after.raw_candidate_point_body_bytes
+            - activity_before.raw_candidate_point_body_bytes,
+        1228800
+    );
+    let ownership = db.vector_memory_ownership_receipt_for_test();
+    assert_eq!(ownership.raw_vector_bodies, 0);
+    assert_eq!(ownership.temporary_workspace, 0);
+    assert_eq!(
+        auto.rows(),
+        exact.rows(),
+        "the automatic route answers exactly"
+    );
     assert_eq!(
         db.vector_store_for_test()
             .resident_raw_partition_count_for_test(),
@@ -676,9 +424,13 @@ fn lang_scope(partition_ordinal: usize) -> Uuid {
 /// Encodes its own partition ordinal, exactly as `many_id` does: decoded by
 /// `lang_partition_ordinal_of` below.
 fn lang_id(partition_ordinal: usize, ordinal: usize) -> Uuid {
+    lang_id_sized(partition_ordinal, ordinal, LANG_ROWS_PER_PARTITION)
+}
+
+fn lang_id_sized(partition_ordinal: usize, ordinal: usize, rows_per_partition: usize) -> Uuid {
     Uuid::from_u128(
         0xCA21_0000_0000_0000_0000_0000_0000_0000
-            + (partition_ordinal * LANG_ROWS_PER_PARTITION + ordinal) as u128,
+            + (partition_ordinal * rows_per_partition + ordinal) as u128,
     )
 }
 
@@ -729,38 +481,16 @@ fn insert_lang_row(db: &Database, id: Uuid, scope: Uuid, embedding: Vec<f32>) {
     .expect("insert one lang-residency fixture row");
 }
 
-fn seed_lang_partition(db: &Database, partition_ordinal: usize) {
+fn seed_lang_partition(db: &Database, partition_ordinal: usize, rows_per_partition: usize) {
     let scope = lang_scope(partition_ordinal);
-    for ordinal in 0..LANG_ROWS_PER_PARTITION {
+    for ordinal in 0..rows_per_partition {
         insert_lang_row(
             db,
-            lang_id(partition_ordinal, ordinal),
+            lang_id_sized(partition_ordinal, ordinal, rows_per_partition),
             scope,
             lang_vector(partition_ordinal, ordinal),
         );
     }
-}
-
-fn drive_maintenance_until_ready_for_indices(
-    db: &Database,
-    expected_partitions: usize,
-    indices: &[VectorIndexRef],
-) {
-    for _ in 0..MAX_MAINTENANCE_CYCLES {
-        let ready = indices.iter().all(|index| {
-            let infos = db.vector_store_for_test().partition_infos(index).unwrap();
-            infos.len() == expected_partitions && infos.iter().all(|info| info.graph_available)
-        });
-        if ready {
-            return;
-        }
-        db.run_maintenance_cycle()
-            .expect("one finite caller-driven maintenance cycle returns");
-    }
-    panic!(
-        "maintenance did not publish {expected_partitions} routes for every index within \
-         {MAX_MAINTENANCE_CYCLES} cycles"
-    );
 }
 
 /// Opens the two-quantized-column lang-filtered fixture, seeds
@@ -771,6 +501,14 @@ fn drive_maintenance_until_ready_for_indices(
 /// starts with zero resident raw partitions, the same as this file's
 /// unquantized fixtures.
 fn open_lang_residency_fixture(with_lang_index: bool) -> (TempDir, Database) {
+    open_sized_lang_residency_fixture(with_lang_index, LANG_ROWS_PER_PARTITION)
+}
+
+/// The same fixture with `rows_per_partition` rows in each scope.
+fn open_sized_lang_residency_fixture(
+    with_lang_index: bool,
+    rows_per_partition: usize,
+) -> (TempDir, Database) {
     let root = TempDir::new().expect("temporary lang-residency directory");
     let path = root.path().join("lang-residency.db");
 
@@ -800,13 +538,8 @@ fn open_lang_residency_fixture(with_lang_index: bool) -> (TempDir, Database) {
             .expect("create the relational lang index");
         }
         for partition_ordinal in 0..LANG_PARTITIONS {
-            seed_lang_partition(&db, partition_ordinal);
+            seed_lang_partition(&db, partition_ordinal, rows_per_partition);
         }
-        drive_maintenance_until_ready_for_indices(
-            &db,
-            LANG_PARTITIONS,
-            &[index(), payload_index()],
-        );
         db.close()
             .expect("close the maintained lang-residency fixture");
     }
@@ -831,34 +564,11 @@ fn open_lang_residency_fixture(with_lang_index: bool) -> (TempDir, Database) {
         "an SQ8 partitioned column must reopen with zero resident raw partitions, \
          the same as this file's unquantized fixtures"
     );
-    // A reopened partition's saved base graph starts dormant; make it
-    // searchable the same way the file's many-partition fixture already
-    // does, before any query. Loading a graph generation never loads raw
-    // vector bodies (asserted again just below).
-    for partition_ordinal in 0..LANG_PARTITIONS {
-        let scope = lang_scope(partition_ordinal);
-        for target_index in [index(), payload_index()] {
-            let route = contextdb_vector::VectorPartitionRef::new(target_index, partition(scope));
-            assert!(
-                db.vector_store_for_test()
-                    .preload_dormant_partition_generation(&route, true)
-                    .expect("preload one saved base graph"),
-                "partition {partition_ordinal} of {:?} starts with one dormant saved base",
-                route.index
-            );
-            // A low AUTO_INDEX_AT plus this many rows can make maintenance
-            // publish an incremental change generation on top of the base.
-            // Preload it too when present; it is fine when there is none.
-            let _ = db
-                .vector_store_for_test()
-                .preload_dormant_partition_generation(&route, false);
-        }
-    }
     assert_eq!(
         db.vector_store_for_test()
             .resident_raw_partition_count_for_test(),
         0,
-        "loading graph generations must not load raw vectors"
+        "reopening and maintaining indexes must not load raw vectors"
     );
     (root, db)
 }
@@ -884,7 +594,9 @@ fn public_point_lookup_leaves_unrelated_quantized_partitions_dormant() {
         matches!(&row.values["payload_vec"], Value::Vector(v) if v.len() == MANY_VECTOR_DIMENSION)
     );
     let after = db.__vector_passive_activity_counters_for_test();
-    assert_eq!(after.raw_partition_loads - before.raw_partition_loads, 2);
+    assert_eq!(after.raw_partition_loads - before.raw_partition_loads, 0);
+    assert!(!raw_resident(&db, lang_scope(0)));
+    assert!(!payload_resident(&db, lang_scope(0)));
     for partition_ordinal in 1..LANG_PARTITIONS {
         assert!(!raw_resident(&db, lang_scope(partition_ordinal)));
         assert!(!payload_resident(&db, lang_scope(partition_ordinal)));
@@ -954,13 +666,14 @@ fn candidate_derivation_loads_no_untouched_vector_body() {
 /// modes `AUTO` and `INDEXED`.
 #[test]
 #[serial]
+#[allow(clippy::bool_assert_comparison)] // Preserve the existing test expression and its assertion contract.
 fn projecting_the_searched_column_loads_only_answer_partitions() {
     let (_root, db) = open_lang_residency_fixture(true);
     let query = params([("query", Value::Vector(lang_query(0)))]);
     let sql_template = "SELECT id, embedding FROM raw_residency_items WHERE lang = 'en' \
                          ORDER BY embedding <=> $query USE VECTOR {mode} LIMIT 3";
 
-    for mode in ["AUTO", "INDEXED"] {
+    for mode in ["AUTO", "EXACT"] {
         let sql = sql_template.replace("{mode}", mode);
 
         let ordinary = db
@@ -986,9 +699,8 @@ fn projecting_the_searched_column_loads_only_answer_partitions() {
             assert_eq!(
                 db.vector_store_for_test()
                     .raw_partition_resident_for_test(&index(), &partition(scope)),
-                expected_scopes.contains(&partition_ordinal),
-                "{mode} ordinary reader: embedding residency for scope {partition_ordinal} \
-                 must follow exactly whether the answer returned one of its rows"
+                false,
+                "{mode} ordinary reader: projected bodies are loaded on demand for scope {partition_ordinal}"
             );
         }
 
@@ -1009,11 +721,8 @@ fn projecting_the_searched_column_loads_only_answer_partitions() {
             assert_eq!(
                 db.vector_store_for_test()
                     .raw_partition_resident_for_test(&index(), &partition(scope)),
-                expected_scopes.contains(&partition_ordinal),
-                "{mode} bounded reader: embedding residency for scope {partition_ordinal} \
-                 must follow exactly whether the answer returned one of its rows; the bounded \
-                 kernel must not push the answer's own projected column demand into the \
-                 candidate scan"
+                false,
+                "{mode} bounded reader: projected bodies are loaded on demand for scope {partition_ordinal}"
             );
         }
     }
@@ -1068,7 +777,7 @@ fn subquery_under_the_candidate_filter_is_untouched() {
 
 /// A covering relational index supplies candidate identities without loading
 /// committed row bodies. The residual-filter control proves that the counter
-/// observes real materialization; the trace identifies the maintained graph.
+/// observes real materialization; the trace identifies the maintained index.
 #[test]
 #[serial]
 fn id_only_candidate_route_step_1_counter_and_trace() {
@@ -1076,12 +785,12 @@ fn id_only_candidate_route_step_1_counter_and_trace() {
     let query = params([("query", Value::Vector(lang_query(0)))]);
 
     let sql = "SELECT id FROM raw_residency_items WHERE lang = 'en' \
-               ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 3";
+               ORDER BY embedding <=> $query USE VECTOR AUTO LIMIT 3";
 
     let before = db.__candidate_derivation_counters_for_test();
     let result = db
         .execute(sql, &query)
-        .expect("INDEXED candidate search over a relationally indexed filter answers");
+        .expect("AUTO candidate search over a relationally indexed filter answers");
     let after = db.__candidate_derivation_counters_for_test();
 
     assert_eq!(
@@ -1090,26 +799,26 @@ fn id_only_candidate_route_step_1_counter_and_trace() {
         "a covering candidate route must hand off identities without materializing stored rows"
     );
 
-    assert_eq!(result.trace.physical_plan, "IndexScan -> HNSWSearch");
-    assert_eq!(result.trace.index_used.as_deref(), Some("lang_idx"));
+    assert_eq!(result.trace().physical_plan, "IndexScan -> VectorSearch");
+    assert_eq!(result.trace().index_used.as_deref(), Some("lang_idx"));
     assert!(
-        !result.trace.predicates_pushed.is_empty(),
+        !result.trace().predicates_pushed.is_empty(),
         "the id-only route must not construct a trace with predicates_pushed blanked"
     );
     assert!(
-        !result.trace.indexes_considered.is_empty(),
+        !result.trace().indexes_considered.is_empty(),
         "the id-only route must not construct a trace with indexes_considered blanked"
     );
     assert!(
-        result.trace.rows_examined > 0,
-        "an INDEXED filtered vector search must never report zero rows examined while real \
+        result.trace().rows_examined > 0,
+        "a filtered vector search must never report zero rows examined while real \
          posting work happened"
     );
     let before_residual = db.__candidate_derivation_counters_for_test();
     let residual = db
         .execute(
             "SELECT id FROM raw_residency_items WHERE lang = 'en' AND scope_id IS NOT NULL \
-         ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 3",
+         ORDER BY embedding <=> $query USE VECTOR AUTO LIMIT 3",
             &query,
         )
         .unwrap();
@@ -1142,8 +851,8 @@ fn composite_covering_index_supplies_vector_candidate_identities_without_row_bod
     ]);
     let sql = "SELECT id FROM raw_residency_items \
                WHERE lang = 'en' AND scope_id IN ($scope_0, $scope_1, $scope_2) \
-               ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 3";
-    let exact_sql = sql.replace("USE VECTOR INDEXED", "USE VECTOR EXACT");
+               ORDER BY embedding <=> $query USE VECTOR AUTO LIMIT 3";
+    let exact_sql = sql.replace("USE VECTOR AUTO", "USE VECTOR EXACT");
     let expected = db
         .execute(&exact_sql, &query)
         .expect("the exact route establishes the ranked answer");
@@ -1153,20 +862,20 @@ fn composite_covering_index_supplies_vector_candidate_identities_without_row_bod
         .expect("the bounded composite-index route answers");
     let after = db.__candidate_derivation_counters_for_test();
 
-    assert_eq!(bounded.result.rows, expected.rows);
+    assert_eq!(bounded.result.rows(), expected.rows());
     assert_eq!(
         after - before,
         0,
         "a fully pushed composite candidate index must hand off identities without row bodies"
     );
     assert_eq!(
-        bounded.result.trace.index_used.as_deref(),
+        bounded.result.trace().index_used.as_deref(),
         Some("lang_scope_idx")
     );
     assert_eq!(
         bounded
             .result
-            .trace
+            .trace()
             .predicates_pushed
             .iter()
             .map(|column| column.as_ref())
@@ -1212,21 +921,7 @@ fn composite_strict_range_fixture() -> (Database, Uuid) {
         )
         .expect("insert one strict composite-range candidate");
     }
-    let vector_index = VectorIndexRef::new("composite_range_candidates", "embedding");
-    for _ in 0..MAX_MAINTENANCE_CYCLES {
-        if db
-            .vector_store_for_test()
-            .partition_infos(&vector_index)
-            .expect("inspect the unpartitioned vector route")
-            .iter()
-            .any(|info| info.graph_available)
-        {
-            return (db, allowed_context);
-        }
-        db.run_maintenance_cycle()
-            .expect("one finite maintenance cycle publishes the graph");
-    }
-    panic!("maintenance did not publish the strict composite-range graph");
+    (db, allowed_context)
 }
 
 fn assert_strict_composite_range_matches_exact(
@@ -1241,7 +936,7 @@ fn assert_strict_composite_range_matches_exact(
         "SELECT id FROM composite_range_candidates WHERE {predicate} \
          ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 10"
     );
-    let indexed_sql = exact_sql.replace("USE VECTOR EXACT", "USE VECTOR INDEXED");
+    let indexed_sql = exact_sql.replace("USE VECTOR EXACT", "USE VECTOR AUTO");
 
     let exact = db
         .execute(&exact_sql, &query)
@@ -1385,22 +1080,6 @@ fn nullable_single_column_lower_ranges_match_exact_in_both_index_directions() {
                 .expect("insert the NULL-tail candidate closest to the query");
             }
         }
-        for _ in 0..MAX_MAINTENANCE_CYCLES {
-            db.run_maintenance_cycle()
-                .expect("publish the finite fixture graphs");
-            let all_ready = ["nullable_lower_range", "required_lower_range"]
-                .into_iter()
-                .all(|table| {
-                    db.vector_store_for_test()
-                        .partition_infos(&VectorIndexRef::new(table, "embedding"))
-                        .expect("inspect one unpartitioned vector route")
-                        .iter()
-                        .any(|info| info.graph_available)
-                });
-            if all_ready {
-                break;
-            }
-        }
 
         for operator in [">", ">="] {
             for (table, should_materialize) in [
@@ -1412,16 +1091,17 @@ fn nullable_single_column_lower_ranges_match_exact_in_both_index_directions() {
                     "SELECT id FROM {table} WHERE boundary {operator} 100 \
                      ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 10"
                 );
-                let indexed_sql = exact_sql.replace("USE VECTOR EXACT", "USE VECTOR INDEXED");
+                let indexed_sql = exact_sql.replace("USE VECTOR EXACT", "USE VECTOR AUTO");
                 let exact = db
                     .execute(&exact_sql, &query)
                     .expect("the exact route establishes SQL NULL semantics");
                 let before = db.__candidate_derivation_counters_for_test();
                 let indexed = bounded::execute(&db, &bounded_request(&indexed_sql, query))
-                    .expect("the directed indexed route answers");
+                    .expect("the directed AUTO route answers");
                 let materialized = db.__candidate_derivation_counters_for_test() - before;
                 assert_eq!(
-                    indexed.result.rows, exact.rows,
+                    indexed.result.rows(),
+                    exact.rows(),
                     "{direction} {operator} must agree with the explicit exact oracle for {table}"
                 );
                 assert!(
@@ -1594,7 +1274,7 @@ fn indexed_route_read_your_writes_inside_a_transaction() {
         Value::Vector(lang_query(MANY_VECTOR_DIMENSION - 1)),
     )]);
     let sql = "SELECT id FROM raw_residency_items WHERE lang = 'en' \
-               ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 3";
+               ORDER BY embedding <=> $query USE VECTOR AUTO LIMIT 3";
 
     // The staged vector uses an axis no committed vector is aligned with,
     // so native quantization cannot turn its first-place score into a tie.
@@ -1618,11 +1298,11 @@ fn indexed_route_read_your_writes_inside_a_transaction() {
     let before = db.__candidate_derivation_counters_for_test();
     let ordinary = db
         .execute(sql, &query)
-        .expect("ordinary INDEXED candidate search inside the transaction answers");
+        .expect("ordinary AUTO candidate search inside the transaction answers");
     let after = db.__candidate_derivation_counters_for_test();
 
     let bounded_result = bounded::execute(&db, &bounded_request(sql, query.clone()))
-        .expect("bounded INDEXED candidate search inside the transaction answers");
+        .expect("bounded AUTO candidate search inside the transaction answers");
 
     let ordinary_ids = result_ids(&ordinary);
     assert!(
@@ -1685,51 +1365,261 @@ fn id_shaped_candidate_fallback_resolves_a_staged_insert() {
         .expect("abandon the transaction");
 }
 
-/// `AUTO` refuses typed when its active limits cannot pay for exact
-/// scoring. Variant (i), ordinary reader: a `MEMORY_LIMIT` too small for the exact-score
-/// array must refuse identically to `INDEXED`'s refusal on the same
-/// variant, without materializing any `payload_vec` partition.
+/// Whether the ordinary reader and the bounded door both answer the statement
+/// under `memory` bytes.
+fn both_doors_admit(
+    db: &Database,
+    request: &mut bounded::BoundedReadRequest,
+    sql: &str,
+    query: &HashMap<String, Value>,
+    memory: u64,
+) -> bool {
+    request.limits.memory = memory;
+    db.read_session(request.limits)
+        .ok()
+        .is_some_and(|session| session.execute(sql, query).is_ok())
+        && bounded::execute(db, request).is_ok()
+}
+
+fn is_memory_refusal(error: &Error) -> bool {
+    use contextdb_core::read_contract::{ReadFailureDetail, ReadFailureKind, ReadFailureLimit};
+    matches!(error, Error::ReadFailure(failure)
+        if failure.kind() == ReadFailureKind::OwnerLimitExceeded
+        && matches!(failure.detail(), ReadFailureDetail::OwnerLimitExceeded(detail)
+            if detail.limit == ReadFailureLimit::Memory))
+}
+
+/// The smallest reader memory that answers `sql` on both doors: the reader's
+/// own budget ledger under a ceiling with room to spare gives an admitted upper
+/// bound, and admission itself decides the rest.
+fn streaming_ceiling(db: &Database, sql: &str, query: &HashMap<String, Value>) -> (u64, u64) {
+    let exact = db
+        .execute(&sql.replace("VECTOR AUTO", "VECTOR EXACT"), query)
+        .unwrap();
+    db.set_memory_limit(Some(db.accountant().usage().used))
+        .unwrap();
+    let mut request = bounded_request(sql, query.clone());
+    request.limits.memory = 64 * 1024 * 1024;
+    watch_budget_ledger_for_test();
+    let measured = bounded::execute(db, &request).expect("the streamed find answers with room");
+    assert_eq!(measured.result.rows(), exact.rows());
+    let events = take_budget_ledger_for_test();
+    let reader_events = || {
+        events
+            .iter()
+            .filter(|event| event.owner_identity != event.parent_identity)
+    };
+    // One storage page, as the reader's own ledger discloses its admission.
+    let page = reader_events()
+        .filter(|event| event.what == "bounded_read/read_storage_page")
+        .map(|event| event.bytes)
+        .max()
+        .expect("the streamed find admitted storage pages") as u64;
+    let mut admitted = reader_events()
+        .map(|event| event.used_after)
+        .max()
+        .expect("the streamed find charged its reader") as u64;
+    let mut refused_at = 1_u64;
+    assert!(!both_doors_admit(db, &mut request, sql, query, refused_at));
+    assert!(
+        both_doors_admit(db, &mut request, sql, query, admitted),
+        "the measured upper bound admits the streamed find on both doors"
+    );
+    while admitted - refused_at > 1 {
+        let middle = refused_at + (admitted - refused_at) / 2;
+        if both_doors_admit(db, &mut request, sql, query, middle) {
+            admitted = middle;
+        } else {
+            refused_at = middle;
+        }
+    }
+    (admitted, page)
+}
+
+/// A streamed top-k holds the same bytes however many candidates it scores; a
+/// held score array grows by one (row id, score) pair for each of them. The
+/// streaming cost is found on a small table, and the SAME ceiling must still
+/// answer on a table eight times larger -- whose score array alone no longer
+/// fits in it -- while one byte below it refuses with the typed memory refusal
+/// and no partial answer.
 #[test]
 #[serial]
 fn auto_refuses_typed_when_the_exact_score_array_cannot_fit() {
-    let (_root, db) = open_lang_residency_fixture(false);
-    let query = params([("query", Value::Vector(lang_query(0)))]);
-
-    let en_row_count = LANG_PARTITIONS * LANG_ROWS_PER_PARTITION;
-    let exact_score_bytes = en_row_count.saturating_mul(std::mem::size_of::<(RowId, f32)>());
-    let settled_usage = db.accountant().usage().used;
-    db.set_memory_limit(Some(settled_usage + exact_score_bytes.saturating_sub(1)))
-        .expect("install a memory ceiling just under the exact-score reservation");
-
+    use contextdb_core::read_contract::{ReadFailureDetail, ReadFailureKind, ReadFailureLimit};
+    const SCALE: usize = 8;
     let auto_sql = "SELECT id FROM raw_residency_items WHERE lang = 'en' \
                     ORDER BY embedding <=> $query USE VECTOR AUTO LIMIT 3";
-    let auto_error = db
-        .execute(auto_sql, &query)
-        .expect_err("AUTO must refuse rather than silently exceed the memory ceiling");
-    assert!(
-        matches!(&auto_error, Error::VectorFilteredRouteUnavailable { .. }),
-        "AUTO's refusal must be the typed VectorFilteredRouteUnavailable error: {auto_error:?}"
-    );
+    let exact_sql = auto_sql.replace("VECTOR AUTO", "VECTOR EXACT");
+    let query = params([("query", Value::Vector(lang_query(0)))]);
 
-    let indexed_sql = "SELECT id FROM raw_residency_items WHERE lang = 'en' \
-                       ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 3";
-    let indexed_error = db
-        .execute(indexed_sql, &query)
-        .expect_err("INDEXED must also refuse on the same variant (no supporting index)");
+    // The larger table's row-filter check can also admit one storage page that
+    // the small table's warm cache never needs; that single page, as the
+    // reader's ledger discloses it, is the most the streaming cost may grow --
+    // far less than the table's score array would take.
+    let (small_cost, page) = {
+        let (_root, small) = open_lang_residency_fixture(false);
+        streaming_ceiling(&small, auto_sql, &query)
+    };
+    let allowed = small_cost + page;
+    let rows_per_partition = LANG_ROWS_PER_PARTITION * SCALE;
+    let (_root, db) = open_sized_lang_residency_fixture(false, rows_per_partition);
+    let exact = db.execute(&exact_sql, &query).unwrap();
+    assert_eq!(exact.rows().len(), 3);
+    let held_array_bytes =
+        LANG_PARTITIONS * rows_per_partition * std::mem::size_of::<(RowId, f32)>();
     assert!(
-        matches!(&indexed_error, Error::VectorFilteredRouteUnavailable { .. }),
-        "INDEXED's refusal must be the same typed error: {indexed_error:?}"
+        held_array_bytes as u64 > allowed,
+        "the larger table's score array alone ({held_array_bytes} bytes) exceeds the \
+         streaming ceiling ({allowed} bytes), so only streaming can answer inside it"
+    );
+    let ceiling = allowed;
+    let writer = db.accountant().usage().used;
+    db.set_memory_limit(Some(writer)).unwrap();
+    let mut request = bounded_request(auto_sql, query.clone());
+    request.limits.memory = ceiling;
+    let ordinary = db
+        .read_session(request.limits)
+        .unwrap()
+        .execute(auto_sql, &query)
+        .unwrap_or_else(|error| {
+            panic!(
+                "the actual reader streams {SCALE}x the rows inside the {ceiling}-byte ceiling \
+                 found on the small table: {error:?}"
+            )
+        });
+    assert_eq!(ordinary.rows(), exact.rows());
+    let bounded = bounded::execute(&db, &request)
+        .expect("bounded execution streams the larger table inside the same ceiling");
+    assert_eq!(bounded.result.rows(), exact.rows());
+
+    request.limits.memory = small_cost - 1;
+    let ordinary_refusal = match db.read_session(request.limits) {
+        Err(error) => error,
+        Ok(session) => session.execute(auto_sql, &query).expect_err(
+            "one byte below the small table's streaming cost refuses the ordinary reader",
+        ),
+    };
+    assert!(
+        is_memory_refusal(&ordinary_refusal),
+        "typed memory refusal, no partial answer: {ordinary_refusal:?}"
+    );
+    request.limits.memory = 1;
+    let refused = bounded::execute(&db, &request).unwrap_err();
+    assert!(
+        matches!(&refused, bounded::TestError::Refused(failure)
+        if failure.kind() == ReadFailureKind::OwnerLimitExceeded
+        && matches!(failure.detail(), ReadFailureDetail::OwnerLimitExceeded(detail)
+            if detail.limit == ReadFailureLimit::Memory)),
+        "actual reader workspace refusal: {refused:?}"
+    );
+    request.limits.memory = ceiling;
+    assert_eq!(
+        bounded::execute(&db, &request).unwrap().result.rows(),
+        exact.rows(),
+        "releasing the refused operation restores the same complete answer"
+    );
+    let indexed_sql = auto_sql.replace("VECTOR AUTO", "VECTOR INDEXED");
+    let indexed_error = db.execute(&indexed_sql, &query).unwrap_err();
+    assert!(
+        matches!(indexed_error, Error::VectorIndexedRouteUnavailable { .. }),
+        "no vector index ships, so INDEXED is refused by name: {indexed_error:?}"
     );
     assert_eq!(
-        std::mem::discriminant(&auto_error),
-        std::mem::discriminant(&indexed_error),
-        "AUTO's refusal must be identical in kind to INDEXED's refusal on the same variant"
+        db.accountant().usage().used,
+        writer,
+        "reader never funds itself from the writer"
     );
-
-    for partition_ordinal in 0..LANG_PARTITIONS {
-        assert!(
-            !payload_resident(&db, lang_scope(partition_ordinal)),
-            "a refused search must not have materialized any payload_vec partition"
-        );
+    for ordinal in 0..LANG_PARTITIONS {
+        assert!(!payload_resident(&db, lang_scope(ordinal)));
     }
+    assert_eq!(
+        db.vector_store_for_test()
+            .resident_raw_partition_count_for_test(),
+        0
+    );
+}
+
+/// Each selected stored body owns 2,048 bytes from admission through decode
+/// and scoring; the next body cannot be admitted until that charge is returned.
+fn assert_streamed_body_charges(
+    ledger: &[contextdb_engine::memory_accounting::BudgetLedgerEntry],
+    expected_bodies: usize,
+) {
+    let mut held = None;
+    let mut count = 0;
+    let mut invoice = None;
+    let mut executing = None;
+    for event in ledger
+        .iter()
+        .filter(|event| event.owner_identity != event.parent_identity)
+    {
+        if event.what == "vector_store/load_raw_vector_candidate" {
+            assert!(
+                held.is_none(),
+                "the previous admitted body must be released before the next"
+            );
+            assert!(
+                event.row_identity.is_some(),
+                "the storage producer records the actual selected row/version"
+            );
+            assert!(
+                event.bytes >= MANY_VECTOR_DIMENSION * std::mem::size_of::<f32>(),
+                "the actual invoice covers its stored F32 body"
+            );
+            assert_eq!(
+                *invoice.get_or_insert(event.bytes),
+                event.bytes,
+                "one declaration has one fixed body/decode window"
+            );
+            assert_eq!(
+                *executing.get_or_insert(event.owner_identity),
+                event.owner_identity,
+                "all bodies use the actual operation child"
+            );
+            held = Some((event.owner_identity, event.bytes));
+            count += 1;
+        } else if event.what == "release" && held == Some((event.owner_identity, event.bytes)) {
+            held = None;
+        }
+    }
+    assert!(
+        held.is_none(),
+        "the last body returns its complete actual invoice"
+    );
+    assert_eq!(count, expected_bodies, "actual producer body count");
+}
+
+fn assert_score_workspace(
+    ledger: &[contextdb_engine::memory_accounting::BudgetLedgerEntry],
+    _ordinary: bool,
+) {
+    let ranking = ledger
+        .iter()
+        .filter(|event| {
+            event.owner_identity != event.parent_identity
+                && event.what == "bounded_read/read/rank_candidates"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ranking.len(),
+        1,
+        "the fixed top-two rank buffer allocates once"
+    );
+    let event = ranking[0];
+    let (pointer, capacity, element_bytes) = event
+        .allocation
+        .expect("actual native rank Vec allocation observed at its producer");
+    assert_ne!(pointer, 0);
+    assert!(capacity >= 2);
+    assert_eq!(
+        event.bytes,
+        capacity * element_bytes,
+        "the actual native rank capacity is fully admitted"
+    );
+    assert!(
+        ledger.iter().any(|release| release.what == "release"
+            && release.owner_identity == event.owner_identity
+            && release.bytes == event.bytes),
+        "the same executing child receives the complete actual rank-container refund"
+    );
 }

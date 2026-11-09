@@ -39,6 +39,10 @@ impl RejectingPlugin {
             reason: reason.to_string(),
         }
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn reject(&self, at_hook: &str) -> Result<()> {
         if self.hook == at_hook {
             Err(Error::PluginRejected {
@@ -988,7 +992,7 @@ fn p15e_on_ddl_veto_drop_table() {
     // Verify we can still query the table
     let result = db.execute("SELECT * FROM widgets", &p).unwrap();
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         0,
         "table must be queryable after vetoed DROP"
     );
@@ -1034,7 +1038,7 @@ fn p15f_on_ddl_veto_alter_table() {
     .unwrap();
     let result = db.execute("SELECT * FROM people", &p).unwrap();
     assert_eq!(
-        result.columns.len(),
+        result.columns().len(),
         2,
         "schema must still have exactly 2 columns (id, name)"
     );
@@ -1313,7 +1317,7 @@ fn p23_on_sync_push_filters_rows() {
 
     // Get changeset and call on_sync_push directly on the plugin
     // (tests plugin behavior, not the SyncClient transport path)
-    let mut cs = db.changes_since(Lsn(0));
+    let mut cs = db.changes_since(Lsn(0)).expect("read the declared changes");
     assert!(
         cs.rows.iter().any(|r| r.table == "secret_items"),
         "changeset must contain secret_items BEFORE on_sync_push"

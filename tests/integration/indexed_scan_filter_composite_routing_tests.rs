@@ -26,7 +26,7 @@ fn tid(n: u128) -> Uuid {
 }
 
 fn pushed(r: &QueryResult) -> Vec<&str> {
-    r.trace
+    r.trace()
         .predicates_pushed
         .iter()
         .map(|c| c.as_ref())
@@ -34,7 +34,7 @@ fn pushed(r: &QueryResult) -> Vec<&str> {
 }
 
 fn reason<'a>(r: &'a QueryResult, name: &str) -> Option<&'a str> {
-    r.trace
+    r.trace()
         .indexes_considered
         .iter()
         .find(|c| c.name == name)
@@ -46,7 +46,7 @@ fn pushed_owned(r: &QueryResult) -> Vec<String> {
 }
 
 fn considered_owned(r: &QueryResult) -> Vec<(String, String)> {
-    r.trace
+    r.trace()
         .indexes_considered
         .iter()
         .map(|c| (c.name.clone(), c.rejected_reason.to_string()))
@@ -55,7 +55,7 @@ fn considered_owned(r: &QueryResult) -> Vec<(String, String)> {
 
 fn trace_capture(r: &QueryResult) -> (Option<String>, Vec<String>, Vec<(String, String)>) {
     (
-        r.trace.index_used.clone(),
+        r.trace().index_used.clone(),
         pushed_owned(r),
         considered_owned(r),
     )
@@ -65,9 +65,9 @@ fn result_capture(
     r: QueryResult,
     examined: u64,
 ) -> (Vec<Vec<Value>>, Option<String>, Vec<String>, u64) {
-    let index = r.trace.index_used.clone();
+    let index = r.trace().index_used.clone();
     let pushed = pushed_owned(&r);
-    (r.rows, index, pushed, examined)
+    (r.rows().to_vec(), index, pushed, examined)
 }
 
 fn create_three_col_int(db: &Database) {
@@ -275,11 +275,11 @@ fn in01_composite_only_inlist_routes() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_c"));
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_c"));
     assert_eq!(pushed(&r), vec!["col"]);
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![vec![Value::Int64(2)]; 3]
             .into_iter()
             .chain(vec![vec![Value::Int64(4)]; 3])
@@ -299,10 +299,10 @@ fn in02_inlist_plus_one_equality_pushes_two() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_c"));
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_c"));
     assert_eq!(pushed(&r), vec!["col", "col2"]);
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![
             vec![Value::Int64(2), Value::Int64(20)],
             vec![Value::Int64(3), Value::Int64(20)]
@@ -327,9 +327,9 @@ fn in03_consumer_three_column_prefix_pushes_three() {
             ]),
         )
         .unwrap();
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_c"));
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_c"));
     assert_eq!(pushed(&r), vec!["col", "col2", "col3"]);
-    assert_eq!(r.rows, vec![vec![Value::Text("Y".into())]; 2]);
+    assert_eq!(r.rows(), vec![vec![Value::Text("Y".into())]; 2]);
     assert_eq!(db.__rows_examined(), 2);
 }
 
@@ -338,10 +338,10 @@ fn in04_composite_beats_leading_unique() {
     let db = Database::open_memory();
     seed_is04_fixture(&db);
     let r = is04_query(&db);
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_c"));
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_c"));
     assert_eq!(pushed(&r), vec!["col", "col2", "col3"]);
     assert_eq!(reason(&r, "__unique_col"), Some(FEWER));
-    assert_eq!(r.rows, vec![vec![Value::Int64(2)]]);
+    assert_eq!(r.rows(), vec![vec![Value::Int64(2)]]);
     assert_eq!(db.__rows_examined(), 1);
 }
 
@@ -358,10 +358,10 @@ fn in05_unrelated_index_on_suffix_col_explained() {
     let r = db
         .execute("SELECT col FROM t WHERE col IN (3) AND col2 = 30", &empty())
         .unwrap();
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_c"));
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_c"));
     assert_eq!(pushed(&r), vec!["col", "col2"]);
     assert_eq!(reason(&r, "idx_only2"), Some(FEWER));
-    assert_eq!(r.rows, vec![vec![Value::Int64(3)]]);
+    assert_eq!(r.rows(), vec![vec![Value::Int64(3)]]);
     assert_eq!(db.__rows_examined(), 1);
 }
 
@@ -394,11 +394,11 @@ fn in06_inlist_single_col_index_routes() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_only"));
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_only"));
     assert_eq!(pushed(&r), vec!["col"]);
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![vec![Value::Int64(2)]; 2]
             .into_iter()
             .chain(vec![vec![Value::Int64(4)]; 2])
@@ -430,10 +430,10 @@ fn in07_three_column_prefix_at_10k_inlist_uuid() {
             &params(vec![("x", Value::Uuid(x)), ("y", Value::Text("T7".into()))]),
         )
         .unwrap();
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_c"));
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_c"));
     assert_eq!(pushed(&r), vec!["col", "col2", "col3"]);
-    assert_eq!(r.rows.len(), 100);
-    for row in &r.rows {
+    assert_eq!(r.rows().len(), 100);
+    for row in r.rows() {
         let Value::Uuid(id) = row[0] else {
             panic!("expected uuid row: {row:?}")
         };
@@ -469,8 +469,8 @@ fn in08_no_leading_match_scan_all_explained() {
     let r = db
         .execute("SELECT col FROM t WHERE tag = 'z'", &empty())
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "Scan");
-    assert_eq!(r.trace.index_used, None);
+    assert_eq!(r.trace().physical_plan, "Scan");
+    assert_eq!(r.trace().index_used, None);
     assert_eq!(pushed(&r), Vec::<&str>::new());
     assert_eq!(reason(&r, "idx_c"), Some(FIRST));
     assert_eq!(reason(&r, "idx_only2"), Some(FIRST));
@@ -498,10 +498,10 @@ fn in09_two_composites_suffix_match_decides() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_c3"));
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_c3"));
     assert_eq!(pushed(&r), vec!["col", "col3"]);
     assert_eq!(reason(&r, "idx_c2"), Some(FEWER));
-    assert_eq!(r.rows, vec![vec![Value::Int64(2)]]);
+    assert_eq!(r.rows(), vec![vec![Value::Int64(2)]]);
     assert_eq!(db.__rows_examined(), 1);
 }
 
@@ -522,9 +522,9 @@ fn in10_equality_leading_pushes_both() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_c"));
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_c"));
     assert_eq!(pushed(&r), vec!["col", "col2"]);
-    assert_eq!(r.rows, vec![vec![Value::Int64(1), Value::Int64(20)]]);
+    assert_eq!(r.rows(), vec![vec![Value::Int64(1), Value::Int64(20)]]);
     assert_eq!(db.__rows_examined(), 1);
 }
 
@@ -549,7 +549,7 @@ fn in11_suffix_range_terminates_prefix() {
     assert_eq!(pushed(&r), vec!["col"]);
     assert_eq!(db.__rows_examined(), 6);
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![
             vec![Value::Int64(2), Value::Int64(15)],
             vec![Value::Int64(2), Value::Int64(25)],
@@ -566,7 +566,7 @@ fn in11_suffix_range_terminates_prefix() {
         .unwrap();
     assert_eq!(pushed(&r_between), vec!["col"]);
     assert_eq!(db.__rows_examined(), 6);
-    assert_eq!(r_between.rows, r.rows);
+    assert_eq!(r_between.rows(), r.rows());
 
     db.execute(
         "CREATE TABLE t2 (id UUID PRIMARY KEY, col INTEGER, col2 TEXT)",
@@ -596,11 +596,11 @@ fn in11_suffix_range_terminates_prefix() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(r_like.trace.index_used.as_deref(), Some("idx_c2"));
+    assert_eq!(r_like.trace().index_used.as_deref(), Some("idx_c2"));
     assert_eq!(pushed(&r_like), vec!["col"]);
     assert_eq!(db.__rows_examined(), 6);
     assert_eq!(
-        r_like.rows,
+        r_like.rows(),
         vec![
             vec![Value::Int64(2), Value::Text("x1".into())],
             vec![Value::Int64(2), Value::Text("x2".into())],
@@ -634,7 +634,7 @@ fn in12_contradictory_leading_constraints_return_empty_without_work() {
         0,
         "a provably empty equality/IN intersection must not touch the index"
     );
-    assert!(r.rows.is_empty());
+    assert!(r.rows().is_empty());
     db.__reset_rows_examined();
     let tier = db
         .execute(
@@ -644,7 +644,7 @@ fn in12_contradictory_leading_constraints_return_empty_without_work() {
         .unwrap();
     assert_eq!(pushed(&tier), vec!["col"]);
     assert_eq!(db.__rows_examined(), 4);
-    assert_eq!(tier.rows, vec![vec![Value::Int64(5)]; 4]);
+    assert_eq!(tier.rows(), vec![vec![Value::Int64(5)]; 4]);
 }
 
 #[test]
@@ -658,11 +658,11 @@ fn in13_fewer_key_columns_win_before_creation_order() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_short"));
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_short"));
     assert_eq!(pushed(&r), vec!["col"]);
     assert_eq!(reason(&r, "idx_long"), Some(MORE_COLUMNS));
     assert_eq!(db.__rows_examined(), 3);
-    assert_eq!(r.rows, vec![vec![Value::Int64(2)], vec![Value::Int64(2)]]);
+    assert_eq!(r.rows(), vec![vec![Value::Int64(2)], vec![Value::Int64(2)]]);
 }
 
 #[test]
@@ -676,11 +676,11 @@ fn in13b_fewer_key_columns_also_win_when_created_first() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_short"));
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_short"));
     assert_eq!(pushed(&r), vec!["col"]);
     assert_eq!(reason(&r, "idx_long"), Some(MORE_COLUMNS));
     assert_eq!(db.__rows_examined(), 3);
-    assert_eq!(r.rows.len(), 2);
+    assert_eq!(r.rows().len(), 2);
 }
 
 #[test]
@@ -698,7 +698,7 @@ fn in14_contradictory_suffix_empty_zero_examined() {
             ]),
         )
         .unwrap();
-    assert!(r.rows.is_empty());
+    assert!(r.rows().is_empty());
     assert_eq!(db.__rows_examined(), 0);
     db.__reset_rows_examined();
     let dedup = db
@@ -711,7 +711,7 @@ fn in14_contradictory_suffix_empty_zero_examined() {
             ]),
         )
         .unwrap();
-    assert_eq!(dedup.rows, vec![vec![Value::Text("Y".into())]]);
+    assert_eq!(dedup.rows(), vec![vec![Value::Text("Y".into())]]);
     assert_eq!(db.__rows_examined(), 1);
 }
 
@@ -730,7 +730,7 @@ fn in15_null_and_nan_suffix_bind_empty_zero_examined() {
             ]),
         )
         .unwrap();
-    assert!(null_suffix.rows.is_empty());
+    assert!(null_suffix.rows().is_empty());
     assert_eq!(db.__rows_examined(), 0);
     db.__reset_rows_examined();
     let positive = db
@@ -743,7 +743,7 @@ fn in15_null_and_nan_suffix_bind_empty_zero_examined() {
             ]),
         )
         .unwrap();
-    assert_eq!(positive.rows, vec![vec![Value::Text("Y".into())]]);
+    assert_eq!(positive.rows(), vec![vec![Value::Text("Y".into())]]);
     assert_eq!(db.__rows_examined(), 1);
 
     let dbf = Database::open_memory();
@@ -772,7 +772,7 @@ fn in15_null_and_nan_suffix_bind_empty_zero_examined() {
             &params(vec![("nan", Value::Float64(f64::NAN))]),
         )
         .unwrap();
-    assert!(nan.rows.is_empty());
+    assert!(nan.rows().is_empty());
     assert_eq!(dbf.__rows_examined(), 0);
 }
 
@@ -809,9 +809,9 @@ fn in15b_numeric_suffix_literal_matches_evaluator_semantics() {
     let r = db
         .execute("SELECT id FROM t WHERE col = 1 AND f = 1", &empty())
         .unwrap();
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_cf"));
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_cf"));
     assert_eq!(pushed(&r), vec!["col", "f"]);
-    assert_eq!(r.rows, vec![vec![Value::Uuid(id)]]);
+    assert_eq!(r.rows(), vec![vec![Value::Uuid(id)]]);
     assert_eq!(db.__rows_examined(), 1);
 }
 
@@ -826,9 +826,9 @@ fn in16_skew_killshot_examines_full_key_not_leading() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_c"));
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_c"));
     assert_eq!(pushed(&r), vec!["col", "col2", "col3"]);
-    assert_eq!(r.rows, vec![vec![Value::Int64(500)]; 3]);
+    assert_eq!(r.rows(), vec![vec![Value::Int64(500)]; 3]);
     assert_eq!(db.__rows_examined(), 3);
 }
 
@@ -856,10 +856,10 @@ fn in17_mixed_direction_composite_full_pushdown() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_md"));
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_md"));
     assert_eq!(pushed(&r), vec!["col", "col2"]);
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![
             vec![Value::Int64(1), Value::Int64(20)],
             vec![Value::Int64(3), Value::Int64(20)]
@@ -895,9 +895,9 @@ fn deg1_inlist_longer_than_table_exact_examined() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_only"));
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_only"));
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![
             vec![Value::Int64(1)],
             vec![Value::Int64(2)],
@@ -931,8 +931,8 @@ fn deg2_all_inlist_absent_empty_zero_examined() {
     let r = db
         .execute("SELECT col FROM t WHERE col IN (100, 200, 300)", &empty())
         .unwrap();
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_only"));
-    assert!(r.rows.is_empty());
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_only"));
+    assert!(r.rows().is_empty());
     assert_eq!(db.__rows_examined(), 0);
 }
 
@@ -978,10 +978,10 @@ fn ord1_inlist_value_order_rowid_asc_within_group() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_c"));
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_c"));
     assert_eq!(pushed(&r), vec!["col", "col2"]);
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![
             vec![Value::Int64(3), Value::Int64(9)],
             vec![Value::Int64(3), Value::Int64(10)],
@@ -1019,11 +1019,11 @@ fn se_gain_composite_routing_gains_sort_elision() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_c"));
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_c"));
     assert_eq!(pushed(&r), vec!["col", "col2"]);
-    assert!(r.trace.sort_elided);
+    assert!(r.trace().sort_elided);
     assert_eq!(reason(&r, "idx_only"), Some(FEWER));
-    assert_eq!(r.rows, vec![vec![Value::Int64(3), Value::Int64(30)]]);
+    assert_eq!(r.rows(), vec![vec![Value::Int64(3), Value::Int64(30)]]);
     assert_eq!(db.__rows_examined(), 1);
 }
 
@@ -1059,11 +1059,11 @@ fn se_lose_composite_routing_loses_elision_rows_still_sorted() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_c3"));
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_c3"));
     assert_eq!(pushed(&r), vec!["col", "col2", "col3"]);
-    assert!(!r.trace.sort_elided);
+    assert!(!r.trace().sort_elided);
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![
             vec![Value::Int64(3), Value::Int64(10)],
             vec![Value::Int64(3), Value::Int64(20)],
@@ -1094,10 +1094,10 @@ fn se_dir_direction_mismatch_blocks_elision() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_c"));
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_c"));
     assert_eq!(pushed(&r), vec!["col", "col2"]);
-    assert!(!r.trace.sort_elided);
-    assert_eq!(r.rows, vec![vec![Value::Int64(3), Value::Int64(30)]]);
+    assert!(!r.trace().sort_elided);
+    assert_eq!(r.rows(), vec![vec![Value::Int64(3), Value::Int64(30)]]);
     assert_eq!(db.__rows_examined(), 1);
 }
 
@@ -1113,14 +1113,14 @@ fn ov_sel_staged_suffix_violator_not_returned() {
     let r = db
         .execute("SELECT id FROM t WHERE col IN (5) AND col2 = 50", &empty())
         .unwrap();
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_c"));
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_c"));
     assert_eq!(pushed(&r), vec!["col", "col2"]);
-    assert_eq!(r.rows, vec![vec![Value::Uuid(a)]]);
+    assert_eq!(r.rows(), vec![vec![Value::Uuid(a)]]);
     db.execute("COMMIT", &empty()).unwrap();
     let after = db
         .execute("SELECT id FROM t WHERE col IN (5) AND col2 = 50", &empty())
         .unwrap();
-    assert_eq!(after.rows, vec![vec![Value::Uuid(a)]]);
+    assert_eq!(after.rows(), vec![vec![Value::Uuid(a)]]);
 }
 
 #[test]
@@ -1155,7 +1155,7 @@ fn ov_upd_staged_suffix_violator_not_updated() {
         )
         .unwrap();
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![
             vec![Value::Uuid(a), Value::Int64(1)],
             vec![Value::Uuid(b), Value::Int64(0)]
@@ -1168,7 +1168,7 @@ fn ov_upd_staged_suffix_violator_not_updated() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(committed.rows, r.rows);
+    assert_eq!(committed.rows(), r.rows());
 }
 
 #[test]
@@ -1188,7 +1188,7 @@ fn ov_del_staged_suffix_violator_not_deleted() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(r.rows, vec![vec![Value::Uuid(b)]]);
+    assert_eq!(r.rows(), vec![vec![Value::Uuid(b)]]);
     db.execute("COMMIT", &empty()).unwrap();
     let committed = db
         .execute(
@@ -1196,7 +1196,7 @@ fn ov_del_staged_suffix_violator_not_deleted() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(committed.rows, vec![vec![Value::Uuid(b)]]);
+    assert_eq!(committed.rows(), vec![vec![Value::Uuid(b)]]);
 }
 
 #[test]
@@ -1247,10 +1247,10 @@ fn rid_sel_routed_equals_unindexed_scan() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(indexed.trace.index_used.as_deref(), Some("idx_c"));
+    assert_eq!(indexed.trace().index_used.as_deref(), Some("idx_c"));
     assert_eq!(pushed(&indexed), vec!["col", "col2", "col3"]);
-    assert_eq!(scan.trace.physical_plan, "Sort");
-    assert_eq!(indexed.rows, scan.rows);
+    assert_eq!(scan.trace().physical_plan, "Sort");
+    assert_eq!(indexed.rows(), scan.rows());
     let empty_i = db
         .execute(
             "SELECT id FROM ti WHERE col IN (2,3,5) AND col2 = -1 ORDER BY id ASC",
@@ -1263,8 +1263,8 @@ fn rid_sel_routed_equals_unindexed_scan() {
             &empty(),
         )
         .unwrap();
-    assert!(empty_i.rows.is_empty());
-    assert_eq!(empty_i.rows, empty_n.rows);
+    assert!(empty_i.rows().is_empty());
+    assert_eq!(empty_i.rows(), empty_n.rows());
 }
 
 #[test]
@@ -1282,9 +1282,9 @@ fn in16b_skew_killshot_uuid_text_suffix() {
             ]),
         )
         .unwrap();
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_c"));
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_c"));
     assert_eq!(pushed(&r), vec!["col", "col2", "col3"]);
-    assert_eq!(r.rows, vec![vec![Value::Text("HOP".into())]; 3]);
+    assert_eq!(r.rows(), vec![vec![Value::Text("HOP".into())]; 3]);
     assert_eq!(db.__rows_examined(), 3);
 }
 
@@ -1346,9 +1346,9 @@ fn isn1_isnull_leading_composite_returns_correct_rows_and_pushes_suffix() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(indexed.rows, vec![vec![Value::Int64(20)]]);
-    assert_eq!(indexed.rows, scan.rows);
-    assert_eq!(indexed.trace.index_used.as_deref(), Some("idx_c"));
+    assert_eq!(indexed.rows(), vec![vec![Value::Int64(20)]]);
+    assert_eq!(indexed.rows(), scan.rows());
+    assert_eq!(indexed.trace().index_used.as_deref(), Some("idx_c"));
     assert_eq!(pushed(&indexed), vec!["col", "col2"]);
     assert_eq!(indexed_examined, 1);
 }
@@ -1364,11 +1364,11 @@ fn or1_or_connected_suffix_stays_residual() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_c"));
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_c"));
     assert_eq!(pushed(&r), vec!["col"]);
     assert_eq!(db.__rows_examined(), 6);
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![
             vec![Value::Int64(2), Value::Int64(10)],
             vec![Value::Int64(2), Value::Int64(30)],
@@ -1383,8 +1383,8 @@ fn sel1_composite_beats_unique_winner_only() {
     let db = Database::open_memory();
     seed_is04_fixture(&db);
     let r = is04_query(&db);
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_c"));
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_c"));
 }
 
 #[test]
@@ -1399,7 +1399,7 @@ fn psh1_two_column_prefix_pushed_only() {
         .unwrap();
     assert_eq!(pushed(&r), vec!["col", "col2"]);
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![
             vec![Value::Int64(2), Value::Int64(20)],
             vec![Value::Int64(3), Value::Int64(20)]
@@ -1488,7 +1488,7 @@ fn rsn_lower_selectivity_exact_string() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_a"));
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_a"));
     assert_eq!(reason(&r, "idx_b"), Some(LOWER));
     assert_eq!(db.__rows_examined(), 1);
 }
@@ -1532,7 +1532,7 @@ fn lc_upsert_then_requery_examined_contract() {
         )
         .unwrap();
     assert_eq!(
-        old_key.rows,
+        old_key.rows(),
         vec![vec![Value::Uuid(tid(0x801))], vec![Value::Uuid(tid(0x802))]]
     );
     assert_eq!(
@@ -1550,7 +1550,7 @@ fn lc_upsert_then_requery_examined_contract() {
             ]),
         )
         .unwrap();
-    assert_eq!(new_key.rows, vec![vec![Value::Uuid(rekeyed)]]);
+    assert_eq!(new_key.rows(), vec![vec![Value::Uuid(rekeyed)]]);
 }
 
 #[test]
@@ -1574,7 +1574,7 @@ fn lc_delete_then_requery_tombstone_examined() {
         )
         .unwrap();
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![
             vec![Value::Uuid(tid(0x801))],
             vec![Value::Uuid(tid(0x802))],
@@ -1626,18 +1626,20 @@ fn sync1_peer_routes_identical_winner() {
     let primary = is04_query(&source);
     let peer = Database::open_memory();
     peer.apply_changes(
-        source.changes_since(Lsn(0)),
+        source
+            .changes_since(Lsn(0))
+            .expect("read the declared changes"),
         &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
     )
     .unwrap();
     let replica = is04_query(&peer);
-    assert_eq!(primary.trace.index_used, replica.trace.index_used);
+    assert_eq!(primary.trace().index_used, replica.trace().index_used);
     assert_eq!(pushed(&primary), pushed(&replica));
     assert_eq!(
         reason(&primary, "__unique_col"),
         reason(&replica, "__unique_col")
     );
-    assert_eq!(replica.trace.index_used.as_deref(), Some("idx_c"));
+    assert_eq!(replica.trace().index_used.as_deref(), Some("idx_c"));
 }
 
 #[test]
@@ -1682,7 +1684,7 @@ fn scope1_scoped_handle_suffix_pushdown_examined_counts_hidden() {
         .unwrap();
     assert_eq!(pushed(&r), vec!["col", "col2", "col3"]);
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![
             vec![Value::Uuid(tid(0xB000))],
             vec![Value::Uuid(tid(0xB001))]
@@ -1696,7 +1698,7 @@ fn scope1_scoped_handle_suffix_pushdown_examined_counts_hidden() {
         )
         .unwrap();
     assert_eq!(
-        all.rows,
+        all.rows(),
         vec![
             vec![Value::Uuid(tid(0xB000))],
             vec![Value::Uuid(tid(0xB001))],

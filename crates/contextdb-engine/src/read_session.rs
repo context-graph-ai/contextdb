@@ -7,16 +7,17 @@
 
 #![forbid(unsafe_code)]
 
+use crate::database::{OwnedQueryResult, QueryResultData};
 use crate::direct_file_reader::{
     DirectMetadataBody as MetadataBody, DirectMetadataRequest as MetadataRequest,
 };
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 use crate::executor::bounded_read_test_support::{ExecutionProbe, TestSourceTouch, TestWorkSource};
+use crate::owned_cursor_page::OwnedCursorPage;
 use crate::plugin::{CorePlugin, DatabasePlugin};
 use crate::read_progress::{ReadProgressObserver, with_progress_observer};
 use crate::{Database, QueryResult};
 use contextdb_core::read_contract::ChannelAddress;
-#[cfg(feature = "test-seams")]
 use contextdb_core::read_contract::DeadlineClock;
 use contextdb_core::read_contract::{
     CursorPage, OwnerReadCancellation, OwnerReadLimits, OwnerReadStatus, OwnerRequestHandler,
@@ -28,6 +29,15 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+pub(crate) fn public_cache_setting_error(error: Error) -> Error {
+    match error {
+        Error::NativeEngineOther(refusal) => {
+            crate::vector_read_memory::public_read_refusal(refusal)
+        }
+        other => other,
+    }
+}
 
 /// Per-session bounded read policy, owner-client deadlines, and the
 /// visibility this session reads under.
@@ -51,11 +61,80 @@ pub struct ReadSessionOptions {
     /// state and combines with `limits.memory` for each read on either route.
     /// It never changes the store's durable MEMORY_LIMIT declaration.
     pub memory_limit: Option<usize>,
+    /// Percent of the reader budget remaining after fixed source reservations
+    /// assigned to its file page cache. None selects default (14%): one seventh
+    /// of that remainder. The declaration follows this session across file opens.
+    /// Values from 0 through 100 are accepted; the original memory ceiling still
+    /// admits the complete open and every query before allocation.
+    pub read_cache_share: Option<u8>,
     pub limits: ReadLimits,
     pub timeouts: ReadClientTimeouts,
     pub contexts: Option<BTreeSet<ContextId>>,
     pub scope_labels: Option<BTreeSet<ScopeLabel>>,
     pub principal: Option<Principal>,
+}
+
+/// The declaration and effective file-cache capacity of a read session.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReadCacheShareStatus {
+    /// A live owner serves one shared cache; this reader policy applies only to its file route.
+    pub shared_serving_cache: bool,
+    pub declared: Option<u8>,
+    /// The default's displayed percent; its exact derivation is (B - F) / 7.
+    pub default_percent: u8,
+    pub budget_bytes: usize,
+    pub fixed_reservation_bytes: usize,
+    pub effective_bytes: usize,
+    /// Physical native index storage prepaid for every selectable share. None
+    /// means no opened file cache was inspected (including options-only inspection).
+    pub prepaid_index_bytes: Option<usize>,
+    /// Cache-paid physical pages, including detached cursor aliases.
+    pub held_page_bytes: Option<usize>,
+    /// Resolved percent of the budget remaining after fixed reservations.
+    pub effective_percent: f64,
+}
+
+impl ReadCacheShareStatus {
+    /// Human-readable declaration source used by policy inspection.
+    pub const fn declaration_source(&self) -> &'static str {
+        if self.shared_serving_cache {
+            "shared owner cache; reader SET READ_CACHE_SHARE is not applicable"
+        } else if self.declared.is_none() {
+            "default (14%)"
+        } else {
+            "declared"
+        }
+    }
+}
+
+impl ReadSessionOptions {
+    /// Inspect the file-cache declaration without opening storage or allocating.
+    pub fn read_cache_share_status(&self) -> ReadCacheShareStatus {
+        let budget = usize::try_from(self.limits.memory).unwrap_or(usize::MAX);
+        let budget = self.memory_limit.unwrap_or(budget);
+        let fixed = crate::persistence::read_source_fixed_reservation_bytes();
+        let cache = crate::persistence::redb_reader_cache_bytes(budget, self.read_cache_share);
+        ReadCacheShareStatus {
+            shared_serving_cache: false,
+            declared: self.read_cache_share,
+            default_percent: 14,
+            budget_bytes: budget,
+            fixed_reservation_bytes: fixed,
+            effective_bytes: cache,
+            prepaid_index_bytes: None,
+            held_page_bytes: None,
+            effective_percent: self.read_cache_share.map_or_else(
+                || {
+                    if budget <= fixed {
+                        0.0
+                    } else {
+                        cache as f64 * 100.0 / (budget - fixed) as f64
+                    }
+                },
+                f64::from,
+            ),
+        }
+    }
 }
 
 /// Owner inspection policy attached to a writable database open.
@@ -66,7 +145,7 @@ pub struct OwnerReadConfig {
     pub timeouts: OwnerServiceTimeouts,
     pub runtime_dir: Option<PathBuf>,
     pub handler: Option<Arc<dyn OwnerRequestHandler>>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub test_hooks: Option<OwnerReadTestHooks>,
 }
@@ -79,7 +158,7 @@ impl Default for OwnerReadConfig {
             timeouts: OwnerServiceTimeouts::default(),
             runtime_dir: None,
             handler: None,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             test_hooks: None,
         }
     }
@@ -151,10 +230,18 @@ pub struct DatabaseOpenOptions {
     pub contexts: Option<BTreeSet<ContextId>>,
     pub scope_labels: Option<BTreeSet<ScopeLabel>>,
     pub principal: Option<Principal>,
-    #[cfg(feature = "test-seams")]
+    /// Ends a writable open's wait for starting readers early, when the
+    /// caller cancels. Without it the open waits until the store is handed
+    /// over.
+    pub reader_wait_stop: Option<OwnerReadCancellation>,
+    /// The caller's own deadline for that wait, on the caller's clock. An
+    /// open whose deadline has already passed is answered `held_by_readers`
+    /// at once. There is no deadline of the engine's own.
+    pub reader_wait_deadline: Option<ReaderWaitDeadline>,
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub test_observer: Option<Arc<dyn ReadSessionTestObserver>>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub test_kernel_observer: Option<Arc<dyn ReadKernelTestObserver>>,
 }
@@ -172,11 +259,33 @@ impl Default for DatabaseOpenOptions {
             contexts: None,
             scope_labels: None,
             principal: None,
-            #[cfg(feature = "test-seams")]
+            reader_wait_stop: None,
+            reader_wait_deadline: None,
+            #[cfg(any(test, feature = "test-seams"))]
             test_observer: None,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             test_kernel_observer: None,
         }
+    }
+}
+
+/// A caller's own deadline for a writable open's wait for starting readers.
+#[derive(Clone)]
+pub struct ReaderWaitDeadline {
+    pub clock: Arc<dyn contextdb_core::read_contract::DeadlineClock>,
+    pub deadline_ms: u64,
+}
+
+impl ReaderWaitDeadline {
+    /// A deadline `within` from now on the engine's own monotonic clock, the
+    /// clock a bounded wait can park on natively. The duration is the
+    /// caller's; the engine adds none of its own.
+    pub fn after(within: Duration) -> Self {
+        let clock: Arc<dyn contextdb_core::read_contract::DeadlineClock> =
+            Arc::new(crate::local_transport::MonotonicDeadlineClock::new());
+        let within_ms = u64::try_from(within.as_millis()).unwrap_or(u64::MAX);
+        let deadline_ms = clock.now_ms().saturating_add(within_ms);
+        Self { clock, deadline_ms }
     }
 }
 
@@ -193,7 +302,13 @@ mod route_observation {
 
     // This vocabulary is exposed only to `test-seams` integration proofs.
     /// The bounded operations whose cancellation identity is observable.
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_session_application_contract.rs"
+        )
+    )]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ReadSessionOperation {
         Execute,
@@ -225,14 +340,19 @@ mod route_observation {
 
     /// Deliberate owner-handshake mismatch used to prove that authentication
     /// failures remain terminal to one route-selection invocation.
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum OwnerHandshakeMismatchForTest {
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature"
+            )
+        )]
         DatabaseIdentity,
     }
 
     /// Route-assembly events needed by cross-process and no-fallback proofs.
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ReadSessionEvent {
         OwnerResolution {
@@ -244,7 +364,7 @@ mod route_observation {
         BeforeDirectBackendOpen {
             attempt: u64,
         },
-        /// Emitted by an owner-only selection that found a live claim on
+        /// Emitted by a route selection that found a live claim on
         /// this store whose holder has not published a serving decision
         /// yet, immediately before the caller waits for that decision
         /// inside its own declared `routing_retry_ms`. `attempt` is the
@@ -263,6 +383,13 @@ mod route_observation {
             retry_attempt: u64,
         },
         RouteSelected(ReadRoute),
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature; used from database_open_options_contract.rs"
+            )
+        )]
         OpenRegistryAcquired,
         /// Emitted inside a writable open at the moment this writer takes
         /// the companion's FIRST exclusive claim on the store, before it
@@ -272,31 +399,100 @@ mod route_observation {
         /// caller in another process -- the window in which an owner-only
         /// ask must not be told the store is free.
         CompanionClaimTaken,
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature; used from database_open_options_contract.rs"
+            )
+        )]
         PersistenceOpened,
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature; used from database_open_options_contract.rs"
+            )
+        )]
         BlobRepositoryOpened,
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature; used from database_open_options_contract.rs"
+            )
+        )]
         PluginOpened,
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature"
+            )
+        )]
         BackgroundWorkerStarted,
         LocalChannelOperation,
         DirectBackendOpen,
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature; used from database_open_options_contract.rs"
+            )
+        )]
         OwnerServiceStarted,
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature; used from read_session_route_contract.rs"
+            )
+        )]
         ResponseFrameReceived {
             terminal: bool,
         },
         /// The cursor has registered its provisional hold before asking the
         /// owner for its first page.
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature; used from writer_file_ownership_survives_recycle.rs"
+            )
+        )]
         OwnerCursorHandoffStarted,
         /// The cursor-open response is complete, but the client has not yet
         /// exchanged its provisional page hold for the exact saved root.
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature; used from cursor_survives_writer_handover.rs"
+            )
+        )]
         BeforeOwnerCursorHandoffRegistration,
         /// The deadline watcher released a retained owner cursor while its
         /// caller still held the cursor object.
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature; used from cursor_survives_writer_handover.rs"
+            )
+        )]
         OwnerCursorExpiryReleased,
     }
 
     /// Concrete production source reached by a bounded read. These values are
     /// emitted only by the adapter implementing the bounded kernel's execution
     /// probe; route selection and backend setup have no callback door for them.
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_session_route_contract.rs"
+        )
+    )]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ReadKernelSource {
         TableRow,
@@ -304,16 +500,23 @@ mod route_observation {
         SortCandidate,
         GraphEdge,
         BruteForceVectorCandidate,
-        HnswCandidate,
         RankCandidate,
         AccessRow,
     }
 
     /// Evidence emitted from the bounded source loop, after route and backend
     /// selection and immediately before one real source item is inspected.
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_session_route_contract.rs"
+        )
+    )]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ReadKernelSourceEvent {
+        pub funding_owner: Option<usize>,
+        pub control_reservation_bytes: Option<usize>,
         pub operation: ReadSessionOperation,
         pub route: ReadRoute,
         pub source: ReadKernelSource,
@@ -322,7 +525,13 @@ mod route_observation {
 
     /// Evidence emitted by the bounded kernel immediately before it returns its
     /// typed cancellation result.
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from a_statement_on_the_file_route_costs_what_the_statement_costs.rs"
+        )
+    )]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ReadKernelCancellationEvent {
         pub operation: ReadSessionOperation,
@@ -332,7 +541,7 @@ mod route_observation {
 
     /// Proof-only handoff from the indexed source after a real residual
     /// rejection and before the walk considers a replacement.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ReadKernelResidualRejectionEvent {
@@ -344,19 +553,25 @@ mod route_observation {
     /// A narrow observer for route assembly. Implementations may block at an
     /// event, allowing a test to kill an owner between response frames without a
     /// wall-clock race.
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     pub trait ReadSessionTestObserver: Send + Sync {
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature; used from read_session_route_contract.rs"
+            )
+        )]
         fn observe_event(&self, _event: ReadSessionEvent) {}
 
         /// Replace one owner's cursor-fetch page for a proof of client-side
         /// decoding and terminal resource release.
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         fn cursor_fetch_payload_for_test(&self, _payload: &[u8]) -> Option<Vec<u8>> {
             None
         }
 
         /// Replace one owner's cursor-open page before the client decodes it.
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         fn cursor_open_payload_for_test(&self, _payload: &[u8]) -> Option<Vec<u8>> {
             None
         }
@@ -366,9 +581,8 @@ mod route_observation {
     /// supplies this observer to the selected backend; it must never invoke these
     /// methods itself. The cancellation value is the value consumed by that
     /// kernel invocation, not a route-level preflight copy.
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     pub trait ReadKernelTestObserver: Send + Sync {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         fn registered_snapshot_for_test(
             &self,
             _route: ReadRoute,
@@ -377,13 +591,20 @@ mod route_observation {
         ) {
         }
 
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature; used from bounded_read_test_support.rs"
+            )
+        )]
         fn before_source_touch(
             &self,
             event: ReadKernelSourceEvent,
             cancellation: OwnerReadCancellation,
         );
 
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         fn after_vector_residual_rejection(
             &self,
             _event: ReadKernelResidualRejectionEvent,
@@ -391,6 +612,13 @@ mod route_observation {
         ) {
         }
 
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature"
+            )
+        )]
         fn cancellation_observed(
             &self,
             event: ReadKernelCancellationEvent,
@@ -402,22 +630,32 @@ mod route_observation {
 // Without the doors these names are the engine's own; with them they are the
 // surface a proof observes through.
 // The production-private façade does not consume every proof export itself.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
+#[allow(
+    unused_imports,
+    reason = "The unit-only private facade also exports types used only by full integration proofs."
+)]
 pub use route_observation::{
     OwnerHandshakeMismatchForTest, ReadKernelCancellationEvent, ReadKernelResidualRejectionEvent,
     ReadKernelSource, ReadKernelSourceEvent, ReadKernelTestObserver, ReadRouteOpenFailure,
     ReadSessionEvent, ReadSessionOperation, ReadSessionTestObserver,
 };
-#[cfg_attr(not(feature = "test-seams"), allow(unused_imports))]
-#[cfg(not(feature = "test-seams"))]
+#[cfg(not(any(test, feature = "test-seams")))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from read_session_application_contract.rs"
+    )
+)]
 pub(crate) use route_observation::{
     OwnerHandshakeMismatchForTest, ReadKernelCancellationEvent, ReadKernelSource,
     ReadKernelSourceEvent, ReadKernelTestObserver, ReadRouteOpenFailure, ReadSessionEvent,
     ReadSessionOperation, ReadSessionTestObserver,
 };
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl From<TestSourceTouch> for ReadKernelSource {
     fn from(value: TestSourceTouch) -> Self {
         match value {
@@ -430,25 +668,24 @@ impl From<TestSourceTouch> for ReadKernelSource {
             // walk takes over them. No new source is published for it.
             TestSourceTouch::GraphEdge | TestSourceTouch::AdjacencyEntry => Self::GraphEdge,
             TestSourceTouch::BruteForceVectorCandidate => Self::BruteForceVectorCandidate,
-            TestSourceTouch::HnswCandidate => Self::HnswCandidate,
             TestSourceTouch::RankCandidate => Self::RankCandidate,
             TestSourceTouch::AccessRow => Self::AccessRow,
         }
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static READ_RUNTIME_DIRECTORY_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 struct ReadRuntimeDirectoryOverrideGuard {
     previous: Option<PathBuf>,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl Drop for ReadRuntimeDirectoryOverrideGuard {
     fn drop(&mut self) {
         let previous = self.previous.take();
@@ -461,7 +698,7 @@ impl Drop for ReadRuntimeDirectoryOverrideGuard {
 /// Return the task-scoped runtime root selected by the surrounding test. The
 /// production route resolver consumes this in place of process environment;
 /// no alternate route selector or transport is exposed.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn runtime_directory_override_for_test() -> Option<PathBuf> {
     READ_RUNTIME_DIRECTORY_OVERRIDE.with(|slot| slot.borrow().clone())
 }
@@ -474,18 +711,18 @@ pub(crate) fn runtime_directory_override_for_test() -> Option<PathBuf> {
 // an observer. Rather than thread one through every writable-open signature
 // for a test-only door, the observer the open was given travels on the thread
 // that is doing the opening. Shipped builds compile this away entirely.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static WRITER_OPEN_OBSERVER: std::cell::RefCell<Option<Arc<dyn ReadSessionTestObserver>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 struct WriterOpenObserverGuard {
     previous: Option<Arc<dyn ReadSessionTestObserver>>,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl Drop for WriterOpenObserverGuard {
     fn drop(&mut self) {
         let previous = self.previous.take();
@@ -497,7 +734,7 @@ impl Drop for WriterOpenObserverGuard {
 
 /// Run a writable open with the observer it was given in force for the whole
 /// of it, so milestones reached below the options layer still reach it.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn with_writer_open_observer<T>(
     observer: Option<&Arc<dyn ReadSessionTestObserver>>,
     run: impl FnOnce() -> T,
@@ -510,14 +747,14 @@ pub(crate) fn with_writer_open_observer<T>(
 /// Tell the writable open on this thread that it reached one of its own
 /// milestones. Nothing outside a proof ever listens.
 pub(crate) fn note_writer_open_event(event: ReadSessionEvent) {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     {
         let observer = WRITER_OPEN_OBSERVER.with(|slot| slot.borrow().clone());
         if let Some(observer) = observer {
             observer.observe_event(event);
         }
     }
-    #[cfg(not(feature = "test-seams"))]
+    #[cfg(not(any(test, feature = "test-seams")))]
     let _ = event;
 }
 
@@ -527,19 +764,19 @@ pub(crate) fn note_writer_open_event(event: ReadSessionEvent) {
 // budgets. A proof drives either one by moving this manual clock rather than
 // sleeping. Route selection reaches those waits through several layers that
 // carry no clock, so the supplied clock travels on the opening thread.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static ROUTE_SELECTION_CLOCK: std::cell::RefCell<
         Option<Arc<dyn contextdb_core::read_contract::DeadlineClock>>,
     > = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 struct RouteSelectionClockGuard {
     previous: Option<Arc<dyn contextdb_core::read_contract::DeadlineClock>>,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl Drop for RouteSelectionClockGuard {
     fn drop(&mut self) {
         let previous = self.previous.take();
@@ -549,8 +786,8 @@ impl Drop for RouteSelectionClockGuard {
     }
 }
 
-#[cfg(feature = "test-seams")]
-fn with_route_selection_clock_for_test<T>(
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) fn with_route_selection_clock_for_test<T>(
     clock: Arc<dyn contextdb_core::read_contract::DeadlineClock>,
     run: impl FnOnce() -> T,
 ) -> T {
@@ -563,14 +800,14 @@ fn with_route_selection_clock_for_test<T>(
 /// proof supplied, or the ordinary monotonic clock every other deadline in a
 /// read session already uses.
 fn claim_window_clock() -> Arc<dyn contextdb_core::read_contract::DeadlineClock> {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     if let Some(clock) = ROUTE_SELECTION_CLOCK.with(|slot| slot.borrow().clone()) {
         return clock;
     }
     read_clock()
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 struct SessionKernelProbe {
     observer: Arc<dyn ReadKernelTestObserver>,
     operation: ReadSessionOperation,
@@ -578,21 +815,8 @@ struct SessionKernelProbe {
     cancellation: OwnerReadCancellation,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl ExecutionProbe for SessionKernelProbe {
-    fn after_hnsw_residual_rejection(
-        &self,
-        event: contextdb_vector::hnsw::HnswResidualRejectionEvent,
-    ) {
-        self.observer.after_vector_residual_rejection(
-            ReadKernelResidualRejectionEvent {
-                operation: self.operation,
-                route: self.route,
-                row_id: event.row_id(),
-            },
-            self.cancellation.clone(),
-        );
-    }
     fn registered_snapshot_for_test(&self, snapshot: contextdb_core::SnapshotId) {
         self.observer
             .registered_snapshot_for_test(self.route, self.operation, snapshot);
@@ -603,6 +827,8 @@ impl ExecutionProbe for SessionKernelProbe {
     fn before_source_touch(&self, source: TestSourceTouch, completed_items: u64) {
         self.observer.before_source_touch(
             ReadKernelSourceEvent {
+                funding_owner: crate::read_work_probe::observed_funding_identity(),
+                control_reservation_bytes: crate::read_work_probe::observed_funding().map(|v| v.1),
                 operation: self.operation,
                 route: self.route,
                 source: source.into(),
@@ -630,7 +856,7 @@ impl ExecutionProbe for SessionKernelProbe {
 /// Work asked for over the channel runs on the owner's thread, so an observer
 /// attached to the store is the only one that can watch it -- a reader's own
 /// thread-local never touches the kernel the owner runs.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn owner_route_kernel_probe(
     observer: &Arc<dyn ReadKernelTestObserver>,
     operation: ReadSessionOperation,
@@ -647,7 +873,7 @@ pub(crate) fn owner_route_kernel_probe(
 /// Build the sole observer adapter accepted by bounded production execution.
 /// Backend adapters pass this value through; route code cannot manufacture a
 /// source-touch callback without entering the bounded executor probe.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn kernel_probe_for_test(
     observer: Arc<dyn ReadKernelTestObserver>,
     operation: ReadSessionOperation,
@@ -663,7 +889,7 @@ pub(crate) fn kernel_probe_for_test(
 }
 
 /// Resource identity and side-effect counts retained by one selected route.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ReadRouteResourceSnapshot {
@@ -688,28 +914,179 @@ pub struct ReadRouteResourceSnapshot {
 /// What one selected route is holding, counted as it is actually used.
 #[derive(Default)]
 struct RouteResources {
+    // Zero means undeclared; a declared percent is encoded as percent + 1.
+    // The existing shared route control outlives every owner continuation.
+    read_cache_share: std::sync::atomic::AtomicU8,
+    // Bounded inline diagnostics: no retained formatted error or query-owned storage.
+    last_cache_refusal: Mutex<Option<[u8; 64]>>,
+    last_query_resident_percent: Mutex<Option<f64>>,
+    expiry: SessionExpiry,
     channel_identity: Mutex<Option<ChannelAddress>>,
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_lifecycle_contract.rs"
+        )
+    )]
     owner_services_started: std::sync::atomic::AtomicU64,
     local_channel_operations: std::sync::atomic::AtomicU64,
     direct_backend_opens: std::sync::atomic::AtomicU64,
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_lifecycle_contract.rs"
+        )
+    )]
     active_owner_slots: std::sync::atomic::AtomicU64,
     active_cursors: std::sync::atomic::AtomicU64,
     /// Real source items THIS route's reads have finished inspecting. Kept per
     /// route rather than read from the process-wide probe, so a caller asking
     /// what its own read has done is not told what its neighbours did.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     bounded_source_items: Arc<std::sync::atomic::AtomicU64>,
     /// The owner's own counter for the channel this route selected, when that
     /// owner runs in this process. Work asked for over the channel is done on
     /// the owner's thread, where this reader's counter above is not in force,
     /// so the owner's number is the only true one for this route.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     channel_source_items: Mutex<Option<Arc<std::sync::atomic::AtomicU64>>>,
 }
 
+/// The session's shared deadline source. Driver custody lives in the public
+/// session and cursor handles, outside callback-upgraded suspended state.
+struct SessionExpiry {
+    clock: Arc<dyn DeadlineClock>,
+    #[cfg(target_os = "linux")]
+    native: Option<Arc<crate::local_transport::MonotonicDeadlineClock>>,
+}
+impl Default for SessionExpiry {
+    fn default() -> Self {
+        #[cfg(any(test, feature = "test-seams"))]
+        if let Some(clock) = ROUTE_SELECTION_CLOCK.with(|slot| slot.borrow().clone()) {
+            return Self {
+                clock,
+                #[cfg(target_os = "linux")]
+                native: None,
+            };
+        }
+        let clock = Arc::new(crate::local_transport::MonotonicDeadlineClock::new());
+        Self {
+            clock: clock.clone(),
+            #[cfg(target_os = "linux")]
+            native: Some(clock),
+        }
+    }
+}
+#[cfg(target_os = "linux")]
+type SessionExpiryDriver = contextdb_core::read_memory::ReadShared<
+    Mutex<crate::local_transport::deadlines::OwnedClockDriver>,
+>;
+#[cfg(not(target_os = "linux"))]
+type SessionExpiryDriver = ();
+
+impl SessionExpiry {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn ensure_driver(
+        &self,
+        custody: &Mutex<Option<SessionExpiryDriver>>,
+        selected: &Arc<dyn DeadlineClock>,
+        owner: impl FnOnce() -> Result<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(clock) = &self.native {
+            let actual: Arc<dyn DeadlineClock> = clock.clone();
+            if !Arc::ptr_eq(selected, &actual) {
+                return Ok(());
+            }
+            let mut driver = custody.lock().expect("session expiry worker");
+            if driver.is_none() {
+                use contextdb_core::read_memory::{ReadCredit, ReadShared};
+                let owner = owner()?;
+                let invoice = ReadCredit::try_new_owned(owner.clone(),
+                    ReadShared::<Mutex<crate::local_transport::deadlines::OwnedClockDriver>>::layout().size(),
+                    "reader", "session_expiry_custody", "Raise the reader memory limit.")?;
+                *driver = Some(ReadShared::try_from_prepaid_with(invoice, || {
+                    clock.start_owned_driver(owner).map(Mutex::new)
+                })?);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (custody, selected, owner);
+        Ok(())
+    }
+}
+
 impl RouteResources {
+    fn note_cache_percent_refusal(&self, percent: Option<u8>) {
+        match percent {
+            None => self.note_cache_refusal("DEFAULT"),
+            Some(value) => {
+                // Admission has already failed: formatting must not allocate.
+                let digits = [
+                    b'0' + value / 100,
+                    b'0' + value / 10 % 10,
+                    b'0' + value % 10,
+                ];
+                let start = if value >= 100 {
+                    0
+                } else if value >= 10 {
+                    1
+                } else {
+                    2
+                };
+                self.note_cache_refusal(
+                    std::str::from_utf8(&digits[start..]).expect("ASCII percent"),
+                );
+            }
+        }
+    }
+
+    fn note_cache_refusal(&self, value: &str) {
+        let mut text = [0_u8; 64];
+        let mut length = value.len().min(text.len());
+        while !value.is_char_boundary(length) {
+            length -= 1;
+        }
+        text[..length].copy_from_slice(&value.as_bytes()[..length]);
+        *self
+            .last_cache_refusal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(text);
+    }
+
+    fn note_cursor_cache_refusal(&self, share: Option<u8>, capacity: usize) {
+        use std::io::Write;
+        let mut bytes = [0_u8; 64];
+        let mut text = std::io::Cursor::new(bytes.as_mut_slice());
+        write!(&mut text, "cursor kept {capacity} bytes (").expect("bounded cursor cache refusal");
+        match share {
+            Some(percent) => write!(&mut text, "{percent})"),
+            None => write!(&mut text, "DEFAULT)"),
+        }
+        .expect("bounded cursor cache refusal");
+        let length = usize::try_from(text.position()).expect("inline text length");
+        self.note_cache_refusal(std::str::from_utf8(&bytes[..length]).expect("ASCII refusal"));
+    }
+
+    fn current_read_cache_share(&self) -> Option<u8> {
+        self.read_cache_share
+            .load(std::sync::atomic::Ordering::Acquire)
+            .checked_sub(1)
+    }
+
+    fn publish_read_cache_share(&self, percent: Option<u8>) {
+        // Both public construction and mutation validate 0..=100 first.
+        self.read_cache_share.store(
+            percent.map_or(0, |percent| percent + 1),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
     fn note_channel_operation(&self) {
         self.local_channel_operations
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -720,7 +1097,7 @@ impl RouteResources {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn snapshot(&self) -> ReadRouteResourceSnapshot {
         use std::sync::atomic::Ordering;
         ReadRouteResourceSnapshot {
@@ -757,7 +1134,28 @@ impl RouteResources {
 
 /// Poll one local-channel answer to completion on the calling thread. A read
 /// session owns no runtime and starts no thread of its own to wait.
-fn wait_for_local_answer<F: std::future::Future>(future: F) -> F::Output {
+#[cfg(target_os = "linux")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn wait_for_local_answer<F, T>(
+    future: F,
+    clock: &Arc<dyn DeadlineClock>,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+) -> crate::owner_read::OwnerReadScaffoldResult<T>
+where
+    F: std::future::Future<Output = crate::owner_read::OwnerReadScaffoldResult<T>> + Send,
+{
+    crate::local_transport::deadlines::drive_local(future, clock, owner)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn wait_for_local_answer<F: std::future::Future>(
+    future: F,
+    _clock: &Arc<dyn DeadlineClock>,
+    _owner: contextdb_core::read_memory::ReadMemoryOwner,
+) -> F::Output {
     struct ParkedThread(std::thread::Thread);
 
     impl std::task::Wake for ParkedThread {
@@ -788,9 +1186,27 @@ fn owner_error(error: crate::owner_read::OwnerReadScaffoldError) -> Error {
     match error {
         Scaffold::Refused(failure) => Error::ReadFailure(failure),
         Scaffold::Database(error) => error,
-        Scaffold::ReadContract(violation) => Error::Other(violation.to_string()),
+        Scaffold::ReadContract(violation) => Error::Other((violation.to_string()).into()),
         Scaffold::LocalTransport(_) => Error::ReadFailure(owner_disconnected()),
-        Scaffold::Unimplemented { seam } => Error::Other(seam.to_owned()),
+        Scaffold::Unimplemented { seam } => Error::Other((seam.to_owned()).into()),
+    }
+}
+
+/// Private query errors remain on the same ImageMemory until this session's
+/// public terminal. Only a diagnostic actually requiring bytes allocates them.
+fn query_owner_error(
+    error: crate::owner_read::OwnerReadScaffoldError,
+    memory: &crate::read_image_memory::ImageMemoryHandle,
+) -> Error {
+    use crate::owner_read::OwnerReadScaffoldError as Scaffold;
+    match error {
+        Scaffold::Refused(failure) => Error::ReadFailure(failure),
+        Scaffold::Database(error) => error,
+        Scaffold::ReadContract(violation) => {
+            crate::local_transport::query_funding::display_error(&violation, memory).into_retained()
+        }
+        Scaffold::LocalTransport(_) => Error::ReadFailure(owner_disconnected()),
+        Scaffold::Unimplemented { seam } => Error::Other(seam.into()),
     }
 }
 
@@ -861,11 +1277,11 @@ fn cursor_not_found() -> contextdb_core::read_contract::ReadFailure {
 /// same fault.
 fn direct_error(path: &Path, error: crate::direct_file_reader::DirectFileReaderError) -> Error {
     use crate::direct_file_reader::DirectFileReaderError as Direct;
-    let reason = error.to_string();
     match error {
         Direct::ReadFailure(failure)
         | Direct::StoreNotFound { failure }
         | Direct::DirectReadRequiresWriter { failure, .. } => Error::ReadFailure(failure),
+
         Direct::Cancelled => Error::ReadCancelled,
         Direct::Engine(prose) => Error::Other(prose),
         Direct::MemoryBudget {
@@ -888,12 +1304,13 @@ fn direct_error(path: &Path, error: crate::direct_file_reader::DirectFileReaderE
         // reader names what it found but has no vocabulary for what to do
         // next, so the same next step the writable open publishes is attached
         // here -- one corrupt file, one thing to go and do, whoever opened it.
-        Direct::CorruptStore(..) | Direct::LegacyLayout(..) => Error::StoreCorrupted {
-            path: path.display().to_string(),
+        error @ (Direct::CorruptStore(..) | Direct::LegacyLayout(..)) => Error::StoreCorrupted {
+            path: path.display().to_string().into(),
             reason: format!(
-                "{reason} — {}",
+                "{error} — {}",
                 crate::persistence::RedbPersistence::CORRUPT_STORE_NEXT_STEP
-            ),
+            )
+            .into(),
         },
         // A cursor this route no longer holds is a CURSOR condition, and it is
         // said in the cursor vocabulary. `owner_not_running` means Rust
@@ -902,17 +1319,23 @@ fn direct_error(path: &Path, error: crate::direct_file_reader::DirectFileReaderE
         // for a page tells them about the plumbing instead of about their
         // cursor, and names no step they can take.
         Direct::CursorUnavailable(_) => Error::ReadFailure(cursor_not_found()),
-        Direct::Contended { .. } => Error::Other(reason),
-        // "Not implemented" is one answer and it means one thing: there is no
-        // production path for this route. Every other prerequisite the direct
-        // reader can find missing is an internal invariant that failed on a
-        // route that IS implemented, and saying it is unimplemented tells the
-        // caller to stop asking instead of what went wrong.
-        Direct::MissingPrerequisite(
-            crate::direct_file_reader::DirectReaderPrerequisite::PersistenceLoadReadImage,
-        ) => Error::ReadSessionNotImplemented,
-        Direct::MissingPrerequisite(_) => Error::Other(reason),
+        // A writer has claimed this physical store, through whichever name,
+        // and still holds it after the one ownership-race retry: a writer
+        // holds the store, said in the typed held-by-writer vocabulary.
+        Direct::Contended { .. } => {
+            crate::persistence::RedbPersistence::held_by_writer_error_from_record(path)
+        }
+        // A missing prerequisite is an internal invariant that failed on a
+        // route that IS implemented; the caller is told what went wrong.
+        error @ Direct::MissingPrerequisite(_) => Error::Other(error.to_string().into()),
     }
+}
+
+struct RouteHandover<'a> {
+    clock: Arc<dyn DeadlineClock>,
+    deadline_ms: u64,
+    cancellation: &'a OwnerReadCancellation,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
 }
 
 /// Which routes an open is willing to take.
@@ -944,16 +1367,20 @@ struct RouteOpenRefusal {
 /// production resolver; there is no second selector and no alternate
 /// transport. Both parts travel together so no caller has to work one out
 /// from the other's pathname.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn read_runtime_directory(
     owner_user: contextdb_core::read_contract::LocalUserIdentity,
     supplied: Option<&Path>,
 ) -> std::result::Result<crate::local_transport::RuntimeDirectory, Error> {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     let supplied = supplied
         .map(Path::to_path_buf)
         .or_else(runtime_directory_override_for_test)
         .map(std::borrow::Cow::<Path>::Owned);
-    #[cfg(not(feature = "test-seams"))]
+    #[cfg(not(any(test, feature = "test-seams")))]
     let supplied = supplied.map(std::borrow::Cow::Borrowed);
     crate::local_transport::runtime_directory_for_store(supplied.as_deref(), owner_user).map_err(
         |error| {
@@ -1008,16 +1435,27 @@ fn published_owner_channel(
 /// lets the direct reader return the stable typed `StoreNotFound` answer. Any
 /// other canonicalization failure stays terminal rather than being mistaken
 /// for proof that the store is absent.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn resolved_route_path(path: &Path) -> Result<PathBuf> {
     resolved_route_path_inner(path, 0)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn resolved_route_path_inner(path: &Path, symlink_depth: usize) -> Result<PathBuf> {
     if symlink_depth > 32 {
-        return Err(Error::Other(format!(
-            "too many symlink levels while resolving the read route for {}",
-            path.display()
-        )));
+        return Err(Error::Other(
+            (format!(
+                "too many symlink levels while resolving the read route for {}",
+                path.display()
+            ))
+            .into(),
+        ));
     }
     // Preserve the target spelling even when the target's parent does not
     // exist. Falling back to the alias spelling would let a stale companion
@@ -1025,8 +1463,9 @@ fn resolved_route_path_inner(path: &Path, symlink_depth: usize) -> Result<PathBu
     if let Ok(metadata) = std::fs::symlink_metadata(path)
         && metadata.file_type().is_symlink()
     {
-        let target = std::fs::read_link(path)
-            .map_err(|error| Error::Other(format!("read_link {}: {error}", path.display())))?;
+        let target = std::fs::read_link(path).map_err(|error| {
+            Error::Other((format!("read_link {}: {error}", path.display())).into())
+        })?;
         let resolved = if target.is_absolute() {
             target
         } else {
@@ -1077,16 +1516,65 @@ fn claim_window_budget(timeouts: ReadClientTimeouts) -> u64 {
     timeouts.routing_retry_ms
 }
 
-/// Try one route, and — for a caller that asked for the owner alone — wait out
-/// a writer that is holding the store with its decision unpublished.
-///
-/// A store nobody owns still answers owner-absent here, immediately. What
-/// changes is a store somebody DOES own: a claim that has said nothing yet is
-/// re-observed once, through the caller's own declared budget, and the answer
-/// is the writer's own — or, if the budget runs out with the claim still held,
-/// the not-serving answer a live holder deserves. Never owner-absent, because
-/// that answer is a consumer's licence to take a store this one is holding.
+/// Initial selection and writer turnover share one retry when a writer
+/// wins physical admission after the direct route was selected. Both attempts
+/// borrow the same handover, so its deadline, token and owner never restart.
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn select_route_with_ownership_retry(
+    path: &Path,
+    options: &ReadSessionOptions,
+    runtime_dir: Option<&Path>,
+    requirement: RouteRequirement,
+    resources: &Arc<RouteResources>,
+    mismatch: Option<OwnerHandshakeMismatchForTest>,
+    handover: Option<&RouteHandover<'_>>,
+    observe: &dyn Fn(ReadSessionEvent),
+) -> Result<SelectedRoute> {
+    let mut attempt = 1u64;
+    loop {
+        match attempt_route(
+            path,
+            options,
+            runtime_dir,
+            requirement,
+            attempt,
+            resources,
+            mismatch,
+            handover,
+            observe,
+        ) {
+            Ok(selected) => return Ok(selected),
+            Err(refusal) => {
+                observe(ReadSessionEvent::RouteOpenFailed {
+                    attempt,
+                    failure: refusal.failure,
+                });
+                if refusal.failure != ReadRouteOpenFailure::WriterBecameOwner || attempt > 1 {
+                    return Err(refusal.error);
+                }
+                let retry_attempt = attempt.saturating_add(1);
+                observe(ReadSessionEvent::OwnershipRaceRetry {
+                    failed_attempt: attempt,
+                    retry_attempt,
+                });
+                attempt = retry_attempt;
+            }
+        }
+    }
+}
+
+/// Select an already-serving owner first. A verified opening claim settles
+/// through its actual publication event within the caller's existing routing
+/// allowance, including when the companion still names the previous writer.
+#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn attempt_route(
     path: &Path,
     options: &ReadSessionOptions,
@@ -1095,15 +1583,11 @@ fn attempt_route(
     attempt: u64,
     resources: &Arc<RouteResources>,
     mismatch: Option<OwnerHandshakeMismatchForTest>,
+    handover: Option<&RouteHandover<'_>>,
     observe: &dyn Fn(ReadSessionEvent),
 ) -> std::result::Result<SelectedRoute, RouteOpenRefusal> {
-    // The holder has finished all writes and reclamation before publishing
-    // this state. Its trusted companion record and live lock jointly attest
-    // that a direct snapshot is safe even while accepted channel reads drain.
-    if requirement == RouteRequirement::OwnerOrFile && owner_is_quiescent(path) {
-        return open_direct_route(path, options, runtime_dir, resources, attempt, observe);
-    }
-    let mut waited = false;
+    let mut claim_wait =
+        handover.map(|handover| (Arc::clone(&handover.clock), handover.deadline_ms));
     loop {
         let refusal = match attempt_route_once(
             path,
@@ -1113,12 +1597,19 @@ fn attempt_route(
             attempt,
             resources,
             mismatch,
+            handover,
             observe,
         ) {
             Ok(selected) => return Ok(selected),
             Err(refusal) => refusal,
         };
-        if refusal.failure != ReadRouteOpenFailure::OwnerRequired {
+        let opening_transition = requirement == RouteRequirement::OwnerOrFile
+            && (refusal.failure == ReadRouteOpenFailure::WriterBecameOwner
+                || matches!(&refusal.error, Error::ReadFailure(failure)
+                    if matches!(failure.kind(),
+                        contextdb_core::read_contract::ReadFailureKind::OwnerNotServing
+                        | contextdb_core::read_contract::ReadFailureKind::OwnerNotRunning)));
+        if refusal.failure != ReadRouteOpenFailure::OwnerRequired && !opening_transition {
             return Err(refusal);
         }
         // Nothing in the record named an owner that could be asked. Whether
@@ -1127,19 +1618,32 @@ fn attempt_route(
         let Some(claim) = crate::persistence::observe_unsettled_claim(path) else {
             return Err(refusal);
         };
-        if waited {
-            return Err(RouteOpenRefusal {
-                failure: ReadRouteOpenFailure::OwnerHeldWithoutDecision,
-                error: Error::ReadFailure(owner_holding_without_a_decision()),
-            });
-        }
-        waited = true;
         observe(ReadSessionEvent::ClaimWindowWait { attempt });
-        match crate::persistence::wait_for_claim_settlement(
-            claim,
-            claim_window_budget(options.timeouts),
-            claim_window_clock().as_ref(),
-        ) {
+        let (clock, deadline_ms) = claim_wait.get_or_insert_with(|| {
+            let clock = claim_window_clock();
+            let deadline_ms = clock
+                .now_ms()
+                .saturating_add(claim_window_budget(options.timeouts));
+            (clock, deadline_ms)
+        });
+        let remaining_ms = deadline_ms.saturating_sub(clock.now_ms());
+        let settlement = if remaining_ms == 0 {
+            crate::persistence::ClaimSettlement::StillHeld
+        } else {
+            crate::persistence::wait_for_claim_settlement(
+                claim,
+                remaining_ms,
+                clock.as_ref(),
+                handover.map(|value| value.cancellation),
+            )
+        };
+        match settlement {
+            crate::persistence::ClaimSettlement::Cancelled => {
+                return Err(RouteOpenRefusal {
+                    failure: ReadRouteOpenFailure::OwnerHeldWithoutDecision,
+                    error: Error::ReadCancelled,
+                });
+            }
             crate::persistence::ClaimSettlement::Settled => continue,
             crate::persistence::ClaimSettlement::StillHeld => {
                 return Err(RouteOpenRefusal {
@@ -1152,6 +1656,10 @@ fn attempt_route(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn attempt_route_once(
     path: &Path,
     options: &ReadSessionOptions,
@@ -1160,24 +1668,53 @@ fn attempt_route_once(
     attempt: u64,
     resources: &Arc<RouteResources>,
     mismatch: Option<OwnerHandshakeMismatchForTest>,
+    handover: Option<&RouteHandover<'_>>,
     observe: &dyn Fn(ReadSessionEvent),
 ) -> std::result::Result<SelectedRoute, RouteOpenRefusal> {
     let published = published_owner_channel(path);
     if requirement == RouteRequirement::OwnerOrFile && owner_is_quiescent(path) {
-        return open_direct_route(path, options, runtime_dir, resources, attempt, observe);
+        return open_direct_route(
+            path,
+            options,
+            runtime_dir,
+            resources,
+            attempt,
+            handover,
+            observe,
+        );
     }
     let owner_channel = match published {
         Some((identity, writer_run, owner_user, address)) => {
-            let runtime = read_runtime_directory(owner_user, runtime_dir).map_err(|error| {
-                RouteOpenRefusal {
-                    failure: ReadRouteOpenFailure::OwnerAuthentication,
-                    error,
+            let runtime = match read_runtime_directory(owner_user, runtime_dir) {
+                Ok(runtime) => runtime,
+                Err(_error)
+                    if requirement == RouteRequirement::OwnerOrFile
+                        && crate::persistence::observed_writer_hold(path) == Some(false) =>
+                {
+                    // An idle companion makes an unavailable owner runtime
+                    // equivalent to a failed dial. Direct admission still
+                    // rejects a writer that claims the store after this probe.
+                    return open_direct_route(
+                        path,
+                        options,
+                        runtime_dir,
+                        resources,
+                        attempt,
+                        handover,
+                        observe,
+                    );
                 }
-            })?;
+                Err(error) => {
+                    return Err(RouteOpenRefusal {
+                        failure: ReadRouteOpenFailure::OwnerAuthentication,
+                        error,
+                    });
+                }
+            };
             let channel_path = crate::local_transport::channel_socket_path(runtime.path(), address)
                 .map_err(|error| RouteOpenRefusal {
                     failure: ReadRouteOpenFailure::OwnerAuthentication,
-                    error: Error::Other(error.to_string()),
+                    error: Error::Other((error.to_string()).into()),
                 })?;
             // A published channel that is absent or inaccessible is still a
             // candidate whose live companion state must be classified. If it
@@ -1234,12 +1771,33 @@ fn attempt_route_once(
                     .declaring(declared)
             }
         };
-        match wait_for_local_answer(crate::owner_read::OwnerClient::connect(
-            &channel_path,
-            presented,
-            options.timeouts,
-            read_clock(),
-        )) {
+        let channel_clock = resources.expiry.clock.clone();
+        let channel_owner = match handover {
+            Some(handover) => handover.owner.clone(),
+            None => crate::local_transport::query_funding::QueryMemory::new(
+                options
+                    .limits
+                    .memory
+                    .min(options.memory_limit.map_or(u64::MAX, |bytes| bytes as u64)),
+            )
+            .map_err(|error| RouteOpenRefusal {
+                failure: ReadRouteOpenFailure::OwnerAuthentication,
+                error,
+            })?
+            .image()
+            .owner(),
+        };
+        match wait_for_local_answer(
+            crate::owner_read::OwnerClient::connect(
+                &channel_path,
+                presented,
+                options.timeouts,
+                channel_clock.clone(),
+                channel_owner.clone(),
+            ),
+            &channel_clock,
+            channel_owner,
+        ) {
             Ok(client) => {
                 // An owner that is winding down accepts the connection and
                 // then refuses every statement. Selecting it would hand the
@@ -1256,6 +1814,7 @@ fn attempt_route_once(
                             runtime_dir,
                             resources,
                             attempt,
+                            handover,
                             observe,
                         );
                     }
@@ -1268,7 +1827,7 @@ fn attempt_route_once(
                     .channel_identity
                     .lock()
                     .expect("route channel identity") = Some(address);
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 {
                     *resources
                         .channel_source_items
@@ -1322,6 +1881,7 @@ fn attempt_route_once(
                                     runtime_dir,
                                     resources,
                                     attempt,
+                                    handover,
                                     observe,
                                 );
                             }
@@ -1331,10 +1891,9 @@ fn attempt_route_once(
                             });
                         }
                         // This is the placeholder a writer publishes while
-                        // its claim window is still open. The owner-only door
-                        // below re-observes that window through the caller's
-                        // declared budget; an ordinary read retains its
-                        // existing direct-lock race path.
+                        // its claim window is still open. Route selection
+                        // settles the verified claim through this caller's
+                        // existing allowance before selecting its route.
                         OwnerServingState::NotApplicable => {}
                     }
                 }
@@ -1395,6 +1954,7 @@ fn attempt_route_once(
                             runtime_dir,
                             resources,
                             attempt,
+                            handover,
                             observe,
                         );
                     }
@@ -1423,7 +1983,15 @@ fn attempt_route_once(
     // anyone.
     if let Some(status) = crate::persistence::recorded_unserved_owner(path) {
         if requirement == RouteRequirement::OwnerOrFile && owner_is_quiescent(path) {
-            return open_direct_route(path, options, runtime_dir, resources, attempt, observe);
+            return open_direct_route(
+                path,
+                options,
+                runtime_dir,
+                resources,
+                attempt,
+                handover,
+                observe,
+            );
         }
         return Err(RouteOpenRefusal {
             failure: ReadRouteOpenFailure::OwnerAuthentication,
@@ -1444,7 +2012,15 @@ fn attempt_route_once(
         });
     }
 
-    open_direct_route(path, options, runtime_dir, resources, attempt, observe)
+    open_direct_route(
+        path,
+        options,
+        runtime_dir,
+        resources,
+        attempt,
+        handover,
+        observe,
+    )
 }
 
 fn owner_is_quiescent(path: &Path) -> bool {
@@ -1455,34 +2031,61 @@ fn owner_is_quiescent(path: &Path) -> bool {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn open_direct_route(
     path: &Path,
     options: &ReadSessionOptions,
     runtime_dir: Option<&Path>,
     resources: &Arc<RouteResources>,
     attempt: u64,
+    handover: Option<&RouteHandover<'_>>,
     observe: &dyn Fn(ReadSessionEvent),
 ) -> std::result::Result<SelectedRoute, RouteOpenRefusal> {
     observe(ReadSessionEvent::BeforeDirectBackendOpen { attempt });
     resources.note_direct_backend_open();
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     let coordination_runtime = runtime_dir
         .map(Path::to_path_buf)
         .or_else(runtime_directory_override_for_test);
-    #[cfg(not(feature = "test-seams"))]
+    #[cfg(not(any(test, feature = "test-seams")))]
     let coordination_runtime = runtime_dir.map(Path::to_path_buf);
     // The declaration this session opened with travels with the reader, so
     // the committed image it hydrates is narrowed before a single row is
     // answered from it.
-    let mut config =
-        crate::direct_file_reader::DirectReaderConfig::new(options.limits, read_clock()).declaring(
-            options.contexts.clone(),
-            options.scope_labels.clone(),
-            options.principal.clone(),
-        );
+    let mut config = crate::direct_file_reader::DirectReaderConfig::new(
+        options.limits,
+        resources.expiry.clock.clone(),
+    )
+    .declaring(
+        options.contexts.clone(),
+        options.scope_labels.clone(),
+        options.principal.clone(),
+    );
     config.memory_limit = options.memory_limit;
+    config.read_cache_share = resources.current_read_cache_share();
     config.runtime_dir = coordination_runtime;
-    match crate::direct_file_reader::DirectFileReader::open(path, config) {
+    let opened = match handover {
+        Some(handover) => {
+            // Native saved-file capture spends the caller's opening budget,
+            // independently of the allowance spent discovering this route.
+            let opening_deadline = resources
+                .expiry
+                .clock
+                .now_ms()
+                .saturating_add(options.limits.active_ms);
+            crate::direct_file_reader::DirectFileReader::open_with_route_deadline(
+                path,
+                config,
+                handover.cancellation,
+                opening_deadline,
+            )
+        }
+        None => crate::direct_file_reader::DirectFileReader::open(path, config),
+    };
+    match opened {
         Ok(reader) => {
             observe(ReadSessionEvent::DirectBackendOpen);
             Ok(SelectedRoute::File(Box::new(reader)))
@@ -1628,27 +2231,31 @@ fn owner_authentication_error(error: Error) -> Error {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn current_read_user()
 -> std::result::Result<contextdb_core::read_contract::LocalUserIdentity, Error> {
     use crate::local_transport::RuntimeDirectoryEnvironment;
     crate::local_transport::ProcessRuntimeDirectoryEnvironment
         .effective_user_identity()
-        .map_err(|error| Error::Other(error.to_string()))
+        .map_err(|error| Error::Other((error.to_string()).into()))
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static SESSION_KERNEL_PROBE: std::cell::RefCell<
         Option<Arc<dyn crate::executor::BoundedExecutionProbe>>,
     > = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 struct SessionKernelProbeGuard {
     previous: Option<Arc<dyn crate::executor::BoundedExecutionProbe>>,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl Drop for SessionKernelProbeGuard {
     fn drop(&mut self) {
         let previous = self.previous.take();
@@ -1665,7 +2272,7 @@ impl Drop for SessionKernelProbeGuard {
 /// doors, and a route may not reach past them; so the observer is left where
 /// the kernel itself picks it up, for exactly the span of one operation, and
 /// is restored even if that operation panics.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn with_session_kernel_probe<T>(
     probe: Option<Arc<dyn crate::executor::BoundedExecutionProbe>>,
     operation: impl FnOnce() -> T,
@@ -1681,7 +2288,7 @@ pub(crate) fn with_session_kernel_probe<T>(
 /// counter the thread it runs on is carrying, so a route that wants to know
 /// what its own reads did puts its counter there for exactly the span of one
 /// operation, and takes it back afterwards even if the operation panics.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn with_route_source_counter<T>(
     resources: &Arc<RouteResources>,
     operation: impl FnOnce() -> T,
@@ -1701,7 +2308,7 @@ fn with_route_source_counter<T>(
     operation()
 }
 
-#[cfg(not(feature = "test-seams"))]
+#[cfg(not(any(test, feature = "test-seams")))]
 fn with_route_source_counter<T>(
     _resources: &Arc<RouteResources>,
     operation: impl FnOnce() -> T,
@@ -1711,23 +2318,28 @@ fn with_route_source_counter<T>(
 
 /// The kernel observer in force for the operation this thread is running.
 /// Only the bounded kernel's own callers read this.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn session_kernel_probe_for_test()
 -> Option<Arc<dyn crate::executor::BoundedExecutionProbe>> {
     SESSION_KERNEL_PROBE.with(|slot| slot.borrow().clone())
 }
 
-/// A route-stable bounded reading handle.
+/// A bounded reading handle for one store incarnation.
+/// New operations reselect their route after a writer run ends; existing
+/// cursors retain their selected snapshot and continuation.
 pub struct ReadSession {
-    route: ReadRoute,
+    requirement: RouteRequirement,
     options: ReadSessionOptions,
+    cache_policy_mutation: Mutex<()>,
     /// The runtime directory this session was opened against, when an operator
     /// supplied one. Kept because the session goes on asking the same
     /// deployment questions -- `.owner status` reaches the same owner the
     /// reads do -- and both must look in the one place the operator named.
     runtime_dir: Option<PathBuf>,
-    state: Arc<ReadSessionState>,
+    state: std::sync::RwLock<SelectedSessionState>,
     resources: Arc<RouteResources>,
+    // External custody stays outside callback-upgraded suspended state.
+    expiry_driver: Mutex<Option<SessionExpiryDriver>>,
     /// Whoever asked to be told what this session's reads are doing while they
     /// run. Held by the session rather than by its options because an
     /// observer is a live caller, not a setting.
@@ -1739,17 +2351,24 @@ pub struct ReadSession {
     /// not one of them -- and because the question is about this session's
     /// view, which is exactly what route selection has just finished
     /// producing.
-    snapshot_at: Option<contextdb_core::Wallclock>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     observer: Option<Arc<dyn ReadSessionTestObserver>>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     kernel_observer: Option<Arc<dyn ReadKernelTestObserver>>,
     /// A clock this session's own reads deadline against, so a test can move
     /// time deliberately instead of waiting for it. The owner route already
     /// takes a clock; a live-database session hardcoded the monotonic one,
     /// which left its deadline behaviour unreachable from a test.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     clock: Option<Arc<dyn contextdb_core::read_contract::DeadlineClock>>,
+}
+
+struct SelectedSessionState {
+    /// Sampled before opening a file image, so a writer completing between
+    /// operations cannot leave the session on its predecessor forever.
+    file_writer_run: Option<contextdb_core::read_contract::WriterRunNumber>,
+    state: Arc<ReadSessionState>,
+    snapshot_at: Option<contextdb_core::Wallclock>,
 }
 
 enum ReadSessionState {
@@ -1791,7 +2410,7 @@ fn read_error(error: crate::executor::BoundedExecutionError) -> Error {
 
 /// Wrap one session observer as the bounded kernel's own probe for a single
 /// operation, so what the observer sees is what the kernel actually did.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn observed_kernel_probe(
     observer: &Arc<dyn ReadKernelTestObserver>,
     operation: ReadSessionOperation,
@@ -1806,20 +2425,33 @@ fn observed_kernel_probe(
     ))
 }
 
-impl ReadSession {
-    /// The clock this session deadlines against: whatever a test installed,
-    /// otherwise the monotonic one every live read has always used.
-    fn session_clock(&self) -> Arc<dyn contextdb_core::read_contract::DeadlineClock> {
-        #[cfg(feature = "test-seams")]
-        if let Some(clock) = self.clock.as_ref() {
-            return Arc::clone(clock);
+impl ReadSessionState {
+    fn route(&self) -> ReadRoute {
+        match self {
+            Self::DirectFile(_) => ReadRoute::File,
+            Self::LiveDatabase(_) | Self::OwnerChannel(_) => ReadRoute::Owner,
         }
-        read_clock()
     }
 }
 
-fn read_clock() -> Arc<dyn contextdb_core::read_contract::DeadlineClock> {
-    #[cfg(feature = "test-seams")]
+impl ReadSession {
+    fn selected_state(&self) -> Arc<ReadSessionState> {
+        Arc::clone(&self.state.read().expect("selected read route").state)
+    }
+
+    /// The clock this session deadlines against: whatever a test installed,
+    /// otherwise the monotonic one every live read has always used.
+    fn session_clock(&self) -> Arc<dyn contextdb_core::read_contract::DeadlineClock> {
+        #[cfg(any(test, feature = "test-seams"))]
+        if let Some(clock) = self.clock.as_ref() {
+            return Arc::clone(clock);
+        }
+        self.resources.expiry.clock.clone()
+    }
+}
+
+pub(crate) fn read_clock() -> Arc<dyn contextdb_core::read_contract::DeadlineClock> {
+    #[cfg(any(test, feature = "test-seams"))]
     if let Some(clock) = ROUTE_SELECTION_CLOCK.with(|slot| slot.borrow().clone()) {
         return clock;
     }
@@ -1832,17 +2464,25 @@ fn read_clock() -> Arc<dyn contextdb_core::read_contract::DeadlineClock> {
 struct LiveCursorExecution {
     database: Arc<Database>,
     handle: crate::executor::BoundedCursorHandle,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     kernel_observer: Option<Arc<dyn ReadKernelTestObserver>>,
 }
 
 impl OwnedCursorExecution for LiveCursorExecution {
+    fn work_observation(&mut self) -> Result<Option<crate::executor::CursorObservation>> {
+        self.handle.work_observation().map_err(read_error)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn fetch(
         &mut self,
         rows: Option<NonZeroUsize>,
         cancellation: &OwnerReadCancellation,
-    ) -> Result<CursorPage> {
-        #[cfg(feature = "test-seams")]
+    ) -> Result<ObservedCursorPage> {
+        #[cfg(any(test, feature = "test-seams"))]
         let probe = self.kernel_observer.as_ref().map(|observer| {
             observed_kernel_probe(
                 observer,
@@ -1851,18 +2491,27 @@ impl OwnedCursorExecution for LiveCursorExecution {
                 cancellation,
             )
         });
-        let fetched = crate::executor::fetch_bounded_cursor(
-            &mut self.handle,
-            rows,
-            cancellation.clone(),
-            #[cfg(feature = "test-seams")]
-            probe,
-        )
+        let fetched = crate::owned_cursor_page::with_public_page(|| {
+            crate::executor::fetch_bounded_cursor(
+                &mut self.handle,
+                rows,
+                cancellation.clone(),
+                #[cfg(any(test, feature = "test-seams"))]
+                probe,
+            )
+        })
         .map_err(read_error)?;
         self.database.publish_authoritative_read(
             &fetched.publication,
             |error| error,
-            || Ok(fetched.page),
+            || {
+                Ok(ObservedCursorPage {
+                    cancelled: false,
+                    page: fetched.page,
+                    observation: fetched.observation,
+                    owner_trace_charge: None,
+                })
+            },
         )
     }
 
@@ -1879,7 +2528,7 @@ impl ReadSession {
     /// Run an operation through the normal route doors while resolving local
     /// channels below an explicit secure test runtime root. The scoped value
     /// is restored even when the operation panics.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn with_runtime_directory_for_test<T>(
         runtime_dir: impl AsRef<Path>,
@@ -1891,12 +2540,232 @@ impl ReadSession {
         operation()
     }
 
-    /// Open a read-only session by selecting the owner or file route once.
+    /// A writer run belongs to one serving connection, not to the store.
+    /// Select once for a new operation after that run ends. Already-open
+    /// cursors keep their own state and exact-root registration unchanged.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn after_writer_turnover(
+        &self,
+        cancellation: &OwnerReadCancellation,
+    ) -> Result<Option<contextdb_core::read_contract::ReadFailure>> {
+        let (previous, file_writer_run) = {
+            let selected = self.state.read().expect("selected read route");
+            (Arc::clone(&selected.state), selected.file_writer_run)
+        };
+        if cancellation.is_cancelled() {
+            return Err(Error::ReadCancelled);
+        }
+        let mismatch = || {
+            Error::ReadFailure(
+                contextdb_core::read_contract::ReadFailure::new(
+                    contextdb_core::read_contract::ReadFailureKind::OwnerMismatch,
+                    contextdb_core::read_contract::ReadFailureDetail::None,
+                )
+                .expect("owner mismatch has no detail"),
+            )
+        };
+        let (path, identity, runtime_dir, observed, memory) = match previous.as_ref() {
+            ReadSessionState::LiveDatabase(_) => return Ok(None),
+            ReadSessionState::OwnerChannel(owner) => {
+                let observed = crate::persistence::observed_writer_state(&owner.path);
+                if let Some(observed) = &observed {
+                    if observed.identity != owner.identity {
+                        return Err(mismatch());
+                    }
+                    let draining = observed.status.state
+                        == contextdb_core::read_contract::OwnerServingState::NotServing
+                        && observed.status.reason
+                            == Some(
+                                contextdb_core::read_contract::OwnerServingReason::ShutdownDraining,
+                            );
+                    if observed.run == owner.writer_run && observed.held && !draining {
+                        return Ok(None);
+                    }
+                }
+                (
+                    owner.path.as_path(),
+                    Some(owner.identity),
+                    // Retain the caller's declaration: a resolved default child
+                    // must not become an operator-supplied directory at turnover.
+                    self.runtime_dir.as_deref(),
+                    observed,
+                    owner
+                        .client
+                        .lock()
+                        .expect("owner client")
+                        .original_connection_owner(),
+                )
+            }
+            ReadSessionState::DirectFile(reader) => {
+                let path = reader.database_path();
+                let identity = reader.database_identity();
+                let observed = crate::persistence::observed_writer_state(path);
+                if let Some(observed) = &observed {
+                    // A readable clean copy may have no companion yet. Its first
+                    // authenticated writer establishes the store identity.
+                    if identity.is_some_and(|identity| observed.identity != identity) {
+                        // A different store at the old pathname is not a new
+                        // writer of this registered descriptor. Keep serving the
+                        // captured file; do not adopt or dial that foreign store.
+                        if reader.database_path_was_replaced() {
+                            return Ok(None);
+                        }
+                        return Err(mismatch());
+                    }
+                    if !observed.held && Some(observed.run) == file_writer_run {
+                        return Ok(None);
+                    }
+                } else if crate::persistence::observe_unsettled_claim(path).is_none() {
+                    // An unchanged idle image needs no new backend. A verified
+                    // opening claim instead enters the selector's bounded wait.
+                    return Ok(None);
+                }
+                (
+                    path,
+                    identity,
+                    self.runtime_dir.as_deref(),
+                    observed,
+                    reader.expiry_memory_owner(),
+                )
+            }
+        };
+        let clock = self.session_clock();
+        let started_ms = clock.now_ms();
+        let handover = RouteHandover {
+            deadline_ms: started_ms.saturating_add(self.options.timeouts.routing_retry_ms),
+            clock: Arc::clone(&clock),
+            cancellation,
+            owner: memory,
+        };
+        let observe = |event| {
+            #[cfg(any(test, feature = "test-seams"))]
+            if let Some(observer) = self.observer.as_ref() {
+                observer.observe_event(event);
+            }
+            #[cfg(not(any(test, feature = "test-seams")))]
+            let _ = event;
+        };
+        let retained_erasure = || -> Result<Option<contextdb_core::read_contract::ReadFailure>> {
+            let ReadSessionState::DirectFile(reader) = previous.as_ref() else {
+                return Ok(None);
+            };
+            let budget = crate::executor::ReadPublicationBudget {
+                clock: Arc::clone(&clock),
+                cancellation: cancellation.clone(),
+                // This source check has the caller's read budget. Time spent
+                // finding a replacement route cannot expire the saved image.
+                started_ms: clock.now_ms(),
+                active_ms: self.options.limits.active_ms,
+            };
+            match reader.check_turnover_with_budget(&budget) {
+                Ok(()) => Ok(None),
+                Err(Error::ReadFailure(failure))
+                    if failure.kind()
+                        == contextdb_core::read_contract::ReadFailureKind::AuthoritativeErasure =>
+                {
+                    // Keep the original snapshot and its fences. Bounded
+                    // reads let the kernel decide which tables are affected;
+                    // owner-only requests preserve this exact erasure answer.
+                    Ok(Some(failure))
+                }
+                Err(other) => Err(other),
+            }
+        };
+        // Check before dialing too: an unavailable replacement channel must
+        // not hide an erasure the retained file reader already knows about.
+        if let Some(failure) = retained_erasure()? {
+            return Ok(Some(failure));
+        }
+        let selected = select_route_with_ownership_retry(
+            path,
+            &self.options(),
+            runtime_dir,
+            self.requirement,
+            &self.resources,
+            None,
+            Some(&handover),
+            &observe,
+        )?;
+        if cancellation.is_cancelled() {
+            return Err(Error::ReadCancelled);
+        }
+        if let Some(failure) = retained_erasure()? {
+            return Ok(Some(failure));
+        }
+        let snapshot_floor = match previous.as_ref() {
+            ReadSessionState::DirectFile(reader) => Some(reader.snapshot_lsn()),
+            _ => None,
+        };
+        let (state, snapshot_at) = match selected {
+            SelectedRoute::Owner(selected) => {
+                if identity.is_some_and(|identity| selected.identity != identity) {
+                    return Err(mismatch());
+                }
+                // A companionless copy has no identity to compare. Its first
+                // authenticated writer must still preserve the committed image
+                // the session already read, rather than adopting an older copy.
+                if snapshot_floor.is_some_and(|floor| {
+                    selected
+                        .client
+                        .lock()
+                        .expect("owner client")
+                        .accepted_lsn()
+                        .is_none_or(|lsn| lsn < floor)
+                }) {
+                    return Err(mismatch());
+                }
+                (ReadSessionState::OwnerChannel(selected), None)
+            }
+            SelectedRoute::File(reader) => {
+                if identity.is_some() && reader.database_identity() != identity {
+                    return Err(mismatch());
+                }
+                if snapshot_floor.is_some_and(|floor| reader.snapshot_lsn() < floor) {
+                    return Err(mismatch());
+                }
+                (
+                    ReadSessionState::DirectFile(reader),
+                    Some(contextdb_core::Wallclock::now()),
+                )
+            }
+        };
+        let route = state.route();
+        let installed = {
+            let mut selected = self.state.write().expect("selected read route");
+            if Arc::ptr_eq(&selected.state, &previous) {
+                *selected = SelectedSessionState {
+                    state: Arc::new(state),
+                    snapshot_at,
+                    file_writer_run: observed.map(|writer| writer.run),
+                };
+                true
+            } else {
+                false
+            }
+        };
+        if installed {
+            observe(ReadSessionEvent::RouteSelected(route));
+        }
+        Ok(None)
+    }
+
+    /// Open a read-only session by selecting its initial owner or file route.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_options(path, ReadSessionOptions::default())
     }
 
     /// Open a read-only session with caller-requested bounds and deadlines.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn open_with_options(path: impl AsRef<Path>, options: ReadSessionOptions) -> Result<Self> {
         Self::select(
             path.as_ref(),
@@ -1931,6 +2800,10 @@ impl ReadSession {
     /// A caller that wants the store's committed rows when there is no owner
     /// opens an ordinary session instead, which reads the file exactly as it
     /// always has.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn open_owner_only(path: impl AsRef<Path>, options: ReadSessionOptions) -> Result<Self> {
         Self::open_owner_only_in_runtime_dir(path, options, None)
     }
@@ -1945,6 +2818,10 @@ impl ReadSession {
     /// about the very owner it was pointed at.
     ///
     /// `None` is the ordinary open: the platform's own runtime location.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn open_owner_only_in_runtime_dir(
         path: impl AsRef<Path>,
         options: ReadSessionOptions,
@@ -1968,6 +2845,10 @@ impl ReadSession {
     /// Opening a store is itself one of the slow things a caller waits on --
     /// the committed image is loaded here -- so the observer is in force for
     /// this call as well as for every statement the session goes on to run.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn open_with_progress(
         path: impl AsRef<Path>,
         options: ReadSessionOptions,
@@ -1996,6 +2877,10 @@ impl ReadSession {
     /// writer nobody is ever able to inspect.
     ///
     /// `None` is the ordinary open: the platform's own runtime location.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn open_in_runtime_dir(
         path: impl AsRef<Path>,
         options: ReadSessionOptions,
@@ -2016,6 +2901,10 @@ impl ReadSession {
     /// The supplied-runtime-directory open, reporting what it is doing while
     /// it loads — see [`Self::open_in_runtime_dir`] and
     /// [`Self::open_with_progress`].
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn open_with_progress_in_runtime_dir(
         path: impl AsRef<Path>,
         options: ReadSessionOptions,
@@ -2036,8 +2925,15 @@ impl ReadSession {
 
     /// Open through the production route selector with deterministic route
     /// observation enabled.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn open_with_observer_for_test(
         path: impl AsRef<Path>,
         options: ReadSessionOptions,
@@ -2057,8 +2953,15 @@ impl ReadSession {
 
     /// Open through the production route selector while a proof drives every
     /// local-channel deadline with its manual clock.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn open_with_clock_for_test(
         path: impl AsRef<Path>,
         options: ReadSessionOptions,
@@ -2081,8 +2984,48 @@ impl ReadSession {
         Ok(session)
     }
 
-    #[cfg(feature = "test-seams")]
+    /// Open below the supplied runtime root while a proof controls the session clock.
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
+    pub fn open_in_runtime_dir_with_clock_for_test(
+        path: impl AsRef<Path>,
+        options: ReadSessionOptions,
+        runtime_dir: Option<PathBuf>,
+        clock: Arc<dyn contextdb_core::read_contract::DeadlineClock>,
+    ) -> Result<Self> {
+        let session_clock = Arc::clone(&clock);
+        let mut session = with_route_selection_clock_for_test(clock, || {
+            Self::select(
+                path.as_ref(),
+                options,
+                runtime_dir,
+                RouteRequirement::OwnerOrFile,
+                None,
+                None,
+                None,
+                None,
+            )
+        })?;
+        session.clock = Some(session_clock);
+        Ok(session)
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn open_with_clock_and_observer_for_test(
         path: impl AsRef<Path>,
         options: ReadSessionOptions,
@@ -2108,8 +3051,15 @@ impl ReadSession {
 
     /// The owner-only door, opened through the production route selector
     /// with deterministic route observation enabled.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn open_owner_only_with_observer_for_test(
         path: impl AsRef<Path>,
         options: ReadSessionOptions,
@@ -2135,8 +3085,15 @@ impl ReadSession {
     /// is proven by advancing a manual clock, never by sleeping. Route
     /// selection therefore has to carry this clock into the claim wait, so
     /// the wait deadlines against it instead of against `Instant::now()`.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn open_owner_only_with_clock_for_test(
         path: impl AsRef<Path>,
         options: ReadSessionOptions,
@@ -2158,8 +3115,15 @@ impl ReadSession {
 
     /// Traverse the normal owner route while presenting one deliberately
     /// mismatched identity field to its real authentication boundary.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn open_with_owner_handshake_mismatch_for_test(
         path: impl AsRef<Path>,
         options: ReadSessionOptions,
@@ -2180,8 +3144,15 @@ impl ReadSession {
 
     /// Open through the production route selector while attaching an observer
     /// that can be called only from the selected backend's bounded kernel.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn open_with_kernel_observer_for_test(
         path: impl AsRef<Path>,
         options: ReadSessionOptions,
@@ -2201,8 +3172,15 @@ impl ReadSession {
 
     /// Compose the existing observers and manual clock without changing route
     /// selection, request semantics or the runtime protocol.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn open_with_observations_for_test(
         path: impl AsRef<Path>,
         options: ReadSessionOptions,
@@ -2229,10 +3207,10 @@ impl ReadSession {
 
     /// Only the file backend owns a session-wide committed image today.
     /// Absence on a live-owner route is an observation, never a fabricated root.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn file_snapshot_for_test(&self) -> Option<crate::direct_file_reader::DirectSnapshot> {
-        match self.state.as_ref() {
+        match self.selected_state().as_ref() {
             ReadSessionState::DirectFile(reader) => Some(
                 crate::direct_file_reader::test_seams::snapshot_for_test(reader),
             ),
@@ -2240,12 +3218,12 @@ impl ReadSession {
         }
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn file_storage_registration_for_test(
         &self,
     ) -> Option<crate::direct_file_reader::DirectStorageRegistrationObservation> {
-        match self.state.as_ref() {
+        match self.selected_state().as_ref() {
             ReadSessionState::DirectFile(reader) => {
                 Some(crate::direct_file_reader::test_seams::storage_registration_for_test(reader))
             }
@@ -2253,7 +3231,7 @@ impl ReadSession {
         }
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn file_memory_for_test(
         &self,
@@ -2261,9 +3239,9 @@ impl ReadSession {
         crate::memory_accounting::MemoryUsage,
         usize,
         usize,
-        std::sync::Weak<dyn Send + Sync>,
+        crate::read_image_memory::ImageMemoryObservation,
     )> {
-        match self.state.as_ref() {
+        match self.selected_state().as_ref() {
             ReadSessionState::DirectFile(reader) => {
                 let (usage, held, witness) =
                     crate::direct_file_reader::test_seams::image_memory_for_test(reader);
@@ -2281,10 +3259,43 @@ impl ReadSession {
     /// Bytes this session's accountant took through `charge_retained` -- the
     /// writer's unconditional retention door. A read session must report zero:
     /// see `a_read_only_session_pays_nothing_at_the_writers_retention_door`.
-    #[cfg(feature = "test-seams")]
+    #[cfg(test)]
+    pub(crate) fn file_write_control_for_test(&self) -> redb::CacheWriteControlForTest {
+        match self.selected_state().as_ref() {
+            ReadSessionState::DirectFile(reader) => {
+                crate::direct_file_reader::test_seams::write_control_for_test(reader)
+            }
+            _ => panic!("fixture must use the actual direct file route"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn file_cached_header_for_test(&self) -> redb::CachePageForTest {
+        match self.selected_state().as_ref() {
+            ReadSessionState::DirectFile(reader) => {
+                crate::direct_file_reader::test_seams::cached_header_for_test(reader)
+            }
+            _ => panic!("fixture must use the actual direct file route"),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn file_cache_index_charge_for_test(
+        &self,
+    ) -> Option<crate::persistence::SourceCacheChargeForTest> {
+        match self.selected_state().as_ref() {
+            ReadSessionState::DirectFile(reader) => {
+                Some(crate::direct_file_reader::test_seams::cache_index_charge_for_test(reader))
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn file_retained_charge_bytes_for_test(&self) -> Option<usize> {
-        match self.state.as_ref() {
+        match self.selected_state().as_ref() {
             ReadSessionState::DirectFile(reader) => {
                 Some(crate::direct_file_reader::test_seams::retained_charge_bytes_for_test(reader))
             }
@@ -2292,10 +3303,10 @@ impl ReadSession {
         }
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn file_admitted_bytes_for_test(&self) -> Option<usize> {
-        match self.state.as_ref() {
+        match self.selected_state().as_ref() {
             ReadSessionState::DirectFile(reader) => {
                 Some(crate::direct_file_reader::test_seams::charged_admissions_for_test(reader))
             }
@@ -2305,12 +3316,12 @@ impl ReadSession {
 
     /// Snapshot real vector generation load/eviction receipts without changing
     /// the file reader's cache state.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn file_vector_passive_activity_for_test(
         &self,
     ) -> Option<contextdb_vector::VectorPassiveActivityCounters> {
-        match self.state.as_ref() {
+        match self.selected_state().as_ref() {
             ReadSessionState::DirectFile(reader) => Some(
                 crate::direct_file_reader::test_seams::vector_passive_activity_for_test(reader),
             ),
@@ -2320,10 +3331,10 @@ impl ReadSession {
 
     /// The vector store a file-route session searches, so a proof can arm a
     /// store seam on the very reader it measures.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn file_vector_store_for_test(&self) -> Option<Arc<contextdb_vector::VectorStore>> {
-        match self.state.as_ref() {
+        match self.selected_state().as_ref() {
             ReadSessionState::DirectFile(reader) => {
                 Some(crate::direct_file_reader::test_seams::vector_store_for_test(reader))
             }
@@ -2336,10 +3347,10 @@ impl ReadSession {
     /// bytes are actually accounted for by a session charge or the reader's
     /// free floor (second) -- independent of whatever `charged_bytes`
     /// reports as charged to the declared session.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn file_retained_content_proof_bytes_for_test(&self) -> Option<(usize, usize)> {
-        match self.state.as_ref() {
+        match self.selected_state().as_ref() {
             ReadSessionState::DirectFile(reader) => Some(
                 crate::direct_file_reader::test_seams::retained_content_proof_bytes_for_test(
                     reader,
@@ -2354,10 +3365,10 @@ impl ReadSession {
     /// copied out of residency stays reachable at exactly its pre-eviction
     /// bytes while the resident set's charge for it disappears -- the
     /// ownership gap a statement-preserving forced eviction needs to observe.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn file_evict_resident_proof_chunks_only_for_test(&self) -> Option<usize> {
-        match self.state.as_ref() {
+        match self.selected_state().as_ref() {
             ReadSessionState::DirectFile(reader) => Some(
                 crate::direct_file_reader::test_seams::evict_resident_proof_chunks_only_for_test(
                     reader,
@@ -2379,34 +3390,47 @@ impl ReadSession {
     /// answer, and the route chosen here is the route for this session's
     /// whole life.
     #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn select(
         path: &Path,
         options: ReadSessionOptions,
         runtime_dir: Option<PathBuf>,
         requirement: RouteRequirement,
-        #[cfg_attr(not(feature = "test-seams"), allow(unused_variables))] session_observer: Option<
-            Arc<dyn ReadSessionTestObserver>,
-        >,
-        #[cfg_attr(not(feature = "test-seams"), allow(unused_variables))] kernel_observer: Option<
-            Arc<dyn ReadKernelTestObserver>,
-        >,
+        session_observer: Option<Arc<dyn ReadSessionTestObserver>>,
+        kernel_observer: Option<Arc<dyn ReadKernelTestObserver>>,
         mismatch: Option<OwnerHandshakeMismatchForTest>,
         progress: Option<Arc<dyn ReadProgressObserver>>,
     ) -> Result<Self> {
-        #[cfg(not(feature = "test-seams"))]
+        #[cfg(not(any(test, feature = "test-seams")))]
         let _ = (&session_observer, &kernel_observer);
         let mut options = options;
+        if options
+            .read_cache_share
+            .is_some_and(|percent| percent > 100)
+        {
+            return Err(Error::InvalidSetting {
+                name: "READ_CACHE_SHARE",
+                value: options
+                    .read_cache_share
+                    .expect("invalid declared percent")
+                    .to_string(),
+                allowed: "0..=100, an integer percent".to_owned(),
+            });
+        }
         if let Some(limit) = options.memory_limit {
             options.limits.memory = options.limits.memory.min(limit as u64);
         }
         options
             .limits
             .validate()
-            .map_err(|violation| Error::Other(violation.to_string()))?;
+            .map_err(|violation| Error::Other((violation.to_string()).into()))?;
         options
             .timeouts
             .validate()
-            .map_err(|violation| Error::Other(violation.to_string()))?;
+            .map_err(|violation| Error::Other((violation.to_string()).into()))?;
         // One real store has one companion, channel address and direct-file
         // door regardless of whether its caller used an absolute path, a
         // relative path or a symlink. Resolve that identity once before any
@@ -2415,51 +3439,33 @@ impl ReadSession {
         // established typed missing-store answer.
         let canonical_path = resolved_route_path(path)?;
         let resources = Arc::new(RouteResources::default());
-        #[cfg(feature = "test-seams")]
+        resources.publish_read_cache_share(options.read_cache_share);
+        #[cfg(any(test, feature = "test-seams"))]
         let observed = session_observer.clone();
         let observe = move |event: ReadSessionEvent| {
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             if let Some(observer) = observed.as_ref() {
                 observer.observe_event(event);
             }
-            #[cfg(not(feature = "test-seams"))]
+            #[cfg(not(any(test, feature = "test-seams")))]
             let _ = event;
         };
         // Loading the committed image happens inside route selection, so the
         // observer is in force for the whole of it: a caller opening a large
         // store hears about the load rather than waiting in silence.
+        let file_writer_run =
+            crate::persistence::observed_writer_state(&canonical_path).map(|writer| writer.run);
         let selected = with_progress_observer(progress.as_ref(), || {
-            let mut attempt = 1u64;
-            loop {
-                match attempt_route(
-                    &canonical_path,
-                    &options,
-                    runtime_dir.as_deref(),
-                    requirement,
-                    attempt,
-                    &resources,
-                    mismatch,
-                    &observe,
-                ) {
-                    Ok(selected) => break Ok(selected),
-                    Err(refusal) => {
-                        observe(ReadSessionEvent::RouteOpenFailed {
-                            attempt,
-                            failure: refusal.failure,
-                        });
-                        if refusal.failure != ReadRouteOpenFailure::WriterBecameOwner || attempt > 1
-                        {
-                            return Err(refusal.error);
-                        }
-                        let retry_attempt = attempt.saturating_add(1);
-                        observe(ReadSessionEvent::OwnershipRaceRetry {
-                            failed_attempt: attempt,
-                            retry_attempt,
-                        });
-                        attempt = retry_attempt;
-                    }
-                }
-            }
+            select_route_with_ownership_retry(
+                &canonical_path,
+                &options,
+                runtime_dir.as_deref(),
+                requirement,
+                &resources,
+                mismatch,
+                None,
+                &observe,
+            )
         })?;
         let (route, state, snapshot_at) = match selected {
             SelectedRoute::Owner(owner) => (
@@ -2476,40 +3482,50 @@ impl ReadSession {
         };
         observe(ReadSessionEvent::RouteSelected(route));
         Ok(Self {
-            route,
+            cache_policy_mutation: Mutex::new(()),
+            requirement,
             options,
             runtime_dir,
-            state: Arc::new(state),
+            state: std::sync::RwLock::new(SelectedSessionState {
+                state: Arc::new(state),
+                snapshot_at,
+                file_writer_run,
+            }),
             resources,
+            expiry_driver: Mutex::new(None),
             progress,
-            snapshot_at,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             observer: session_observer,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             kernel_observer,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             clock: None,
         })
     }
 
     pub(crate) fn from_live_database(database: Database, limits: ReadLimits) -> Self {
         Self {
-            route: ReadRoute::Owner,
+            cache_policy_mutation: Mutex::new(()),
+            requirement: RouteRequirement::OwnerOnly,
             options: ReadSessionOptions {
                 limits,
                 timeouts: ReadClientTimeouts::default(),
                 ..ReadSessionOptions::default()
             },
             runtime_dir: None,
-            state: Arc::new(ReadSessionState::LiveDatabase(Arc::new(database))),
+            state: std::sync::RwLock::new(SelectedSessionState {
+                state: Arc::new(ReadSessionState::LiveDatabase(Arc::new(database))),
+                snapshot_at: None,
+                file_writer_run: None,
+            }),
             resources: Arc::new(RouteResources::default()),
+            expiry_driver: Mutex::new(None),
             progress: None,
-            snapshot_at: None,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             observer: None,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             kernel_observer: None,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             clock: None,
         }
     }
@@ -2528,7 +3544,7 @@ impl ReadSession {
         session
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn from_live_database_with_observer(
         database: Database,
         limits: ReadLimits,
@@ -2536,20 +3552,25 @@ impl ReadSession {
     ) -> Self {
         observer.observe_event(ReadSessionEvent::RouteSelected(ReadRoute::Owner));
         Self {
-            route: ReadRoute::Owner,
+            cache_policy_mutation: Mutex::new(()),
+            requirement: RouteRequirement::OwnerOnly,
             options: ReadSessionOptions {
                 limits,
                 timeouts: ReadClientTimeouts::default(),
                 ..ReadSessionOptions::default()
             },
             runtime_dir: None,
-            state: Arc::new(ReadSessionState::LiveDatabase(Arc::new(database))),
+            state: std::sync::RwLock::new(SelectedSessionState {
+                state: Arc::new(ReadSessionState::LiveDatabase(Arc::new(database))),
+                snapshot_at: None,
+                file_writer_run: None,
+            }),
             resources: Arc::new(RouteResources::default()),
+            expiry_driver: Mutex::new(None),
             progress: None,
-            snapshot_at: None,
             observer: Some(observer),
             kernel_observer: None,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             clock: None,
         }
     }
@@ -2558,7 +3579,7 @@ impl ReadSession {
     /// caller supplies, so a deadline can be reached deliberately instead of
     /// waited for. The owner route has always taken a clock; this is the same
     /// door for the in-process route.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn from_live_database_with_clock(
         database: Database,
         limits: ReadLimits,
@@ -2569,60 +3590,72 @@ impl ReadSession {
         session
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn from_live_database_with_kernel_observer(
         database: Database,
         limits: ReadLimits,
         observer: Arc<dyn ReadKernelTestObserver>,
     ) -> Self {
         Self {
-            route: ReadRoute::Owner,
+            cache_policy_mutation: Mutex::new(()),
+            requirement: RouteRequirement::OwnerOnly,
             options: ReadSessionOptions {
                 limits,
                 timeouts: ReadClientTimeouts::default(),
                 ..ReadSessionOptions::default()
             },
             runtime_dir: None,
-            state: Arc::new(ReadSessionState::LiveDatabase(Arc::new(database))),
+            state: std::sync::RwLock::new(SelectedSessionState {
+                state: Arc::new(ReadSessionState::LiveDatabase(Arc::new(database))),
+                snapshot_at: None,
+                file_writer_run: None,
+            }),
             resources: Arc::new(RouteResources::default()),
+            expiry_driver: Mutex::new(None),
             progress: None,
-            snapshot_at: None,
             observer: None,
             kernel_observer: Some(observer),
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             clock: None,
         }
     }
 
-    pub const fn route(&self) -> ReadRoute {
-        self.route
+    /// The route currently selected by this session.
+    pub fn route(&self) -> ReadRoute {
+        self.selected_state().route()
     }
 
-    /// Current bytes charged to the accountant that serves this route.
+    /// Current bytes charged to the reads this route serves.
     ///
+    /// A live database reports what its declared reader memory holds for
+    /// reads -- never the database's shared total, which also carries writer
+    /// state and background-maintenance reservations whose size depends on
+    /// timing, so identical reads would report different charges.
     /// A file reader has its own accountant. An owner-channel reader observes
     /// the owner's shared accountant through its already-selected channel, so
     /// that figure can also include other work the owner is serving. Charges
     /// held only during a statement return when that work releases them.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn charged_bytes(&self) -> Result<u64> {
-        match self.state.as_ref() {
-            ReadSessionState::LiveDatabase(database) => Ok(u64::try_from(
-                database.bounded_read_accountant().usage().used,
-            )
-            .unwrap_or(u64::MAX)),
+        let _ = self.after_writer_turnover(&OwnerReadCancellation::new())?;
+        match self.selected_state().as_ref() {
+            ReadSessionState::LiveDatabase(database) => Ok(database.declared_read_charged_bytes()),
             ReadSessionState::DirectFile(reader) => Ok(reader.charged_bytes()),
             ReadSessionState::OwnerChannel(owner) => {
                 let responses = owner.ask(
                     self.options.limits,
                     crate::local_transport::LocalRequest::OwnerStatus,
                     None,
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     self.observer.as_ref(),
                 )?;
                 for response in responses {
                     match response {
                         crate::local_transport::LocalResponse::OwnerStatus { status } => {
-                            return Ok(status.memory.used_bytes);
+                            return Ok(status.reader_charged_bytes);
                         }
                         crate::local_transport::LocalResponse::Failure { failure } => {
                             return Err(Error::ReadFailure(failure));
@@ -2642,100 +3675,510 @@ impl ReadSession {
     }
 
     pub fn options(&self) -> ReadSessionOptions {
-        self.options.clone()
+        let mut options = self.options.clone();
+        options.read_cache_share = self.resources.current_read_cache_share();
+        options
+    }
+
+    /// Resolve writer turnover and inspect the declaration and physical file cache.
+    /// Route-selection failures retain their typed error instead of returning stale status.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Route selection retains typed inline refusal diagnostics."
+    )]
+    pub fn read_cache_share_status(&self) -> Result<ReadCacheShareStatus> {
+        if let Some(failure) = self.after_writer_turnover(&OwnerReadCancellation::new())? {
+            return Err(Error::ReadFailure(failure));
+        }
+        let _mutation = self
+            .cache_policy_mutation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut status = self.options().read_cache_share_status();
+        match self.selected_state().as_ref() {
+            ReadSessionState::DirectFile(reader) => {
+                status.prepaid_index_bytes = Some(reader.prepaid_cache_index_bytes());
+                status.held_page_bytes = Some(reader.held_cache_page_bytes());
+            }
+            ReadSessionState::LiveDatabase(database) => {
+                let observation = database.read_cache_observation()?;
+                status.budget_bytes = database
+                    .accountant()
+                    .usage()
+                    .limit
+                    .unwrap_or_else(crate::memory_accounting::effective_process_ceiling);
+                status.shared_serving_cache = true;
+                status.effective_bytes = observation
+                    .as_ref()
+                    .map_or(0, |cache| cache.installed_capacity());
+                status.prepaid_index_bytes = observation.as_ref().map(|cache| cache.index_bytes());
+                status.held_page_bytes = observation.as_ref().map(|cache| cache.held_page_bytes());
+                let available = status
+                    .budget_bytes
+                    .saturating_sub(status.fixed_reservation_bytes);
+                status.effective_percent = if available == 0 {
+                    0.0
+                } else {
+                    status.effective_bytes as f64 * 100.0 / available as f64
+                };
+            }
+            ReadSessionState::OwnerChannel(owner) => {
+                let responses = owner.ask(
+                    self.options.limits,
+                    crate::local_transport::LocalRequest::OwnerStatus,
+                    None,
+                    #[cfg(any(test, feature = "test-seams"))]
+                    self.observer.as_ref(),
+                )?;
+                let observed = responses
+                    .into_iter()
+                    .find_map(|response| match response {
+                        crate::local_transport::LocalResponse::OwnerStatus { status } => {
+                            Some(Ok(status))
+                        }
+                        crate::local_transport::LocalResponse::Failure { failure } => {
+                            Some(Err(Error::ReadFailure(failure)))
+                        }
+                        _ => None,
+                    })
+                    .ok_or_else(|| Error::ReadFailure(owner_disconnected()))??;
+                status.budget_bytes =
+                    usize::try_from(observed.serving_cache_budget_bytes).unwrap_or(usize::MAX);
+                status.effective_bytes =
+                    observed.serving_cache_capacity_bytes.unwrap_or(0) as usize;
+                status.prepaid_index_bytes = observed
+                    .serving_cache_index_bytes
+                    .map(|value| value as usize);
+                status.held_page_bytes = observed
+                    .serving_cache_held_page_bytes
+                    .map(|value| value as usize);
+                status.shared_serving_cache = true;
+                let available = status
+                    .budget_bytes
+                    .saturating_sub(status.fixed_reservation_bytes);
+                status.effective_percent = if available == 0 {
+                    0.0
+                } else {
+                    status.effective_bytes as f64 * 100.0 / available as f64
+                };
+            }
+        }
+        Ok(status)
+    }
+
+    /// Change the file-cache share immediately without reopening
+    /// the pinned snapshot. Growth is admitted before publication. Shrink retires
+    /// entries while cursor-held backing remains funded through its final free.
+    /// None restores default (14%); values outside 0..=100 leave policy unchanged.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Refusals retain their original inline diagnostics."
+    )]
+    pub fn set_read_cache_share(&self, percent: Option<u8>) -> Result<()> {
+        if percent.is_some_and(|percent| percent > 100) {
+            let value = percent.expect("invalid declared percent").to_string();
+            self.resources.note_cache_refusal(&value);
+            return Err(Error::InvalidSetting {
+                name: "READ_CACHE_SHARE",
+                value,
+                allowed: "0..=100, an integer percent".to_owned(),
+            });
+        }
+        if let Some(failure) = self.after_writer_turnover(&OwnerReadCancellation::new())? {
+            return Err(Error::ReadFailure(failure));
+        }
+        let _mutation = self
+            .cache_policy_mutation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let ReadSessionState::DirectFile(reader) = self.selected_state().as_ref() {
+            let mut options = self.options();
+            options.read_cache_share = percent;
+            if let Err(error) =
+                reader.select_cache_capacity(options.read_cache_share_status().effective_bytes)
+            {
+                self.resources.note_cache_percent_refusal(percent);
+                return Err(public_cache_setting_error(error));
+            }
+        }
+        self.resources.publish_read_cache_share(percent);
+        Ok(())
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Setting refusals retain typed inline diagnostics."
+    )]
+    fn execute_cache_setting(
+        &self,
+        statement: contextdb_parser::Statement,
+        selected: &ReadSessionState,
+    ) -> Result<QueryResult> {
+        match statement {
+            contextdb_parser::Statement::SetReadCacheShare(value) => {
+                let percent = match value.as_deref() {
+                    None => None,
+                    Some(value) => match value.parse::<u8>() {
+                        Ok(percent) if percent <= 100 => Some(percent),
+                        _ => {
+                            self.resources.note_cache_refusal(value);
+                            return Err(Error::InvalidSetting {
+                                name: "READ_CACHE_SHARE",
+                                value: value.to_owned(),
+                                allowed: "0..=100, an integer percent".to_owned(),
+                            });
+                        }
+                    },
+                };
+                self.set_read_cache_share(percent)?;
+                Ok(QueryResult::empty())
+            }
+            contextdb_parser::Statement::ShowReadCacheShare => self.show_cache_setting(selected),
+            _ => unreachable!("parser recognizes only read cache settings"),
+        }
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Inspection retains the original reader's typed refusals."
+    )]
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "Inspection uses the established Int64 byte-count SQL surface."
+    )]
+    fn show_cache_setting(&self, selected: &ReadSessionState) -> Result<QueryResult> {
+        use contextdb_core::read_memory::ReadCredit;
+        const COLUMNS: [&str; 10] = [
+            "declared",
+            "effective_bytes",
+            "effective_percent",
+            "last_refusal",
+            "last_query_resident_percent",
+            "budget_bytes",
+            "fixed_reservation_bytes",
+            "prepaid_index_bytes",
+            "held_page_bytes",
+            "default_percent",
+        ];
+        let owner = match selected {
+            ReadSessionState::DirectFile(reader) => reader
+                .request_read_memory()
+                .map_err(|error| direct_error(Path::new(""), error))?,
+            ReadSessionState::LiveDatabase(database) => {
+                database.ordinary_read_child()?.into_owner()
+            }
+            ReadSessionState::OwnerChannel(_) => {
+                crate::local_transport::query_funding::QueryMemory::new(self.options.limits.memory)?
+                    .image()
+                    .owner()
+            }
+        };
+        let status = self.read_cache_share_status()?;
+        let refusal = *self
+            .resources
+            .last_cache_refusal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let refusal = refusal.as_ref().map(|bytes| {
+            let length = bytes
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(bytes.len());
+            std::str::from_utf8(&bytes[..length]).expect("setting value prefix is valid UTF-8")
+        });
+        let resident = *self
+            .resources
+            .last_query_resident_percent
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // Exact fixed output Layouts and string bytes are admitted before any
+        // vectors or text are allocated; the answer retains that same invoice.
+        let bytes = COLUMNS.len() * (size_of::<String>() + size_of::<Value>())
+            + size_of::<Vec<Value>>()
+            + COLUMNS.iter().map(|name| name.len()).sum::<usize>()
+            + if status.shared_serving_cache {
+                status.declaration_source().len()
+            } else if status.declared.is_none() {
+                "default".len()
+            } else {
+                0
+            }
+            + refusal.map_or(0, str::len);
+        let credit = ReadCredit::try_new_owned(
+            owner.clone(),
+            bytes,
+            "reader",
+            "show_read_cache_share",
+            "Release retained answers or raise the reader memory limit.",
+        )?;
+        let charge = crate::read_image_memory::QueryAnswerCharge::holding_reader(credit)?;
+        QueryResult::publish_with_owner(owner.clone(), || {
+            let mut result = QueryResultData::empty();
+            result.columns = COLUMNS.into_iter().map(str::to_owned).collect();
+            result.rows = vec![vec![
+                if status.shared_serving_cache {
+                    Value::Text(status.declaration_source().to_owned())
+                } else {
+                    status.declared.map_or_else(
+                        || Value::Text("default".to_owned()),
+                        |value| Value::Int64(i64::from(value)),
+                    )
+                },
+                Value::Int64(status.effective_bytes as i64),
+                Value::Float64(status.effective_percent),
+                refusal.map_or(Value::Null, |value| Value::Text(value.to_owned())),
+                resident.map_or(Value::Null, Value::Float64),
+                Value::Int64(status.budget_bytes as i64),
+                Value::Int64(status.fixed_reservation_bytes as i64),
+                status
+                    .prepaid_index_bytes
+                    .map_or(Value::Null, |value| Value::Int64(value as i64)),
+                status
+                    .held_page_bytes
+                    .map_or(Value::Null, |value| Value::Int64(value as i64)),
+                Value::Int64(i64::from(status.default_percent)),
+            ]];
+            crate::executor::bounded::encoded_query_size(self.options.limits, &result)
+                .map_err(read_error)?;
+            let mut answer = OwnedQueryResult::new(result);
+            answer.answer_charge = charge;
+            answer.retained_read_memory = Some(owner);
+            Ok(answer)
+        })
     }
 
     /// Run a bounded query with a fresh cancellation token.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn execute(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
         self.execute_with_cancellation(sql, params, &OwnerReadCancellation::new())
     }
 
     /// Run a bounded query using the caller's cancellation token.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn execute_with_cancellation(
         &self,
         sql: &str,
         params: &HashMap<String, Value>,
         cancellation: &OwnerReadCancellation,
     ) -> Result<QueryResult> {
+        let _ = with_progress_observer(self.progress.as_ref(), || {
+            with_route_source_counter(&self.resources, || self.after_writer_turnover(cancellation))
+        })?;
+        let selected = self.selected_state();
+        if matches!(selected.as_ref(), ReadSessionState::OwnerChannel(_))
+            && cancellation.is_cancelled()
+        {
+            return Err(Error::ReadCancelled);
+        }
+        if let Some(statement) = contextdb_parser::parser::parse_read_cache_share_statement(sql) {
+            if cancellation.is_cancelled() {
+                return Err(Error::ReadCancelled);
+            }
+            return self.execute_cache_setting(statement, selected.as_ref());
+        }
+        // The keeper is outside all query allocations and survives BOTH
+        // success conversion and final error conversion at this public door.
+        let query_memory = if matches!(selected.as_ref(), ReadSessionState::OwnerChannel(_)) {
+            Some(crate::local_transport::query_funding::QueryMemory::new(
+                self.options.limits.memory.min(
+                    self.options
+                        .memory_limit
+                        .map_or(u64::MAX, |bytes| bytes as u64),
+                ),
+            )?)
+        } else {
+            None
+        };
         contextdb_core::find_attribution::begin(sql);
         let executed = with_progress_observer(self.progress.as_ref(), || {
             with_route_source_counter(&self.resources, || {
-                self.execute_within_route(sql, params, cancellation)
+                self.execute_on_selected_route(
+                    selected.as_ref(),
+                    sql,
+                    params,
+                    cancellation,
+                    query_memory.as_ref(),
+                )
             })
         });
         contextdb_core::find_attribution::finish();
-        executed
+        if let Some(error) = query_memory.as_ref().and_then(|q| q.take_stop()) {
+            drop(executed);
+            return Err(error);
+        }
+        match executed {
+            Ok(result) => match query_memory {
+                Some(memory) => memory.publish_result(result),
+                None => result.into_public(),
+            },
+            Err(error) => Err(error),
+        }
     }
 
-    fn execute_within_route(
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn execute_on_selected_route(
         &self,
+        selected: &ReadSessionState,
         sql: &str,
         params: &HashMap<String, Value>,
         cancellation: &OwnerReadCancellation,
-    ) -> Result<QueryResult> {
-        match self.state.as_ref() {
+        query_memory: Option<&crate::local_transport::query_funding::QueryMemory>,
+    ) -> Result<OwnedQueryResult> {
+        let _native_selection = crate::database::vector_ivf::ReadOnlySelection::enter();
+        match selected {
             ReadSessionState::LiveDatabase(database) => {
-                let executed = crate::executor::execute_bounded(
-                    database,
-                    sql,
-                    params,
-                    self.options.limits,
-                    self.session_clock(),
-                    cancellation.clone(),
-                    #[cfg(feature = "test-seams")]
-                    self.kernel_probe(ReadSessionOperation::Execute, cancellation),
-                )
-                .map_err(read_error)?;
-                database.publish_authoritative_read(
-                    &executed.publication,
-                    |error| error,
-                    || Ok(executed.result),
-                )
+                let cache = database.read_cache_observation()?;
+                let mut data_statement = false;
+                let mut execute = || {
+                    let child = database.ordinary_read_child()?;
+                    crate::executor::bounded::with_native_read_memory(
+                        child,
+                        |read_memory, native_trace_refund| {
+                            let executed =
+                            crate::executor::execute_bounded_on_target_with_native_trace_refund(
+                                database.as_ref(),
+                                sql,
+                                params,
+                                read_memory,
+                                self.options.limits,
+                                self.session_clock(),
+                                cancellation.clone(),
+                                #[cfg(any(test, feature = "test-seams"))]
+                                self.kernel_probe(ReadSessionOperation::Execute, cancellation),
+                                Some(&native_trace_refund),
+                            )
+                            .map_err(read_error)?;
+                            data_statement = executed.data_statement;
+                            database.publish_authoritative_read(
+                                &executed.publication,
+                                |error| error,
+                                || Ok(executed.result),
+                            )
+                        },
+                    )
+                };
+                let (mut result, fraction) = match cache {
+                    Some(cache) => cache.with_page_window(execute),
+                    None => (execute(), None),
+                };
+                if let Ok(answer) = result.as_mut()
+                    && data_statement
+                {
+                    answer.trace.cache_resident_fraction = fraction;
+                }
+                if result.is_ok() && data_statement {
+                    *self
+                        .resources
+                        .last_query_resident_percent
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) =
+                        fraction.map(|value| value * 100.0);
+                }
+                result
             }
             // The committed file is asked through the target the reader
             // already holds, so the engine answers this route in the same
             // words it answers the owner's -- the direct reader's own doors
             // can only relay a fault as prose.
             ReadSessionState::DirectFile(reader) => {
-                let executed = crate::executor::execute_bounded_on_target(
-                    reader.execution_target().as_ref(),
-                    sql,
-                    params,
-                    self.options.limits,
-                    self.session_clock(),
-                    cancellation.clone(),
-                    #[cfg(feature = "test-seams")]
-                    self.kernel_probe(ReadSessionOperation::Execute, cancellation),
-                )
-                .map_err(read_error)?;
-                reader.publish_bounded_result(&executed.publication, executed.result)
+                let request = reader
+                    .request_query_read_owner()
+                    .map_err(|error| direct_error(Path::new(""), error))?;
+                let mut data_statement = false;
+                let (mut result, fraction) = reader.with_cache_page_window(|| {
+                    crate::executor::bounded::with_request_read_memory(
+                        request,
+                        |error| error,
+                        |read_memory, native_trace_refund| {
+                            let executed =
+                            crate::executor::execute_bounded_on_target_with_native_trace_refund(
+                                reader.execution_target().as_ref(),
+                                sql,
+                                params,
+                                read_memory,
+                                self.options.limits,
+                                self.session_clock(),
+                                cancellation.clone(),
+                                #[cfg(any(test, feature = "test-seams"))]
+                                self.kernel_probe(ReadSessionOperation::Execute, cancellation),
+                                native_trace_refund.as_ref(),
+                            )
+                            .map_err(read_error)?;
+                            data_statement = executed.data_statement;
+                            reader.publish_bounded_result(&executed.publication, executed.result)
+                        },
+                    )
+                });
+                if let Ok(answer) = result.as_mut()
+                    && data_statement
+                {
+                    answer.trace.cache_resident_fraction = fraction;
+                }
+                if result.is_ok() && data_statement {
+                    *self
+                        .resources
+                        .last_query_resident_percent
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) =
+                        fraction.map(|value| value * 100.0);
+                }
+                result
             }
             ReadSessionState::OwnerChannel(owner) => {
-                let responses = owner.ask(
+                let receiving_memory = query_memory
+                    .expect("owner query has terminal custody")
+                    .image();
+                let request = crate::local_transport::query_funding::query_request(
+                    sql,
+                    params,
+                    receiving_memory.clone(),
+                )?;
+                let responses = owner.ask_query(
                     self.options.limits,
-                    crate::local_transport::LocalRequest::Query {
-                        statement: sql.to_owned(),
-                        params: params.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-                    },
+                    request,
                     Some(cancellation),
-                    #[cfg(feature = "test-seams")]
+                    query_memory.expect("owner query retains terminal custody"),
+                    #[cfg(any(test, feature = "test-seams"))]
                     self.observer.as_ref(),
                 )?;
-                published_query_result(responses, self.options.limits)
+                let result =
+                    published_query_result(responses, self.options.limits, receiving_memory)?;
+                *self
+                    .resources
+                    .last_query_resident_percent
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = result
+                    .trace
+                    .cache_resident_fraction
+                    .map(|fraction| fraction * 100.0);
+                Ok(result)
             }
         }
     }
 
-    /// When the view this session reads was taken.
-    ///
-    /// A session that reads a committed file reads ONE image, taken at one
-    /// moment, and every answer it gives describes the store as it was then --
-    /// so a caller can say how old the answer is. A session talking to a live
-    /// owner has no such moment: the owner's state is still moving, and every
-    /// answer is as current as the instant it was asked, which is why there is
-    /// no instant to report rather than a made-up one.
-    pub const fn snapshot_at(&self) -> Option<contextdb_core::Wallclock> {
-        self.snapshot_at
+    /// The committed LSN of the currently selected file snapshot.
+    /// Live-owner reads have no fixed session-wide snapshot to report.
+    pub fn snapshot_lsn(&self) -> Option<contextdb_core::Lsn> {
+        match self.selected_state().as_ref() {
+            ReadSessionState::DirectFile(reader) => Some(reader.snapshot_lsn()),
+            ReadSessionState::LiveDatabase(_) | ReadSessionState::OwnerChannel(_) => None,
+        }
+    }
+
+    /// When the currently selected file image was taken.
+    /// Later operations can select a new image when the store's writer changes.
+    /// A live owner serves moving committed state and has no fixed moment.
+    pub fn snapshot_at(&self) -> Option<contextdb_core::Wallclock> {
+        self.state.read().expect("selected read route").snapshot_at
     }
 
     /// Ask this store a question about itself.
@@ -2751,6 +4194,10 @@ impl ReadSession {
     /// kind that never issues a continuation is refused rather than quietly
     /// ignored, because a caller that thinks it is resuming and is in fact
     /// starting over would silently read the inventory twice.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn metadata(
         &self,
         request: MetadataRequest,
@@ -2767,51 +4214,78 @@ impl ReadSession {
         with_progress_observer(self.progress.as_ref(), || {
             with_route_source_counter(&self.resources, || {
                 let cancellation = OwnerReadCancellation::new();
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 return with_session_kernel_probe(
                     self.kernel_probe(ReadSessionOperation::Metadata, &cancellation),
                     || self.metadata_within_route(request, continuation, &cancellation),
                 );
-                #[cfg(not(feature = "test-seams"))]
+                #[cfg(not(any(test, feature = "test-seams")))]
                 self.metadata_within_route(request, continuation, &cancellation)
             })
         })
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn metadata_within_route(
         &self,
         request: MetadataRequest,
         continuation: Option<&str>,
         cancellation: &OwnerReadCancellation,
     ) -> Result<MetadataAnswer> {
-        match self.state.as_ref() {
+        let _ = self.after_writer_turnover(cancellation)?;
+        self.metadata_on_selected_route(request, continuation, cancellation)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn metadata_on_selected_route(
+        &self,
+        request: MetadataRequest,
+        continuation: Option<&str>,
+        cancellation: &OwnerReadCancellation,
+    ) -> Result<MetadataAnswer> {
+        match self.selected_state().as_ref() {
             ReadSessionState::LiveDatabase(database) => {
                 if matches!(request, MetadataRequest::ImageState { .. }) {
                     return Err(crate::read_image::image_state_is_a_file_question());
                 }
                 let clock = self.session_clock();
                 let started_ms = clock.now_ms();
+                let read_memory = database.declared_read_request_provider().request_budget()?;
                 let publication = database.capture_authoritative_read_publication(
-                    crate::direct_file_reader::metadata_publication_tables(&request),
+                    crate::direct_file_reader::metadata_publication_tables(
+                        &request,
+                        read_memory.clone(),
+                    )?,
                     self.options.limits,
                     Arc::clone(&clock),
                     cancellation.clone(),
                     started_ms,
+                    read_memory.clone(),
                 );
                 let answer = crate::read_image::project_metadata_from_database(
                     database,
+                    read_memory.clone(),
                     request,
                     self.options.limits,
                     clock,
                     continuation,
                     cancellation,
                 )
-                .map(|(body, continuation)| MetadataAnswer {
-                    body,
-                    continuation,
-                    charge: Default::default(),
-                })
-                .map_err(|error| direct_error(Path::new(""), error))?;
+                .map_err(|error| direct_error(Path::new(""), error))
+                .and_then(|(body, continuation, charge)| {
+                    MetadataAnswer::try_new(
+                        body,
+                        continuation,
+                        crate::read_image_memory::AnswerCharge::holding(charge),
+                        read_memory,
+                    )
+                })?;
                 database.publish_authoritative_read(&publication, |error| error, || Ok(answer))
             }
             // The committed file answers from the image the reader already
@@ -2819,11 +4293,7 @@ impl ReadSession {
             // exactly what a direct reader says.
             ReadSessionState::DirectFile(reader) => reader
                 .metadata_from_with_cancellation(request, continuation, cancellation)
-                .map(|answered| MetadataAnswer {
-                    body: answered.body,
-                    continuation: answered.continuation,
-                    charge: answered.charge,
-                })
+                .map(|answered| answered.metadata)
                 .map_err(|error| direct_error(Path::new(""), error)),
             ReadSessionState::OwnerChannel(owner) => {
                 self.owner_metadata(owner, request, continuation, cancellation)
@@ -2838,6 +4308,10 @@ impl ReadSession {
     /// the canonical body itself, and the inventories arrive as a page of
     /// items with the continuation that resumes them. Both become one body
     /// here, so a caller never has to know which shape travelled.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn owner_metadata(
         &self,
         owner: &OwnerRoute,
@@ -2877,6 +4351,11 @@ impl ReadSession {
             MetadataRequest::MaintenanceStatus => {
                 crate::local_transport::LocalMetadataRequest::MaintenanceStatus
             }
+            MetadataRequest::VerifyHistory { table } => {
+                crate::local_transport::LocalMetadataRequest::VerifyHistory {
+                    table: table.clone(),
+                }
+            }
             // Explaining a statement is the owner planning it, not an
             // inventory it keeps, so it travels as its own request, and the
             // caller's binding travels with it: the owner plans the statement
@@ -2890,21 +4369,35 @@ impl ReadSession {
                 return Err(crate::read_image::image_state_is_a_file_question());
             }
         };
-        let responses = owner.ask(
+        let receiving_limit = limits.memory.min(
+            self.options
+                .memory_limit
+                .map_or(u64::MAX, |bytes| bytes as u64),
+        );
+        let receiving_memory = crate::read_contract::decoder_memory(receiving_limit)?;
+        let responses = owner.ask_with_cursor_memory(
             limits,
             crate::local_transport::LocalRequest::Metadata { request: local },
             Some(cancellation),
-            #[cfg(feature = "test-seams")]
+            None,
+            Some(receiving_memory.owner()),
+            #[cfg(any(test, feature = "test-seams"))]
             self.observer.as_ref(),
         )?;
         let payload = published_metadata_payload(responses, limits.memory)?;
-        promoted_metadata_answer(&request, &payload, limits)
+        let mut receiving_limits = limits;
+        receiving_limits.memory = receiving_limit;
+        promoted_metadata_answer(&request, &payload, receiving_limits, receiving_memory)
     }
 
     /// Ask the owner to plan a statement against the caller's own binding
     /// without running it. The binding travels with the statement: a
     /// partition scope resolves only after its key binds, so an explain that
     /// left the binding behind would describe a scope the caller never named.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn owner_explain(
         &self,
         owner: &OwnerRoute,
@@ -2912,7 +4405,13 @@ impl ReadSession {
         params: &HashMap<String, Value>,
         cancellation: &OwnerReadCancellation,
     ) -> Result<MetadataAnswer> {
-        let answered = owner.ask(
+        let receiving_limit = self.options.limits.memory.min(
+            self.options
+                .memory_limit
+                .map_or(u64::MAX, |bytes| bytes as u64),
+        );
+        let receiving_memory = crate::read_contract::decoder_memory(receiving_limit)?;
+        let answered = owner.ask_with_cursor_memory(
             self.options.limits,
             crate::local_transport::LocalRequest::Explain {
                 statement: sql,
@@ -2922,25 +4421,31 @@ impl ReadSession {
                     .collect(),
             },
             Some(cancellation),
-            #[cfg(feature = "test-seams")]
+            None,
+            Some(receiving_memory.owner()),
+            #[cfg(any(test, feature = "test-seams"))]
             self.observer.as_ref(),
         )?;
         // The owner writes an explained plan through the same canonical
         // writer the file route uses, so it is read back with that writer's
         // own inverse rather than re-derived from a query result.
-        let body =
-            crate::read_contract::decode_metadata_body(&published_explain_payload(answered)?)
-                .map_err(|error| Error::Other(error.to_string()))?;
-        Ok(MetadataAnswer {
+        let body = crate::read_contract::decode_metadata_body_with_memory(
+            &published_explain_payload(answered)?,
+            &receiving_memory,
+            receiving_limit,
+        )
+        .map_err(read_encoding_error)?;
+        MetadataAnswer::try_new(
             body,
-            continuation: None,
-            charge: Default::default(),
-        })
+            None,
+            crate::read_image_memory::AnswerCharge::holding(receiving_memory.clone()),
+            receiving_memory.owner(),
+        )
     }
 
     /// Present this session's kernel observer, if a test attached one, in the
     /// only shape the bounded kernel accepts.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn kernel_probe(
         &self,
         operation: ReadSessionOperation,
@@ -2948,15 +4453,23 @@ impl ReadSession {
     ) -> Option<Arc<dyn crate::executor::BoundedExecutionProbe>> {
         self.kernel_observer
             .as_ref()
-            .map(|observer| observed_kernel_probe(observer, operation, self.route, cancellation))
+            .map(|observer| observed_kernel_probe(observer, operation, self.route(), cancellation))
     }
 
     /// Open a bounded cursor with a fresh cancellation token.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn open_cursor(&self, sql: &str, params: &HashMap<String, Value>) -> Result<ReadCursor> {
         self.open_cursor_with_cancellation(sql, params, &OwnerReadCancellation::new())
     }
 
     /// Open a bounded cursor using the caller's cancellation token.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn open_cursor_with_cancellation(
         &self,
         sql: &str,
@@ -2973,38 +4486,105 @@ impl ReadSession {
         opened
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn open_cursor_within_route(
         &self,
         sql: &str,
         params: &HashMap<String, Value>,
         cancellation: &OwnerReadCancellation,
     ) -> Result<ReadCursor> {
-        match self.state.as_ref() {
+        let _ = self.after_writer_turnover(cancellation)?;
+        self.open_cursor_on_selected_route(sql, params, cancellation)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn open_cursor_on_selected_route(
+        &self,
+        sql: &str,
+        params: &HashMap<String, Value>,
+        cancellation: &OwnerReadCancellation,
+    ) -> Result<ReadCursor> {
+        let _native_selection = crate::database::vector_ivf::ReadOnlySelection::enter();
+        let selected_state = self.selected_state();
+        let route = selected_state.route();
+        match selected_state.as_ref() {
             ReadSessionState::OwnerChannel(owner) => {
                 let clock = self.session_clock();
                 let now = clock.now_ms();
+                let (retained_owner, retained_memory) =
+                    crate::local_transport::query_funding::QueryMemory::new(
+                        self.options.limits.memory.min(
+                            self.options
+                                .memory_limit
+                                .map_or(u64::MAX, |bytes| bytes as u64),
+                        ),
+                    )?
+                    .into_cursor_owner()?;
+                let handoff_ticket = if cfg!(all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                )) {
+                    Some(
+                        crate::persistence::read_coordination::RegistrationCommitTicket::new(
+                            retained_owner.clone(),
+                        )?,
+                    )
+                } else {
+                    None
+                };
+                let public_carrier = OwnedCursorPage::try_prepare_public(retained_owner.clone())?;
+                let expiry_waker: OwnerExpirySlot =
+                    owner_expiry_shared(retained_owner.clone(), Mutex::new(None))?;
+                let operation_deadline = now.saturating_add(self.options.limits.active_ms);
                 let handoff =
-                    crate::persistence::ReadSnapshotRegistrationGuard::owner_handoff_start(
+                    crate::persistence::ReadSnapshotRegistrationGuard::owner_handoff_start_with_transaction(
                         &owner.path,
                         owner.identity,
-                        owner.writer_run,
                         Some(&owner.runtime_dir),
+                        cancellation,
+                        (Arc::clone(&clock), operation_deadline),
+                        self.options.limits.active_ms,
+                        retained_memory.clone(),
+                        handoff_ticket.as_ref().map(|ticket| ticket.transaction()),
                     )
                     .map_err(|error| direct_error(&owner.path, error.into_direct_reader_error()))?;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 if let Some(observer) = self.observer.as_ref() {
                     observer.observe_event(ReadSessionEvent::OwnerCursorHandoffStarted);
                 }
-                let responses = owner.ask(
+                // The request owns a statement clone throughout the reply.
+                // Admit it into this same owner before making that clone.
+                let request_bytes = crate::executor::bounded::cursor_statement_bytes(sql, params)
+                    .map_err(read_error)?;
+                retained_memory.reserve(request_bytes)?;
+                let request_charge = OwnerTraceCharge {
+                    memory: retained_memory.clone(),
+                    bytes: request_bytes,
+                    _decoded_credit: None,
+                    _retained_owner: None,
+                };
+                let responses = owner.ask_with_cursor_memory(
                     self.options.limits,
                     crate::local_transport::LocalRequest::CursorOpen {
                         statement: sql.to_owned(),
                         params: params.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
                     },
                     Some(cancellation),
-                    #[cfg(feature = "test-seams")]
+                    Some(cursor_receive_allowance(
+                        self.options.limits.memory,
+                        &retained_memory,
+                    )),
+                    Some(retained_owner.clone()),
+                    #[cfg(any(test, feature = "test-seams"))]
                     self.observer.as_ref(),
                 )?;
+                drop(request_charge);
                 let opened_cursor_id = responses.iter().find_map(|response| match response {
                     crate::local_transport::LocalResponse::CursorOpened { opened } => {
                         Some(opened.cursor_id)
@@ -3014,7 +4594,9 @@ impl ReadSession {
                 let published = match published_cursor_open(
                     responses,
                     self.options.limits,
-                    #[cfg(feature = "test-seams")]
+                    &retained_memory,
+                    &retained_owner,
+                    #[cfg(any(test, feature = "test-seams"))]
                     self.observer.as_ref(),
                 ) {
                     Ok(published) => published,
@@ -3025,7 +4607,7 @@ impl ReadSession {
                                 self.options.limits,
                                 crate::local_transport::LocalRequest::CursorClose { cursor_id },
                                 None,
-                                #[cfg(feature = "test-seams")]
+                                #[cfg(any(test, feature = "test-seams"))]
                                 self.observer.as_ref(),
                             );
                         }
@@ -3034,12 +4616,14 @@ impl ReadSession {
                 };
                 let PublishedOwnerCursor {
                     cursor_id,
-                    first_page,
+                    mut first_page,
+                    observation,
+                    owner_trace_charge,
                     snapshot,
                     physical_identity,
                     limits,
                 } = published;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 if let Some(observer) = self.observer.as_ref() {
                     observer.observe_event(ReadSessionEvent::BeforeOwnerCursorHandoffRegistration);
                 }
@@ -3054,6 +4638,10 @@ impl ReadSession {
                                     physical_identity,
                                     snapshot,
                                     Some(&owner.runtime_dir),
+                                    cancellation,
+                                    (Arc::clone(&clock), operation_deadline),
+                                    self.options.limits.active_ms,
+                                    retained_memory.clone(),
                                 )
                                 .map_err(|error| {
                                     direct_error(&owner.path, error.into_direct_reader_error())
@@ -3068,21 +4656,55 @@ impl ReadSession {
                                 self.options.principal.clone(),
                             );
                             config.memory_limit = self.options.memory_limit;
+                            config.read_cache_share = self.resources.current_read_cache_share();
                             config.runtime_dir = Some(owner.runtime_dir.clone());
                             let retained_bytes =
                                 crate::executor::bounded::cursor_statement_bytes(sql, params)
                                     .map_err(read_error)?;
-                            let retained_memory = crate::read_image_memory::ImageMemory::new(Some(
-                                usize::try_from(limits.memory).unwrap_or(usize::MAX),
-                            ));
+                            if retained_bytes
+                                .checked_add(retained_memory.held())
+                                .is_none_or(|bytes| bytes as u64 > limits.memory)
+                            {
+                                return Err(read_encoding_error(
+                                    crate::read_contract::ReadEncodingError::MemoryCeilingExceeded {
+                                        ceiling: limits.memory,
+                                    }));
+                            }
                             retained_memory.reserve(retained_bytes)?;
+                            let mut statement_charge = OwnerTraceCharge {
+                                memory: retained_memory.clone(),
+                                bytes: retained_bytes,
+                                _decoded_credit: None,
+                                _retained_owner: None,
+                            };
+                            let retained_sql = sql.to_owned();
+                            let retained_params = params.clone();
+                            let actual_statement_bytes =
+                                crate::executor::bounded::cursor_statement_bytes(
+                                    &retained_sql,
+                                    &retained_params,
+                                )
+                                .map_err(read_error)?;
+                            if actual_statement_bytes > retained_bytes {
+                                return Err(Error::Other(
+                                    ("cursor statement exceeded its admitted clone allowance"
+                                        .to_string())
+                                    .into(),
+                                ));
+                            }
+                            retained_memory.release(retained_bytes - actual_statement_bytes);
+                            statement_charge.bytes = 0;
                             Some(OwnerCursorContinuation {
-                                retained_memory,
+                                retained_memory: retained_memory.clone(),
+                                retained_statement_bytes: actual_statement_bytes,
+                                declared_memory: self.options.limits.memory,
+                                discarded_rows_examined: 0,
+                                failed_open_observation: None,
                                 path: owner.path.clone(),
                                 registration: Some(registration),
                                 config,
-                                sql: sql.to_owned(),
-                                params: params.clone(),
+                                sql: retained_sql,
+                                params: retained_params,
                                 delivered: first_page.rows.len(),
                                 cursor: None,
                                 skipped: 0,
@@ -3098,83 +4720,180 @@ impl ReadSession {
                             limits,
                             crate::local_transport::LocalRequest::CursorClose { cursor_id },
                             None,
-                            #[cfg(feature = "test-seams")]
+                            #[cfg(any(test, feature = "test-seams"))]
                             self.observer.as_ref(),
                         );
                         return Err(error);
                     }
                 };
+                let owner_groups =
+                    match OwnerGroupBaseline::capture(&observation.trace, &retained_memory) {
+                        Ok(groups) => groups,
+                        Err(error) => {
+                            let _ = owner.ask(
+                                limits,
+                                crate::local_transport::LocalRequest::CursorClose { cursor_id },
+                                None,
+                                #[cfg(any(test, feature = "test-seams"))]
+                                self.observer.as_ref(),
+                            );
+                            return Err(error);
+                        }
+                    };
+                first_page.attach_publication(public_carrier);
                 let complete = !first_page.has_more;
-                if !complete {
-                    self.resources
-                        .active_cursors
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if !complete
+                    && let Err(error) =
+                        self.resources
+                            .expiry
+                            .ensure_driver(&self.expiry_driver, &clock, || {
+                                Ok(owner
+                                    .client
+                                    .lock()
+                                    .expect("owner client")
+                                    .original_connection_owner())
+                            })
+                {
+                    let _ = owner.ask(
+                        limits,
+                        crate::local_transport::LocalRequest::CursorClose { cursor_id },
+                        None,
+                        #[cfg(any(test, feature = "test-seams"))]
+                        self.observer.as_ref(),
+                    );
+                    return Err(error);
                 }
+                let mut construction_count =
+                    CursorConstructionCount::new(&self.resources, !complete);
+                let owner_rows_examined = observation.rows_examined;
+                let (trace, observation) = take_cursor_observation(observation);
                 let cursor = ReadCursor {
+                    _expiry_driver: self
+                        .expiry_driver
+                        .lock()
+                        .expect("session expiry worker")
+                        .as_ref()
+                        .cloned(),
+                    trace,
+                    observation,
+                    owner_trace_charge: Some(owner_trace_charge),
                     state: Arc::new(SuspendedReadCursorState {
-                        route: self.route,
-                        session: Arc::clone(&self.state),
+                        route,
+                        session: Arc::clone(&selected_state),
                         resources: Arc::clone(&self.resources),
                         progress: self.progress.as_ref().map(Arc::clone),
-                        first_page,
+                        first_page: first_page.into_public()?,
                         execution: Mutex::new(Box::new(OwnerCursorExecution {
-                            session: Arc::clone(&self.state),
+                            session: Arc::clone(&selected_state),
                             resources: Arc::clone(&self.resources),
                             limits,
                             cursor_id,
+                            owner_rows_examined,
+                            owner_groups,
+                            cancelled_observation: None,
+                            cancelled_trace_charge: None,
+                            retained_memory: retained_memory.clone(),
+                            retained_owner: retained_owner.clone(),
                             continuation: if complete { None } else { continuation },
                             last_used_ms: clock.now_ms(),
-                            clock,
+                            clock: Arc::clone(&clock),
                             created_ms: now,
                             closed: complete,
                             expired: None,
-                            expiry_waker: Arc::new(Mutex::new(None)),
-                            #[cfg(feature = "test-seams")]
+                            expiry_waker,
+                            expiry_failure: None,
+                            #[cfg(any(test, feature = "test-seams"))]
                             observer: self.observer.as_ref().map(Arc::clone),
                         })),
-                        #[cfg(feature = "test-seams")]
+                        #[cfg(any(test, feature = "test-seams"))]
                         observer: self.observer.as_ref().map(Arc::clone),
-                        #[cfg(feature = "test-seams")]
+                        #[cfg(any(test, feature = "test-seams"))]
                         kernel_observer: self.kernel_observer.as_ref().map(Arc::clone),
                     }),
                 };
-                if !complete {
-                    start_owner_cursor_expiry_watch(&cursor.state);
+                construction_count.transfer_to_cursor();
+                if !complete
+                    && let Err(error) =
+                        start_owner_cursor_expiry_watch(&cursor.state, retained_owner.clone())
+                {
+                    let _ = cursor.close();
+                    return Err(error);
+                }
+                // Temporary publication leaves while the transaction is still staging.
+                drop(handoff);
+                let handoff_ticket = if complete {
+                    drop(handoff_ticket);
+                    None
+                } else {
+                    handoff_ticket
+                };
+                if let Err(error) = crate::persistence::read_coordination::check_handoff_authority(
+                    cancellation,
+                    clock.as_ref(),
+                    operation_deadline,
+                    self.options.limits.active_ms,
+                ) {
+                    let _ = cursor.close();
+                    return Err(error);
+                }
+                if let Some(ticket) = handoff_ticket {
+                    ticket.commit();
                 }
                 Ok(cursor)
             }
             ReadSessionState::DirectFile(reader) => {
+                self.resources.expiry.ensure_driver(
+                    &self.expiry_driver,
+                    &self.session_clock(),
+                    || Ok(reader.expiry_memory_owner()),
+                )?;
                 let rows = NonZeroUsize::new(
                     usize::try_from(self.options.limits.cursor_page_rows).unwrap_or(usize::MAX),
                 )
                 .unwrap_or(NonZeroUsize::MIN);
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 let opened = with_session_kernel_probe(
                     self.kernel_probe(ReadSessionOperation::CursorOpen, cancellation),
-                    || reader.open_cursor_with_cancellation(sql, params, rows, cancellation),
+                    || {
+                        crate::owned_cursor_page::with_public_page(|| {
+                            reader.open_cursor_with_cancellation(sql, params, rows, cancellation)
+                        })
+                    },
                 );
-                #[cfg(not(feature = "test-seams"))]
-                let opened = reader.open_cursor_with_cancellation(sql, params, rows, cancellation);
+                #[cfg(not(any(test, feature = "test-seams")))]
+                let opened = crate::owned_cursor_page::with_public_page(|| {
+                    reader.open_cursor_with_cancellation(sql, params, rows, cancellation)
+                });
                 let opened = opened.map_err(|error| direct_error(Path::new(""), error))?;
                 self.resources
                     .active_cursors
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (trace, observation) = take_cursor_observation(opened.first_page.observation);
                 Ok(ReadCursor {
+                    _expiry_driver: self
+                        .expiry_driver
+                        .lock()
+                        .expect("session expiry worker")
+                        .as_ref()
+                        .cloned(),
+                    trace,
+                    observation,
+                    owner_trace_charge: None,
                     state: Arc::new(SuspendedReadCursorState {
-                        route: self.route,
-                        session: Arc::clone(&self.state),
+                        route,
+                        session: Arc::clone(&selected_state),
                         resources: Arc::clone(&self.resources),
                         progress: self.progress.as_ref().map(Arc::clone),
-                        first_page: opened.first_page.page,
+                        first_page: opened.first_page.page.into_public()?,
                         execution: Mutex::new(Box::new(DirectCursorExecution {
                             cursor: opened.cursor,
                             resources: Arc::clone(&self.resources),
-                            #[cfg(feature = "test-seams")]
+                            #[cfg(any(test, feature = "test-seams"))]
                             kernel_observer: self.kernel_observer.as_ref().map(Arc::clone),
                         })),
-                        #[cfg(feature = "test-seams")]
+                        #[cfg(any(test, feature = "test-seams"))]
                         observer: self.observer.as_ref().map(Arc::clone),
-                        #[cfg(feature = "test-seams")]
+                        #[cfg(any(test, feature = "test-seams"))]
                         kernel_observer: self.kernel_observer.as_ref().map(Arc::clone),
                     }),
                 })
@@ -3190,38 +4909,69 @@ impl ReadSession {
                 if database.active_read_transaction().is_some() {
                     return Err(Error::ReadFailure(cursor_transaction_active()));
                 }
-                let opened = crate::executor::open_bounded_cursor(
-                    Arc::clone(database),
-                    sql,
-                    params,
-                    self.options.limits,
-                    self.session_clock(),
-                    cancellation.clone(),
-                    #[cfg(feature = "test-seams")]
-                    self.kernel_probe(ReadSessionOperation::CursorOpen, cancellation),
-                )
-                .map_err(read_error)?;
+                if cancellation.is_cancelled() {
+                    return Err(Error::ReadCancelled);
+                }
+                self.resources.expiry.ensure_driver(
+                    &self.expiry_driver,
+                    &self.session_clock(),
+                    || database.declared_reader_memory(),
+                )?;
+                let request = database
+                    .declared_read_request_provider()
+                    .request_budget_owner()?;
+                let opened = crate::executor::bounded::with_request_read_memory(
+                    request,
+                    |error| error,
+                    |read_memory, native_trace_refund| {
+                        crate::owned_cursor_page::with_public_page(|| {
+                            crate::executor::open_bounded_cursor_with_native_trace_refund(
+                                Arc::clone(database),
+                                sql,
+                                params,
+                                read_memory,
+                                self.options.limits,
+                                self.session_clock(),
+                                cancellation.clone(),
+                                #[cfg(any(test, feature = "test-seams"))]
+                                self.kernel_probe(ReadSessionOperation::CursorOpen, cancellation),
+                                native_trace_refund.as_ref(),
+                            )
+                        })
+                        .map_err(read_error)
+                    },
+                )?;
                 let publication = opened.publication.clone();
                 database.publish_authoritative_read(
                     &publication,
                     |error| error,
                     || {
+                        let (trace, observation) = take_cursor_observation(opened.observation);
                         Ok(ReadCursor {
+                            _expiry_driver: self
+                                .expiry_driver
+                                .lock()
+                                .expect("session expiry worker")
+                                .as_ref()
+                                .cloned(),
+                            trace,
+                            observation,
+                            owner_trace_charge: None,
                             state: Arc::new(SuspendedReadCursorState {
-                                route: self.route,
-                                session: Arc::clone(&self.state),
+                                route,
+                                session: Arc::clone(&selected_state),
                                 resources: Arc::clone(&self.resources),
                                 progress: self.progress.as_ref().map(Arc::clone),
-                                first_page: opened.first_page,
+                                first_page: opened.first_page.into_public()?,
                                 execution: Mutex::new(Box::new(LiveCursorExecution {
                                     database: Arc::clone(database),
                                     handle: opened.cursor,
-                                    #[cfg(feature = "test-seams")]
+                                    #[cfg(any(test, feature = "test-seams"))]
                                     kernel_observer: self.kernel_observer.as_ref().map(Arc::clone),
                                 })),
-                                #[cfg(feature = "test-seams")]
+                                #[cfg(any(test, feature = "test-seams"))]
                                 observer: self.observer.as_ref().map(Arc::clone),
-                                #[cfg(feature = "test-seams")]
+                                #[cfg(any(test, feature = "test-seams"))]
                                 kernel_observer: self.kernel_observer.as_ref().map(Arc::clone),
                             }),
                         })
@@ -3232,15 +4982,21 @@ impl ReadSession {
     }
 
     /// Send an administrative request to the owner selected for this session.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn request_owner(&self, namespace: &str, request: &[u8]) -> Result<Vec<u8>> {
-        match self.state.as_ref() {
+        if let Some(failure) = self.after_writer_turnover(&OwnerReadCancellation::new())? {
+            return Err(Error::ReadFailure(failure));
+        }
+        match self.selected_state().as_ref() {
             // The embedded caller already holds the owner, so it asks the
             // handler directly rather than dialling its own channel.
             ReadSessionState::LiveDatabase(database) => {
                 database.request_owner_in_process(namespace, request)
             }
-            // There is no owner on this route and this session will not go
-            // looking for one; the caller is told so plainly.
+            // Re-selection found no current owner for this store.
             ReadSessionState::DirectFile(_) => Err(Error::ReadFailure(owner_not_running())),
             ReadSessionState::OwnerChannel(owner) => {
                 let responses = owner.ask(
@@ -3250,7 +5006,7 @@ impl ReadSession {
                         payload: request.to_vec(),
                     },
                     None,
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     self.observer.as_ref(),
                 )?;
                 match responses.into_iter().next() {
@@ -3261,8 +5017,15 @@ impl ReadSession {
         }
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn route_resources_for_test(&self) -> Result<ReadRouteResourceSnapshot> {
         Ok(self.resources.snapshot())
     }
@@ -3276,8 +5039,15 @@ impl ReadSession {
     /// and each resource reads as held for as long as this process still owns
     /// the store's registry entry. Asking is free of side effects — no route
     /// is selected, no channel is dialled, no backend is opened.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn route_resources_for_path_for_test(
         path: impl AsRef<Path>,
     ) -> Result<ReadRouteResourceSnapshot> {
@@ -3313,6 +5083,10 @@ impl ReadSession {
     ///
     /// A store nobody owns is `OwnerNotRunning`. An in-memory store has no
     /// path to ask about and is `NotApplicable`.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn owner_status(
         path: impl AsRef<Path>,
         options: ReadSessionOptions,
@@ -3332,6 +5106,10 @@ impl ReadSession {
     /// Where there is no owner there is nothing to report BUT the word, so
     /// those answers carry the state alone: a store nobody owns has no limits
     /// in force, and an in-memory store has no owner to have any.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn owner_report(
         path: impl AsRef<Path>,
         options: ReadSessionOptions,
@@ -3344,6 +5122,10 @@ impl ReadSession {
     /// session that reads through a supplied root asks about its owner through
     /// the same root, or it would report "not running" about the very owner it
     /// is reading from.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn owner_report_in_runtime_dir(
         path: impl AsRef<Path>,
         options: ReadSessionOptions,
@@ -3373,26 +5155,44 @@ impl ReadSession {
                 let runtime = read_runtime_directory(owner_user, runtime_dir)?;
                 let channel_path =
                     crate::local_transport::channel_socket_path(runtime.path(), address)
-                        .map_err(|error| Error::Other(error.to_string()))?;
+                        .map_err(|error| Error::Other((error.to_string()).into()))?;
                 #[cfg(unix)]
                 let channel_identity =
                     crate::local_transport::channel_filesystem_identity(&channel_path).ok();
                 let presented = crate::local_transport::LocalHandshake::current(
                     identity, writer_run, owner_user,
                 );
-                match wait_for_local_answer(crate::owner_read::OwnerClient::connect(
-                    &channel_path,
-                    presented,
-                    options.timeouts,
-                    read_clock(),
-                )) {
+                let channel_clock = read_clock();
+                let channel_owner = crate::local_transport::query_funding::QueryMemory::new(
+                    options
+                        .limits
+                        .memory
+                        .min(options.memory_limit.map_or(u64::MAX, |bytes| bytes as u64)),
+                )?
+                .image()
+                .owner();
+                match wait_for_local_answer(
+                    crate::owner_read::OwnerClient::connect(
+                        &channel_path,
+                        presented,
+                        options.timeouts,
+                        channel_clock.clone(),
+                        channel_owner.clone(),
+                    ),
+                    &channel_clock,
+                    channel_owner,
+                ) {
                     Ok(mut client) => {
-                        let answered = wait_for_local_answer(client.request(
-                            crate::local_transport::LocalRequestEnvelope {
+                        let request_clock = client.deadline_clock();
+                        let request_owner = client.original_connection_owner();
+                        let answered = wait_for_local_answer(
+                            client.request(crate::local_transport::LocalRequestEnvelope {
                                 limits: options.limits,
                                 request: crate::local_transport::LocalRequest::OwnerStatus,
-                            },
-                        ))
+                            }),
+                            &request_clock,
+                            request_owner,
+                        )
                         .map_err(owner_error)?;
                         for response in answered {
                             match response {
@@ -3478,7 +5278,9 @@ impl ReadSession {
                 claim,
                 claim_window_budget(options.timeouts),
                 claim_window_clock().as_ref(),
+                None,
             ) {
+                crate::persistence::ClaimSettlement::Cancelled => return Err(Error::ReadCancelled),
                 crate::persistence::ClaimSettlement::Settled => continue,
                 crate::persistence::ClaimSettlement::StillHeld => {
                     return Err(Error::ReadFailure(owner_holding_without_a_decision()));
@@ -3490,8 +5292,15 @@ impl ReadSession {
     /// Send an owner-status request over the real local channel. Status
     /// bypasses admission but still authenticates the selected listener, so a
     /// draining listener is distinguishable from an unbound or stale path.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn probe_owner_status_for_test(
         path: impl AsRef<Path>,
         options: ReadSessionOptions,
@@ -3510,29 +5319,133 @@ impl OwnerRoute {
     /// in force on this thread: the observer it opened the session with is
     /// installed for the span of this operation, and the token it may cancel
     /// is the one it handed to this call.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn ask(
         &self,
         limits: ReadLimits,
         request: crate::local_transport::LocalRequest,
         cancellation: Option<&OwnerReadCancellation>,
-        #[cfg(feature = "test-seams")] observer: Option<&Arc<dyn ReadSessionTestObserver>>,
+        #[cfg(any(test, feature = "test-seams"))] observer: Option<
+            &Arc<dyn ReadSessionTestObserver>,
+        >,
     ) -> Result<Vec<crate::local_transport::LocalResponse>> {
+        self.ask_with_cursor_memory(
+            limits,
+            request,
+            cancellation,
+            None,
+            None,
+            #[cfg(any(test, feature = "test-seams"))]
+            observer,
+        )
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn ask_query(
+        &self,
+        limits: ReadLimits,
+        request: crate::local_transport::query_funding::Funded<
+            crate::local_transport::LocalRequest,
+        >,
+        cancellation: Option<&OwnerReadCancellation>,
+        custody: &crate::local_transport::query_funding::QueryMemory,
+        #[cfg(any(test, feature = "test-seams"))] observer: Option<
+            &Arc<dyn ReadSessionTestObserver>,
+        >,
+    ) -> Result<
+        crate::local_transport::query_funding::FundedVec<
+            crate::local_transport::query_funding::Funded<crate::local_transport::LocalResponse>,
+        >,
+    > {
         self.resources.note_channel_operation();
         let progress = crate::read_progress::observer_for_this_read();
         let mut client = self.client.lock().expect("selected owner channel");
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(observer) = observer {
             let observer = Arc::clone(observer);
             client.observe_response_frames_for_test(Some(Arc::new(move |terminal| {
                 observer.observe_event(ReadSessionEvent::ResponseFrameReceived { terminal });
             })));
         }
-        let answered = wait_for_local_answer(client.request_watching(
-            crate::local_transport::LocalRequestEnvelope { limits, request },
-            progress.as_ref(),
-            cancellation,
-        ));
-        #[cfg(feature = "test-seams")]
+        let request_clock = client.deadline_clock();
+        let answered = wait_for_local_answer(
+            client.request_watching_with_query_memory(
+                request,
+                limits,
+                progress.as_ref(),
+                cancellation,
+                custody,
+            ),
+            &request_clock,
+            custody.image().owner(),
+        );
+        #[cfg(any(test, feature = "test-seams"))]
+        client.observe_response_frames_for_test(None);
+        answered.map_err(|error| {
+            custody.terminal();
+            match custody.take_stop() {
+                Some(error) => error,
+                None => query_owner_error(error, &custody.image()),
+            }
+        })
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn ask_with_cursor_memory(
+        &self,
+        limits: ReadLimits,
+        request: crate::local_transport::LocalRequest,
+        cancellation: Option<&OwnerReadCancellation>,
+        cursor_memory: Option<u64>,
+        original_owner: Option<contextdb_core::read_memory::ReadMemoryOwner>,
+        #[cfg(any(test, feature = "test-seams"))] observer: Option<
+            &Arc<dyn ReadSessionTestObserver>,
+        >,
+    ) -> Result<Vec<crate::local_transport::LocalResponse>> {
+        self.resources.note_channel_operation();
+        let progress = crate::read_progress::observer_for_this_read();
+        let mut client = self.client.lock().expect("selected owner channel");
+        #[cfg(any(test, feature = "test-seams"))]
+        if let Some(observer) = observer {
+            let observer = Arc::clone(observer);
+            client.observe_response_frames_for_test(Some(Arc::new(move |terminal| {
+                observer.observe_event(ReadSessionEvent::ResponseFrameReceived { terminal });
+            })));
+        }
+        let owned_request;
+        let request_owner = match original_owner {
+            Some(owner) => owner,
+            None => {
+                owned_request =
+                    crate::local_transport::query_funding::QueryMemory::with_original_owner(
+                        client.original_connection_owner(),
+                        limits.memory,
+                    )?;
+                owned_request.image().owner()
+            }
+        };
+        let request_clock = client.deadline_clock();
+        let answered = wait_for_local_answer(
+            client.request_watching_under_cursor_memory(
+                crate::local_transport::LocalRequestEnvelope { limits, request },
+                progress.as_ref(),
+                cancellation,
+                cursor_memory,
+                request_owner.clone(),
+            ),
+            &request_clock,
+            request_owner,
+        );
+        #[cfg(any(test, feature = "test-seams"))]
         client.observe_response_frames_for_test(None);
         answered.map_err(owner_error)
     }
@@ -3684,14 +5597,65 @@ impl OwnerReport {
 /// The continuation sits beside the body rather than inside it: the body is
 /// the published document, byte-for-byte the same on every route, and where a
 /// paged read left off is this exchange's business, not the document's.
-#[derive(Debug, Clone, PartialEq)]
-pub struct MetadataAnswer {
+/// Immutable metadata. Clones retain the same admitted body and continuation;
+/// a field projection cannot detach their allocations from original custody.
+#[derive(Debug, Clone)]
+pub struct MetadataAnswer(contextdb_core::read_memory::ReadShared<MetadataAnswerData>);
+#[derive(Debug, PartialEq)]
+pub struct MetadataAnswerData {
     pub body: MetadataBody,
-    /// Where to resume, when this answer was one page of an inventory and more
-    /// of it remains. Absent means the answer is complete.
     pub continuation: Option<String>,
-    /// What the answer holds against the session's memory while it is held.
     pub(crate) charge: crate::read_image_memory::AnswerCharge,
+}
+impl std::ops::Deref for MetadataAnswer {
+    type Target = MetadataAnswerData;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl PartialEq for MetadataAnswer {
+    fn eq(&self, other: &Self) -> bool {
+        *self.0 == *other.0
+    }
+}
+impl MetadataAnswer {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn try_new(
+        body: MetadataBody,
+        continuation: Option<String>,
+        charge: crate::read_image_memory::AnswerCharge,
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<Self> {
+        use contextdb_core::read_memory::{NativeProduce, ReadCredit, ReadShared};
+        let invoice = ReadCredit::try_new_owned(
+            owner,
+            ReadShared::<MetadataAnswerData>::layout().size(),
+            "reader",
+            "metadata_answer",
+            "Raise the reader memory limit.",
+        )?;
+        ReadShared::try_from_prepaid_with_native(invoice, || {
+            Ok::<_, Error>(MetadataAnswerData {
+                body,
+                continuation,
+                charge,
+            })
+        })
+        .map(Self)
+        .map_err(|error| match error {
+            NativeProduce::Refused(error) => Error::NativeEngineOther(error),
+            NativeProduce::Producer(error) => error,
+        })
+    }
+
+    /// What the answer's own shared cell holds against its owner.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) fn cell_credit_bytes(&self) -> usize {
+        self.0.credit().bytes()
+    }
 }
 
 /// Whether this kind of question can be answered a page at a time.
@@ -3713,6 +5677,7 @@ fn metadata_kind_name(request: &MetadataRequest) -> &'static str {
         MetadataRequest::Explain { .. } => "an explained statement",
         MetadataRequest::EventsStatus => "the event inventory",
         MetadataRequest::MaintenanceStatus => "the maintenance status",
+        MetadataRequest::VerifyHistory { .. } => "a historical index verification",
         MetadataRequest::ImageState { .. } => "the committed image state",
         MetadataRequest::DeliveryStatus { .. } => "delivery status",
         MetadataRequest::DeliveryOutcome { .. } => "a delivery outcome",
@@ -3720,6 +5685,10 @@ fn metadata_kind_name(request: &MetadataRequest) -> &'static str {
 }
 
 /// The owner's explained plan, or the reason there is not one.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn published_explain_payload(
     responses: Vec<crate::local_transport::LocalResponse>,
 ) -> Result<Vec<u8>> {
@@ -3736,6 +5705,10 @@ fn published_explain_payload(
 }
 
 /// The owner's metadata reply, or the reason there is not one.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn published_metadata_payload(
     responses: Vec<crate::local_transport::LocalResponse>,
     memory_ceiling: u64,
@@ -3764,59 +5737,77 @@ fn published_metadata_payload(
 /// inventories travel as a page, so the page's items are promoted back into
 /// the body they were flattened from -- and the page's continuation comes out
 /// beside it.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn promoted_metadata_answer(
     request: &MetadataRequest,
     payload: &[u8],
     limits: ReadLimits,
+    receiving_memory: crate::read_image_memory::ImageMemoryHandle,
 ) -> Result<MetadataAnswer> {
     match request {
         MetadataRequest::Schema { .. }
         | MetadataRequest::MaintenanceStatus
+        | MetadataRequest::VerifyHistory { .. }
         | MetadataRequest::DeliveryStatus { .. }
         | MetadataRequest::DeliveryOutcome { .. } => {
-            let body = crate::read_contract::decode_metadata_body(payload)
-                .map_err(|error| Error::Other(error.to_string()))?;
-            Ok(MetadataAnswer {
+            let body = crate::read_contract::decode_metadata_body_with_memory(
+                payload,
+                &receiving_memory,
+                limits.memory,
+            )
+            .map_err(read_encoding_error)?;
+            MetadataAnswer::try_new(
                 body,
-                continuation: None,
-                charge: Default::default(),
-            })
+                None,
+                crate::read_image_memory::AnswerCharge::holding(receiving_memory.clone()),
+                receiving_memory.owner(),
+            )
         }
         MetadataRequest::Tables => {
-            let page = decoded_metadata_page(payload, limits)?;
-            Ok(MetadataAnswer {
-                body: MetadataBody::Tables {
-                    items: crate::metadata_page::table_names_of(&page),
-                    has_more: page.has_more,
-                },
-                continuation: page.continuation,
-                charge: Default::default(),
-            })
+            let page = crate::read_contract::decode_metadata_page_with_memory(
+                payload,
+                &receiving_memory,
+                limits.memory,
+            )
+            .map_err(read_encoding_error)?;
+            let body = MetadataBody::Tables {
+                items: crate::metadata_page::table_names_of_funded(&page, &receiving_memory)?,
+                has_more: page.has_more,
+            };
+            MetadataAnswer::try_new(
+                body,
+                page.continuation,
+                crate::read_image_memory::AnswerCharge::holding(receiving_memory.clone()),
+                receiving_memory.owner(),
+            )
         }
         MetadataRequest::EventsStatus => {
-            let page = decoded_metadata_page(payload, limits)?;
-            Ok(MetadataAnswer {
-                body: MetadataBody::EventsStatus {
-                    status: crate::metadata_page::events_of(&page),
-                    has_more: page.has_more,
-                    continuation: page.continuation.clone(),
-                },
-                continuation: page.continuation,
-                charge: Default::default(),
-            })
+            let page = crate::read_contract::decode_metadata_page_with_memory(
+                payload,
+                &receiving_memory,
+                limits.memory,
+            )
+            .map_err(read_encoding_error)?;
+            receiving_memory.reserve(page.continuation.as_ref().map_or(0, String::len))?;
+            let body = MetadataBody::EventsStatus {
+                status: crate::metadata_page::events_of_funded(&page, &receiving_memory)?,
+                has_more: page.has_more,
+                continuation: page.continuation.clone(),
+            };
+            MetadataAnswer::try_new(
+                body,
+                page.continuation,
+                crate::read_image_memory::AnswerCharge::holding(receiving_memory.clone()),
+                receiving_memory.owner(),
+            )
         }
         MetadataRequest::Explain { .. } | MetadataRequest::ImageState { .. } => {
             Err(Error::ReadFailure(owner_disconnected()))
         }
     }
-}
-
-fn decoded_metadata_page(
-    payload: &[u8],
-    limits: ReadLimits,
-) -> Result<contextdb_core::read_contract::MetadataPage> {
-    crate::read_contract::decode_metadata_page_under_memory_ceiling(payload, limits.memory)
-        .map_err(read_encoding_error)
 }
 
 /// Preserve a decoder's budget refusal across the owner channel and classify
@@ -3827,6 +5818,7 @@ fn read_encoding_error(error: crate::read_contract::ReadEncodingError) -> Error 
     };
 
     match error {
+        crate::read_contract::ReadEncodingError::Admission(error) => error,
         crate::read_contract::ReadEncodingError::MemoryCeilingExceeded { ceiling } => {
             Error::ReadFailure(ReadFailure::owner_limit_exceeded(
                 OwnerLimitExceededDetail {
@@ -3841,41 +5833,64 @@ fn read_encoding_error(error: crate::read_contract::ReadEncodingError) -> Error 
             ReadFailure::new(ReadFailureKind::InvalidChannelData, ReadFailureDetail::None)
                 .expect("invalid channel data accepts canonical empty detail"),
         ),
+
         crate::read_contract::ReadEncodingError::Unimplemented => Error::ReadSessionNotImplemented,
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn published_query_result(
-    responses: Vec<crate::local_transport::LocalResponse>,
+    mut responses: crate::local_transport::query_funding::FundedVec<
+        crate::local_transport::query_funding::Funded<crate::local_transport::LocalResponse>,
+    >,
     limits: ReadLimits,
-) -> Result<QueryResult> {
-    use crate::local_transport::{OrdinaryResultReceiver, ResultReceiveOutcome};
-    let mut receiver =
-        OrdinaryResultReceiver::with_effective_ceilings(limits.result_bytes, limits.memory)
-            .map_err(|error| {
-                owner_error(crate::owner_read::OwnerReadScaffoldError::from_local(error))
-            })?;
+    receiving_memory: crate::read_image_memory::ImageMemoryHandle,
+) -> Result<OwnedQueryResult> {
+    use crate::local_transport::{FundedResultReceiveOutcome, OrdinaryResultReceiver};
+    let mut receiver = OrdinaryResultReceiver::with_query_memory(
+        limits.result_bytes,
+        limits.memory,
+        receiving_memory.clone(),
+    )
+    .map_err(|error| owner_error(crate::owner_read::OwnerReadScaffoldError::from_local(error)))?;
     let mut published = None;
-    for response in responses {
-        match crate::owner_read::OwnerClient::receive_ordinary(&mut receiver, response)
-            .map_err(owner_error)?
-        {
-            ResultReceiveOutcome::Pending => {}
-            ResultReceiveOutcome::Published(result) => published = Some(result.bytes),
-            ResultReceiveOutcome::Failed(failure) => return Err(Error::ReadFailure(failure)),
-            ResultReceiveOutcome::EngineFailed(failure) => {
-                return Err(failure.into_error(limits.memory));
+    // Drain borrows the funded original container; its invoice survives the
+    // iterator and every early return until the physical Vec is destroyed.
+    for response in responses.values.drain(..) {
+        match receiver.receive_funded(response).map_err(|error| {
+            owner_error(crate::owner_read::OwnerReadScaffoldError::from_local(error))
+        })? {
+            FundedResultReceiveOutcome::Pending => {}
+            FundedResultReceiveOutcome::Published(result) => {
+                drop(result.terminal);
+                published = Some(result.bytes);
             }
-            ResultReceiveOutcome::Disconnected => {
-                return Err(Error::ReadFailure(owner_disconnected()));
+            FundedResultReceiveOutcome::Failed(failure) => {
+                return Err(Error::ReadFailure(failure.into_retained()));
+            }
+            FundedResultReceiveOutcome::EngineFailed(failure) => {
+                return Err(crate::local_transport::query_funding::query_error(
+                    failure,
+                    &receiving_memory,
+                    limits.memory,
+                )
+                .into_retained());
             }
         }
     }
+    drop(responses);
     let bytes = published.ok_or_else(|| Error::ReadFailure(owner_disconnected()))?;
-    let canonical =
-        crate::read_contract::decode_query_result_under_memory_ceiling(&bytes, limits.memory)
-            .map_err(read_encoding_error)?;
-    restored_query_result(canonical)
+    let baseline = receiving_memory.held();
+    let canonical = crate::read_contract::decode_query_result_funded(
+        &bytes.value,
+        &receiving_memory,
+        limits.memory,
+    )
+    .map_err(read_encoding_error)?;
+    restored_query_result(canonical.into_retained(), receiving_memory, baseline)
 }
 
 /// Turn the owner's canonical answer back into the same value an in-process
@@ -3885,10 +5900,159 @@ fn published_query_result(
 /// free text, so a label this reader does not recognise means the owner is
 /// speaking a vocabulary this build does not have -- which is an answer about
 /// the channel, not a result to hand back.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn restored_query_result(
     canonical: crate::read_contract::CanonicalQueryResult,
-) -> Result<QueryResult> {
-    let physical_plan = known_plan_label(&canonical.trace.physical_plan).ok_or_else(|| {
+    receiving_memory: crate::read_image_memory::ImageMemoryHandle,
+    baseline: usize,
+) -> Result<OwnedQueryResult> {
+    let mut canonical = canonical;
+    let trace = std::mem::replace(
+        &mut canonical.trace,
+        crate::read_contract::CanonicalQueryTrace::empty(),
+    );
+    let row_bytes = crate::executor::bounded::canonical_query_capacity_bytes(&canonical)
+        .map_err(read_error)?
+        .checked_sub(std::mem::size_of::<
+            crate::read_contract::CanonicalQueryResult,
+        >())
+        .ok_or_else(|| Error::Other("canonical answer size underflow".into()))?;
+    let copies = trace_restoration_bytes(&trace)?;
+    receiving_memory.reserve(copies)?;
+    let trace = restored_query_trace(trace)?;
+    let cascade = canonical
+        .cascade
+        .take()
+        .map(|cascade| crate::database::CascadeReport {
+            dropped_indexes: cascade.dropped_indexes,
+        });
+    let trace_bytes =
+        crate::executor::bounded::query_trace_capacity_bytes(&trace).map_err(read_error)?;
+    let retained = row_bytes
+        .checked_add(trace_bytes)
+        .ok_or_else(|| Error::Other("query answer size overflow".into()))?;
+    // The decoding owner also contains fixed native controls. All payload
+    // credit stays on this owner; excess container/temporary charges return
+    // only after restoration destroys their source buffers.
+    let payload_admitted = receiving_memory
+        .held()
+        .checked_sub(baseline)
+        .ok_or_else(|| Error::Other("query answer admission underflow".into()))?;
+    if retained > payload_admitted {
+        return Err(Error::Other(
+            "query answer exceeded prepaid native credit".into(),
+        ));
+    }
+    receiving_memory.release(payload_admitted - retained);
+    Ok(OwnedQueryResult {
+        result: QueryResultData {
+            columns: canonical.columns,
+            rows: canonical.rows,
+            rows_affected: canonical.rows_affected,
+            trace,
+            cascade,
+        },
+        answer_charge: crate::read_image_memory::QueryAnswerCharge::holding(
+            receiving_memory.clone(),
+        ),
+        vector_copy_charge: crate::read_image_memory::QueryAnswerCharge::holding(
+            receiving_memory.clone(),
+        ),
+        retained_read_memory: Some(
+            receiving_memory
+                .reader_budget()
+                .expect("receiver retains its original reader"),
+        ),
+    })
+}
+
+/// Only native containers newly allocated during the canonical-to-engine
+/// move. Existing strings, vectors and JSON payloads keep their prepaid credit.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn trace_restoration_bytes(trace: &crate::read_contract::CanonicalQueryTrace) -> Result<usize> {
+    let add = |bytes: usize, count: usize, width: usize| {
+        count
+            .checked_mul(width)
+            .and_then(|n| bytes.checked_add(n))
+            .ok_or_else(|| Error::Other("trace restoration size overflow".into()))
+    };
+    let mut bytes = 0;
+    if trace.predicates_pushed.len() > 4 {
+        bytes = add(
+            bytes,
+            trace.predicates_pushed.len(),
+            std::mem::size_of::<std::borrow::Cow<'static, str>>(),
+        )?;
+    }
+    if trace.indexes_considered.len() > 4 {
+        bytes = add(
+            bytes,
+            trace.indexes_considered.len(),
+            std::mem::size_of::<crate::database::IndexCandidate>(),
+        )?;
+    }
+    if trace.groups.capacity() != trace.groups.len() {
+        bytes = add(
+            bytes,
+            trace.groups.len(),
+            std::mem::size_of::<crate::database::GroupDisclosure>(),
+        )?;
+    }
+    if let Some(vector) = &trace.vector_search {
+        bytes = add(
+            bytes,
+            1,
+            std::mem::size_of::<crate::VectorSearchDisclosure>(),
+        )?;
+        bytes = add(
+            bytes,
+            vector.partitions.len(),
+            std::mem::size_of::<crate::VectorPartitionDisclosure>(),
+        )?;
+    }
+    if let Some(count) = &trace.maintained_count {
+        bytes = add(
+            bytes,
+            1,
+            std::mem::size_of::<crate::maintained_counts::MaintainedCountDisclosure>(),
+        )?;
+        bytes = add(
+            bytes,
+            count.columns.len(),
+            std::mem::size_of::<(String, contextdb_core::SortDirection)>(),
+        )?;
+        if !count.used && !count.declared {
+            bytes = add(
+                bytes,
+                count.already_declared.len(),
+                std::mem::size_of::<Vec<(String, contextdb_core::SortDirection)>>(),
+            )?;
+            for columns in &count.already_declared {
+                bytes = add(
+                    bytes,
+                    columns.len(),
+                    std::mem::size_of::<(String, contextdb_core::SortDirection)>(),
+                )?;
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn restored_query_trace(
+    canonical: crate::read_contract::CanonicalQueryTrace,
+) -> Result<crate::QueryTrace> {
+    let physical_plan = known_plan_label(&canonical.physical_plan).ok_or_else(|| {
         Error::ReadFailure(
             contextdb_core::read_contract::ReadFailure::new(
                 contextdb_core::read_contract::ReadFailureKind::InvalidChannelData,
@@ -3898,7 +6062,6 @@ fn restored_query_result(
         )
     })?;
     let vector_search = canonical
-        .trace
         .vector_search
         .map(crate::database::VectorSearchDisclosure::try_from)
         .transpose()
@@ -3911,39 +6074,51 @@ fn restored_query_result(
                 .expect("invalid channel data accepts canonical empty detail"),
             )
         })?;
-    Ok(QueryResult {
-        columns: canonical.columns,
-        rows: canonical.rows,
-        rows_affected: canonical.rows_affected,
-        trace: crate::database::QueryTrace {
-            physical_plan,
-            index_used: canonical.trace.index_used,
-            predicates_pushed: canonical
-                .trace
-                .predicates_pushed
-                .into_iter()
-                .map(std::borrow::Cow::Owned)
-                .collect(),
-            indexes_considered: canonical
-                .trace
-                .indexes_considered
-                .into_iter()
-                .map(|candidate| crate::database::IndexCandidate {
+    if canonical
+        .cache_resident_fraction
+        .is_some_and(|fraction| !fraction.is_finite() || !(0.0..=1.0).contains(&fraction))
+    {
+        return Err(Error::ReadFailure(
+            contextdb_core::read_contract::ReadFailure::new(
+                contextdb_core::read_contract::ReadFailureKind::InvalidChannelData,
+                contextdb_core::read_contract::ReadFailureDetail::None,
+            )
+            .expect("invalid channel data accepts empty detail"),
+        ));
+    }
+    Ok(crate::database::QueryTrace {
+        physical_plan,
+        index_used: canonical.index_used,
+        predicates_pushed: {
+            let mut predicates =
+                smallvec::SmallVec::with_capacity(canonical.predicates_pushed.len());
+            for predicate in canonical.predicates_pushed {
+                predicates.push(std::borrow::Cow::Owned(predicate));
+            }
+            predicates
+        },
+        indexes_considered: {
+            let mut candidates =
+                smallvec::SmallVec::with_capacity(canonical.indexes_considered.len());
+            for candidate in canonical.indexes_considered {
+                candidates.push(crate::database::IndexCandidate {
                     name: candidate.name,
                     rejected_reason: std::borrow::Cow::Owned(candidate.rejected_reason),
-                })
-                .collect(),
-            sort_elided: canonical.trace.sort_elided,
-            query_vector_source: canonical.trace.query_vector_source,
-            vector_search,
-            rows_examined: canonical.trace.rows_examined,
-            maintained_count: canonical.trace.maintained_count.map(|disclosure| {
-                Box::new(
-                    crate::read_contract::CanonicalMaintainedCountDisclosure::restored(disclosure),
-                )
-            }),
+                });
+            }
+            candidates
         },
-        cascade: None,
+        sort_elided: canonical.sort_elided,
+        query_vector_source: canonical.query_vector_source,
+        // trace_restoration_bytes (or cursor receive admission) funds this
+        // allocation before restoration begins; nested containers move here.
+        vector_search: vector_search.map(Box::new),
+        rows_examined: canonical.rows_examined,
+        groups: canonical.groups.into_boxed_slice(),
+        cache_resident_fraction: canonical.cache_resident_fraction,
+        maintained_count: canonical.maintained_count.map(|disclosure| {
+            Box::new(crate::read_contract::CanonicalMaintainedCountDisclosure::restored(disclosure))
+        }),
     })
 }
 
@@ -3957,11 +6132,8 @@ fn known_plan_label(label: &str) -> Option<&'static str> {
         "AdjacencyProbe",
         "EdgesScan",
         "GraphBfs",
-        "HNSWSearch",
         "VectorSearch",
-        "IndexScan -> HNSWSearch",
         "IndexScan -> VectorSearch",
-        "Scan -> HNSWSearch",
         "Scan -> VectorSearch",
     ];
     LABELS.iter().copied().find(|known| *known == label)
@@ -3972,12 +6144,18 @@ fn known_plan_label(label: &str) -> Option<&'static str> {
 struct DirectCursorExecution {
     cursor: crate::direct_file_reader::DirectCursor,
     resources: Arc<RouteResources>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     kernel_observer: Option<Arc<dyn ReadKernelTestObserver>>,
 }
 
 impl OwnedCursorExecution for DirectCursorExecution {
-    #[cfg(feature = "test-seams")]
+    fn work_observation(&mut self) -> Result<Option<crate::executor::CursorObservation>> {
+        self.cursor
+            .work_observation()
+            .map_err(|error| direct_error(Path::new(""), error))
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
     fn file_resource_witness_for_test(
         &self,
     ) -> Result<Option<crate::direct_file_reader::DirectCursorResourceWitness>> {
@@ -3990,8 +6168,8 @@ impl OwnedCursorExecution for DirectCursorExecution {
         &mut self,
         rows: Option<NonZeroUsize>,
         cancellation: &OwnerReadCancellation,
-    ) -> Result<CursorPage> {
-        #[cfg(feature = "test-seams")]
+    ) -> Result<ObservedCursorPage> {
+        #[cfg(any(test, feature = "test-seams"))]
         let probe = self.kernel_observer.as_ref().map(|observer| {
             observed_kernel_probe(
                 observer,
@@ -4000,14 +6178,18 @@ impl OwnedCursorExecution for DirectCursorExecution {
                 cancellation,
             )
         });
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let fetched = with_session_kernel_probe(probe, || {
+            crate::owned_cursor_page::with_public_page(|| {
+                self.cursor.fetch_with_cancellation(rows, cancellation)
+            })
+        });
+        #[cfg(not(any(test, feature = "test-seams")))]
+        let fetched = crate::owned_cursor_page::with_public_page(|| {
             self.cursor.fetch_with_cancellation(rows, cancellation)
         });
-        #[cfg(not(feature = "test-seams"))]
-        let fetched = self.cursor.fetch_with_cancellation(rows, cancellation);
         fetched
-            .map(|fetched| fetched.page)
+            .map(ObservedCursorPage::from)
             .map_err(|error| direct_error(Path::new(""), error))
     }
 
@@ -4032,11 +6214,207 @@ impl OwnedCursorExecution for DirectCursorExecution {
     }
 }
 
+struct ObservedCursorPage {
+    cancelled: bool,
+    page: OwnedCursorPage,
+    observation: crate::executor::CursorObservation,
+    owner_trace_charge: Option<Arc<OwnerTraceCharge>>,
+}
+impl std::ops::Deref for ObservedCursorPage {
+    type Target = OwnedCursorPage;
+    fn deref(&self) -> &OwnedCursorPage {
+        &self.page
+    }
+}
+impl std::ops::DerefMut for ObservedCursorPage {
+    fn deref_mut(&mut self) -> &mut OwnedCursorPage {
+        &mut self.page
+    }
+}
+impl From<crate::direct_file_reader::DirectCursorPage> for ObservedCursorPage {
+    fn from(page: crate::direct_file_reader::DirectCursorPage) -> Self {
+        Self {
+            cancelled: false,
+            page: page.page,
+            observation: page.observation,
+            owner_trace_charge: None,
+        }
+    }
+}
+fn take_cursor_observation(
+    observation: crate::executor::CursorObservation,
+) -> (
+    crate::QueryTrace,
+    Option<crate::executor::CursorObservation>,
+) {
+    let rows_examined = observation.rows_examined;
+    if observation.charge.is_none() && observation.group_page_returns.is_none() {
+        // Channel restoration already owns its admitted trace; move it into
+        // the handle instead of allocating another copy.
+        let mut trace =
+            Arc::try_unwrap(observation.trace).unwrap_or_else(|trace| trace.as_ref().clone());
+        trace.rows_examined = rows_examined;
+        (trace, None)
+    } else {
+        // This single owned copy is covered by the shared kernel snapshot's
+        // charge and reused until actual plan metadata changes.
+        let mut trace = observation.trace.as_ref().clone();
+        trace.rows_examined = rows_examined;
+        (trace, Some(observation))
+    }
+}
+/// Restored metadata remains charged to the continuation's existing owner
+/// until the handle replaces it or drops, including after execution ends.
+struct OwnerTraceCharge {
+    memory: crate::read_image_memory::ImageMemoryHandle,
+    bytes: usize,
+    _decoded_credit: Option<contextdb_core::read_memory::ReadCredit>,
+    _retained_owner: Option<contextdb_core::read_memory::ReadMemoryOwner>,
+}
+impl Drop for OwnerTraceCharge {
+    fn drop(&mut self) {
+        self.memory.release(self.bytes);
+    }
+}
+fn cursor_receive_allowance(
+    memory: u64,
+    retained_memory: &crate::read_image_memory::ImageMemory,
+) -> u64 {
+    let configured = retained_memory
+        .accountant
+        .usage()
+        .limit
+        .map_or(u64::MAX, |bytes| u64::try_from(bytes).unwrap_or(u64::MAX));
+    memory
+        .min(configured)
+        .saturating_sub(retained_memory.held() as u64)
+        // The public cell is prepaid on retained_owner, outside ImageMemory.
+        .saturating_sub(OwnedCursorPage::public_carrier_bytes() as u64)
+}
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn decode_observed_page(
+    payload: &[u8],
+    memory: u64,
+    retained_memory: &crate::read_image_memory::ImageMemoryHandle,
+    retained_owner: &contextdb_core::read_memory::ReadMemoryOwner,
+) -> Result<ObservedCursorPage> {
+    let available =
+        cursor_receive_allowance(memory, retained_memory).saturating_sub(payload.len() as u64);
+    crate::local_transport::observed_cursor_page_allocation_bytes(payload, available).map_err(
+        |error| match error {
+            crate::read_contract::ReadEncodingError::MemoryCeilingExceeded { .. } => {
+                read_encoding_error(
+                    crate::read_contract::ReadEncodingError::MemoryCeilingExceeded {
+                        ceiling: memory,
+                    },
+                )
+            }
+            other => read_encoding_error(other),
+        },
+    )?;
+    let before = retained_memory.held();
+    let decoded =
+        crate::read_contract::cursor_observation::decode_observed_cursor_page_with_memory(
+            payload,
+            retained_memory,
+            available,
+        )
+        .map_err(|error| match error {
+            crate::read_contract::ReadEncodingError::MemoryCeilingExceeded { .. } => {
+                read_encoding_error(
+                    crate::read_contract::ReadEncodingError::MemoryCeilingExceeded {
+                        ceiling: memory,
+                    },
+                )
+            }
+            other => read_encoding_error(other),
+        })?;
+    // Move the actual decoder debit; do not pay a different owner for the
+    // same live columns, rows, JSON trees, and canonical trace allocations.
+    let bytes = retained_memory
+        .held()
+        .checked_sub(before)
+        .ok_or_else(|| Error::Other("cursor decoder credit underflow".into()))?;
+    let credit = retained_memory.take_retained_credit(bytes)?;
+    let credit =
+        crate::local_transport::query_funding::retain_cursor_credit(credit, retained_owner.clone());
+    let mut decoded = crate::local_transport::query_funding::Funded {
+        value: decoded,
+        credit: Some(credit),
+    };
+    let page_bytes = crate::executor::bounded::cursor_page_capacity_bytes(&decoded.value.page)
+        .map_err(read_error)?;
+    let restoration = trace_restoration_bytes(&decoded.value.trace)?
+        .checked_add(
+            std::mem::size_of::<crate::QueryTrace>()
+                + std::mem::size_of::<OwnerTraceCharge>()
+                + 4 * std::mem::size_of::<usize>(),
+        )
+        .ok_or_else(|| Error::Other("cursor trace restoration overflow".into()))?;
+    let restoration_credit = contextdb_core::read_memory::ReadCredit::try_new(
+        retained_memory.clone(),
+        restoration,
+        "read_channel",
+        "restore_cursor_trace",
+        "Reduce the page or raise the reader memory limit.",
+    )?;
+    let rows_examined = decoded.value.trace.rows_examined;
+    let trace = restored_query_trace(decoded.value.trace)?;
+    let page_credit = decoded
+        .credit
+        .as_mut()
+        .expect("decoded cursor has its original credit")
+        .try_split_off(page_bytes)?;
+    let mut page = crate::local_transport::query_funding::Funded {
+        value: decoded.value.page,
+        credit: Some(page_credit),
+    };
+    if page.value.rows.capacity() != 0 {
+        page.credit
+            .as_mut()
+            .expect("decoded page retains its original credit")
+            .try_grow_for(
+                crate::owned_cursor_page::SharedRows::allocation_header_bytes(),
+                "reader",
+                "publish_cursor_root",
+                "Reduce retained pages or raise the reader memory limit.",
+            )?;
+    }
+    let page = page
+        .value
+        .with_credit(page.credit.take().expect("page has original credit"))?;
+    let charge = OwnerTraceCharge {
+        memory: retained_memory.clone(),
+        bytes: restoration,
+        _decoded_credit: decoded.credit.take(),
+        _retained_owner: Some(retained_owner.clone()),
+    };
+    restoration_credit.transfer();
+    Ok(ObservedCursorPage {
+        cancelled: false,
+        page,
+        observation: crate::executor::CursorObservation {
+            trace: Arc::new(trace),
+            rows_examined,
+            charge: None,
+            group_page_returns: None,
+        },
+        owner_trace_charge: Some(Arc::new(charge)),
+    })
+}
+
 /// A route-bound bounded cursor. Its lifetime is independent from the handle
 /// that opened it: the cursor owns an `Arc` containing the route, session
 /// snapshot owner, and suspended execution state.
 pub struct ReadCursor {
+    trace: crate::QueryTrace,
+    observation: Option<crate::executor::CursorObservation>,
+    owner_trace_charge: Option<Arc<OwnerTraceCharge>>,
     state: Arc<SuspendedReadCursorState>,
+    _expiry_driver: Option<SessionExpiryDriver>,
 }
 
 struct SuspendedReadCursorState {
@@ -4050,9 +6428,9 @@ struct SuspendedReadCursorState {
     progress: Option<Arc<dyn ReadProgressObserver>>,
     first_page: CursorPage,
     execution: Mutex<Box<dyn OwnedCursorExecution>>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     observer: Option<Arc<dyn ReadSessionTestObserver>>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     kernel_observer: Option<Arc<dyn ReadKernelTestObserver>>,
 }
 
@@ -4064,24 +6442,84 @@ struct SuspendedReadCursorState {
 /// The owner serves pages while available. This side retains the exact
 /// registered storage root, statement and delivered-row position so an owner
 /// withdrawal can resume through the existing file execution kernel.
+struct OwnerGroupBaseline {
+    groups: Box<[crate::database::GroupDisclosure]>,
+    ordinals: Box<[u64]>,
+    _charge: OwnerTraceCharge,
+}
+impl OwnerGroupBaseline {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn capture(
+        trace: &crate::QueryTrace,
+        memory: &crate::read_image_memory::ImageMemoryHandle,
+    ) -> Result<Self> {
+        let bytes = trace
+            .groups
+            .len()
+            .checked_mul(
+                std::mem::size_of::<crate::database::GroupDisclosure>()
+                    + std::mem::size_of::<u64>(),
+            )
+            .and_then(|bytes| {
+                trace.groups.iter().try_fold(bytes, |bytes, group| {
+                    bytes.checked_add(group.partition_key.len())
+                })
+            })
+            .ok_or_else(|| Error::Other("group baseline memory overflow".into()))?;
+        memory.reserve(bytes)?;
+        let charge = OwnerTraceCharge {
+            memory: memory.clone(),
+            bytes,
+            _decoded_credit: None,
+            _retained_owner: None,
+        };
+        let groups = trace.groups.to_vec().into_boxed_slice();
+        let ordinals = trace
+            .groups
+            .iter()
+            .map(|group| group.ordinal)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Ok(Self {
+            groups,
+            ordinals,
+            _charge: charge,
+        })
+    }
+}
+
 struct OwnerCursorExecution {
     session: Arc<ReadSessionState>,
     resources: Arc<RouteResources>,
     limits: ReadLimits,
     cursor_id: [u8; 16],
     continuation: Option<OwnerCursorContinuation>,
+    owner_rows_examined: u64,
+    owner_groups: OwnerGroupBaseline,
+    cancelled_observation: Option<crate::executor::CursorObservation>,
+    cancelled_trace_charge: Option<Arc<OwnerTraceCharge>>,
+    retained_memory: crate::read_image_memory::ImageMemoryHandle,
     clock: Arc<dyn contextdb_core::read_contract::DeadlineClock>,
     created_ms: u64,
     last_used_ms: u64,
     closed: bool,
     expired: Option<contextdb_core::read_contract::CursorExpiryKind>,
-    expiry_waker: Arc<Mutex<Option<std::thread::Thread>>>,
-    #[cfg(feature = "test-seams")]
+    expiry_waker: OwnerExpirySlot,
+    expiry_failure: Option<Error>,
+    #[cfg(any(test, feature = "test-seams"))]
     observer: Option<Arc<dyn ReadSessionTestObserver>>,
+    retained_owner: contextdb_core::read_memory::ReadMemoryOwner,
 }
 
 struct OwnerCursorContinuation {
-    retained_memory: Arc<crate::read_image_memory::ImageMemory>,
+    retained_memory: crate::read_image_memory::ImageMemoryHandle,
+    retained_statement_bytes: usize,
+    declared_memory: u64,
+    discarded_rows_examined: u64,
+    failed_open_observation: Option<crate::executor::CursorObservation>,
     path: PathBuf,
     registration: Option<crate::persistence::ReadSnapshotRegistrationGuard>,
     config: crate::direct_file_reader::DirectReaderConfig,
@@ -4092,12 +6530,46 @@ struct OwnerCursorContinuation {
     skipped: usize,
 }
 
+impl Drop for OwnerCursorContinuation {
+    fn drop(&mut self) {
+        self.retained_memory.release(self.retained_statement_bytes);
+    }
+}
+
 impl OwnerCursorContinuation {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Cache operations retain typed diagnostics."
+    )]
+    fn refresh_cache_share(&mut self, resources: &RouteResources) -> Result<()> {
+        if let Some(cursor) = self.cursor.as_ref() {
+            let share = resources.current_read_cache_share();
+            let budget = self.config.memory_limit.unwrap_or_else(|| {
+                usize::try_from(self.config.limits.memory).unwrap_or(usize::MAX)
+            });
+            let capacity = crate::persistence::redb_reader_cache_bytes(budget, share);
+            let (kept, _working) = cursor
+                .select_cache_capacity_for_page(capacity)
+                .map_err(public_cache_setting_error)?;
+            if kept < capacity {
+                resources.note_cursor_cache_refusal(share, kept);
+            } else {
+                self.config.read_cache_share = share;
+            }
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn fetch(
         &mut self,
         rows: Option<NonZeroUsize>,
         cancellation: &OwnerReadCancellation,
-    ) -> Result<CursorPage> {
+        resources: &RouteResources,
+    ) -> Result<ObservedCursorPage> {
         crate::executor::bounded::cursor_replay_checkpoint().map_err(read_error)?;
         if rows.is_some_and(|rows| rows.get() as u64 > self.config.limits.result_rows) {
             return Err(Error::ReadFailure(
@@ -4111,6 +6583,7 @@ impl OwnerCursorContinuation {
                 ),
             ));
         }
+        self.refresh_cache_share(resources)?;
         if self.cursor.is_none() {
             let registration = self
                 .registration
@@ -4118,41 +6591,82 @@ impl OwnerCursorContinuation {
                 .ok_or_else(|| Error::ReadFailure(owner_disconnected()))?
                 .retain_owner_snapshot();
             let mut config = self.config.clone();
-            let available = usize::try_from(config.limits.memory)
+            // Start with the policy this cursor already had. A new shrink can
+            // apply immediately; growth waits for this reader's first real page
+            // measurement, so even its initial encoding keeps its room.
+            let requested_share = resources.current_read_cache_share();
+            let available = usize::try_from(self.declared_memory)
                 .unwrap_or(usize::MAX)
+                .min(config.memory_limit.unwrap_or(usize::MAX))
                 .saturating_sub(self.retained_memory.held());
             config.memory_limit = Some(config.memory_limit.unwrap_or(available).min(available));
-            config.limits.memory = config.limits.memory.min(available as u64);
+            config.limits.memory = available as u64;
+            if crate::persistence::redb_reader_cache_bytes(available, requested_share)
+                < crate::persistence::redb_reader_cache_bytes(available, config.read_cache_share)
+            {
+                config.read_cache_share = requested_share;
+            }
             config.limits.cursor_page_rows = config
                 .limits
                 .cursor_page_rows
                 .min(self.delivered.max(1) as u64);
-            let reader = crate::direct_file_reader::DirectFileReader::from_owner_snapshot(
-                &self.path,
-                config,
-                registration,
-            )
-            .map_err(|error| direct_error(&self.path, error))?;
-            let opened = reader
-                .open_cursor_with_cancellation(
-                    &self.sql,
-                    &self.params,
-                    NonZeroUsize::new(
-                        self.delivered
-                            .max(1)
-                            .min(self.config.limits.cursor_page_rows as usize),
-                    )
-                    .unwrap(),
+            let opened_share = config.read_cache_share;
+            let reader =
+                crate::direct_file_reader::DirectFileReader::from_owner_snapshot_with_cancellation(
+                    &self.path,
+                    config,
+                    registration,
                     cancellation,
                 )
                 .map_err(|error| direct_error(&self.path, error))?;
-            let mut first_page = opened.first_page.page;
+            let admitted_memory = reader.admitted_memory();
+            let (opened, examined, open_observation) =
+                crate::executor::bounded::with_cursor_open_work(|| {
+                    reader.open_cursor_with_cancellation(
+                        &self.sql,
+                        &self.params,
+                        NonZeroUsize::new(
+                            self.delivered
+                                .max(1)
+                                .min(self.config.limits.cursor_page_rows as usize),
+                        )
+                        .unwrap(),
+                        cancellation,
+                    )
+                });
+            let opened = match opened {
+                Ok(opened) => opened,
+                Err(error) => {
+                    self.failed_open_observation = open_observation
+                        .map(|receipt| receipt.into_observation().map_err(read_error))
+                        .transpose()?
+                        .flatten();
+                    self.discarded_rows_examined = self
+                        .discarded_rows_examined
+                        .checked_add(examined.map_err(read_error)?)
+                        .ok_or_else(|| {
+                            Error::Other(
+                                ("cursor rows-examined counter overflow".to_string()).into(),
+                            )
+                        })?;
+                    return Err(direct_error(&self.path, error));
+                }
+            };
+            let mut first_page = ObservedCursorPage::from(opened.first_page);
+            self.config.read_cache_share = opened_share;
+            self.config.limits.memory = admitted_memory;
+            self.config.memory_limit = Some(usize::try_from(admitted_memory).unwrap_or(usize::MAX));
             self.cursor = Some(opened.cursor);
+            self.refresh_cache_share(resources)?;
             if self.delivered == 0 {
                 return Ok(first_page);
             }
             self.skipped = first_page.rows.len();
             if !crate::executor::bounded::cursor_replay_work_available() {
+                first_page.observation = first_page
+                    .observation
+                    .unpublished_groups_withdrawn()
+                    .map_err(read_error)?;
                 first_page.rows.clear();
                 first_page.has_more = true;
                 return Ok(first_page);
@@ -4171,13 +6685,17 @@ impl OwnerCursorContinuation {
                     ),
                     cancellation,
                 )
-                .map_err(|error| direct_error(&self.path, error))?
-                .page;
+                .map(ObservedCursorPage::from)
+                .map_err(|error| direct_error(&self.path, error))?;
             self.skipped += page.rows.len();
             if !page.has_more && self.skipped < self.delivered {
                 return Err(Error::ReadFailure(owner_disconnected()));
             }
             if !crate::executor::bounded::cursor_replay_work_available() {
+                page.observation = page
+                    .observation
+                    .unpublished_groups_withdrawn()
+                    .map_err(read_error)?;
                 page.rows.clear();
                 page.has_more = true;
                 return Ok(page);
@@ -4190,19 +6708,63 @@ impl OwnerCursorContinuation {
                 rows.or_else(|| NonZeroUsize::new(self.config.limits.cursor_page_rows as usize)),
                 cancellation,
             )
-            .map(|page| page.page)
+            .map(ObservedCursorPage::from)
             .map_err(|error| direct_error(&self.path, error))
     }
 }
 
 impl OwnerCursorExecution {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn merge_replay_groups(
+        &self,
+        mut observation: crate::executor::CursorObservation,
+    ) -> Result<crate::executor::CursorObservation> {
+        let groups = &observation.trace.groups;
+        if groups.len() != self.owner_groups.groups.len()
+            || groups
+                .iter()
+                .zip(self.owner_groups.ordinals.iter())
+                .any(|(group, prior)| group.ordinal != *prior)
+        {
+            return Err(Error::ReadFailure(
+                contextdb_core::read_contract::ReadFailure::new(
+                    contextdb_core::read_contract::ReadFailureKind::InvalidChannelData,
+                    contextdb_core::read_contract::ReadFailureDetail::None,
+                )
+                .expect("invalid replay group sequence accepts empty detail"),
+            ));
+        }
+        for (replayed, owner) in groups.iter().zip(self.owner_groups.groups.iter()) {
+            replayed
+                .examined_entries
+                .checked_add(owner.examined_entries)
+                .ok_or_else(|| Error::Other("group examined counter overflow".into()))?;
+        }
+        // The existing kernel observation credit owns the outward trace copy.
+        for (replayed, owner) in Arc::make_mut(&mut observation.trace)
+            .groups
+            .iter_mut()
+            .zip(self.owner_groups.groups.iter())
+        {
+            replayed.examined_entries += owner.examined_entries;
+        }
+        Ok(observation)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn fetch_continuation(
         &mut self,
         rows: Option<NonZeroUsize>,
         cancellation: &OwnerReadCancellation,
         started_ms: u64,
-    ) -> Result<CursorPage> {
-        crate::executor::bounded::with_cursor_replay_budget(
+    ) -> Result<ObservedCursorPage> {
+        let fetched = crate::executor::bounded::with_cursor_replay_budget(
             self.limits,
             Arc::clone(&self.clock),
             started_ms,
@@ -4212,9 +6774,48 @@ impl OwnerCursorExecution {
                 self.continuation
                     .as_mut()
                     .unwrap()
-                    .fetch(rows, cancellation)
+                    .fetch(rows, cancellation, &self.resources)
             },
-        )
+        );
+        if fetched.is_err() {
+            let failed = self
+                .continuation
+                .as_mut()
+                .unwrap()
+                .failed_open_observation
+                .take();
+            if let Some(observation) = failed {
+                // Alignment is checked before merging or updating the durable
+                // replay baseline. The failed open published no rows.
+                let mut observation = self.merge_replay_groups(observation)?;
+                for (baseline, merged) in self
+                    .owner_groups
+                    .groups
+                    .iter_mut()
+                    .zip(observation.trace.groups.iter())
+                {
+                    baseline.examined_entries = merged.examined_entries;
+                }
+                observation.rows_examined = self
+                    .owner_rows_examined
+                    .checked_add(self.continuation.as_ref().unwrap().discarded_rows_examined)
+                    .ok_or_else(|| Error::Other("cursor rows-examined counter overflow".into()))?;
+                // Move the admitted carrier to the outer observation path;
+                // its charge survives terminal resource release.
+                self.cancelled_observation = Some(observation);
+            }
+        }
+        fetched.and_then(|mut page| {
+            page.observation = self.merge_replay_groups(page.observation)?;
+            page.observation.rows_examined = self
+                .owner_rows_examined
+                .checked_add(self.continuation.as_ref().unwrap().discarded_rows_examined)
+                .and_then(|total| total.checked_add(page.observation.rows_examined))
+                .ok_or_else(|| {
+                    Error::Other(("cursor rows-examined counter overflow".to_string()).into())
+                })?;
+            Ok(page)
+        })
     }
 
     fn release_local_cursor_slot(&mut self) {
@@ -4226,13 +6827,13 @@ impl OwnerCursorExecution {
         self.resources
             .active_cursors
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        if let Some(watcher) = self
+        let watcher = self
             .expiry_waker
             .lock()
             .expect("cursor expiry watcher")
-            .as_ref()
-        {
-            watcher.unpark();
+            .take();
+        if let Some(watcher) = watcher {
+            watcher.retire();
         }
     }
 
@@ -4287,6 +6888,10 @@ impl OwnerCursorExecution {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn ask(
         &self,
         request: crate::local_transport::LocalRequest,
@@ -4295,22 +6900,86 @@ impl OwnerCursorExecution {
         let ReadSessionState::OwnerChannel(owner) = self.session.as_ref() else {
             return Err(Error::ReadFailure(owner_not_running()));
         };
-        owner.ask(
+        let cursor_memory = matches!(
+            request,
+            crate::local_transport::LocalRequest::CursorFetch { .. }
+        )
+        .then(|| cursor_receive_allowance(self.limits.memory, &self.retained_memory));
+        owner.ask_with_cursor_memory(
             self.limits,
             request,
             cancellation,
-            #[cfg(feature = "test-seams")]
+            cursor_memory,
+            Some(self.retained_owner.clone()),
+            #[cfg(any(test, feature = "test-seams"))]
             self.observer.as_ref(),
         )
     }
 }
 
 impl OwnedCursorExecution for OwnerCursorExecution {
+    #[cfg(any(test, feature = "test-seams"))]
+    fn continued_file_limits_for_test(&self) -> Option<(Option<usize>, ReadLimits)> {
+        self.continuation
+            .as_ref()
+            .filter(|continuation| continuation.cursor.is_some())
+            .map(|continuation| (continuation.config.memory_limit, continuation.config.limits))
+    }
+
+    fn refuse_expiry_watch(&mut self, error: Error) {
+        if self.closed {
+            return;
+        }
+        self.expiry_failure = Some(error);
+        self.release_local_cursor_slot();
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn work_observation(&mut self) -> Result<Option<crate::executor::CursorObservation>> {
+        if let Some(observation) = self.cancelled_observation.take() {
+            return Ok(Some(observation));
+        }
+        if let Some(continuation) = self.continuation.as_ref()
+            && let Some(cursor) = &continuation.cursor
+        {
+            let observation = cursor
+                .work_observation()
+                .map_err(|error| direct_error(&continuation.path, error))?;
+            return observation
+                .map(|observation| {
+                    let mut observation = self.merge_replay_groups(observation)?;
+                    observation.rows_examined = self
+                        .owner_rows_examined
+                        .checked_add(continuation.discarded_rows_examined)
+                        .and_then(|total| total.checked_add(observation.rows_examined))
+                        .ok_or_else(|| {
+                            Error::Other("cursor rows-examined counter overflow".into())
+                        })?;
+                    Ok(observation)
+                })
+                .transpose();
+        }
+        Ok(None)
+    }
+    fn take_work_trace_charge(&mut self) -> Option<Arc<OwnerTraceCharge>> {
+        self.cancelled_trace_charge.take()
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn fetch(
         &mut self,
         rows: Option<NonZeroUsize>,
         cancellation: &OwnerReadCancellation,
-    ) -> Result<CursorPage> {
+    ) -> Result<ObservedCursorPage> {
+        if let Some(error) = self.expiry_failure.take() {
+            return Err(error);
+        }
         let now = self.clock.now_ms();
         self.expire_if_due(now);
         if let Some(expiry) = self.expired {
@@ -4318,6 +6987,7 @@ impl OwnedCursorExecution for OwnerCursorExecution {
                 contextdb_core::read_contract::ReadFailure::cursor_expired(expiry),
             ));
         }
+        let public_carrier = OwnedCursorPage::try_prepare_public(self.retained_owner.clone())?;
         if self
             .continuation
             .as_ref()
@@ -4332,7 +7002,10 @@ impl OwnedCursorExecution for OwnerCursorExecution {
             } else if page.as_ref().is_err_and(Self::failure_ends_cursor) {
                 self.release_local_cursor_slot();
             }
-            return page;
+            return page.map(|mut page| {
+                page.page.attach_publication(public_carrier);
+                page
+            });
         }
         let wire_rows = rows.map(|rows| {
             std::num::NonZeroU64::new(u64::try_from(rows.get()).unwrap_or(u64::MAX))
@@ -4350,7 +7023,9 @@ impl OwnedCursorExecution for OwnerCursorExecution {
                 published_cursor_page(
                     responses,
                     self.limits,
-                    #[cfg(feature = "test-seams")]
+                    &self.retained_memory,
+                    &self.retained_owner,
+                    #[cfg(any(test, feature = "test-seams"))]
                     self.observer.as_ref(),
                 )
             });
@@ -4368,6 +7043,45 @@ impl OwnedCursorExecution for OwnerCursorExecution {
             page => (page, true),
         };
         if let Ok(page) = &page {
+            if self
+                .continuation
+                .as_ref()
+                .is_none_or(|continuation| continuation.cursor.is_none())
+            {
+                self.owner_groups = match OwnerGroupBaseline::capture(
+                    &page.observation.trace,
+                    &self.retained_memory,
+                ) {
+                    Ok(groups) => groups,
+                    Err(error) => {
+                        self.release_local_cursor_slot();
+                        if owner_cursor_may_be_live {
+                            let _ = self.ask(
+                                crate::local_transport::LocalRequest::CursorClose {
+                                    cursor_id: self.cursor_id,
+                                },
+                                None,
+                            );
+                        }
+                        return Err(error);
+                    }
+                };
+            }
+            if page.cancelled {
+                self.owner_rows_examined = page.observation.rows_examined;
+                self.cancelled_observation = Some(page.observation.clone());
+                self.cancelled_trace_charge = page.owner_trace_charge.clone();
+                return Err(Error::ReadCancelled);
+            }
+            self.cancelled_observation = None;
+            self.cancelled_trace_charge = None;
+            if self
+                .continuation
+                .as_ref()
+                .is_none_or(|continuation| continuation.cursor.is_none())
+            {
+                self.owner_rows_examined = page.observation.rows_examined;
+            }
             self.last_used_ms = self.clock.now_ms();
             if let Some(continuation) = &mut self.continuation
                 && continuation.cursor.is_none()
@@ -4391,7 +7105,10 @@ impl OwnedCursorExecution for OwnerCursorExecution {
                 );
             }
         }
-        page
+        page.map(|mut page| {
+            page.page.attach_publication(public_carrier);
+            page
+        })
     }
 
     fn close(&mut self) -> Result<()> {
@@ -4440,15 +7157,10 @@ impl OwnedCursorExecution for OwnerCursorExecution {
     ) -> Option<(
         Arc<dyn contextdb_core::read_contract::DeadlineClock>,
         u64,
-        Arc<Mutex<Option<std::thread::Thread>>>,
+        OwnerExpirySlot,
     )> {
-        self.expiry_deadline_ms().map(|deadline| {
-            (
-                Arc::clone(&self.clock),
-                deadline,
-                Arc::clone(&self.expiry_waker),
-            )
-        })
+        self.expiry_deadline_ms()
+            .map(|deadline| (Arc::clone(&self.clock), deadline, self.expiry_waker.clone()))
     }
 
     fn expire_from_watch(&mut self, now: u64) {
@@ -4458,33 +7170,41 @@ impl OwnedCursorExecution for OwnerCursorExecution {
 
 struct PublishedOwnerCursor {
     cursor_id: [u8; 16],
-    first_page: CursorPage,
+    first_page: OwnedCursorPage,
+    observation: crate::executor::CursorObservation,
+    owner_trace_charge: Arc<OwnerTraceCharge>,
     snapshot: Option<redb::StorageSnapshotIdentity>,
     physical_identity: Option<(u64, u64)>,
     limits: ReadLimits,
 }
 
 /// The identity and first page the owner published when it opened a cursor.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn published_cursor_open(
     responses: Vec<crate::local_transport::LocalResponse>,
     limits: ReadLimits,
-    #[cfg(feature = "test-seams")] observer: Option<&Arc<dyn ReadSessionTestObserver>>,
+    retained_memory: &crate::read_image_memory::ImageMemoryHandle,
+    retained_owner: &contextdb_core::read_memory::ReadMemoryOwner,
+    #[cfg(any(test, feature = "test-seams"))] observer: Option<&Arc<dyn ReadSessionTestObserver>>,
 ) -> Result<PublishedOwnerCursor> {
     for response in responses {
         match response {
             crate::local_transport::LocalResponse::CursorOpened { opened } => {
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 let replacement = observer
                     .and_then(|observer| observer.cursor_open_payload_for_test(&opened.payload));
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 let payload = replacement.as_deref().unwrap_or(&opened.payload);
-                #[cfg(not(feature = "test-seams"))]
+                #[cfg(not(any(test, feature = "test-seams")))]
                 let payload = &opened.payload;
-                let page = crate::read_contract::decode_cursor_page_under_memory_ceiling(
-                    payload,
-                    limits.memory,
-                )
-                .map_err(read_encoding_error)?;
+                let limits =
+                    ReadLimits::stricter_of(limits, opened.effective_limits.unwrap_or(limits))
+                        .map_err(|error| Error::Other((error.to_string()).into()))?;
+                let page =
+                    decode_observed_page(payload, limits.memory, retained_memory, retained_owner)?;
                 let snapshot = opened.storage_snapshot.map(|(transaction_id, root)| {
                     redb::StorageSnapshotIdentity {
                         transaction_id,
@@ -4497,12 +7217,13 @@ fn published_cursor_open(
                         }),
                     }
                 });
-                let limits =
-                    ReadLimits::stricter_of(limits, opened.effective_limits.unwrap_or(limits))
-                        .map_err(|error| Error::Other(error.to_string()))?;
                 return Ok(PublishedOwnerCursor {
                     cursor_id: opened.cursor_id,
-                    first_page: page,
+                    first_page: page.page,
+                    observation: page.observation,
+                    owner_trace_charge: page
+                        .owner_trace_charge
+                        .expect("owner page retains its trace charge"),
                     snapshot,
                     physical_identity: opened.physical_identity,
                     limits,
@@ -4518,26 +7239,48 @@ fn published_cursor_open(
 }
 
 /// One page the owner published for a cursor it is holding.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn published_cursor_page(
     responses: Vec<crate::local_transport::LocalResponse>,
     limits: ReadLimits,
-    #[cfg(feature = "test-seams")] observer: Option<&Arc<dyn ReadSessionTestObserver>>,
-) -> Result<CursorPage> {
+    retained_memory: &crate::read_image_memory::ImageMemoryHandle,
+    retained_owner: &contextdb_core::read_memory::ReadMemoryOwner,
+    #[cfg(any(test, feature = "test-seams"))] observer: Option<&Arc<dyn ReadSessionTestObserver>>,
+) -> Result<ObservedCursorPage> {
     for response in responses {
         match response {
+            crate::local_transport::LocalResponse::CursorCancelled { page } => {
+                let mut observed = decode_observed_page(
+                    &page.payload,
+                    limits.memory,
+                    retained_memory,
+                    retained_owner,
+                )?;
+                if !observed.rows.is_empty() {
+                    return Err(Error::Other(
+                        "cancelled cursor observation contains rows".into(),
+                    ));
+                }
+                observed.cancelled = true;
+                return Ok(observed);
+            }
             crate::local_transport::LocalResponse::CursorPage { page } => {
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 let replacement = observer
                     .and_then(|observer| observer.cursor_fetch_payload_for_test(&page.payload));
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 let payload = replacement.as_deref().unwrap_or(&page.payload);
-                #[cfg(not(feature = "test-seams"))]
+                #[cfg(not(any(test, feature = "test-seams")))]
                 let payload = &page.payload;
-                return crate::read_contract::decode_cursor_page_under_memory_ceiling(
+                return decode_observed_page(
                     payload,
                     limits.memory,
-                )
-                .map_err(read_encoding_error);
+                    retained_memory,
+                    retained_owner,
+                );
             }
             crate::local_transport::LocalResponse::Failure { failure } => {
                 return Err(Error::ReadFailure(failure));
@@ -4551,23 +7294,81 @@ fn published_cursor_page(
 type CursorExpiryWatch = (
     Arc<dyn contextdb_core::read_contract::DeadlineClock>,
     u64,
-    Arc<Mutex<Option<std::thread::Thread>>>,
+    OwnerExpirySlot,
 );
 
+struct CursorConstructionCount<'a> {
+    resources: &'a RouteResources,
+    owned: bool,
+}
+impl<'a> CursorConstructionCount<'a> {
+    fn new(resources: &'a RouteResources, owned: bool) -> Self {
+        if owned {
+            resources
+                .active_cursors
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        Self { resources, owned }
+    }
+    fn transfer_to_cursor(&mut self) {
+        self.owned = false;
+    }
+}
+impl Drop for CursorConstructionCount<'_> {
+    fn drop(&mut self) {
+        if self.owned {
+            self.resources
+                .active_cursors
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
 trait OwnedCursorExecution: Send {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
+    fn continued_file_limits_for_test(&self) -> Option<(Option<usize>, ReadLimits)> {
+        None
+    }
+
+    fn take_work_trace_charge(&mut self) -> Option<Arc<OwnerTraceCharge>> {
+        None
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn work_observation(&mut self) -> Result<Option<crate::executor::CursorObservation>> {
+        Ok(None)
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn file_resource_witness_for_test(
         &self,
     ) -> Result<Option<crate::direct_file_reader::DirectCursorResourceWitness>> {
         Ok(None)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn fetch(
         &mut self,
         rows: Option<NonZeroUsize>,
         cancellation: &OwnerReadCancellation,
-    ) -> Result<CursorPage>;
+    ) -> Result<ObservedCursorPage>;
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn close(&mut self) -> Result<()>;
 
     /// Whether the suspended read behind this cursor is still there.
@@ -4578,74 +7379,216 @@ trait OwnedCursorExecution: Send {
     }
 
     fn expire_from_watch(&mut self, _now: u64) {}
+    fn refuse_expiry_watch(&mut self, _error: Error) {
+        let _ = self.close();
+    }
 }
 
-/// A cursor's deadline remains active even when its caller keeps the object
-/// but never fetches again. The watcher owns no cursor or page hold; it wakes
-/// on the declared clock, then closes the retained root under the same cursor
-/// mutex as a foreground fetch. Closing a cursor unparks it immediately.
-fn start_owner_cursor_expiry_watch(state: &Arc<SuspendedReadCursorState>) {
-    struct WakeThread(std::thread::Thread);
-    impl std::task::Wake for WakeThread {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
-        fn wake_by_ref(self: &Arc<Self>) {
-            self.0.unpark();
+/// Concrete owner-channel expiry callback on the session's existing clock.
+/// Driver custody belongs to the public handles, outside the suspended
+/// state this callback upgrades, so expiry cannot self-join its worker.
+struct OwnerCursorExpiryWatch {
+    execution: std::sync::Weak<SuspendedReadCursorState>,
+    clock: Arc<dyn DeadlineClock>,
+    wait: Mutex<
+        Option<(
+            u64,
+            contextdb_core::read_memory::ReadOwnedFuture<'static, Result<()>>,
+        )>,
+    >,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+}
+
+type OwnerExpirySlot = contextdb_core::read_memory::ReadShared<
+    Mutex<Option<contextdb_core::read_memory::ReadShared<OwnerCursorExpiryWatch>>>,
+>;
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn owner_expiry_shared<T>(
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+    value: T,
+) -> Result<contextdb_core::read_memory::ReadShared<T>> {
+    use contextdb_core::read_memory::{ReadCredit, ReadShared};
+    let invoice = ReadCredit::try_new_owned(
+        owner,
+        ReadShared::<T>::layout().size(),
+        "reader",
+        "owner_cursor_expiry_control",
+        "Raise the reader memory limit.",
+    )?;
+    ReadShared::try_from_prepaid(value, invoice)
+}
+
+impl OwnerCursorExpiryWatch {
+    fn retire(&self) {
+        let wait = self.wait.lock().unwrap_or_else(|p| p.into_inner()).take();
+        drop(wait);
+    }
+    fn refuse(&self, error: Error) {
+        if let Some(state) = self.execution.upgrade() {
+            state
+                .execution
+                .lock()
+                .expect("read cursor state")
+                .refuse_expiry_watch(error);
         }
     }
+    fn drive(watch: &contextdb_core::read_memory::ReadShared<Self>) {
+        use std::future::Future;
+        use std::task::Poll;
+        let this = &**watch;
+        let Some(state) = this.execution.upgrade() else {
+            this.retire();
+            return;
+        };
+        let Ok(mut execution) = state.execution.try_lock() else {
+            return;
+        };
+        let was_live = execution.is_live();
+        execution.expire_from_watch(this.clock.now_ms());
+        #[cfg(any(test, feature = "test-seams"))]
+        if was_live
+            && !execution.is_live()
+            && let Some(observer) = state.observer.as_ref()
+        {
+            observer.observe_event(ReadSessionEvent::OwnerCursorExpiryReleased);
+        }
+        #[cfg(not(any(test, feature = "test-seams")))]
+        let _ = was_live;
+        let Some((_, deadline, _)) = execution.expiry_watch() else {
+            return;
+        };
+        drop(execution);
+        let Ok(mut wait) = this.wait.try_lock() else {
+            return;
+        };
+        if wait.as_ref().is_none_or(|(armed, _)| *armed != deadline) {
+            match this.arm(deadline) {
+                Ok(armed) => *wait = Some((deadline, armed)),
+                Err(error) => {
+                    drop(wait);
+                    this.refuse(error);
+                    return;
+                }
+            }
+        }
+        let wake =
+            match owner_expiry_shared(this.owner.clone(), OwnerCursorExpiryWake(watch.clone())) {
+                Ok(wake) => wake,
+                Err(error) => {
+                    drop(wait);
+                    this.refuse(error);
+                    return;
+                }
+            };
+        let waker = wake.into_read_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        for attempt in 0..2 {
+            let outcome =
+                std::pin::Pin::new(&mut wait.as_mut().expect("armed owner expiry").1).poll(&mut cx);
+            match outcome {
+                Poll::Pending => return,
+                Poll::Ready(Err(error)) => {
+                    let completed = wait.take();
+                    drop(wait);
+                    drop(completed);
+                    this.refuse(error);
+                    return;
+                }
+                Poll::Ready(Ok(())) if this.clock.now_ms() >= deadline => {
+                    let completed = wait.take();
+                    drop(wait);
+                    drop(completed);
+                    Self::drive(watch);
+                    return;
+                }
+                Poll::Ready(Ok(())) if attempt == 0 => match this.arm(deadline) {
+                    Ok(armed) => *wait = Some((deadline, armed)),
+                    Err(error) => {
+                        drop(wait);
+                        this.refuse(error);
+                        return;
+                    }
+                },
+                Poll::Ready(Ok(())) => {
+                    let completed = wait.take();
+                    drop(wait);
+                    drop(completed);
+                    this.refuse(Error::NativeEngineOther(
+                        contextdb_core::read_memory::NativeRefusal::Other(
+                            "cursor deadline timer could not be armed",
+                        ),
+                    ));
+                    return;
+                }
+            }
+        }
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn arm(
+        &self,
+        deadline: u64,
+    ) -> Result<contextdb_core::read_memory::ReadOwnedFuture<'static, Result<()>>> {
+        let clock = self.clock.clone();
+        let owner = self.owner.clone();
+        contextdb_core::read_memory::ReadOwnedFuture::try_new_with(owner.clone(), || {
+            Ok(async move {
+                crate::local_transport::wait_until_owned(clock.as_ref(), deadline, &owner)?.await;
+                Ok(())
+            })
+        })
+    }
+}
+struct OwnerCursorExpiryWake(contextdb_core::read_memory::ReadShared<OwnerCursorExpiryWatch>);
+impl contextdb_core::read_memory::NativeReadWake for OwnerCursorExpiryWake {
+    fn wake_read(&self) {
+        OwnerCursorExpiryWatch::drive(&self.0);
+    }
+}
 
-    let Some((clock, mut deadline, waker_slot)) = state
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn start_owner_cursor_expiry_watch(
+    state: &Arc<SuspendedReadCursorState>,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+) -> Result<()> {
+    let execution = state.execution.lock().expect("read cursor state");
+    let Some((clock, _, slot)) = execution.expiry_watch() else {
+        return Ok(());
+    };
+    drop(execution);
+    let watch = owner_expiry_shared(
+        owner.clone(),
+        OwnerCursorExpiryWatch {
+            execution: Arc::downgrade(state),
+            clock,
+            wait: Mutex::new(None),
+            owner,
+        },
+    )?;
+    *slot.lock().expect("cursor expiry watcher") = Some(watch.clone());
+    OwnerCursorExpiryWatch::drive(&watch);
+    Ok(())
+}
+
+fn drive_owner_cursor_expiry(state: &Arc<SuspendedReadCursorState>) {
+    let watch = state
         .execution
         .lock()
         .expect("read cursor state")
         .expiry_watch()
-    else {
-        return;
-    };
-    let weak = Arc::downgrade(state);
-    std::thread::Builder::new()
-        .name("contextdb-cursor-expiry".to_owned())
-        .spawn(move || {
-            *waker_slot.lock().expect("cursor expiry watcher") = Some(std::thread::current());
-            let waker = std::task::Waker::from(Arc::new(WakeThread(std::thread::current())));
-            let mut context = std::task::Context::from_waker(&waker);
-            loop {
-                let mut wait = clock.wait_until(deadline);
-                loop {
-                    if wait.as_mut().poll(&mut context).is_ready() {
-                        break;
-                    }
-                    std::thread::park();
-                    let Some(state) = weak.upgrade() else {
-                        return;
-                    };
-                    if !state.execution.lock().expect("read cursor state").is_live() {
-                        return;
-                    }
-                }
-                let Some(state) = weak.upgrade() else {
-                    return;
-                };
-                let mut execution = state.execution.lock().expect("read cursor state");
-                let was_live = execution.is_live();
-                execution.expire_from_watch(clock.now_ms());
-                #[cfg(feature = "test-seams")]
-                if was_live
-                    && !execution.is_live()
-                    && let Some(observer) = state.observer.as_ref()
-                {
-                    observer.observe_event(ReadSessionEvent::OwnerCursorExpiryReleased);
-                }
-                #[cfg(not(feature = "test-seams"))]
-                let _ = was_live;
-                let Some((_, next_deadline, _)) = execution.expiry_watch() else {
-                    return;
-                };
-                deadline = next_deadline;
-            }
-        })
-        .expect("start cursor expiry watcher");
+        .and_then(|(_, _, slot)| slot.lock().expect("cursor expiry watcher").clone());
+    if let Some(watch) = watch {
+        OwnerCursorExpiryWatch::drive(&watch);
+    }
 }
 
 impl Drop for OwnerCursorExecution {
@@ -4655,10 +7598,28 @@ impl Drop for OwnerCursorExecution {
 }
 
 impl ReadCursor {
+    /// Inspect the limits actually admitted by this cursor's lazy file reader.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn continued_file_limits_for_test(&self) -> Option<(Option<usize>, ReadLimits)> {
+        self.state
+            .execution
+            .lock()
+            .expect("read cursor state")
+            .continued_file_limits_for_test()
+    }
+
     /// Observe the existing file cursor's privately owned retention resources.
     /// A remote owner cursor has no locally inspectable file-resource witness.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn file_resource_witness_for_test(
         &self,
     ) -> Result<Option<crate::direct_file_reader::DirectCursorResourceWitness>> {
@@ -4679,17 +7640,55 @@ impl ReadCursor {
         &self.state.first_page
     }
 
+    /// The actual plan and cumulative source work at the latest successfully
+    /// published page. A failed fetch retains the preceding observation;
+    /// work from a cancelled kernel attempt is included by its next successful
+    /// page. Owner withdrawal continues counting actual file replay work too.
+    ///
+    /// ```no_run
+    /// # fn example() -> contextdb_core::Result<()> {
+    /// use contextdb_engine::ReadSession;
+    /// use std::collections::HashMap;
+    /// let session = ReadSession::open("store.db")?;
+    /// let mut cursor = session.open_cursor("SELECT * FROM items", &HashMap::new())?;
+    /// println!("{}: {}", cursor.trace().physical_plan, cursor.rows_examined());
+    /// while cursor.first_page().has_more() && cursor.is_live() {
+    ///     let page = cursor.fetch(None)?;
+    ///     println!("examined {}", cursor.trace().rows_examined);
+    ///     if !page.has_more() { break; }
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub fn trace(&self) -> &crate::QueryTrace {
+        &self.trace
+    }
+
+    /// Cumulative rows, index entries and adjacency entries actually examined
+    /// through the latest successful page; this is not the number of emitted rows.
+    pub fn rows_examined(&self) -> u64 {
+        self.trace.rows_examined
+    }
+
     /// Fetch a cursor page with a fresh cancellation token.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn fetch(&mut self, rows: Option<NonZeroUsize>) -> Result<CursorPage> {
         self.fetch_with_cancellation(rows, &OwnerReadCancellation::new())
     }
 
     /// Fetch a cursor page using the caller's cancellation token.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn fetch_with_cancellation(
         &mut self,
         rows: Option<NonZeroUsize>,
         cancellation: &OwnerReadCancellation,
     ) -> Result<CursorPage> {
+        let _native_selection = crate::database::vector_ivf::ReadOnlySelection::enter();
         let resources = Arc::clone(&self.state.resources);
         let progress = self.state.progress.as_ref().map(Arc::clone);
         contextdb_core::find_attribution::begin("cursor fetch");
@@ -4697,9 +7696,14 @@ impl ReadCursor {
             with_route_source_counter(&resources, || self.fetch_within_route(rows, cancellation))
         });
         contextdb_core::find_attribution::finish();
+        drive_owner_cursor_expiry(&self.state);
         fetched
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn fetch_within_route(
         &mut self,
         rows: Option<NonZeroUsize>,
@@ -4707,13 +7711,42 @@ impl ReadCursor {
     ) -> Result<CursorPage> {
         let mut execution = self.state.execution.lock().expect("read cursor state");
         let _ = &self.state.session;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let _ = (&self.state.observer, &self.state.kernel_observer);
         let fetched = execution.fetch(rows, cancellation);
+        if fetched.is_err()
+            && let Ok(Some(observation)) = execution.work_observation()
+        {
+            let observation = observation
+                .unpublished_groups_withdrawn()
+                .map_err(read_error)?;
+            (self.trace, self.observation) = take_cursor_observation(observation);
+            if let Some(charge) = execution.take_work_trace_charge() {
+                self.owner_trace_charge = Some(charge);
+            }
+        }
         if fetched.is_err() && !execution.is_live() {
             let _ = execution.close();
         }
-        fetched
+        fetched.and_then(|page| {
+            // The owner answers a later exhausted fetch with its empty sentinel.
+            // It contains no new execution and cannot replace the last trace.
+            if !(page.columns.is_empty() && page.rows.is_empty() && !page.has_more) {
+                let rows_examined = page.observation.rows_examined;
+                if self
+                    .observation
+                    .as_ref()
+                    .is_none_or(|prior| !Arc::ptr_eq(&prior.trace, &page.observation.trace))
+                {
+                    (self.trace, self.observation) = take_cursor_observation(page.observation);
+                    self.owner_trace_charge = page.owner_trace_charge;
+                } else {
+                    self.observation = Some(page.observation);
+                }
+                self.trace.rows_examined = rows_examined;
+            }
+            page.page.into_public()
+        })
     }
 
     /// Whether this cursor still holds the read it was opened with.
@@ -4726,14 +7759,23 @@ impl ReadCursor {
     /// `.cursor open` while every fetch and close says the cursor is gone,
     /// which leaves the session with no cursor and no way to get one.
     pub fn is_live(&self) -> bool {
-        self.state
+        let live = self
+            .state
             .execution
             .lock()
             .expect("read cursor state")
-            .is_live()
+            .is_live();
+        // A deadline wake racing this short observation defers on its mutex.
+        // Retry after releasing it, just as the foreground fetch does.
+        drive_owner_cursor_expiry(&self.state);
+        live
     }
 
     /// Release the cursor's snapshot and route resources.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn close(self) -> Result<()> {
         self.state
             .execution
@@ -4742,13 +7784,13 @@ impl ReadCursor {
             .close()
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn retained_state_owners_for_test(&self) -> usize {
         Arc::strong_count(&self.state)
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn retained_session_owners_for_test(&self) -> usize {
         Arc::strong_count(&self.state.session)
@@ -4756,7 +7798,7 @@ impl ReadCursor {
 }
 
 /// Test-only controls consumed by the owner service once it is assembled.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct OwnerReadTestHooks {
@@ -4779,12 +7821,16 @@ pub struct OwnerReadTestHooks {
     pub quiescent_stop: Option<Arc<dyn Fn(QuiescentStopPhase) + Send + Sync>>,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QuiescentStopPhase {
     WritesStopped,
     Published,
+    /// The owner refuses new work; its channel stays published while the
+    /// work it already admitted drains.
+    AdmissionStopped,
+    /// The drained owner removed the channel it created.
     ChannelWithdrawn,
     AcceptedDrained,
 }
@@ -4799,5 +7845,86 @@ pub(crate) fn owner_read_not_implemented_status() -> OwnerReadStatus {
                 "owner reads are not implemented".to_owned(),
             ),
         ),
+    }
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+impl ReadSession {
+    #[cfg(all(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
+    pub(crate) fn with_direct_file_physical_context_for_test<T>(
+        &self,
+        action: impl FnOnce(
+            &Database,
+            &crate::vector_read_memory::DeclaredReadRoot,
+            Option<(usize, usize, u64)>,
+        ) -> Result<T>,
+    ) -> Result<T> {
+        let state = self.selected_state();
+        let ReadSessionState::DirectFile(reader) = state.as_ref() else {
+            return Err(Error::PlanError(
+                "physical fixture requires the direct-file route".into(),
+            ));
+        };
+        let target = reader.execution_target();
+        action(
+            target.resident_history_database_for_test()?,
+            reader.original_parent_for_physical_test(),
+            reader.original_image_payer_for_physical_test(),
+        )
+    }
+
+    /// Use the Database already installed behind this session's execution
+    /// target, preserving its captured root and fallible history capability.
+    #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
+    pub fn __with_resident_history_for_test<T>(
+        &self,
+        operation: impl FnOnce(&Database) -> Result<T>,
+    ) -> Result<T> {
+        match self.selected_state().as_ref() {
+            ReadSessionState::LiveDatabase(database) => operation(database.as_ref()),
+            ReadSessionState::DirectFile(reader) => {
+                let target = reader.execution_target();
+                operation(target.resident_history_database_for_test()?)
+            }
+            ReadSessionState::OwnerChannel(_) => Err(Error::PlanError(
+                "owner-channel session has no local installed history database".into(),
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "test-seams")]
+impl ReadSession {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn native_ivf_verification_window_for_test(&self) -> Result<u64> {
+        match self.selected_state().as_ref() {
+            ReadSessionState::LiveDatabase(database) => {
+                database.native_ivf_verification_window_for_test()
+            }
+            ReadSessionState::DirectFile(reader) => reader
+                .execution_target()
+                .resident_history_database_for_test()?
+                .native_ivf_verification_window_for_test(),
+            ReadSessionState::OwnerChannel(_) => Err(Error::Other(
+                "remote verification observations belong to the serving process".into(),
+            )),
+        }
     }
 }

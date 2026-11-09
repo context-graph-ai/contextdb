@@ -1,4 +1,5 @@
 //! The declared node-local selection travels on the ordinary purge plane.
+
 use super::*;
 use contextdb_parser::ast::{BinOp, ColumnRef, Expr, Literal, UnaryOp};
 
@@ -34,6 +35,10 @@ enum Scalar {
 }
 
 impl Predicate {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn capture(
         expr: &Expr,
         parameters: &HashMap<String, Value>,
@@ -105,12 +110,20 @@ impl Predicate {
             // replayed on other nodes, and inventing a wire shape for it here
             // would let a node replay something this one never proved it could
             // evaluate. Refused until it has one.
-            Expr::InSubquery { .. } | Expr::RowVectorSource { .. } | Expr::Row(_) => {
+            Expr::InSubquery { .. }
+            | Expr::RowVectorSource { .. }
+            | Expr::Row(_)
+            | Expr::RowNumber(_)
+            | Expr::WindowRank(_) => {
                 return Err(Error::SubqueryNotSupported);
             }
         })
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn expression(&self) -> Result<Expr> {
         Ok(match self {
             Self::Column(table, column) => Expr::Column(ColumnRef {
@@ -173,6 +186,10 @@ impl Predicate {
 }
 
 impl NodeLocalPredicate {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn capture(
         expr: Option<&Expr>,
         parameters: &HashMap<String, Value>,
@@ -189,6 +206,10 @@ impl NodeLocalPredicate {
         })
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
         RedbPersistence::decode_config_value(bytes)
     }
@@ -197,11 +218,19 @@ impl NodeLocalPredicate {
         format!("authoritative_purge_local_applied.v1.{}", self.id)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn select(
         &self,
         db: &Database,
         table: &str,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<AuthoritativePurgeSelection>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(meta) = db.table_meta(table) else {
             return Ok(Vec::new());
         };
@@ -216,7 +245,12 @@ impl NodeLocalPredicate {
             .map(Predicate::expression)
             .transpose()?;
         let rows = crate::executor::filter_rows_by_predicate(
-            db.scan(table, db.snapshot_for_read())?,
+            db.scan_with_read_memory(
+                table,
+                db.snapshot_for_read(),
+                vector_copy_owner,
+                read_memory.clone(),
+            )?,
             predicate.as_ref(),
             &self.parameters,
         )?;
@@ -224,7 +258,7 @@ impl NodeLocalPredicate {
             .map(|row| {
                 let key = natural_key_from_row_values(&meta, &row.values)
                     .ok_or_else(|| Error::NotSyncEligible(table.into()))?;
-                db.resolve_authoritative_purge_selection(table, &key)
+                db.resolve_authoritative_purge_selection(table, &key, read_memory.clone())
             })
             .collect()
     }

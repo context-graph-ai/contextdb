@@ -30,14 +30,14 @@ fn seed_and_assert() {
         .unwrap();
     }
     let count = db.execute("SELECT COUNT(*) FROM t", &empty()).unwrap();
-    assert_eq!(count.rows, vec![vec![Value::Int64(ROWS)]]);
+    assert_eq!(count.rows(), vec![vec![Value::Int64(ROWS)]]);
     let result = db
         .execute(
             "SELECT bucket FROM t WHERE id = $id",
             &params(vec![("id", Value::Uuid(sampled_id.unwrap()))]),
         )
         .unwrap();
-    assert_eq!(result.rows, vec![vec![Value::Int64(SAMPLE)]]);
+    assert_eq!(result.rows(), vec![vec![Value::Int64(SAMPLE)]]);
 }
 
 fn timed_seed_and_assert() {
@@ -51,6 +51,10 @@ fn timed_seed_and_assert() {
 }
 
 fn bench_in_memory_100k_pk_inserts_sublinear(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function("in_memory_100k_pk_inserts_sublinear", |_| {});
+        return;
+    }
     seed_and_assert();
     c.bench_function("in_memory_100k_pk_inserts_sublinear", |b| {
         b.iter(timed_seed_and_assert)

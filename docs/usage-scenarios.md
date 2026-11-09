@@ -87,7 +87,7 @@ CREATE TABLE evidence (
 
 `ORDER BY vector_text <=> $query` and `ORDER BY vector_vision <=> $query`
 route to different `(table, column)` indexes, each with its own dimension,
-quantization, and HNSW state.
+quantization, and index state.
 
 ---
 

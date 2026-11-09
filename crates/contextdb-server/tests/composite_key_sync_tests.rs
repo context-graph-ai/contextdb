@@ -114,10 +114,10 @@ fn windows(db: &Database) -> Vec<(String, String, String, i64, i64)> {
         .expect("metric_windows scan");
     let idx = |name: &str| {
         result
-            .columns
+            .columns()
             .iter()
             .position(|column| column == name)
-            .unwrap_or_else(|| panic!("column {name} must be selected, got {:?}", result.columns))
+            .unwrap_or_else(|| panic!("column {name} must be selected, got {:?}", result.columns()))
     };
     let (machine, sensor, metric, window_start, value) = (
         idx("machine_id"),
@@ -135,7 +135,7 @@ fn windows(db: &Database) -> Vec<(String, String, String, i64, i64)> {
         other => panic!("expected an integer, got {other:?}"),
     };
     let mut rows: Vec<(String, String, String, i64, i64)> = result
-        .rows
+        .rows()
         .iter()
         .map(|row| {
             (
@@ -182,7 +182,8 @@ fn start_hub(broker: &InProcessBroker, ddl: &str) -> RunningHub {
             TenantId::from(TENANT),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -208,6 +209,7 @@ fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, _role: &str) -> Syn
         TenantId::from(TENANT),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 // ---------------------------------------------------------------------------

@@ -1,4 +1,3 @@
-#![allow(dead_code)] // Existing compatibility and test seam shape.
 use crate::memory_accounting::MemoryAccountant;
 use crate::sync_types::{DdlChange, NaturalKey, natural_key_from_row_values};
 use contextdb_core::{
@@ -64,8 +63,8 @@ pub(crate) struct PreparedVectorPartitionBinding {
     pub(crate) row: VersionedRow,
     /// The table declaration the key columns' types were read from, so the
     /// identity can be re-derived from this binding alone.
-    pub(crate) table_meta: TableMeta,
-    pub(crate) declaration: ColumnDef,
+    pub(crate) table_meta: Arc<TableMeta>,
+    pub(crate) declaration: usize,
     pub(crate) partition_key: VectorPartitionKey,
     pub(crate) vector_created_tx: contextdb_core::TxId,
     pub(crate) vector_lsn: Lsn,
@@ -84,7 +83,7 @@ pub(crate) enum PreparedVectorPartitionMutation {
     Insert {
         index: VectorIndexRef,
         after: PreparedVectorPartitionBinding,
-        entry: contextdb_core::VectorEntry,
+        entry: usize,
     },
     Move {
         index: VectorIndexRef,
@@ -100,15 +99,92 @@ pub(crate) enum PreparedVectorPartitionMutation {
 /// declarations needed by persistence.
 pub(crate) struct PreparedVectorPartitionMutationBatch {
     pub(crate) commit_lsn: Lsn,
+    // Private synchronous preparation keeps this exact write-set allocation immutable.
+    vector_source: (usize, usize),
     pub(crate) mutations: Vec<PreparedVectorPartitionMutation>,
     vector_publication: Option<PreparedPartitionedVectorBatch>,
+    deferred_publication: Option<DeferredVectorPublication>,
+    _deferred_copy_owner: Option<contextdb_vector::VectorCopyAdmission>,
     memberships: contextdb_relational::store::PreparedMembershipBatch,
     retention_expiries: Vec<contextdb_relational::store::PreparedRetentionExpiry>,
+    row_retirements: Vec<(String, crate::database::MemoryRowRetirement)>,
+    // The engine projection can outlive vector publication within apply.
+    // Keep its copied inputs funded until every projection payload is gone.
+    _vector_copy_owner: contextdb_vector::VectorCopyAdmission,
+    // Staged INSERT copies are write preparation, separate from source reads.
+    _insert_copy_owner: contextdb_vector::VectorCopyAdmission,
+}
+
+// The journal uses the immutable projection while these body-free inputs wait
+// for canonical proof scratch to be destroyed. Their containers remain funded
+// by the projection's original insert owner.
+pub(crate) struct DeferredVectorPublication {
+    deletes: Vec<PartitionedVectorDelete>,
+    inserts: Vec<PartitionedVectorEntry>,
+    moves: Vec<PartitionedVectorMove>,
+    reclaimable: HashSet<contextdb_vector::VectorPartitionRef>,
+}
+
+pub(crate) struct CompletedVectorPublication {
+    publication: Option<PreparedPartitionedVectorBatch>,
+    // Declared after the publication: backing drops before its copy credit.
+    owner: contextdb_vector::VectorCopyAdmission,
 }
 
 impl PreparedVectorPartitionMutationBatch {
+    pub(crate) fn take_deferred_publication(&mut self) -> Option<DeferredVectorPublication> {
+        self.deferred_publication.take()
+    }
+
+    pub(crate) fn install_publication(&mut self, completed: CompletedVectorPublication) {
+        self.vector_publication = completed.publication;
+        self._deferred_copy_owner = Some(completed.owner);
+    }
+
+    pub(crate) fn reclaimable_partitions(
+        &self,
+    ) -> impl Iterator<Item = &contextdb_vector::VectorPartitionRef> {
+        self.vector_publication
+            .iter()
+            .flat_map(|publication| publication.reclaimable_partitions())
+    }
     pub(crate) fn is_empty(&self) -> bool {
         self.mutations.is_empty()
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn resolve_insert<'w>(
+        &self,
+        ws: &'w WriteSet,
+        ordinal: usize,
+        index: &VectorIndexRef,
+        after: &PreparedVectorPartitionBinding,
+    ) -> Result<&'w contextdb_core::VectorEntry> {
+        if self.vector_source != (ws.vector_inserts.as_ptr() as usize, ws.vector_inserts.len())
+            || self.commit_lsn != ws.commit_lsn.unwrap_or(Lsn(0))
+        {
+            return Err(Error::Other(
+                "prepared vectors belong to a different immutable write set".into(),
+            ));
+        }
+        let entry = ws
+            .vector_inserts
+            .get(ordinal)
+            .ok_or_else(|| Error::Other("prepared vector ordinal is out of bounds".into()))?;
+        if entry.index != *index
+            || entry.row_id != after.row.row_id
+            || entry.created_tx != after.vector_created_tx
+            || entry.lsn != after.vector_lsn
+            || entry.deleted_tx.is_some()
+        {
+            return Err(Error::Other(
+                "prepared vector identity disagrees with its staged occurrence".into(),
+            ));
+        }
+        Ok(entry)
     }
 }
 
@@ -119,6 +195,10 @@ impl PreparedVectorPartitionMutationBatch {
 /// key and a predicate literal meet under the same `=` the row filter
 /// applies. A key value no component of the declared type is `=`-equal to
 /// is refused rather than stored as a partition no query can name.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn vector_partition_key_for_row(
     index: &VectorIndexRef,
     meta: &TableMeta,
@@ -365,7 +445,7 @@ pub(crate) fn build_received_schema_change_log_entries(
         entries.push(ChangeLogEntry::RowInsert {
             table: table.clone(),
             row_id: row.row_id,
-            lsn,
+            lsn: row.lsn,
         });
     }
     for (table, row_id, _) in &ws.relational_deletes {
@@ -397,7 +477,7 @@ pub(crate) fn build_received_schema_change_log_entries(
             source: entry.source,
             target: entry.target,
             edge_type: entry.edge_type.clone(),
-            lsn,
+            lsn: entry.lsn,
         });
     }
     for (source, edge_type, target, _) in &ws.adj_deletes {
@@ -424,49 +504,19 @@ pub(crate) fn build_received_schema_change_log_entries(
         entries.push(ChangeLogEntry::VectorInsert {
             index: entry.index.clone(),
             row_id: entry.row_id,
-            lsn,
+            lsn: entry.lsn,
         });
+    }
+    if entries.windows(2).any(|pair| pair[0].lsn() > pair[1].lsn()) {
+        entries.sort_by_key(ChangeLogEntry::lsn);
     }
     entries
 }
 
-/// Infallibly append an already-prepared log payload and its two derived
-/// indexes. Received-schema publication calls this after Redb succeeds,
-/// without replaying any data WriteSet into the stores a second time.
-pub(crate) fn publish_prepared_change_log_entries(
-    accountant: &MemoryAccountant,
-    change_log: &RwLock<Vec<ChangeLogEntry>>,
-    table_index: &RwLock<ChangeLogTableIndex>,
-    lsn_refcounts: &RwLock<ChangeLogLsnRefcounts>,
-    structurally_dropped_tables: &HashSet<String>,
-    entries: Vec<ChangeLogEntry>,
-) {
-    let mut table_index = table_index.write();
-    let mut lsn_refcounts = lsn_refcounts.write();
-    let mut change_log = change_log.write();
-    accountant.charge_retained(change_log_retained_bytes(&entries));
-    if !structurally_dropped_tables.is_empty() {
-        let before = change_log_retained_bytes(&change_log);
-        change_log.retain(|entry| match entry {
-            ChangeLogEntry::RowInsert { table, .. } | ChangeLogEntry::RowDelete { table, .. } => {
-                !structurally_dropped_tables.contains(table)
-            }
-            ChangeLogEntry::VectorInsert { index, .. }
-            | ChangeLogEntry::VectorDelete { index, .. } => {
-                !structurally_dropped_tables.contains(&index.table)
-            }
-            ChangeLogEntry::EdgeInsert { .. } | ChangeLogEntry::EdgeDelete { .. } => true,
-        });
-        accountant.release(before.saturating_sub(change_log_retained_bytes(&change_log)));
-        table_index.clear();
-        lsn_refcounts.clear();
-        record_change_log_entries(&mut table_index, &mut lsn_refcounts, &change_log);
-    }
-    record_change_log_entries(&mut table_index, &mut lsn_refcounts, &entries);
-    change_log.extend(entries);
-}
-
 pub struct CompositeStore {
+    private_working_graph: bool,
+    pub(crate) row_retirements: Arc<Mutex<crate::database::RetentionDeferredEdges>>,
+    pub(crate) memory_row_retirements: bool,
     pub(crate) local_erasure_stages: crate::database::discard::StageRegistry,
     pub(crate) received_arriving_table_meta: ReceivedArrivingTableMetaRegistry,
     pub relational: Arc<RelationalStore>,
@@ -477,8 +527,9 @@ pub struct CompositeStore {
     pub change_log_lsn_refcounts: Arc<RwLock<ChangeLogLsnRefcounts>>,
     pub ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
     vector_partition_snapshot_stages: VectorPartitionSnapshotStageRegistry,
-    accountant: Arc<MemoryAccountant>,
+    pub(crate) accountant: crate::memory_accounting::StoreAccountantHandle,
     apply_phase_pause: Arc<ApplyPhasePause>,
+    pub(crate) precommit_vector_root: Mutex<crate::persistence::WriterSnapshotWeak>,
 }
 
 #[derive(Debug, Default)]
@@ -545,7 +596,11 @@ impl ApplyPhasePause {
         }
     }
 
-    pub(crate) fn maybe_pause(&self) {
+    /// The same pause with no deadline: the paused operation continues only
+    /// when its test releases it. The test's guard releases on drop, so a
+    /// failing test still lets the operation finish.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) fn maybe_pause_until_released(&self) {
         let mut state = self.state.lock();
         if !state.armed || state.released {
             return;
@@ -554,6 +609,34 @@ impl ApplyPhasePause {
         self.waiters.notify_all();
         while state.armed && !state.released {
             self.waiters.wait(&mut state);
+        }
+        state.armed = false;
+        state.reached = false;
+        state.released = false;
+        self.waiters.notify_all();
+    }
+
+    pub(crate) fn maybe_pause(&self) {
+        let mut state = self.state.lock();
+        if !state.armed || state.released {
+            return;
+        }
+        state.reached = true;
+        self.waiters.notify_all();
+        // An armed pause is held by a test that releases it. If that test
+        // fails first -- often inside a thread scope that then joins this very
+        // thread -- nobody releases it, and the whole test binary would hang
+        // instead of reporting the failure. Far past any deliberate hold, the
+        // pause lets the paused operation continue.
+        const ABANDONED_PAUSE: std::time::Duration = std::time::Duration::from_secs(300);
+        let deadline = std::time::Instant::now() + ABANDONED_PAUSE;
+        while state.armed && !state.released {
+            if self.waiters.wait_until(&mut state, deadline).timed_out() {
+                eprintln!(
+                    "an armed test pause was never released; continuing after {ABANDONED_PAUSE:?}"
+                );
+                break;
+            }
         }
         state.armed = false;
         state.reached = false;
@@ -583,7 +666,7 @@ impl CompositeStore {
             change_log_lsn_refcounts,
             ddl_log,
             Arc::new(Mutex::new(HashMap::new())),
-            accountant,
+            crate::memory_accounting::AccountantHandle::from_host(accountant),
             Arc::new(ApplyPhasePause::new()),
         )
     }
@@ -598,10 +681,15 @@ impl CompositeStore {
         change_log_lsn_refcounts: Arc<RwLock<ChangeLogLsnRefcounts>>,
         ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
         vector_partition_snapshot_stages: VectorPartitionSnapshotStageRegistry,
-        accountant: Arc<MemoryAccountant>,
+        accountant: crate::memory_accounting::AccountantHandle,
         apply_phase_pause: Arc<ApplyPhasePause>,
     ) -> Self {
         Self {
+            private_working_graph: false,
+            row_retirements: Arc::new(Mutex::new(
+                crate::database::RetentionDeferredEdges::default(),
+            )),
+            memory_row_retirements: true,
             local_erasure_stages: Arc::new(Mutex::new(HashMap::new())),
             received_arriving_table_meta: Arc::new(Mutex::new(HashMap::new())),
             relational,
@@ -612,8 +700,9 @@ impl CompositeStore {
             change_log_lsn_refcounts,
             ddl_log,
             vector_partition_snapshot_stages,
-            accountant,
+            accountant: crate::memory_accounting::StoreAccountantHandle::new(accountant),
             apply_phase_pause,
+            precommit_vector_root: Mutex::new(crate::persistence::WriterSnapshotWeak::default()),
         }
     }
 
@@ -760,6 +849,10 @@ impl CompositeStore {
         NaturalKey::single("id".to_string(), Value::Int64(row_id.0 as i64))
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn vector_table_meta<'meta>(
         table_meta: &'meta HashMap<String, TableMeta>,
         index: &VectorIndexRef,
@@ -771,10 +864,14 @@ impl CompositeStore {
             })
     }
 
-    fn vector_declaration(
-        table_meta: &HashMap<String, TableMeta>,
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn vector_declaration<'m>(
+        table_meta: &'m HashMap<String, TableMeta>,
         index: &VectorIndexRef,
-    ) -> Result<ColumnDef> {
+    ) -> Result<&'m ColumnDef> {
         table_meta
             .get(&index.table)
             .and_then(|meta| {
@@ -783,16 +880,20 @@ impl CompositeStore {
                     .find(|column| column.name == index.column)
             })
             .filter(|column| matches!(&column.column_type, ColumnType::Vector(_)))
-            .cloned()
             .ok_or_else(|| Error::UnknownVectorIndex {
                 index: index.clone(),
             })
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn validate_registered_vector_declaration(
         &self,
         index: &VectorIndexRef,
         declaration: &ColumnDef,
+        _vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
     ) -> Result<()> {
         let expected =
             crate::database::vector_index_layout_from_column(declaration).ok_or_else(|| {
@@ -801,102 +902,263 @@ impl CompositeStore {
                     issue: VectorPartitionDeclarationIssue::RequiresVectorColumn,
                 }
             })?;
-        if self.vector.index_layout(index)? != expected {
-            return Err(Error::Other(format!(
-                "registered vector layout does not match the durable declaration for {}.{}",
-                index.table, index.column
-            )));
+        if !self
+            .vector
+            .with_index_layout(index, |layout| layout == &expected)?
+        {
+            return Err(Error::Other(
+                (format!(
+                    "registered vector layout does not match the durable declaration for {}.{}",
+                    index.table, index.column
+                ))
+                .into(),
+            ));
         }
         Ok(())
     }
 
-    fn old_accepted_row(
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn live_accepted_row(
         &self,
         table: &str,
         row_id: RowId,
-        deleted_rows: Option<&HashMap<String, HashMap<RowId, VersionedRow>>>,
-    ) -> Option<VersionedRow> {
-        deleted_rows
-            .and_then(|by_table| by_table.get(table))
-            .and_then(|by_row| by_row.get(&row_id))
-            .cloned()
-            .or_else(|| self.relational.live_row_by_id(table, row_id))
+        owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<Option<VersionedRow>> {
+        let tables = self.relational.tables.read();
+        let Some(rows) = tables.get(table) else {
+            return Ok(None);
+        };
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        owner.reserve_for(
+            table.len(),
+            "writer",
+            "prepare_vector_source_row",
+            "Raise MEMORY_LIMIT to prepare this vector write.",
+        )?;
+        let Some(position) = self.relational.visible_version_position(
+            table,
+            rows,
+            row_id,
+            SnapshotId::from_raw_wire(u64::MAX),
+        ) else {
+            return Ok(None);
+        };
+        let Some(row) = rows.get(position).filter(|row| row.deleted_tx.is_none()) else {
+            return Ok(None);
+        };
+        let bytes = crate::memory_accounting::native_map_plan::<String, Value>(row.values.len())?
+            .layout
+            .size()
+            .saturating_add(
+                row.values
+                    .iter()
+                    .map(|(name, value)| name.len().saturating_add(value.estimated_bytes()))
+                    .sum::<usize>(),
+            );
+        owner.reserve_for(
+            bytes,
+            "writer",
+            "prepare_vector_source_row",
+            "Raise MEMORY_LIMIT to prepare this vector write.",
+        )?;
+        Ok(Some(row.clone()))
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn old_accepted_row<'a>(
+        &self,
+        table: &str,
+        row_id: RowId,
+        deleted_rows: Option<&'a HashMap<String, HashMap<RowId, VersionedRow>>>,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<Option<std::borrow::Cow<'a, VersionedRow>>> {
+        if let Some(row) = deleted_rows
+            .and_then(|tables| tables.get(table))
+            .and_then(|rows| rows.get(&row_id))
+        {
+            return Ok(Some(std::borrow::Cow::Borrowed(row)));
+        }
+        self.live_accepted_row(table, row_id, owner)
+            .map(|row| row.map(std::borrow::Cow::Owned))
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn current_vector_for_partition(
         &self,
         index: &VectorIndexRef,
         partition_key: &VectorPartitionKey,
-        row_id: RowId,
-    ) -> Result<Option<contextdb_core::VectorEntry>> {
-        let Some(current_key) = self.vector.current_partition_for_row(index, row_id) else {
+        accepted: &VersionedRow,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<Option<(TxId, Lsn)>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        let (root, durable) = {
+            let captured = self.precommit_vector_root.lock();
+            (captured.upgrade(), captured.is_registered())
+        };
+        if let Some(root) = root {
+            return crate::persistence::vector_current_identity::accepted_identity(
+                &root,
+                index,
+                partition_key,
+                accepted,
+                vector_copy_owner,
+                read_memory,
+            );
+        }
+        if durable {
+            return Err(Error::Other(
+                "writer publication no longer owns its commit source".into(),
+            ));
+        }
+        let Some(current_key) =
+            self.vector
+                .current_partition_for_row(index, accepted.row_id, vector_copy_owner)?
+        else {
             return Ok(None);
         };
         if &current_key != partition_key {
-            return Err(Error::Other(format!(
-                "vector partition membership disagrees with the accepted row for {}.{}",
-                index.table, index.column
-            )));
+            return Err(Error::Other(
+                (format!(
+                    "vector partition membership disagrees with the accepted row for {}.{}",
+                    index.table, index.column
+                ))
+                .into(),
+            ));
         }
         self.vector
-            .ensure_raw_partition_loaded(index, partition_key)?;
-        Ok(self.vector.live_entry_for_row_in_partition(
-            index,
-            partition_key,
-            row_id,
-            SnapshotId::from_raw_wire(u64::MAX),
-        ))
+            .try_live_entry_for_row_in_partition(
+                index,
+                partition_key,
+                accepted.row_id,
+                SnapshotId::from_raw_wire(u64::MAX),
+                vector_copy_owner,
+            )
+            .map(|entry| entry.map(|entry| (entry.created_tx, entry.lsn)))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn prepared_binding(
         index: &VectorIndexRef,
         meta: &TableMeta,
-        declaration: ColumnDef,
-        row: VersionedRow,
-        vector_created_tx: contextdb_core::TxId,
+        declaration: &ColumnDef,
+        row: &VersionedRow,
+        vector_created_tx: TxId,
         vector_lsn: Lsn,
+        schemas: &mut HashMap<usize, Arc<TableMeta>>,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
     ) -> Result<PreparedVectorPartitionBinding> {
-        let partition_key = vector_partition_key_for_row(index, meta, &declaration, &row)?;
+        let declaration_ordinal = meta
+            .columns
+            .iter()
+            .position(|column| column == declaration)
+            .ok_or_else(|| {
+                Error::Other("prepared vector declaration is absent from its exact schema".into())
+            })?;
+        let schema = match schemas.get(&(meta as *const TableMeta as usize)) {
+            Some(schema) => schema.clone(),
+            None => {
+                owner.reserve_for(
+                    meta.metadata_bytes().saturating_add(
+                        std::mem::size_of::<TableMeta>() + 2 * std::mem::size_of::<usize>(),
+                    ),
+                    "writer",
+                    "prepare_vector_schema",
+                    "Raise MEMORY_LIMIT to prepare this vector write.",
+                )?;
+                let schema = Arc::new(meta.clone());
+                // Sharing is keyed by this exact immutable schema allocation.
+                schemas.insert(meta as *const TableMeta as usize, schema.clone());
+                schema
+            }
+        };
+        let columns = declaration.partition_key_columns.as_deref().unwrap_or(&[]);
+        let bytes = crate::memory_accounting::native_map_plan::<String, Value>(columns.len())?
+            .layout
+            .size()
+            .saturating_add(
+                columns
+                    .iter()
+                    .map(|name| name.len() + row.values.get(name).map_or(0, Value::estimated_bytes))
+                    .sum::<usize>(),
+            );
+        owner.reserve_for(
+            bytes,
+            "writer",
+            "prepare_vector_binding",
+            "Raise MEMORY_LIMIT to prepare this vector write.",
+        )?;
+        let mut values = HashMap::with_capacity(columns.len());
+        for column in columns {
+            if let Some(value) = row.values.get(column) {
+                values.insert(column.clone(), value.clone());
+            }
+        }
+        let row = VersionedRow {
+            row_id: row.row_id,
+            values,
+            created_tx: row.created_tx,
+            deleted_tx: row.deleted_tx,
+            lsn: row.lsn,
+            created_at: row.created_at,
+        };
+        // The retained key and its construction scratch are admitted before encoding.
+        owner.reserve_for(
+            columns
+                .iter()
+                .map(|column| row.values.get(column).map_or(0, Value::estimated_bytes))
+                .sum::<usize>()
+                .saturating_mul(4)
+                .saturating_add(columns.len() * std::mem::size_of::<Value>()),
+            "writer",
+            "prepare_vector_partition_key",
+            "Raise MEMORY_LIMIT to prepare this vector write.",
+        )?;
+        let partition_key = vector_partition_key_for_row(index, meta, declaration, &row)?;
         Ok(PreparedVectorPartitionBinding {
             row,
-            table_meta: meta.clone(),
-            declaration,
+            table_meta: schema,
+            declaration: declaration_ordinal,
             partition_key,
             vector_created_tx,
             vector_lsn,
         })
     }
 
-    /// Resolve every vector write against the finalized rows and declaration,
-    /// then ask the vector store to validate the complete keyed batch without
-    /// mutating it. A relational key-only replacement synthesizes a local
-    /// move for each unchanged live vector column.
-    pub(crate) fn prepare_vector_partition_mutations(
-        &self,
-        ws: &WriteSet,
-        table_meta: &HashMap<String, TableMeta>,
-        deleted_rows: Option<&HashMap<String, HashMap<RowId, VersionedRow>>>,
-    ) -> Result<PreparedVectorPartitionMutationBatch> {
-        self.prepare_vector_partition_mutations_with_reclamation(
-            ws,
-            table_meta,
-            deleted_rows,
-            HashSet::new(),
-            None,
-            false,
-        )
-    }
-
     /// Database supplies only states it has proved reclaimable while holding
     /// its snapshot-removal guard through durable and memory publication.
     /// This layer never infers that proof from current rows.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_vector_partition_mutations_with_reclaimable_partitions(
         &self,
         ws: &WriteSet,
         table_meta: &HashMap<String, TableMeta>,
         deleted_rows: Option<&HashMap<String, HashMap<RowId, VersionedRow>>>,
         reclaimable_partitions: HashSet<contextdb_vector::VectorPartitionRef>,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<PreparedVectorPartitionMutationBatch> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.prepare_vector_partition_mutations_with_reclamation(
             ws,
             table_meta,
@@ -904,16 +1166,27 @@ impl CompositeStore {
             reclaimable_partitions,
             None,
             false,
+            false,
+            vector_copy_owner,
+            read_memory.clone(),
         )
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_vector_partition_mutations_with_registered_snapshots(
         &self,
         ws: &WriteSet,
         table_meta: &HashMap<String, TableMeta>,
         deleted_rows: Option<&HashMap<String, HashMap<RowId, VersionedRow>>>,
         registered_snapshots: &[SnapshotId],
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<PreparedVectorPartitionMutationBatch> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.prepare_vector_partition_mutations_with_reclamation(
             ws,
             table_meta,
@@ -921,6 +1194,9 @@ impl CompositeStore {
             HashSet::new(),
             Some(registered_snapshots),
             false,
+            false,
+            vector_copy_owner,
+            read_memory.clone(),
         )
     }
 
@@ -938,14 +1214,19 @@ impl CompositeStore {
     /// persistence path for a registered received-schema stage never does)
     /// is not required to also clean it up on that account -- the stage
     /// registration's own unwind guard removes it unconditionally regardless.
-    fn take_received_arriving_table_meta(
+    pub(crate) fn take_received_arriving_table_meta(
         &self,
         commit_lsn: Option<Lsn>,
     ) -> Option<Arc<HashMap<String, TableMeta>>> {
         commit_lsn.and_then(|lsn| self.received_arriving_table_meta.lock().remove(&lsn))
     }
 
-    fn prepare_vector_partition_mutations_with_reclamation(
+    #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn prepare_vector_partition_mutations_with_reclamation(
         &self,
         ws: &WriteSet,
         table_meta: &HashMap<String, TableMeta>,
@@ -953,28 +1234,175 @@ impl CompositeStore {
         reclaimable_partitions: HashSet<contextdb_vector::VectorPartitionRef>,
         registered_snapshots: Option<&[SnapshotId]>,
         resolving_staged_arrival: bool,
+        defer_publication: bool,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<PreparedVectorPartitionMutationBatch> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        let mut vector_copy_owner = vector_copy_owner.scratch();
+        let mut insert_copy_owner = contextdb_vector::VectorCopyAdmission::new(
+            self.accountant.as_handle().vector_budget()?,
+        );
         let commit_lsn = ws.commit_lsn.unwrap_or(Lsn(0));
-        let new_rows = ws
-            .relational_inserts
-            .iter()
-            .map(|(table, row)| ((table.clone(), row.row_id), row.clone()))
-            .collect::<HashMap<_, _>>();
-        let accepted_new_row = |table: &str, row_id: RowId| {
-            new_rows
-                .get(&(table.to_owned(), row_id))
-                .cloned()
-                .or_else(|| self.relational.live_row_by_id(table, row_id))
+        let schema_capacity = table_meta.len().min(
+            ws.vector_inserts
+                .len()
+                .saturating_add(ws.vector_deletes.len())
+                .saturating_add(ws.vector_moves.len())
+                .saturating_add(ws.relational_inserts.len()),
+        );
+        insert_copy_owner.reserve_for(
+            crate::memory_accounting::native_map_plan::<(&str, RowId), &VersionedRow>(
+                ws.relational_inserts.len(),
+            )?
+            .layout
+            .size()
+            .saturating_add(
+                crate::memory_accounting::native_map_plan::<usize, Arc<TableMeta>>(
+                    schema_capacity,
+                )?
+                .layout
+                .size(),
+            ),
+            "writer",
+            "prepare_vector_row_directory",
+            "Raise MEMORY_LIMIT to prepare this vector write.",
+        )?;
+        let mut schemas = HashMap::with_capacity(schema_capacity);
+        let mut new_rows = HashMap::with_capacity(ws.relational_inserts.len());
+        for (table, row) in &ws.relational_inserts {
+            new_rows.insert((table.as_str(), row.row_id), row);
+        }
+        let accepted_new_row = |table: &str,
+                                row_id: RowId,
+                                owner: &mut contextdb_vector::VectorCopyAdmission|
+         -> Result<_> {
+            match new_rows.get(&(table, row_id)).copied() {
+                Some(row) => Ok(Some(std::borrow::Cow::Borrowed(row))),
+                None => self.old_accepted_row(table, row_id, deleted_rows, owner),
+            }
         };
 
-        let mut mutations = Vec::new();
+        let synthesized_moves = ws
+            .relational_inserts
+            .iter()
+            .filter(|(table, row)| {
+                deleted_rows
+                    .and_then(|tables| tables.get(table))
+                    .is_some_and(|rows| rows.contains_key(&row.row_id))
+                    || self
+                        .relational
+                        .tables
+                        .read()
+                        .get(table)
+                        .is_some_and(|rows| !rows.is_empty())
+            })
+            .map(|(table, _)| {
+                table_meta.get(table).map_or(0, |meta| {
+                    meta.columns
+                        .iter()
+                        .filter(|column| matches!(column.column_type, ColumnType::Vector(_)))
+                        .count()
+                })
+            })
+            .sum::<usize>();
+        let move_capacity = ws
+            .vector_moves
+            .len()
+            .checked_add(synthesized_moves)
+            .ok_or_else(|| Error::Other("vector preparation count overflow".into()))?;
+        let mutation_capacity = ws
+            .vector_deletes
+            .len()
+            .checked_add(ws.vector_inserts.len())
+            .and_then(|count| count.checked_add(move_capacity))
+            .ok_or_else(|| Error::Other("vector preparation count overflow".into()))?;
+        let touch_capacity = mutation_capacity
+            .checked_add(move_capacity)
+            .ok_or_else(|| Error::Other("vector preparation count overflow".into()))?;
+        let declaration_capacity = table_meta
+            .values()
+            .map(|meta| {
+                meta.columns
+                    .iter()
+                    .filter(|column| matches!(column.column_type, ColumnType::Vector(_)))
+                    .count()
+            })
+            .sum::<usize>()
+            .min(mutation_capacity);
+        let array_bytes =
+            std::alloc::Layout::array::<PreparedVectorPartitionMutation>(mutation_capacity)
+                .map_err(|_| Error::Other("vector mutation array overflow".into()))?
+                .size()
+                .saturating_add(
+                    std::alloc::Layout::array::<PartitionedVectorDelete>(ws.vector_deletes.len())
+                        .map_err(|_| Error::Other("vector delete array overflow".into()))?
+                        .size(),
+                )
+                .saturating_add(
+                    std::alloc::Layout::array::<PartitionedVectorEntry>(ws.vector_inserts.len())
+                        .map_err(|_| Error::Other("vector insert array overflow".into()))?
+                        .size(),
+                )
+                .saturating_add(
+                    std::alloc::Layout::array::<PartitionedVectorMove>(move_capacity)
+                        .map_err(|_| Error::Other("vector move array overflow".into()))?
+                        .size(),
+                );
+        let mut names = 0usize;
+        for index in ws
+            .vector_inserts
+            .iter()
+            .map(|entry| &entry.index)
+            .chain(ws.vector_deletes.iter().map(|(index, ..)| index))
+            .chain(ws.vector_moves.iter().map(|(index, ..)| index))
+        {
+            names =
+                names.saturating_add((index.table.len() + index.column.len()).saturating_mul(4));
+        }
+        for (table, _) in &ws.relational_inserts {
+            if let Some(meta) = table_meta.get(table) {
+                for column in &meta.columns {
+                    if matches!(column.column_type, ColumnType::Vector(_)) {
+                        names = names
+                            .saturating_add((table.len() + column.name.len()).saturating_mul(4));
+                    }
+                }
+            }
+        }
+        insert_copy_owner.reserve_for(
+            array_bytes
+                .saturating_add(names)
+                .saturating_add(
+                    crate::memory_accounting::native_map_plan::<(VectorIndexRef, RowId), ()>(
+                        touch_capacity,
+                    )?
+                    .layout
+                    .size(),
+                )
+                .saturating_add(
+                    crate::memory_accounting::native_map_plan::<VectorIndexRef, ()>(
+                        declaration_capacity,
+                    )?
+                    .layout
+                    .size(),
+                ),
+            "writer",
+            "prepare_vector_containers",
+            "Raise MEMORY_LIMIT to prepare this vector write.",
+        )?;
+        let mut mutations = Vec::with_capacity(mutation_capacity);
         let mut keyed_deletes = Vec::with_capacity(ws.vector_deletes.len());
         let mut keyed_inserts = Vec::with_capacity(ws.vector_inserts.len());
-        let mut keyed_moves = Vec::with_capacity(ws.vector_moves.len());
-        let mut explicit_touches = HashSet::<(VectorIndexRef, RowId)>::new();
-        let mut checked_declarations = HashSet::<VectorIndexRef>::new();
+        let mut keyed_moves = Vec::with_capacity(move_capacity);
+        let mut explicit_touches =
+            HashSet::<(VectorIndexRef, RowId)>::with_capacity(touch_capacity);
+        let mut checked_declarations =
+            HashSet::<VectorIndexRef>::with_capacity(declaration_capacity);
 
         for (index, row_id, deleted_tx) in &ws.vector_deletes {
+            let mut source_owner = insert_copy_owner.scratch();
             let meta = Self::vector_table_meta(table_meta, index)?;
             let declaration = Self::vector_declaration(table_meta, index)?;
             // A staged arriving table has no registered live vector layout
@@ -982,33 +1410,50 @@ impl CompositeStore {
             // ran this exact check against the arriving shape, so this is a
             // re-check against not-yet-published state, not a missing one.
             if !resolving_staged_arrival && checked_declarations.insert(index.clone()) {
-                self.validate_registered_vector_declaration(index, &declaration)?;
+                self.validate_registered_vector_declaration(
+                    index,
+                    declaration,
+                    &mut vector_copy_owner,
+                )?;
             }
             let row = self
-                .old_accepted_row(&index.table, *row_id, deleted_rows)
+                .old_accepted_row(&index.table, *row_id, deleted_rows, &mut source_owner)?
                 .ok_or_else(|| {
-                    Error::Other(format!(
-                        "accepted source row is missing for vector delete on {}.{}",
-                        index.table, index.column
-                    ))
+                    Error::Other(
+                        (format!(
+                            "accepted source row is missing for vector delete on {}.{}",
+                            index.table, index.column
+                        ))
+                        .into(),
+                    )
                 })?;
-            let partition_key = vector_partition_key_for_row(index, meta, &declaration, &row)?;
+            let partition_key = vector_partition_key_for_row(index, meta, declaration, &row)?;
             let vector = self
-                .current_vector_for_partition(index, &partition_key, *row_id)?
+                .current_vector_for_partition(
+                    index,
+                    &partition_key,
+                    &row,
+                    &mut vector_copy_owner,
+                    read_memory.clone(),
+                )?
                 .ok_or_else(|| Error::NotFound(format!("vector row {row_id}")))?;
             let before = Self::prepared_binding(
                 index,
                 meta,
                 declaration,
-                row,
-                vector.created_tx,
-                vector.lsn,
+                &row,
+                vector.0,
+                vector.1,
+                &mut schemas,
+                &mut insert_copy_owner,
             )?;
             keyed_deletes.push(PartitionedVectorDelete::new(
                 index.clone(),
                 before.partition_key.clone(),
                 *row_id,
                 *deleted_tx,
+                before.vector_created_tx,
+                before.vector_lsn,
             ));
             mutations.push(PreparedVectorPartitionMutation::Delete {
                 index: index.clone(),
@@ -1018,80 +1463,135 @@ impl CompositeStore {
             explicit_touches.insert((index.clone(), *row_id));
         }
 
-        for entry in &ws.vector_inserts {
+        for (entry_ordinal, entry) in ws.vector_inserts.iter().enumerate() {
+            let mut source_owner = insert_copy_owner.scratch();
             let meta = Self::vector_table_meta(table_meta, &entry.index)?;
             let declaration = Self::vector_declaration(table_meta, &entry.index)?;
             if !resolving_staged_arrival && checked_declarations.insert(entry.index.clone()) {
-                self.validate_registered_vector_declaration(&entry.index, &declaration)?;
+                self.validate_registered_vector_declaration(
+                    &entry.index,
+                    declaration,
+                    &mut vector_copy_owner,
+                )?;
             }
-            let row = accepted_new_row(&entry.index.table, entry.row_id).ok_or_else(|| {
-                Error::Other(format!(
-                    "accepted destination row is missing for vector insert on {}.{}",
-                    entry.index.table, entry.index.column
-                ))
-            })?;
+            let row = accepted_new_row(&entry.index.table, entry.row_id, &mut source_owner)?
+                .ok_or_else(|| {
+                    Error::Other(
+                        (format!(
+                            "accepted destination row is missing for vector insert on {}.{}",
+                            entry.index.table, entry.index.column
+                        ))
+                        .into(),
+                    )
+                })?;
             let after = Self::prepared_binding(
                 &entry.index,
                 meta,
                 declaration,
-                row,
+                &row,
                 entry.created_tx,
                 entry.lsn,
+                &mut schemas,
+                &mut insert_copy_owner,
             )?;
-            keyed_inserts.push(PartitionedVectorEntry::new(
-                after.partition_key.clone(),
-                entry.clone(),
-            ));
+            if !defer_publication {
+                Self::copy_partition_insert(
+                    entry,
+                    &after,
+                    &mut keyed_inserts,
+                    &mut insert_copy_owner,
+                )?;
+            }
             mutations.push(PreparedVectorPartitionMutation::Insert {
                 index: entry.index.clone(),
                 after,
-                entry: entry.clone(),
+                entry: entry_ordinal,
             });
             explicit_touches.insert((entry.index.clone(), entry.row_id));
         }
 
         for (index, old_row_id, new_row_id, moved_tx) in &ws.vector_moves {
+            let mut source_owner = insert_copy_owner.scratch();
             let meta = Self::vector_table_meta(table_meta, index)?;
             let declaration = Self::vector_declaration(table_meta, index)?;
             if !resolving_staged_arrival && checked_declarations.insert(index.clone()) {
-                self.validate_registered_vector_declaration(index, &declaration)?;
+                self.validate_registered_vector_declaration(
+                    index,
+                    declaration,
+                    &mut vector_copy_owner,
+                )?;
             }
             let old_row = self
-                .old_accepted_row(&index.table, *old_row_id, deleted_rows)
+                .old_accepted_row(&index.table, *old_row_id, deleted_rows, &mut source_owner)?
                 .ok_or_else(|| {
-                    Error::Other(format!(
-                        "accepted source row is missing for vector move on {}.{}",
-                        index.table, index.column
-                    ))
+                    Error::Other(
+                        (format!(
+                            "accepted source row is missing for vector move on {}.{}",
+                            index.table, index.column
+                        ))
+                        .into(),
+                    )
                 })?;
-            let new_row = accepted_new_row(&index.table, *new_row_id).ok_or_else(|| {
-                Error::Other(format!(
-                    "accepted destination row is missing for vector move on {}.{}",
-                    index.table, index.column
-                ))
-            })?;
-            let source_key = vector_partition_key_for_row(index, meta, &declaration, &old_row)?;
+            let new_row = accepted_new_row(&index.table, *new_row_id, &mut source_owner)?
+                .ok_or_else(|| {
+                    Error::Other(
+                        (format!(
+                            "accepted destination row is missing for vector move on {}.{}",
+                            index.table, index.column
+                        ))
+                        .into(),
+                    )
+                })?;
+            let source_key = vector_partition_key_for_row(index, meta, declaration, &old_row)?;
             let vector = self
-                .current_vector_for_partition(index, &source_key, *old_row_id)?
+                .current_vector_for_partition(
+                    index,
+                    &source_key,
+                    &old_row,
+                    &mut vector_copy_owner,
+                    read_memory.clone(),
+                )?
                 .ok_or_else(|| Error::NotFound(format!("vector row {old_row_id}")))?;
             let before = Self::prepared_binding(
                 index,
                 meta,
-                declaration.clone(),
-                old_row,
-                vector.created_tx,
-                vector.lsn,
+                declaration,
+                &old_row,
+                vector.0,
+                vector.1,
+                &mut schemas,
+                &mut insert_copy_owner,
             )?;
-            let after =
-                Self::prepared_binding(index, meta, declaration, new_row, *moved_tx, commit_lsn)?;
-            keyed_moves.push(PartitionedVectorMove::new(
-                index.clone(),
-                before.partition_key.clone(),
-                after.partition_key.clone(),
-                *old_row_id,
-                *new_row_id,
+            let after = Self::prepared_binding(
+                index,
+                meta,
+                declaration,
+                &new_row,
                 *moved_tx,
-            ));
+                commit_lsn,
+                &mut schemas,
+                &mut insert_copy_owner,
+            )?;
+            keyed_moves.push(
+                PartitionedVectorMove::new(
+                    index.clone(),
+                    before.partition_key.clone(),
+                    after.partition_key.clone(),
+                    *old_row_id,
+                    *new_row_id,
+                    *moved_tx,
+                    before.vector_created_tx,
+                    before.vector_lsn,
+                )
+                .with_target_membership(
+                    contextdb_vector::store::VectorMembershipProvenance::new(
+                        after.row.created_tx,
+                        after.row.lsn,
+                        *moved_tx,
+                        after.row.deleted_tx,
+                    ),
+                ),
+            );
             mutations.push(PreparedVectorPartitionMutation::Move {
                 index: index.clone(),
                 before,
@@ -1106,11 +1606,9 @@ impl CompositeStore {
         // vector owner binding even when the partition key stays the same:
         // later delete/move preparation names the newly accepted row version.
         for (table, new_row) in &ws.relational_inserts {
-            let Some(old_row) = deleted_rows
-                .and_then(|by_table| by_table.get(table))
-                .and_then(|by_row| by_row.get(&new_row.row_id))
-                .cloned()
-                .or_else(|| self.relational.live_row_by_id(table, new_row.row_id))
+            let mut source_owner = insert_copy_owner.scratch();
+            let Some(old_row) =
+                self.old_accepted_row(table, new_row.row_id, deleted_rows, &mut source_owner)?
             else {
                 continue;
             };
@@ -1135,20 +1633,31 @@ impl CompositeStore {
                     continue;
                 }
                 if !resolving_staged_arrival && checked_declarations.insert(index.clone()) {
-                    self.validate_registered_vector_declaration(&index, declaration)?;
+                    self.validate_registered_vector_declaration(
+                        &index,
+                        declaration,
+                        &mut vector_copy_owner,
+                    )?;
                 }
-                let Some(vector) =
-                    self.current_vector_for_partition(&index, &old_key, new_row.row_id)?
+                let Some(vector) = self.current_vector_for_partition(
+                    &index,
+                    &old_key,
+                    &old_row,
+                    &mut vector_copy_owner,
+                    read_memory.clone(),
+                )?
                 else {
                     continue;
                 };
                 let before = Self::prepared_binding(
                     &index,
                     meta,
-                    declaration.clone(),
-                    old_row.clone(),
-                    vector.created_tx,
-                    vector.lsn,
+                    declaration,
+                    &old_row,
+                    vector.0,
+                    vector.1,
+                    &mut schemas,
+                    &mut insert_copy_owner,
                 )?;
                 // No vector payload arrived, but the local move versions the
                 // unchanged bytes at this commit so old and new snapshots keep
@@ -1156,10 +1665,12 @@ impl CompositeStore {
                 let after = Self::prepared_binding(
                     &index,
                     meta,
-                    declaration.clone(),
-                    new_row.clone(),
+                    declaration,
+                    new_row,
                     new_row.created_tx,
                     commit_lsn,
+                    &mut schemas,
+                    &mut insert_copy_owner,
                 )?;
                 keyed_moves.push(
                     PartitionedVectorMove::new(
@@ -1169,8 +1680,18 @@ impl CompositeStore {
                         new_row.row_id,
                         new_row.row_id,
                         new_row.created_tx,
+                        before.vector_created_tx,
+                        before.vector_lsn,
                     )
-                    .replacing_row_version(),
+                    .replacing_row_version()
+                    .with_target_membership(
+                        contextdb_vector::store::VectorMembershipProvenance::new(
+                            after.row.created_tx,
+                            after.row.lsn,
+                            new_row.created_tx,
+                            after.row.deleted_tx,
+                        ),
+                    ),
                 );
                 mutations.push(PreparedVectorPartitionMutation::Move {
                     index,
@@ -1184,34 +1705,81 @@ impl CompositeStore {
         let memberships = self.relational.prepare_memberships(
             &ws.relational_deletes,
             &ws.relational_inserts,
-            self.accountant.clone(),
+            self.accountant.read_budget()?,
         )?;
-        let vector_publication = if mutations.is_empty() {
-            None
+        // Deferred preparation runs while persistence holds its handle guards.
+        // Only wholly fresh routes in unoccupied columns can prepare without
+        // loading an existing body/graph or consulting a reclaimable route.
+        // Other writes retain the established preparation/lock ordering.
+        let mut fresh_publication = defer_publication && reclaimable_partitions.is_empty();
+        if fresh_publication {
+            for index in &checked_declarations {
+                if self.vector.live_or_retained_partition_count(index)? != 0 {
+                    fresh_publication = false;
+                    break;
+                }
+            }
+        }
+        if fresh_publication {
+            fresh_publication = mutations
+                .iter()
+                .all(|mutation| matches!(mutation, PreparedVectorPartitionMutation::Insert { .. }));
+        }
+        if defer_publication && !fresh_publication {
+            for mutation in &mutations {
+                if let PreparedVectorPartitionMutation::Insert { after, entry, .. } = mutation {
+                    Self::copy_partition_insert(
+                        &ws.vector_inserts[*entry],
+                        after,
+                        &mut keyed_inserts,
+                        &mut insert_copy_owner,
+                    )?;
+                }
+            }
+        }
+        let (vector_publication, deferred_publication) = if fresh_publication {
+            (
+                None,
+                Some(DeferredVectorPublication {
+                    deletes: keyed_deletes,
+                    inserts: keyed_inserts,
+                    moves: keyed_moves,
+                    reclaimable: reclaimable_partitions,
+                }),
+            )
         } else {
-            let expected_moves = keyed_moves.len();
-            let prepared = match registered_snapshots {
-                Some(registered_snapshots) => self
-                    .vector
-                    .prepare_partitioned_batch_with_registered_snapshots(
+            let vector_publication = if mutations.is_empty() {
+                None
+            } else {
+                let expected_moves = keyed_moves.len();
+                let prepared = match registered_snapshots {
+                    Some(registered_snapshots) => self
+                        .vector
+                        .prepare_partitioned_batch_with_registered_snapshots(
+                            keyed_deletes,
+                            keyed_inserts,
+                            keyed_moves,
+                            registered_snapshots,
+                            vector_copy_owner.scratch(),
+                        )?,
+                    None => self.vector.prepare_partitioned_batch(
                         keyed_deletes,
                         keyed_inserts,
                         keyed_moves,
-                        registered_snapshots,
+                        reclaimable_partitions,
+                        vector_copy_owner.scratch(),
                     )?,
-                None => self.vector.prepare_partitioned_batch(
-                    keyed_deletes,
-                    keyed_inserts,
-                    keyed_moves,
-                    reclaimable_partitions,
-                )?,
+                };
+                if prepared.valid_move_count() != expected_moves {
+                    return Err(Error::Other(
+                        ("prepared vector partition batch lost a validated move source"
+                            .to_string())
+                        .into(),
+                    ));
+                }
+                Some(prepared)
             };
-            if prepared.valid_move_count() != expected_moves {
-                return Err(Error::Other(
-                    "prepared vector partition batch lost a validated move source".to_string(),
-                ));
-            }
-            Some(prepared)
+            (vector_publication, None)
         };
         let retention_identities = ws
             .config_writes
@@ -1221,17 +1789,223 @@ impl CompositeStore {
             .collect::<Result<Vec<(TableName, RowId, TxId, Lsn)>>>()?;
         let retention_expiries = self
             .relational
-            .prepare_retention_expiries(retention_identities, self.accountant.clone())?;
+            .prepare_retention_expiries(retention_identities, self.accountant.read_budget()?)?;
+        let mut row_retirements = Vec::new();
+        if self.memory_row_retirements {
+            let count = ws
+                .config_writes
+                .iter()
+                .filter(|(key, _)| key.starts_with(crate::persistence::row_graph::RETIRED_PREFIX))
+                .count();
+            insert_copy_owner.reserve_for(
+                count.saturating_mul(std::mem::size_of::<(
+                    String,
+                    crate::database::MemoryRowRetirement,
+                )>()),
+                "retention",
+                "prepare_retirement_vector",
+                "Raise MEMORY_LIMIT to prepare retirement controls.",
+            )?;
+            row_retirements.reserve_exact(count);
+            for (key, bytes) in &ws.config_writes {
+                if !key.starts_with(crate::persistence::row_graph::RETIRED_PREFIX) {
+                    continue;
+                }
+                let mut credit = crate::memory_accounting::OwnedMemoryReservation::new(
+                    self.accountant.as_handle(),
+                );
+                let node = 2
+                    * (11 * std::mem::size_of::<(String, crate::database::MemoryRowRetirement)>()
+                        + 16 * std::mem::size_of::<usize>()
+                        + crate::sync_types::held::ALLOCATION_BYTES);
+                credit.try_grow_for(
+                    bytes
+                        .len()
+                        .saturating_mul(4)
+                        .saturating_add(key.len())
+                        .saturating_add(node),
+                    "retention",
+                    "prepare_memory_retirement",
+                    "Raise MEMORY_LIMIT to retain exact retirement controls.",
+                )?;
+                let image = crate::read_image_memory::ImageMemory::charging_reader(
+                    self.accountant.as_handle(),
+                    read_memory.clone(),
+                );
+                let record =
+                    image.scope(|| crate::persistence::row_graph::decode_retirement(bytes))?;
+                let expected_key = image
+                    .scope(|| crate::persistence::row_graph::retirement_key(&record.owned.owner))?;
+                crate::persistence::row_graph::validate_retirement(&record, &record.owned)?;
+                if expected_key != *key {
+                    return Err(Error::StoreCorrupted {
+                        path: "row-derived adjacency".into(),
+                        reason: "retirement key differs from its exact owner".into(),
+                    });
+                }
+                row_retirements.push((
+                    expected_key,
+                    crate::database::MemoryRowRetirement {
+                        owned: record.owned,
+                        memory: credit,
+                    },
+                ));
+            }
+        }
         Ok(PreparedVectorPartitionMutationBatch {
             memberships,
             retention_expiries,
+            row_retirements,
             commit_lsn,
+            vector_source: (ws.vector_inserts.as_ptr() as usize, ws.vector_inserts.len()),
             mutations,
             vector_publication,
+            deferred_publication,
+            _deferred_copy_owner: None,
+            _vector_copy_owner: vector_copy_owner,
+            _insert_copy_owner: insert_copy_owner,
         })
     }
 
-    pub(crate) fn apply_exact(&self, ws: &WriteSet) -> Result<()> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn copy_partition_insert(
+        entry: &contextdb_core::VectorEntry,
+        after: &PreparedVectorPartitionBinding,
+        inserts: &mut Vec<PartitionedVectorEntry>,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<()> {
+        let copied_body_bytes = entry
+            .vector
+            .len()
+            .checked_mul(std::mem::size_of::<f32>())
+            .and_then(|bytes| bytes.checked_add(entry.index.table.len()))
+            .and_then(|bytes| bytes.checked_add(entry.index.column.len()))
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<contextdb_core::VectorEntry>()))
+            .and_then(|bytes| bytes.checked_add(after.partition_key.estimated_bytes()))
+            .ok_or_else(|| Error::Other("vector input copy size overflow".into()))?;
+        owner.reserve_for(
+            copied_body_bytes,
+            "writer",
+            "prepare_vector_insert_copies",
+            "Raise MEMORY_LIMIT to prepare this vector write.",
+        )?;
+        inserts.push(PartitionedVectorEntry::with_membership(
+            after.partition_key.clone(),
+            entry.clone(),
+            contextdb_vector::store::VectorMembershipProvenance::new(
+                after.row.created_tx,
+                after.row.lsn,
+                contextdb_core::TxId(after.row.created_tx.0.max(entry.created_tx.0)),
+                after.row.deleted_tx.or(entry.deleted_tx),
+            ),
+            entry.deleted_tx,
+        ));
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn prepare_vector_partition_projection(
+        &self,
+        ws: &WriteSet,
+        table_meta: &HashMap<String, TableMeta>,
+        deleted_rows: Option<&HashMap<String, HashMap<RowId, VersionedRow>>>,
+        reclaimable: HashSet<contextdb_vector::VectorPartitionRef>,
+        snapshots: Option<&[SnapshotId]>,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<PreparedVectorPartitionMutationBatch> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        self.prepare_vector_partition_mutations_with_reclamation(
+            ws,
+            table_meta,
+            deleted_rows,
+            reclaimable,
+            snapshots,
+            false,
+            true,
+            owner,
+            read_memory,
+        )
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn prepare_deferred_vector_publication(
+        &self,
+        ws: &WriteSet,
+        batch: &PreparedVectorPartitionMutationBatch,
+        deferred: DeferredVectorPublication,
+        snapshots: Option<&[SnapshotId]>,
+    ) -> Result<CompletedVectorPublication> {
+        // A fresh owner on the SAME writer capability pays before each clone.
+        let mut owner = contextdb_vector::VectorCopyAdmission::new(
+            self.accountant.as_handle().vector_budget()?,
+        );
+        let mut deferred = deferred;
+        for mutation in &batch.mutations {
+            if let PreparedVectorPartitionMutation::Insert {
+                index,
+                after,
+                entry,
+            } = mutation
+            {
+                let entry = batch.resolve_insert(ws, *entry, index, after)?;
+                Self::copy_partition_insert(entry, after, &mut deferred.inserts, &mut owner)?;
+            }
+        }
+        let publication = if batch.is_empty() {
+            None
+        } else {
+            let expected_moves = deferred.moves.len();
+            let prepared = match snapshots {
+                Some(snapshots) => self
+                    .vector
+                    .prepare_partitioned_batch_with_registered_snapshots(
+                        deferred.deletes,
+                        deferred.inserts,
+                        deferred.moves,
+                        snapshots,
+                        owner.scratch(),
+                    )?,
+                None => self.vector.prepare_partitioned_batch(
+                    deferred.deletes,
+                    deferred.inserts,
+                    deferred.moves,
+                    deferred.reclaimable,
+                    owner.scratch(),
+                )?,
+            };
+            if prepared.valid_move_count() != expected_moves {
+                return Err(Error::Other(
+                    "prepared vector partition batch lost a validated move source".into(),
+                ));
+            }
+            Some(prepared)
+        };
+        Ok(CompletedVectorPublication { publication, owner })
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn apply_exact(
+        &self,
+        ws: &WriteSet,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let registered_snapshots = self.take_vector_partition_snapshot_stage(ws.commit_lsn);
         // A received unit that declares a table in the same delivery that
         // carries that table's rows/vectors has not published its schema
@@ -1245,10 +2019,8 @@ impl CompositeStore {
         // not-yet-published state.
         let arriving = self.take_received_arriving_table_meta(ws.commit_lsn);
         let resolving_staged_arrival = arriving.is_some();
-        let table_meta = match arriving {
-            Some(arriving) => (*arriving).clone(),
-            None => self.relational.table_meta.read().clone(),
-        };
+        let live_table_meta = self.relational.table_meta.read();
+        let table_meta = arriving.as_deref().unwrap_or(&live_table_meta);
         let deleted_rows = self.deleted_rows_snapshot_for_write_set(ws);
         // One publication owner per affected state, and the change log's owner
         // for a received unit's commit is its stage: the stage already built
@@ -1263,27 +2035,87 @@ impl CompositeStore {
         } else {
             self.build_change_log_entries_with_snapshots(
                 ws,
-                Some(&table_meta),
+                Some(table_meta),
                 deleted_rows.as_ref(),
             )
         };
+        let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
         let partition_mutations = self.prepare_vector_partition_mutations_with_reclamation(
             ws,
-            &table_meta,
+            table_meta,
             deleted_rows.as_ref(),
             HashSet::new(),
             registered_snapshots.as_deref(),
             resolving_staged_arrival,
+            false,
+            &mut vector_copy_owner,
+            read_memory,
         )?;
-        self.apply_exact_with_log_entries(ws, log_entries, partition_mutations)
+        drop(live_table_meta);
+        // This store is a private image's: the retention its commit makes
+        // unavoidable is admitted here, at a fallible point, and the apply
+        // consumes it in place of its infallible charge.
+        let preadmitted = crate::memory_accounting::PreadmittedRetention::admit(
+            &self.accountant,
+            self.commit_retained_bytes(&log_entries),
+        )?;
+        self.apply_exact_with_log_entries(ws, log_entries, partition_mutations, Some(preadmitted))
     }
 
+    /// What one commit's apply retains: the change-log entries and their side
+    /// indexes plus the commit-index entry, or only the private paged worker's
+    /// commit-index entry when bodies live on disk.
+    pub(crate) fn commit_retained_bytes(&self, log_entries: &[ChangeLogEntry]) -> usize {
+        if self.relational.uses_disk_backed_committed_bodies() {
+            if self.private_working_graph {
+                COMMIT_INDEX_ENTRY_BYTES
+            } else {
+                0
+            }
+        } else {
+            change_log_retained_bytes(log_entries).saturating_add(COMMIT_INDEX_ENTRY_BYTES)
+        }
+    }
+
+    /// Charge one commit's retention: consume its pre-admission on a private
+    /// image, otherwise take the charge a durable commit cannot refuse.
+    fn retain_commit_bytes(
+        &self,
+        bytes: usize,
+        preadmitted: Option<crate::memory_accounting::PreadmittedRetention<'_>>,
+    ) {
+        match preadmitted {
+            Some(preadmitted) => preadmitted.consume(bytes),
+            None => self.accountant.charge_retained(bytes),
+        }
+    }
+
+    pub(crate) fn with_private_working_graph(mut self) -> Self {
+        self.private_working_graph = true;
+        self
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn apply_exact_with_log_entries(
         &self,
         ws: &WriteSet,
         log_entries: Vec<ChangeLogEntry>,
         partition_mutations: PreparedVectorPartitionMutationBatch,
+        preadmitted: Option<crate::memory_accounting::PreadmittedRetention<'_>>,
     ) -> Result<()> {
+        let working_graph = if self.private_working_graph {
+            Some(crate::persistence::received_working_source::WorkingReadSource::current_for_relational(self.relational.as_ref())?
+                .ok_or_else(|| Error::Other("private graph apply is outside its working loan".into()))?)
+        } else {
+            None
+        };
+        if let Some(source) = &working_graph {
+            self.vector.validate_private_paged_columns()?;
+            source.apply_private_vector_plan(&partition_mutations, ws)?;
+        }
         // Erase the old image after durable success, before ordinary writes publish.
         let erasure = ws
             .commit_lsn
@@ -1298,15 +2130,44 @@ impl CompositeStore {
         );
         self.relational
             .publish_retention_expiries(partition_mutations.retention_expiries);
+        // Prepared controls and their writer invoices publish under the same commit
+        // frontier as rows and reciprocal tombstones; this phase cannot refuse.
+        {
+            let mut retired = self.row_retirements.lock();
+            for (key, value) in partition_mutations.row_retirements {
+                if let Some(old) = retired.retired.insert(key, value) {
+                    drop(old.owned);
+                    drop(old.memory);
+                }
+            }
+        }
         self.apply_phase_pause.maybe_pause();
+        if let Some(source) = &working_graph {
+            source.apply_private_graph(ws)?;
+        }
         self.graph.apply_deletes_ref(&ws.adj_deletes);
         self.graph.apply_inserts_ref(&ws.adj_inserts);
+        self.graph.apply_row_deletes_ref(&ws.row_adj_deletes);
+        self.graph.apply_row_inserts_ref(&ws.row_adj_inserts);
         if let Some(publication) = partition_mutations.vector_publication {
-            self.vector.publish_prepared_partitioned_batch(
-                publication,
-                partition_mutations.commit_lsn,
-                Some(&*self.accountant),
-            );
+            #[cfg(any(test, feature = "test-seams"))]
+            abort_before_vector_publication_for_test();
+            if working_graph.is_some() {
+                // The accepted plan already changed the single private native
+                // image and its maintained catalog. Publishing its transient
+                // states again would rebuild a writer-resident history registry.
+                // Drop their independently admitted copies before their owners.
+                drop(publication);
+            } else {
+                self.vector.publish_prepared_partitioned_batch(
+                    publication,
+                    partition_mutations.commit_lsn,
+                    Some(&*self.accountant),
+                );
+            }
+        }
+        if working_graph.is_some() {
+            self.vector.retire_private_working_partitions();
         }
         let (clear_source_lsns, set_source_lsns) = sync_source_lsn_updates(ws);
         if !clear_source_lsns.is_empty() {
@@ -1333,13 +2194,27 @@ impl CompositeStore {
                     },
                 ));
         }
+        // File-backed history is already installed atomically in durable
+        // selectors. Keep no second decoded log or lookup directory.
+        if self.relational.uses_disk_backed_committed_bodies() {
+            // The unpublished paged worker still uses an in-memory commit
+            // directory. Its manager retains this entry even though row/log
+            // bodies use the working source, so fund the entry until close.
+            if self.private_working_graph {
+                self.retain_commit_bytes(COMMIT_INDEX_ENTRY_BYTES, preadmitted);
+            } else {
+                self.retain_commit_bytes(0, preadmitted);
+            }
+            return Ok(());
+        }
         // What the log and its two side indexes now hold, plus the one
         // commit-index entry the transaction manager inserts for this commit
         // the moment this apply returns. Both exist once the commit is
         // durable, so the charge cannot refuse here -- the typed refusal
         // fires on the next admission, which is what a declared limit is for.
-        self.accountant.charge_retained(
+        self.retain_commit_bytes(
             change_log_retained_bytes(&log_entries).saturating_add(COMMIT_INDEX_ENTRY_BYTES),
+            preadmitted,
         );
         record_change_log_entries(
             &mut self.change_log_table_index.write(),
@@ -1351,24 +2226,73 @@ impl CompositeStore {
     }
 }
 
+/// Count every emitted provenance event, including repeated row identities.
+pub(crate) fn sync_source_lsn_update_cardinality(ws: &WriteSet) -> Option<usize> {
+    if is_retention_expiry(ws) {
+        return Some(0);
+    }
+    ws.relational_deletes
+        .len()
+        .checked_add(ws.relational_inserts.len())
+        .and_then(|count| count.checked_add(ws.sync_source_provenance_marks.len()))
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn sync_source_lsn_updates(
     ws: &WriteSet,
 ) -> (Vec<SyncSourceLsnClear>, Vec<SyncSourceLsnSet>) {
-    // Expiry keeps accepted-source provenance until physical reclamation.
-    if is_retention_expiry(ws) {
-        return (Vec::new(), Vec::new());
-    }
-    let mut clear = ws
-        .relational_deletes
-        .iter()
-        .map(|(table, row_id, _)| (table.clone(), *row_id))
-        .collect::<Vec<_>>();
+    let mut clear = Vec::new();
     let mut set = Vec::new();
+    visit_sync_source_lsn_updates(
+        ws,
+        |table, row| {
+            clear.push((table.to_owned(), row));
+            Ok(())
+        },
+        |table, row, lsn, kind| {
+            set.push((table.to_owned(), row, lsn, kind));
+            Ok(())
+        },
+    )
+    .expect("collecting provenance updates is infallible");
+    (clear, set)
+}
+
+/// Borrow the same update order without building a second unit-sized image.
+/// Every clear precedes every set, and explicit marks follow inserted rows.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(crate) fn visit_sync_source_lsn_updates(
+    ws: &WriteSet,
+    mut clear: impl FnMut(&str, RowId) -> Result<()>,
+    mut set: impl FnMut(&str, RowId, Lsn, u8) -> Result<()>,
+) -> Result<()> {
+    if is_retention_expiry(ws) {
+        return Ok(());
+    }
+    for (table, row, _) in &ws.relational_deletes {
+        clear(table, *row)?;
+    }
     for (table, row) in &ws.relational_inserts {
-        if let Some(source_lsn) = ws
+        if ws
             .relational_insert_source_lsns
             .get(table)
-            .and_then(|by_row| by_row.get(&row.row_id))
+            .and_then(|rows| rows.get(&row.row_id))
+            .is_none()
+        {
+            clear(table, row.row_id)?;
+        }
+    }
+    for (table, row) in &ws.relational_inserts {
+        if let Some(lsn) = ws
+            .relational_insert_source_lsns
+            .get(table)
+            .and_then(|rows| rows.get(&row.row_id))
             .copied()
         {
             let kind = ws
@@ -1377,21 +2301,22 @@ pub(crate) fn sync_source_lsn_updates(
                 .and_then(|rows| rows.get(&row.row_id))
                 .copied()
                 .unwrap_or(0);
-            set.push((table.clone(), row.row_id, source_lsn, kind));
-        } else {
-            clear.push((table.clone(), row.row_id));
+            set(table, row.row_id, lsn, kind)?;
         }
     }
-    // Marks for rows this write set does not rewrite. They follow the staged
-    // rows so that a row both rewritten and marked in one transaction ends on
-    // the mark, which is the later statement about it.
-    set.extend(ws.sync_source_provenance_marks.iter().cloned());
-    (clear, set)
+    for (table, row, lsn, kind) in &ws.sync_source_provenance_marks {
+        set(table, *row, *lsn, *kind)?;
+    }
+    Ok(())
 }
 
 impl WriteSetApplicator for CompositeStore {
-    fn apply(&self, ws: &WriteSet) -> Result<()> {
-        self.apply_exact(ws)
+    fn apply(
+        &self,
+        ws: &WriteSet,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<()> {
+        self.apply_exact(ws, read_memory)
     }
 
     fn new_row_id(&self) -> RowId {
@@ -1400,9 +2325,93 @@ impl WriteSetApplicator for CompositeStore {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)] // Keep test-only publication controls beside their tests.
 mod tests {
     use super::*;
     use contextdb_core::TxId;
+
+    fn sync_cardinality_row(id: u64) -> VersionedRow {
+        VersionedRow {
+            row_id: RowId(id),
+            values: HashMap::new(),
+            created_tx: TxId(1),
+            deleted_tx: None,
+            lsn: Lsn(1),
+            created_at: None,
+        }
+    }
+
+    // This is the one invariant for the planned cardinality helper: it must
+    // count emitted provenance events, rather than distinct row identities.
+    fn assert_sync_source_lsn_update_cardinality(ws: WriteSet) {
+        let (clear, set) = sync_source_lsn_updates(&ws);
+        assert_eq!(
+            sync_source_lsn_update_cardinality(&ws),
+            Some(clear.len() + set.len()),
+            "the planned sizing term stays equal to the producer's emitted clear and set events"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::field_reassign_with_default,
+        reason = "The fixture starts with the shipped defaults and changes only the option under test."
+    )]
+    fn sync_source_lsn_update_cardinality_counts_each_ordinary_primary_key_insert_at_n_and_two_n() {
+        for count in [8, 16] {
+            let mut write_set = WriteSet::default();
+            write_set.relational_inserts = (0..count)
+                .map(|id| ("ordinary_primary_key".to_string(), sync_cardinality_row(id)))
+                .collect();
+            assert_sync_source_lsn_update_cardinality(write_set);
+        }
+    }
+
+    #[test]
+    fn sync_source_lsn_update_cardinality_counts_marked_inserts_deletes_and_later_marks() {
+        let mut write_set = WriteSet {
+            relational_deletes: vec![("events".to_string(), RowId(1), TxId(1))],
+            relational_inserts: vec![
+                ("events".to_string(), sync_cardinality_row(1)),
+                ("events".to_string(), sync_cardinality_row(2)),
+            ],
+            sync_source_provenance_marks: vec![
+                ("events".to_string(), RowId(1), Lsn(7), 1),
+                ("events".to_string(), RowId(2), Lsn(8), 2),
+            ],
+            ..WriteSet::default()
+        };
+        write_set
+            .relational_insert_source_lsns
+            .insert("events".to_string(), HashMap::from([(RowId(2), Lsn(6))]));
+
+        assert_sync_source_lsn_update_cardinality(write_set);
+    }
+
+    #[test]
+    fn sync_source_lsn_update_cardinality_preserves_duplicate_marks_as_emitted_events() {
+        let repeated_mark = ("events".to_string(), RowId(9), Lsn(12), 1);
+        let write_set = WriteSet {
+            relational_inserts: vec![("events".to_string(), sync_cardinality_row(9))],
+            sync_source_provenance_marks: vec![repeated_mark.clone(), repeated_mark],
+            ..WriteSet::default()
+        };
+
+        assert_sync_source_lsn_update_cardinality(write_set);
+    }
+
+    #[test]
+    fn sync_source_lsn_update_cardinality_is_zero_for_retention_expiry() {
+        let write_set = WriteSet {
+            relational_deletes: vec![("events".to_string(), RowId(1), TxId(1))],
+            relational_inserts: vec![("events".to_string(), sync_cardinality_row(2))],
+            sync_source_provenance_marks: vec![("events".to_string(), RowId(3), Lsn(9), 1)],
+            config_writes: vec![(format!("{RETENTION_EXPIRY_PREFIX}1:events:1:1"), vec![])],
+            ..WriteSet::default()
+        };
+
+        assert_sync_source_lsn_update_cardinality(write_set);
+    }
 
     #[test]
     fn received_schema_drop_omits_structural_row_and_vector_deletes() {
@@ -1443,57 +2452,386 @@ mod tests {
         assert!(entries.iter().any(
             |entry| matches!(entry, ChangeLogEntry::VectorDelete { index, .. } if index.table == "kept")
         ));
+    }
+}
 
-        let historic = vec![
-            ChangeLogEntry::RowInsert {
-                table: "dropped".to_string(),
-                row_id: RowId(1),
-                lsn: Lsn(4),
-            },
-            ChangeLogEntry::VectorInsert {
-                index: VectorIndexRef::new("dropped", "embedding"),
-                row_id: RowId(1),
-                lsn: Lsn(4),
-            },
-            ChangeLogEntry::RowInsert {
-                table: "kept".to_string(),
-                row_id: RowId(2),
-                lsn: Lsn(5),
-            },
-        ];
-        let change_log = RwLock::new(historic.clone());
-        let table_index = RwLock::new(ChangeLogTableIndex::new());
-        let lsn_refcounts = RwLock::new(ChangeLogLsnRefcounts::new());
+/// Crash seam (test-seams only): when the named environment variable holds a
+/// marker path, a commit whose durable transaction has already committed
+/// writes `reached` to that path and aborts the process before any vector
+/// state is published in memory. Production builds contain no such path.
+#[cfg(any(test, feature = "test-seams"))]
+pub const ABORT_BEFORE_VECTOR_PUBLICATION_ENV: &str =
+    "CONTEXTDB_TEST_ABORT_AFTER_DURABLE_COMMIT_BEFORE_VECTOR_PUBLICATION";
+
+#[cfg(any(test, feature = "test-seams"))]
+fn abort_before_vector_publication_for_test() {
+    if let Some(marker) = std::env::var_os(ABORT_BEFORE_VECTOR_PUBLICATION_ENV) {
+        let _ = std::fs::write(&marker, b"reached");
+        std::process::abort();
+    }
+}
+
+/// Lend the single finalized event/DDL slot to a synchronous persistence
+/// consumer. The result cannot retain the stage borrow; all guards have ended
+/// when this bridge returns to its memory-publication caller.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(crate) fn with_owned_commit_events_for_apply<R>(
+    events: &crate::database::event_bus::OwnedEventBusHandle,
+    lsn: Option<Lsn>,
+    identity: contextdb_tx::manager::EngineTerminalIdentity,
+    f: impl for<'e> FnOnce(Option<crate::database::event_bus::OwnedStageBorrow<'e>>) -> Result<R>,
+) -> Result<R> {
+    match lsn {
+        Some(lsn) => events.with_owned_commit_events(lsn, identity, f),
+        None => f(None),
+    }
+}
+
+pub(crate) struct OwnedPreparedMemoryApply {
+    resident_memory: Option<crate::database::PreparedMemorySwap>,
+    pub(crate) log_entries: Vec<ChangeLogEntry>,
+    pub(crate) partition_mutations: Option<PreparedVectorPartitionMutationBatch>,
+    clear_sources: Vec<SyncSourceLsnClear>,
+    set_sources: Vec<SyncSourceLsnSet>,
+    _preparation: crate::memory_accounting::OwnedMemoryReservation,
+}
+impl OwnedPreparedMemoryApply {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn admit_resident_copies(
+        &mut self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        bytes: usize,
+    ) -> Result<()> {
+        let mut admission = crate::memory_accounting::reserve_preparation_from_original(
+            original,
+            bytes,
+            "writer_source",
+            "memory_committed_copies",
+            "Reduce committed memory contents or raise MEMORY_LIMIT.",
+        )?;
+        self.resident_memory = Some(
+            crate::database::PreparedMemorySwap::from_original_preparation(
+                &mut admission,
+                0,
+                bytes,
+                0,
+            )?,
+        );
+        Ok(())
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn prepare(
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        ws: &WriteSet,
+        log_entries: Vec<ChangeLogEntry>,
+        partition_mutations: PreparedVectorPartitionMutationBatch,
+        mut preparation: crate::memory_accounting::OwnedMemoryReservation,
+    ) -> Result<Self> {
+        let frame = crate::persistence::OriginalPersistenceFrame::new(original)?;
+        frame.array::<SyncSourceLsnClear>(ws.relational_deletes.len())?;
+        frame.array::<SyncSourceLsnSet>(ws.relational_inserts.len())?;
+        for (table, _, _) in &ws.relational_deletes {
+            frame.reserve(table.len())?;
+        }
+        for (table, _) in &ws.relational_inserts {
+            frame.reserve(table.len() * 2)?;
+        }
+        let (clear_sources, set_sources) = sync_source_lsn_updates(ws);
+        let mut source_memory = frame.into_reservation();
+        crate::memory_accounting::merge_preparation_original(&mut preparation, &mut source_memory)?;
+        Ok(Self {
+            resident_memory: None,
+            log_entries,
+            partition_mutations: Some(partition_mutations),
+            clear_sources,
+            set_sources,
+            _preparation: preparation,
+        })
+    }
+}
+impl CompositeStore {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn prepare_owned_change_log_entries_with_snapshots(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        ws: &WriteSet,
+        table_meta: Option<&HashMap<String, TableMeta>>,
+        deleted_rows: Option<&HashMap<String, HashMap<RowId, VersionedRow>>>,
+    ) -> Result<(
+        Vec<ChangeLogEntry>,
+        crate::memory_accounting::OwnedMemoryReservation,
+    )> {
+        let frame = crate::persistence::OriginalPersistenceFrame::new(original)?;
+        let count = ws
+            .relational_inserts
+            .len()
+            .checked_add(ws.relational_deletes.len())
+            .and_then(|n| n.checked_add(ws.adj_inserts.len()))
+            .and_then(|n| n.checked_add(ws.adj_deletes.len()))
+            .and_then(|n| n.checked_add(ws.vector_inserts.len()))
+            .and_then(|n| n.checked_add(ws.vector_deletes.len()))
+            .ok_or_else(|| Error::Other("change log preparation count overflow".into()))?;
+        frame.array::<ChangeLogEntry>(
+            count
+                .checked_mul(4)
+                .ok_or_else(|| Error::Other("change log preparation layout overflow".into()))?,
+        )?;
+        for (table, _) in &ws.relational_inserts {
+            frame.reserve(table.len())?;
+        }
+        for (table, id, _) in &ws.relational_deletes {
+            frame.reserve(table.len() + 2)?;
+            if let Some(row) = deleted_rows
+                .and_then(|tables| tables.get(table))
+                .and_then(|rows| rows.get(id))
+            {
+                frame.record(row)?;
+            } else if let Some(row) = self
+                .relational
+                .tables
+                .read()
+                .get(table)
+                .and_then(|rows| rows.iter().find(|r| r.row_id == *id))
+            {
+                frame.record(row)?;
+            }
+            if let Some(meta) = table_meta.and_then(|tables| tables.get(table)) {
+                frame.record(meta)?;
+            }
+        }
+        for edge in &ws.adj_inserts {
+            frame.reserve(edge.edge_type.len())?;
+        }
+        for (_, kind, _, _) in &ws.adj_deletes {
+            frame.reserve(kind.len())?;
+        }
+        for vector in &ws.vector_inserts {
+            frame.reserve(vector.index.table.len() + vector.index.column.len())?;
+        }
+        for (index, _, _) in &ws.vector_deletes {
+            frame.reserve(index.table.len() + index.column.len())?;
+        }
+        let entries = self.build_change_log_entries_with_snapshots(ws, table_meta, deleted_rows);
+        Ok((entries, frame.into_reservation()))
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn apply_owned_exact_with_log_entries(
+        &self,
+        ws: &WriteSet,
+        mut prepared: OwnedPreparedMemoryApply,
+        preadmitted: Option<crate::memory_accounting::PreadmittedRetention<'_>>,
+    ) -> Result<()> {
+        crate::database::discard::publish_original_discard_for_apply(ws);
+        let partition_mutations = prepared
+            .partition_mutations
+            .take()
+            .expect("prepared native partition publication");
+        self.relational.apply_prepared_rows(
+            &ws.relational_deletes,
+            &ws.relational_inserts,
+            partition_mutations.memberships,
+        );
+        self.relational
+            .publish_retention_expiries(partition_mutations.retention_expiries);
+        // Prepared controls and their writer invoices publish under the same commit
+        // frontier as rows and reciprocal tombstones; this phase cannot refuse.
+        {
+            let mut retired = self.row_retirements.lock();
+            for (key, value) in partition_mutations.row_retirements {
+                if let Some(old) = retired.retired.insert(key, value) {
+                    drop(old.owned);
+                    drop(old.memory);
+                }
+            }
+        }
+        self.apply_phase_pause.maybe_pause();
+        self.graph.apply_deletes_ref(&ws.adj_deletes);
+        self.graph.apply_inserts_ref(&ws.adj_inserts);
+        self.graph.apply_row_deletes_ref(&ws.row_adj_deletes);
+        self.graph.apply_row_inserts_ref(&ws.row_adj_inserts);
+        if let Some(publication) = partition_mutations.vector_publication {
+            #[cfg(any(test, feature = "test-seams"))]
+            abort_before_vector_publication_for_test();
+            self.vector.publish_prepared_partitioned_batch(
+                publication,
+                partition_mutations.commit_lsn,
+                // Owned insertion copies have allocation-scoped reservations.
+                // They never transfer a legacy per-insert raw-body debit, so
+                // publication must not refund one when it discards the copy.
+                None,
+            );
+        }
+        let clear_source_lsns = std::mem::take(&mut prepared.clear_sources);
+        let set_source_lsns = std::mem::take(&mut prepared.set_sources);
+        if !clear_source_lsns.is_empty() {
+            self.relational.clear_sync_source_lsns(clear_source_lsns);
+        }
+        if !set_source_lsns.is_empty() {
+            self.relational.set_sync_source_lsns(
+                set_source_lsns
+                    .iter()
+                    .map(|(table, row_id, lsn, _)| (table.clone(), *row_id, *lsn)),
+            );
+            self.relational
+                .set_sync_source_kinds(set_source_lsns.into_iter().map(
+                    |(table, row_id, _, kind)| {
+                        (
+                            table,
+                            row_id,
+                            match kind {
+                                1 => SyncSourceKind::AcceptedLocal,
+                                2 => SyncSourceKind::AcceptedLocalPending,
+                                _ => SyncSourceKind::Pulled,
+                            },
+                        )
+                    },
+                ));
+        }
+        // File-backed history is already installed atomically in durable
+        // selectors. Keep no second decoded log or lookup directory.
+        if self.relational.uses_disk_backed_committed_bodies() {
+            // The unpublished paged worker still uses an in-memory commit
+            // directory. Its manager retains this entry even though row/log
+            // bodies use the working source, so fund the entry until close.
+            if self.private_working_graph {
+                self.retain_commit_bytes(COMMIT_INDEX_ENTRY_BYTES, preadmitted);
+            } else {
+                self.retain_commit_bytes(0, preadmitted);
+            }
+            return Ok(());
+        }
+        // What the log and its two side indexes now hold, plus the one
+        // commit-index entry the transaction manager inserts for this commit
+        // the moment this apply returns. Both exist once the commit is
+        // durable, so the charge cannot refuse here -- the typed refusal
+        // fires on the next admission, which is what a declared limit is for.
+        self.retain_commit_bytes(
+            change_log_retained_bytes(&prepared.log_entries)
+                .saturating_add(COMMIT_INDEX_ENTRY_BYTES),
+            preadmitted,
+        );
         record_change_log_entries(
-            &mut table_index.write(),
-            &mut lsn_refcounts.write(),
-            &historic,
+            &mut self.change_log_table_index.write(),
+            &mut self.change_log_lsn_refcounts.write(),
+            &prepared.log_entries,
         );
+        self.change_log
+            .write()
+            .extend(std::mem::take(&mut prepared.log_entries));
+        if let Some(memory) = prepared.resident_memory.as_mut() {
+            memory.commit_after_swap();
+        }
+        Ok(())
+    }
+}
 
-        publish_prepared_change_log_entries(
-            &MemoryAccountant::no_limit(),
-            &change_log,
-            &table_index,
-            &lsn_refcounts,
-            &structurally_dropped_tables,
-            entries,
-        );
+// A memory-only host has no durable queue transaction. The event companion
+// performs the actual guarded queue publication after these infallible commits.
+impl crate::database::event_bus::OwnedSinkQueuePersistence for CompositeStore {
+    type Update<'o> = ();
+    type Removals<'o> = ();
+    fn is_durable(&self) -> bool {
+        false
+    }
+    fn prepare_update<'o>(
+        &self,
+        original: &'o crate::memory_accounting::OwnedMemoryReservation,
+        _sink: &'o str,
+        _entry_id: u64,
+        _encoded: &[u8],
+        _uncertain: bool,
+        _unconfirmed_delta: i8,
+    ) -> Result<Self::Update<'o>> {
+        crate::memory_accounting::persistence_original_projection(original)?;
+        Ok(())
+    }
+    fn commit_update(&self, _: Self::Update<'_>) -> Result<()> {
+        Ok(())
+    }
+    fn prepare_removals<'o>(
+        &self,
+        original: &'o crate::memory_accounting::OwnedMemoryReservation,
+        _sink: &'o str,
+        _ids: &'o [u64],
+        _unconfirmed: u64,
+    ) -> Result<Self::Removals<'o>> {
+        crate::memory_accounting::persistence_original_projection(original)?;
+        Ok(())
+    }
+    fn commit_removals(&self, _: Self::Removals<'_>) -> Result<()> {
+        Ok(())
+    }
+}
 
-        assert!(!change_log.read().iter().any(|entry| match entry {
-            ChangeLogEntry::RowInsert { table, .. } | ChangeLogEntry::RowDelete { table, .. } =>
-                table == "dropped",
-            ChangeLogEntry::VectorInsert { index, .. }
-            | ChangeLogEntry::VectorDelete { index, .. } => index.table == "dropped",
-            _ => false,
-        }));
-        assert_eq!(
-            table_index.read().get("dropped"),
-            None,
-            "retired generation coordinates leave the auxiliary index too"
-        );
-        assert!(
-            table_index.read().contains_key("kept"),
-            "unaffected table history and newly published deletes remain indexed"
-        );
+impl crate::database::event_bus::OwnedSinkQueuePersistence for std::sync::Arc<CompositeStore> {
+    type Update<'o> =
+        <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::Update<'o>;
+    type Removals<'o> =
+        <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::Removals<'o>;
+    fn is_durable(&self) -> bool {
+        <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::is_durable(
+            self.as_ref(),
+        )
+    }
+    fn prepare_update<'o>(
+        &self,
+        original: &'o crate::memory_accounting::OwnedMemoryReservation,
+        sink: &'o str,
+        entry_id: u64,
+        encoded: &[u8],
+        uncertain: bool,
+        delta: i8,
+    ) -> Result<Self::Update<'o>> {
+        <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::prepare_update(
+            self.as_ref(),
+            original,
+            sink,
+            entry_id,
+            encoded,
+            uncertain,
+            delta,
+        )
+    }
+    fn commit_update(&self, prepared: Self::Update<'_>) -> Result<()> {
+        <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::commit_update(
+            self.as_ref(),
+            prepared,
+        )
+    }
+    fn prepare_removals<'o>(
+        &self,
+        original: &'o crate::memory_accounting::OwnedMemoryReservation,
+        sink: &'o str,
+        ids: &'o [u64],
+        unconfirmed: u64,
+    ) -> Result<Self::Removals<'o>> {
+        <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::prepare_removals(
+            self.as_ref(),
+            original,
+            sink,
+            ids,
+            unconfirmed,
+        )
+    }
+    fn commit_removals(&self, prepared: Self::Removals<'_>) -> Result<()> {
+        <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::commit_removals(
+            self.as_ref(),
+            prepared,
+        )
     }
 }

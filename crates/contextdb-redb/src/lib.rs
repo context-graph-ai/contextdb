@@ -62,10 +62,23 @@
 //! [lmdb]: https://www.lmdb.tech/doc/
 //! [design]: https://github.com/cberner/redb/blob/master/docs/design.md
 
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use db::scratch_backend_allocation_size;
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use db::{ADMISSION_PAGE_BUDGET, AdmissionReadReceipt, last_admission_read_receipt};
+#[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+#[doc(hidden)]
+pub use db::{
+    AdmissionBudgetOverride, StoreDamage, allocator_state_lookups_for_test, damage_store_for_test,
+    damage_table_root_for_test, override_admission_page_budget_for_test,
+};
 pub use db::{
     Builder, CacheStats, Database, MultimapTableDefinition, MultimapTableHandle, ReadOnlyDatabase,
-    ReadableDatabase, RepairSession, StorageBackend, TableDefinition, TableHandle,
-    UntypedMultimapTableHandle, UntypedTableHandle,
+    ReadableDatabase, ReclaimBoundary, ReclaimStep, RepairSession, ScratchBackend, StorageBackend,
+    TableDefinition, TableHandle, UntypedMultimapTableHandle, UntypedTableHandle,
+    scratch_backend_in_directory,
 };
 pub use error::{
     CommitError, CompactionError, DatabaseError, Error, SavepointError, SetDurabilityError,
@@ -86,6 +99,9 @@ pub use transactions::{CompactionCursor, CompactionProgress};
 pub use transactions::{DatabaseStats, Durability, ReadTransaction, WriteTransaction};
 #[doc(hidden)]
 pub use transactions::{ExternalSnapshotProvider, ExternalSnapshotRetentionStats};
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use transactions::{PreparedReadInput, PreparedReadView, PreparedWrite};
 #[doc(hidden)]
 pub use transactions::{StorageSnapshotIdentity, StorageUserRootIdentity};
 pub use tree_store::{AccessGuard, AccessGuardMut, AccessGuardMutInPlace, Savepoint};
@@ -96,15 +112,33 @@ pub use types::{Key, MutInPlaceValue, TypeName, Value};
 
 pub type Result<T = (), E = StorageError> = std::result::Result<T, E>;
 
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod allocation_observation;
 pub mod backends;
 #[cfg(feature = "test-seams")]
 pub mod commit_work;
 mod complex_types;
 mod db;
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use db::NativeStorageBackend;
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use db::ReadCacheObservation;
+#[doc(hidden)]
+pub use native_storage_admission::{NativeBackendError, NativeIoCause};
 mod error;
 mod multimap_table;
 mod sealed;
 mod table;
+mod table_registry;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use table_registry::{RegistryAllocationRecord, set_registry_allocation_observer_for_test};
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use table_registry::{RegistryMonitor, RegistryReplacement, RegistryReserveError};
 #[cfg(feature = "test-seams")]
 mod table_write_observer;
 #[cfg(feature = "test-seams")]
@@ -113,11 +147,17 @@ pub use table_write_observer::{
     TableWriteForTest, TableWriteObservationGuardForTest, TableWriteObserverForTest,
     TableWriteOperationForTest,
 };
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use tree_store::with_random_state_for_test;
 mod transaction_tracker;
 mod transactions;
 mod tree_store;
 mod tuple_types;
 mod types;
+
+#[cfg(all(test, feature = "contextdb-internal"))]
+mod commit_failure_rows;
 
 #[cfg(test)]
 fn create_tempfile() -> tempfile::NamedTempFile {
@@ -128,8 +168,84 @@ fn create_tempfile() -> tempfile::NamedTempFile {
     }
 }
 
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+#[doc(hidden)]
+pub mod native_page_observations;
+
+mod native_storage_admission;
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use native_storage_admission::{
+    NativeColdFault, NativeColdReadError, NativeStorageAdmission, NativeStorageCredit,
+    NativeStorageRefused, PreparedReadError, PreparedTableDefinitionError, native_storage_active,
+    with_control_write, with_native_storage_admission, with_native_storage_write_buffer_limit,
+};
+
+mod atomic_compat;
 mod read_admission;
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use read_admission::ReadCacheRequest;
 #[doc(hidden)]
 pub use read_admission::{BackendReadObservation, observe_backend_reads};
 #[doc(hidden)]
-pub use read_admission::{ReadPageCharge, with_read_memory_admission, with_read_page_charge};
+pub use read_admission::{
+    ReadPageCharge, ScanAllowance, ScanReads, admit_active_read_memory, scan_reads,
+    with_read_memory_admission, with_read_memory_admission_storage, with_read_page_charge,
+    with_read_page_charge_storage, with_scan_reads,
+};
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use db::allocator_metadata_test_seams::observe_allocator_region_loads_for_test;
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use db::AllocatorSaveEntryPlant;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use db::FreeTotalsSaveForTest;
+
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use transactions::{NativeReadView, TableRootEvent};
+
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use tree_store::CacheReserveOwner;
+
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use read_admission::{
+    with_cache_preparation_admission, with_retained_cache_preparation_admission,
+};
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use tree_store::{CachePageForTest, CacheWriteControlForTest, CacheWriteForTest};
+
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use read_admission::{OwnedReadPageCharge, with_owned_read_page_charge_storage};
+
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+#[doc(hidden)]
+pub use tree_store::CheckedWriterBackendForTest;
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use native_storage_admission::observe_pending_names_for_test;
+
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+pub use tree_store::CachePressureFixtureForTest;
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use read_admission::{
+    PageAllocationWorkForTest, PageLifetimesForTest, observe_page_allocations_for_test,
+    observe_page_lifetimes_for_test,
+};
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod page_payer_observation;

@@ -19,6 +19,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+static SINK: OnceLock<Option<Mutex<Sink>>> = OnceLock::new();
 
 struct Sink {
     file: File,
@@ -33,10 +34,12 @@ struct Record {
     partitions: Vec<Vec<(String, Field)>>,
     loads: Vec<Vec<(String, Field)>>,
     started: Option<Instant>,
+    // Inline observation state has no per-request heap admission or refund.
+    native_reclaim: NativeReclaimMeters,
+    native_reclaim_present: bool,
 }
 
 fn sink() -> Option<&'static Mutex<Sink>> {
-    static SINK: OnceLock<Option<Mutex<Sink>>> = OnceLock::new();
     SINK.get_or_init(|| {
         let path = std::env::var_os("CONTEXTDB_FIND_ATTRIBUTION")?;
         let file = OpenOptions::new()
@@ -102,6 +105,11 @@ pub fn begin(label: &str) {
 
 /// Close the record opened by the matching `begin` and append it to the sink.
 pub fn finish() {
+    if finish_native_record() {
+        return;
+    }
+    #[cfg(test)]
+    find_attribution_native_tests::observe_legacy_finish_lock_gap();
     if !enabled() {
         return;
     }
@@ -114,6 +122,15 @@ pub fn finish() {
     let Some(record) = sink.record.take() else {
         return;
     };
+    if record.native_reclaim_present {
+        let total_nanos = record
+            .started
+            .map(|started| started.elapsed().as_nanos() as u64)
+            .unwrap_or_default();
+        let _appended = write_native_record(&mut sink.file, &record, total_nanos);
+        let _flushed = sink.file.flush();
+        return;
+    }
     let total_nanos = record
         .started
         .map(|started| started.elapsed().as_nanos() as u64)
@@ -150,6 +167,182 @@ pub fn finish() {
     });
     let _appended = writeln!(sink.file, "{line}");
     let _flushed = sink.file.flush();
+}
+
+// This sibling streams only an open record that observed native pressure.
+// It never resolves the environment or opens a file; all other records use
+// the unchanged legacy finish body.
+fn finish_native_record() -> bool {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return false;
+    }
+    let Some(Some(sink)) = SINK.get() else {
+        return false;
+    };
+    let Ok(mut sink) = sink.lock() else {
+        return false;
+    };
+    if sink
+        .record
+        .as_ref()
+        .is_none_or(|record| !record.native_reclaim_present)
+    {
+        return false;
+    }
+    let record = sink.record.take().expect("open native attribution record");
+    let total_nanos = record
+        .started
+        .map(|started| started.elapsed().as_nanos() as u64)
+        .unwrap_or_default();
+    let _appended = write_native_record(&mut sink.file, &record, total_nanos);
+    let _flushed = sink.file.flush();
+    true
+}
+
+// Write borrowed fields directly. Even an output error needs no allocating JSON
+// error wrapper, Value, copied key or intermediate collection in this path.
+fn write_json_string(writer: &mut impl Write, value: &str) -> std::io::Result<()> {
+    writer.write_all(b"\"")?;
+    let bytes = value.as_bytes();
+    let mut start = 0;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for (index, &byte) in bytes.iter().enumerate() {
+        if byte == b'"' || byte == b'\\' || byte < 0x20 {
+            writer.write_all(&bytes[start..index])?;
+            match byte {
+                b'"' => writer.write_all(b"\\\"")?,
+                b'\\' => writer.write_all(b"\\\\")?,
+                b'\x08' => writer.write_all(b"\\b")?,
+                b'\t' => writer.write_all(b"\\t")?,
+                b'\n' => writer.write_all(b"\\n")?,
+                b'\x0c' => writer.write_all(b"\\f")?,
+                b'\r' => writer.write_all(b"\\r")?,
+                _ => writer.write_all(&[
+                    b'\\',
+                    b'u',
+                    b'0',
+                    b'0',
+                    HEX[(byte >> 4) as usize],
+                    HEX[(byte & 15) as usize],
+                ])?,
+            }
+            start = index + 1;
+        }
+    }
+    writer.write_all(&bytes[start..])?;
+    writer.write_all(b"\"")
+}
+
+fn write_json_millis(writer: &mut impl Write, value: f64) -> std::io::Result<()> {
+    if value.is_finite() {
+        // Use the existing JSON formatter's fixed float buffer directly,
+        // without Serializer's allocating error conversion on I/O failure.
+        serde_json::ser::Formatter::write_f64(&mut serde_json::ser::CompactFormatter, writer, value)
+    } else {
+        writer.write_all(b"null")
+    }
+}
+
+fn write_json_key(writer: &mut impl Write, name: &str, first: &mut bool) -> std::io::Result<()> {
+    if !*first {
+        writer.write_all(b",")?;
+    }
+    *first = false;
+    write_json_string(writer, name)?;
+    writer.write_all(b":")
+}
+
+fn write_native_counts(writer: &mut impl Write, record: &Record) -> std::io::Result<()> {
+    writer.write_all(b"{")?;
+    let mut first = true;
+    let mut legacy = record.counts.iter().peekable();
+    // Both streams are sorted. Equal keys are emitted once with their sum;
+    // nothing is inserted into the preexisting dynamic record.
+    for (name, amount) in record.native_reclaim.labels() {
+        let Some(mut amount) = amount else {
+            continue;
+        };
+        while legacy.peek().is_some_and(|(key, _)| key.as_str() < name) {
+            let (key, value) = legacy.next().expect("peeked legacy count");
+            write_json_key(writer, key, &mut first)?;
+            write!(writer, "{value}")?;
+        }
+        if legacy.peek().is_some_and(|(key, _)| key.as_str() == name) {
+            amount += *legacy.next().expect("matching legacy count").1;
+        }
+        write_json_key(writer, name, &mut first)?;
+        write!(writer, "{amount}")?;
+    }
+    for (name, amount) in legacy {
+        write_json_key(writer, name, &mut first)?;
+        write!(writer, "{amount}")?;
+    }
+    writer.write_all(b"}")
+}
+
+fn write_native_entries(
+    writer: &mut impl Write,
+    entries: &[Vec<(String, Field)>],
+) -> std::io::Result<()> {
+    writer.write_all(b"[")?;
+    let mut first_entry = true;
+    for entry in entries {
+        if !first_entry {
+            writer.write_all(b",")?;
+        }
+        first_entry = false;
+        writer.write_all(b"{")?;
+        let mut first = true;
+        let mut previous: Option<&str> = None;
+        // The legacy JSON map sorts keys and retains the last duplicate. Do
+        // the same over borrowed views, without building another map.
+        while let Some(name) = entry
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .filter(|name| previous.is_none_or(|previous| *name > previous))
+            .min()
+        {
+            let value = &entry
+                .iter()
+                .rev()
+                .find(|(key, _)| key.as_str() == name)
+                .expect("borrowed entry key")
+                .1;
+            write_json_key(writer, name, &mut first)?;
+            match value {
+                Field::Text(value) => write_json_string(writer, value)?,
+                Field::Count(value) => write!(writer, "{value}")?,
+                Field::Millis(value) => write_json_millis(writer, *value)?,
+            }
+            previous = Some(name);
+        }
+        writer.write_all(b"}")?;
+    }
+    writer.write_all(b"]")
+}
+
+fn write_native_record(
+    writer: &mut impl Write,
+    record: &Record,
+    total_nanos: u64,
+) -> std::io::Result<()> {
+    writer.write_all(b"{\"counts\":")?;
+    write_native_counts(writer, record)?;
+    writer.write_all(b",\"label\":")?;
+    write_json_string(writer, &record.label)?;
+    writer.write_all(b",\"loads\":")?;
+    write_native_entries(writer, &record.loads)?;
+    writer.write_all(b",\"partitions\":")?;
+    write_native_entries(writer, &record.partitions)?;
+    writer.write_all(b",\"stage_ms\":{")?;
+    let mut first = true;
+    for (name, nanos) in &record.stage_nanos {
+        write_json_key(writer, name, &mut first)?;
+        write_json_millis(writer, *nanos as f64 / 1e6)?;
+    }
+    writer.write_all(b"},\"total_ms\":")?;
+    write_json_millis(writer, total_nanos as f64 / 1e6)?;
+    writer.write_all(b"}\n")
 }
 
 /// Add to a named work count for the open record.
@@ -257,6 +450,7 @@ static PAGE_FILL_BYTES: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 pub fn note_page_lookup(hit: bool) {
+    inline_phases::page_lookup(hit);
     if !enabled() {
         return;
     }
@@ -268,6 +462,7 @@ pub fn note_page_lookup(hit: bool) {
 
 #[inline]
 pub fn note_page_fill(bytes: usize) {
+    inline_phases::page_fill(bytes);
     if !enabled() {
         return;
     }
@@ -320,6 +515,31 @@ pub struct LoadMeters {
     pub least_cache_loads: u64,
 }
 
+/// Fixed counters recorded by native pressure reclaimers.
+///
+/// These stay outside the allocating attribution record because a native
+/// refusal may be running after its memory admission has failed.  They are
+/// per-thread for the same reason as `LoadMeters`: a caller can sample only
+/// the reclamation it caused without observing another statement.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativeReclaimMeters {
+    pub serving_page_give_back_short: u64,
+    pub serving_page_bytes_given_back: u64,
+    pub serving_page_give_back_reached_final_pass: bool,
+    pub graph_reclaims_over_budget: u64,
+    pub graph_reclaim_required_bytes: u64,
+    pub graph_reclaim_available_bytes: u64,
+    pub sealed_generations_evicted: u64,
+}
+
+/// A fixed, nestable native-pressure meter scope.
+#[doc(hidden)]
+pub struct NativeReclaimMeterScope {
+    prior: NativeReclaimMeters,
+    active: bool,
+}
+
 /// What one saved-graph load was priced at, admitted at and holds.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LoadCharge {
@@ -353,7 +573,207 @@ thread_local! {
                 least_cache_loads: 0,
             })
         };
+    static NATIVE_RECLAIM_METERS: std::cell::Cell<NativeReclaimMeters> =
+        const { std::cell::Cell::new(NativeReclaimMeters {
+            serving_page_give_back_short: 0,
+            serving_page_bytes_given_back: 0,
+            serving_page_give_back_reached_final_pass: false,
+            graph_reclaims_over_budget: 0,
+            graph_reclaim_required_bytes: 0,
+            graph_reclaim_available_bytes: 0,
+            sealed_generations_evicted: 0,
+        }) };
 }
+
+#[inline]
+#[doc(hidden)]
+pub fn note_native_serving_page_give_back_short() {
+    NATIVE_RECLAIM_METERS.with(|meters| {
+        let mut now = meters.get();
+        now.serving_page_give_back_short = now.serving_page_give_back_short.saturating_add(1);
+        meters.set(now);
+    });
+}
+
+#[inline]
+#[doc(hidden)]
+pub fn note_native_serving_page_bytes_given_back(bytes: usize) {
+    NATIVE_RECLAIM_METERS.with(|meters| {
+        let mut now = meters.get();
+        now.serving_page_bytes_given_back = now
+            .serving_page_bytes_given_back
+            .saturating_add(bytes as u64);
+        meters.set(now);
+    });
+}
+
+#[inline]
+#[doc(hidden)]
+pub fn note_native_serving_page_give_back_reached_final_pass() {
+    NATIVE_RECLAIM_METERS.with(|meters| {
+        let mut now = meters.get();
+        now.serving_page_give_back_reached_final_pass = true;
+        meters.set(now);
+    });
+}
+
+#[inline]
+#[doc(hidden)]
+pub fn note_native_graph_reclaims_over_budget() {
+    NATIVE_RECLAIM_METERS.with(|meters| {
+        let mut now = meters.get();
+        now.graph_reclaims_over_budget = now.graph_reclaims_over_budget.saturating_add(1);
+        meters.set(now);
+    });
+}
+
+#[inline]
+#[doc(hidden)]
+pub fn note_native_graph_reclaim_required_bytes(bytes: usize) {
+    NATIVE_RECLAIM_METERS.with(|meters| {
+        let mut now = meters.get();
+        now.graph_reclaim_required_bytes = now
+            .graph_reclaim_required_bytes
+            .saturating_add(bytes as u64);
+        meters.set(now);
+    });
+}
+
+#[inline]
+#[doc(hidden)]
+pub fn note_native_graph_reclaim_available_bytes(bytes: usize) {
+    NATIVE_RECLAIM_METERS.with(|meters| {
+        let mut now = meters.get();
+        now.graph_reclaim_available_bytes = now
+            .graph_reclaim_available_bytes
+            .saturating_add(bytes as u64);
+        meters.set(now);
+    });
+}
+
+#[inline]
+#[doc(hidden)]
+pub fn note_native_sealed_generations_evicted(evicted: usize) {
+    NATIVE_RECLAIM_METERS.with(|meters| {
+        let mut now = meters.get();
+        now.sealed_generations_evicted = now
+            .sealed_generations_evicted
+            .saturating_add(evicted as u64);
+        meters.set(now);
+    });
+}
+
+/// Start a fixed, non-allocating meter scope around native pressure work.
+#[doc(hidden)]
+pub fn native_reclaim_meter_scope() -> NativeReclaimMeterScope {
+    let prior = NATIVE_RECLAIM_METERS.with(|meters| {
+        let prior = meters.get();
+        meters.set(NativeReclaimMeters::default());
+        prior
+    });
+    NativeReclaimMeterScope {
+        prior,
+        active: true,
+    }
+}
+
+impl NativeReclaimMeterScope {
+    /// Bind this scope's counters to the currently open record, restore the
+    /// enclosing scope, and return an observational copy. No heap admission is
+    /// needed.
+    #[doc(hidden)]
+    pub fn finish(mut self) -> NativeReclaimMeters {
+        self.active = false;
+        restore_native_reclaim_meter_scope(self.prior)
+    }
+}
+
+impl Drop for NativeReclaimMeterScope {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = restore_native_reclaim_meter_scope(self.prior);
+        }
+    }
+}
+
+fn restore_native_reclaim_meter_scope(prior: NativeReclaimMeters) -> NativeReclaimMeters {
+    let local = NATIVE_RECLAIM_METERS.with(|meters| {
+        let local = meters.get();
+        meters.set(prior);
+        local
+    });
+    // Normal completion and unwind both bind local work exactly once. The
+    // enclosing active scope is restored separately, so nested work is never
+    // counted again when that scope closes. With no open record, drop the
+    // observation just as legacy count does; never initialize the sink here.
+    if ENABLED.load(Ordering::Relaxed)
+        && let Some(Some(sink)) = SINK.get()
+        && let Ok(mut sink) = sink.lock()
+        && let Some(record) = sink.record.as_mut()
+    {
+        record.native_reclaim.merge(local);
+        record.native_reclaim_present = true;
+    }
+    local
+}
+
+impl NativeReclaimMeters {
+    fn merge(&mut self, other: Self) {
+        // Completed scopes aggregate like the legacy count map's u64 +=;
+        // the native note functions retain their existing saturating meters.
+        self.serving_page_give_back_short += other.serving_page_give_back_short;
+        self.serving_page_bytes_given_back += other.serving_page_bytes_given_back;
+        self.serving_page_give_back_reached_final_pass |=
+            other.serving_page_give_back_reached_final_pass;
+        self.graph_reclaims_over_budget += other.graph_reclaims_over_budget;
+        self.graph_reclaim_required_bytes += other.graph_reclaim_required_bytes;
+        self.graph_reclaim_available_bytes += other.graph_reclaim_available_bytes;
+        self.sealed_generations_evicted += other.sealed_generations_evicted;
+    }
+
+    fn labels(self) -> [(&'static str, Option<u64>); 6] {
+        let graph = self.graph_reclaims_over_budget != 0;
+        [
+            (
+                "graph_reclaim_available_bytes",
+                graph.then_some(self.graph_reclaim_available_bytes),
+            ),
+            (
+                "graph_reclaim_required_bytes",
+                graph.then_some(self.graph_reclaim_required_bytes),
+            ),
+            (
+                "graph_reclaims_over_budget",
+                graph.then_some(self.graph_reclaims_over_budget),
+            ),
+            (
+                "sealed_generations_evicted",
+                graph.then_some(self.sealed_generations_evicted),
+            ),
+            (
+                "serving_page_bytes_given_back",
+                self.serving_page_give_back_reached_final_pass
+                    .then_some(self.serving_page_bytes_given_back),
+            ),
+            (
+                "serving_page_give_back_short",
+                (self.serving_page_give_back_short != 0)
+                    .then_some(self.serving_page_give_back_short),
+            ),
+        ]
+    }
+}
+
+/// Fixed native pressure counters for this thread. This read allocates no
+/// diagnostic state and does not initialize the attribution sink.
+#[doc(hidden)]
+pub fn native_reclaim_meters() -> NativeReclaimMeters {
+    NATIVE_RECLAIM_METERS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+#[path = "find_attribution_native_tests.rs"]
+mod find_attribution_native_tests;
 
 /// One full pass over `bytes` saved bytes to check them; `name` says which
 /// step of a load paid for it.
@@ -421,4 +841,265 @@ pub fn note_refused_saved_graph_load() {
 /// What this thread has loaded and hashed so far.
 pub fn load_meters() -> LoadMeters {
     LOAD_METERS.with(std::cell::Cell::get)
+}
+
+/// Fixed inline measurements for the private default-feature diagnostic.
+/// This path never enters the legacy allocating Record or its sink.
+#[doc(hidden)]
+pub mod inline_phases {
+    use std::cell::Cell;
+    use std::io::Write;
+    use std::sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    };
+    use std::time::Instant;
+    #[derive(Clone, Copy)]
+    #[repr(usize)]
+    pub enum Phase {
+        Planning,
+        CandidateDrain,
+        Grouping,
+        Adapter,
+        Rescore,
+        Materialize,
+        IsAllowed,
+        ResolveScore,
+        BeforeSource,
+        BeforeDistance,
+        Acquire,
+        Release,
+        PageRead,
+        PageAuth,
+        Origin,
+        RowLookup,
+        RowVersion,
+        Neighbours,
+        Distance,
+        LoadPoint,
+        Identity,
+        NavigationLock,
+        DurableDistance,
+        PagedDistance,
+        ResidentF32Distance,
+        ResidentQuantizedDistance,
+    }
+    const N: usize = 26;
+    const NAMES: [&str; N] = [
+        "planning",
+        "candidate_drain",
+        "grouping",
+        "adapter",
+        "rescore",
+        "materialize",
+        "is_allowed",
+        "resolve_score",
+        "before_source",
+        "before_distance",
+        "acquire",
+        "release",
+        "page_read",
+        "page_auth",
+        "origin",
+        "row_lookup",
+        "row_version",
+        "neighbours",
+        "distance",
+        "load_point",
+        "identity",
+        "navigation_lock",
+        "durable_distance",
+        "paged_distance",
+        "resident_f32_distance",
+        "resident_quantized_distance",
+    ];
+    struct State {
+        active: Cell<bool>,
+        request: Cell<u64>,
+        depth: Cell<u32>,
+        calls: [Cell<u64>; N],
+        ns: [Cell<u64>; N],
+        page_lookups: Cell<u64>,
+        page_hits: Cell<u64>,
+        page_fills: Cell<u64>,
+        page_bytes: Cell<u64>,
+        auth_bytes: Cell<u64>,
+    }
+    thread_local! { static STATE: State = const { State {
+        active: Cell::new(false), request: Cell::new(0), depth: Cell::new(0),
+        calls: [const { Cell::new(0) }; N], ns: [const { Cell::new(0) }; N],
+        page_lookups: Cell::new(0), page_hits: Cell::new(0), page_fills: Cell::new(0),
+        page_bytes: Cell::new(0), auth_bytes: Cell::new(0),
+    } }; }
+    pub struct Statement {
+        start: Option<Instant>,
+        enabled: bool,
+        root: bool,
+    }
+    pub fn statement() -> Statement {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        // One bounded transient OsString is resolved lazily in the first
+        // execute, which the unchanged producer performs before warm samples.
+        if !*ENABLED.get_or_init(|| std::env::var_os("CONTEXTDB_INLINE_PHASES").is_some()) {
+            return Statement {
+                start: None,
+                enabled: false,
+                root: false,
+            };
+        }
+        STATE.with(|state| {
+            let root = !state.active.get();
+            if root {
+                state.request.set(NEXT.fetch_add(1, Ordering::Relaxed));
+                state.depth.set(0);
+                for slot in &state.calls {
+                    slot.set(0);
+                }
+                for slot in &state.ns {
+                    slot.set(0);
+                }
+                state.page_lookups.set(0);
+                state.page_hits.set(0);
+                state.page_fills.set(0);
+                state.page_bytes.set(0);
+                state.auth_bytes.set(0);
+                state.active.set(true);
+            }
+            state.depth.set(state.depth.get() + 1);
+            Statement {
+                start: root.then(Instant::now),
+                enabled: true,
+                root,
+            }
+        })
+    }
+    impl Drop for Statement {
+        fn drop(&mut self) {
+            if !self.enabled {
+                return;
+            }
+            if !self.root {
+                STATE.with(|state| state.depth.set(state.depth.get() - 1));
+                return;
+            }
+            let elapsed = self
+                .start
+                .map_or(0, |start| start.elapsed().as_nanos() as u64);
+            let (request, calls, ns, pages) = STATE.with(|state| {
+                state.active.set(false);
+                state.depth.set(0);
+                (
+                    state.request.get(),
+                    std::array::from_fn::<_, N, _>(|i| state.calls[i].get()),
+                    std::array::from_fn::<_, N, _>(|i| state.ns[i].get()),
+                    [
+                        state.page_lookups.get(),
+                        state.page_hits.get(),
+                        state.page_fills.get(),
+                        state.page_bytes.get(),
+                        state.auth_bytes.get(),
+                    ],
+                )
+            });
+            // A record's finite field count and maximum decimal widths fit
+            // within 4KiB (native PIPE_BUF). Format on the stack and flush
+            // once after snapshotting; no per-piece stderr writes or heap.
+            let mut buffer = [0u8; 4096];
+            let mut output = std::io::Cursor::new(buffer.as_mut_slice());
+            let formatted = (|| -> std::io::Result<()> {
+                write!(
+                    output,
+                    "inline_phases pid={} request={} elapsed_ns={} nested_times=inclusive timer_clock_reads=2 page_lookups={} page_hits={} page_fills={} page_bytes={} auth_bytes={}",
+                    std::process::id(),
+                    request,
+                    elapsed,
+                    pages[0],
+                    pages[1],
+                    pages[2],
+                    pages[3],
+                    pages[4]
+                )?;
+                for (index, name) in NAMES.iter().enumerate() {
+                    write!(
+                        output,
+                        " {}_calls={} {}_ns={}",
+                        name, calls[index], name, ns[index]
+                    )?;
+                }
+                writeln!(output)
+            })();
+            let len = output.position() as usize;
+            if formatted.is_ok() {
+                let _ = std::io::stderr().write_all(&buffer[..len]);
+            }
+        }
+    }
+    pub struct Timer {
+        phase: Phase,
+        start: Option<Instant>,
+        request: u64,
+    }
+    #[inline]
+    pub fn enter(phase: Phase) -> Timer {
+        STATE.with(|state| {
+            // The off path checks one byte before touching any counter/array.
+            if !state.active.get() {
+                return Timer {
+                    phase,
+                    start: None,
+                    request: 0,
+                };
+            }
+            Timer {
+                phase,
+                start: Some(Instant::now()),
+                request: state.request.get(),
+            }
+        })
+    }
+    impl Drop for Timer {
+        #[inline]
+        fn drop(&mut self) {
+            let Some(start) = self.start else {
+                return;
+            };
+            // Enabled tiny-phase samples include two clock reads; use the
+            // same-ELF collection-off control to bound instrumentation cost.
+            let elapsed = start.elapsed().as_nanos() as u64;
+            STATE.with(|state| {
+                if state.active.get() && state.request.get() == self.request {
+                    let index = self.phase as usize;
+                    state.calls[index].set(state.calls[index].get().saturating_add(1));
+                    state.ns[index].set(state.ns[index].get().saturating_add(elapsed));
+                }
+            });
+        }
+    }
+    #[inline]
+    pub fn page_lookup(hit: bool) {
+        STATE.with(|state| {
+            if state.active.get() {
+                state.page_lookups.set(state.page_lookups.get() + 1);
+                state.page_hits.set(state.page_hits.get() + u64::from(hit));
+            }
+        });
+    }
+    #[inline]
+    pub fn page_fill(bytes: usize) {
+        STATE.with(|state| {
+            if state.active.get() {
+                state.page_fills.set(state.page_fills.get() + 1);
+                state.page_bytes.set(state.page_bytes.get() + bytes as u64);
+            }
+        });
+    }
+    #[inline]
+    pub fn authenticated(bytes: usize) {
+        STATE.with(|state| {
+            if state.active.get() {
+                state.auth_bytes.set(state.auth_bytes.get() + bytes as u64);
+            }
+        });
+    }
 }

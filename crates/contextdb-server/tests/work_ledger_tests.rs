@@ -46,7 +46,8 @@ fn edge_as(broker: &InProcessBroker, tenant: &str) -> (Arc<Database>, SyncClient
         broker.client_as(&node_id),
         contextdb_core::TenantId::from(tenant),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     (db, client, node_id)
 }
 
@@ -81,21 +82,21 @@ fn hub_claim_holder(hub: &Database, job_id: &str, attempt: i64) -> Option<String
         )
         .expect("hub claim scan");
     let node_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "node_id")
         .expect("node_id col");
     let job_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "job_id")
         .expect("job_id col");
     let attempt_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "attempt")
         .expect("attempt col");
-    result.rows.iter().find_map(|row| {
+    result.rows().iter().find_map(|row| {
         let job_matches = matches!(&row[job_idx], Value::Text(j) if j == job_id);
         let attempt_matches = matches!(&row[attempt_idx], Value::Int64(a) if *a == attempt);
         if job_matches && attempt_matches {
@@ -923,56 +924,110 @@ async fn movement_policy_withholds_foreign_jobs_from_a_closed_worker() {
 
 #[tokio::test]
 async fn worker_loop_polls_until_shutdown_and_executes_arriving_work() {
-    let broker = InProcessBroker::new();
+    let (cancel_watchdog, watchdog_rx) = std::sync::mpsc::channel();
+    let (expired_tx, expired_rx) = tokio::sync::oneshot::channel();
+    let stage = Arc::new(AtomicUsize::new(0));
+    let watchdog_stage = stage.clone();
+    let watchdog = std::thread::spawn(move || {
+        if matches!(
+            watchdog_rx.recv_timeout(Duration::from_secs(60)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ) {
+            let _ = expired_tx.send(watchdog_stage.load(Ordering::SeqCst));
+        }
+    });
+    tokio::select! {
+        () = exercise_worker_loop(stage) => {},
+        expired = expired_rx => match expired.unwrap_or_default() {
+            0 => panic!("worker startup event never delivered"),
+            1 => panic!("worker result event never delivered"),
+            _ => panic!("worker shutdown event never delivered"),
+        },
+    }
+    let _ = cancel_watchdog.send(());
+    watchdog.join().expect("liveness watchdog finishes");
+}
+
+async fn exercise_worker_loop(stage: Arc<AtomicUsize>) {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| T0 as u64);
+    let broker = InProcessBroker::with_event_driven_shutdown_for_test();
     let tenant = "wl-s10";
     let (hub_db, shutdown, task) = start_hub(&broker, tenant);
+    broker
+        .wait_for_registered_route_for_test(&contextdb_engine::subjects::push_subject(tenant))
+        .await;
 
     let (a_db, a_client) = edge(&broker, tenant);
     let (b_db, b_client) = edge(&broker, tenant);
     advertise_capability(&b_db, "node-b", "wl.demo", &tags(&["class:wl.demo"]), T0)
         .expect("B advertises");
 
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (ticks_tx, ticks_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (pull_observer, _pull_events) = tokio::sync::mpsc::unbounded_channel();
+    let (_pull_tick, pull_ticks) = tokio::sync::mpsc::unbounded_channel();
     let loop_shutdown = Arc::new(AtomicBool::new(false));
     let loop_task = tokio::spawn({
         let shutdown = loop_shutdown.clone();
         async move {
-            run_worker_loop(
-                &b_client,
-                &worker_config("node-b"),
-                Arc::new(DemoExecutor),
-                Duration::from_millis(10),
-                shutdown,
+            contextdb_server::work_ledger::with_worker_loop_control_for_test(
+                events_tx,
+                ticks_rx,
+                T0,
+                contextdb_server::work_ledger::with_in_execution_pull_control_for_test(
+                    pull_observer,
+                    pull_ticks,
+                    run_worker_loop(
+                        &b_client,
+                        &worker_config("node-b"),
+                        Arc::new(DemoExecutor),
+                        Duration::from_millis(10),
+                        shutdown,
+                    ),
+                ),
             )
             .await
         }
     });
 
+    match events_rx.recv().await {
+        Some(contextdb_server::work_ledger::WorkerLoopEventForTest::Started) => {}
+        other => panic!("worker startup event never delivered: {other:?}"),
+    }
+    stage.store(1, Ordering::SeqCst);
+
     // Work arrives while the loop is already running.
     submit_job(&a_db, &demo_spec("job-s10", "node-a"), &[b"loop payload"]).expect("submit on A");
-    within(a_client.push()).await.expect("A push");
+    a_client.push().await.expect("A push");
 
-    // The loop picks it up without any external nudge.
-    within(async {
-        loop {
-            if count_rows(&hub_db, "work_results") == 1 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await;
+    // The test releases the worker's next scheduled poll; the worker itself
+    // still claims, executes, and pushes the result.
+    ticks_tx.send(()).expect("worker poll tick never delivered");
+    match events_rx.recv().await {
+        Some(contextdb_server::work_ledger::WorkerLoopEventForTest::PollFinished(
+            PollOutcome::Executed { .. },
+        )) => {}
+        other => panic!("worker result event never delivered: {other:?}"),
+    }
+    assert_eq!(
+        count_rows(&hub_db, "work_results"),
+        1,
+        "the worker result must reach the hub"
+    );
+    stage.store(2, Ordering::SeqCst);
 
     loop_shutdown.store(true, Ordering::SeqCst);
-    within(loop_task)
+    let _ = ticks_tx.send(());
+    loop_task
         .await
         .expect("join loop")
         .expect("loop exits cleanly");
 
-    within(a_client.pull_default()).await.expect("A pull");
+    a_client.pull_default().await.expect("A pull");
     let result = job_result(&a_db, "job-s10").expect("read").expect("row");
     assert_eq!(result.executor_node_id, "node-b");
 
-    shutdown.store(true, Ordering::SeqCst);
+    broker.stop_serving_for_test(&shutdown);
     let _ = task.await;
 }
 
@@ -985,12 +1040,12 @@ fn hub_capability_row_count(hub: &Database, node_id: &str) -> usize {
         Err(_) => return 0,
     };
     let node_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "node_id")
         .expect("node_id col");
     result
-        .rows
+        .rows()
         .iter()
         .filter(|row| matches!(&row[node_idx], Value::Text(n) if n == node_id))
         .count()
@@ -1016,44 +1071,79 @@ async fn worker_repushes_capabilities_until_hub_receives_them() {
     // broker yet, so the loop's startup push fails with NoResponder on every
     // one of its 5 internal attempts.
     let (_w_db, w_client) = edge(&broker, tenant);
+    use contextdb_server::work_ledger::CapabilityPushEventForTest;
+    struct Watchdog {
+        cancel: std::sync::mpsc::Sender<()>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for Watchdog {
+        fn drop(&mut self) {
+            let _ = self.cancel.send(());
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+    let (events, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (cancel, canceled) = std::sync::mpsc::channel();
+    let (expired, mut expiry) = tokio::sync::oneshot::channel();
+    let watchdog = Watchdog {
+        cancel,
+        thread: Some(std::thread::spawn(move || {
+            if matches!(
+                canceled.recv_timeout(Duration::from_secs(60)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                let _ = expired.send(());
+            }
+        })),
+    };
 
     let loop_shutdown = Arc::new(AtomicBool::new(false));
     let loop_task = tokio::spawn({
         let shutdown = loop_shutdown.clone();
         async move {
-            run_worker_loop(
-                &w_client,
-                &worker_config("node-w"),
-                Arc::new(DemoExecutor),
-                Duration::from_millis(20),
-                shutdown,
-            )
+            contextdb_server::work_ledger::with_capability_push_observer_for_test(events, async {
+                run_worker_loop(
+                    &w_client,
+                    &worker_config("node-w"),
+                    Arc::new(DemoExecutor),
+                    Duration::from_millis(20),
+                    shutdown,
+                )
+                .await
+            })
             .await
         }
     });
 
-    // Outlast the startup push's own retry budget (5 attempts, backing off
-    // 0/500/1000/1500/2000ms = 5s) plus slack, so the swallowed-Err path is
-    // the one under test, not the built-in single-call retry. The runtime is
-    // paused (virtual time): this and every internal backoff auto-advance
-    // instantly and DETERMINISTICALLY — ordering guaranteed, zero wall-clock.
-    tokio::time::sleep(Duration::from_millis(6_500)).await;
-
-    // The hub comes up late.
-    let (hub_db, shutdown, task) = start_hub(&broker, tenant);
-
-    // The loop must eventually re-push the outstanding capability now that
-    // the hub can receive it — bounded wait over many poll cycles (the loop
-    // polls every 20ms), not a single fixed sleep.
-    within(async {
-        loop {
-            if hub_capability_row_count(&hub_db, "node-w") >= 1 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+    // Wait for the startup push's retry budget to finish before starting the hub.
+    loop {
+        let event = tokio::select! {
+            biased;
+            _ = &mut expiry => panic!("worker capability push event never delivered"),
+            event = event_rx.recv() => event.expect("worker capability push event never delivered"),
+        };
+        if event == CapabilityPushEventForTest::StartupFinished {
+            break;
         }
-    })
-    .await;
+    }
+
+    // The hub comes up after the startup push has finished.
+    let (hub_db, shutdown, task) = start_hub(&broker, tenant);
+    loop {
+        let event = tokio::select! {
+            biased;
+            _ = &mut expiry => panic!("hub capability row never delivered"),
+            event = event_rx.recv() => event.expect("hub capability row never delivered"),
+        };
+        if event == CapabilityPushEventForTest::RepushFinished
+            && hub_capability_row_count(&hub_db, "node-w") >= 1
+        {
+            break;
+        }
+    }
+    drop(watchdog);
 
     loop_shutdown.store(true, Ordering::SeqCst);
     let _ = loop_task.await;
@@ -1078,8 +1168,8 @@ fn hub_capability_advertised_at(hub: &Database, node_id: &str, capability_id: &s
             &params,
         )
         .ok()?;
-    let idx = result.columns.iter().position(|c| c == "advertised_at")?;
-    match result.rows.first()?.get(idx)? {
+    let idx = result.columns().iter().position(|c| c == "advertised_at")?;
+    match result.rows().first()?.get(idx)? {
         Value::Timestamp(ms) => Some(*ms),
         _ => None,
     }
@@ -1100,8 +1190,11 @@ fn hub_last_contact_ms(hub: &Database, node_id: &str) -> Option<i64> {
             &params,
         )
         .ok()?;
-    let idx = result.columns.iter().position(|c| c == "last_contact_ms")?;
-    match result.rows.first()?.get(idx)? {
+    let idx = result
+        .columns()
+        .iter()
+        .position(|c| c == "last_contact_ms")?;
+    match result.rows().first()?.get(idx)? {
         Value::Timestamp(ms) => Some(*ms),
         Value::Int64(ms) => Some(*ms),
         _ => None,
@@ -1156,9 +1249,19 @@ async fn re_advertised_capability_currency_propagates_to_the_hub() {
 /// such record exists.
 #[tokio::test]
 async fn hub_records_last_contact_per_node_and_it_advances() {
-    let broker = InProcessBroker::new();
+    let now = Arc::new(std::sync::atomic::AtomicU64::new(T0 as u64));
+    let _clock = {
+        let now = now.clone();
+        contextdb_core::Wallclock::test_clock_guard(move || now.load(Ordering::SeqCst))
+    };
+    let broker = InProcessBroker::with_event_driven_shutdown_for_test();
     let tenant = "wl-s15";
     let (hub_db, shutdown, task) = start_hub(&broker, tenant);
+    within(
+        broker
+            .wait_for_registered_route_for_test(&contextdb_engine::subjects::push_subject(tenant)),
+    )
+    .await;
 
     // The edge presents its signer-derived transport identity, so the hub
     // attributes every exchange it serves — including the status-only second
@@ -1175,28 +1278,17 @@ async fn hub_records_last_contact_per_node_and_it_advances() {
         "the hub must record a last-contact for authenticated node {transport_node_id} after it serves an exchange; got {first:?}"
     );
 
-    // A later exchange must advance the recorded last-contact. The hub stamps
-    // real wall-clock millis, so poll bounded on the CONDITION (a later
-    // exchange with a strictly newer stamp) instead of betting one fixed sleep
-    // covers the clock's granularity.
-    let mut second = None;
-    within(async {
-        loop {
-            within(w_client.push()).await.expect("later exchange");
-            second = hub_last_contact_ms(&hub_db, &transport_node_id);
-            if matches!((first, second), (Some(a), Some(b)) if b > a) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    })
-    .await;
+    // The hub handler runs on this current-thread runtime and sees the
+    // explicitly advanced thread-local clock on the next exchange.
+    now.store(T0 as u64 + 1, Ordering::SeqCst);
+    within(w_client.push()).await.expect("later exchange");
+    let second = hub_last_contact_ms(&hub_db, &transport_node_id);
     assert!(
         matches!((first, second), (Some(a), Some(b)) if b > a),
         "a later exchange must advance the recorded last-contact; first={first:?} second={second:?}"
     );
 
-    shutdown.store(true, Ordering::SeqCst);
+    broker.stop_serving_for_test(&shutdown);
     let _ = task.await;
 }
 
@@ -1353,7 +1445,7 @@ async fn redelivered_own_claim_reads_as_won_not_lost() {
 /// only when told — then the between-chunks check must observe the synced-in
 /// cancellation.
 struct RemoteCancelProbeExecutor {
-    reached_chunk_zero: std::sync::mpsc::Sender<()>,
+    reached_chunk_zero: tokio::sync::mpsc::UnboundedSender<()>,
     proceed: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
     chunks_processed: AtomicUsize,
 }
@@ -1372,15 +1464,12 @@ impl WorkExecutor for RemoteCancelProbeExecutor {
             self.chunks_processed.fetch_add(1, Ordering::SeqCst);
             if i == 0 {
                 self.reached_chunk_zero.send(()).expect("signal chunk zero");
-                // A plain std recv with a bound: it blocks THIS OS thread
-                // only (what a long executor does anyway), and the bound
-                // guarantees a clean test failure instead of a runtime-
-                // shutdown deadlock when the control side gives up.
+                // Dropping the control sender releases this blocked executor.
                 if self
                     .proceed
                     .lock()
                     .expect("proceed receiver")
-                    .recv_timeout(Duration::from_secs(15))
+                    .recv()
                     .is_err()
                 {
                     return ExecutionVerdict::Failed(
@@ -1396,11 +1485,39 @@ impl WorkExecutor for RemoteCancelProbeExecutor {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test]
 async fn remote_cancellation_stops_the_worker_between_chunks() {
-    let broker = InProcessBroker::new();
+    let (cancel_watchdog, watchdog_rx) = std::sync::mpsc::channel();
+    let (expired_tx, expired_rx) = tokio::sync::oneshot::channel();
+    let stage = Arc::new(AtomicUsize::new(0));
+    let watchdog_stage = stage.clone();
+    let watchdog = std::thread::spawn(move || {
+        if matches!(
+            watchdog_rx.recv_timeout(Duration::from_secs(60)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ) {
+            let _ = expired_tx.send(watchdog_stage.load(Ordering::SeqCst));
+        }
+    });
+    tokio::select! {
+        () = exercise_remote_cancellation(stage) => {},
+        expired = expired_rx => match expired.unwrap_or_default() {
+            0 => panic!("hub route or executor chunk entry never delivered"),
+            1 => panic!("remote cancellation push never delivered"),
+            _ => panic!("worker pull completion never delivered"),
+        },
+    }
+    let _ = cancel_watchdog.send(());
+    watchdog.join().expect("liveness watchdog finishes");
+}
+
+async fn exercise_remote_cancellation(stage: Arc<AtomicUsize>) {
+    let broker = InProcessBroker::with_event_driven_shutdown_for_test();
     let tenant = "wl-s13";
     let (hub_db, shutdown, task) = start_hub(&broker, tenant);
+    broker
+        .wait_for_registered_route_for_test(&contextdb_engine::subjects::push_subject(tenant))
+        .await;
 
     let (a_db, a_client) = edge(&broker, tenant);
     let (b_db, b_client) = edge(&broker, tenant);
@@ -1411,12 +1528,14 @@ async fn remote_cancellation_stops_the_worker_between_chunks() {
         &[b"chunk-0", b"chunk-1", b"chunk-2"],
     )
     .expect("submit");
-    within(a_client.push()).await.expect("A push");
+    a_client.push().await.expect("A push");
 
     advertise_capability(&b_db, "node-b", "wl.demo", &tags(&["class:wl.demo"]), T0)
         .expect("B advertises");
 
-    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (reached_tx, mut reached_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (pull_tx, mut pull_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tick_tx, tick_rx) = tokio::sync::mpsc::unbounded_channel();
     let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
     let executor = Arc::new(RemoteCancelProbeExecutor {
         reached_chunk_zero: reached_tx,
@@ -1427,38 +1546,34 @@ async fn remote_cancellation_stops_the_worker_between_chunks() {
     let config = worker_config("node-b");
     let poll = poll_and_execute_once(&b_client, &config, executor.clone(), T0 + 1);
     let control = async {
-        within(async {
-            loop {
-                match reached_rx.try_recv() {
-                    Ok(()) => break,
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {
-                        tokio::time::sleep(Duration::from_millis(50)).await
-                    }
-                    Err(err) => panic!("worker never reached chunk zero: {err}"),
-                }
-            }
-        })
-        .await;
+        reached_rx
+            .recv()
+            .await
+            .expect("executor chunk entry never delivered");
+        stage.store(1, Ordering::SeqCst);
         // The submitter cancels while the job is mid-flight — on ITS machine,
         // through the hub. The worker's own store knows nothing yet.
         cancel_job(&a_db, "job-s13", "node-a", Some("remote cancel"), T0 + 5).expect("cancel on A");
-        within(a_client.push())
-            .await
-            .expect("A pushes the cancellation");
+        a_client.push().await.expect("A pushes the cancellation");
+        stage.store(2, Ordering::SeqCst);
         // Wait until the cancellation has genuinely ARRIVED in B's store (the
         // worker must be pulling while it executes), then let it proceed to
         // the between-chunks check.
-        within(async {
-            loop {
-                if job_state(&b_db, "job-s13", T0 + 6).expect("B state") == JobState::Cancelled {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+        loop {
+            tick_tx.send(()).expect("worker pull tick never delivered");
+            pull_rx
+                .recv()
+                .await
+                .expect("worker pull completion never delivered");
+            if job_state(&b_db, "job-s13", T0 + 6).expect("B state") == JobState::Cancelled {
+                break;
             }
-        })
-        .await;
+        }
         proceed_tx.send(()).expect("proceed");
     };
+    let poll = contextdb_server::work_ledger::with_in_execution_pull_control_for_test(
+        pull_tx, tick_rx, poll,
+    );
     let (outcome, ()) = tokio::join!(poll, control);
     assert_eq!(
         outcome.expect("poll"),
@@ -1478,7 +1593,7 @@ async fn remote_cancellation_stops_the_worker_between_chunks() {
     );
     assert_eq!(count_rows(&hub_db, "work_results"), 0);
 
-    shutdown.store(true, Ordering::SeqCst);
+    broker.stop_serving_for_test(&shutdown);
     let _ = task.await;
 }
 
@@ -1493,8 +1608,42 @@ async fn remote_cancellation_stops_the_worker_between_chunks() {
 /// must stay untouched by this gate.
 #[tokio::test(start_paused = true)]
 async fn canonical_worker_never_pushes_its_advertisement() {
+    use contextdb_server::work_ledger::WorkerLoopEventForTest;
+    struct Watchdog {
+        cancel: std::sync::mpsc::Sender<()>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for Watchdog {
+        fn drop(&mut self) {
+            let _ = self.cancel.send(());
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+    let (cancel, canceled) = std::sync::mpsc::channel();
+    let (expired, mut expiry) = tokio::sync::oneshot::channel();
+    let watchdog = Watchdog {
+        cancel,
+        thread: Some(std::thread::spawn(move || {
+            if matches!(
+                canceled.recv_timeout(Duration::from_secs(60)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                let _ = expired.send(());
+            }
+        })),
+    };
     let broker = InProcessBroker::new();
     let (hub_db, shutdown, task) = start_hub(&broker, "t-canon");
+    let push_subject = contextdb_engine::subjects::push_subject("t-canon");
+    tokio::select! {
+        biased;
+        _ = &mut expiry => panic!("hub route registration never delivered"),
+        _ = broker.wait_for_registered_route_for_test(
+            &push_subject
+        ) => {}
+    }
 
     let (_edge_db, client, _) = edge_as(&broker, "t-canon");
     let config = WorkerConfig {
@@ -1510,26 +1659,45 @@ async fn canonical_worker_never_pushes_its_advertisement() {
     };
     let executor: Arc<dyn WorkExecutor> = Arc::new(DemoExecutor);
     let worker_shutdown = Arc::new(AtomicBool::new(false));
+    let (events, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (ticks, tick_rx) = tokio::sync::mpsc::unbounded_channel();
     let loop_task = {
         let worker_shutdown = worker_shutdown.clone();
         async move {
-            let _ = run_worker_loop(
+            let run = run_worker_loop(
                 &client,
                 &config,
                 executor,
                 Duration::from_millis(50),
                 worker_shutdown,
+            );
+            let _ = contextdb_server::work_ledger::with_worker_loop_control_for_test(
+                events, tick_rx, T0, run,
             )
             .await;
         }
     };
     let handle = tokio::spawn(loop_task);
-    // Paused virtual time: 600 ms advances instantly but still guarantees
-    // >= 12 deterministic 50 ms poll cycles ran before the negative below —
-    // a stronger "never pushes" witness than a wall-clock window.
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    let startup = tokio::select! {
+        biased;
+        _ = &mut expiry => panic!("canonical worker startup never delivered"),
+        event = event_rx.recv() => event.expect("canonical worker startup never delivered"),
+    };
+    assert!(matches!(startup, WorkerLoopEventForTest::Started));
+    // Observe twelve completed polls before checking that no push arrived.
+    for _ in 0..12 {
+        ticks.send(()).expect("canonical worker poll permit");
+        let event = tokio::select! {
+            biased;
+            _ = &mut expiry => panic!("canonical worker poll never delivered"),
+            event = event_rx.recv() => event.expect("canonical worker poll never delivered"),
+        };
+        assert!(matches!(event, WorkerLoopEventForTest::PollFinished(_)));
+    }
     worker_shutdown.store(true, Ordering::SeqCst);
+    drop(ticks);
     let _ = handle.await;
+    drop(watchdog);
 
     let received = hub_capability_row_count(&hub_db, "canon-node");
     assert!(

@@ -12,21 +12,37 @@
 //! than a second shape that merely decodes alike.
 
 use contextdb_core::{Lsn, TxId, VectorSearchMode};
-use contextdb_engine::read_contract::{decode_metadata_body, encode_metadata_body};
+use contextdb_engine::read_contract::{
+    decode_metadata_body, encode_metadata_body as encode_metadata_body_native,
+};
 use contextdb_engine::{
     DdlChange, DirectColumnReference, DirectEventTypeStatus, DirectEventsStatus, DirectImageState,
     DirectIndexColumn, DirectIndexDirection, DirectMaintenanceStatus, DirectPropagationRule,
     DirectRankPolicy, DirectReferencePropagation, DirectRetainPolicy, DirectRouteStatus,
     DirectScheduleStatus, DirectSchema, DirectSchemaColumn, DirectSchemaIndex,
     DirectScopeLabelKind, DirectSinkStatus, DirectStateMachine, DirectVectorQuantization,
-    MetadataBody, VectorPartitionHnswDisclosure, VectorQuerySourceDisclosure,
-    VectorSearchDisclosure, VectorSearchLayerPresence, VectorSearchResidual, VectorSearchRoute,
-    VectorSearchRouteEvidence, VectorSearchScopeShape, VectorSearchTailState,
+    MetadataBody, VectorPartitionDisclosure, VectorQuerySourceDisclosure, VectorSearchDisclosure,
+    VectorSearchLayerPresence, VectorSearchResidual, VectorSearchRoute, VectorSearchRouteEvidence,
+    VectorSearchScopeShape, VectorSearchTailState,
 };
 use std::collections::BTreeMap;
 
 /// Read one body back and require it to be the body that was written, in both
 /// directions: the same value, and the same bytes.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn encode_metadata_body(
+    body: &MetadataBody,
+) -> Result<Vec<u8>, contextdb_engine::read_contract::ReadEncodingError> {
+    encode_metadata_body_native(
+        body,
+        super::read_contract_encoding::fixture_encoding_owner(),
+    )
+    .map(|bytes| bytes.as_slice().to_vec())
+}
+
 fn survives_the_wire(body: &MetadataBody) {
     let written = encode_metadata_body(body).expect("encode the metadata body");
     let read = decode_metadata_body(&written).expect("read the metadata body back");
@@ -339,7 +355,7 @@ fn an_explained_statement_survives_the_wire() {
     });
     survives_the_wire(&MetadataBody::Explain {
         sql: "SELECT id FROM documents ORDER BY embedding <=> $query LIMIT 2".to_owned(),
-        physical_plan: "Project -> HNSWSearch".to_owned(),
+        physical_plan: "Project -> VectorSearch".to_owned(),
         index: None,
         vector_search: Some(VectorSearchDisclosure {
             route_evidence: VectorSearchRouteEvidence::PassivePrediction,
@@ -362,16 +378,19 @@ fn an_explained_statement_survives_the_wire() {
             global_candidate_budget: None,
             admission_evaluations: None,
             expansion_evaluations: None,
+            rescore_evaluations: None,
             layers_admitted: None,
             budget_terminal: None,
-            partition_hnsw: vec![VectorPartitionHnswDisclosure {
+            partitions: vec![VectorPartitionDisclosure {
                 partition: "<redacted:1>".to_owned(),
                 route: Some(VectorSearchRoute::FilteredIndexed),
                 reason: Some("predicted_indexed_route".to_owned()),
-                hnsw_m: 24,
-                hnsw_ef_construction: 240,
-                hnsw_ef_search: 96,
-                ef_search_source: "declared".to_owned(),
+                lists: None,
+                lists_source: None,
+                probes: None,
+                probes_source: None,
+                refine_factor_hundredths: None,
+                refine_factor_source: None,
                 policy_revision: 7,
             }],
         }),
@@ -407,6 +426,29 @@ fn a_maintenance_status_survives_the_wire() {
             currency_compaction_enabled: false,
             active_maintenance_loops: 3,
         },
+    });
+}
+
+#[test]
+fn a_historical_index_verification_survives_the_wire() {
+    survives_the_wire(&MetadataBody::VerifyHistory {
+        table: "tagged".to_owned(),
+        indexes: vec![
+            contextdb_engine::HistoricalIndexVerification {
+                index: "tagged_by_tag".to_owned(),
+                postings: 2,
+                versions: 3,
+            },
+            contextdb_engine::HistoricalIndexVerification {
+                index: "__pk_tagged".to_owned(),
+                postings: 0,
+                versions: 0,
+            },
+        ],
+    });
+    survives_the_wire(&MetadataBody::VerifyHistory {
+        table: "empty".to_owned(),
+        indexes: Vec::new(),
     });
 }
 

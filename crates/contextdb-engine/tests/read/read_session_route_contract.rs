@@ -163,7 +163,7 @@ fn seed_committed_rows(path: &std::path::Path) -> usize {
 }
 
 fn cursor_page_ids(page: &CursorPage) -> Vec<i64> {
-    page.rows
+    page.rows()
         .iter()
         .map(|row| match row.as_slice() {
             [Value::Int64(id)] => *id,
@@ -172,6 +172,10 @@ fn cursor_page_ids(page: &CursorPage) -> Vec<i64> {
         .collect()
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn direct_session(observer: Arc<dyn ReadKernelTestObserver>) -> (tempfile::TempDir, ReadSession) {
     let directory = tempfile::TempDir::new().expect("task-scoped direct-route directory");
     let path = directory.path().join("direct-cancellation.db");
@@ -185,6 +189,10 @@ fn direct_session(observer: Arc<dyn ReadKernelTestObserver>) -> (tempfile::TempD
     (directory, session)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn owner_session(
     observer: Arc<dyn ReadKernelTestObserver>,
 ) -> (tempfile::TempDir, Database, ReadSession) {
@@ -247,6 +255,10 @@ fn assert_one_selected_backend_operation(
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn file_and_owner_routes_select_once_and_return_canonical_equivalent_results() {
     let directory = tempfile::TempDir::new().expect("task-scoped route fixture directory");
     let path = directory.path().join("route-equivalence.db");
@@ -310,21 +322,23 @@ fn file_and_owner_routes_select_once_and_return_canonical_equivalent_results() {
         .execute("SELECT * FROM route_rows_missing", &HashMap::new())
         .expect_err("owner route reports the missing table");
 
-    assert_eq!(file_result.columns, owner_result.columns);
-    assert_eq!(file_result.rows, owner_result.rows);
-    assert_eq!(file_result.rows_affected, owner_result.rows_affected);
+    assert_eq!(file_result.columns(), owner_result.columns());
+    assert_eq!(file_result.rows(), owner_result.rows());
+    assert_eq!(file_result.rows_affected(), owner_result.rows_affected());
     assert_eq!(
-        format!("{:?}", file_result.trace),
-        format!("{:?}", owner_result.trace)
+        format!("{:?}", file_result.trace()),
+        format!("{:?}", owner_result.trace())
     );
     assert_eq!(
-        format!("{:?}", file_result.cascade),
-        format!("{:?}", owner_result.cascade)
+        format!("{:?}", file_result.cascade()),
+        format!("{:?}", owner_result.cascade())
     );
-    assert_eq!(file_result.rows.len(), row_count);
+    assert_eq!(file_result.rows().len(), row_count);
     assert_eq!(
-        encode_query_result(&file_result).expect("encode file result canonically"),
-        encode_query_result(&owner_result).expect("encode owner result canonically"),
+        encode_query_result(&file_result, file_result.encoding_owner_for_test())
+            .expect("encode file result canonically"),
+        encode_query_result(&owner_result, owner_result.encoding_owner_for_test())
+            .expect("encode owner result canonically"),
     );
     assert!(matches!(
         (file_error, owner_error),
@@ -344,6 +358,10 @@ fn file_and_owner_routes_select_once_and_return_canonical_equivalent_results() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn file_and_live_owner_reads_report_the_same_one_byte_memory_limit() {
     let directory = tempfile::TempDir::new().expect("task-scoped route fixture directory");
     let path = directory.path().join("one-byte-memory.db");
@@ -604,6 +622,7 @@ fn spawn_startup_race_owner(
             "writer_winning_the_direct_open_boundary_retries_once_into_the_real_owner",
         ))
         .arg("--nocapture")
+        .args(["--format", "terse"])
         .env(STARTUP_RACE_OWNER_CHILD, "1")
         .env(STARTUP_RACE_OWNER_PATH, path)
         .env(STARTUP_RACE_OWNER_RUNTIME, runtime_root)
@@ -627,6 +646,10 @@ fn spawn_startup_race_owner(
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn writer_winning_the_direct_open_boundary_retries_once_into_the_real_owner() {
     if std::env::var_os(STARTUP_RACE_OWNER_CHILD).is_some() {
         let path = std::path::PathBuf::from(
@@ -731,21 +754,25 @@ fn writer_winning_the_direct_open_boundary_retries_once_into_the_real_owner() {
 
     owner.kill().expect("stop the selected startup-race owner");
     owner.wait().expect("reap the selected startup-race owner");
-    assert!(matches!(
-        session.request_owner("startup-race", &challenge),
-        Err(Error::ReadFailure(failure)) if failure.kind() == ReadFailureKind::OwnerDisconnected
-    ));
+    let after_owner_exit = session.request_owner("startup-race", &challenge);
+    assert!(
+        matches!(&after_owner_exit,
+            Err(Error::ReadFailure(failure)) if failure.kind() == ReadFailureKind::OwnerNotRunning
+        ),
+        "an administrative request resolves the current owner after exit: {after_owner_exit:?}"
+    );
+    assert_eq!(session.route(), ReadRoute::File);
     let after_disconnect = session
         .route_resources_for_test()
-        .expect("inspect the fixed route after selected-owner disconnect");
+        .expect("inspect the current file route after selected-owner exit");
     assert_eq!(after_disconnect.channel_identity, selected.channel_identity);
     assert_eq!(
         after_disconnect.direct_backend_opens,
-        selected.direct_backend_opens
+        selected.direct_backend_opens.saturating_add(1)
     );
     assert_eq!(
         after_disconnect.local_channel_operations,
-        selected.local_channel_operations.saturating_add(1),
+        selected.local_channel_operations,
     );
     let final_events = route_resolution_events(&observer.events());
     assert_eq!(
@@ -762,12 +789,16 @@ fn writer_winning_the_direct_open_boundary_retries_once_into_the_real_owner() {
                 **event == (ReadSessionEvent::BeforeDirectBackendOpen { attempt: 1 })
             })
             .count(),
-        1,
+        2,
     );
-    assert!(!final_events.contains(&ReadSessionEvent::RouteSelected(ReadRoute::File)));
+    assert!(final_events.contains(&ReadSessionEvent::RouteSelected(ReadRoute::File)));
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn missing_store_direct_open_failure_is_terminal_without_an_ownership_retry() {
     let directory = tempfile::TempDir::new().expect("task-scoped missing-store directory");
     let runtime_root = secure_runtime_root(&directory, "missing-store-runtime");
@@ -786,6 +817,10 @@ fn missing_store_direct_open_failure_is_terminal_without_an_ownership_retry() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn missing_store_beneath_a_missing_parent_keeps_the_typed_refusal() {
     let directory = tempfile::TempDir::new().expect("task-scoped missing-parent directory");
     let runtime_root = secure_runtime_root(&directory, "missing-parent-runtime");
@@ -809,6 +844,10 @@ fn missing_store_beneath_a_missing_parent_keeps_the_typed_refusal() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn damaged_store_direct_open_failure_is_terminal_without_an_ownership_retry() {
     let directory = tempfile::TempDir::new().expect("task-scoped damaged-store directory");
     let path = directory.path().join("damaged-store.db");
@@ -825,6 +864,10 @@ fn damaged_store_direct_open_failure_is_terminal_without_an_ownership_retry() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn direct_read_requiring_writer_is_terminal_without_an_ownership_retry() {
     let directory = tempfile::TempDir::new().expect("task-scoped direct-refusal directory");
     let path = directory.path().join("direct-refusal.db");
@@ -858,6 +901,10 @@ impl OwnerRequestHandler for RejectIfInvokedHandler {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn owner_identity_authentication_failure_is_terminal_without_direct_fallback_or_retry() {
     let directory = tempfile::TempDir::new().expect("task-scoped authentication directory");
     let path = directory.path().join("owner-authentication.db");
@@ -898,6 +945,7 @@ fn owner_identity_authentication_failure_is_terminal_without_direct_fallback_or_
 struct KernelCancellationState {
     armed: bool,
     entered: Option<ReadKernelSourceEvent>,
+    source_events: Vec<ReadKernelSourceEvent>,
     kernel_token: Option<OwnerReadCancellation>,
     released: bool,
     operation_finished: bool,
@@ -955,6 +1003,49 @@ impl KernelCancellationGate {
         state.armed = false;
     }
 
+    fn completed_source_items_at_trigger(&self) -> u64 {
+        let state = self.state.lock().expect("kernel cancellation gate lock");
+        let entered = state.entered.expect("typed trigger was reached");
+        assert_eq!(state.source_events.last(), Some(&entered));
+        // The final callback is BEFORE the item cancelled at N-1. Every
+        // earlier callback in this successful prefix completed one source item.
+        let prefix = &state.source_events[..state.source_events.len() - 1];
+        let categories = [
+            ReadKernelSource::TableRow,
+            ReadKernelSource::IndexEntry,
+            ReadKernelSource::SortCandidate,
+            ReadKernelSource::GraphEdge,
+            ReadKernelSource::BruteForceVectorCandidate,
+            ReadKernelSource::RankCandidate,
+            ReadKernelSource::AccessRow,
+        ];
+        let completed_by_category: Vec<_> = categories
+            .iter()
+            .map(|source| {
+                (
+                    *source,
+                    u64::try_from(
+                        prefix
+                            .iter()
+                            .filter(|event| event.source == *source)
+                            .count(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
+        let total = completed_by_category
+            .iter()
+            .map(|(_, completed)| *completed)
+            .sum();
+        assert_eq!(
+            total,
+            u64::try_from(prefix.len()).unwrap(),
+            "every completed observed source belongs to the reconciled categories"
+        );
+        total
+    }
+
     fn assert_kernel_reported_cancellation(&self) {
         assert!(
             self.state
@@ -976,6 +1067,11 @@ impl ReadKernelTestObserver for KernelCancellationGate {
         if !state.armed {
             return;
         }
+        assert!(
+            state.entered.is_none(),
+            "no source attempt follows the cancellation trigger"
+        );
+        state.source_events.push(event);
         if event.source == ReadKernelSource::TableRow
             && event.completed_items == cancellation_batch_rows().saturating_sub(1)
             && state.entered.is_none()
@@ -1016,6 +1112,10 @@ impl ReadKernelTestObserver for KernelCancellationGate {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn cancel_execute_inside_kernel(
     session: ReadSession,
     gate: Arc<KernelCancellationGate>,
@@ -1026,7 +1126,6 @@ fn cancel_execute_inside_kernel(
     let before = session
         .route_resources_for_test()
         .expect("capture selected backend state before execute");
-    let before_source_rows = before.bounded_source_items_completed;
     let cancellation = OwnerReadCancellation::new();
     let operation_cancellation = cancellation.clone();
     let finished = gate.clone();
@@ -1052,6 +1151,17 @@ fn cancel_execute_inside_kernel(
     // that lands would race the cancellation delivery this test exists to prove.
     wait_for_kernel_cancellation(&kernel_token);
     let identical_token_observed = kernel_token.is_cancelled();
+    assert_eq!(
+        session
+            .route_resources_for_test()
+            .expect("source state at acknowledgment")
+            .bounded_source_items_completed,
+        blocked
+            .as_ref()
+            .expect("source state at trigger")
+            .bounded_source_items_completed,
+        "exactly zero additional source work before releasing the acknowledged kernel",
+    );
     gate.release();
     let outcome = worker.join();
     assert_eq!(event.operation, ReadSessionOperation::Execute);
@@ -1062,21 +1172,21 @@ fn cancel_execute_inside_kernel(
         cancellation_batch_rows().saturating_sub(1)
     );
     assert!(!cancelled_before_request);
+    let source_items_at_trigger = blocked
+        .expect("inspect the blocked execute source")
+        .bounded_source_items_completed;
     assert_eq!(
-        blocked
-            .expect("inspect the blocked execute source")
-            .bounded_source_items_completed,
-        before_source_rows.saturating_add(cancellation_batch_rows().saturating_sub(1)),
-        "the cancellation gate must be beyond the backend adapter and after one real row",
+        event.completed_items,
+        gate.completed_source_items_at_trigger(),
+        "kernel source count equals the complete observed successful kernel prefix",
     );
     assert_cancelled(outcome.expect("cancelled execute worker joins"));
     let after = session
         .route_resources_for_test()
         .expect("inspect execute source after cancellation");
     assert_eq!(
-        after.bounded_source_items_completed,
-        before_source_rows.saturating_add(cancellation_batch_rows().saturating_sub(1)),
-        "the cancelled kernel must not touch the second row",
+        after.bounded_source_items_completed, source_items_at_trigger,
+        "the cancelled kernel must perform no source work after cancellation acknowledgment",
     );
     assert_one_selected_backend_operation(before, after, route);
     assert!(
@@ -1086,6 +1196,10 @@ fn cancel_execute_inside_kernel(
     gate.assert_kernel_reported_cancellation();
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn cancel_cursor_open_inside_kernel(
     session: ReadSession,
     gate: Arc<KernelCancellationGate>,
@@ -1096,7 +1210,6 @@ fn cancel_cursor_open_inside_kernel(
     let before = session
         .route_resources_for_test()
         .expect("capture selected backend state before cursor open");
-    let before_source_rows = before.bounded_source_items_completed;
     let cancellation = OwnerReadCancellation::new();
     let operation_cancellation = cancellation.clone();
     let finished = gate.clone();
@@ -1122,6 +1235,17 @@ fn cancel_cursor_open_inside_kernel(
     // that lands would race the cancellation delivery this test exists to prove.
     wait_for_kernel_cancellation(&kernel_token);
     let identical_token_observed = kernel_token.is_cancelled();
+    assert_eq!(
+        session
+            .route_resources_for_test()
+            .expect("source state at acknowledgment")
+            .bounded_source_items_completed,
+        blocked
+            .as_ref()
+            .expect("source state at trigger")
+            .bounded_source_items_completed,
+        "exactly zero additional source work before releasing the acknowledged kernel",
+    );
     gate.release();
     let outcome = worker.join();
     assert_eq!(event.operation, ReadSessionOperation::CursorOpen);
@@ -1132,20 +1256,21 @@ fn cancel_cursor_open_inside_kernel(
         cancellation_batch_rows().saturating_sub(1)
     );
     assert!(!cancelled_before_request);
+    let source_items_at_trigger = blocked
+        .expect("inspect the blocked cursor-open source")
+        .bounded_source_items_completed;
     assert_eq!(
-        blocked
-            .expect("inspect the blocked cursor-open source")
-            .bounded_source_items_completed,
-        before_source_rows.saturating_add(cancellation_batch_rows().saturating_sub(1)),
+        event.completed_items,
+        gate.completed_source_items_at_trigger(),
+        "kernel source count equals the complete observed successful kernel prefix",
     );
     assert_cancelled(outcome.expect("cancelled cursor-open worker joins"));
     let after = session
         .route_resources_for_test()
         .expect("inspect cursor-open source after cancellation");
     assert_eq!(
-        after.bounded_source_items_completed,
-        before_source_rows.saturating_add(cancellation_batch_rows().saturating_sub(1)),
-        "cursor open must not touch the second row after cancellation",
+        after.bounded_source_items_completed, source_items_at_trigger,
+        "cursor open must perform no source work after cancellation acknowledgment",
     );
     assert_one_selected_backend_operation(before, after, route);
     assert!(identical_token_observed);
@@ -1189,7 +1314,7 @@ fn cancel_cursor_fetch_inside_kernel(
     let cursor = session
         .open_cursor("SELECT id FROM route_rows", &HashMap::new())
         .expect("open a cursor with a suspended continuation before fetch cancellation");
-    assert!(cursor.first_page().has_more);
+    assert!(cursor.first_page().has_more());
     let first_page_ids = cursor_page_ids(cursor.first_page());
     let requested_rows = usize::try_from(cancellation_batch_rows())
         .expect("cancellation batch size fits this platform");
@@ -1198,7 +1323,6 @@ fn cancel_cursor_fetch_inside_kernel(
     let before = session
         .route_resources_for_test()
         .expect("capture selected backend state before cursor fetch");
-    let before_source_rows = before.bounded_source_items_completed;
     let cancellation = OwnerReadCancellation::new();
     let operation_cancellation = cancellation.clone();
     let finished = gate.clone();
@@ -1221,6 +1345,17 @@ fn cancel_cursor_fetch_inside_kernel(
     // that lands would race the cancellation delivery this test exists to prove.
     wait_for_kernel_cancellation(&kernel_token);
     let identical_token_observed = kernel_token.is_cancelled();
+    assert_eq!(
+        session
+            .route_resources_for_test()
+            .expect("source state at acknowledgment")
+            .bounded_source_items_completed,
+        blocked
+            .as_ref()
+            .expect("source state at trigger")
+            .bounded_source_items_completed,
+        "exactly zero additional source work before releasing the acknowledged kernel",
+    );
     gate.release();
     let outcome = worker.join();
     assert_eq!(event.operation, ReadSessionOperation::CursorFetch);
@@ -1231,11 +1366,13 @@ fn cancel_cursor_fetch_inside_kernel(
         cancellation_batch_rows().saturating_sub(1)
     );
     assert!(!cancelled_before_request);
+    let source_items_at_trigger = blocked
+        .expect("inspect the blocked cursor-fetch source")
+        .bounded_source_items_completed;
     assert_eq!(
-        blocked
-            .expect("inspect the blocked cursor-fetch source")
-            .bounded_source_items_completed,
-        before_source_rows.saturating_add(cancellation_batch_rows().saturating_sub(1)),
+        event.completed_items,
+        gate.completed_source_items_at_trigger(),
+        "kernel source count equals the complete observed successful kernel prefix",
     );
     let (mut cursor, cancelled_fetch) = outcome.expect("cancelled cursor-fetch worker joins");
     assert_cancelled(cancelled_fetch);
@@ -1243,9 +1380,8 @@ fn cancel_cursor_fetch_inside_kernel(
         .route_resources_for_test()
         .expect("inspect cursor-fetch source after cancellation");
     assert_eq!(
-        after.bounded_source_items_completed,
-        before_source_rows.saturating_add(cancellation_batch_rows().saturating_sub(1)),
-        "cursor fetch must not touch the second requested row after cancellation",
+        after.bounded_source_items_completed, source_items_at_trigger,
+        "cursor fetch must perform no source work after cancellation acknowledgment",
     );
     assert_one_selected_backend_operation(before, after, route);
     assert!(identical_token_observed);
@@ -1267,7 +1403,10 @@ fn cancel_cursor_fetch_inside_kernel(
             .collect::<Vec<_>>(),
         "a cancelled unpublished page must not advance the suspended continuation",
     );
-    assert!(next_page.has_more, "the cursor remains genuinely suspended");
+    assert!(
+        next_page.has_more(),
+        "the cursor remains genuinely suspended"
+    );
     let after_resume = session
         .route_resources_for_test()
         .expect("inspect the selected route after cursor resume");
@@ -1417,9 +1556,9 @@ fn spawn_owner_process(
     path: &std::path::Path,
     runtime_root: &std::path::Path,
     nonce: &str,
-) -> Child {
+) -> OwnerProcess {
     let executable = std::env::current_exe().expect("current integration-test executable");
-    let mut child = Command::new(executable)
+    let child = Command::new(executable)
         .arg("--exact")
         .arg(crate::child_test_filter(
             module_path!(),
@@ -1434,21 +1573,69 @@ fn spawn_owner_process(
         .stdout(Stdio::piped())
         .spawn()
         .expect("start the independent writable owner");
-    let stdout = child.stdout.take().expect("child owner stdout");
-    let mut lines = BufReader::new(stdout).lines();
+    let mut owner = OwnerProcess {
+        child,
+        stdout_drain: None,
+    };
+    let stdout = owner.child.stdout.take().expect("child owner stdout");
+    let mut stdout = BufReader::new(stdout);
+    let mut line = String::new();
     loop {
-        let line = lines
-            .next()
-            .expect("child owner writes a readiness line")
+        line.clear();
+        let bytes = stdout
+            .read_line(&mut line)
             .expect("read child owner output");
-        if line == format!("contextdb-route-owner-ready:{nonce}") {
+        assert_ne!(bytes, 0, "child owner writes a readiness line");
+        if line.trim_end() == format!("contextdb-route-owner-ready:{nonce}") {
             break;
         }
     }
-    child
+    owner.stdout_drain = Some(std::thread::spawn(move || {
+        std::io::copy(&mut stdout, &mut std::io::sink())
+    }));
+    owner
+}
+
+struct OwnerProcess {
+    child: Child,
+    stdout_drain: Option<std::thread::JoinHandle<std::io::Result<u64>>>,
+}
+
+impl OwnerProcess {
+    fn kill(&mut self) -> std::io::Result<()> {
+        self.child.kill()
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait()?;
+        self.join_stdout()?;
+        Ok(status)
+    }
+
+    fn join_stdout(&mut self) -> std::io::Result<()> {
+        let Some(stdout_drain) = self.stdout_drain.take() else {
+            return Ok(());
+        };
+        stdout_drain
+            .join()
+            .map_err(|_| std::io::Error::other("child owner stdout drainer panicked"))??;
+        Ok(())
+    }
+}
+
+impl Drop for OwnerProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = self.join_stdout();
+    }
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn owner_disconnect_after_partial_reply_never_falls_back_within_the_session() {
     if std::env::var_os(ROUTE_OWNER_CHILD).is_some() {
         let path =

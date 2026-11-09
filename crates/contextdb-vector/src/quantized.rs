@@ -1,14 +1,14 @@
-use crate::memory_budget::MemoryBudget;
+use crate::store::VectorMembershipProvenance;
 use contextdb_core::{Lsn, RowId, TxId, VectorEntry, VectorIndexRef, VectorQuantization};
 use parking_lot::Mutex;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-const HNSW_HEADER_BYTES: usize = 12;
-
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StoredVectorEntry {
+    pub membership: VectorMembershipProvenance,
+    pub canonical_deleted_tx: Option<TxId>,
     pub row_id: RowId,
     pub vector: StoredVector,
     pub created_tx: TxId,
@@ -19,6 +19,13 @@ pub(crate) struct StoredVectorEntry {
 impl StoredVectorEntry {
     pub fn from_vector_entry(entry: VectorEntry, quantization: VectorQuantization) -> Self {
         Self {
+            membership: VectorMembershipProvenance::new(
+                entry.created_tx,
+                entry.lsn,
+                entry.created_tx,
+                entry.deleted_tx,
+            ),
+            canonical_deleted_tx: entry.deleted_tx,
             row_id: entry.row_id,
             vector: StoredVector::from_f32(&entry.vector, quantization),
             created_tx: entry.created_tx,
@@ -29,6 +36,13 @@ impl StoredVectorEntry {
 
     pub fn from_vector_entry_ref(entry: &VectorEntry, quantization: VectorQuantization) -> Self {
         Self {
+            membership: VectorMembershipProvenance::new(
+                entry.created_tx,
+                entry.lsn,
+                entry.created_tx,
+                entry.deleted_tx,
+            ),
+            canonical_deleted_tx: entry.deleted_tx,
             row_id: entry.row_id,
             vector: StoredVector::from_f32(&entry.vector, quantization),
             created_tx: entry.created_tx,
@@ -54,8 +68,11 @@ impl StoredVectorEntry {
 
     /// Legacy void moves retain the body-only caller admission protocol even
     /// when their source was promoted by a previous fallible open.
+    #[cfg(test)]
     pub(crate) fn owned_copy(&self) -> Self {
         Self {
+            membership: self.membership,
+            canonical_deleted_tx: self.canonical_deleted_tx,
             row_id: self.row_id,
             vector: self.vector.owned_copy(),
             created_tx: self.created_tx,
@@ -65,7 +82,11 @@ impl StoredVectorEntry {
     }
 
     pub fn visible_at(&self, snapshot: contextdb_core::SnapshotId) -> bool {
-        self.created_tx.0 <= snapshot.0 && self.deleted_tx.is_none_or(|tx| tx.0 > snapshot.0)
+        self.membership.visible_from.0 <= snapshot.0
+            && self
+                .membership
+                .deleted_tx
+                .is_none_or(|tx| tx.0 > snapshot.0)
     }
 }
 
@@ -84,12 +105,16 @@ pub(crate) struct RawVectorPayload<T> {
 struct RawPayloadCharge {
     body_bytes: usize,
     header_bytes: usize,
-    accountant: Arc<dyn MemoryBudget>,
+    accountant: crate::memory_budget::MemoryBudgetOwner,
     /// Promotion can admit a header through a later open's accountant while
     /// the legacy body keeps the funder that already owns its reservation.
-    header_accountant: Option<Arc<dyn MemoryBudget>>,
+    header_accountant: Option<crate::memory_budget::MemoryBudgetOwner>,
     live_body_bytes: Arc<AtomicUsize>,
     live_header_bytes: Arc<AtomicUsize>,
+    _body_control_invoice:
+        Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
+    _header_control_invoice:
+        Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
 }
 
 impl Drop for RawPayloadCharge {
@@ -179,14 +204,25 @@ impl<T> SharedVectorPayload<T> {
     }
 
     /// The caller has admitted the shared header before this allocation.
-    fn promote_to_shared(&mut self, header_accountant: Option<Arc<dyn MemoryBudget>>) {
+    fn promote_to_shared(
+        &mut self,
+        header_accountant: Option<crate::memory_budget::MemoryBudgetOwner>,
+    ) {
         if let Self::Owned(payload) = self {
             let mut charge = payload.charge.get_mut().take();
             if let Some(charge) = charge.as_mut() {
                 let header_bytes = shared_payload_header_bytes();
                 charge.header_bytes = header_bytes;
-                charge.header_accountant = header_accountant
-                    .filter(|accountant| !Arc::ptr_eq(&charge.accountant, accountant));
+                charge.header_accountant = header_accountant.filter(|accountant| {
+                    !crate::memory_budget::same_funder(
+                        charge.accountant.as_ref(),
+                        accountant.as_ref(),
+                    )
+                });
+                charge._header_control_invoice = charge
+                    .header_accountant
+                    .as_ref()
+                    .and_then(|owner| owner.control_invoice());
                 charge
                     .live_header_bytes
                     .fetch_add(header_bytes, Ordering::SeqCst);
@@ -221,10 +257,12 @@ impl<T> SharedVectorPayload<T> {
     fn adopt_charge(
         &self,
         body_bytes: usize,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         live_body_bytes: Arc<AtomicUsize>,
         live_header_bytes: Arc<AtomicUsize>,
     ) {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         let mut charge = self.payload().charge.lock();
         if charge.is_none() {
             let header_bytes = self.header_bytes();
@@ -233,6 +271,8 @@ impl<T> SharedVectorPayload<T> {
             *charge = Some(RawPayloadCharge {
                 body_bytes,
                 header_bytes,
+                _body_control_invoice: accountant.control_invoice(),
+                _header_control_invoice: None,
                 accountant,
                 header_accountant: None,
                 live_body_bytes,
@@ -294,7 +334,29 @@ pub fn stored_vector_value(vector: &[f32], quantization: VectorQuantization) -> 
     match quantization {
         VectorQuantization::F32 => vector.to_vec(),
         VectorQuantization::SQ8 | VectorQuantization::SQ4 => {
-            StoredVector::from_f32(vector, quantization).to_f32()
+            // A row-value projection needs the floats, not a retained stored
+            // payload. Use the same grid and dequantizer directly so this
+            // copy allocates only its final float vector.
+            let levels = if quantization == VectorQuantization::SQ8 {
+                255.0
+            } else {
+                15.0
+            };
+            let (min, max) = vector_min_max(vector);
+            let range = max - min;
+            vector
+                .iter()
+                .map(|value| {
+                    let q = if range <= f32::EPSILON {
+                        0
+                    } else {
+                        (((*value - min) / range) * levels)
+                            .round()
+                            .clamp(0.0, levels) as u8
+                    };
+                    dequantize(q, levels, min, max)
+                })
+                .collect()
         }
     }
 }
@@ -312,6 +374,7 @@ pub fn stored_vector_resident_bytes(dimension: usize, quantization: VectorQuanti
 }
 
 impl StoredVector {
+    #[cfg(test)]
     fn owned_copy(&self) -> Self {
         match self {
             Self::F32(payload) => Self::F32(payload.to_vec().into()),
@@ -409,7 +472,7 @@ impl StoredVector {
 
     pub(crate) fn promote_to_shared_with_header_owner(
         &mut self,
-        accountant: Option<Arc<dyn MemoryBudget>>,
+        accountant: Option<crate::memory_budget::MemoryBudgetOwner>,
     ) {
         match self {
             Self::F32(payload) => payload.promote_to_shared(accountant),
@@ -437,10 +500,12 @@ impl StoredVector {
 
     pub(crate) fn adopt_raw_charge(
         &self,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         live_bytes: Arc<AtomicUsize>,
         live_header_bytes: Arc<AtomicUsize>,
     ) {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         let bytes = self.storage_bytes();
         match self {
             Self::F32(payload) => {
@@ -558,263 +623,43 @@ impl StoredVector {
         }
     }
 
-    pub fn cosine_similarity(&self, query: &[f32]) -> f32 {
+    /// The exact route's ranking key over the coordinates this body actually
+    /// stores: quantized bodies are decoded one coordinate at a time with the
+    /// stored decoder, then compared through the one canonical arithmetic.
+    /// A length mismatch keeps the existing similarity of 0.0.
+    pub fn canonical_similarity(&self, query: &[f32]) -> f64 {
         if query.len() != self.len() {
             return 0.0;
         }
-        match self {
-            StoredVector::F32(vector) => {
-                cosine_from_iter(query.iter().copied(), vector.iter().copied(), vector.len())
-            }
+        let distance = match self {
+            StoredVector::F32(vector) => crate::cosine::canonical_cosine_distance(query, vector),
             StoredVector::SQ8 {
-                min, max, payload, ..
-            } => cosine_query_sq8(query, payload, *min, *max),
+                min,
+                max,
+                len,
+                payload,
+            } => crate::cosine::canonical_cosine_distance_pairs(
+                query.iter().copied().zip(
+                    payload
+                        .iter()
+                        .take(*len)
+                        .map(|byte| dequantize(*byte, 255.0, *min, *max)),
+                ),
+            ),
             StoredVector::SQ4 {
                 min,
                 max,
                 len,
                 payload,
-            } => cosine_query_sq4(query, payload, *len, *min, *max),
-        }
-    }
-
-    pub fn as_f32_slice(&self) -> Option<&[f32]> {
-        match self {
-            StoredVector::F32(vector) => Some(vector),
-            _ => None,
-        }
-    }
-
-    pub fn to_hnsw_u8(&self) -> Vec<u8> {
-        let (len, min, max, payload) = match self {
-            StoredVector::F32(_) => return Vec::new(),
-            StoredVector::SQ8 {
-                min,
-                max,
-                len,
-                payload,
-            }
-            | StoredVector::SQ4 {
-                min,
-                max,
-                len,
-                payload,
-            } => (*len, *min, *max, &payload[..]),
+            } => crate::cosine::canonical_cosine_distance_pairs(
+                query
+                    .iter()
+                    .copied()
+                    .zip((0..*len).map(|at| dequantize(unpack_sq4(payload, at), 15.0, *min, *max))),
+            ),
         };
-        let mut bytes = Vec::with_capacity(HNSW_HEADER_BYTES + payload.len());
-        bytes.extend_from_slice(&(len as u32).to_le_bytes());
-        bytes.extend_from_slice(&min.to_le_bytes());
-        bytes.extend_from_slice(&max.to_le_bytes());
-        bytes.extend_from_slice(payload);
-        bytes
+        1.0 - distance
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct HnswQuantizedHeader<'a> {
-    pub len: usize,
-    pub min: f32,
-    pub max: f32,
-    pub payload: &'a [u8],
-}
-
-pub(crate) fn decode_hnsw_quantized(bytes: &[u8]) -> Option<HnswQuantizedHeader<'_>> {
-    if bytes.len() < HNSW_HEADER_BYTES {
-        return None;
-    }
-    let len = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
-    let min = f32::from_le_bytes(bytes[4..8].try_into().ok()?);
-    let max = f32::from_le_bytes(bytes[8..12].try_into().ok()?);
-    Some(HnswQuantizedHeader {
-        len,
-        min,
-        max,
-        payload: &bytes[HNSW_HEADER_BYTES..],
-    })
-}
-
-pub(crate) fn quantized_hnsw_query_score(
-    bytes: &[u8],
-    query: &[f32],
-    quantization: VectorQuantization,
-) -> Option<f32> {
-    let stored = decode_hnsw_quantized(bytes)?;
-    if stored.len != query.len() {
-        return None;
-    }
-    match quantization {
-        VectorQuantization::SQ8 => Some(cosine_query_sq8(
-            query,
-            stored.payload,
-            stored.min,
-            stored.max,
-        )),
-        VectorQuantization::SQ4 => Some(cosine_query_sq4(
-            query,
-            stored.payload,
-            stored.len,
-            stored.min,
-            stored.max,
-        )),
-        VectorQuantization::F32 => None,
-    }
-}
-
-pub(crate) fn quantized_hnsw_distance(
-    left: &[u8],
-    right: &[u8],
-    quantization: VectorQuantization,
-) -> f32 {
-    let Some(left) = decode_hnsw_quantized(left) else {
-        return 1.0;
-    };
-    let Some(right) = decode_hnsw_quantized(right) else {
-        return 1.0;
-    };
-    let len = left.len.min(right.len);
-    if len == 0 {
-        return 0.0;
-    }
-
-    let similarity = match quantization {
-        VectorQuantization::SQ8 => cosine_sq8(left, right, len),
-        VectorQuantization::SQ4 => cosine_sq4(left, right, len),
-        VectorQuantization::F32 => return 1.0,
-    };
-
-    (1.0 - similarity as f64).max(0.0) as f32
-}
-
-fn cosine_query_sq8(query: &[f32], payload: &[u8], min: f32, max: f32) -> f32 {
-    let len = query.len().min(payload.len());
-    let range = max - min;
-    let scale = if range <= f32::EPSILON {
-        0.0
-    } else {
-        range / 255.0
-    };
-    let (mut dot, mut query_norm, mut vector_norm) = (0.0_f32, 0.0_f32, 0.0_f32);
-    for i in 0..len {
-        let a = query[i];
-        let b = if scale == 0.0 {
-            min
-        } else {
-            min + payload[i] as f32 * scale
-        };
-        dot += a * b;
-        query_norm += a * a;
-        vector_norm += b * b;
-    }
-    finish_cosine(dot, query_norm, vector_norm)
-}
-
-fn cosine_query_sq4(query: &[f32], payload: &[u8], len: usize, min: f32, max: f32) -> f32 {
-    let len = query.len().min(len);
-    let range = max - min;
-    let scale = if range <= f32::EPSILON {
-        0.0
-    } else {
-        range / 15.0
-    };
-    let (mut dot, mut query_norm, mut vector_norm) = (0.0_f32, 0.0_f32, 0.0_f32);
-    for (i, a) in query.iter().copied().enumerate().take(len) {
-        let q = unpack_sq4(payload, i);
-        let b = if scale == 0.0 {
-            min
-        } else {
-            min + q as f32 * scale
-        };
-        dot += a * b;
-        query_norm += a * a;
-        vector_norm += b * b;
-    }
-    finish_cosine(dot, query_norm, vector_norm)
-}
-
-fn cosine_sq8(left: HnswQuantizedHeader<'_>, right: HnswQuantizedHeader<'_>, len: usize) -> f32 {
-    let left_range = left.max - left.min;
-    let right_range = right.max - right.min;
-    let left_scale = if left_range <= f32::EPSILON {
-        0.0
-    } else {
-        left_range / 255.0
-    };
-    let right_scale = if right_range <= f32::EPSILON {
-        0.0
-    } else {
-        right_range / 255.0
-    };
-    let (mut dot, mut left_norm, mut right_norm) = (0.0_f32, 0.0_f32, 0.0_f32);
-    for i in 0..len {
-        let a = if left_scale == 0.0 {
-            left.min
-        } else {
-            left.min + left.payload.get(i).copied().unwrap_or(0) as f32 * left_scale
-        };
-        let b = if right_scale == 0.0 {
-            right.min
-        } else {
-            right.min + right.payload.get(i).copied().unwrap_or(0) as f32 * right_scale
-        };
-        dot += a * b;
-        left_norm += a * a;
-        right_norm += b * b;
-    }
-    finish_cosine(dot, left_norm, right_norm)
-}
-
-fn cosine_sq4(left: HnswQuantizedHeader<'_>, right: HnswQuantizedHeader<'_>, len: usize) -> f32 {
-    let left_range = left.max - left.min;
-    let right_range = right.max - right.min;
-    let left_scale = if left_range <= f32::EPSILON {
-        0.0
-    } else {
-        left_range / 15.0
-    };
-    let right_scale = if right_range <= f32::EPSILON {
-        0.0
-    } else {
-        right_range / 15.0
-    };
-    let (mut dot, mut left_norm, mut right_norm) = (0.0_f32, 0.0_f32, 0.0_f32);
-    for i in 0..len {
-        let a = if left_scale == 0.0 {
-            left.min
-        } else {
-            left.min + unpack_sq4(left.payload, i) as f32 * left_scale
-        };
-        let b = if right_scale == 0.0 {
-            right.min
-        } else {
-            right.min + unpack_sq4(right.payload, i) as f32 * right_scale
-        };
-        dot += a * b;
-        left_norm += a * a;
-        right_norm += b * b;
-    }
-    finish_cosine(dot, left_norm, right_norm)
-}
-
-fn cosine_from_iter<A, B>(left: A, right: B, expected_len: usize) -> f32
-where
-    A: Iterator<Item = f32>,
-    B: Iterator<Item = f32>,
-{
-    let (dot, left_norm, right_norm) = left.zip(right).take(expected_len).fold(
-        (0.0_f32, 0.0_f32, 0.0_f32),
-        |(dot, left_norm, right_norm), (a, b)| (dot + a * b, left_norm + a * a, right_norm + b * b),
-    );
-    if left_norm == 0.0 || right_norm == 0.0 {
-        return 0.0;
-    }
-    finish_cosine(dot, left_norm, right_norm)
-}
-
-fn finish_cosine(dot: f32, left_norm: f32, right_norm: f32) -> f32 {
-    if left_norm == 0.0 || right_norm == 0.0 {
-        return 0.0;
-    }
-    dot / (left_norm.sqrt() * right_norm.sqrt())
 }
 
 fn dequantize(q: u8, levels: f32, min: f32, max: f32) -> f32 {

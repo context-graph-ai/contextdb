@@ -121,7 +121,7 @@ fn anti_tests_rejected_constructs() {
     ));
     assert!(matches!(
         parse("SELECT ROW_NUMBER() OVER (PARTITION BY x) FROM t"),
-        Err(Error::WindowFunctionNotSupported)
+        Err(Error::WindowFunctionNotSupported { .. })
     ));
     assert!(matches!(
         parse("CREATE PROCEDURE p AS SELECT 1"),
@@ -872,17 +872,17 @@ fn rejection_recursive_cte() {
 fn rejection_window_functions() {
     assert!(matches!(
         parse("SELECT ROW_NUMBER() OVER (PARTITION BY x) FROM t"),
-        Err(Error::WindowFunctionNotSupported)
+        Err(Error::WindowFunctionNotSupported { .. })
     ));
     assert!(matches!(
         parse("SELECT id, status, RANK() OVER (ORDER BY confidence DESC) FROM decisions"),
-        Err(Error::WindowFunctionNotSupported)
+        Err(Error::WindowFunctionNotSupported { .. })
     ));
     assert!(matches!(
         parse(
             "SELECT id, SUM(count) OVER (PARTITION BY entity_id ORDER BY created_at) FROM outcomes"
         ),
-        Err(Error::WindowFunctionNotSupported)
+        Err(Error::WindowFunctionNotSupported { .. })
     ));
 }
 
@@ -1464,6 +1464,43 @@ fn insert_without_column_list() {
     );
     assert_eq!(ins.values.len(), 1);
     assert_eq!(ins.values[0].len(), 2);
+}
+
+#[test]
+fn ddl_parses_follows_parent_purge_on_column_and_table_foreign_keys() {
+    let Statement::CreateTable(table) = parse(
+        "CREATE TABLE child (id UUID PRIMARY KEY, \
+         parent_id UUID REFERENCES parent(id) FOLLOWS PARENT PURGE, \
+         plain_id UUID REFERENCES parent(id), \
+         context_id UUID, other_id UUID, \
+         FOREIGN KEY (context_id, other_id) REFERENCES other(context_id, id) FOLLOWS PARENT PURGE, \
+         FOREIGN KEY (context_id, plain_id) REFERENCES parent(context_id, id))",
+    )
+    .expect("both foreign key spellings take the clause") else {
+        panic!("a CREATE TABLE statement");
+    };
+    let reference = |name: &str| {
+        table
+            .columns
+            .iter()
+            .find(|column| column.name == name)
+            .and_then(|column| column.references.as_ref())
+            .unwrap_or_else(|| panic!("{name} references its parent"))
+            .follows_parent_purge
+    };
+    assert!(reference("parent_id"));
+    assert!(
+        !reference("plain_id"),
+        "leaving the clause out means no following"
+    );
+    assert_eq!(
+        table
+            .composite_foreign_keys
+            .iter()
+            .map(|fk| (fk.parent_table.as_str(), fk.follows_parent_purge))
+            .collect::<Vec<_>>(),
+        vec![("other", true), ("parent", false)]
+    );
 }
 
 #[test]

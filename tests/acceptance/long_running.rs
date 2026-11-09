@@ -1,6 +1,4 @@
 use super::common::*;
-#[allow(unused_imports)]
-use std::time::Duration;
 use tempfile::TempDir;
 
 /// I worked offline for a long time accumulating 10,000 rows, reconnected, and all of them made it to the server.

@@ -16,6 +16,13 @@ const MAX_AMORTIZED_COMMIT_P95: Duration = Duration::from_millis(5);
 const MAX_FAST_SINK_P95: Duration = Duration::from_secs(2);
 
 fn bench_event_bus_throughput(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function(
+            "tier1_event_bus_throughput/commit_loop_with_blocked_sink",
+            |_| {},
+        );
+        return;
+    }
     pre_gate_exact_delivery();
 
     let mut group = c.benchmark_group("tier1_event_bus_throughput");

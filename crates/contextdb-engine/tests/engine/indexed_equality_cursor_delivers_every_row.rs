@@ -142,6 +142,10 @@ fn rendered(rows: &[Vec<Value>]) -> Vec<String> {
     rows.iter().map(|row| format!("{row:?}")).collect()
 }
 
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn page_through(
     database: &Database,
     sql: &str,
@@ -160,16 +164,16 @@ fn page_through(
     // it is part of what opening a cursor gives you, not something a later
     // fetch re-delivers. A reader that starts counting at the first `fetch`
     // discards it and mistakes its own omission for lost rows.
-    let mut rows = rendered(&cursor.first_page().rows);
+    let mut rows = rendered(&cursor.first_page().rows());
     let mut pages = 1_usize;
-    let mut has_more = cursor.first_page().has_more;
+    let mut has_more = cursor.first_page().has_more();
     let mut stopped_by = None;
     while has_more {
         match cursor.fetch(NonZeroUsize::new(page_rows as usize)) {
             Ok(page) => {
-                rows.extend(rendered(&page.rows));
+                rows.extend(rendered(&page.rows()));
                 pages += 1;
-                has_more = page.has_more;
+                has_more = page.has_more();
                 assert!(
                     pages < 10_000,
                     "a cursor that keeps promising more without finishing is not paging"
@@ -252,6 +256,10 @@ fn compared(rows: &[String], ordered: bool) -> Vec<String> {
 }
 
 #[test]
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn an_indexed_lookup_read_one_page_at_a_time_gives_what_one_call_gives() {
     let database = seeded();
     let mut losses = Vec::new();
@@ -261,12 +269,12 @@ fn an_indexed_lookup_read_one_page_at_a_time_gives_what_one_call_gives() {
             .execute(shape.sql, &shape.params)
             .unwrap_or_else(|error| panic!("the executor answers {}: {error}", shape.what));
         assert_eq!(
-            whole.rows.len(),
+            whole.rows().len(),
             shape.expected_rows,
             "{}: the fixture holds the rows this shape is about",
             shape.what
         );
-        let expected = compared(&rendered(&whole.rows), shape.ordered);
+        let expected = compared(&rendered(&whole.rows()), shape.ordered);
 
         for page_rows in PAGE_SIZES {
             let paged = page_through(&database, shape.sql, &shape.params, page_rows);

@@ -48,7 +48,8 @@ fn authenticated_server(
             contextdb_core::TenantId::from(tenant),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     )
 }
 
@@ -70,6 +71,7 @@ fn authenticated_client_with_identity(
         contextdb_core::TenantId::from(tenant),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 /// Construct an in-process fake hub over `broker` and immediately spawn its
@@ -98,6 +100,10 @@ fn column_index(columns: &[String], name: &str) -> usize {
         .unwrap_or_else(|| panic!("result must project column {name}: {columns:?}"))
 }
 
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn expect_text_value(db: &Database, table: &str, column: &str, id: Uuid, expected: &str) {
     let mut key = HashMap::new();
     key.insert("id".to_string(), Value::Uuid(id));
@@ -106,25 +112,29 @@ fn expect_text_value(db: &Database, table: &str, column: &str, id: Uuid, expecte
         .execute(&sql, &key)
         .unwrap_or_else(|err| panic!("{table}.{column} lookup must succeed: {err}"));
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "{table} must hold exactly the row {id}"
     );
-    let idx = column_index(&result.columns, column);
+    let idx = column_index(&result.columns(), column);
     assert_eq!(
-        result.rows[0][idx],
+        result.rows()[0][idx],
         Value::Text(expected.to_string()),
         "{table}.{column} for {id} must match"
     );
 }
 
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn uuid_set(db: &Database, table: &str) -> BTreeSet<Uuid> {
     let result = db
         .execute(&format!("SELECT id FROM {table}"), &HashMap::new())
         .unwrap_or_else(|err| panic!("{table} id scan must succeed: {err}"));
-    let id_idx = column_index(&result.columns, "id");
+    let id_idx = column_index(&result.columns(), "id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[id_idx] {
             Value::Uuid(id) => *id,
@@ -791,7 +801,12 @@ fn remove_exact_sanctioned_occurrences(
 }
 
 fn smoke_driver_without_authorized_orchestration(src: &str) -> String {
-    let mut audited = src.to_string();
+    // Rustfmt wraps these three database calls and the canonical-store call.
+    // Normalize only the observed method continuation; exact counts below
+    // still reject an extra engine call in this fixed verifier.
+    let mut audited = src
+        .replace("\n        .changes_since(", ".changes_since(")
+        .replace("\n            .changes_since(", ".changes_since(");
     let smoke_transport_import = format!(
         "use contextdb_engine::transport::{CONCRETE_TRANSPORT_ADAPTER}::{{\n    ProductionSmokeCheckpoint, ProductionSmokeGateKind, arm_production_smoke_gate,\n}};\n"
     );
@@ -836,7 +851,7 @@ fn smoke_driver_without_authorized_orchestration(src: &str) -> String {
         ("Database::open(&edge_path)", 2),
         ("Database::open(&restored_path)", 1),
         ("let db = Database::open_memory();", 1),
-        ("fn custody_client(db: &Arc<Database>", 1),
+        ("fn custody_client(\n    db: &Arc<Database>", 1),
         ("contextdb_engine::AuthenticatedTenantPolicyBinding", 1),
         ("contextdb_engine::DeliveryStatusCounts", 1),
         ("contextdb_engine::DeliveryOutcome", 5),
@@ -851,7 +866,6 @@ fn smoke_driver_without_authorized_orchestration(src: &str) -> String {
         // suppress a future open at any other callsite.
         ("Database::open(&args.db)", 5),
         ("database.changes_since(", 3),
-        ("let canonical = Database::open_memory();", 1),
         ("let database = Database::open_memory();", 3),
         ("print_refused_ddl_state(&Database::open_memory())", 1),
         ("canonical.changes_since(", 1),
@@ -867,7 +881,9 @@ fn smoke_driver_without_authorized_orchestration(src: &str) -> String {
             "smoke driver verifier expression",
         );
     }
-    audited
+    // Opening the verifier's scratch database is orchestration, independent
+    // of its storage choice. Keep scanning every engine operation after open.
+    audited.replace("Database::open(", "")
 }
 
 /// The server crate root may name the engine only through these established
@@ -929,6 +945,10 @@ fn smoke_policy_journey_without_authorized_verifier_orchestration(src: &str) -> 
         );
     }
     for (authorized_use, expected_count) in [
+        (
+            "contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(",
+            1,
+        ),
         // Each is an existing durable verifier handle. A new open expression
         // must stay visible to the ownership scanner.
         ("Arc<Database>", 2),
@@ -1067,8 +1087,11 @@ async fn ip_01_push_pull_converges_over_fake() {
     edge_a_db
         .execute("INSERT INTO notes (id, body) VALUES ($id, $body)", &row)
         .expect("insert on edge A");
-    let expected_push_batches =
-        acceptance_stamped_push_batches_for_test(edge_a_db.changes_since(Lsn(0)));
+    let expected_push_batches = acceptance_stamped_push_batches_for_test(
+        edge_a_db
+            .changes_since(Lsn(0))
+            .expect("read changes_since fixture"),
+    );
     let expected_batch_results =
         expected_apply_results_for_batches(&expected_push_batches, &policies);
     let edge_a_identity = Arc::new(FabricIdentity::generate());
@@ -1100,7 +1123,9 @@ async fn ip_01_push_pull_converges_over_fake() {
             .is_some_and(|lsn| lsn <= edge_a_push.new_lsn),
         "push status must not claim a hub position beyond the following accepted push: {push_status:?}"
     );
-    let live_hub_history = server_db.changes_since(Lsn(0));
+    let live_hub_history = server_db
+        .changes_since(Lsn(0))
+        .expect("read changes_since fixture");
     let push_exchanges = exchanges_on(&broker, &push_subject(tenant));
     assert_eq!(
         push_exchanges.len(),
@@ -1183,8 +1208,12 @@ async fn ip_01_push_pull_converges_over_fake() {
         1,
         "pull must send one complete PullRequest envelope through the fake"
     );
-    let expected_pull_changes =
-        expected_deliverable_table_changes(server_db.changes_since(Lsn(0)), "notes");
+    let expected_pull_changes = expected_deliverable_table_changes(
+        server_db
+            .changes_since(Lsn(0))
+            .expect("read changes_since fixture"),
+        "notes",
+    );
     let (expected_ordinary_pull, expected_dependency_units) =
         split_expected_pull_units(expected_pull_changes);
     assert_eq!(
@@ -1359,6 +1388,7 @@ async fn ip_interrupted_push_after_commit_must_not_report_false_failure() {
         .expect("insert on edge");
     let transmitted_source_ceiling = edge_db
         .changes_since(Lsn(0))
+        .expect("read changes_since fixture")
         .max_lsn()
         .expect("the interrupted push has source work to transmit");
 
@@ -1373,7 +1403,8 @@ async fn ip_interrupted_push_after_commit_must_not_report_false_failure() {
         faulty,
         contextdb_core::TenantId::from(tenant),
         edge_identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
 
     let push = within(edge.push()).await;
 
@@ -1462,8 +1493,11 @@ async fn ip_02_conflicting_push_reports_real_apply_result_over_fake() {
         )
         .expect("insert second");
     let losing_lsn = second_db.current_lsn();
-    let expected_push_batches =
-        acceptance_stamped_push_batches_for_test(second_db.changes_since(Lsn(0)));
+    let expected_push_batches = acceptance_stamped_push_batches_for_test(
+        second_db
+            .changes_since(Lsn(0))
+            .expect("read changes_since fixture"),
+    );
     let second = authenticated_client(second_db.clone(), &broker, tenant);
     let second_push = within(second.push()).await;
     assert!(
@@ -1726,12 +1760,20 @@ async fn ip_03_large_changeset_batch_split_converges_over_fake() {
             )
             .expect("insert blob");
     }
-    let size_split_batches = split_changeset_for_test(edge_db.changes_since(Lsn(0)));
+    let size_split_batches = split_changeset_for_test(
+        edge_db
+            .changes_since(Lsn(0))
+            .expect("read changes_since fixture"),
+    );
     assert!(
         size_split_batches.len() > 1,
         "fixture must exercise the independent size/barrier splitter"
     );
-    let expected_batches = acceptance_stamped_push_batches_for_test(edge_db.changes_since(Lsn(0)));
+    let expected_batches = acceptance_stamped_push_batches_for_test(
+        edge_db
+            .changes_since(Lsn(0))
+            .expect("read changes_since fixture"),
+    );
     assert!(
         expected_batches.len() > 1,
         "fixture must force several sync batches, got {}",
@@ -1790,7 +1832,9 @@ async fn ip_03_large_changeset_batch_split_converges_over_fake() {
     )
     .server_current_lsn
     .expect("authenticated status carries the live hub position");
-    let live_hub_history = server_db.changes_since(Lsn(0));
+    let live_hub_history = server_db
+        .changes_since(Lsn(0))
+        .expect("read changes_since fixture");
     let push_exchanges = exchanges_on(&broker, &push_subject(tenant));
     assert_eq!(
         push_exchanges.len(),
@@ -1904,13 +1948,12 @@ async fn ip_03_large_changeset_batch_split_converges_over_fake() {
         "every exact row of a batch-split push must converge over the fake"
     );
     let pull_exchanges = exchanges_on(&broker, &pull_subject(tenant));
-    assert_eq!(
-        pull_exchanges.len(),
-        1,
-        "the reader pull must travel as a complete pull request over the fake"
+    let expected_pull_changes = expected_deliverable_table_changes(
+        server_db
+            .changes_since(Lsn(0))
+            .expect("read changes_since fixture"),
+        "blobs",
     );
-    let expected_pull_changes =
-        expected_deliverable_table_changes(server_db.changes_since(Lsn(0)), "blobs");
     let (expected_ordinary_pull, expected_dependency_units) =
         split_expected_pull_units(expected_pull_changes);
     assert_eq!(
@@ -1940,40 +1983,137 @@ async fn ip_03_large_changeset_batch_split_converges_over_fake() {
         expected_dependency_units[0].ddl.as_slice(),
         [DdlChange::CreateTable { name, .. }] if name == "blobs"
     ));
-    let expected_pull_response = DependencyCompletePullResponse {
-        ordinary: PullResponse {
-            changeset: expected_wire_changeset_for_freshly_pushed_rows(
-                &server_db,
-                expected_ordinary_pull,
-            ),
-            has_more: false,
-            cursor: Some(server_db.current_lsn()),
-            source: server_db
-                .sync_incarnation(&contextdb_core::TenantId::from(tenant))
-                .ok(),
-            schema_recovery: None,
-        },
-        units: expected_dependency_units
-            .into_iter()
-            .map(|unit| {
-                with_forwarded_schema_author(
-                    expected_wire_changeset_for_freshly_pushed_rows(&server_db, unit),
-                    &edge_node_id,
-                    &pushed_authors,
-                )
-            })
-            .collect(),
-    };
-    assert_pull_exchange(
-        &pull_exchanges[0],
-        PullRequest {
-            since_lsn: Lsn(0),
+    // Ask the existing source-page seam for the pages admitted by the hub's
+    // declared byte bound, then preserve bootstrap barriers exactly as the
+    // shipping pull contract does. A whole-tail oracle cannot describe this.
+    let page_bytes = usize::try_from(
+        server_db
+            .owner_read_config()
+            .limits
+            .limits
+            .cursor_page_bytes,
+    )
+    .expect("page byte limit fits this host");
+    let mut expected_pages = Vec::new();
+    let mut since = Lsn(0);
+    loop {
+        let (source_page, through) = server_db
+            .with_checked_changes_page_for_test(
+                since,
+                page_bytes,
+                server_db
+                    .declared_reader_memory()
+                    .expect("page oracle reader"),
+                |changes, through| (changes.clone(), through),
+            )
+            .expect("select expected bounded source page");
+        let source_frontier = source_page.max_lsn();
+        let application_page = expected_deliverable_table_changes(source_page, "blobs");
+        let mut bootstrap_pages = application_page
+            .clone()
+            .split_at_trigger_bootstrap_barriers();
+        let shaped = bootstrap_pages.len() > 1;
+        let application_page = if shaped {
+            bootstrap_pages.remove(0)
+        } else {
+            application_page
+        };
+        let has_more = shaped || through.is_some();
+        let cursor = if shaped {
+            application_page.max_lsn()
+        } else {
+            application_page
+                .max_lsn()
+                .into_iter()
+                .chain(through)
+                .chain(source_frontier.filter(|_| !has_more))
+                .max()
+        };
+        let (ordinary, units) = split_expected_pull_units(application_page);
+        expected_pages.push((
+            since,
+            DependencyCompletePullResponse {
+                ordinary: PullResponse {
+                    changeset: expected_wire_changeset_for_freshly_pushed_rows(
+                        &server_db, ordinary,
+                    ),
+                    has_more,
+                    cursor,
+                    source: server_db
+                        .sync_incarnation(&contextdb_core::TenantId::from(tenant))
+                        .ok(),
+                    schema_recovery: None,
+                },
+                units: units
+                    .into_iter()
+                    .map(|unit| {
+                        with_forwarded_schema_author(
+                            expected_wire_changeset_for_freshly_pushed_rows(&server_db, unit),
+                            &edge_node_id,
+                            &pushed_authors,
+                        )
+                    })
+                    .collect(),
+            },
+        ));
+        if !has_more {
+            break;
+        }
+        let next = cursor.expect("a bounded nonterminal page discloses its continuation");
+        assert!(next > since, "every bounded page must advance");
+        since = next;
+    }
+    assert_eq!(
+        pull_exchanges.len(),
+        expected_pages.len(),
+        "the reader sends one complete request per engine-bounded page"
+    );
+    for (index, (exchange, (since_lsn, response))) in
+        pull_exchanges.iter().zip(expected_pages).enumerate()
+    {
+        let expected_request = PullRequest {
+            since_lsn,
             max_entries: Some(500),
             schema_recovery: None,
-        },
-        expected_pull_response,
-        "multi-batch history pull",
-    );
+        };
+        if response.units.is_empty() {
+            let request: PullRequest = payload(
+                &exchange.0,
+                MessageType::PullRequest,
+                "ordinary page request",
+            );
+            assert_eq!(request, expected_request, "page {index} request");
+            let actual: PullResponse = payload(
+                &exchange.1,
+                MessageType::PullResponse,
+                "ordinary page response",
+            );
+            let mut expected = response.ordinary;
+            take_served_authorship(
+                &actual.changeset,
+                &mut expected.changeset,
+                "ordinary bounded page",
+            );
+            assert_eq!(actual.cursor, expected.cursor, "page {index} cursor");
+            assert_eq!(
+                actual.has_more, expected.has_more,
+                "page {index} completion"
+            );
+            assert_eq!(
+                wire_changeset_summary(&actual.changeset),
+                wire_changeset_summary(&expected.changeset),
+                "page {index} structure"
+            );
+            assert!(actual == expected, "page {index} exact ordinary payload");
+        } else {
+            assert_pull_exchange(
+                exchange,
+                expected_request,
+                response,
+                &format!("multi-batch history page {index}"),
+            );
+        }
+    }
 
     shutdown.store(true, Ordering::SeqCst);
     let _ = server_task.await;

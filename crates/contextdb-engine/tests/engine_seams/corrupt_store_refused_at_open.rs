@@ -178,7 +178,7 @@ fn a_readable_store_still_opens() {
         session
             .execute("SELECT id FROM kept", &HashMap::new())
             .expect("the intact store answers")
-            .rows
+            .rows()
             .len(),
         0
     );

@@ -110,7 +110,7 @@ fn change_history(reader: &DirectFileReader) -> Result<DirectChangeState, Direct
         .metadata(DirectMetadataRequest::ImageState {
             kind: DirectImageMetadataKind::ChangeLog,
         })
-        .map(|response| match response.body {
+        .map(|response| match response.body.clone() {
             DirectMetadataBody::ImageState {
                 state: DirectImageState::ChangeLog(changes),
             } => changes,
@@ -129,7 +129,7 @@ fn table_order(changes: &DirectChangeState) -> Vec<String> {
         .collect()
 }
 
-fn assert_reported_as_damage(
+pub(crate) fn assert_reported_as_damage(
     result: Result<DirectChangeState, DirectFileReaderError>,
     damage: &str,
 ) {
@@ -138,7 +138,7 @@ fn assert_reported_as_damage(
             DirectStoreDiagnostic::MalformedRecord,
             reason,
         )) => {
-            assert!(!reason.is_empty(), "{damage}: the damage carries a reason")
+            assert!(!(reason == ""), "{damage}: the damage carries a reason")
         }
         Ok(changes) => panic!(
             "{damage} must not be answered as a history: commits={} rows={} tables={:?}",
@@ -150,7 +150,9 @@ fn assert_reported_as_damage(
     }
 }
 
-fn damaged_history(damage: HistoryDamage) -> Result<DirectChangeState, DirectFileReaderError> {
+pub(crate) fn damaged_history(
+    damage: HistoryDamage,
+) -> Result<DirectChangeState, DirectFileReaderError> {
     let root = tempfile::tempdir().expect("history damage directory");
     let path = root.path().join("history.db");
     seed(&path);
@@ -267,7 +269,7 @@ fn assert_open_refuses(damage: HistoryDamage, what: &str) {
             DirectStoreDiagnostic::MalformedRecord,
             reason,
         )) => {
-            assert!(!reason.is_empty(), "{what}: the refusal carries a reason")
+            assert!(!(reason == ""), "{what}: the refusal carries a reason")
         }
         Ok(reader) => {
             let frontiers =
@@ -427,7 +429,7 @@ fn history_under(
         },
         cancellation,
     )
-    .map(|response| match response.body {
+    .map(|response| match response.body.clone() {
         DirectMetadataBody::ImageState {
             state: DirectImageState::ChangeLog(changes),
         } => changes,

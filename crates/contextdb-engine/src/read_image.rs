@@ -9,7 +9,9 @@
 //! re-derived beside it.
 
 use crate::OwnerReadCancellation;
-use crate::cli_render::{render_column_type, render_table_meta};
+use crate::cli_render::render_column_type;
+#[cfg(any(test, feature = "test-seams"))]
+use crate::cli_render::render_table_meta;
 use crate::database::{Database, MaintenancePolicy};
 use crate::direct_file_reader::{
     DirectChangeFrontiers, DirectChangeState, DirectColumnReference, DirectConfigurationState,
@@ -22,12 +24,10 @@ use crate::direct_file_reader::{
     DirectSyncState, DirectTableSyncPolicy, DirectTypedImageDigest, DirectVectorQuantization,
 };
 use crate::executor::ReadExecutionTarget;
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 use crate::memory_accounting::MemoryAccountant;
 use crate::persistence::ReadPersistenceImageParts;
-use contextdb_core::read_contract::{
-    DeadlineClock, MetadataPageVocabulary, ReadFailure, ReadLimits,
-};
+use contextdb_core::read_contract::{DeadlineClock, ReadFailure, ReadLimits};
 use contextdb_core::{
     ColumnType, ContextId, Direction, Error, HistoryPolicy, IndexKind, Lsn, Principal,
     PropagationRule, Result, RetainUnit, ScopeLabel, ScopeLabelKind, SortDirection, SyncDirection,
@@ -42,7 +42,7 @@ pub(crate) struct CommittedImage {
     pub(crate) target: Arc<dyn ReadExecutionTarget>,
     pub(crate) image: Arc<DirectOwnedImage>,
     pub(crate) digest: DirectTypedImageDigest,
-    pub(crate) memory: Arc<crate::read_image_memory::ImageMemory>,
+    pub(crate) memory: crate::read_image_memory::ImageMemoryHandle,
 }
 
 /// What a read session declared about who it reads as and which part of the
@@ -70,11 +70,12 @@ impl crate::persistence::ReadPersistenceImage {
     /// with the owned projection and identity that ride alongside it.
     pub(crate) fn into_committed_image(
         self,
-        retained_source: Arc<crate::persistence::RetainedReadSource>,
+        retained_source: crate::persistence::RetainedReadSource,
         memory_limit: Option<usize>,
         contexts: Option<BTreeSet<ContextId>>,
         scope_labels: Option<BTreeSet<ScopeLabel>>,
         principal: Option<Principal>,
+        declared_read_memory: crate::vector_read_memory::DeclaredReadRoot,
     ) -> std::result::Result<CommittedImage, DirectFileReaderError> {
         build_committed_image(
             self.into_runtime_parts(retained_source),
@@ -84,45 +85,32 @@ impl crate::persistence::ReadPersistenceImage {
                 scope_labels,
                 principal,
             },
+            declared_read_memory,
         )
-        .map_err(|error| match error {
-            Error::MemoryBudgetExceeded {
-                subsystem,
-                operation,
-                requested_bytes,
-                available_bytes,
-                budget_limit_bytes,
-                hint,
-            } => DirectFileReaderError::MemoryBudget {
-                subsystem,
-                operation,
-                requested_bytes,
-                available_bytes,
-                budget_limit_bytes,
-                hint,
-            },
-            other => DirectFileReaderError::Engine(other.to_string()),
-        })
+        .map_err(history_answer_error)
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_committed_image(
     parts: ReadPersistenceImageParts,
     memory_limit: Option<usize>,
     declared: DeclaredReadVisibility,
+    declared_read_memory: crate::vector_read_memory::DeclaredReadRoot,
 ) -> Result<CommittedImage> {
     let digest = parts.content_identity.clone();
     let memory = parts.memory.clone();
     let accountant = memory.accountant.clone();
+    let decode_memory = crate::read_image_memory::ImageMemory::operation_reader(
+        accountant.clone(),
+        parts.open_context.read_memory(),
+    )?;
+    let _decode_scope = decode_memory.enter();
     if let Some(limit) = memory_limit {
         accountant.set_budget(Some(limit))?;
-    }
-    // The committed database consumes the decoded rows below, so it needs one
-    // additional image-sized reservation during construction. The typed image
-    // projection still exists until its incremental identity replacement is
-    // ready, but it does not justify reserving a second Database image.
-    if !parts.lazy_relational {
-        memory.reserve(memory.held())?;
     }
     // Keep durable configuration separate from this process's startup ceiling,
     // so the same committed image keeps the same identity for every reader.
@@ -132,11 +120,17 @@ fn build_committed_image(
         .find(|(key, _)| key == "memory_limit")
         .map(|(_, bytes)| crate::persistence::RedbPersistence::decode_config_value::<usize>(bytes))
         .transpose()?;
-    let mut database =
-        Database::open_committed_image(parts, Arc::new(crate::plugin::CorePlugin), accountant)?;
+    let open_context = parts.open_context.clone();
+    open_context.checkpoint()?;
+    let mut database = Database::open_committed_image(
+        parts,
+        Arc::new(crate::plugin::CorePlugin),
+        accountant,
+        declared_read_memory,
+    )?;
 
     // The metadata projection is read back before any narrowing is applied.
-    let mut image = project_owned_image(&database)?;
+    let mut image = project_owned_image(&database, &memory)?;
     image.configuration.memory_limit_bytes = declared_memory_limit;
     let image = DirectOwnedImage {
         snapshot: DirectSnapshot {
@@ -154,6 +148,28 @@ fn build_committed_image(
         database.declare_read_access(declared.contexts, declared.scope_labels, declared.principal);
     }
 
+    open_context.checkpoint()?;
+    let header = std::alloc::Layout::new::<(
+        std::sync::atomic::AtomicUsize,
+        std::sync::atomic::AtomicUsize,
+    )>();
+    let target_bytes = header
+        .extend(std::alloc::Layout::new::<Database>())
+        .map_err(|_| Error::Other("image target layout overflow".into()))?
+        .0
+        .pad_to_align()
+        .size();
+    let image_bytes = header
+        .extend(std::alloc::Layout::new::<DirectOwnedImage>())
+        .map_err(|_| Error::Other("owned image layout overflow".into()))?
+        .0
+        .pad_to_align()
+        .size();
+    memory.reserve(
+        target_bytes
+            .checked_add(image_bytes)
+            .ok_or_else(|| Error::Other("image controls size overflow".into()))?,
+    )?;
     Ok(CommittedImage {
         target: Arc::new(database) as Arc<dyn ReadExecutionTarget>,
         image: Arc::new(image),
@@ -162,18 +178,44 @@ fn build_committed_image(
     })
 }
 
-fn project_owned_image(database: &Database) -> Result<DirectOwnedImage> {
-    let mut table_names = database.table_names();
-    table_names.sort();
-
-    let schemas = table_names
-        .iter()
-        .filter_map(|table| {
-            database
-                .table_meta(table)
-                .map(|meta| project_schema(table, &meta))
-        })
-        .collect::<Vec<_>>();
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn project_owned_image(
+    database: &Database,
+    memory: &crate::read_image_memory::ImageMemoryHandle,
+) -> Result<DirectOwnedImage> {
+    use crate::local_transport::query_funding::Funded;
+    let schemas = database.with_metadata_catalog(|catalog| -> Result<Vec<DirectSchema>> {
+        let bytes = catalog
+            .len()
+            .checked_mul(std::mem::size_of::<(&str, &contextdb_core::TableMeta)>())
+            .ok_or_else(|| Error::Other("image catalog size overflow".into()))?;
+        let mut source = Funded::allocate_owned(Some(memory.owner()), bytes, || {
+            // A trait-object iterator does not carry TrustedLen. Collect would
+            // choose Vec's minimum capacity for a short catalog; allocate the
+            // admitted exact count explicitly instead.
+            let mut source = Vec::with_capacity(catalog.len());
+            source.extend(catalog);
+            source
+        })?;
+        source
+            .value
+            .sort_unstable_by(|left, right| left.0.cmp(right.0));
+        memory.reserve(
+            source
+                .value
+                .len()
+                .checked_mul(std::mem::size_of::<DirectSchema>())
+                .ok_or_else(|| Error::Other("image schema inventory size overflow".into()))?,
+        )?;
+        let mut schemas = Vec::with_capacity(source.value.len());
+        for (table, meta) in &source.value {
+            schemas.push(project_schema_funded(table, meta, memory.owner())?.into_retained());
+        }
+        Ok(schemas)
+    })?;
 
     // Open authenticates the committed root, but it must not point-load every
     // historical row to manufacture metadata no caller requested. The target
@@ -184,21 +226,51 @@ fn project_owned_image(database: &Database) -> Result<DirectOwnedImage> {
         committed_watermark: database.committed_watermark(),
         next_tx: database.next_tx(),
     };
+    let policy_bytes = schemas.iter().try_fold(
+        schemas
+            .len()
+            .checked_mul(std::mem::size_of::<DirectTableSyncPolicy>())
+            .ok_or_else(|| Error::Other("image policy size overflow".into()))?,
+        |bytes, schema| {
+            bytes
+                .checked_add(schema.table.len())
+                .and_then(|bytes| {
+                    bytes.checked_add(schema.sync_direction.as_deref().unwrap_or("two_way").len())
+                })
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        schema
+                            .conflict_policy
+                            .as_deref()
+                            .unwrap_or("keep_first")
+                            .len(),
+                    )
+                })
+                .ok_or_else(|| Error::Other("image policy size overflow".into()))
+        },
+    )?;
+    memory.reserve(policy_bytes)?;
     let policies = schemas
         .iter()
         .map(|schema| DirectTableSyncPolicy {
             table: schema.table.clone(),
             direction: schema
                 .sync_direction
-                .clone()
-                .unwrap_or_else(|| "two_way".to_owned()),
+                .as_deref()
+                .unwrap_or("two_way")
+                .to_owned(),
             conflict_policy: schema
                 .conflict_policy
-                .clone()
-                .unwrap_or_else(|| "keep_first".to_owned()),
+                .as_deref()
+                .unwrap_or("keep_first")
+                .to_owned(),
         })
         .collect();
-    let sync = direct_sync_state(database, policies, HashMap::new());
+    let sync = DirectSyncState {
+        watermark: database.sync_watermark(),
+        sources: Vec::new(),
+        tables: policies,
+    };
 
     let configuration = DirectConfigurationState {
         memory_limit_bytes: database.memory_limit(),
@@ -206,12 +278,19 @@ fn project_owned_image(database: &Database) -> Result<DirectOwnedImage> {
         schemas,
     };
 
-    let events = project_events(database);
+    let events = database
+        .direct_events_status_funded(memory.owner())?
+        .into_retained();
 
     // Runtime fields are the fresh handle's own: this session started no
     // maintenance and inherits no caller's policy. Retention and currency are
     // declarations, so they come from the image's own schemas.
     let status = database.maintenance_status();
+    let policy = match status.policy {
+        MaintenancePolicy::EngineOwned => "engine_owned",
+        MaintenancePolicy::CallerDriven => "caller_driven",
+    };
+    memory.reserve(policy.len())?;
     let maintenance = DirectMaintenanceStatus {
         policy: match status.policy {
             MaintenancePolicy::EngineOwned => "engine_owned".to_owned(),
@@ -241,14 +320,35 @@ fn direct_quantization(quantization: VectorQuantization) -> DirectVectorQuantiza
     }
 }
 
+/// Output refusal preserves the original typed engine budget and diagnostic fields.
+pub(crate) fn encoding_answer_error(
+    error: crate::read_contract::ReadEncodingError,
+    diagnostic: contextdb_core::read_memory::ReadPrepared<crate::read_contract::ReadEncodingError>,
+) -> DirectFileReaderError {
+    match error {
+        crate::read_contract::ReadEncodingError::Admission(error) => history_answer_error(error),
+        error => DirectFileReaderError::Engine(contextdb_core::error::DiagnosticText::from_shared(
+            diagnostic.publish(error),
+        )),
+    }
+}
+
 /// The reading surface's diagnosis of a history request the engine refused:
 /// damage is the typed corrupt-store answer and a memory refusal is the typed
 /// budget answer, so neither is flattened into an untyped engine message.
-fn history_answer_error(error: Error) -> DirectFileReaderError {
+pub(crate) fn history_answer_error(error: Error) -> DirectFileReaderError {
+    let error = match error {
+        Error::NativeEngineOther(
+            refusal @ contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded { .. },
+        ) => crate::persistence::native_storage_admission::original_storage_error(
+            crate::persistence::native_storage_admission::NativeStorageFailure::Refused(refusal),
+        ),
+        error => error,
+    };
     match error {
         Error::StoreCorrupted { path, reason } => DirectFileReaderError::CorruptStore(
             crate::direct_file_reader::DirectStoreDiagnostic::MalformedRecord,
-            format!("store {path} is corrupt: {reason}"),
+            format!("store {path} is corrupt: {reason}").into(),
         ),
         Error::MemoryBudgetExceeded {
             subsystem,
@@ -267,7 +367,10 @@ fn history_answer_error(error: Error) -> DirectFileReaderError {
         },
         Error::ReadCancelled => DirectFileReaderError::Cancelled,
         Error::ReadFailure(failure) => DirectFileReaderError::ReadFailure(failure),
-        other => DirectFileReaderError::Engine(other.to_string()),
+        Error::Other(reason) => DirectFileReaderError::Engine(reason),
+        Error::NativeEngineOther(refusal) => DirectFileReaderError::Engine(refusal.into()),
+        Error::FundedEngine(owner) => DirectFileReaderError::Engine(owner.into()),
+        other => DirectFileReaderError::Engine(other.to_string().into()),
     }
 }
 
@@ -278,12 +381,12 @@ fn image_history_answer_error(error: crate::database::ImageHistoryError) -> Dire
     match error {
         crate::database::ImageHistoryError::Engine(error) => history_answer_error(error),
         crate::database::ImageHistoryError::Store { diagnosis, .. } => {
-            (*diagnosis).into_direct_reader_error()
+            diagnosis.into_direct_reader_error()
         }
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static ANSWER_ENCODING_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
         const { std::cell::RefCell::new(None) };
@@ -292,23 +395,37 @@ thread_local! {
 /// Run `hook` on this thread each time a metadata answer's encoding is
 /// written, before the request's last check -- so a proof can cancel a
 /// request while its answer is being encoded. Dropping the guard removes it.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from history_request_memory.rs"
+    )
+)]
 pub fn while_encoding_answers_for_test(hook: impl Fn() + 'static) -> AnswerEncodingHookGuard {
     ANSWER_ENCODING_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
     AnswerEncodingHookGuard(())
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader.rs"
+    )
+)]
 pub struct AnswerEncodingHookGuard(());
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl Drop for AnswerEncodingHookGuard {
     fn drop(&mut self) {
         ANSWER_ENCODING_HOOK.with(|slot| slot.borrow_mut().take());
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn answer_encoded_for_test() {
     ANSWER_ENCODING_HOOK.with(|slot| {
         if let Some(hook) = slot.borrow().as_ref() {
@@ -321,8 +438,12 @@ pub(crate) fn answer_encoded_for_test() {
 /// the transient copies its construction admitted are gone once it returns,
 /// the answer itself is not, and it stays charged for as long as its
 /// response is held.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn settle_answer_charge(
-    charge: &crate::read_image_memory::ImageMemory,
+    charge: &crate::read_image_memory::ImageMemoryHandle,
     retained: usize,
 ) -> Result<()> {
     let held = charge.held();
@@ -343,36 +464,59 @@ fn settle_answer_charge(
 pub(crate) fn project_change_state(
     database: &Database,
     checkpoint: &dyn Fn() -> Result<()>,
-    charge: &crate::read_image_memory::ImageMemory,
+    charge: &crate::read_image_memory::ImageMemoryHandle,
 ) -> std::result::Result<DirectChangeState, DirectFileReaderError> {
     // The history is read here, with its refusal reported, before the
     // inspection below that would answer an unreadable history as empty.
+    let read_memory = match charge.reader_budget() {
+        Some(memory) => memory,
+        None => database
+            .declared_reader_memory()
+            .map_err(history_answer_error)?,
+    };
     database
-        .ensure_image_history_within(checkpoint)
+        .ensure_image_history_with_read_memory(checkpoint, read_memory.clone())
         .map_err(image_history_answer_error)?;
-    project_loaded_change_state(database, checkpoint, charge).map_err(history_answer_error)
+    project_loaded_change_state(database, checkpoint, charge, read_memory)
+        .map_err(history_answer_error)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn project_loaded_change_state(
     database: &Database,
     checkpoint: &dyn Fn() -> Result<()>,
-    charge: &crate::read_image_memory::ImageMemory,
+    charge: &crate::read_image_memory::ImageMemoryHandle,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<DirectChangeState> {
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let admit = |bytes: usize| charge.reserve(bytes);
+    let release = |bytes: usize| {
+        charge.release(bytes);
+        Ok(())
+    };
     let projection = crate::database::ChangeProjection {
         checkpoint,
         admit: &admit,
+        release: &release,
         bounded: true,
         ddl: true,
+        page: None,
     };
-    let (changes, _) = database.projected_changes_with_arrivals(&projection, false)?;
-    checkpoint()?;
-    charge.reserve(
-        database
-            .commit_index_len_for_read_image()
-            .saturating_mul(std::mem::size_of::<(Lsn, TxId)>()),
+    let mut vector_copy = charge.vector_copy(0)?;
+    let (changes, _) = database.projected_changes_with_arrivals(
+        &projection,
+        false,
+        &mut vector_copy.owner,
+        charge.clone(),
     )?;
-    let commit_index = database.commit_index_for_read_image()?;
+    vector_copy.into_image();
+    checkpoint()?;
+    let context = contextdb_tx::ReadCommitContext::new(read_memory, checkpoint);
+    let commit_index = database.commit_index_for_read_image(&context, charge)?;
     checkpoint()?;
     let answer = direct_change_state(database, commit_index, changes);
     settle_answer_charge(charge, change_state_bytes(&answer))?;
@@ -433,27 +577,50 @@ fn change_state_bytes(state: &DirectChangeState) -> usize {
 pub(crate) fn project_sync_state(
     database: &Database,
     checkpoint: &dyn Fn() -> Result<()>,
-    charge: &crate::read_image_memory::ImageMemory,
+    charge: &crate::read_image_memory::ImageMemoryHandle,
 ) -> std::result::Result<DirectSyncState, DirectFileReaderError> {
+    let read_memory = match charge.reader_budget() {
+        Some(memory) => memory,
+        None => database
+            .declared_reader_memory()
+            .map_err(history_answer_error)?,
+    };
     database
-        .ensure_image_history_within(checkpoint)
+        .ensure_image_history_with_read_memory(checkpoint, read_memory)
         .map_err(image_history_answer_error)?;
     project_loaded_sync_state(database, checkpoint, charge).map_err(history_answer_error)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn project_loaded_sync_state(
     database: &Database,
     checkpoint: &dyn Fn() -> Result<()>,
-    charge: &crate::read_image_memory::ImageMemory,
+    charge: &crate::read_image_memory::ImageMemoryHandle,
 ) -> Result<DirectSyncState> {
     let admit = |bytes: usize| charge.reserve(bytes);
+    let release = |bytes: usize| {
+        charge.release(bytes);
+        Ok(())
+    };
     let projection = crate::database::ChangeProjection {
         checkpoint,
         admit: &admit,
+        release: &release,
         bounded: true,
         ddl: false,
+        page: None,
     };
-    let (changes, arrivals) = database.projected_changes_with_arrivals(&projection, true)?;
+    let mut vector_copy = charge.vector_copy(0)?;
+    let (changes, arrivals) = database.projected_changes_with_arrivals(
+        &projection,
+        true,
+        &mut vector_copy.owner,
+        charge.clone(),
+    )?;
+    vector_copy.into_image();
     drop(changes);
     checkpoint()?;
     // Each table's policy is read from its declaration in place: the answer
@@ -565,6 +732,14 @@ fn direct_change_state(
 /// One projection serves both the committed image and a live database,
 /// because it is the same question: what event types, sinks, routes and
 /// schedules does this store declare.
+#[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from read_content_test_adapter.rs"
+    )
+)]
 pub(crate) fn project_events(database: &Database) -> DirectEventsStatus {
     let bus = database.event_bus_status();
     DirectEventsStatus {
@@ -635,26 +810,268 @@ fn project_scope_label(kind: &ScopeLabelKind) -> DirectScopeLabelKind {
     }
 }
 
+/// Price the concrete schema clone before making its first allocation. The
+/// DDL and type strings use counted writers, and transitions are inserted in
+/// sorted order under the existing native map node envelope.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(crate) fn project_schema_funded(
+    table: &str,
+    meta: &contextdb_core::TableMeta,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+) -> Result<crate::local_transport::query_funding::Funded<DirectSchema>> {
+    use crate::cli_render::{MetadataColumnType, metadata_text_len};
+    use contextdb_core::read_memory::ReadCredit;
+    let mut ddl = crate::cli_render::render_table_meta_funded(owner.clone(), table, meta)?;
+    let mut bytes = 0usize;
+    let overflow = || Error::Other("schema projection size overflow".into());
+    let mut add = |amount: usize| -> Result<()> {
+        bytes = bytes.checked_add(amount).ok_or_else(overflow)?;
+        Ok(())
+    };
+    fn list_bytes(values: &[String]) -> Option<usize> {
+        values.iter().try_fold(
+            values.len().checked_mul(std::mem::size_of::<String>())?,
+            |bytes, value| bytes.checked_add(value.len()),
+        )
+    }
+    add(table.len())?;
+    add(meta
+        .columns
+        .len()
+        .checked_mul(std::mem::size_of::<DirectSchemaColumn>())
+        .ok_or_else(overflow)?)?;
+    for column in &meta.columns {
+        add(column.name.len())?;
+        add(metadata_text_len(format_args!(
+            "{}",
+            MetadataColumnType(&column.column_type)
+        ))?)?;
+        if let Some(default) = &column.default {
+            add(default.len())?;
+        }
+        if let Some(reference) = &column.references {
+            add(reference.table.len())?;
+            add(reference.column.len())?;
+            if let Some(PropagationRule::ForeignKey { trigger_state, target_state, .. }) = meta.propagation_rules.iter().find(|rule|
+                matches!(rule, PropagationRule::ForeignKey { fk_column, .. } if fk_column == &column.name)) {
+                add(trigger_state.len())?; add(target_state.len())?;
+            }
+        }
+        if let Some(keys) = &column.partition_key_columns {
+            add(list_bytes(keys).ok_or_else(overflow)?)?;
+        }
+        if let Some(rank) = &column.rank_policy {
+            for text in [
+                &rank.sort_key,
+                &rank.formula,
+                &rank.joined_table,
+                &rank.joined_column,
+            ] {
+                add(text.len())?;
+            }
+        }
+        if let Some(scope) = &column.scope_label {
+            match scope {
+                ScopeLabelKind::Simple { write_labels } => {
+                    add(list_bytes(write_labels).ok_or_else(overflow)?)?
+                }
+                ScopeLabelKind::Split {
+                    read_labels,
+                    write_labels,
+                } => {
+                    add(list_bytes(read_labels).ok_or_else(overflow)?)?;
+                    add(list_bytes(write_labels).ok_or_else(overflow)?)?;
+                }
+            }
+        }
+        if let Some(acl) = &column.acl_ref {
+            add(acl.ref_table.len())?;
+            add(acl.ref_column.len())?;
+        }
+    }
+    if meta.primary_key_columns.is_empty() {
+        let count = meta
+            .columns
+            .iter()
+            .filter(|column| column.primary_key)
+            .count();
+        add(count
+            .checked_mul(std::mem::size_of::<String>())
+            .ok_or_else(overflow)?)?;
+        for column in meta.columns.iter().filter(|column| column.primary_key) {
+            add(column.name.len())?;
+        }
+    } else {
+        add(list_bytes(&meta.primary_key_columns).ok_or_else(overflow)?)?;
+    }
+    let index_count = meta
+        .indexes
+        .iter()
+        .filter(|index| index.kind != IndexKind::Auto)
+        .count();
+    add(index_count
+        .checked_mul(std::mem::size_of::<DirectSchemaIndex>())
+        .ok_or_else(overflow)?)?;
+    for index in meta
+        .indexes
+        .iter()
+        .filter(|index| index.kind != IndexKind::Auto)
+    {
+        add(index.name.len())?;
+        add(index
+            .columns
+            .len()
+            .checked_mul(std::mem::size_of::<DirectIndexColumn>())
+            .ok_or_else(overflow)?)?;
+        for (column, _) in &index.columns {
+            add(column.len())?;
+        }
+    }
+    if let Some(state) = &meta.state_machine {
+        add(state.column.len())?;
+        add(crate::local_transport::query_funding::tree_bytes::<
+            String,
+            Vec<String>,
+        >(state.transitions.len())?)?;
+        for (from, to) in &state.transitions {
+            add(from.len())?;
+            add(list_bytes(to).ok_or_else(overflow)?)?;
+        }
+    }
+    if meta.default_ttl_seconds.is_some() {
+        add(meta
+            .retain_declared_unit
+            .unwrap_or(RetainUnit::Seconds)
+            .sql()
+            .len())?;
+    }
+    if let Some(history) = meta.history_policy {
+        add(match history {
+            HistoryPolicy::All => "ALL",
+            HistoryPolicy::CurrentOnly => "CURRENT_ONLY",
+        }
+        .len())?;
+    }
+    if let Some(direction) = meta.sync_direction {
+        add(sync_direction_str(direction).len())?;
+    }
+    if let Some(conflict) = conflict_policy_str(meta) {
+        add(conflict.len())?;
+    }
+    add(list_bytes(&meta.dag_edge_types).ok_or_else(overflow)?)?;
+    add(meta
+        .propagation_rules
+        .len()
+        .checked_mul(std::mem::size_of::<DirectPropagationRule>())
+        .ok_or_else(overflow)?)?;
+    for rule in &meta.propagation_rules {
+        match rule {
+            PropagationRule::Edge {
+                edge_type,
+                direction,
+                trigger_state,
+                target_state,
+                ..
+            } => {
+                add(edge_type.len())?;
+                add(trigger_state.len())?;
+                add(target_state.len())?;
+                add(match direction {
+                    Direction::Incoming => "INCOMING",
+                    Direction::Outgoing => "OUTGOING",
+                    Direction::Both => "BOTH",
+                }
+                .len())?;
+            }
+            PropagationRule::VectorExclusion { trigger_state } => add(trigger_state.len())?,
+            PropagationRule::ForeignKey {
+                fk_column,
+                referenced_table,
+                referenced_column,
+                trigger_state,
+                target_state,
+                ..
+            } => {
+                for text in [
+                    fk_column,
+                    referenced_table,
+                    referenced_column,
+                    trigger_state,
+                    target_state,
+                ] {
+                    add(text.len())?;
+                }
+            }
+        }
+    }
+    let mut credit = ReadCredit::try_new_owned(
+        owner,
+        bytes,
+        "reader",
+        "schema_projection",
+        "Raise the declared memory limit to inspect this schema.",
+    )?;
+    if let Some(ddl_credit) = ddl.credit.take() {
+        credit.try_merge_prepaid(ddl_credit)?;
+    }
+    let schema = project_schema_with_ddl(table, meta, ddl.value);
+    Ok(crate::local_transport::query_funding::Funded {
+        value: schema,
+        credit: Some(credit),
+    })
+}
+fn sync_direction_str(direction: SyncDirection) -> &'static str {
+    match direction {
+        SyncDirection::None => "sync_off",
+        SyncDirection::Push => "push_only",
+        SyncDirection::Pull => "pull_only",
+        SyncDirection::Both => "two_way",
+    }
+}
+fn conflict_policy_str(meta: &contextdb_core::TableMeta) -> Option<&'static str> {
+    meta.conflict_policy
+        .and_then(|policy| policy.declared_clause())
+        .map(|clause| match clause {
+            "SYNC CONFLICT KEEP FIRST" => "keep_first",
+            "SYNC CONFLICT KEEP LATEST" => "keep_latest",
+            other => other,
+        })
+}
+
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn project_schema(table: &str, meta: &contextdb_core::TableMeta) -> DirectSchema {
+    project_schema_with_ddl(table, meta, render_table_meta(table, meta))
+}
+
+fn project_schema_with_ddl(
+    table: &str,
+    meta: &contextdb_core::TableMeta,
+    ddl: String,
+) -> DirectSchema {
     let columns = meta
         .columns
         .iter()
         .map(|column| {
-            let propagation = meta.propagation_rules.iter().find_map(|rule| match rule {
-                PropagationRule::ForeignKey {
-                    fk_column,
-                    trigger_state,
-                    target_state,
-                    max_depth,
-                    abort_on_failure,
-                    ..
-                } if fk_column == &column.name => Some(DirectReferencePropagation {
-                    on_state: trigger_state.clone(),
-                    set_state: target_state.clone(),
-                    max_depth: *max_depth,
-                    abort_on_failure: *abort_on_failure,
-                }),
-                _ => None,
+            let propagation = column.references.as_ref().and_then(|_| {
+                meta.propagation_rules.iter().find_map(|rule| match rule {
+                    PropagationRule::ForeignKey {
+                        fk_column,
+                        trigger_state,
+                        target_state,
+                        max_depth,
+                        abort_on_failure,
+                        ..
+                    } if fk_column == &column.name => Some(DirectReferencePropagation {
+                        on_state: trigger_state.clone(),
+                        set_state: target_state.clone(),
+                        max_depth: *max_depth,
+                        abort_on_failure: *abort_on_failure,
+                    }),
+                    _ => None,
+                })
             });
             DirectSchemaColumn {
                 name: column.name.clone(),
@@ -694,19 +1111,34 @@ pub(crate) fn project_schema(table: &str, meta: &contextdb_core::TableMeta) -> D
         })
         .collect::<Vec<_>>();
     let primary_key = if meta.primary_key_columns.is_empty() {
-        meta.columns
-            .iter()
-            .filter(|column| column.primary_key)
-            .map(|column| column.name.clone())
-            .collect()
+        let mut keys = Vec::with_capacity(
+            meta.columns
+                .iter()
+                .filter(|column| column.primary_key)
+                .count(),
+        );
+        keys.extend(
+            meta.columns
+                .iter()
+                .filter(|column| column.primary_key)
+                .map(|column| column.name.clone()),
+        );
+        keys
     } else {
         meta.primary_key_columns.clone()
     };
-    let indexes = meta
+    let mut indexes = Vec::with_capacity(
+        meta.indexes
+            .iter()
+            .filter(|index| index.kind != IndexKind::Auto)
+            .count(),
+    );
+    for index in meta
         .indexes
         .iter()
         .filter(|index| index.kind != IndexKind::Auto)
-        .map(|index| DirectSchemaIndex {
+    {
+        indexes.push(DirectSchemaIndex {
             name: index.name.clone(),
             columns: index
                 .columns
@@ -719,15 +1151,24 @@ pub(crate) fn project_schema(table: &str, meta: &contextdb_core::TableMeta) -> D
                     },
                 })
                 .collect(),
-        })
-        .collect();
-    let state_machine = meta.state_machine.as_ref().map(|state| DirectStateMachine {
-        column: state.column.clone(),
-        transitions: state
+        });
+    }
+    let state_machine = meta.state_machine.as_ref().map(|state| {
+        let mut transitions = BTreeMap::new();
+        let mut previous: Option<&str> = None;
+        while let Some((from, to)) = state
             .transitions
             .iter()
-            .map(|(from, to)| (from.clone(), to.clone()))
-            .collect(),
+            .filter(|(key, _)| previous.is_none_or(|previous| key.as_str() > previous))
+            .min_by(|left, right| left.0.cmp(right.0))
+        {
+            transitions.insert(from.clone(), to.clone());
+            previous = Some(from);
+        }
+        DirectStateMachine {
+            column: state.column.clone(),
+            transitions,
+        }
     });
     let retain = meta.default_ttl_seconds.map(|seconds| {
         let (window, unit) = match meta.retain_declared_unit {
@@ -793,7 +1234,16 @@ pub(crate) fn project_schema(table: &str, meta: &contextdb_core::TableMeta) -> D
             },
         })
         .collect::<Vec<_>>();
-    propagate.sort_by_key(propagation_sort_key);
+    // Preserve equal-key order without sort scratch or cloned comparison keys.
+    for at in 1..propagate.len() {
+        let mut next = at;
+        while next != 0
+            && propagation_sort_key(&propagate[next]) < propagation_sort_key(&propagate[next - 1])
+        {
+            propagate.swap(next, next - 1);
+            next -= 1;
+        }
+    }
     DirectSchema {
         table: table.to_owned(),
         immutable: meta.immutable,
@@ -807,7 +1257,7 @@ pub(crate) fn project_schema(table: &str, meta: &contextdb_core::TableMeta) -> D
         conflict_policy: conflict_policy_word(meta),
         dag_edge_types: meta.dag_edge_types.clone(),
         propagate,
-        ddl: render_table_meta(table, meta),
+        ddl,
     }
 }
 
@@ -831,61 +1281,124 @@ fn conflict_policy_word(meta: &contextdb_core::TableMeta) -> Option<String> {
         })
 }
 
-fn propagation_sort_key(rule: &DirectPropagationRule) -> (u8, String, String) {
+fn propagation_sort_key(rule: &DirectPropagationRule) -> (u8, &str, &str) {
     match rule {
         DirectPropagationRule::Edge {
             edge_type,
             on_state,
             ..
-        } => (0, on_state.clone(), edge_type.clone()),
+        } => (0, on_state.as_str(), edge_type.as_str()),
         DirectPropagationRule::ForeignKey {
             column, on_state, ..
-        } => (1, on_state.clone(), column.clone()),
-        DirectPropagationRule::VectorExclusion { on_state } => (2, on_state.clone(), String::new()),
+        } => (1, on_state.as_str(), column.as_str()),
+        DirectPropagationRule::VectorExclusion { on_state } => (2, on_state.as_str(), ""),
     }
 }
 
 /// Length-prefixed absorption, so two different shapes cannot hash alike.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 struct FamilyDigest {
     hasher: blake3::Hasher,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl FamilyDigest {
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     fn new(_accountant: &Arc<MemoryAccountant>) -> Self {
         Self {
             hasher: blake3::Hasher::new(),
         }
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     fn bytes(&mut self, bytes: &[u8]) -> &mut Self {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_work_probe::note_hashed_bytes(bytes.len());
         self.hasher.update(&(bytes.len() as u64).to_le_bytes());
         self.hasher.update(bytes);
         self
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     fn text(&mut self, text: &str) -> &mut Self {
         self.bytes(text.as_bytes())
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     fn number(&mut self, value: u64) -> &mut Self {
         self.hasher.update(&value.to_le_bytes());
         self
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     fn flag(&mut self, value: bool) -> &mut Self {
         self.number(u64::from(value))
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     fn finish(&self) -> [u8; 32] {
         *self.hasher.finalize().as_bytes()
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader_contract_tests.rs"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn typed_digest(
     image: &DirectOwnedImage,
     accountant: &Arc<MemoryAccountant>,
@@ -1063,7 +1576,21 @@ fn typed_digest(
     })
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from read_only_open_loads_only_the_working_set.rs"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(crate) fn typed_digest_for_test(image: &DirectOwnedImage) -> Result<DirectTypedImageDigest> {
     typed_digest(image, &Arc::new(MemoryAccountant::no_limit()))
 }
@@ -1148,8 +1675,8 @@ fn write_vector_search_disclosure(
             crate::database::VectorQuerySourceDisclosure::RedactedRowKey => 1,
             crate::database::VectorQuerySourceDisclosure::Unknown => 2,
         })
-        .count(disclosure.partition_hnsw.len() as u64);
-    for partition in &disclosure.partition_hnsw {
+        .count(disclosure.partitions.len() as u64);
+    for partition in &disclosure.partitions {
         bytes
             .text(&partition.partition)
             .tag(match partition.route {
@@ -1158,17 +1685,28 @@ fn write_vector_search_disclosure(
                 Some(crate::database::VectorSearchRoute::Indexed) => 2,
                 Some(crate::database::VectorSearchRoute::FilteredIndexed) => 3,
             })
-            .optional_text(partition.reason.as_deref())
-            .count(partition.hnsw_m as u64)
-            .count(partition.hnsw_ef_construction as u64)
-            .count(partition.hnsw_ef_search as u64)
-            .text(&partition.ef_search_source)
-            .count(partition.policy_revision);
+            .optional_text(partition.reason.as_deref());
+        for (member, source) in [
+            (partition.lists, &partition.lists_source),
+            (partition.probes, &partition.probes_source),
+            (
+                partition.refine_factor_hundredths,
+                &partition.refine_factor_source,
+            ),
+        ] {
+            match member {
+                Some(value) => bytes.tag(1).count(u64::from(value)),
+                None => bytes.tag(0),
+            };
+            bytes.optional_text(source.as_deref());
+        }
+        bytes.count(partition.policy_revision);
     }
     for count in [
         disclosure.global_candidate_budget,
         disclosure.admission_evaluations,
         disclosure.expansion_evaluations,
+        disclosure.rescore_evaluations,
         disclosure.layers_admitted,
     ] {
         match count {
@@ -1183,6 +1721,10 @@ fn write_vector_search_disclosure(
     bytes.optional_text(disclosure.budget_terminal.as_deref());
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn read_vector_search_disclosure(
     bytes: &mut crate::read_contract::CanonicalReader<'_>,
 ) -> std::result::Result<
@@ -1216,7 +1758,7 @@ fn read_vector_search_disclosure(
         usize::try_from(bytes.count()?).map_err(|_| invalid_metadata_payload())?;
     let auto_index_at_source = bytes.text()?;
     let column_count = bytes.element_count()?;
-    let mut partition_key_columns = Vec::with_capacity(column_count);
+    let mut partition_key_columns = bytes.vector(column_count)?;
     for _ in 0..column_count {
         partition_key_columns.push(bytes.text()?);
     }
@@ -1261,28 +1803,41 @@ fn read_vector_search_disclosure(
         _ => return Err(invalid_metadata_payload()),
     };
     let partition_count = bytes.element_count()?;
-    let mut partition_hnsw = Vec::with_capacity(partition_count);
+    let mut partitions = bytes.vector(partition_count)?;
     for _ in 0..partition_count {
-        partition_hnsw.push(crate::database::VectorPartitionHnswDisclosure {
-            partition: bytes.text()?,
-            route: match bytes.tag()? {
+        let partition = bytes.text()?;
+        let route = match bytes.tag()? {
+            0 => None,
+            1 => Some(crate::database::VectorSearchRoute::Exact),
+            2 => Some(crate::database::VectorSearchRoute::Indexed),
+            3 => Some(crate::database::VectorSearchRoute::FilteredIndexed),
+            _ => return Err(invalid_metadata_payload()),
+        };
+        let reason = bytes.optional_text()?;
+        let mut members = [(None, None), (None, None), (None, None)];
+        for member in &mut members {
+            let value = match bytes.tag()? {
                 0 => None,
-                1 => Some(crate::database::VectorSearchRoute::Exact),
-                2 => Some(crate::database::VectorSearchRoute::Indexed),
-                3 => Some(crate::database::VectorSearchRoute::FilteredIndexed),
+                1 => Some(u32::try_from(bytes.count()?).map_err(|_| invalid_metadata_payload())?),
                 _ => return Err(invalid_metadata_payload()),
-            },
-            reason: bytes.optional_text()?,
-            hnsw_m: usize::try_from(bytes.count()?).map_err(|_| invalid_metadata_payload())?,
-            hnsw_ef_construction: usize::try_from(bytes.count()?)
-                .map_err(|_| invalid_metadata_payload())?,
-            hnsw_ef_search: usize::try_from(bytes.count()?)
-                .map_err(|_| invalid_metadata_payload())?,
-            ef_search_source: bytes.text()?,
+            };
+            *member = (value, bytes.optional_text()?);
+        }
+        let [lists, probes, refine] = members;
+        partitions.push(crate::database::VectorPartitionDisclosure {
+            partition,
+            route,
+            reason,
+            lists: lists.0,
+            lists_source: lists.1,
+            probes: probes.0,
+            probes_source: probes.1,
+            refine_factor_hundredths: refine.0,
+            refine_factor_source: refine.1,
             policy_revision: bytes.count()?,
         });
     }
-    let mut budget_counts = [None; 4];
+    let mut budget_counts = [None; 5];
     for count in &mut budget_counts {
         *count = match bytes.tag()? {
             0 => None,
@@ -1309,11 +1864,12 @@ fn read_vector_search_disclosure(
         refusal,
         recovery,
         query_source,
-        partition_hnsw,
+        partitions,
         global_candidate_budget: budget_counts[0],
         admission_evaluations: budget_counts[1],
         expansion_evaluations: budget_counts[2],
-        layers_admitted: budget_counts[3],
+        rescore_evaluations: budget_counts[3],
+        layers_admitted: budget_counts[4],
         budget_terminal,
     }))
 }
@@ -1329,16 +1885,10 @@ pub(crate) fn write_metadata_body(
 ) {
     match body {
         DirectMetadataBody::DeliveryStatus { counts, has_more } => {
-            bytes
-                .tag(6)
-                .flag(*has_more)
-                .text(&serde_json::to_string(counts).expect("finite custody counts serialize"));
+            bytes.tag(6).flag(*has_more).json_text(counts);
         }
         DirectMetadataBody::DeliveryOutcome { outcome, has_more } => {
-            bytes
-                .tag(7)
-                .flag(*has_more)
-                .text(&serde_json::to_string(outcome).expect("custody projection serializes"));
+            bytes.tag(7).flag(*has_more).json_text(outcome);
         }
         DirectMetadataBody::Tables { items, has_more } => {
             bytes.tag(0).count(items.len() as u64);
@@ -1372,6 +1922,15 @@ pub(crate) fn write_metadata_body(
             bytes.tag(3);
             write_events(bytes, status);
             bytes.flag(*has_more).optional_text(continuation.as_deref());
+        }
+        DirectMetadataBody::VerifyHistory { table, indexes } => {
+            bytes.tag(8).text(table).count(indexes.len() as u64);
+            for index in indexes {
+                bytes
+                    .text(&index.index)
+                    .count(index.postings)
+                    .count(index.versions);
+            }
         }
         DirectMetadataBody::MaintenanceStatus { status } => {
             bytes
@@ -1459,13 +2018,24 @@ pub(crate) fn write_metadata_body(
 /// The exact inverse of [`write_metadata_body`]: same order, same tags, same
 /// prefixes. Kept beside the writer so the two are read together and a field
 /// added to one is visibly missing from the other.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn read_metadata_body(
     bytes: &mut crate::read_contract::CanonicalReader<'_>,
 ) -> std::result::Result<DirectMetadataBody, crate::read_contract::ReadEncodingError> {
+    let _decode_scope =
+        crate::read_image_memory::ImageMemory::enter_decode_call().map_err(|error| {
+            crate::read_contract::encoding_error_from_core(
+                error,
+                contextdb_core::read_contract::ReadLimits::SHIPPED_MEMORY,
+            )
+        })?;
     match bytes.tag()? {
         0 => {
             let count = bytes.element_count()?;
-            let mut items = Vec::new();
+            let mut items = bytes.vector(count)?;
             for _ in 0..count {
                 items.push(bytes.text()?);
             }
@@ -1510,10 +2080,29 @@ pub(crate) fn read_metadata_body(
         5 => Ok(DirectMetadataBody::ImageState {
             state: read_image_state(bytes)?,
         }),
+        8 => {
+            let table = bytes.text()?;
+            let count = bytes.element_count()?;
+            let mut indexes = bytes.vector(count)?;
+            for _ in 0..count {
+                indexes.push(crate::HistoricalIndexVerification {
+                    index: bytes.text()?,
+                    postings: bytes.count()?,
+                    versions: bytes.count()?,
+                });
+            }
+            Ok(DirectMetadataBody::VerifyHistory { table, indexes })
+        }
         6 => {
             let has_more = bytes.flag()?;
             let counts: Option<crate::DeliveryStatusCounts> =
-                serde_json::from_str(&bytes.text()?).map_err(|_| invalid_metadata_payload())?;
+                crate::read_image_memory::decode_json(&_decode_scope, bytes.text()?.as_bytes())
+                    .map_err(|error| {
+                        crate::read_contract::encoding_error_from_core(
+                            error,
+                            contextdb_core::read_contract::ReadLimits::SHIPPED_MEMORY,
+                        )
+                    })?;
             if has_more == counts.is_some() {
                 return Err(invalid_metadata_payload());
             }
@@ -1521,8 +2110,14 @@ pub(crate) fn read_metadata_body(
         }
         7 => {
             let has_more = bytes.flag()?;
-            let outcome = crate::custody_types::decode_outcome_projection(&bytes.text()?)
-                .map_err(|_| invalid_metadata_payload())?;
+            let outcome = crate::custody_types::decode_outcome_projection(&bytes.text()?).map_err(
+                |error| {
+                    crate::read_contract::encoding_error_from_core(
+                        error,
+                        contextdb_core::read_contract::ReadLimits::SHIPPED_MEMORY,
+                    )
+                },
+            )?;
             if has_more && outcome.is_some() {
                 return Err(invalid_metadata_payload());
             }
@@ -1536,6 +2131,10 @@ fn invalid_metadata_payload() -> crate::read_contract::ReadEncodingError {
     crate::read_contract::ReadEncodingError::InvalidPayload
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn read_image_state(
     bytes: &mut crate::read_contract::CanonicalReader<'_>,
 ) -> std::result::Result<DirectImageState, crate::read_contract::ReadEncodingError> {
@@ -1543,7 +2142,7 @@ fn read_image_state(
         0 => {
             let watermark = Lsn(bytes.count()?);
             let source_count = bytes.element_count()?;
-            let mut sources = Vec::new();
+            let mut sources = bytes.vector(source_count)?;
             for _ in 0..source_count {
                 let row_lsn = Lsn(bytes.count()?);
                 let source_lsn = match bytes.tag()? {
@@ -1557,7 +2156,7 @@ fn read_image_state(
                 });
             }
             let table_count = bytes.element_count()?;
-            let mut tables = Vec::new();
+            let mut tables = bytes.vector(table_count)?;
             for _ in 0..table_count {
                 tables.push(DirectTableSyncPolicy {
                     table: bytes.text()?,
@@ -1576,7 +2175,7 @@ fn read_image_state(
             let committed_watermark = TxId(bytes.count()?);
             let next_tx = TxId(bytes.count()?);
             let index_count = bytes.element_count()?;
-            let mut commit_index = Vec::new();
+            let mut commit_index = bytes.vector(index_count)?;
             for _ in 0..index_count {
                 commit_index.push((Lsn(bytes.count()?), TxId(bytes.count()?)));
             }
@@ -1585,7 +2184,7 @@ fn read_image_state(
             let vectors = read_rendered(bytes)?;
             let ddl = read_rendered(bytes)?;
             let lsn_count = bytes.element_count()?;
-            let mut ddl_lsn = Vec::new();
+            let mut ddl_lsn = bytes.vector(lsn_count)?;
             for _ in 0..lsn_count {
                 ddl_lsn.push(Lsn(bytes.count()?));
             }
@@ -1613,7 +2212,7 @@ fn read_image_state(
                 _ => return Err(invalid_metadata_payload()),
             };
             let schema_count = bytes.element_count()?;
-            let mut schemas = Vec::new();
+            let mut schemas = bytes.vector(schema_count)?;
             for _ in 0..schema_count {
                 schemas.push(read_schema(bytes)?);
             }
@@ -1630,36 +2229,62 @@ fn read_image_state(
 /// The change log's own entries are written as their serde rendering, so they
 /// are read back the same way. A rendering that is not the type it sits in
 /// front of is an invalid payload, not an empty entry.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn read_rendered<T: serde::de::DeserializeOwned>(
     bytes: &mut crate::read_contract::CanonicalReader<'_>,
 ) -> std::result::Result<Vec<T>, crate::read_contract::ReadEncodingError> {
+    let _decode_scope =
+        crate::read_image_memory::ImageMemory::enter_decode_call().map_err(|error| {
+            crate::read_contract::encoding_error_from_core(
+                error,
+                contextdb_core::read_contract::ReadLimits::SHIPPED_MEMORY,
+            )
+        })?;
     let count = bytes.element_count()?;
-    let mut values = Vec::new();
+    let mut values = bytes.vector(count)?;
     for _ in 0..count {
         let rendered = bytes.raw()?;
-        values.push(serde_json::from_slice(rendered).map_err(|_| invalid_metadata_payload())?);
+        values.push(
+            crate::read_image_memory::decode_json(&_decode_scope, rendered).map_err(|error| {
+                crate::read_contract::encoding_error_from_core(
+                    error,
+                    contextdb_core::read_contract::ReadLimits::SHIPPED_MEMORY,
+                )
+            })?,
+        );
     }
     Ok(values)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn read_labels_list(
     bytes: &mut crate::read_contract::CanonicalReader<'_>,
 ) -> std::result::Result<Vec<String>, crate::read_contract::ReadEncodingError> {
     let count = bytes.element_count()?;
-    let mut labels = Vec::with_capacity(count);
+    let mut labels = bytes.vector(count)?;
     for _ in 0..count {
         labels.push(bytes.text()?);
     }
     Ok(labels)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn read_schema(
     bytes: &mut crate::read_contract::CanonicalReader<'_>,
 ) -> std::result::Result<DirectSchema, crate::read_contract::ReadEncodingError> {
     let table = bytes.text()?;
     let immutable = bytes.flag()?;
     let column_count = bytes.element_count()?;
-    let mut columns = Vec::new();
+    let mut columns = bytes.vector(column_count)?;
     for _ in 0..column_count {
         let name = bytes.text()?;
         let data_type = bytes.text()?;
@@ -1752,7 +2377,7 @@ fn read_schema(
             _ => return Err(invalid_metadata_payload()),
         };
         let partition_key_count = bytes.element_count()?;
-        let mut partition_key_columns = Vec::with_capacity(partition_key_count);
+        let mut partition_key_columns = bytes.vector(partition_key_count)?;
         for _ in 0..partition_key_count {
             partition_key_columns.push(bytes.text()?);
         }
@@ -1787,16 +2412,16 @@ fn read_schema(
         });
     }
     let primary_key_count = bytes.element_count()?;
-    let mut primary_key = Vec::new();
+    let mut primary_key = bytes.vector(primary_key_count)?;
     for _ in 0..primary_key_count {
         primary_key.push(bytes.text()?);
     }
     let index_count = bytes.element_count()?;
-    let mut indexes = Vec::new();
+    let mut indexes = bytes.vector(index_count)?;
     for _ in 0..index_count {
         let name = bytes.text()?;
         let column_count = bytes.element_count()?;
-        let mut index_columns = Vec::new();
+        let mut index_columns = bytes.vector(column_count)?;
         for _ in 0..column_count {
             let column = bytes.text()?;
             let direction = match bytes.tag()? {
@@ -1816,11 +2441,19 @@ fn read_schema(
         1 => {
             let column = bytes.text()?;
             let transition_count = bytes.element_count()?;
+            // Native B-tree node capacity is admitted before insertion on
+            // this same decoder owner; strings and target vectors are separate.
+            bytes.admit(
+                crate::local_transport::query_funding::tree_bytes::<String, Vec<String>>(
+                    transition_count,
+                )
+                .map_err(crate::read_contract::ReadEncodingError::Admission)?,
+            )?;
             let mut transitions = BTreeMap::new();
             for _ in 0..transition_count {
                 let from = bytes.text()?;
                 let target_count = bytes.element_count()?;
-                let mut targets = Vec::new();
+                let mut targets = bytes.vector(target_count)?;
                 for _ in 0..target_count {
                     targets.push(bytes.text()?);
                 }
@@ -1847,12 +2480,12 @@ fn read_schema(
     let sync_direction = bytes.optional_text()?;
     let conflict_policy = bytes.optional_text()?;
     let edge_type_count = bytes.element_count()?;
-    let mut dag_edge_types = Vec::new();
+    let mut dag_edge_types = bytes.vector(edge_type_count)?;
     for _ in 0..edge_type_count {
         dag_edge_types.push(bytes.text()?);
     }
     let rule_count = bytes.element_count()?;
-    let mut propagate = Vec::new();
+    let mut propagate = bytes.vector(rule_count)?;
     for _ in 0..rule_count {
         propagate.push(match bytes.tag()? {
             0 => DirectPropagationRule::Edge {
@@ -1896,11 +2529,15 @@ fn read_schema(
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn read_events(
     bytes: &mut crate::read_contract::CanonicalReader<'_>,
 ) -> std::result::Result<DirectEventsStatus, crate::read_contract::ReadEncodingError> {
     let type_count = bytes.element_count()?;
-    let mut event_types = Vec::new();
+    let mut event_types = bytes.vector(type_count)?;
     for _ in 0..type_count {
         event_types.push(DirectEventTypeStatus {
             name: bytes.text()?,
@@ -1909,7 +2546,7 @@ fn read_events(
         });
     }
     let sink_count = bytes.element_count()?;
-    let mut sinks = Vec::new();
+    let mut sinks = bytes.vector(sink_count)?;
     for _ in 0..sink_count {
         sinks.push(DirectSinkStatus {
             name: bytes.text()?,
@@ -1924,7 +2561,7 @@ fn read_events(
         });
     }
     let route_count = bytes.element_count()?;
-    let mut routes = Vec::new();
+    let mut routes = bytes.vector(route_count)?;
     for _ in 0..route_count {
         routes.push(DirectRouteStatus {
             name: bytes.text()?,
@@ -1933,7 +2570,7 @@ fn read_events(
         });
     }
     let schedule_count = bytes.element_count()?;
-    let mut schedules = Vec::new();
+    let mut schedules = bytes.vector(schedule_count)?;
     for _ in 0..schedule_count {
         let name = bytes.text()?;
         let every = bytes.text()?;
@@ -1966,18 +2603,19 @@ fn read_events(
     })
 }
 
-fn write_rendered<T: serde::Serialize>(
+fn write_rendered<T: history_json::HistoryJson>(
     bytes: &mut crate::read_contract::CanonicalWriter,
     values: &[T],
 ) {
     bytes.count(values.len() as u64);
     for value in values {
-        let rendered = serde_json::to_value(value)
-            .and_then(|document| serde_json::to_vec(&document))
-            .unwrap_or_default();
-        bytes.raw(&rendered);
+        bytes.json_text(&history_json::Canonical(value));
     }
 }
+
+mod history_json;
+mod metadata_clone;
+use metadata_clone::CloneHeapBytes;
 
 fn write_labels_list(bytes: &mut crate::read_contract::CanonicalWriter, labels: &[String]) {
     bytes.count(labels.len() as u64);
@@ -2252,14 +2890,37 @@ fn write_events(bytes: &mut crate::read_contract::CanonicalWriter, events: &Dire
 /// Every kind a live owner can answer is answered here in the same words the
 /// file route uses; the one kind it cannot is refused by name rather than
 /// answered emptily -- see [`project_metadata`] for the image's own version.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn project_metadata_from_database(
     database: &Database,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     request: DirectMetadataRequest,
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
     continuation: Option<&str>,
     cancellation: &OwnerReadCancellation,
-) -> std::result::Result<(DirectMetadataBody, Option<String>), DirectFileReaderError> {
+) -> std::result::Result<
+    (
+        DirectMetadataBody,
+        Option<String>,
+        crate::read_image_memory::ImageMemoryHandle,
+    ),
+    DirectFileReaderError,
+> {
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+    let charge = crate::read_image_memory::ImageMemory::admitted_reader_for(
+        crate::executor::ReadExecutionTarget::bounded_read_accountant(database),
+        read_memory.clone(),
+        "reader",
+        "metadata_body",
+        "Raise the reader memory limit.",
+    )
+    .map_err(history_answer_error)?;
+    let _read_scope = database.enter_writer_read(None, read_memory.clone());
     // An inventory is bounded a page at a time by the pager below. Everything
     // else arrives whole, so whether it fits is decided once it is built.
     let arrives_whole = !matches!(
@@ -2270,33 +2931,50 @@ pub(crate) fn project_metadata_from_database(
     let body = match request {
         request @ (DirectMetadataRequest::DeliveryStatus { .. }
         | DirectMetadataRequest::DeliveryOutcome { .. }) => {
-            crate::custody::inspection::metadata(database, request)
-                .map_err(|e| DirectFileReaderError::Engine(e.to_string()))?
+            crate::custody::inspection::metadata(database, request, read_memory.clone())
+                .map_err(history_answer_error)?
         }
         DirectMetadataRequest::Tables => {
-            let page = paged(
-                MetadataPageVocabulary::Tables,
-                crate::metadata_page::table_items(database.table_names()),
-                continuation,
-                limits.result_bytes,
-                crate::metadata_page::metadata_table_key,
+            let page = funded_paging(
+                read_memory.clone(),
+                database.metadata_table_page(
+                    read_memory.clone(),
+                    continuation,
+                    limits.result_bytes,
+                ),
             )?;
-            resume_at = page.continuation.clone();
+            charge
+                .reserve(
+                    page.value
+                        .continuation
+                        .as_ref()
+                        .map_or(0, |text| text.len()),
+                )
+                .map_err(history_answer_error)?;
+            resume_at = page.value.continuation.clone();
             DirectMetadataBody::Tables {
-                items: crate::metadata_page::table_names_of(&page),
-                has_more: page.has_more,
+                items: crate::metadata_page::table_names_of_funded(&page.value, &charge)
+                    .map_err(history_answer_error)?,
+                has_more: page.value.has_more,
             }
         }
         DirectMetadataRequest::Schema { table } => {
-            let meta = database.table_meta(&table).ok_or_else(|| {
-                DirectFileReaderError::Engine(format!("table not found: {table}"))
-            })?;
+            let schema = database
+                .metadata_schema(&table, charge.owner())
+                .map_err(history_answer_error)?
+                .ok_or_else(|| {
+                    engine_message(
+                        read_memory.clone(),
+                        format_args!("table not found: {table}"),
+                    )
+                })?;
             DirectMetadataBody::Schema {
-                schema: project_schema(&table, &meta),
+                schema: schema.into_retained(),
             }
         }
         DirectMetadataRequest::Explain { sql, params } => explained_statement(
             database,
+            read_memory.clone(),
             sql,
             &params,
             limits,
@@ -2304,21 +2982,32 @@ pub(crate) fn project_metadata_from_database(
             cancellation,
         )?,
         DirectMetadataRequest::EventsStatus => {
-            let page = paged(
-                MetadataPageVocabulary::EventsStatus,
-                crate::metadata_page::event_status_items(
-                    &database.event_bus_status(),
-                    &database.cron_status(),
+            let source = database
+                .direct_events_status_funded(read_memory.clone())
+                .map_err(history_answer_error)?;
+            let page = funded_paging(
+                read_memory.clone(),
+                crate::metadata_page::borrowed_event_page(
+                    read_memory.clone(),
+                    &source.value,
+                    continuation,
+                    limits.result_bytes,
                 ),
-                continuation,
-                limits.result_bytes,
-                crate::metadata_page::metadata_event_key,
             )?;
-            resume_at = page.continuation.clone();
+            charge
+                .reserve(
+                    page.value
+                        .continuation
+                        .as_ref()
+                        .map_or(0, |text| text.len().saturating_mul(2)),
+                )
+                .map_err(history_answer_error)?;
+            resume_at = page.value.continuation.clone();
             DirectMetadataBody::EventsStatus {
-                status: crate::metadata_page::events_of(&page),
-                has_more: page.has_more,
-                continuation: page.continuation.clone(),
+                status: crate::metadata_page::events_of_funded(&page.value, &charge)
+                    .map_err(history_answer_error)?,
+                has_more: page.value.has_more,
+                continuation: page.value.continuation.clone(),
             }
         }
         DirectMetadataRequest::MaintenanceStatus => {
@@ -2339,19 +3028,29 @@ pub(crate) fn project_metadata_from_database(
                 },
             }
         }
+        DirectMetadataRequest::VerifyHistory { table } => {
+            // The walk stops at this request's cancellation or active time.
+            let started_ms = clock.now_ms();
+            let indexes = database
+                .verify_historical_indexes_within(&table, read_memory.clone(), &mut || {
+                    request_checkpoint(cancellation, clock.as_ref(), started_ms, limits.active_ms)
+                })
+                .map_err(history_answer_error)?;
+            DirectMetadataBody::VerifyHistory { table, indexes }
+        }
         // The route decides this one: an owner -- here or over a channel --
         // is not a committed file. The session refuses it before reaching
         // this projection; this arm keeps the match honest if it ever does.
         DirectMetadataRequest::ImageState { .. } => {
             return Err(DirectFileReaderError::Engine(
-                "the state of a committed image is a question about a file".to_owned(),
+                "the state of a committed image is a question about a file".into(),
             ));
         }
     };
     if arrives_whole {
         admit_complete(&body, limits.result_bytes)?;
     }
-    Ok((body, resume_at))
+    Ok((body, resume_at, charge))
 }
 
 /// The stable word a caller branches on for the inspection asked for here.
@@ -2369,12 +3068,18 @@ pub(crate) const IMAGE_STATE_INSPECTION: &str = "image_state";
 /// of being handed a bare "not implemented" it cannot act on.
 pub(crate) fn image_state_is_a_file_question() -> Error {
     Error::ReadFailure(ReadFailure::owner_route_unsupported(
-        IMAGE_STATE_INSPECTION.to_owned(),
+        IMAGE_STATE_INSPECTION.into(),
     ))
 }
 
+#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn project_metadata(
     target: &dyn ReadExecutionTarget,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     request: DirectMetadataRequest,
     image: &DirectOwnedImage,
     limits: ReadLimits,
@@ -2382,6 +3087,8 @@ pub(crate) fn project_metadata(
     continuation: Option<&str>,
     cancellation: &OwnerReadCancellation,
 ) -> std::result::Result<DirectMetadataResponse, DirectFileReaderError> {
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let arrives_whole = !matches!(
         request,
         DirectMetadataRequest::Tables | DirectMetadataRequest::EventsStatus
@@ -2390,12 +3097,19 @@ pub(crate) fn project_metadata(
         request,
         DirectMetadataRequest::ImageState {
             kind: DirectImageMetadataKind::ChangeLog | DirectImageMetadataKind::Sync
-        }
+        } | DirectMetadataRequest::VerifyHistory { .. }
     );
     // What this answer costs the reader's memory while it is built, encoded
     // and then held by the caller: released when the last copy of the
     // response is dropped.
-    let charge = crate::read_image_memory::ImageMemory::charging(target.bounded_read_accountant());
+    let charge = crate::read_image_memory::ImageMemory::admitted_reader_for(
+        target.bounded_read_accountant(),
+        read_memory.clone(),
+        "reader",
+        "metadata_body",
+        "Raise the reader memory limit.",
+    )
+    .map_err(history_answer_error)?;
     // A history this request has to read is walked record by record; the walk
     // stops at the request's cancellation or its active-time budget instead
     // of finishing a history nobody is waiting for.
@@ -2420,29 +3134,37 @@ pub(crate) fn project_metadata(
     let body = match request {
         request @ (DirectMetadataRequest::DeliveryStatus { .. }
         | DirectMetadataRequest::DeliveryOutcome { .. }) => target
-            .delivery_metadata(request)
-            .map_err(|e| DirectFileReaderError::Engine(e.to_string()))?,
+            .delivery_metadata(request, read_memory.clone())
+            .map_err(history_answer_error)?,
         DirectMetadataRequest::Tables => {
             // Cut by the same pager the owner uses, so an inventory read from
             // the file breaks at exactly the places it breaks over a channel.
-            let page = paged(
-                MetadataPageVocabulary::Tables,
-                crate::metadata_page::table_items(
+            let page = funded_paging(
+                read_memory.clone(),
+                crate::metadata_page::borrowed_table_page(
+                    read_memory.clone(),
                     image
                         .configuration
                         .schemas
                         .iter()
-                        .map(|schema| schema.table.clone())
-                        .collect(),
+                        .map(|schema| schema.table.as_str()),
+                    continuation,
+                    limits.result_bytes,
                 ),
-                continuation,
-                limits.result_bytes,
-                crate::metadata_page::metadata_table_key,
             )?;
-            resume_at = page.continuation.clone();
+            charge
+                .reserve(
+                    page.value
+                        .continuation
+                        .as_ref()
+                        .map_or(0, |text| text.len()),
+                )
+                .map_err(history_answer_error)?;
+            resume_at = page.value.continuation.clone();
             DirectMetadataBody::Tables {
-                items: crate::metadata_page::table_names_of(&page),
-                has_more: page.has_more,
+                items: crate::metadata_page::table_names_of_funded(&page.value, &charge)
+                    .map_err(history_answer_error)?,
+                has_more: page.value.has_more,
             }
         }
         DirectMetadataRequest::Schema { table } => {
@@ -2451,14 +3173,22 @@ pub(crate) fn project_metadata(
                 .schemas
                 .iter()
                 .find(|schema| schema.table == table)
-                .cloned()
                 .ok_or_else(|| {
-                    DirectFileReaderError::Engine(format!("table not found: {table}"))
+                    engine_message(
+                        read_memory.clone(),
+                        format_args!("table not found: {table}"),
+                    )
                 })?;
-            DirectMetadataBody::Schema { schema }
+            charge
+                .reserve(schema.clone_heap_bytes().map_err(history_answer_error)?)
+                .map_err(history_answer_error)?;
+            DirectMetadataBody::Schema {
+                schema: schema.clone(),
+            }
         }
         DirectMetadataRequest::Explain { sql, params } => explained_statement(
             target,
+            read_memory.clone(),
             sql,
             &params,
             limits,
@@ -2466,22 +3196,51 @@ pub(crate) fn project_metadata(
             cancellation,
         )?,
         DirectMetadataRequest::EventsStatus => {
-            let page = paged(
-                MetadataPageVocabulary::EventsStatus,
-                crate::metadata_page::event_status_items_of(&image.events),
-                continuation,
-                limits.result_bytes,
-                crate::metadata_page::metadata_event_key,
+            let page = funded_paging(
+                read_memory.clone(),
+                crate::metadata_page::borrowed_event_page(
+                    read_memory.clone(),
+                    &image.events,
+                    continuation,
+                    limits.result_bytes,
+                ),
             )?;
-            resume_at = page.continuation.clone();
+            charge
+                .reserve(
+                    page.value
+                        .continuation
+                        .as_ref()
+                        .map_or(0, |text| text.len().saturating_mul(2)),
+                )
+                .map_err(history_answer_error)?;
+            resume_at = page.value.continuation.clone();
             DirectMetadataBody::EventsStatus {
-                status: crate::metadata_page::events_of(&page),
-                has_more: page.has_more,
-                continuation: page.continuation.clone(),
+                status: crate::metadata_page::events_of_funded(&page.value, &charge)
+                    .map_err(history_answer_error)?,
+                has_more: page.value.has_more,
+                continuation: page.value.continuation.clone(),
             }
         }
-        DirectMetadataRequest::MaintenanceStatus => DirectMetadataBody::MaintenanceStatus {
-            status: image.maintenance.clone(),
+        DirectMetadataRequest::MaintenanceStatus => {
+            charge
+                .reserve(
+                    image
+                        .maintenance
+                        .clone_heap_bytes()
+                        .map_err(history_answer_error)?,
+                )
+                .map_err(history_answer_error)?;
+            DirectMetadataBody::MaintenanceStatus {
+                status: image.maintenance.clone(),
+            }
+        }
+        DirectMetadataRequest::VerifyHistory { table } => DirectMetadataBody::VerifyHistory {
+            indexes: target
+                .historical_index_verification(&table, read_memory.clone(), &mut || {
+                    history_checkpoint()
+                })
+                .map_err(history_answer_error)?,
+            table,
         },
         DirectMetadataRequest::ImageState { kind } => DirectMetadataBody::ImageState {
             state: match kind {
@@ -2494,7 +3253,12 @@ pub(crate) fn project_metadata(
                 DirectImageMetadataKind::Configuration => {
                     // The copy is admitted at the size of what it copies.
                     charge
-                        .reserve(configuration_state_bytes(&image.configuration))
+                        .reserve(
+                            image
+                                .configuration
+                                .clone_heap_bytes()
+                                .map_err(history_answer_error)?,
+                        )
                         .map_err(history_answer_error)?;
                     DirectImageState::Configuration(image.configuration.clone())
                 }
@@ -2505,48 +3269,48 @@ pub(crate) fn project_metadata(
     // request's result ceiling is refused on its own size, and the bytes
     // that carry it are admitted before they exist.
     let encoded_len = crate::read_contract::encoded_metadata_body_len(&body);
-    if arrives_whole {
-        if let Some(failure) =
+    if arrives_whole
+        && let Some(failure) =
             crate::metadata_page::admit_complete_metadata(encoded_len, limits.result_bytes)
-        {
-            return Err(DirectFileReaderError::ReadFailure(failure));
-        }
-        charge.reserve(encoded_len).map_err(history_answer_error)?;
+    {
+        return Err(DirectFileReaderError::ReadFailure(failure));
     }
     if reads_history {
         history_checkpoint().map_err(history_answer_error)?;
     }
-    let canonical_bytes = crate::read_contract::encode_metadata_body_measured(&body, encoded_len);
+    let encoding_diagnostic = contextdb_core::error::DiagnosticText::try_prepare_shared::<
+        crate::read_contract::ReadEncodingError,
+    >(
+        read_memory.clone(),
+        "reader",
+        "encode_metadata",
+        "Raise the reader memory limit to encode metadata.",
+    )
+    .map_err(history_answer_error)?;
+    let canonical_bytes = crate::read_contract::encode_metadata_body_funded(
+        &body,
+        read_memory.clone(),
+        limits.memory,
+    )
+    .and_then(|bytes| crate::read_contract::EncodedReadBytes::from_funded(bytes, limits.memory))
+    .map_err(|error| encoding_answer_error(error, encoding_diagnostic))?;
     if reads_history {
         // A request cancelled, or out of active time, while its answer was
         // being encoded is refused rather than answered.
         history_checkpoint().map_err(history_answer_error)?;
     }
-    Ok(DirectMetadataResponse {
+    let metadata = crate::read_session::MetadataAnswer::try_new(
         body,
+        resume_at,
+        crate::read_image_memory::AnswerCharge::holding(charge),
+        read_memory,
+    )
+    .map_err(history_answer_error)?;
+    Ok(DirectMetadataResponse {
+        metadata,
         canonical_bytes,
         snapshot: image.snapshot,
-        continuation: resume_at,
-        charge: crate::read_image_memory::AnswerCharge::holding(charge),
     })
-}
-
-/// What one copy of a committed image's configuration holds: its schemas,
-/// measured by their canonical encoding -- which visits every field once --
-/// and tripled, because a decoded copy costs more than its wire bytes once
-/// its containers are counted.
-fn configuration_state_bytes(configuration: &DirectConfigurationState) -> usize {
-    64usize.saturating_add(
-        configuration
-            .schemas
-            .iter()
-            .map(|schema| {
-                let mut counter = crate::read_contract::CanonicalWriter::counting();
-                write_schema(&mut counter, schema);
-                counter.len().saturating_mul(3)
-            })
-            .sum::<usize>(),
-    )
 }
 
 /// What the engine would do with this statement, without running it.
@@ -2561,17 +3325,32 @@ fn configuration_state_bytes(configuration: &DirectConfigurationState) -> usize 
 /// count and route this answer reports.
 pub(crate) fn explained_statement(
     target: &dyn ReadExecutionTarget,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     sql: String,
     params: &HashMap<String, Value>,
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
     cancellation: &OwnerReadCancellation,
 ) -> std::result::Result<DirectMetadataBody, DirectFileReaderError> {
-    let statement = contextdb_parser::parse(&sql)
-        .map_err(|error| DirectFileReaderError::Engine(error.to_string()))?;
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+    let parse_diagnostic =
+        crate::direct_file_reader::PreparedEngineDiagnostic::new(read_memory.clone())
+            .map_err(history_answer_error)?;
+    let statement =
+        contextdb_parser::parse(&sql).map_err(|error| parse_diagnostic.engine(error))?;
+    let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
+    let explain_diagnostic =
+        crate::direct_file_reader::PreparedEngineDiagnostic::new(read_memory.clone())
+            .map_err(history_answer_error)?;
     let explained = target
-        .explain_output_without_running_it(&sql, params)
-        .map_err(|error| DirectFileReaderError::Engine(error.to_string()))?;
+        .explain_output_without_running_it(
+            &sql,
+            params,
+            &mut vector_copy_owner,
+            read_memory.clone(),
+        )
+        .map_err(|error| explain_diagnostic.engine(error))?;
     if contextdb_parser::statement_effect(&statement) != contextdb_parser::StatementEffect::Read
         || explained.vector_search.is_some()
     {
@@ -2582,7 +3361,8 @@ pub(crate) fn explained_statement(
             sql,
         });
     }
-    let answered = target.read_query(&sql, params, limits, clock, cancellation)?;
+    let answered =
+        target.read_query(&sql, params, read_memory, limits, clock, cancellation, None)?;
     Ok(DirectMetadataBody::Explain {
         physical_plan: answered.0.trace.physical_plan.to_owned(),
         index: answered.0.trace.index_used.clone(),
@@ -2591,27 +3371,28 @@ pub(crate) fn explained_statement(
     })
 }
 
-/// One page of an inventory, cut by the shared pager.
-fn paged(
-    vocabulary: MetadataPageVocabulary,
-    items: Vec<contextdb_core::read_contract::MetadataItem>,
-    continuation: Option<&str>,
-    page_bytes: u64,
-    key: fn(&contextdb_core::read_contract::MetadataItem) -> String,
-) -> std::result::Result<contextdb_core::read_contract::MetadataPage, DirectFileReaderError> {
-    crate::metadata_page::continuation_page(vocabulary, items, continuation, page_bytes, key)
-        .map_err(|error| match error {
-            // A misused continuation and a page that cannot fit are both
-            // typed refusals a caller can act on -- the same ones the owner
-            // gives for the same store -- not engine prose.
-            crate::metadata_page::MetadataPagingError::Continuation(failure)
-            | crate::metadata_page::MetadataPagingError::Oversized(failure) => {
-                DirectFileReaderError::ReadFailure(failure)
-            }
-            crate::metadata_page::MetadataPagingError::Encoding(encoding) => {
-                DirectFileReaderError::Engine(encoding.to_string())
-            }
-        })
+fn funded_paging(
+    read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+    page: std::result::Result<
+        crate::local_transport::query_funding::Funded<contextdb_core::read_contract::MetadataPage>,
+        crate::metadata_page::MetadataPagingError,
+    >,
+) -> std::result::Result<
+    crate::local_transport::query_funding::Funded<contextdb_core::read_contract::MetadataPage>,
+    DirectFileReaderError,
+> {
+    page.map_err(|error| match error {
+        crate::metadata_page::MetadataPagingError::Continuation(failure)
+        | crate::metadata_page::MetadataPagingError::Oversized(failure) => {
+            DirectFileReaderError::ReadFailure(failure)
+        }
+        crate::metadata_page::MetadataPagingError::Encoding(
+            crate::read_contract::ReadEncodingError::Admission(error),
+        ) => history_answer_error(error),
+        crate::metadata_page::MetadataPagingError::Encoding(error) => {
+            engine_message(read_memory, format_args!("{error}"))
+        }
+    })
 }
 
 /// Refuse a complete answer that does not fit the byte ceiling in force.
@@ -2623,10 +3404,46 @@ fn admit_complete(
     body: &DirectMetadataBody,
     result_bytes: u64,
 ) -> std::result::Result<(), DirectFileReaderError> {
-    let payload = crate::read_contract::encode_metadata_body(body)
-        .map_err(|error| DirectFileReaderError::Engine(error.to_string()))?;
-    match crate::metadata_page::admit_complete_metadata(payload.len(), result_bytes) {
+    let encoded_len = crate::read_contract::encoded_metadata_body_len(body);
+    match crate::metadata_page::admit_complete_metadata(encoded_len, result_bytes) {
         Some(failure) => Err(DirectFileReaderError::ReadFailure(failure)),
         None => Ok(()),
+    }
+}
+
+/// A walk's checkpoint: cancelled, or past its active time, it refuses.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(crate) fn request_checkpoint(
+    cancellation: &OwnerReadCancellation,
+    clock: &dyn DeadlineClock,
+    started_ms: u64,
+    active_ms: u64,
+) -> Result<()> {
+    if cancellation.is_cancelled() {
+        return Err(Error::ReadCancelled);
+    }
+    if clock.now_ms().saturating_sub(started_ms) > active_ms {
+        return Err(Error::ReadFailure(ReadFailure::owner_limit_exceeded(
+            contextdb_core::read_contract::OwnerLimitExceededDetail {
+                limit: contextdb_core::read_contract::ReadFailureLimit::ActiveMs,
+                value: active_ms,
+                required: None,
+                statement: None,
+            },
+        )));
+    }
+    Ok(())
+}
+
+fn engine_message(
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+    value: impl std::fmt::Display,
+) -> DirectFileReaderError {
+    match crate::funded_error::diagnostic_text(owner, value) {
+        Ok(text) => DirectFileReaderError::Engine(text),
+        Err(error) => history_answer_error(error),
     }
 }

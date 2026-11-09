@@ -19,6 +19,27 @@ pub(crate) type Checksum = u128;
 // Dummy value. Final value will be computed during commit
 pub(crate) const DEFERRED: Checksum = 999;
 
+/// The last byte a page's checksum covers, for planting damage in a closed store.
+#[cfg(any(test, all(feature = "test-seams", feature = "contextdb-internal")))]
+pub(crate) fn last_checksummed_byte<T: Page>(
+    page: &T,
+    fixed_key_size: Option<usize>,
+    fixed_value_size: Option<usize>,
+) -> Option<usize> {
+    let end = match page.memory()[0] {
+        LEAF => {
+            let leaf = LeafAccessor::new(page.memory(), fixed_key_size, fixed_value_size);
+            leaf.value_end(leaf.num_pairs().checked_sub(1)?)
+        }
+        BRANCH => {
+            let branch = BranchAccessor::new(page, fixed_key_size);
+            branch.key_end(branch.num_keys().checked_sub(1)?)
+        }
+        _ => None,
+    }?;
+    end.checked_sub(1)
+}
+
 pub(super) fn leaf_checksum<T: Page>(
     page: &T,
     fixed_key_size: Option<usize>,
@@ -46,6 +67,13 @@ pub(super) fn leaf_checksum<T: Page>(
             page.memory().len()
         )))
     } else {
+        #[cfg(feature = "test-seams")]
+        crate::commit_work::observe_root_work(
+            crate::commit_work::RootWorkKindForTest::ChecksumBytes,
+            None,
+            Some(page.get_page_number().to_le_bytes()),
+            end,
+        )?;
         Ok(xxh3_checksum(&page.memory()[..end]))
     }
 }
@@ -76,6 +104,13 @@ pub(super) fn branch_checksum<T: Page>(
             page.memory().len()
         )))
     } else {
+        #[cfg(feature = "test-seams")]
+        crate::commit_work::observe_root_work(
+            crate::commit_work::RootWorkKindForTest::ChecksumBytes,
+            None,
+            Some(page.get_page_number().to_le_bytes()),
+            end,
+        )?;
         Ok(xxh3_checksum(&page.memory()[..end]))
     }
 }
@@ -224,9 +259,90 @@ impl<'a, V: Value + 'static> AccessGuard<'a, V> {
         }
     }
 
+    /// Bytes in the complete backing allocation retained by this guard.
+    /// Fork-only accounting quote; inspecting it neither allocates nor reads IO.
+    #[doc(hidden)]
+    pub fn retained_page_bytes(&self) -> usize {
+        match &self.page {
+            EitherPage::OwnedMemory(value) => value.capacity(),
+            _ => self.page.memory().len(),
+        }
+    }
+
+    // Borrow the actual backing; never clone it while testing final ownership.
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn cached_memory_for_test(&self) -> Option<&PageMemory> {
+        match &self.page {
+            EitherPage::Immutable(page) => Some(page.memory_for_test()),
+            EitherPage::ArcMemory(page) => Some(page),
+            _ => None,
+        }
+    }
+
     /// Access the stored value
     pub fn value(&self) -> V::SelfType<'_> {
         V::from_bytes(&self.page.memory()[self.offset..(self.offset + self.len)])
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+pub(crate) fn singleton_u64_range(page: &impl Page, key: u64) -> Result<Range<usize>> {
+    let bytes = page.memory();
+    if bytes.len() < 16
+        || bytes[0] != LEAF
+        || u16::from_le_bytes(bytes[2..4].try_into().unwrap()) != 1
+        || bytes[8..16] != key.to_le_bytes()
+    {
+        return Err(StorageError::Corrupted(
+            "invalid singleton u64 payload leaf".into(),
+        ));
+    }
+    let end = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    if end < 16 || end > bytes.len() {
+        return Err(StorageError::Corrupted(
+            "singleton value exceeds its native leaf".into(),
+        ));
+    }
+    Ok(16..end)
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl AccessGuard<'_, &'static [u8]> {
+    /// A singleton u64-keyed byte value's native page identity and checksum.
+    /// The opaque scalar handle grants no borrow and copies no backing.
+    #[doc(hidden)]
+    pub fn singleton_u64_handle(&self, key: u64) -> Result<[u8; 24]> {
+        let EitherPage::Immutable(page) = &self.page else {
+            return Err(StorageError::Corrupted(
+                "singleton handle needs a native page".into(),
+            ));
+        };
+        let range = singleton_u64_range(page, key)?;
+        if self.offset != range.start
+            || self.len != range.len()
+            || !matches!(self.on_drop, OnDrop::None)
+        {
+            return Err(StorageError::Corrupted(
+                "singleton handle needs a whole value".into(),
+            ));
+        }
+        let mut handle = [0; 24];
+        handle[..8].copy_from_slice(&page.get_page_number().to_le_bytes());
+        handle[8..].copy_from_slice(&leaf_checksum(page, Some(8), None)?.to_le_bytes());
+        Ok(handle)
+    }
+
+    /// Retain the original page and select an admitted subrecord without copying it.
+    #[doc(hidden)]
+    pub fn slice_bytes(mut self, range: Range<usize>) -> Result<Self> {
+        if range.start > range.end || range.end > self.len {
+            return Err(StorageError::Corrupted(
+                "payload range exceeds its stored value".into(),
+            ));
+        }
+        self.offset += range.start;
+        self.len = range.len();
+        Ok(self)
     }
 }
 
@@ -308,7 +424,7 @@ impl<'a, V: Value + 'static> AccessGuardMut<'a, V> {
             self.entry_index,
             self.key_width,
             V::fixed_width(),
-            value_bytes.as_ref(),
+            value_bytes.as_ref().len(),
         ) {
             let mut mutator =
                 LeafMutator::new(self.page.memory_mut(), self.key_width, V::fixed_width());
@@ -369,6 +485,31 @@ impl<V: MutInPlaceValue + 'static> AccessGuardMut<'_, V> {
     }
 }
 
+#[cfg(feature = "contextdb-internal")]
+impl<V: Value + 'static> AccessGuardMut<'_, V> {
+    /// Native identity and checksum after this whole singleton value is filled.
+    #[doc(hidden)]
+    pub fn singleton_u64_handle(&self, key: u64) -> Result<[u8; 24]> {
+        let range = singleton_u64_range(&self.page, key)?;
+        if self.offset != range.start || self.len != range.len() {
+            return Err(StorageError::Corrupted(
+                "singleton handle needs a whole value".into(),
+            ));
+        }
+        let mut handle = [0; 24];
+        handle[..8].copy_from_slice(&self.page.get_page_number().to_le_bytes());
+        handle[8..].copy_from_slice(&leaf_checksum(&self.page, Some(8), None)?.to_le_bytes());
+        Ok(handle)
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl<V: MutInPlaceValue + 'static> AsMut<V::BaseRefType> for AccessGuardMut<'_, V> {
+    fn as_mut(&mut self) -> &mut V::BaseRefType {
+        self.value_mut()
+    }
+}
+
 impl<V: Value + 'static> Drop for AccessGuardMut<'_, V> {
     fn drop(&mut self) {
         // no-op. This Drop impl is only here to ensure that self is dropped before the transaction
@@ -391,6 +532,24 @@ impl<'a, V: Value + 'static> AccessGuardMutInPlace<'a, V> {
             len,
             _value_type: Default::default(),
         }
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl<V: Value + 'static> AccessGuardMutInPlace<'_, V> {
+    /// Native identity and checksum after this whole singleton value is filled.
+    #[doc(hidden)]
+    pub fn singleton_u64_handle(&self, key: u64) -> Result<[u8; 24]> {
+        let range = singleton_u64_range(&self.page, key)?;
+        if self.offset != range.start || self.len != range.len() {
+            return Err(StorageError::Corrupted(
+                "singleton handle needs a whole value".into(),
+            ));
+        }
+        let mut handle = [0; 24];
+        handle[..8].copy_from_slice(&self.page.get_page_number().to_le_bytes());
+        handle[8..].copy_from_slice(&leaf_checksum(&self.page, Some(8), None)?.to_le_bytes());
+        Ok(handle)
     }
 }
 
@@ -450,17 +609,6 @@ impl<'a> LeafAccessor<'a> {
             fixed_key_size,
             fixed_value_size,
             num_pairs,
-        }
-    }
-
-    pub(super) fn print_node<K: Key, V: Value>(&self, include_value: bool) {
-        let mut i = 0;
-        while let Some(entry) = self.entry(i) {
-            eprint!(" key_{i}={:?}", K::from_bytes(entry.key()));
-            if include_value {
-                eprint!(" value_{i}={:?}", V::from_bytes(entry.value()));
-            }
-            i += 1;
         }
     }
 
@@ -626,8 +774,32 @@ impl<'a> LeafAccessor<'a> {
     }
 }
 
+/// A borrowed serialized value or a length-only reservation. Zero reservations
+/// own no payload; bytes are initialized only in the allocated destination.
+#[derive(Clone, Copy)]
+pub(super) enum LeafValue<'a> {
+    Bytes(&'a [u8]),
+    Zeroes(usize),
+}
+
+impl LeafValue<'_> {
+    pub(super) fn len(self) -> usize {
+        match self {
+            Self::Bytes(bytes) => bytes.len(),
+            Self::Zeroes(len) => len,
+        }
+    }
+
+    fn write(self, destination: &mut [u8]) {
+        match self {
+            Self::Bytes(bytes) => destination.copy_from_slice(bytes),
+            Self::Zeroes(_) => destination.fill(0),
+        }
+    }
+}
+
 pub(super) struct LeafBuilder<'a, 'b> {
-    pairs: Vec<(&'a [u8], &'a [u8])>,
+    pairs: Vec<(&'a [u8], LeafValue<'a>)>,
     fixed_key_size: Option<usize>,
     fixed_value_size: Option<usize>,
     total_key_bytes: usize,
@@ -665,6 +837,10 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
     }
 
     pub(super) fn push(&mut self, key: &'a [u8], value: &'a [u8]) {
+        self.push_value(key, LeafValue::Bytes(value));
+    }
+
+    pub(super) fn push_value(&mut self, key: &'a [u8], value: LeafValue<'a>) {
         self.total_key_bytes += key.len();
         self.total_value_bytes += value.len();
         self.pairs.push((key, value));
@@ -720,7 +896,7 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
             first_split_key_bytes,
         );
         for (key, value) in self.pairs.iter().take(division) {
-            builder.append(key, value);
+            builder.append_value(key, *value);
         }
         drop(builder);
 
@@ -739,7 +915,7 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
             self.total_key_bytes - first_split_key_bytes,
         );
         for (key, value) in &self.pairs[division..] {
-            builder.append(key, value);
+            builder.append_value(key, *value);
         }
         drop(builder);
 
@@ -761,7 +937,7 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
             self.total_key_bytes,
         );
         for (key, value) in self.pairs {
-            builder.append(key, value);
+            builder.append_value(key, value);
         }
         drop(builder);
         Ok(page)
@@ -885,6 +1061,10 @@ impl<'a> RawLeafBuilder<'a> {
     }
 
     pub(crate) fn append(&mut self, key: &[u8], value: &[u8]) {
+        self.append_value(key, LeafValue::Bytes(value));
+    }
+
+    fn append_value(&mut self, key: &[u8], value: LeafValue<'_>) {
         if let Some(key_width) = self.fixed_key_size {
             assert_eq!(key_width, key.len());
         }
@@ -923,7 +1103,7 @@ impl<'a> RawLeafBuilder<'a> {
                     .to_le_bytes(),
             );
         }
-        self.page[value_offset..(value_offset + value.len())].copy_from_slice(value);
+        value.write(&mut self.page[value_offset..(value_offset + value.len())]);
         self.pairs_written += 1;
     }
 }
@@ -967,7 +1147,7 @@ impl<'b> LeafMutator<'b> {
         position: usize,
         fixed_key_size: Option<usize>,
         fixed_value_size: Option<usize>,
-        new_value: &[u8],
+        new_value_length: usize,
     ) -> bool {
         let accessor = LeafAccessor::new(page.memory(), fixed_key_size, fixed_value_size);
         let remaining = page.memory().len() - accessor.total_length();
@@ -975,7 +1155,7 @@ impl<'b> LeafMutator<'b> {
             .value_range(position)
             .map(|(s, e)| e - s)
             .unwrap_or_default();
-        let required_delta = isize::try_from(new_value.len()).unwrap()
+        let required_delta = isize::try_from(new_value_length).unwrap()
             - isize::try_from(existing_value_len).unwrap();
         required_delta <= isize::try_from(remaining).unwrap()
     }
@@ -986,7 +1166,7 @@ impl<'b> LeafMutator<'b> {
         fixed_key_size: Option<usize>,
         fixed_value_size: Option<usize>,
         new_key: &[u8],
-        new_value: &[u8],
+        new_value_length: usize,
     ) -> bool {
         let accessor = LeafAccessor::new(page.memory(), fixed_key_size, fixed_value_size);
         // If this is a large page, only allow in-place appending to avoid write amplification
@@ -997,7 +1177,7 @@ impl<'b> LeafMutator<'b> {
             return false;
         }
         let remaining = page.memory().len() - accessor.total_length();
-        let mut required_delta = new_key.len() + new_value.len();
+        let mut required_delta = new_key.len() + new_value_length;
         if fixed_key_size.is_none() {
             required_delta += size_of::<u32>();
         }
@@ -1009,6 +1189,10 @@ impl<'b> LeafMutator<'b> {
 
     // Replace the value at index `i` with `value`, leaving the key unchanged.
     pub(crate) fn replace(&mut self, i: usize, value: &[u8]) {
+        self.replace_value(i, LeafValue::Bytes(value));
+    }
+
+    pub(super) fn replace_value(&mut self, i: usize, value: LeafValue<'_>) {
         let accessor = LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size);
         let num_pairs = accessor.num_pairs();
         let last_value_end = accessor.value_end(num_pairs - 1).unwrap();
@@ -1039,11 +1223,11 @@ impl<'b> LeafMutator<'b> {
 
         // Write the new value
         dest -= value.len();
-        self.page[dest..(dest + value.len())].copy_from_slice(value);
+        value.write(&mut self.page[dest..(dest + value.len())]);
     }
 
     // Insert the given key, value pair at index i and shift all following pairs to the right
-    pub(crate) fn insert(&mut self, i: usize, key: &[u8], value: &[u8]) {
+    pub(super) fn insert_value(&mut self, i: usize, key: &[u8], value: LeafValue<'_>) {
         let accessor = LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size);
         let required_delta = {
             let mut delta = key.len() + value.len();
@@ -1101,7 +1285,7 @@ impl<'b> LeafMutator<'b> {
         // Insert the value
         let inserted_value_end: u32 = dest.try_into().unwrap();
         dest -= value.len();
-        self.page[dest..(dest + value.len())].copy_from_slice(value);
+        value.write(&mut self.page[dest..(dest + value.len())]);
 
         // Right shift the trailing key data & preceding value data
         let start = shift_key_start;
@@ -1280,22 +1464,6 @@ impl<'a: 'b, 'b, T: Page + 'a> BranchAccessor<'a, 'b, T> {
             fixed_key_size,
             _page_lifetime: Default::default(),
         }
-    }
-
-    pub(super) fn print_node<K: Key>(&self) {
-        eprint!(
-            "Internal[ (page={:?}), child_0={:?}",
-            self.page.get_page_number(),
-            self.child_page(0).unwrap()
-        );
-        for i in 0..(self.count_children() - 1) {
-            if let Some(child) = self.child_page(i + 1) {
-                let key = self.key(i).unwrap();
-                eprint!(" key_{i}={:?}", K::from_bytes(key));
-                eprint!(" child_{}={child:?}", i + 1);
-            }
-        }
-        eprint!("]");
     }
 
     pub(crate) fn total_length(&self) -> usize {

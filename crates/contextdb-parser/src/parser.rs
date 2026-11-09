@@ -8,9 +8,185 @@ use pest_derive::Parser;
 #[grammar = "grammar.pest"]
 struct ContextDbParser;
 
+// Bounds parser recursion as well as recursive AST consumers and destruction.
+const MAX_EXPR_NESTING: usize = 128;
+// Nesting at or below this depth parses on the caller's stack. Deeper nesting
+// within the limit needs more than a 2 MiB thread can give the recursive
+// grammar, so it parses on a thread whose stack is sized for the limit.
+const INLINE_EXPR_NESTING: usize = 16;
+const DEEP_PARSE_STACK_BYTES: usize = 32 * 1024 * 1024;
+
+fn depth_error(depth: usize) -> Error {
+    Error::ExpressionDepthExceeded {
+        depth,
+        limit: MAX_EXPR_NESTING,
+    }
+}
+
+#[expect(clippy::result_large_err, reason = "Uses the public typed error.")]
+fn check_expression_nesting(sql: &str) -> Result<usize> {
+    let mut frames = vec![0usize];
+    let mut prefixes = 0;
+    let mut deepest = 0;
+    let mut operand = true;
+    for token in syntax_keyword_tokens(sql) {
+        match token.as_str() {
+            "(" => {
+                frames.push(frames.last().copied().unwrap_or(0) + prefixes + 1);
+                prefixes = 0;
+                operand = true;
+            }
+            ")" => {
+                if frames.len() > 1 {
+                    frames.pop();
+                }
+                prefixes = 0;
+                operand = false;
+            }
+            "NOT" => {
+                prefixes += 1;
+                operand = true;
+            }
+            "-" if operand => prefixes += 1,
+            _ => {
+                prefixes = 0;
+                operand = matches!(
+                    token.as_str(),
+                    "AND"
+                        | "OR"
+                        | "="
+                        | "<>"
+                        | "<"
+                        | ">"
+                        | "+"
+                        | "-"
+                        | "*"
+                        | "/"
+                        | ","
+                        | "WHERE"
+                        | "SELECT"
+                        | "BY"
+                        | "THEN"
+                        | "ELSE"
+                );
+            }
+        }
+        let depth = frames.last().copied().unwrap_or(0) + prefixes;
+        if depth > MAX_EXPR_NESTING {
+            return Err(depth_error(depth));
+        }
+        deepest = deepest.max(depth);
+    }
+    Ok(deepest)
+}
+
+/// Combine boolean operands in order without cloning or changing short-circuit order.
+#[doc(hidden)]
+pub fn balanced_boolean_expr(operands: Vec<Expr>, op: BinOp) -> Option<Expr> {
+    assert!(matches!(op, BinOp::And | BinOp::Or));
+    fn build(iter: &mut std::vec::IntoIter<Expr>, len: usize, op: BinOp) -> Expr {
+        if len == 1 {
+            return iter.next().expect("boolean operand");
+        }
+        let left_len = len / 2;
+        Expr::BinaryOp {
+            left: Box::new(build(iter, left_len, op)),
+            op,
+            right: Box::new(build(iter, len - left_len, op)),
+        }
+    }
+    let len = operands.len();
+    (len != 0).then(|| build(&mut operands.into_iter(), len, op))
+}
+
+fn expression_depth(expr: &Expr) -> usize {
+    let child = match expr {
+        Expr::BinaryOp { left, right, .. } | Expr::CosineDistance { left, right } => {
+            expression_depth(left).max(expression_depth(right))
+        }
+        Expr::UnaryOp { operand, .. } => expression_depth(operand),
+        Expr::FunctionCall { args, .. } | Expr::Row(args) => {
+            args.iter().map(expression_depth).max().unwrap_or(0)
+        }
+        Expr::RowVectorSource { key, .. } => expression_depth(key),
+        Expr::InList { expr, list, .. } => {
+            expression_depth(expr).max(list.iter().map(expression_depth).max().unwrap_or(0))
+        }
+        Expr::Like { expr, pattern, .. } => expression_depth(expr).max(expression_depth(pattern)),
+        Expr::InSubquery { expr, .. } | Expr::IsNull { expr, .. } => expression_depth(expr),
+        _ => return 0,
+    };
+    child + 1
+}
+
+#[expect(clippy::result_large_err, reason = "Uses the public typed error.")]
+fn checked_expression(expr: Expr) -> Result<Expr> {
+    let depth = expression_depth(&expr);
+    if depth > MAX_EXPR_NESTING {
+        return Err(depth_error(depth));
+    }
+    Ok(expr)
+}
+
+/// Recognize only a session cache setting; other SQL keeps its normal parse path.
+#[doc(hidden)]
+pub fn parse_read_cache_share_statement(input: &str) -> Option<Statement> {
+    let leading = input.trim_start();
+    if !leading
+        .get(..3)
+        .is_some_and(|word| word.eq_ignore_ascii_case("SET"))
+        && !leading
+            .get(..4)
+            .is_some_and(|word| word.eq_ignore_ascii_case("SHOW"))
+        && !leading.starts_with("--")
+        && !leading.starts_with("/*")
+    {
+        return None;
+    }
+    let outer = ContextDbParser::parse(Rule::read_cache_share_statement, input)
+        .ok()?
+        .next()?;
+    let inner = outer.into_inner().next()?;
+    match inner.as_rule() {
+        Rule::show_read_cache_share => Some(Statement::ShowReadCacheShare),
+        Rule::set_read_cache_share => Some(build_read_cache_share(inner)),
+        _ => None,
+    }
+}
+
+fn build_read_cache_share(pair: Pair<'_, Rule>) -> Statement {
+    let value = pair
+        .into_inner()
+        .next()
+        .expect("cache share value")
+        .as_str();
+    Statement::SetReadCacheShare((!value.eq_ignore_ascii_case("DEFAULT")).then(|| value.to_owned()))
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn parse(input: &str) -> Result<Statement> {
     let sql = input.trim();
+    if check_expression_nesting(sql)? <= INLINE_EXPR_NESTING {
+        return parse_checked(sql);
+    }
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(DEEP_PARSE_STACK_BYTES)
+            .spawn_scoped(scope, || parse_checked(sql))
+            .map_err(|e| Error::ParseError(format!("deeply nested expression: {e}")))?
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn parse_checked(sql: &str) -> Result<Statement> {
     if starts_with_keywords(sql, &["CREATE", "PROCEDURE"])
         || starts_with_keywords(sql, &["CREATE", "FUNCTION"])
     {
@@ -19,14 +195,24 @@ pub fn parse(input: &str) -> Result<Statement> {
     if starts_with_keywords(sql, &["WITH", "RECURSIVE"]) {
         return Err(Error::RecursiveCteNotSupported);
     }
+    // GROUP BY is read in exactly one form: COUNT(*) per group of one table's
+    // columns, which the engine answers from a declared maintained count.
+    // Every other statement naming it keeps the established refusal, whatever
+    // else is wrong with it.
     if contains_keyword_sequence_outside_strings(sql, &["GROUP", "BY"]) {
-        return Err(Error::ParseError("GROUP BY is not supported".to_string()));
+        return match parse_statement(sql) {
+            Ok(statement) if is_grouped_count(&statement) => Ok(statement),
+            _ => Err(Error::ParseError("GROUP BY is not supported".to_string())),
+        };
     }
-    if contains_token_outside_strings(sql, "OVER")
-        && !contains_keyword_sequence_outside_strings(sql, &["DELIVERY", "MANIFEST", "OVER"])
-    {
-        return Err(Error::WindowFunctionNotSupported);
-    }
+    parse_statement(sql)
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn parse_statement(sql: &str) -> Result<Statement> {
     if contains_where_match_operator(sql) {
         return Err(Error::FullTextSearchNotSupported);
     }
@@ -82,12 +268,19 @@ pub fn parse(input: &str) -> Result<Statement> {
         Rule::show_vector_partitions_stmt => build_show_vector_partitions(inner)?,
         Rule::set_memory_limit => Statement::SetMemoryLimit(build_set_memory_limit(inner)?),
         Rule::show_memory_limit => Statement::ShowMemoryLimit,
+        Rule::set_read_cache_share => build_read_cache_share(inner),
+        Rule::show_read_cache_share => Statement::ShowReadCacheShare,
         Rule::set_disk_limit => Statement::SetDiskLimit(build_set_disk_limit(inner)?),
         Rule::show_disk_limit => Statement::ShowDiskLimit,
+        Rule::show_content_size => Statement::ShowContentSize,
         Rule::set_maintenance_poll_interval => {
             Statement::SetMaintenancePollInterval(build_maintenance_poll_interval(inner)?)
         }
         Rule::show_maintenance_poll_interval => Statement::ShowMaintenancePollInterval,
+        Rule::set_storage_compaction => {
+            Statement::SetStorageCompaction(build_storage_compaction(inner)?)
+        }
+        Rule::show_storage_compaction => Statement::ShowStorageCompaction,
         Rule::set_vector_serving_cache => {
             Statement::SetVectorServingCache(build_vector_serving_cache(inner)?)
         }
@@ -99,6 +292,10 @@ pub fn parse(input: &str) -> Result<Statement> {
     Ok(stmt)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_show_vector_partitions(pair: Pair<'_, Rule>) -> Result<Statement> {
     let mut table = None;
     let mut column = None;
@@ -162,6 +359,10 @@ fn build_show_vector_partitions(pair: Pair<'_, Rule>) -> Result<Statement> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_select(pair: Pair<'_, Rule>) -> Result<SelectStatement> {
     let mut ctes = Vec::new();
     let mut body = None;
@@ -188,6 +389,10 @@ fn build_select(pair: Pair<'_, Rule>) -> Result<SelectStatement> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_cte(pair: Pair<'_, Rule>) -> Result<Cte> {
     let mut name = None;
     let mut query = None;
@@ -206,14 +411,20 @@ fn build_cte(pair: Pair<'_, Rule>) -> Result<Cte> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectBody> {
     let mut distinct = false;
     let mut columns = Vec::new();
     let mut from = Vec::new();
     let mut joins = Vec::new();
     let mut where_clause = None;
+    let mut group_by = Vec::new();
     let mut order_by = Vec::new();
     let mut use_vector = None;
+    let mut vector_search_override = None;
     let mut use_rank = None;
     let mut limit = None;
 
@@ -232,11 +443,51 @@ fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectBody> {
             Rule::where_clause => {
                 where_clause = Some(build_where_clause(p)?);
             }
+            Rule::group_by_clause => {
+                group_by = p.into_inner().map(build_expr).collect::<Result<_>>()?;
+            }
+            Rule::named_window_clause => return Err(window_refusal("named window")),
             Rule::order_by_clause => {
                 order_by = build_order_by_clause(p)?;
             }
             Rule::use_vector_clause => {
-                use_vector = Some(build_use_vector_clause(p)?);
+                use_vector = Some(build_use_vector_clause(p.clone())?);
+                if let Some(options) = p
+                    .into_inner()
+                    .find(|p| p.as_rule() == Rule::vector_query_options)
+                {
+                    let group = options.into_inner().next().expect("query policy group");
+                    let mut target = None;
+                    let mut probes = None;
+                    let mut refine_factor = None;
+                    for (name, value) in vector_group_members(group)? {
+                        match name.as_str() {
+                            "target_accuracy" => target = Some(vector_raw_value(value)),
+                            "probes" => probes = Some(vector_raw_value(value)),
+                            "refine_factor" => refine_factor = Some(vector_raw_value(value)),
+                            _ => {
+                                return Err(Error::ParseError(format!(
+                                    "unknown vector search override {}",
+                                    name.to_ascii_uppercase()
+                                )));
+                            }
+                        }
+                    }
+                    vector_search_override = if let Some(target_accuracy) = target {
+                        if probes.is_some() || refine_factor.is_some() {
+                            return Err(Error::ParseError(
+                                "TARGET_ACCURACY cannot be mixed with PROBES or REFINE_FACTOR"
+                                    .into(),
+                            ));
+                        }
+                        Some(VectorSearchOverride::Objectives { target_accuracy })
+                    } else {
+                        Some(VectorSearchOverride::Ivf {
+                            probes,
+                            refine_factor,
+                        })
+                    };
+                }
             }
             Rule::use_rank_clause => {
                 use_rank = Some(build_use_rank_clause(p)?);
@@ -248,12 +499,30 @@ fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectBody> {
         }
     }
 
+    // Compare parsed specifications within this SELECT scope. Nested SELECTs
+    // are validated by their own builder, so unrelated CTE scopes never collide.
+    let mut window = None;
+    for column in &columns {
+        validate_window_spec(&column.expr, &mut window)?;
+    }
+    for order in &order_by {
+        validate_window_spec(&order.expr, &mut window)?;
+    }
+    if let Some(predicate) = &where_clause {
+        validate_window_spec(predicate, &mut window)?;
+    }
+    for join in &joins {
+        validate_window_spec(&join.on, &mut window)?;
+    }
+
     Ok(SelectBody {
+        vector_search_override,
         distinct,
         columns,
         from,
         joins,
         where_clause,
+        group_by,
         order_by,
         use_vector,
         use_rank,
@@ -261,6 +530,10 @@ fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectBody> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_select_list(pair: Pair<'_, Rule>) -> Result<Vec<SelectColumn>> {
     let mut cols = Vec::new();
 
@@ -281,6 +554,10 @@ fn build_select_list(pair: Pair<'_, Rule>) -> Result<Vec<SelectColumn>> {
     Ok(cols)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_select_item(pair: Pair<'_, Rule>) -> Result<SelectColumn> {
     let mut expr = None;
     let mut alias = None;
@@ -300,6 +577,10 @@ fn build_select_item(pair: Pair<'_, Rule>) -> Result<SelectColumn> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_from_clause(pair: Pair<'_, Rule>) -> Result<Vec<FromItem>> {
     let mut items = Vec::new();
     for p in pair.into_inner() {
@@ -310,6 +591,10 @@ fn build_from_clause(pair: Pair<'_, Rule>) -> Result<Vec<FromItem>> {
     Ok(items)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_from_item(pair: Pair<'_, Rule>) -> Result<FromItem> {
     let inner = pair
         .into_inner()
@@ -323,6 +608,10 @@ fn build_from_item(pair: Pair<'_, Rule>) -> Result<FromItem> {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_join_clause(pair: Pair<'_, Rule>) -> Result<JoinClause> {
     let mut join_type = None;
     let mut table = None;
@@ -358,6 +647,10 @@ fn build_join_clause(pair: Pair<'_, Rule>) -> Result<JoinClause> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_table_ref(pair: Pair<'_, Rule>) -> Result<FromItem> {
     let mut name = None;
     let mut alias = None;
@@ -377,6 +670,10 @@ fn build_table_ref(pair: Pair<'_, Rule>) -> Result<FromItem> {
     Ok(FromItem::Table { name, alias })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_graph_table(pair: Pair<'_, Rule>) -> Result<FromItem> {
     let mut graph_name = None;
     let mut pattern = None;
@@ -430,6 +727,10 @@ fn build_graph_table(pair: Pair<'_, Rule>) -> Result<FromItem> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_match_pattern(pair: Pair<'_, Rule>) -> Result<GraphPattern> {
     let inner = pair
         .into_inner()
@@ -458,6 +759,10 @@ fn build_match_pattern(pair: Pair<'_, Rule>) -> Result<GraphPattern> {
     Ok(GraphPattern { start, edges })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_node_pattern(pair: Pair<'_, Rule>) -> Result<NodePattern> {
     let mut alias = None;
     let mut label = None;
@@ -479,6 +784,10 @@ fn build_node_pattern(pair: Pair<'_, Rule>) -> Result<NodePattern> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_edge_step(pair: Pair<'_, Rule>) -> Result<EdgeStep> {
     let edge = pair
         .into_inner()
@@ -525,6 +834,10 @@ fn build_edge_step(pair: Pair<'_, Rule>) -> Result<EdgeStep> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_edge_bracket(pair: Pair<'_, Rule>) -> Result<(Option<String>, Option<String>)> {
     let mut alias = None;
     let mut edge_type = None;
@@ -554,6 +867,10 @@ fn build_edge_bracket(pair: Pair<'_, Rule>) -> Result<(Option<String>, Option<St
     Ok((alias, edge_type))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_quantifier(pair: Pair<'_, Rule>) -> Result<(u32, u32)> {
     let inner = pair
         .into_inner()
@@ -581,6 +898,10 @@ fn build_quantifier(pair: Pair<'_, Rule>) -> Result<(u32, u32)> {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_columns_clause(pair: Pair<'_, Rule>) -> Result<Vec<GraphTableColumn>> {
     let mut cols = Vec::new();
 
@@ -612,6 +933,10 @@ fn build_columns_clause(pair: Pair<'_, Rule>) -> Result<Vec<GraphTableColumn>> {
     Ok(cols)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_where_clause(pair: Pair<'_, Rule>) -> Result<Expr> {
     let expr_pair = pair
         .into_inner()
@@ -620,6 +945,10 @@ fn build_where_clause(pair: Pair<'_, Rule>) -> Result<Expr> {
     build_expr(expr_pair)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_order_by_clause(pair: Pair<'_, Rule>) -> Result<Vec<OrderByItem>> {
     let mut items = Vec::new();
     for p in pair.into_inner() {
@@ -630,6 +959,10 @@ fn build_order_by_clause(pair: Pair<'_, Rule>) -> Result<Vec<OrderByItem>> {
     Ok(items)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_order_item(pair: Pair<'_, Rule>) -> Result<OrderByItem> {
     let mut direction = SortDirection::Asc;
     let mut expr = None;
@@ -641,6 +974,7 @@ fn build_order_item(pair: Pair<'_, Rule>) -> Result<OrderByItem> {
                 let left = build_additive_expr(
                     it.next()
                         .ok_or_else(|| Error::ParseError("invalid cosine expr".to_string()))?,
+                    false,
                 )?;
                 let right = build_cosine_rhs(
                     it.next()
@@ -671,6 +1005,10 @@ fn build_order_item(pair: Pair<'_, Rule>) -> Result<OrderByItem> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_cosine_rhs(pair: Pair<'_, Rule>) -> Result<Expr> {
     let inner = pair
         .into_inner()
@@ -678,11 +1016,15 @@ fn build_cosine_rhs(pair: Pair<'_, Rule>) -> Result<Expr> {
         .ok_or_else(|| Error::ParseError("invalid cosine RHS".to_string()))?;
     match inner.as_rule() {
         Rule::row_vector_source => build_row_vector_source(inner),
-        Rule::additive_expr => build_additive_expr(inner),
+        Rule::additive_expr => build_additive_expr(inner, false),
         other => Err(unexpected_rule(other, "build_cosine_rhs")),
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_row_vector_source(pair: Pair<'_, Rule>) -> Result<Expr> {
     let mut values = pair.into_inner();
     let table = match values.next() {
@@ -717,6 +1059,10 @@ fn build_row_vector_source(pair: Pair<'_, Rule>) -> Result<Expr> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_row_vector_key(pair: Pair<'_, Rule>) -> Result<Expr> {
     let inner = pair
         .into_inner()
@@ -744,6 +1090,10 @@ fn build_row_vector_key(pair: Pair<'_, Rule>) -> Result<Expr> {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_limit_clause(pair: Pair<'_, Rule>) -> Result<u64> {
     let num = pair
         .into_inner()
@@ -752,6 +1102,10 @@ fn build_limit_clause(pair: Pair<'_, Rule>) -> Result<u64> {
     parse_u64(num.as_str(), "invalid LIMIT value")
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_use_vector_clause(pair: Pair<'_, Rule>) -> Result<VectorSearchMode> {
     let mode = pair
         .into_inner()
@@ -760,6 +1114,10 @@ fn build_use_vector_clause(pair: Pair<'_, Rule>) -> Result<VectorSearchMode> {
     build_vector_search_mode(mode)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_use_rank_clause(pair: Pair<'_, Rule>) -> Result<String> {
     pair.into_inner()
         .find(|p| p.as_rule() == Rule::identifier)
@@ -767,6 +1125,10 @@ fn build_use_rank_clause(pair: Pair<'_, Rule>) -> Result<String> {
         .ok_or_else(|| Error::ParseError("USE RANK missing sort key".to_string()))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_vector_search_mode(pair: Pair<'_, Rule>) -> Result<VectorSearchMode> {
     match pair.as_str().to_ascii_uppercase().as_str() {
         "AUTO" => Ok(VectorSearchMode::Auto),
@@ -778,62 +1140,50 @@ fn build_vector_search_mode(pair: Pair<'_, Rule>) -> Result<VectorSearchMode> {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     let inner = pair
         .into_inner()
         .next()
         .ok_or_else(|| Error::ParseError("invalid expression".to_string()))?;
-    build_or_expr(inner)
+    checked_expression(build_or_expr(inner)?)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_or_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
-    let mut inner = pair.into_inner();
-    let first = inner
-        .next()
-        .ok_or_else(|| Error::ParseError("invalid OR expression".to_string()))?;
-    let mut expr = build_and_expr(first)?;
-
-    while let Some(op_or_next) = inner.next() {
-        if op_or_next.as_rule() == Rule::or_op {
-            let rhs_pair = inner
-                .next()
-                .ok_or_else(|| Error::ParseError("OR missing right operand".to_string()))?;
-            let rhs = build_and_expr(rhs_pair)?;
-            expr = Expr::BinaryOp {
-                left: Box::new(expr),
-                op: BinOp::Or,
-                right: Box::new(rhs),
-            };
-        }
-    }
-
-    Ok(expr)
+    let operands = pair
+        .into_inner()
+        .filter(|p| p.as_rule() != Rule::or_op)
+        .map(build_and_expr)
+        .collect::<Result<Vec<_>>>()?;
+    balanced_boolean_expr(operands, BinOp::Or)
+        .ok_or_else(|| Error::ParseError("invalid OR expression".to_string()))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_and_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
-    let mut inner = pair.into_inner();
-    let first = inner
-        .next()
-        .ok_or_else(|| Error::ParseError("invalid AND expression".to_string()))?;
-    let mut expr = build_unary_bool_expr(first)?;
-
-    while let Some(op_or_next) = inner.next() {
-        if op_or_next.as_rule() == Rule::and_op {
-            let rhs_pair = inner
-                .next()
-                .ok_or_else(|| Error::ParseError("AND missing right operand".to_string()))?;
-            let rhs = build_unary_bool_expr(rhs_pair)?;
-            expr = Expr::BinaryOp {
-                left: Box::new(expr),
-                op: BinOp::And,
-                right: Box::new(rhs),
-            };
-        }
-    }
-
-    Ok(expr)
+    let operands = pair
+        .into_inner()
+        .filter(|p| p.as_rule() != Rule::and_op)
+        .map(build_unary_bool_expr)
+        .collect::<Result<Vec<_>>>()?;
+    balanced_boolean_expr(operands, BinOp::And)
+        .ok_or_else(|| Error::ParseError("invalid AND expression".to_string()))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_unary_bool_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     let mut not_count = 0usize;
     let mut cmp = None;
@@ -857,15 +1207,16 @@ fn build_unary_bool_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     Ok(expr)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_comparison_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     let mut inner = pair.into_inner();
     let left_pair = inner
         .next()
         .ok_or_else(|| Error::ParseError("comparison missing left operand".to_string()))?;
-    let left = match left_pair.as_rule() {
-        Rule::row_value => build_row_value(left_pair)?,
-        _ => build_additive_expr(left_pair)?,
-    };
+    let left = build_additive_expr(left_pair, true)?;
 
     if let Some(suffix) = inner.next() {
         build_comparison_suffix(left, suffix)
@@ -882,6 +1233,10 @@ fn build_comparison_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_row_value(pair: Pair<'_, Rule>) -> Result<Expr> {
     let mut elements = Vec::new();
     for element in pair.into_inner() {
@@ -897,6 +1252,10 @@ fn build_row_value(pair: Pair<'_, Rule>) -> Result<Expr> {
     Ok(Expr::Row(elements))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_comparison_suffix(left: Expr, pair: Pair<'_, Rule>) -> Result<Expr> {
     let suffix = pair
         .into_inner()
@@ -925,7 +1284,7 @@ fn build_comparison_suffix(left: Expr, pair: Pair<'_, Rule>) -> Result<Expr> {
                     ));
                 }
             };
-            let right = build_additive_expr(rhs_pair)?;
+            let right = build_additive_expr(rhs_pair, false)?;
             Ok(Expr::BinaryOp {
                 left: Box::new(left),
                 op,
@@ -945,7 +1304,7 @@ fn build_comparison_suffix(left: Expr, pair: Pair<'_, Rule>) -> Result<Expr> {
             for p in suffix.into_inner() {
                 match p.as_rule() {
                     Rule::not_op => negated = true,
-                    Rule::additive_expr => pattern = Some(build_additive_expr(p)?),
+                    Rule::additive_expr => pattern = Some(build_additive_expr(p, false)?),
                     other => return Err(unexpected_rule(other, "build_comparison_suffix.like")),
                 }
             }
@@ -963,7 +1322,7 @@ fn build_comparison_suffix(left: Expr, pair: Pair<'_, Rule>) -> Result<Expr> {
             for p in suffix.into_inner() {
                 match p.as_rule() {
                     Rule::not_op => negated = true,
-                    Rule::additive_expr => vals.push(build_additive_expr(p)?),
+                    Rule::additive_expr => vals.push(build_additive_expr(p, false)?),
                     other => {
                         return Err(unexpected_rule(other, "build_comparison_suffix.between"));
                     }
@@ -1086,7 +1445,11 @@ fn build_comparison_suffix(left: Expr, pair: Pair<'_, Rule>) -> Result<Expr> {
     }
 }
 
-fn build_additive_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn build_additive_expr(pair: Pair<'_, Rule>, allow_row: bool) -> Result<Expr> {
     let mut inner = pair.into_inner();
     let first = inner
         .next()
@@ -1098,16 +1461,38 @@ fn build_additive_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
             .next()
             .ok_or_else(|| Error::ParseError("arithmetic missing right operand".to_string()))?;
         let rhs = build_multiplicative_expr(rhs_pair)?;
+        require_scalar(&expr)?;
+        require_scalar(&rhs)?;
         let func = if op.as_str() == "+" { "__add" } else { "__sub" };
-        expr = Expr::FunctionCall {
+        expr = checked_expression(Expr::FunctionCall {
             name: func.to_string(),
             args: vec![expr, rhs],
-        };
+        })?;
     }
 
+    if !allow_row {
+        require_scalar(&expr)?;
+    }
     Ok(expr)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn require_scalar(expr: &Expr) -> Result<()> {
+    if matches!(expr, Expr::Row(_)) {
+        return Err(Error::ParseError(
+            "a row value is not a scalar expression".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_multiplicative_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     let mut inner = pair.into_inner();
     let first = inner
@@ -1120,16 +1505,22 @@ fn build_multiplicative_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
             .next()
             .ok_or_else(|| Error::ParseError("arithmetic missing right operand".to_string()))?;
         let rhs = build_unary_math_expr(rhs_pair)?;
+        require_scalar(&expr)?;
+        require_scalar(&rhs)?;
         let func = if op.as_str() == "*" { "__mul" } else { "__div" };
-        expr = Expr::FunctionCall {
+        expr = checked_expression(Expr::FunctionCall {
             name: func.to_string(),
             args: vec![expr, rhs],
-        };
+        })?;
     }
 
     Ok(expr)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_unary_math_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     let mut neg_count = 0usize;
     let mut primary = None;
@@ -1144,6 +1535,9 @@ fn build_unary_math_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
 
     let mut expr =
         primary.ok_or_else(|| Error::ParseError("invalid unary expression".to_string()))?;
+    if neg_count != 0 {
+        require_scalar(&expr)?;
+    }
     for _ in 0..neg_count {
         expr = Expr::UnaryOp {
             op: UnaryOp::Neg,
@@ -1154,6 +1548,10 @@ fn build_unary_math_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     Ok(expr)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_primary_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     let mut inner = pair.into_inner();
     let first = inner
@@ -1161,6 +1559,7 @@ fn build_primary_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
         .ok_or_else(|| Error::ParseError("invalid primary expression".to_string()))?;
 
     match first.as_rule() {
+        Rule::window_call => build_window_call(first),
         Rule::function_call => build_function_call(first),
         Rule::parameter => Ok(Expr::Parameter(
             first.as_str().trim_start_matches('$').to_string(),
@@ -1192,13 +1591,114 @@ fn build_primary_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
             Ok(Expr::Literal(Literal::Vector(values)))
         }
         Rule::column_ref => build_column_ref(first),
-        Rule::expr => build_expr(first),
+        Rule::parenthesized_expr => {
+            let mut elements = first.into_inner();
+            let first = elements
+                .next()
+                .ok_or_else(|| Error::ParseError("empty parenthesised expression".to_string()))?;
+            let first = build_expr(first)?;
+            if elements.peek().is_none() {
+                Ok(first)
+            } else {
+                let mut row = vec![first];
+                for element in elements {
+                    row.push(build_expr(element)?);
+                }
+                Ok(Expr::Row(row))
+            }
+        }
         _ => Err(Error::ParseError(
             "unsupported primary expression".to_string(),
         )),
     }
 }
 
+fn window_refusal(form: &str) -> Error {
+    Error::WindowFunctionNotSupported {
+        form: form.to_string(),
+    }
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn build_window_call(pair: Pair<'_, Rule>) -> Result<Expr> {
+    let mut parts = pair.into_inner();
+    let call = parts
+        .next()
+        .ok_or_else(|| Error::ParseError("window function missing".into()))?;
+    let Expr::FunctionCall { name, args } = build_function_call(call)? else {
+        return Err(window_refusal("unsupported window function"));
+    };
+    if !name.eq_ignore_ascii_case("ROW_NUMBER") {
+        let form = match name.to_ascii_uppercase().as_str() {
+            "RANK" => "RANK window",
+            "DENSE_RANK" => "DENSE_RANK window",
+            "SUM" => "SUM window",
+            "COUNT" => "COUNT window",
+            "AVG" => "AVG window",
+            "MIN" => "MIN window",
+            "MAX" => "MAX window",
+            "LAG" => "LAG window",
+            "LEAD" => "LEAD window",
+            _ => "unsupported window function",
+        };
+        return Err(window_refusal(form));
+    }
+    if !args.is_empty() {
+        return Err(window_refusal("ROW_NUMBER with arguments"));
+    }
+    let spec = parts
+        .next()
+        .ok_or_else(|| Error::ParseError("OVER clause missing".into()))?;
+    if spec.as_rule() == Rule::identifier {
+        return Err(window_refusal("named window"));
+    }
+    let mut partition_by = Vec::new();
+    let mut order_by = Vec::new();
+    for part in spec.into_inner() {
+        match part.as_rule() {
+            Rule::window_partition => {
+                for expression in part.into_inner() {
+                    let Expr::Column(column) = build_expr(expression)? else {
+                        return Err(window_refusal("computed window partition expression"));
+                    };
+                    partition_by.push(column);
+                }
+            }
+            Rule::order_by_clause => {
+                for item in build_order_by_clause(part)? {
+                    let Expr::Column(column) = item.expr else {
+                        return Err(window_refusal("computed window ordering expression"));
+                    };
+                    if item.direction == SortDirection::CosineDistance {
+                        return Err(window_refusal("computed window ordering expression"));
+                    }
+                    order_by.push(WindowOrderColumn {
+                        column,
+                        direction: item.direction,
+                    });
+                }
+            }
+            Rule::window_reference => return Err(window_refusal("named window")),
+            Rule::window_frame => return Err(window_refusal("explicit window frame")),
+            other => return Err(unexpected_rule(other, "build_window_call")),
+        }
+    }
+    if order_by.is_empty() {
+        return Err(window_refusal("ROW_NUMBER without ORDER BY"));
+    }
+    Ok(Expr::RowNumber(RowNumberWindow {
+        partition_by,
+        order_by,
+    }))
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_function_call(pair: Pair<'_, Rule>) -> Result<Expr> {
     let mut name = None;
     let mut args = Vec::new();
@@ -1225,6 +1725,10 @@ fn build_function_call(pair: Pair<'_, Rule>) -> Result<Expr> {
     Ok(Expr::FunctionCall { name, args })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_column_ref(pair: Pair<'_, Rule>) -> Result<Expr> {
     let ids: Vec<String> = pair
         .into_inner()
@@ -1245,6 +1749,10 @@ fn build_column_ref(pair: Pair<'_, Rule>) -> Result<Expr> {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
     let mut name = None;
     let mut if_not_exists = false;
@@ -1556,6 +2064,10 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
 /// Read one `MAINTAIN COUNT ...` clause. Each parenthesised list reuses
 /// `indexed_column`, so the optional per-column `ASC`/`DESC` is spelled
 /// exactly as `CREATE INDEX` spells it and defaults to `ASC`.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_maintain_count_option(pair: Pair<'_, Rule>) -> Result<MaintainedCountsDecl> {
     let mut lists: Vec<Vec<(String, SortDirection)>> = Vec::new();
     for part in pair.into_inner() {
@@ -1623,6 +2135,10 @@ fn build_maintain_count_option(pair: Pair<'_, Rule>) -> Result<MaintainedCountsD
     Ok(MaintainedCountsDecl::Lists(lists))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_identifier_list(pair: Pair<'_, Rule>) -> Result<Vec<String>> {
     let mut values = Vec::new();
     for part in pair.into_inner() {
@@ -1639,6 +2155,10 @@ fn build_identifier_list(pair: Pair<'_, Rule>) -> Result<Vec<String>> {
     Ok(values)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_edge_discard_option(pair: Pair<'_, Rule>) -> Result<contextdb_core::EdgeDiscardMode> {
     let spelling = pair
         .into_inner()
@@ -1652,6 +2172,10 @@ fn build_edge_discard_option(pair: Pair<'_, Rule>) -> Result<contextdb_core::Edg
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_declare_tenant_table_policy(pair: Pair<'_, Rule>) -> Result<DeclareTenantTablePolicy> {
     let mut table = None;
     let mut immutable = false;
@@ -1740,6 +2264,10 @@ fn build_declare_tenant_table_policy(pair: Pair<'_, Rule>) -> Result<DeclareTena
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_show_delivery_outcomes(pair: Pair<'_, Rule>) -> Result<ShowDeliveryOutcomes> {
     let mut table = None;
     let mut where_clause = None;
@@ -1768,6 +2296,10 @@ fn build_show_delivery_outcomes(pair: Pair<'_, Rule>) -> Result<ShowDeliveryOutc
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_history_option(pair: Pair<'_, Rule>) -> Result<contextdb_core::HistoryPolicy> {
     let inner = pair
         .into_inner()
@@ -1780,6 +2312,10 @@ fn build_history_option(pair: Pair<'_, Rule>) -> Result<contextdb_core::HistoryP
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_alter_table(pair: Pair<'_, Rule>) -> Result<AlterTable> {
     let mut table = None;
     let mut action = None;
@@ -1799,6 +2335,10 @@ fn build_alter_table(pair: Pair<'_, Rule>) -> Result<AlterTable> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_alter_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
     let action = pair
         .into_inner()
@@ -1905,12 +2445,73 @@ fn build_alter_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_alter_column_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
+    let column_name = pair
+        .clone()
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::identifier)
+        .map(|p| parse_identifier(p.as_str()))
+        .ok_or_else(|| Error::ParseError("ALTER COLUMN missing column".into()))?;
+    for action in pair.clone().into_inner() {
+        match action.as_rule() {
+            Rule::alter_column_set_search => {
+                let default = action
+                    .as_str()
+                    .trim_end()
+                    .to_ascii_uppercase()
+                    .ends_with("DEFAULT");
+                return Ok(AlterAction::SetVectorSearch {
+                    column: column_name,
+                    search: if default {
+                        None
+                    } else {
+                        Some(build_vector_search_objectives(action)?)
+                    },
+                });
+            }
+            Rule::alter_column_set_ivf => {
+                let default = action
+                    .as_str()
+                    .trim_end()
+                    .to_ascii_uppercase()
+                    .ends_with("DEFAULT");
+                return Ok(AlterAction::SetVectorIvf {
+                    column: column_name,
+                    ivf: if default {
+                        None
+                    } else {
+                        Some(build_vector_ivf_options(action)?)
+                    },
+                });
+            }
+            Rule::alter_column_set_with => {
+                return Ok(AlterAction::SetVectorWith {
+                    column: column_name,
+                    policy: build_vector_engine_policy(action)?,
+                });
+            }
+            Rule::alter_column_reset_with => {
+                return Ok(AlterAction::ResetVectorWith {
+                    column: column_name,
+                    members: action
+                        .into_inner()
+                        .map(|p| parse_identifier(p.as_str()).to_ascii_lowercase())
+                        .collect(),
+                });
+            }
+            _ => {}
+        }
+    }
     let mut column = None;
     let mut max_partitions = None;
     let mut search_mode = None;
     let mut auto_index_at = None;
-    let mut hnsw = None;
+    let auto_expansion_ceiling = None;
+    let flat_below = None;
     let mut consolidation = None;
 
     for part in pair.into_inner() {
@@ -1953,20 +2554,10 @@ fn build_alter_column_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
                     VectorPolicyValue::Default => None,
                 });
             }
-            Rule::alter_column_set_hnsw => {
-                let text = part.as_str();
-                let options = part
-                    .into_inner()
-                    .find(|item| item.as_rule() == Rule::hnsw_options)
-                    .map(build_vector_hnsw_options)
-                    .transpose()?;
-                if options.is_none() && !text.to_ascii_uppercase().ends_with("DEFAULT") {
-                    return Err(Error::ParseError(
-                        "ALTER COLUMN SET HNSW missing policy or DEFAULT".to_string(),
-                    ));
-                }
-                hnsw = Some(options);
+            Rule::alter_column_set_auto_expansion_ceiling => {
+                return Err(removed_vector_clause("AUTO_EXPANSION_CEILING"));
             }
+            Rule::alter_column_set_flat_below => return Err(removed_vector_clause("FLAT_BELOW")),
             Rule::alter_column_set_consolidation => {
                 let text = part.as_str();
                 let mut disabled = false;
@@ -1997,27 +2588,50 @@ fn build_alter_column_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
 
     let column =
         column.ok_or_else(|| Error::ParseError("ALTER COLUMN missing column name".to_string()))?;
-    match (
-        max_partitions,
-        search_mode,
-        auto_index_at,
-        hnsw,
-        consolidation,
-    ) {
-        (Some(max_partitions), None, None, None, None) => Ok(AlterAction::SetVectorMaxPartitions {
+    if let Some(auto_expansion_ceiling) = auto_expansion_ceiling {
+        return if max_partitions.is_none()
+            && search_mode.is_none()
+            && auto_index_at.is_none()
+            && flat_below.is_none()
+            && consolidation.is_none()
+        {
+            Ok(AlterAction::SetVectorAutoExpansionCeiling {
+                column,
+                auto_expansion_ceiling,
+            })
+        } else {
+            Err(Error::ParseError(
+                "ALTER COLUMN requires exactly one SET action".to_string(),
+            ))
+        };
+    }
+    if let Some(flat_below) = flat_below {
+        return if max_partitions.is_none()
+            && search_mode.is_none()
+            && auto_index_at.is_none()
+            && consolidation.is_none()
+        {
+            Ok(AlterAction::SetVectorFlatBelow { column, flat_below })
+        } else {
+            Err(Error::ParseError(
+                "ALTER COLUMN requires exactly one SET action".to_string(),
+            ))
+        };
+    }
+    match (max_partitions, search_mode, auto_index_at, consolidation) {
+        (Some(max_partitions), None, None, None) => Ok(AlterAction::SetVectorMaxPartitions {
             column,
             max_partitions,
         }),
-        (None, Some(search_mode), None, None, None) => Ok(AlterAction::SetVectorSearchMode {
+        (None, Some(search_mode), None, None) => Ok(AlterAction::SetVectorSearchMode {
             column,
             search_mode,
         }),
-        (None, None, Some(auto_index_at), None, None) => Ok(AlterAction::SetVectorAutoIndexAt {
+        (None, None, Some(auto_index_at), None) => Ok(AlterAction::SetVectorAutoIndexAt {
             column,
             auto_index_at,
         }),
-        (None, None, None, Some(hnsw), None) => Ok(AlterAction::SetVectorHnsw { column, hnsw }),
-        (None, None, None, None, Some(consolidation)) => Ok(AlterAction::SetVectorConsolidation {
+        (None, None, None, Some(consolidation)) => Ok(AlterAction::SetVectorConsolidation {
             column,
             consolidation,
         }),
@@ -2027,6 +2641,10 @@ fn build_alter_column_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMachineDef>)> {
     let mut name = None;
     let mut data_type = None;
@@ -2044,7 +2662,11 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
     let mut max_partitions = None;
     let mut search_mode = None;
     let mut auto_index_at = None;
-    let mut hnsw = VectorHnswOptions::default();
+    let mut auto_expansion_ceiling = None;
+    let mut flat_below = None;
+    let mut search = VectorSearchObjectives::default();
+    let mut ivf = VectorIvfOptions::default();
+    let mut engine_policy = VectorEnginePolicyOptions::default();
     let mut consolidation = VectorConsolidationOptions::default();
     let mut rank_policy = None;
     let mut context_id = false;
@@ -2064,12 +2686,20 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
             }
             Rule::data_type => {
                 let vector_options = vector_column_options_for_data_type(&p)?;
-                quantization = vector_quantization_for_data_type(&p)?;
+                quantization = vector_options
+                    .engine_policy
+                    .quantization
+                    .flatten()
+                    .unwrap_or_default();
+                search = vector_options.search;
+                ivf = vector_options.ivf;
+                engine_policy = vector_options.engine_policy;
                 partition_key_columns = vector_options.partition_key_columns;
                 max_partitions = vector_options.max_partitions;
                 search_mode = vector_options.search_mode;
                 auto_index_at = vector_options.auto_index_at;
-                hnsw = vector_options.hnsw;
+                auto_expansion_ceiling = vector_options.auto_expansion_ceiling;
+                flat_below = vector_options.flat_below;
                 consolidation = vector_options.consolidation;
                 data_type = Some(build_data_type(p)?);
             }
@@ -2226,7 +2856,11 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
             max_partitions,
             search_mode,
             auto_index_at,
-            hnsw,
+            auto_expansion_ceiling,
+            flat_below,
+            search,
+            ivf,
+            engine_policy,
             consolidation,
             rank_policy,
             context_id,
@@ -2237,6 +2871,10 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
     ))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_rank_policy_clause(pair: Pair<'_, Rule>) -> Result<RankPolicyAst> {
     let mut joined_table = None;
     let mut joined_column = None;
@@ -2284,6 +2922,10 @@ fn build_rank_policy_clause(pair: Pair<'_, Rule>) -> Result<RankPolicyAst> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_unique_table_constraint(pair: Pair<'_, Rule>) -> Result<Vec<String>> {
     let columns: Vec<String> = pair
         .into_inner()
@@ -2310,6 +2952,10 @@ fn build_unique_table_constraint(pair: Pair<'_, Rule>) -> Result<Vec<String>> {
     Ok(columns)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_primary_key_table_constraint(pair: Pair<'_, Rule>) -> Result<Vec<String>> {
     let columns: Vec<String> = pair
         .into_inner()
@@ -2338,7 +2984,15 @@ fn build_primary_key_table_constraint(pair: Pair<'_, Rule>) -> Result<Vec<String
     Ok(columns)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_composite_foreign_key(pair: Pair<'_, Rule>) -> Result<CompositeForeignKey> {
+    let follows_parent_purge = pair
+        .clone()
+        .into_inner()
+        .any(|p| p.as_rule() == Rule::follows_parent_purge);
     let mut identifiers = pair
         .into_inner()
         .filter(|p| p.as_rule() == Rule::identifier)
@@ -2367,6 +3021,7 @@ fn build_composite_foreign_key(pair: Pair<'_, Rule>) -> Result<CompositeForeignK
         child_columns,
         parent_table,
         parent_columns,
+        follows_parent_purge,
     })
 }
 
@@ -2387,6 +3042,10 @@ fn refuse_nested_direction(nested: Pair<'_, Rule>) -> Error {
     ))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_sync_direction_option(pair: Pair<'_, Rule>) -> Result<contextdb_core::SyncDirection> {
     use contextdb_core::SyncDirection;
     let spelling = pair
@@ -2402,6 +3061,10 @@ fn build_sync_direction_option(pair: Pair<'_, Rule>) -> Result<contextdb_core::S
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_sync_conflict_option(pair: Pair<'_, Rule>) -> Result<contextdb_core::ConflictPolicy> {
     use contextdb_core::ConflictPolicy;
     let policy = pair
@@ -2415,6 +3078,10 @@ fn build_sync_conflict_option(pair: Pair<'_, Rule>) -> Result<contextdb_core::Co
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_retain_option(pair: Pair<'_, Rule>) -> Result<RetainOption> {
     let mut amount = None;
     let mut unit = None;
@@ -2466,6 +3133,10 @@ fn build_retain_option(pair: Pair<'_, Rule>) -> Result<RetainOption> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_scope_label_simple(pair: Pair<'_, Rule>) -> Result<ScopeLabelConstraint> {
     let labels = pair
         .into_inner()
@@ -2480,6 +3151,10 @@ fn build_scope_label_simple(pair: Pair<'_, Rule>) -> Result<ScopeLabelConstraint
     Ok(ScopeLabelConstraint::Simple { labels })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_scope_label_split(pair: Pair<'_, Rule>) -> Result<ScopeLabelConstraint> {
     let raw = pair.as_str();
     let write_pos = find_keyword_outside_strings(raw, "WRITE")
@@ -2562,6 +3237,10 @@ fn find_keyword_outside_strings(raw: &str, keyword: &str) -> Option<usize> {
     None
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_acl_constraint(pair: Pair<'_, Rule>) -> Result<AclConstraint> {
     let mut identifiers = pair
         .into_inner()
@@ -2579,7 +3258,15 @@ fn build_acl_constraint(pair: Pair<'_, Rule>) -> Result<AclConstraint> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_references_clause(pair: Pair<'_, Rule>) -> Result<ForeignKey> {
+    let follows_parent_purge = pair
+        .clone()
+        .into_inner()
+        .any(|p| p.as_rule() == Rule::follows_parent_purge);
     let ids: Vec<String> = pair
         .into_inner()
         .filter(|p| p.as_rule() == Rule::identifier)
@@ -2596,9 +3283,14 @@ fn build_references_clause(pair: Pair<'_, Rule>) -> Result<ForeignKey> {
         table: ids[0].clone(),
         column: ids[1].clone(),
         propagation_rules: Vec::new(),
+        follows_parent_purge,
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_fk_propagation_clause(pair: Pair<'_, Rule>) -> Result<AstPropagationRule> {
     let mut trigger_state = None;
     let mut target_state = None;
@@ -2629,6 +3321,10 @@ fn build_fk_propagation_clause(pair: Pair<'_, Rule>) -> Result<AstPropagationRul
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_edge_propagation_option(pair: Pair<'_, Rule>) -> Result<AstPropagationRule> {
     let mut edge_type = None;
     let mut direction = None;
@@ -2671,6 +3367,10 @@ fn build_edge_propagation_option(pair: Pair<'_, Rule>) -> Result<AstPropagationR
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_vector_propagation_option(pair: Pair<'_, Rule>) -> Result<AstPropagationRule> {
     let trigger_state = pair
         .into_inner()
@@ -2681,6 +3381,10 @@ fn build_vector_propagation_option(pair: Pair<'_, Rule>) -> Result<AstPropagatio
     Ok(AstPropagationRule::VectorExclusion { trigger_state })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn parse_max_depth_clause(pair: Pair<'_, Rule>) -> Result<u32> {
     let depth = pair
         .into_inner()
@@ -2689,6 +3393,10 @@ fn parse_max_depth_clause(pair: Pair<'_, Rule>) -> Result<u32> {
     parse_u32(depth.as_str(), "invalid MAX DEPTH value")
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_data_type(pair: Pair<'_, Rule>) -> Result<DataType> {
     let txt = pair.as_str().to_string();
     let mut inner = pair.into_inner();
@@ -2728,10 +3436,19 @@ struct ParsedVectorColumnOptions {
     max_partitions: Option<String>,
     search_mode: Option<VectorSearchMode>,
     auto_index_at: Option<String>,
-    hnsw: VectorHnswOptions,
+    auto_expansion_ceiling: Option<String>,
+    flat_below: Option<String>,
+    search: VectorSearchObjectives,
+    ivf: VectorIvfOptions,
+    has_with: bool,
+    engine_policy: VectorEnginePolicyOptions,
     consolidation: VectorConsolidationOptions,
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn vector_column_options_for_data_type(pair: &Pair<'_, Rule>) -> Result<ParsedVectorColumnOptions> {
     let Some(vector_type) = pair
         .clone()
@@ -2744,7 +3461,16 @@ fn vector_column_options_for_data_type(pair: &Pair<'_, Rule>) -> Result<ParsedVe
     let mut options = ParsedVectorColumnOptions::default();
     for part in vector_type.into_inner() {
         match part.as_rule() {
-            Rule::integer | Rule::vector_quantization_clause => {}
+            Rule::integer => {}
+            Rule::vector_quantization_clause => {
+                if options.has_with {
+                    return Err(Error::ParseError("duplicate WITH carrier".into()));
+                }
+                options.has_with = true;
+                options.engine_policy = build_vector_engine_policy(part)?;
+            }
+            Rule::vector_search_clause => options.search = build_vector_search_objectives(part)?,
+            Rule::vector_ivf_clause => options.ivf = build_vector_ivf_options(part)?,
             Rule::vector_partition_key_clause => {
                 options.partition_key_columns = part
                     .into_inner()
@@ -2779,13 +3505,10 @@ fn vector_column_options_for_data_type(pair: &Pair<'_, Rule>) -> Result<ParsedVe
                     VectorPolicyValue::Default => None,
                 };
             }
-            Rule::vector_hnsw_clause => {
-                let options_pair = part
-                    .into_inner()
-                    .find(|item| item.as_rule() == Rule::hnsw_options)
-                    .ok_or_else(|| Error::ParseError("HNSW missing policy group".to_string()))?;
-                options.hnsw = build_vector_hnsw_options(options_pair)?;
+            Rule::vector_auto_expansion_ceiling_clause => {
+                return Err(removed_vector_clause("AUTO_EXPANSION_CEILING"));
             }
+            Rule::vector_flat_below_clause => return Err(removed_vector_clause("FLAT_BELOW")),
             Rule::vector_consolidation_clause => {
                 let declaration = part.into_inner().next().ok_or_else(|| {
                     Error::ParseError("CONSOLIDATION missing policy group".to_string())
@@ -2824,46 +3547,16 @@ fn build_vector_policy_value(pair: Pair<'_, Rule>) -> VectorPolicyValue {
     }
 }
 
-fn build_vector_hnsw_options(pair: Pair<'_, Rule>) -> Result<VectorHnswOptions> {
-    let mut options = VectorHnswOptions::default();
-    for option in pair.into_inner() {
-        if option.as_rule() != Rule::hnsw_option {
-            return Err(unexpected_rule(
-                option.as_rule(),
-                "build_vector_hnsw_options",
-            ));
-        }
-        let mut parts = option.into_inner();
-        let name = parts
-            .next()
-            .ok_or_else(|| Error::ParseError("HNSW member missing name".to_string()))?;
-        let value = parts
-            .next()
-            .ok_or_else(|| Error::ParseError("HNSW member missing value".to_string()))?;
-        let slot = match name.as_str().to_ascii_uppercase().as_str() {
-            "M" => &mut options.m,
-            "EF_CONSTRUCTION" => &mut options.ef_construction,
-            "EF_SEARCH" => &mut options.ef_search,
-            _ => {
-                return Err(Error::ParseError("unknown HNSW policy member".to_string()));
-            }
-        };
-        if slot.is_some() {
-            return Err(Error::ParseError(format!(
-                "duplicate HNSW policy member {}",
-                name.as_str()
-            )));
-        }
-        *slot = Some(build_vector_policy_value(value));
-    }
-    if options == VectorHnswOptions::default() {
-        return Err(Error::ParseError(
-            "HNSW requires at least one policy member".to_string(),
-        ));
-    }
-    Ok(options)
+fn removed_vector_clause(keyword: &str) -> Error {
+    Error::ParseError(format!(
+        "Remove the {keyword} clause: the default search policy applies; to declare a target use SEARCH (TARGET_ACCURACY = n, EXPECTED_VECTORS = n)"
+    ))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_vector_consolidation_options(pair: Pair<'_, Rule>) -> Result<VectorConsolidationOptions> {
     let mut options = VectorConsolidationOptions::default();
     for option in pair.into_inner() {
@@ -2905,38 +3598,10 @@ fn build_vector_consolidation_options(pair: Pair<'_, Rule>) -> Result<VectorCons
     Ok(options)
 }
 
-fn vector_quantization_for_data_type(pair: &Pair<'_, Rule>) -> Result<VectorQuantization> {
-    let Some(vector_type) = pair
-        .clone()
-        .into_inner()
-        .find(|p| p.as_rule() == Rule::vector_type)
-    else {
-        return Ok(VectorQuantization::F32);
-    };
-
-    for p in vector_type.into_inner() {
-        if p.as_rule() == Rule::vector_quantization_clause {
-            let value = p
-                .into_inner()
-                .find(|part| part.as_rule() == Rule::vector_quantization_value)
-                .ok_or_else(|| Error::ParseError("missing vector quantization value".to_string()))?
-                .as_str()
-                .trim_matches('\'')
-                .to_ascii_uppercase();
-            return match value.as_str() {
-                "F32" => Ok(VectorQuantization::F32),
-                "SQ8" => Ok(VectorQuantization::SQ8),
-                "SQ4" => Ok(VectorQuantization::SQ4),
-                _ => Err(Error::ParseError(format!(
-                    "unsupported vector quantization '{value}'"
-                ))),
-            };
-        }
-    }
-
-    Ok(VectorQuantization::F32)
-}
-
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_state_machine_option(pair: Pair<'_, Rule>) -> Result<StateMachineDef> {
     let entries = pair
         .into_inner()
@@ -2989,6 +3654,10 @@ fn build_state_machine_option(pair: Pair<'_, Rule>) -> Result<StateMachineDef> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_dag_option(pair: Pair<'_, Rule>) -> Result<Vec<String>> {
     let edge_types = pair
         .into_inner()
@@ -3005,6 +3674,10 @@ fn build_dag_option(pair: Pair<'_, Rule>) -> Result<Vec<String>> {
     Ok(edge_types)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_drop_table(pair: Pair<'_, Rule>) -> Result<DropTable> {
     let mut if_exists = false;
     let mut name = None;
@@ -3023,6 +3696,10 @@ fn build_drop_table(pair: Pair<'_, Rule>) -> Result<DropTable> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_create_index(pair: Pair<'_, Rule>) -> Result<CreateIndex> {
     let mut name: Option<String> = None;
     let mut table: Option<String> = None;
@@ -3070,6 +3747,10 @@ fn build_create_index(pair: Pair<'_, Rule>) -> Result<CreateIndex> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_drop_index(pair: Pair<'_, Rule>) -> Result<DropIndex> {
     let mut if_exists = false;
     let mut idents: Vec<String> = Vec::new();
@@ -3092,6 +3773,10 @@ fn build_drop_index(pair: Pair<'_, Rule>) -> Result<DropIndex> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_create_schedule(pair: Pair<'_, Rule>) -> Result<Statement> {
     let mut name = None;
     let mut every = None;
@@ -3135,6 +3820,10 @@ fn build_create_schedule(pair: Pair<'_, Rule>) -> Result<Statement> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_drop_schedule(pair: Pair<'_, Rule>) -> Result<Statement> {
     let name = pair
         .into_inner()
@@ -3144,6 +3833,10 @@ fn build_drop_schedule(pair: Pair<'_, Rule>) -> Result<Statement> {
     Ok(Statement::DropSchedule { name })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_create_trigger(pair: Pair<'_, Rule>) -> Result<Statement> {
     let mut name = None;
     let mut table = None;
@@ -3176,6 +3869,10 @@ fn build_create_trigger(pair: Pair<'_, Rule>) -> Result<Statement> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_drop_trigger(pair: Pair<'_, Rule>) -> Result<Statement> {
     let name = pair
         .into_inner()
@@ -3185,6 +3882,10 @@ fn build_drop_trigger(pair: Pair<'_, Rule>) -> Result<Statement> {
     Ok(Statement::DropTrigger { name })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_create_event_type(pair: Pair<'_, Rule>) -> Result<Statement> {
     let mut name = None;
     let mut when = None;
@@ -3215,6 +3916,10 @@ fn build_create_event_type(pair: Pair<'_, Rule>) -> Result<Statement> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_create_sink(pair: Pair<'_, Rule>) -> Result<Statement> {
     let mut name = None;
     let mut sink_type = None;
@@ -3246,6 +3951,10 @@ fn build_create_sink(pair: Pair<'_, Rule>) -> Result<Statement> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_create_route(pair: Pair<'_, Rule>) -> Result<Statement> {
     let mut idents = Vec::new();
     let mut where_in = None;
@@ -3287,6 +3996,10 @@ fn build_create_route(pair: Pair<'_, Rule>) -> Result<Statement> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_drop_route(pair: Pair<'_, Rule>) -> Result<Statement> {
     let name = pair
         .into_inner()
@@ -3296,6 +4009,10 @@ fn build_drop_route(pair: Pair<'_, Rule>) -> Result<Statement> {
     Ok(Statement::DropRoute { name })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_insert(pair: Pair<'_, Rule>) -> Result<Insert> {
     let mut table = None;
     let mut columns = Vec::new();
@@ -3324,6 +4041,10 @@ fn build_insert(pair: Pair<'_, Rule>) -> Result<Insert> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_values_row(pair: Pair<'_, Rule>) -> Result<Vec<Expr>> {
     pair.into_inner()
         .filter(|p| p.as_rule() == Rule::expr)
@@ -3331,6 +4052,10 @@ fn build_values_row(pair: Pair<'_, Rule>) -> Result<Vec<Expr>> {
         .collect()
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_on_conflict(pair: Pair<'_, Rule>) -> Result<OnConflict> {
     let mut columns = Vec::new();
     let mut update_columns = Vec::new();
@@ -3349,6 +4074,10 @@ fn build_on_conflict(pair: Pair<'_, Rule>) -> Result<OnConflict> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_assignment(pair: Pair<'_, Rule>) -> Result<(String, Expr)> {
     let mut name = None;
     let mut value = None;
@@ -3367,6 +4096,10 @@ fn build_assignment(pair: Pair<'_, Rule>) -> Result<(String, Expr)> {
     ))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_delete(pair: Pair<'_, Rule>) -> Result<Delete> {
     let mut table = None;
     let mut where_clause = None;
@@ -3385,18 +4118,30 @@ fn build_delete(pair: Pair<'_, Rule>) -> Result<Delete> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_purge(pair: Pair<'_, Rule>) -> Result<Purge> {
     Ok(Purge {
         selections: build_erasure_selections(pair)?,
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_discard(pair: Pair<'_, Rule>) -> Result<Discard> {
     Ok(Discard {
         selections: build_erasure_selections(pair)?,
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_erasure_selections(pair: Pair<'_, Rule>) -> Result<Vec<ErasureSelection>> {
     let mut selections = Vec::new();
     for selection in pair.into_inner() {
@@ -3423,6 +4168,10 @@ fn build_erasure_selections(pair: Pair<'_, Rule>) -> Result<Vec<ErasureSelection
     Ok(selections)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_update(pair: Pair<'_, Rule>) -> Result<Update> {
     let mut table = None;
     let mut assignments = Vec::new();
@@ -3444,6 +4193,97 @@ fn build_update(pair: Pair<'_, Rule>) -> Result<Update> {
     })
 }
 
+/// The one grouped form the engine answers: `COUNT(*)` per group of plain
+/// columns of one table, the WHERE clause pinning columns with `= literal`,
+/// `= parameter` or `IS NULL`. Whether a maintained count backs the columns is
+/// the engine's decision; this is the shape only.
+fn is_grouped_count(statement: &Statement) -> bool {
+    let Statement::Select(select) = statement else {
+        return false;
+    };
+    let body = &select.body;
+    if !select.ctes.is_empty()
+        || body.group_by.is_empty()
+        || body.distinct
+        || !body.joins.is_empty()
+        || !body.order_by.is_empty()
+        || body.use_vector.is_some()
+        || body.use_rank.is_some()
+        || body.limit.is_some()
+    {
+        return false;
+    }
+    let [FromItem::Table { name, alias }] = body.from.as_slice() else {
+        return false;
+    };
+    let in_scope = |column: &ColumnRef| {
+        column.column != "*"
+            && column
+                .table
+                .as_deref()
+                .is_none_or(|qualifier| qualifier == name || alias.as_deref() == Some(qualifier))
+    };
+    let mut grouped = Vec::with_capacity(body.group_by.len());
+    for item in &body.group_by {
+        let Expr::Column(column) = item else {
+            return false;
+        };
+        if !in_scope(column) || grouped.contains(&column.column.as_str()) {
+            return false;
+        }
+        grouped.push(column.column.as_str());
+    }
+    let mut counted = false;
+    for column in &body.columns {
+        match &column.expr {
+            Expr::Column(reference)
+                if in_scope(reference) && grouped.contains(&reference.column.as_str()) => {}
+            Expr::FunctionCall { name, args }
+                if name.eq_ignore_ascii_case("COUNT")
+                    && matches!(
+                        args.as_slice(),
+                        [Expr::Column(ColumnRef { table: None, column })] if column == "*"
+                    ) =>
+            {
+                counted = true;
+            }
+            _ => return false,
+        }
+    }
+    counted
+        && body
+            .where_clause
+            .as_ref()
+            .is_none_or(|filter| grouped_count_pins(filter, &in_scope))
+}
+
+fn grouped_count_pins(expr: &Expr, in_scope: &dyn Fn(&ColumnRef) -> bool) -> bool {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => grouped_count_pins(left, in_scope) && grouped_count_pins(right, in_scope),
+        Expr::BinaryOp {
+            left,
+            op: BinOp::Eq,
+            right,
+        } => matches!(
+            (left.as_ref(), right.as_ref()),
+            (Expr::Column(column), Expr::Literal(_) | Expr::Parameter(_)) if in_scope(column)
+        ),
+        Expr::IsNull {
+            expr,
+            negated: false,
+        } => matches!(expr.as_ref(), Expr::Column(column) if in_scope(column)),
+        _ => false,
+    }
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validate_statement(stmt: &Statement) -> Result<()> {
     if let Statement::Select(sel) = stmt {
         validate_select(sel)?;
@@ -3451,6 +4291,10 @@ fn validate_statement(stmt: &Statement) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validate_select(sel: &SelectStatement) -> Result<()> {
     for cte in &sel.ctes {
         if let Cte::SqlCte { query, .. } = cte {
@@ -3475,6 +4319,10 @@ fn validate_select(sel: &SelectStatement) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validate_select_body(body: &SelectBody) -> Result<()> {
     if body
         .order_by
@@ -3502,6 +4350,10 @@ fn validate_select_body(body: &SelectBody) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validate_match_clause(mc: &MatchClause) -> Result<()> {
     if mc.graph_name.as_ref().is_none_or(|g| g.trim().is_empty()) {
         return Err(Error::ParseError(
@@ -3543,6 +4395,10 @@ fn validate_match_clause(mc: &MatchClause) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validate_expr(expr: &Expr) -> Result<()> {
     match expr {
         Expr::InSubquery { subquery, .. } => {
@@ -3581,11 +4437,19 @@ fn validate_expr(expr: &Expr) -> Result<()> {
                 validate_expr(arg)?;
             }
         }
-        Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) => {}
+        Expr::RowNumber(_)
+        | Expr::WindowRank(_)
+        | Expr::Column(_)
+        | Expr::Literal(_)
+        | Expr::Parameter(_) => {}
     }
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validate_subquery_expr(expr: &Expr, cte_names: &[&str]) -> Result<()> {
     match expr {
         Expr::InSubquery { subquery, .. } => {
@@ -3636,12 +4500,20 @@ fn validate_subquery_expr(expr: &Expr, cte_names: &[&str]) -> Result<()> {
                 validate_subquery_expr(element, cte_names)?;
             }
         }
-        Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) => {}
+        Expr::RowNumber(_)
+        | Expr::WindowRank(_)
+        | Expr::Column(_)
+        | Expr::Literal(_)
+        | Expr::Parameter(_) => {}
     }
 
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validate_row_vector_key_expr(expr: &Expr) -> Result<()> {
     match expr {
         Expr::Literal(Literal::Bool(_))
@@ -3700,188 +4572,136 @@ fn parse_string_literals_in(raw: &str) -> Vec<String> {
     out
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn parse_u32(s: &str, err: &str) -> Result<u32> {
     s.parse::<u32>()
         .map_err(|_| Error::ParseError(err.to_string()))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn parse_u64(s: &str, err: &str) -> Result<u64> {
     s.parse::<u64>()
         .map_err(|_| Error::ParseError(err.to_string()))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn parse_i64(s: &str, err: &str) -> Result<i64> {
     s.parse::<i64>()
         .map_err(|_| Error::ParseError(err.to_string()))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn parse_f64(s: &str, err: &str) -> Result<f64> {
     s.parse::<f64>()
         .map_err(|_| Error::ParseError(err.to_string()))
 }
 
 fn starts_with_keywords(input: &str, words: &[&str]) -> bool {
-    let tokens: Vec<&str> = input.split_whitespace().take(words.len()).collect();
-
-    if tokens.len() != words.len() {
-        return false;
-    }
-
-    tokens
-        .iter()
-        .zip(words)
-        .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    let tokens = syntax_keyword_tokens(input);
+    tokens.len() >= words.len()
+        && tokens
+            .iter()
+            .take(words.len())
+            .zip(words)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
 }
 
-fn contains_token_outside_strings(input: &str, token: &str) -> bool {
-    let mut in_str = false;
-    let mut chars = input.char_indices().peekable();
-
-    while let Some((idx, ch)) = chars.next() {
-        if ch == '\'' {
-            if in_str {
-                if let Some((_, next_ch)) = chars.peek()
-                    && *next_ch == '\''
-                {
-                    let _ = chars.next();
-                    continue;
+/// Keyword prechecks use lexical boundaries, not SQL data or comments.
+fn syntax_keyword_tokens(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        if ch == '-' && chars.peek() == Some(&'-') {
+            chars.next();
+            for ch in chars.by_ref() {
+                if ch == '\n' {
+                    break;
                 }
-                in_str = false;
-            } else {
-                in_str = true;
             }
             continue;
         }
-
-        if in_str {
+        if ch == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            while let Some(ch) = chars.next() {
+                if ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    break;
+                }
+            }
             continue;
         }
-
-        // `idx` is a char boundary, but `idx + token.len()` need not be: a
-        // multi-byte character starting inside the fixed-width window would put
-        // it mid-character. `get` returns None there instead of panicking, and
-        // a window that ends mid-character can never equal an ASCII token.
-        if is_word_boundary(input, idx.saturating_sub(1))
-            && input
-                .get(idx..idx + token.len())
-                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(token))
-            && is_word_boundary(input, idx + token.len())
-        {
-            return true;
+        if ch == '\'' || ch == '"' {
+            while let Some(next) = chars.next() {
+                if next == ch {
+                    if chars.peek() == Some(&ch) {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            tokens.push("<quoted>".into());
+        } else if ch.is_ascii_alphanumeric() || ch == '_' {
+            let mut token = String::from(ch);
+            while chars
+                .peek()
+                .is_some_and(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+            {
+                if let Some(next) = chars.next() {
+                    token.push(next);
+                }
+            }
+            tokens.push(token.to_ascii_uppercase());
+        } else {
+            tokens.push(ch.to_string());
         }
     }
-
-    false
+    tokens
 }
 
 fn contains_keyword_sequence_outside_strings(input: &str, words: &[&str]) -> bool {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut in_str = false;
-    let mut chars = input.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == '\'' {
-            if in_str {
-                if chars.peek() == Some(&'\'') {
-                    let _ = chars.next();
-                    continue;
-                }
-                in_str = false;
-            } else {
-                in_str = true;
-            }
-            if !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
-            }
-            continue;
-        }
-
-        if in_str {
-            continue;
-        }
-
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            current.push(ch);
-        } else if !current.is_empty() {
-            tokens.push(std::mem::take(&mut current));
-        }
-    }
-
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-
-    tokens.windows(words.len()).any(|window| {
-        window
-            .iter()
-            .zip(words)
-            .all(|(a, b)| a.eq_ignore_ascii_case(b))
-    })
+    syntax_keyword_tokens(input)
+        .windows(words.len())
+        .any(|window| {
+            window
+                .iter()
+                .zip(words)
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+        })
 }
 
 fn contains_where_match_operator(input: &str) -> bool {
-    let mut in_str = false;
-    let mut word = String::new();
     let mut seen_where = false;
-
-    for ch in input.chars() {
-        if ch == '\'' {
-            in_str = !in_str;
-            if !word.is_empty() {
-                if word.eq_ignore_ascii_case("WHERE") {
-                    seen_where = true;
-                } else if seen_where && word.eq_ignore_ascii_case("MATCH") {
-                    return true;
-                }
-                word.clear();
-            }
-            continue;
-        }
-
-        if in_str {
-            continue;
-        }
-
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            word.push(ch);
-            continue;
-        }
-
-        if !word.is_empty() {
-            if word.eq_ignore_ascii_case("WHERE") {
-                seen_where = true;
-            } else if seen_where && word.eq_ignore_ascii_case("GRAPH_TABLE") {
-                // A later graph traversal can legitimately contain MATCH; do not
-                // keep a prior WHERE active across that boundary.
-                seen_where = false;
-            } else if seen_where && word.eq_ignore_ascii_case("MATCH") {
-                return true;
-            } else if seen_where
-                && (word.eq_ignore_ascii_case("GROUP")
-                    || word.eq_ignore_ascii_case("ORDER")
-                    || word.eq_ignore_ascii_case("LIMIT"))
-            {
-                seen_where = false;
-            }
-            word.clear();
+    for word in syntax_keyword_tokens(input) {
+        match word.as_str() {
+            "WHERE" => seen_where = true,
+            "MATCH" if seen_where => return true,
+            "GRAPH_TABLE" | "GROUP" | "ORDER" | "LIMIT" => seen_where = false,
+            _ => {}
         }
     }
-
-    if !word.is_empty() && seen_where && word.eq_ignore_ascii_case("MATCH") {
-        return true;
-    }
-
     false
 }
 
-fn is_word_boundary(s: &str, idx: usize) -> bool {
-    if idx >= s.len() {
-        return true;
-    }
-    !s.as_bytes()[idx].is_ascii_alphanumeric() && s.as_bytes()[idx] != b'_'
-}
-
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_set_memory_limit(pair: Pair<'_, Rule>) -> Result<SetMemoryLimitValue> {
     let inner = pair
         .into_inner()
@@ -3906,6 +4726,10 @@ fn build_set_memory_limit(pair: Pair<'_, Rule>) -> Result<SetMemoryLimitValue> {
 }
 
 /// `None` means the column returns to the engine's default share.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_vector_serving_cache(pair: Pair<'_, Rule>) -> Result<Option<u64>> {
     let inner = pair
         .into_inner()
@@ -3930,6 +4754,10 @@ fn build_vector_serving_cache(pair: Pair<'_, Rule>) -> Result<Option<u64>> {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_set_disk_limit(pair: Pair<'_, Rule>) -> Result<SetDiskLimitValue> {
     let inner = pair
         .into_inner()
@@ -3953,6 +4781,101 @@ fn build_set_disk_limit(pair: Pair<'_, Rule>) -> Result<SetDiskLimitValue> {
     }
 }
 
+/// Ranges are the engine's to judge (`StorageCompactionPolicy::validate`), so
+/// the statement and the Rust setter refuse identically. Only what a parser
+/// alone can see is refused here: a number too large to hold, and a clause
+/// named twice.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn build_storage_compaction(pair: Pair<'_, Rule>) -> Result<StorageCompactionSetting> {
+    use contextdb_core::StorageCompactionDeclarationIssue as Issue;
+    let refuse = |issue| Error::InvalidStorageCompactionDeclaration { issue };
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn ratio(pair: Pair<'_, Rule>, name: &str) -> Result<f64> {
+        let text = pair
+            .into_inner()
+            .find(|part| part.as_rule() == Rule::storage_compaction_ratio)
+            .ok_or_else(|| {
+                Error::ParseError(format!("STORAGE_COMPACTION {name} is missing a value"))
+            })?;
+        text.as_str()
+            .parse::<f64>()
+            .map_err(|_| Error::ParseError(format!("STORAGE_COMPACTION {name} is not a number")))
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn integer(pair: Pair<'_, Rule>, name: &str) -> Result<Option<u64>> {
+        let text = pair
+            .into_inner()
+            .find(|part| part.as_rule() == Rule::integer)
+            .ok_or_else(|| {
+                Error::ParseError(format!("STORAGE_COMPACTION {name} is missing a value"))
+            })?;
+        Ok(text.as_str().parse::<u64>().ok())
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn once<T>(slot: &mut Option<T>, value: T) -> Result<()> {
+        if slot.replace(value).is_some() {
+            return Err(Error::InvalidStorageCompactionDeclaration {
+                issue: contextdb_core::StorageCompactionDeclarationIssue::DuplicateClause,
+            });
+        }
+        Ok(())
+    }
+    let mut clauses = StorageCompactionClauses::default();
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::storage_compaction_default => return Ok(StorageCompactionSetting::Default),
+            Rule::storage_compaction_start_ratio => {
+                once(&mut clauses.start_ratio, ratio(part, "START_RATIO")?)?;
+            }
+            Rule::storage_compaction_stop_ratio => {
+                once(&mut clauses.stop_ratio, ratio(part, "STOP_RATIO")?)?;
+            }
+            Rule::storage_compaction_min_interval => {
+                let unit = part
+                    .clone()
+                    .into_inner()
+                    .find(|inner| inner.as_rule() == Rule::storage_compaction_interval_unit)
+                    .map(|inner| inner.as_str().to_ascii_uppercase())
+                    .unwrap_or_default();
+                let multiplier: u64 = match unit.as_str() {
+                    "HOURS" => 3_600_000,
+                    "MINUTES" => 60_000,
+                    "SECONDS" => 1_000,
+                    _ => 1,
+                };
+                let milliseconds = integer(part, "MIN_INTERVAL")?
+                    .and_then(|value| value.checked_mul(multiplier))
+                    .ok_or_else(|| refuse(Issue::MinIntervalOutOfRange))?;
+                once(&mut clauses.min_interval_ms, milliseconds)?;
+            }
+            Rule::storage_compaction_max_sweeps => {
+                let sweeps = integer(part, "MAX_SWEEPS")?
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(|| refuse(Issue::MaxSweepsOutOfRange))?;
+                once(&mut clauses.max_sweeps, sweeps)?;
+            }
+            other => return Err(unexpected_rule(other, "build_storage_compaction")),
+        }
+    }
+    Ok(StorageCompactionSetting::Declare(clauses))
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_maintenance_poll_interval(pair: Pair<'_, Rule>) -> Result<u64> {
     let mut value = None;
     let mut multiplier = None;
@@ -3996,6 +4919,10 @@ fn build_maintenance_poll_interval(pair: Pair<'_, Rule>) -> Result<u64> {
     Ok(milliseconds)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn parse_size_with_unit(text: &str) -> Result<u64> {
     let (digits, suffix) = text.split_at(text.len() - 1);
     let base: u64 = digits
@@ -4008,4 +4935,227 @@ fn parse_size_with_unit(text: &str) -> Result<u64> {
         _ => return Err(Error::ParseError(format!("unknown size suffix: {suffix}"))),
     };
     Ok(base * multiplier)
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn validate_window_spec<'a>(
+    expr: &'a Expr,
+    window: &mut Option<&'a RowNumberWindow>,
+) -> Result<()> {
+    match expr {
+        Expr::RowNumber(spec) => {
+            if window.is_some_and(|existing| existing != spec) {
+                return Err(window_refusal("several distinct windows"));
+            }
+            *window = Some(spec);
+        }
+        Expr::BinaryOp { left, right, .. } | Expr::CosineDistance { left, right } => {
+            validate_window_spec(left, window)?;
+            validate_window_spec(right, window)?;
+        }
+        Expr::UnaryOp { operand, .. } | Expr::IsNull { expr: operand, .. } => {
+            validate_window_spec(operand, window)?
+        }
+        Expr::FunctionCall { args, .. } | Expr::Row(args) => {
+            for arg in args {
+                validate_window_spec(arg, window)?;
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            validate_window_spec(expr, window)?;
+            for item in list {
+                validate_window_spec(item, window)?;
+            }
+        }
+        Expr::Like { expr, pattern, .. } => {
+            validate_window_spec(expr, window)?;
+            validate_window_spec(pattern, window)?;
+        }
+        Expr::InSubquery { expr, .. } => validate_window_spec(expr, window)?,
+        Expr::RowVectorSource { key, .. } => validate_window_spec(key, window)?,
+        Expr::WindowRank(_) | Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) => {}
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn vector_group_members(pair: Pair<'_, Rule>) -> Result<Vec<(String, Pair<'_, Rule>)>> {
+    let group = if pair.as_rule() == Rule::vector_policy_group {
+        pair
+    } else {
+        pair.into_inner()
+            .find(|p| p.as_rule() == Rule::vector_policy_group)
+            .ok_or_else(|| Error::ParseError("missing vector policy group".into()))?
+    };
+    let mut result = Vec::new();
+    for member in group.into_inner() {
+        let mut parts = member.into_inner();
+        let name = parts
+            .next()
+            .expect("policy name")
+            .as_str()
+            .to_ascii_lowercase();
+        if result.iter().any(|(old, _)| old == &name) {
+            return Err(Error::ParseError(format!(
+                "duplicate vector policy member {}",
+                name.to_ascii_uppercase()
+            )));
+        }
+        result.push((name, parts.next().expect("policy value")));
+    }
+    Ok(result)
+}
+fn vector_raw_value(pair: Pair<'_, Rule>) -> VectorPolicyValue {
+    let raw = pair.as_str();
+    if raw.eq_ignore_ascii_case("DEFAULT") {
+        VectorPolicyValue::Default
+    } else {
+        VectorPolicyValue::Value(raw.to_owned())
+    }
+}
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn build_vector_search_objectives(pair: Pair<'_, Rule>) -> Result<VectorSearchObjectives> {
+    let mut result = VectorSearchObjectives::default();
+    for (name, value) in vector_group_members(pair)? {
+        match name.as_str() {
+            "search_radius" => return Err(removed_vector_clause("SEARCH_RADIUS")),
+            "target_accuracy" => result.target_accuracy = Some(vector_raw_value(value)),
+            "expected_vectors" => result.expected_vectors = Some(vector_raw_value(value)),
+            _ => {
+                return Err(Error::ParseError(format!(
+                    "unknown SEARCH member {}",
+                    name.to_ascii_uppercase()
+                )));
+            }
+        }
+    }
+    Ok(result)
+}
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn build_vector_ivf_options(pair: Pair<'_, Rule>) -> Result<VectorIvfOptions> {
+    let mut result = VectorIvfOptions::default();
+    for (name, value) in vector_group_members(pair)? {
+        match name.as_str() {
+            "search_radius" => return Err(removed_vector_clause("SEARCH_RADIUS")),
+            "lists" => result.lists = Some(vector_raw_value(value)),
+            "probes" => result.probes = Some(vector_raw_value(value)),
+            "refine_factor" => result.refine_factor = Some(vector_raw_value(value)),
+            _ => {
+                return Err(Error::ParseError(format!(
+                    "unknown IVF member {}",
+                    name.to_ascii_uppercase()
+                )));
+            }
+        }
+    }
+    Ok(result)
+}
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn build_vector_engine_policy(pair: Pair<'_, Rule>) -> Result<VectorEnginePolicyOptions> {
+    let mut result = VectorEnginePolicyOptions::default();
+    for (name, value) in vector_group_members(pair)? {
+        match name.as_str() {
+            "calibration_max_k" => result.calibration_max_k = Some(vector_raw_value(value)),
+            "probe_grid" => result.probe_grid = Some(vector_raw_value(value)),
+            "refine_growth" => result.refine_growth = Some(vector_raw_value(value)),
+            "calibration_samples" => result.calibration_samples = Some(vector_raw_value(value)),
+            "min_lists" => result.min_lists = Some(vector_raw_value(value)),
+            "vectors_per_list" => result.vectors_per_list = Some(vector_raw_value(value)),
+            "centroid_memory_percent" => {
+                result.centroid_memory_percent = Some(vector_raw_value(value))
+            }
+            "training_samples" => result.training_samples = Some(vector_raw_value(value)),
+            "training_iterations" => result.training_iterations = Some(vector_raw_value(value)),
+            "training_seed" => result.training_seed = Some(vector_raw_value(value)),
+            "max_delta_runs" => result.max_delta_runs = Some(vector_raw_value(value)),
+            "write_buffer_bytes" => result.write_buffer_bytes = Some(vector_raw_value(value)),
+            "ingest_batch_keys" => result.ingest_batch_keys = Some(vector_raw_value(value)),
+            "coalesce_pages_per_step" => {
+                result.coalesce_pages_per_step = Some(vector_raw_value(value))
+            }
+            "build_batch_entries" => result.build_batch_entries = Some(vector_raw_value(value)),
+            "remap_batch_entries" => result.remap_batch_entries = Some(vector_raw_value(value)),
+            "directory_window_objects" => {
+                result.directory_window_objects = Some(vector_raw_value(value))
+            }
+            "page_window_bytes" => result.page_window_bytes = Some(vector_raw_value(value)),
+            "calibration_depths" => {
+                result.calibration_depths =
+                    Some(if value.as_str().eq_ignore_ascii_case("DEFAULT") {
+                        VectorPolicyListValue::Default
+                    } else {
+                        let list = value.into_inner().next().expect("value");
+                        if list.as_rule() != Rule::vector_policy_list {
+                            return Err(Error::ParseError(
+                                "calibration_depths requires a list".into(),
+                            ));
+                        }
+                        VectorPolicyListValue::Values(
+                            list.into_inner().map(|p| p.as_str().to_owned()).collect(),
+                        )
+                    });
+            }
+            "refine_factors" => {
+                result.refine_factors = Some(if value.as_str().eq_ignore_ascii_case("DEFAULT") {
+                    VectorPolicyListValue::Default
+                } else {
+                    let list = value.into_inner().next().expect("value");
+                    if list.as_rule() != Rule::vector_policy_list {
+                        return Err(Error::ParseError("refine_factors requires a list".into()));
+                    }
+                    VectorPolicyListValue::Values(
+                        list.into_inner().map(|p| p.as_str().to_owned()).collect(),
+                    )
+                });
+            }
+
+            "calibration_queries" => {
+                result.calibration_queries =
+                    Some(if value.as_str().eq_ignore_ascii_case("DEFAULT") {
+                        VectorPolicyReferenceValue::Default
+                    } else {
+                        let reference = value.into_inner().next().expect("value");
+                        if reference.as_rule() != Rule::vector_policy_reference {
+                            return Err(Error::ParseError(
+                                "calibration_queries requires table.column".into(),
+                            ));
+                        }
+                        let mut parts = reference.into_inner();
+                        VectorPolicyReferenceValue::Reference {
+                            table: parse_identifier(parts.next().expect("table").as_str()),
+                            column: parse_identifier(parts.next().expect("column").as_str()),
+                        }
+                    });
+            }
+            "quantization" => {
+                result.quantization = Some(if value.as_str().eq_ignore_ascii_case("DEFAULT") {
+                    None
+                } else {
+                    Some(match value.as_str().trim_matches('\'') {
+                        "F32" => VectorQuantization::F32,
+                        "SQ8" => VectorQuantization::SQ8,
+                        "SQ4" => VectorQuantization::SQ4,
+                        _ => return Err(Error::ParseError("invalid quantization".into())),
+                    })
+                })
+            }
+            _ => result.unknown_members.push(name),
+        }
+    }
+    Ok(result)
 }

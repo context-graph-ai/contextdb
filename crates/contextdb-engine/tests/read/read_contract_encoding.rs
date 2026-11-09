@@ -6,13 +6,15 @@ use contextdb_core::read_contract::{
 use contextdb_core::{TxId, Value, VectorIndexRef, VectorSearchMode};
 use contextdb_engine::read_contract::{
     CanonicalCascadeReport, CanonicalIndexCandidate, CanonicalQueryResult, CanonicalQueryTrace,
-    CanonicalVectorPartitionHnswDisclosure, CanonicalVectorSearchDisclosure, ReadEncodingError,
+    CanonicalVectorPartitionDisclosure, CanonicalVectorSearchDisclosure, ReadEncodingError,
     cursor_page_encoded_size, decode_cursor_page, decode_metadata_page, decode_query_result,
-    encode_cursor_page, encode_metadata_page, encode_query_result, metadata_page_encoded_size,
+    encode_cursor_page as encode_cursor_page_native,
+    encode_metadata_page as encode_metadata_page_native,
+    encode_query_result as encode_query_result_native, metadata_page_encoded_size,
     query_result_encoded_size,
 };
 use contextdb_engine::{
-    CascadeReport, IndexCandidate, VectorPartitionHnswDisclosure, VectorQuerySourceDisclosure,
+    CascadeReport, IndexCandidate, VectorPartitionDisclosure, VectorQuerySourceDisclosure,
     VectorSearchDisclosure, VectorSearchLayerPresence, VectorSearchResidual, VectorSearchRoute,
     VectorSearchRouteEvidence, VectorSearchScopeShape, VectorSearchTailState,
 };
@@ -21,13 +23,94 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+// Standalone codec inputs are application fixtures with the same explicit
+// unbounded ceiling already declared by QueryFixture and cursor_fixture.
+pub(super) fn fixture_encoding_owner() -> contextdb_core::read_memory::ReadMemoryOwner {
+    contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(u64::MAX)
+        .expect("codec fixture root")
+        .child()
+        .expect("codec fixture child")
+}
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(super) fn encode_query_result(result: &QueryResult) -> Result<Vec<u8>, ReadEncodingError> {
+    encode_query_result_native(result, result.encoding_owner_for_test())
+        .map(|bytes| bytes.as_slice().to_vec())
+}
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn encode_cursor_page(page: &CursorPage) -> Result<Vec<u8>, ReadEncodingError> {
+    encode_cursor_page_native(
+        page,
+        page.encoding_owner().expect("funded actual page fixture"),
+    )
+    .map(|bytes| bytes.as_slice().to_vec())
+}
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn encode_metadata_page(page: &MetadataPage) -> Result<Vec<u8>, ReadEncodingError> {
+    encode_metadata_page_native(page, fixture_encoding_owner())
+        .map(|bytes| bytes.as_slice().to_vec())
+}
+
+struct QueryFixture {
+    columns: Vec<String>,
+    rows: Vec<Vec<Value>>,
+    rows_affected: u64,
+    trace: QueryTrace,
+    cascade: Option<CascadeReport>,
+}
+impl QueryFixture {
+    fn empty() -> Self {
+        Self {
+            columns: vec![],
+            rows: vec![],
+            rows_affected: 0,
+            trace: QueryTrace::scan(),
+            cascade: None,
+        }
+    }
+    fn finish(self) -> QueryResult {
+        let owner =
+            contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(u64::MAX)
+                .expect("codec fixture root")
+                .child()
+                .expect("codec fixture child");
+        QueryResult::from_owned_parts_for_test(
+            owner,
+            self.columns,
+            self.rows,
+            self.rows_affected,
+            self.trace,
+            self.cascade,
+        )
+        .expect("funded actual result fixture")
+    }
+}
+fn cursor_fixture(columns: Vec<String>, rows: Vec<Vec<Value>>, has_more: bool) -> CursorPage {
+    let owner =
+        contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(u64::MAX)
+            .expect("codec fixture root")
+            .child()
+            .expect("codec fixture child");
+    CursorPage::from_owned_parts_for_test(owner, columns, rows, has_more)
+        .expect("funded actual page fixture")
+}
+
 fn standard_bytes<T: Serialize>(value: &T) -> Vec<u8> {
     encode_to_vec(value, standard()).expect("bincode standard encoding")
 }
 
-fn result_with_every_value_kind() -> QueryResult {
-    QueryResult {
-        columns: vec![
+fn rich_parts() -> QueryFixture {
+    {
+        let mut query_fixture = QueryFixture::empty();
+        query_fixture.columns = vec![
             "null".to_owned(),
             "bool".to_owned(),
             "int".to_owned(),
@@ -38,8 +121,8 @@ fn result_with_every_value_kind() -> QueryResult {
             "json".to_owned(),
             "vector".to_owned(),
             "tx".to_owned(),
-        ],
-        rows: vec![vec![
+        ];
+        query_fixture.rows = vec![vec![
             Value::Null,
             Value::Bool(true),
             Value::Int64(-7),
@@ -50,9 +133,9 @@ fn result_with_every_value_kind() -> QueryResult {
             Value::Json(serde_json::json!({"route": "neutral"})),
             Value::Vector(vec![1.0, -2.0, 3.5]),
             Value::TxId(TxId(42)),
-        ]],
-        rows_affected: 3,
-        trace: QueryTrace {
+        ]];
+        query_fixture.rows_affected = 3;
+        query_fixture.trace = QueryTrace {
             physical_plan: "IndexScan",
             index_used: Some("events_created_at".to_owned()),
             predicates_pushed: smallvec::smallvec!["created_at >= $since".into()],
@@ -65,19 +148,23 @@ fn result_with_every_value_kind() -> QueryResult {
             vector_search: None,
             rows_examined: 9,
             maintained_count: None,
-        },
-        cascade: Some(CascadeReport {
+            cache_resident_fraction: Some(0.5),
+            groups: Default::default(),
+        };
+        query_fixture.cascade = Some(CascadeReport {
             dropped_indexes: vec!["events_stale".to_owned()],
-        }),
+        });
+        query_fixture
     }
 }
 
-fn materially_different_result() -> QueryResult {
-    QueryResult {
-        columns: vec!["count".to_owned()],
-        rows: vec![vec![Value::Int64(0)], vec![Value::Int64(1)]],
-        rows_affected: 0,
-        trace: QueryTrace {
+fn sparse_parts() -> QueryFixture {
+    {
+        let mut query_fixture = QueryFixture::empty();
+        query_fixture.columns = vec!["count".to_owned()];
+        query_fixture.rows = vec![vec![Value::Int64(0)], vec![Value::Int64(1)]];
+        query_fixture.rows_affected = 0;
+        query_fixture.trace = QueryTrace {
             physical_plan: "Scan",
             index_used: None,
             predicates_pushed: smallvec::SmallVec::new(),
@@ -87,9 +174,19 @@ fn materially_different_result() -> QueryResult {
             vector_search: None,
             rows_examined: 2,
             maintained_count: None,
-        },
-        cascade: None,
+            cache_resident_fraction: None,
+            groups: Default::default(),
+        };
+        query_fixture.cascade = None;
+        query_fixture
     }
+}
+
+fn result_with_every_value_kind() -> QueryResult {
+    rich_parts().finish()
+}
+fn materially_different_result() -> QueryResult {
+    sparse_parts().finish()
 }
 
 fn expected_result_with_every_value_kind() -> CanonicalQueryResult {
@@ -132,6 +229,8 @@ fn expected_result_with_every_value_kind() -> CanonicalQueryResult {
             vector_search: None,
             rows_examined: 9,
             maintained_count: None,
+            cache_resident_fraction: Some(0.5),
+            groups: Default::default(),
         },
         cascade: Some(CanonicalCascadeReport {
             dropped_indexes: vec!["events_stale".to_owned()],
@@ -154,6 +253,8 @@ fn expected_materially_different_result() -> CanonicalQueryResult {
             vector_search: None,
             rows_examined: 2,
             maintained_count: None,
+            cache_resident_fraction: None,
+            groups: Default::default(),
         },
         cascade: None,
     }
@@ -189,7 +290,7 @@ fn canonical_query_projection_preserves_every_success_field() {
 fn query_result_encoding_is_canonical_dynamic_and_route_neutral() {
     let rich = result_with_every_value_kind();
     let sparse = materially_different_result();
-    assert_eq!(rich.rows[0].len(), 10, "every Value kind must be covered");
+    assert_eq!(rich.rows()[0].len(), 10, "every Value kind must be covered");
 
     let rich_dto = expected_result_with_every_value_kind();
     let sparse_dto = expected_materially_different_result();
@@ -226,24 +327,24 @@ fn query_result_encoding_is_canonical_dynamic_and_route_neutral() {
 
 #[test]
 fn query_result_codec_mutation_matrix_covers_every_encoded_field() {
-    let rich = result_with_every_value_kind();
+    let rich = rich_parts();
     let rich_expected = expected_result_with_every_value_kind();
-    let sparse = materially_different_result();
+    let sparse = sparse_parts();
     let sparse_expected = expected_materially_different_result();
 
-    let mut renamed_columns = rich.clone();
+    let mut renamed_columns = rich_parts();
     let mut renamed_columns_expected = rich_expected.clone();
     renamed_columns.columns[0] = "null_value".to_owned();
     renamed_columns_expected.columns[0] = "null_value".to_owned();
 
-    let mut additional_column = rich.clone();
+    let mut additional_column = rich_parts();
     let mut additional_column_expected = rich_expected.clone();
     additional_column.columns.push("extra".to_owned());
     additional_column.rows[0].push(Value::Text("present".to_owned()));
     additional_column_expected.columns.push("extra".to_owned());
     additional_column_expected.rows[0].push(Value::Text("present".to_owned()));
 
-    let mut additional_row = rich.clone();
+    let mut additional_row = rich_parts();
     let mut additional_row_expected = rich_expected.clone();
     let second_row = vec![
         Value::Null,
@@ -260,12 +361,12 @@ fn query_result_codec_mutation_matrix_covers_every_encoded_field() {
     additional_row.rows.push(second_row.clone());
     additional_row_expected.rows.push(second_row);
 
-    let mut rows_affected = rich.clone();
+    let mut rows_affected = rich_parts();
     let mut rows_affected_expected = rich_expected.clone();
     rows_affected.rows_affected = 17;
     rows_affected_expected.rows_affected = 17;
 
-    let mut trace_text = rich.clone();
+    let mut trace_text = rich_parts();
     let mut trace_text_expected = rich_expected.clone();
     trace_text.trace.physical_plan = "NestedLoop";
     trace_text.trace.index_used = Some("events_payload_idx".to_owned());
@@ -274,7 +375,7 @@ fn query_result_codec_mutation_matrix_covers_every_encoded_field() {
     trace_text_expected.trace.index_used = Some("events_payload_idx".to_owned());
     trace_text_expected.trace.rows_examined = 91;
 
-    let mut more_predicates = rich.clone();
+    let mut more_predicates = rich_parts();
     let mut more_predicates_expected = rich_expected.clone();
     more_predicates
         .trace
@@ -285,7 +386,7 @@ fn query_result_codec_mutation_matrix_covers_every_encoded_field() {
         .predicates_pushed
         .push("id > 7".to_owned());
 
-    let mut more_candidates = rich.clone();
+    let mut more_candidates = rich_parts();
     let mut more_candidates_expected = rich_expected.clone();
     more_candidates
         .trace
@@ -302,7 +403,7 @@ fn query_result_codec_mutation_matrix_covers_every_encoded_field() {
             rejected_reason: "ordering is incompatible".to_owned(),
         });
 
-    let mut trace_flags = rich.clone();
+    let mut trace_flags = rich_parts();
     let mut trace_flags_expected = rich_expected.clone();
     trace_flags.trace.sort_elided = false;
     trace_flags.trace.query_vector_source = Some(VectorIndexRef::new("events", "alternate"));
@@ -310,9 +411,9 @@ fn query_result_codec_mutation_matrix_covers_every_encoded_field() {
     trace_flags_expected.trace.query_vector_source =
         Some(VectorIndexRef::new("events", "alternate"));
 
-    let mut vector_trace = rich.clone();
+    let mut vector_trace = rich_parts();
     let mut vector_trace_expected = rich_expected.clone();
-    vector_trace.trace.vector_search = Some(VectorSearchDisclosure {
+    vector_trace.trace.vector_search = Some(Box::new(VectorSearchDisclosure {
         route_evidence: VectorSearchRouteEvidence::Executed,
         requested_mode: VectorSearchMode::Auto,
         resolved_mode: VectorSearchMode::Exact,
@@ -333,19 +434,22 @@ fn query_result_codec_mutation_matrix_covers_every_encoded_field() {
         global_candidate_budget: Some(320),
         admission_evaluations: Some(12),
         expansion_evaluations: Some(80),
+        rescore_evaluations: Some(0),
         layers_admitted: Some(2),
         budget_terminal: Some("answer_complete".to_owned()),
-        partition_hnsw: vec![VectorPartitionHnswDisclosure {
+        partitions: vec![VectorPartitionDisclosure {
             partition: "<redacted:1>".to_owned(),
             route: Some(VectorSearchRoute::Exact),
-            reason: Some("live_count_at_or_below_ef_search".to_owned()),
-            hnsw_m: 16,
-            hnsw_ef_construction: 100,
-            hnsw_ef_search: 32,
-            ef_search_source: "column".to_owned(),
+            reason: Some("below_auto_index_threshold".to_owned()),
+            lists: None,
+            lists_source: None,
+            probes: None,
+            probes_source: None,
+            refine_factor_hundredths: None,
+            refine_factor_source: None,
             policy_revision: 3,
         }],
-    });
+    }));
     vector_trace_expected.trace.vector_search = Some(CanonicalVectorSearchDisclosure {
         route_evidence: "executed".to_owned(),
         requested_mode: "AUTO".to_owned(),
@@ -367,21 +471,24 @@ fn query_result_codec_mutation_matrix_covers_every_encoded_field() {
         global_candidate_budget: Some(320),
         admission_evaluations: Some(12),
         expansion_evaluations: Some(80),
+        rescore_evaluations: Some(0),
         layers_admitted: Some(2),
         budget_terminal: Some("answer_complete".to_owned()),
-        partition_hnsw: vec![CanonicalVectorPartitionHnswDisclosure {
+        partitions: vec![CanonicalVectorPartitionDisclosure {
             partition: "<redacted:1>".to_owned(),
             route: Some("exact".to_owned()),
-            reason: Some("live_count_at_or_below_ef_search".to_owned()),
-            hnsw_m: 16,
-            hnsw_ef_construction: 100,
-            hnsw_ef_search: 32,
-            ef_search_source: "column".to_owned(),
+            reason: Some("below_auto_index_threshold".to_owned()),
+            lists: None,
+            lists_source: None,
+            probes: None,
+            probes_source: None,
+            refine_factor_hundredths: None,
+            refine_factor_source: None,
             policy_revision: 3,
         }],
     });
 
-    let mut more_dropped_indexes = rich.clone();
+    let mut more_dropped_indexes = rich_parts();
     let mut more_dropped_indexes_expected = rich_expected.clone();
     more_dropped_indexes
         .cascade
@@ -443,6 +550,7 @@ fn query_result_codec_mutation_matrix_covers_every_encoded_field() {
         ),
     ];
     for (name, result, expected) in cases {
+        let result = result.finish();
         assert_query_codec_case(&result, &expected);
         assert_eq!(
             encode_query_result(&result).expect("repeat route-neutral encoding"),
@@ -481,11 +589,12 @@ fn query_result_decoding_requires_one_complete_payload() {
 fn query_result_codec_rejects_wrong_row_arity_at_every_boundary() {
     let invalid_cases = [
         (
-            QueryResult {
-                columns: vec!["id".to_owned(), "payload".to_owned()],
-                rows: vec![vec![Value::Int64(7)]],
-                rows_affected: 0,
-                trace: QueryTrace {
+            {
+                let mut query_fixture = QueryFixture::empty();
+                query_fixture.columns = vec!["id".to_owned(), "payload".to_owned()];
+                query_fixture.rows = vec![vec![Value::Int64(7)]];
+                query_fixture.rows_affected = 0;
+                query_fixture.trace = QueryTrace {
                     physical_plan: "Scan",
                     index_used: None,
                     predicates_pushed: smallvec::SmallVec::new(),
@@ -495,8 +604,11 @@ fn query_result_codec_rejects_wrong_row_arity_at_every_boundary() {
                     vector_search: None,
                     rows_examined: 1,
                     maintained_count: None,
-                },
-                cascade: None,
+                    cache_resident_fraction: None,
+                    groups: Default::default(),
+                };
+                query_fixture.cascade = None;
+                query_fixture.finish()
             },
             CanonicalQueryResult {
                 columns: vec!["id".to_owned(), "payload".to_owned()],
@@ -512,19 +624,22 @@ fn query_result_codec_rejects_wrong_row_arity_at_every_boundary() {
                     vector_search: None,
                     rows_examined: 1,
                     maintained_count: None,
+                    cache_resident_fraction: None,
+                    groups: Default::default(),
                 },
                 cascade: None,
             },
         ),
         (
-            QueryResult {
-                columns: vec!["id".to_owned()],
-                rows: vec![vec![
+            {
+                let mut query_fixture = QueryFixture::empty();
+                query_fixture.columns = vec!["id".to_owned()];
+                query_fixture.rows = vec![vec![
                     Value::Int64(8),
                     Value::Text("unexpected second value".to_owned()),
-                ]],
-                rows_affected: 0,
-                trace: QueryTrace {
+                ]];
+                query_fixture.rows_affected = 0;
+                query_fixture.trace = QueryTrace {
                     physical_plan: "IndexScan",
                     index_used: Some("events_id".to_owned()),
                     predicates_pushed: smallvec::smallvec!["id = $id".into()],
@@ -534,8 +649,11 @@ fn query_result_codec_rejects_wrong_row_arity_at_every_boundary() {
                     vector_search: None,
                     rows_examined: 1,
                     maintained_count: None,
-                },
-                cascade: None,
+                    cache_resident_fraction: None,
+                    groups: Default::default(),
+                };
+                query_fixture.cascade = None;
+                query_fixture.finish()
             },
             CanonicalQueryResult {
                 columns: vec!["id".to_owned()],
@@ -554,6 +672,8 @@ fn query_result_codec_rejects_wrong_row_arity_at_every_boundary() {
                     vector_search: None,
                     rows_examined: 1,
                     maintained_count: None,
+                    cache_resident_fraction: None,
+                    groups: Default::default(),
                 },
                 cascade: None,
             },
@@ -580,19 +700,15 @@ fn query_result_codec_rejects_wrong_row_arity_at_every_boundary() {
 #[test]
 fn cursor_encoding_covers_nonempty_more_and_empty_exhausted_pages() {
     let pages = [
-        CursorPage {
-            columns: vec!["id".to_owned(), "payload".to_owned()],
-            rows: vec![vec![
+        cursor_fixture(
+            vec!["id".to_owned(), "payload".to_owned()],
+            vec![vec![
                 Value::Int64(7),
                 Value::Text("complete row".to_owned()),
             ]],
-            has_more: true,
-        },
-        CursorPage {
-            columns: vec!["id".to_owned(), "payload".to_owned()],
-            rows: vec![],
-            has_more: false,
-        },
+            true,
+        ),
+        cursor_fixture(vec!["id".to_owned(), "payload".to_owned()], vec![], false),
     ];
 
     let mut encodings = Vec::new();
@@ -605,8 +721,8 @@ fn cursor_encoding_covers_nonempty_more_and_empty_exhausted_pages() {
             encoded.len()
         );
         assert_eq!(
-            decode_cursor_page(&encoded).expect("canonical cursor-page decoding"),
-            page.clone()
+            &decode_cursor_page(&encoded).expect("canonical cursor-page decoding"),
+            page
         );
         encodings.push(encoded);
     }
@@ -622,8 +738,8 @@ fn assert_cursor_codec_case(page: &CursorPage) {
         encoded.len()
     );
     assert_eq!(
-        decode_cursor_page(&encoded).expect("canonical cursor-page decoding"),
-        page.clone()
+        &decode_cursor_page(&encoded).expect("canonical cursor-page decoding"),
+        page
     );
 }
 
@@ -657,31 +773,19 @@ fn cursor_codec_mutation_matrix_covers_columns_rows_values_and_valid_page_shapes
     .map(str::to_owned)
     .collect::<Vec<_>>();
     let cases = [
-        CursorPage {
-            columns: columns.clone(),
-            rows: vec![full_row.clone()],
-            has_more: true,
-        },
-        CursorPage {
-            columns: columns.clone(),
-            rows: vec![full_row.clone(), full_row.clone()],
-            has_more: false,
-        },
-        CursorPage {
-            columns: vec!["renamed".to_owned()],
-            rows: vec![vec![Value::Text("different value".to_owned())]],
-            has_more: false,
-        },
-        CursorPage {
-            columns: vec!["id".to_owned()],
-            rows: vec![],
-            has_more: true,
-        },
-        CursorPage {
-            columns: vec!["id".to_owned(), "payload".to_owned()],
-            rows: vec![],
-            has_more: false,
-        },
+        cursor_fixture(columns.clone(), vec![full_row.clone()], true),
+        cursor_fixture(
+            columns.clone(),
+            vec![full_row.clone(), full_row.clone()],
+            false,
+        ),
+        cursor_fixture(
+            vec!["renamed".to_owned()],
+            vec![vec![Value::Text("different value".to_owned())]],
+            false,
+        ),
+        cursor_fixture(vec!["id".to_owned()], vec![], true),
+        cursor_fixture(vec!["id".to_owned(), "payload".to_owned()], vec![], false),
     ];
     for page in cases {
         assert_cursor_codec_case(&page);
@@ -690,14 +794,14 @@ fn cursor_codec_mutation_matrix_covers_columns_rows_values_and_valid_page_shapes
 
 #[test]
 fn cursor_decoding_requires_one_complete_payload() {
-    let page = CursorPage {
-        columns: vec!["id".to_owned(), "payload".to_owned()],
-        rows: vec![vec![
+    let page = cursor_fixture(
+        vec!["id".to_owned(), "payload".to_owned()],
+        vec![vec![
             Value::Int64(7),
             Value::Text("complete row".to_owned()),
         ]],
-        has_more: true,
-    };
+        true,
+    );
     let bytes = standard_bytes(&page);
     assert_eq!(
         decode_cursor_page(&bytes).expect("decode one complete cursor page"),
@@ -722,11 +826,11 @@ fn cursor_decoding_requires_one_complete_payload() {
 
 #[test]
 fn cursor_codec_rejects_wrong_row_arity_at_every_boundary() {
-    let invalid = CursorPage {
-        columns: vec!["id".to_owned(), "payload".to_owned()],
-        rows: vec![vec![Value::Int64(7)]],
-        has_more: true,
-    };
+    let invalid = cursor_fixture(
+        vec!["id".to_owned(), "payload".to_owned()],
+        vec![vec![Value::Int64(7)]],
+        true,
+    );
     assert!(matches!(
         encode_cursor_page(&invalid),
         Err(ReadEncodingError::InvalidPayload)

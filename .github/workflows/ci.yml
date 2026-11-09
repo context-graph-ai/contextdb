@@ -34,11 +34,12 @@ jobs:
     outputs:
       integration_required: ${{ steps.classify.outputs.integration_required }}
       impact_reason: ${{ steps.classify.outputs.impact_reason }}
-      path_classes: ${{ steps.classify.outputs.path_classes }}
+      path_classes_artifact: ci-impact-${{ github.run_id }}-${{ github.run_attempt }}
       performance_qualification: ${{ steps.classify.outputs.performance_qualification }}
       integration_matrix: ${{ steps.plan.outputs.matrix }}
       combined_matrix: ${{ steps.plan.outputs.combined_matrix }}
       bundle_matrix: ${{ steps.plan.outputs.bundle_matrix }}
+      build_matrix: ${{ steps.plan.outputs.build_matrix }}
       enabled: ${{ steps.plan.outputs.enabled }}
       run_default: ${{ steps.plan.outputs.run_default }}
       gate_mode: ${{ steps.plan.outputs.gate_mode }}
@@ -59,9 +60,16 @@ jobs:
           CI_INTEGRATION_ENABLED: ${{ steps.classify.outputs.integration_required }}
           CI_INTEGRATION_DEFAULT: "false"
           IMPACT_REASON: ${{ steps.classify.outputs.impact_reason }}
-          PATH_CLASSES: ${{ steps.classify.outputs.path_classes }}
+          PATH_CLASSES_FILE: ${{ steps.classify.outputs.path_classes_file }}
           PERFORMANCE_QUALIFICATION: ${{ steps.classify.outputs.performance_qualification }}
         run: python3 -B scripts/ci-integration.py plan
+      - name: Save complete path classifications
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-impact-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.classify.outputs.path_classes_file }}
+          if-no-files-found: error
+          retention-days: 14
 
   integration:
     needs: [impact, test-bundles]
@@ -74,16 +82,31 @@ jobs:
         env:
           CI_INTEGRATION_ENABLED: ${{ needs.impact.outputs.enabled }}
           CI_INTEGRATION_DEFAULT: ${{ needs.impact.outputs.run_default }}
-          CI_INTEGRATION_NEEDS: ${{ toJSON(needs) }}
-          CI_COMBINED_MATRIX: ${{ needs.impact.outputs.combined_matrix }}
-          CI_BUNDLE_MATRIX: ${{ needs.impact.outputs.bundle_matrix }}
+          CI_INTEGRATION_NEEDS_FILE: ${{ runner.temp }}/integration-needs.json
+          CI_COMBINED_MATRIX_FILE: ${{ runner.temp }}/combined-matrix.json
+          CI_BUNDLE_MATRIX_FILE: ${{ runner.temp }}/bundle-matrix.json
+          CI_BUILD_MATRIX_FILE: ${{ runner.temp }}/build-matrix.json
           DEDUP_SHA: ${{ needs.impact.outputs.dedup_sha }}
           DEDUP_REASON: ${{ needs.impact.outputs.dedup_reason }}
           SOURCE_SHA: ${{ needs.impact.outputs.source_sha }}
           SOURCE_FINGERPRINT: ${{ needs.impact.outputs.source_fingerprint }}
           GATE_MODE: ${{ needs.impact.outputs.gate_mode }}
           RUN_DEFAULT: ${{ needs.impact.outputs.run_default }}
-        run: python3 -B scripts/ci-integration.py normal-required
+        # The values reach the script text, not the environment: about seventy jobs overflow one environment string.
+        run: |
+          cat > "$CI_INTEGRATION_NEEDS_FILE" <<'CI_JSON_END'
+          ${{ toJSON(needs) }}
+          CI_JSON_END
+          cat > "$CI_COMBINED_MATRIX_FILE" <<'CI_JSON_END'
+          ${{ needs.impact.outputs.combined_matrix }}
+          CI_JSON_END
+          cat > "$CI_BUNDLE_MATRIX_FILE" <<'CI_JSON_END'
+          ${{ needs.impact.outputs.bundle_matrix }}
+          CI_JSON_END
+          cat > "$CI_BUILD_MATRIX_FILE" <<'CI_JSON_END'
+          ${{ needs.impact.outputs.build_matrix }}
+          CI_JSON_END
+          python3 -B scripts/ci-integration.py normal-required
 
   lint:
     runs-on: ubuntu-latest
@@ -99,6 +122,7 @@ jobs:
           python3 -B scripts/ci-inventory-tests.py
           python3 -B scripts/ci-acceptance-partition-tests.py
           python3 -B scripts/ci-integration-tests.py
+          python3 -B scripts/ci-aggregate-routing-tests.py
           python3 -B scripts/ci-routing-tests.py
           python3 -B scripts/ci-routing-tests.py --dedup-only
           python3 -B scripts/ci-routing-tests.py --plan-only
@@ -129,15 +153,44 @@ jobs:
           key: lint-macos-debug0-jobs2
       - run: bash scripts/verify pr lint
 
-  test-bundles:
-    name: test / ${{ matrix.name }}
+  test-builds:
+    name: ${{ matrix.name }}
     needs: impact
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      CARGO_PROFILE_TEST_OPT_LEVEL: "1"
-      CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: "true"
-      CARGO_PROFILE_TEST_OVERFLOW_CHECKS: "true"
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.impact.outputs.build_matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Free disk space
+        run: bash scripts/ci-free-disk.sh
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: false
+          rustflags: ""
+      - name: Stamp tracked sources
+        run: bash scripts/ci-shared-build.sh stamp
+      - name: Compile the shared build
+        run: python3 -B scripts/ci-integration.py build-run "${{ matrix.build }}"
+      - name: Pack the compiled target
+        run: bash scripts/ci-shared-build.sh pack "${{ runner.temp }}/build.tar.zst"
+      - name: Upload the compiled target
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: build-${{ matrix.build }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          path: ${{ runner.temp }}/build.tar.zst
+          compression-level: 0
+          retention-days: 1
+          overwrite: true
+          if-no-files-found: error
+
+  test-bundles:
+    name: test / ${{ matrix.name }}
+    needs: [impact, test-builds]
+    if: always() && !cancelled() && needs.impact.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.impact.outputs.bundle_matrix) }}
@@ -149,8 +202,19 @@ jobs:
         with:
           cache: false
           rustflags: ""
+      - name: Restore shared build for constituent 1
+        if: always() && !cancelled() && matrix.slot1.build != null
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: build-${{ matrix.slot1.build }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          path: ${{ runner.temp }}/build-slot1
+      - name: Unpack shared build for constituent 1
+        if: always() && !cancelled() && matrix.slot1.build != null
+        continue-on-error: true
+        run: bash scripts/ci-shared-build.sh restore "${{ runner.temp }}/build-slot1"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        if: always() && !cancelled() && matrix.slot1 != null
+        if: always() && !cancelled() && matrix.slot1 != null && matrix.slot1.build == null
         with:
           key: ${{ matrix.slot1.cache_key }}
           add-job-id-key: false
@@ -169,6 +233,7 @@ jobs:
           CI_CRATE: ${{ matrix.slot1.pr.crate }}
           CI_FEATURES: ${{ matrix.slot1.pr.features }}
           CI_SHARD: ${{ matrix.slot1.pr.shard }}
+          CI_FRAGMENT: ${{ toJSON(matrix.slot1.fragment) }}
         run: bash scripts/verify pr shard
       - id: slot1_integration
         name: Run constituent 1 / ${{ matrix.slot1.name }}
@@ -179,12 +244,13 @@ jobs:
           CI_INTEGRATION_DEFAULT: "false"
           CI_INTEGRATION_SLICE: ${{ matrix.slot1.integration.id }}
           CI_INTEGRATION_PLAN: ${{ toJSON(matrix.slot1.integration) }}
+          CI_FRAGMENT: ${{ toJSON(matrix.slot1.fragment) }}
         run: bash scripts/verify integration "${CI_INTEGRATION_SLICE}"
       - name: Upload constituent 1 shard receipt
         if: always() && !cancelled() && matrix.slot1.kind == 'pr'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: test-${{ matrix.slot1.pr.shard }}-${{ github.run_attempt }}
+          name: test-${{ matrix.slot1.pr.shard }}${{ matrix.slot1.fragment && format('-part{0}', matrix.slot1.fragment.part) || '' }}-${{ github.run_attempt }}
           path: ${{ env.CARGO_TARGET_DIR || 'target' }}/ci-shard-out/
           retention-days: 14
           if-no-files-found: error
@@ -192,12 +258,23 @@ jobs:
         if: always() && !cancelled() && matrix.slot1.kind == 'integration'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: extended-integration-${{ matrix.slot1.integration.id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: extended-integration-${{ matrix.slot1.integration.id }}${{ matrix.slot1.fragment && format('-part{0}', matrix.slot1.fragment.part) || '' }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/ci-integration-out/
           if-no-files-found: error
           retention-days: 14
+      - name: Restore shared build for constituent 2
+        if: always() && !cancelled() && matrix.slot2.build != null
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: build-${{ matrix.slot2.build }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          path: ${{ runner.temp }}/build-slot2
+      - name: Unpack shared build for constituent 2
+        if: always() && !cancelled() && matrix.slot2.build != null
+        continue-on-error: true
+        run: bash scripts/ci-shared-build.sh restore "${{ runner.temp }}/build-slot2"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        if: always() && !cancelled() && matrix.slot2 != null
+        if: always() && !cancelled() && matrix.slot2 != null && matrix.slot2.build == null
         with:
           key: ${{ matrix.slot2.cache_key }}
           add-job-id-key: false
@@ -216,6 +293,7 @@ jobs:
           CI_CRATE: ${{ matrix.slot2.pr.crate }}
           CI_FEATURES: ${{ matrix.slot2.pr.features }}
           CI_SHARD: ${{ matrix.slot2.pr.shard }}
+          CI_FRAGMENT: ${{ toJSON(matrix.slot2.fragment) }}
         run: bash scripts/verify pr shard
       - id: slot2_integration
         name: Run constituent 2 / ${{ matrix.slot2.name }}
@@ -226,12 +304,13 @@ jobs:
           CI_INTEGRATION_DEFAULT: "false"
           CI_INTEGRATION_SLICE: ${{ matrix.slot2.integration.id }}
           CI_INTEGRATION_PLAN: ${{ toJSON(matrix.slot2.integration) }}
+          CI_FRAGMENT: ${{ toJSON(matrix.slot2.fragment) }}
         run: bash scripts/verify integration "${CI_INTEGRATION_SLICE}"
       - name: Upload constituent 2 shard receipt
         if: always() && !cancelled() && matrix.slot2.kind == 'pr'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: test-${{ matrix.slot2.pr.shard }}-${{ github.run_attempt }}
+          name: test-${{ matrix.slot2.pr.shard }}${{ matrix.slot2.fragment && format('-part{0}', matrix.slot2.fragment.part) || '' }}-${{ github.run_attempt }}
           path: ${{ env.CARGO_TARGET_DIR || 'target' }}/ci-shard-out/
           retention-days: 14
           if-no-files-found: error
@@ -239,12 +318,23 @@ jobs:
         if: always() && !cancelled() && matrix.slot2.kind == 'integration'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: extended-integration-${{ matrix.slot2.integration.id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: extended-integration-${{ matrix.slot2.integration.id }}${{ matrix.slot2.fragment && format('-part{0}', matrix.slot2.fragment.part) || '' }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/ci-integration-out/
           if-no-files-found: error
           retention-days: 14
+      - name: Restore shared build for constituent 3
+        if: always() && !cancelled() && matrix.slot3.build != null
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: build-${{ matrix.slot3.build }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          path: ${{ runner.temp }}/build-slot3
+      - name: Unpack shared build for constituent 3
+        if: always() && !cancelled() && matrix.slot3.build != null
+        continue-on-error: true
+        run: bash scripts/ci-shared-build.sh restore "${{ runner.temp }}/build-slot3"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        if: always() && !cancelled() && matrix.slot3 != null
+        if: always() && !cancelled() && matrix.slot3 != null && matrix.slot3.build == null
         with:
           key: ${{ matrix.slot3.cache_key }}
           add-job-id-key: false
@@ -263,6 +353,7 @@ jobs:
           CI_CRATE: ${{ matrix.slot3.pr.crate }}
           CI_FEATURES: ${{ matrix.slot3.pr.features }}
           CI_SHARD: ${{ matrix.slot3.pr.shard }}
+          CI_FRAGMENT: ${{ toJSON(matrix.slot3.fragment) }}
         run: bash scripts/verify pr shard
       - id: slot3_integration
         name: Run constituent 3 / ${{ matrix.slot3.name }}
@@ -273,12 +364,13 @@ jobs:
           CI_INTEGRATION_DEFAULT: "false"
           CI_INTEGRATION_SLICE: ${{ matrix.slot3.integration.id }}
           CI_INTEGRATION_PLAN: ${{ toJSON(matrix.slot3.integration) }}
+          CI_FRAGMENT: ${{ toJSON(matrix.slot3.fragment) }}
         run: bash scripts/verify integration "${CI_INTEGRATION_SLICE}"
       - name: Upload constituent 3 shard receipt
         if: always() && !cancelled() && matrix.slot3.kind == 'pr'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: test-${{ matrix.slot3.pr.shard }}-${{ github.run_attempt }}
+          name: test-${{ matrix.slot3.pr.shard }}${{ matrix.slot3.fragment && format('-part{0}', matrix.slot3.fragment.part) || '' }}-${{ github.run_attempt }}
           path: ${{ env.CARGO_TARGET_DIR || 'target' }}/ci-shard-out/
           retention-days: 14
           if-no-files-found: error
@@ -286,12 +378,23 @@ jobs:
         if: always() && !cancelled() && matrix.slot3.kind == 'integration'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: extended-integration-${{ matrix.slot3.integration.id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: extended-integration-${{ matrix.slot3.integration.id }}${{ matrix.slot3.fragment && format('-part{0}', matrix.slot3.fragment.part) || '' }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/ci-integration-out/
           if-no-files-found: error
           retention-days: 14
+      - name: Restore shared build for constituent 4
+        if: always() && !cancelled() && matrix.slot4.build != null
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: build-${{ matrix.slot4.build }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          path: ${{ runner.temp }}/build-slot4
+      - name: Unpack shared build for constituent 4
+        if: always() && !cancelled() && matrix.slot4.build != null
+        continue-on-error: true
+        run: bash scripts/ci-shared-build.sh restore "${{ runner.temp }}/build-slot4"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        if: always() && !cancelled() && matrix.slot4 != null
+        if: always() && !cancelled() && matrix.slot4 != null && matrix.slot4.build == null
         with:
           key: ${{ matrix.slot4.cache_key }}
           add-job-id-key: false
@@ -310,6 +413,7 @@ jobs:
           CI_CRATE: ${{ matrix.slot4.pr.crate }}
           CI_FEATURES: ${{ matrix.slot4.pr.features }}
           CI_SHARD: ${{ matrix.slot4.pr.shard }}
+          CI_FRAGMENT: ${{ toJSON(matrix.slot4.fragment) }}
         run: bash scripts/verify pr shard
       - id: slot4_integration
         name: Run constituent 4 / ${{ matrix.slot4.name }}
@@ -320,12 +424,13 @@ jobs:
           CI_INTEGRATION_DEFAULT: "false"
           CI_INTEGRATION_SLICE: ${{ matrix.slot4.integration.id }}
           CI_INTEGRATION_PLAN: ${{ toJSON(matrix.slot4.integration) }}
+          CI_FRAGMENT: ${{ toJSON(matrix.slot4.fragment) }}
         run: bash scripts/verify integration "${CI_INTEGRATION_SLICE}"
       - name: Upload constituent 4 shard receipt
         if: always() && !cancelled() && matrix.slot4.kind == 'pr'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: test-${{ matrix.slot4.pr.shard }}-${{ github.run_attempt }}
+          name: test-${{ matrix.slot4.pr.shard }}${{ matrix.slot4.fragment && format('-part{0}', matrix.slot4.fragment.part) || '' }}-${{ github.run_attempt }}
           path: ${{ env.CARGO_TARGET_DIR || 'target' }}/ci-shard-out/
           retention-days: 14
           if-no-files-found: error
@@ -333,10 +438,13 @@ jobs:
         if: always() && !cancelled() && matrix.slot4.kind == 'integration'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: extended-integration-${{ matrix.slot4.integration.id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: extended-integration-${{ matrix.slot4.integration.id }}${{ matrix.slot4.fragment && format('-part{0}', matrix.slot4.fragment.part) || '' }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/ci-integration-out/
           if-no-files-found: error
           retention-days: 14
+      - name: Record shared build reuse
+        if: always() && !cancelled()
+        run: bash scripts/ci-shared-build.sh report
       - name: Require every bundled constituent to succeed
         if: always()
         env:
@@ -435,7 +543,7 @@ jobs:
         include:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-          # macOS targets set aside until CDB-153 (engine uses Linux-only pipe2/SOCK_CLOEXEC) is fixed
+          # macOS targets are disabled because the engine uses Linux-only pipe2/SOCK_CLOEXEC
     timeout-minutes: 30
     runs-on: ${{ matrix.os }}
     steps:
@@ -460,15 +568,20 @@ jobs:
   required:
     name: PR checks
     if: always()
-    needs: [lint, lint-macos, test-bundles, build, features, installed-smoke, cross-compile, impact, integration]
+    needs: [lint, lint-macos, test-builds, test-bundles, build, features, installed-smoke, cross-compile, impact, integration]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Require every check to succeed
         env:
-          CI_NEEDS: ${{ toJSON(needs) }}
-        run: python3 scripts/ci-required.py
+          CI_NEEDS_FILE: ${{ runner.temp }}/needs.json
+        # The needs context reaches the script text, not the environment: about seventy jobs overflow one environment string.
+        run: |
+          cat > "$CI_NEEDS_FILE" <<'CI_JSON_END'
+          ${{ toJSON(needs) }}
+          CI_JSON_END
+          python3 scripts/ci-required.py
 
   development-binaries:
     needs: [required]

@@ -183,6 +183,10 @@ impl LiveOwner {
 
     /// Dial the live owner on a fresh connection presenting `presented`, ask
     /// it one read, and report how that attempt was answered.
+    #[expect(
+        clippy::useless_conversion,
+        reason = "The fixture retains its explicit conversion at the ownership boundary."
+    )]
     fn answer_for(&self, presented: LocalHandshake) -> Answer {
         let clock: Arc<dyn DeadlineClock> = Arc::new(self.clock.clone());
         let connected = block_on(OwnerClient::connect(
@@ -190,6 +194,10 @@ impl LiveOwner {
             presented,
             self.client_timeouts,
             clock,
+            self._database
+                .declared_reader_memory()
+                .expect("original reader owner")
+                .into(),
         ));
         let mut client = match connected {
             Ok(client) => client,

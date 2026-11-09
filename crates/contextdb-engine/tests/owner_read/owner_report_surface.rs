@@ -79,6 +79,10 @@ fn served_store(directory: &Path, runtime_root: PathBuf) -> (Database, PathBuf) 
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_serving_owner_reports_the_limits_and_capacity_it_is_actually_running_with() {
     let directory = tempfile::TempDir::new().expect("task-scoped report directory");
     let runtime_root = secure_runtime_root(directory.path(), "serving-runtime");
@@ -189,6 +193,10 @@ fn a_serving_owner_reports_the_limits_and_capacity_it_is_actually_running_with()
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_repointed_alias_does_not_report_the_old_store_owner() {
     let directory = tempfile::TempDir::new().expect("task-scoped report-alias directory");
     let runtime_root = secure_runtime_root(directory.path(), "report-alias-runtime");
@@ -228,6 +236,10 @@ fn a_repointed_alias_does_not_report_the_old_store_owner() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_owner_serving_a_reader_says_so_in_the_count_it_reports() {
     let directory = tempfile::TempDir::new().expect("task-scoped report directory");
     let runtime_root = secure_runtime_root(directory.path(), "active-runtime");
@@ -297,7 +309,7 @@ fn a_store_nobody_owns_has_no_owner_report_to_give() {
         session
             .execute("SELECT payload FROM report_rows", &HashMap::new())
             .expect("the idle file answers")
-            .rows
+            .rows()
             .len(),
         1
     );

@@ -32,7 +32,7 @@ ever disagree, the script wins and this page is wrong.
 
 ## Acceptance bars
 
-The rows below are the engine's acceptance evidence for bounded storage: imports
+The rows below specify required acceptance measurements for storage growth: imports
 of 10,000 and 100,000 passages, search, event append, open, memory, recall and
 index build, measured as engine operations. They come from the owner-maintained
 product acceptance intent with internal tracking references removed; every
@@ -43,7 +43,11 @@ Only the owner changes them. A result is judged against a row only by quoting th
 row's number, statistic and scope; nothing else on this page or in a benchmark
 source is an acceptance bar.
 
-Here, p95 is the 95th-percentile latency. `EXACT` compares every allowed stored vector; `INDEXED` requires the maintained index route; `AUTO` chooses within declared thresholds and budgets. Recall@10 measures agreement with EXACT’s nearest ten; every measured query must reach ≥ 0.95.
+The index-dependent rows below are qualification requirements, not shipped capabilities or completed measurements. This release ships exact search only; index acceleration remains unqualified.
+<!-- enforced by: a_search_is_exact_with_no_index_built::an_auto_find_answers_exactly_after_commit_with_no_maintenance, a_search_is_exact_with_no_index_built::indexed_is_refused_at_every_door, a_search_is_exact_with_no_index_built::no_cycle_or_commit_builds_or_writes_an_index, a_search_is_exact_with_no_index_built::declared_index_policy_is_recorded_and_has_no_effect -->
+
+Here, p95 is the 95th-percentile latency. `EXACT` and `AUTO` compare allowed stored vectors within the active budgets in this release; `INDEXED` is refused. Recall@10 measures agreement with EXACT’s nearest ten; every measured query must reach ≥ 0.95.
+<!-- enforced by: a_search_is_exact_with_no_index_built::an_auto_find_answers_exactly_after_commit_with_no_maintenance, a_search_is_exact_with_no_index_built::indexed_is_refused_at_every_door -->
 
 | Required outcome | Acceptance evidence |
 |---|---|

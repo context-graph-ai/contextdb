@@ -1,11 +1,11 @@
-#![allow(dead_code)] // Existing compatibility and test seam shape.
 //! Crash-recoverable, physical-store publication fencing for authoritative erasure.
 
 use super::{
-    CoordinationWatch, RangeLockMode, RangeLockOutcome, announce_companion_release,
-    block_on_companion_range_lock, create_reader_breadcrumb_directory, reader_breadcrumb_root,
-    reader_snapshot_directory, release_companion_range_lock, take_companion_range_lock_shared,
-    validate_reader_breadcrumb_directory, validate_reader_runtime_directory,
+    CoordinationWatch, CoordinationWatchFailure, RangeLockMode, RangeLockOutcome,
+    announce_companion_release, block_on_companion_range_lock, create_reader_breadcrumb_directory,
+    reader_breadcrumb_root, reader_snapshot_directory, release_companion_range_lock,
+    take_companion_range_lock_shared, validate_reader_breadcrumb_directory,
+    validate_reader_runtime_directory,
 };
 use contextdb_core::read_contract::DatabaseIdentity;
 use contextdb_core::{Error, Lsn, Result};
@@ -73,6 +73,48 @@ pub(crate) struct Fence {
 }
 
 impl Fence {
+    /// Take this reader's baseline again, at the instant its exact root is
+    /// captured, without waiting: while the reader holds the store's data lock
+    /// no writer can be publishing a purge, and while its provisional
+    /// registration exists no cleanup can be removing the fence, so a refused
+    /// try is an invariant failure, answered as one.
+    pub(crate) fn rebaseline_without_waiting(&mut self) -> std::io::Result<()> {
+        acquire_reader_lock(
+            &self.file,
+            PUBLICATION_ADMISSION_LOCK_OFFSET,
+            RangeLockMode::Shared,
+            true,
+        )?;
+        if let Err(error) = acquire_reader_lock(
+            &self.file,
+            PUBLICATION_LOCK_OFFSET,
+            RangeLockMode::Shared,
+            true,
+        ) {
+            release_companion_range_lock(&self.file, PUBLICATION_ADMISSION_LOCK_OFFSET);
+            return Err(error);
+        }
+        let readable = read_latest(&mut self.file);
+        release_companion_range_lock(&self.file, PUBLICATION_LOCK_OFFSET);
+        release_companion_range_lock(&self.file, PUBLICATION_ADMISSION_LOCK_OFFSET);
+        self.reader_baseline = Some(match readable? {
+            State::Clear(clear) => clear.generation,
+            State::Pending(pending) => pending.prior.generation,
+        });
+        Ok(())
+    }
+
+    /// Whether this fence's path still names the inode this descriptor holds.
+    /// A last departing reader may have removed a Clear fence after this one
+    /// was opened; a registration published against a departed fence would
+    /// never see a later publication, so it reopens instead.
+    pub(crate) fn path_still_names(&self) -> bool {
+        match (self.file.metadata(), std::fs::symlink_metadata(&self.path)) {
+            (Ok(held), Ok(named)) => trusted(&named) && same_inode(&held, &named),
+            _ => false,
+        }
+    }
+
     /// A continuation of the same physical reader keeps the earliest
     /// publication generation it observed for this registry. A purge that
     /// commits while the exact-root registration is installed must not become
@@ -97,11 +139,75 @@ pub(crate) struct PreparedPublication {
     resolved: bool,
 }
 
+/// Physical exclusion is independent of whether durable reader fences exist.
+pub(crate) struct AcquiredPurgePublication {
+    pub(super) fences: Option<FenceSet>,
+    #[cfg(target_os = "linux")]
+    pub(super) physical: super::writer_file::ReaderAudit,
+}
+
+pub(crate) struct PreparedPurgePublication {
+    fences: Option<PreparedPublicationSet>,
+    #[cfg(target_os = "linux")]
+    _physical: super::writer_file::ReaderAudit,
+}
+
+impl AcquiredPurgePublication {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn prepare(
+        self,
+        frontier: Lsn,
+        tables: &BTreeSet<String>,
+    ) -> Result<PreparedPurgePublication> {
+        let fences = self
+            .fences
+            .map(|fences| fences.prepare(frontier, tables))
+            .transpose()?;
+        Ok(PreparedPurgePublication {
+            fences,
+            #[cfg(target_os = "linux")]
+            _physical: self.physical,
+        })
+    }
+}
+impl PreparedPurgePublication {
+    pub(crate) fn marker(&self) -> Option<DurableMarker> {
+        self.fences.as_ref().map(PreparedPublicationSet::marker)
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn commit(self) -> Result<()> {
+        if let Some(fences) = self.fences {
+            fences.commit()?;
+        }
+        Ok(())
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn abort(self) -> Result<()> {
+        if let Some(fences) = self.fences {
+            fences.abort()?;
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct FenceSet(pub(crate) Vec<Fence>);
 
 pub(crate) struct PreparedPublicationSet(Vec<PreparedPublication>);
 
 impl FenceSet {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare(
         self,
         frontier: Lsn,
@@ -137,6 +243,10 @@ impl PreparedPublicationSet {
             .marker()
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn commit(self) -> Result<()> {
         for publication in self.0 {
             let path = publication.fence.path.display().to_string();
@@ -151,6 +261,10 @@ impl PreparedPublicationSet {
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn abort(self) -> Result<()> {
         for publication in self.0 {
             let path = publication.fence.path.display().to_string();
@@ -249,14 +363,6 @@ fn open_existing(path: &Path) -> std::io::Result<File> {
     Ok(file)
 }
 
-fn create(
-    runtime_root: &Path,
-    identity: (u64, u64),
-    database_identity: DatabaseIdentity,
-) -> std::io::Result<Fence> {
-    create_with_admission_mode(runtime_root, identity, database_identity, false)
-}
-
 fn create_with_admission_mode(
     runtime_root: &Path,
     identity: (u64, u64),
@@ -335,6 +441,65 @@ fn initialize(file: &mut File) -> std::io::Result<()> {
             count: 0,
         }),
     )
+}
+
+/// Whether `name` is a publication fence's file name inside a registry.
+pub(crate) fn is_fence_file_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.starts_with("purge-publication-") && name.ends_with(".fence"))
+}
+
+/// What the last departing reader may do with one fence it found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FenceRemoval {
+    /// The fence was Clear, held by nobody, named by its path, and is gone.
+    Removed,
+    /// Something about the fence could not be proven, so it stays.
+    Kept,
+}
+
+/// Remove a fence only when every condition holds at once: no other holder of
+/// either range lock (both taken exclusive by try), a readable Clear state, and
+/// a path that still names the very inode those locks are on. Both locks are
+/// held through the unlink. A Pending, unreadable or ambiguous fence is crash
+/// recovery state that only a writer may reconcile, so it is always kept.
+pub(crate) fn remove_if_clear(path: &Path) -> FenceRemoval {
+    let mut file = match open_existing(path) {
+        Ok(file) => file,
+        Err(_) => return FenceRemoval::Kept,
+    };
+    if !matches!(
+        super::take_companion_range_lock_exclusive(&file, PUBLICATION_ADMISSION_LOCK_OFFSET),
+        Ok(RangeLockOutcome::Taken)
+    ) {
+        return FenceRemoval::Kept;
+    }
+    if !matches!(
+        super::take_companion_range_lock_exclusive(&file, PUBLICATION_LOCK_OFFSET),
+        Ok(RangeLockOutcome::Taken)
+    ) {
+        release_companion_range_lock(&file, PUBLICATION_ADMISSION_LOCK_OFFSET);
+        return FenceRemoval::Kept;
+    }
+    let removal = match (
+        read_latest(&mut file),
+        file.metadata(),
+        std::fs::symlink_metadata(path),
+    ) {
+        (Ok(State::Clear(_)), Ok(held), Ok(named))
+            if trusted(&named) && same_inode(&held, &named) =>
+        {
+            if std::fs::remove_file(path).is_ok() {
+                FenceRemoval::Removed
+            } else {
+                FenceRemoval::Kept
+            }
+        }
+        _ => FenceRemoval::Kept,
+    };
+    release_companion_range_lock(&file, PUBLICATION_LOCK_OFFSET);
+    release_companion_range_lock(&file, PUBLICATION_ADMISSION_LOCK_OFFSET);
+    removal
 }
 
 pub(crate) fn open_for_reader(
@@ -953,16 +1118,42 @@ fn run_publication_wait_hook(
 /// Install a one-shot hook for the window named by `slot`, taken by the first
 /// wait that reaches it on this thread.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
+#[allow(
+    dead_code,
+    reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+)]
 pub(crate) fn install_after_held_admission_take_hook_for_test(hook: PublicationWaitHook) {
     AFTER_HELD_ADMISSION_TAKE.with(|slot| *slot.borrow_mut() = Some(hook));
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
+#[allow(
+    dead_code,
+    reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+)]
 pub(crate) fn install_before_admission_sleep_hook_for_test(hook: PublicationWaitHook) {
     BEFORE_ADMISSION_SLEEP.with(|slot| *slot.borrow_mut() = Some(hook));
 }
 
 impl Fence {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn acquire_reader_admission(
         &self,
         budget: Option<&crate::executor::ReadPublicationBudget>,
@@ -1022,11 +1213,12 @@ impl Fence {
             run_publication_wait_hook(&AFTER_HELD_ADMISSION_TAKE);
             if watch.is_none() {
                 watch = Some(
-                    CoordinationWatch::arm(&self.path, Some(&budget.cancellation)).map_err(
-                        |error| {
-                            publication_refusal(format!(
+                    CoordinationWatch::arm_funded(&self.path, &budget.cancellation).map_err(
+                        |error| match error {
+                            CoordinationWatchFailure::Admission(error) => error,
+                            CoordinationWatchFailure::Io(error) => publication_refusal(format!(
                                 "cannot watch authoritative erasure publication admission: {error}"
-                            ))
+                            )),
                         },
                     )?,
                 );
@@ -1072,22 +1264,28 @@ impl Fence {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn acquire_for_prepare(mut self) -> Result<Self> {
         block_on_companion_range_lock(
             &self.file,
             PUBLICATION_ADMISSION_LOCK_OFFSET,
             RangeLockMode::Exclusive,
         )
-        .map_err(|error| Error::Other(format!("acquire purge publication admission: {error}")))?;
+        .map_err(|error| {
+            Error::Other((format!("acquire purge publication admission: {error}")).into())
+        })?;
         if let Err(error) = block_on_companion_range_lock(
             &self.file,
             PUBLICATION_LOCK_OFFSET,
             RangeLockMode::Exclusive,
         ) {
             release_exclusive_admission(&self.file);
-            return Err(Error::Other(format!(
-                "acquire purge publication fence: {error}"
-            )));
+            return Err(Error::Other(
+                (format!("acquire purge publication fence: {error}")).into(),
+            ));
         }
         self.writer_acquired = true;
         Ok(self)
@@ -1101,32 +1299,45 @@ impl Fence {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn is_pending(&mut self) -> Result<bool> {
         block_on_companion_range_lock(
             &self.file,
             PUBLICATION_ADMISSION_LOCK_OFFSET,
             RangeLockMode::Exclusive,
         )
-        .map_err(|error| Error::Other(format!("acquire purge recovery admission: {error}")))?;
+        .map_err(|error| {
+            Error::Other((format!("acquire purge recovery admission: {error}")).into())
+        })?;
         if let Err(error) = block_on_companion_range_lock(
             &self.file,
             PUBLICATION_LOCK_OFFSET,
             RangeLockMode::Exclusive,
         ) {
             release_exclusive_admission(&self.file);
-            return Err(Error::Other(format!(
-                "acquire purge recovery probe: {error}"
-            )));
+            return Err(Error::Other(
+                (format!("acquire purge recovery probe: {error}")).into(),
+            ));
         }
         let pending = read_latest(&mut self.file)
             .map(|state| matches!(state, State::Pending(_)))
-            .map_err(|error| Error::Other(format!("read purge recovery probe: {error}")));
+            .map_err(|error| Error::Other((format!("read purge recovery probe: {error}")).into()));
         release_companion_range_lock(&self.file, PUBLICATION_LOCK_OFFSET);
         release_exclusive_admission(&self.file);
         pending
     }
 
     #[cfg(test)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn publish<T>(
         &mut self,
         snapshot_lsn: Lsn,
@@ -1136,12 +1347,56 @@ impl Fence {
         self.publish_with_budget(snapshot_lsn, tables, value, None)
     }
 
-    pub(crate) fn publish_with_budget<T>(
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn publish_with_budget<'a, T>(
         &mut self,
         snapshot_lsn: Lsn,
-        tables: &BTreeSet<String>,
+        tables: impl IntoIterator<Item = &'a String>,
         value: T,
         budget: Option<&crate::executor::ReadPublicationBudget>,
+    ) -> Result<T> {
+        self.publish_tables_with_budget(
+            snapshot_lsn,
+            tables.into_iter().map(String::as_str),
+            value,
+            budget,
+            true,
+        )
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn check_turnover_with_budget(
+        &mut self,
+        snapshot_lsn: Lsn,
+        budget: &crate::executor::ReadPublicationBudget,
+    ) -> Result<()> {
+        self.publish_tables_with_budget(snapshot_lsn, ["*"], (), Some(budget), false)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn publish_tables_with_budget<'a, T>(
+        &mut self,
+        snapshot_lsn: Lsn,
+        tables: impl IntoIterator<Item = &'a str>,
+        value: T,
+        budget: Option<&crate::executor::ReadPublicationBudget>,
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                unused_variables,
+                reason = "KEEP-SEAM: only the test-seams build pauses on it"
+            )
+        )]
+        publishing_result: bool,
     ) -> Result<T> {
         #[cfg(any(test, feature = "test-seams"))]
         super::read_persistence_test_scaffold::note_erasure_publication_for_test();
@@ -1207,12 +1462,19 @@ impl Fence {
             Ok(value)
         })();
         #[cfg(feature = "test-seams")]
-        pause_before_publication_unlock_for_test();
+        if publishing_result {
+            pause_before_publication_unlock_for_test();
+        }
         release_companion_range_lock(&self.file, PUBLICATION_LOCK_OFFSET);
         release_companion_range_lock(&self.file, PUBLICATION_ADMISSION_LOCK_OFFSET);
         verdict
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg(test)]
     pub(crate) fn prepare(
         self,
         frontier: Lsn,
@@ -1221,6 +1483,10 @@ impl Fence {
         self.prepare_with_token(frontier, tables, uuid::Uuid::new_v4().into_bytes())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn prepare_with_token(
         mut self,
         frontier: Lsn,
@@ -1231,64 +1497,65 @@ impl Fence {
             self = self.acquire_for_prepare()?;
         }
         let result = (|| {
-            let prior = match read_latest(&mut self.file)
-                .map_err(|error| Error::Other(format!("read purge publication fence: {error}")))?
-            {
+            let prior = match read_latest(&mut self.file).map_err(|error| {
+                Error::Other((format!("read purge publication fence: {error}")).into())
+            })? {
                 State::Clear(clear) => clear,
                 State::Pending(_) => {
                     return Err(Error::Other(
-                        "authoritative purge publication is awaiting crash recovery".to_owned(),
+                        ("authoritative purge publication is awaiting crash recovery".to_owned())
+                            .into(),
                     ));
                 }
             };
-            let generation = prior
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| Error::Other("purge publication generation overflow".to_owned()))?;
-            let sequence = prior
-                .sequence
-                .checked_add(1)
-                .ok_or_else(|| Error::Other("purge publication sequence overflow".to_owned()))?;
+            let generation = prior.generation.checked_add(1).ok_or_else(|| {
+                Error::Other(("purge publication generation overflow".to_owned()).into())
+            })?;
+            let sequence = prior.sequence.checked_add(1).ok_or_else(|| {
+                Error::Other(("purge publication sequence overflow".to_owned()).into())
+            })?;
             let mut identities = BTreeSet::from([wildcard_identity()]);
             identities.extend(tables.iter().map(|table| table_identity(table)));
             let tables: Vec<_> = identities.into_iter().collect();
             let mut additions = 0_u64;
             for table in &tables {
                 if find_bucket(&mut self.file, prior.index_offset, prior.capacity, table)
-                    .map_err(|error| Error::Other(format!("read purge frontier index: {error}")))?
+                    .map_err(|error| {
+                        Error::Other((format!("read purge frontier index: {error}")).into())
+                    })?
                     .1
                     .is_none()
                 {
                     additions = additions.checked_add(1).ok_or_else(|| {
-                        Error::Other("purge publication table count overflow".to_owned())
+                        Error::Other(("purge publication table count overflow".to_owned()).into())
                     })?;
                 }
             }
-            let count = prior
-                .count
-                .checked_add(additions)
-                .ok_or_else(|| Error::Other("purge publication table count overflow".to_owned()))?;
+            let count = prior.count.checked_add(additions).ok_or_else(|| {
+                Error::Other(("purge publication table count overflow".to_owned()).into())
+            })?;
             let mut capacity = prior.capacity;
             while count.checked_mul(10).ok_or_else(|| {
-                Error::Other("purge publication capacity arithmetic overflow".to_owned())
+                Error::Other(("purge publication capacity arithmetic overflow".to_owned()).into())
             })? > capacity.checked_mul(7).ok_or_else(|| {
-                Error::Other("purge publication capacity arithmetic overflow".to_owned())
+                Error::Other(("purge publication capacity arithmetic overflow".to_owned()).into())
             })? {
                 capacity = capacity.checked_mul(2).ok_or_else(|| {
-                    Error::Other("purge publication frontier capacity overflow".to_owned())
+                    Error::Other(("purge publication frontier capacity overflow".to_owned()).into())
                 })?;
             }
-            let current_end = index_end(prior.index_offset, prior.capacity)
-                .map_err(|error| Error::Other(format!("size purge frontier index: {error}")))?;
+            let current_end = index_end(prior.index_offset, prior.capacity).map_err(|error| {
+                Error::Other((format!("size purge frontier index: {error}")).into())
+            })?;
             if self
                 .file
                 .metadata()
-                .map_err(|error| Error::Other(error.to_string()))?
+                .map_err(|error| Error::Other((error.to_string()).into()))?
                 .len()
                 > current_end
             {
                 self.file.set_len(current_end).map_err(|error| {
-                    Error::Other(format!("trim purge publication tail: {error}"))
+                    Error::Other((format!("trim purge publication tail: {error}")).into())
                 })?;
             }
             let manifest_offset = current_end;
@@ -1301,16 +1568,16 @@ impl Fence {
                 .and_then(|_| self.file.write_all(&manifest))
                 .and_then(|_| self.file.sync_data())
                 .map_err(|error| {
-                    Error::Other(format!("write purge publication manifest: {error}"))
+                    Error::Other((format!("write purge publication manifest: {error}")).into())
                 })?;
             let manifest_len = u64::try_from(manifest.len()).map_err(|_| {
-                Error::Other("purge publication manifest length overflow".to_owned())
+                Error::Other(("purge publication manifest length overflow".to_owned()).into())
             })?;
             let index_offset = if capacity == prior.capacity {
                 prior.index_offset
             } else {
                 manifest_offset.checked_add(manifest_len).ok_or_else(|| {
-                    Error::Other("purge publication index offset overflow".to_owned())
+                    Error::Other(("purge publication index offset overflow".to_owned()).into())
                 })?
             };
             let pending = PendingState {
@@ -1327,7 +1594,7 @@ impl Fence {
                 manifest_hash: *blake3::hash(&manifest).as_bytes(),
             };
             write_state(&mut self.file, &State::Pending(pending.clone())).map_err(|error| {
-                Error::Other(format!("prepare durable purge publication fence: {error}"))
+                Error::Other((format!("prepare durable purge publication fence: {error}")).into())
             })?;
             Ok((prior, pending, tables))
         })();
@@ -1346,26 +1613,33 @@ impl Fence {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn recover(&mut self, marker: Option<DurableMarker>) -> Result<()> {
         block_on_companion_range_lock(
             &self.file,
             PUBLICATION_ADMISSION_LOCK_OFFSET,
             RangeLockMode::Exclusive,
         )
-        .map_err(|error| Error::Other(format!("acquire purge recovery admission: {error}")))?;
+        .map_err(|error| {
+            Error::Other((format!("acquire purge recovery admission: {error}")).into())
+        })?;
         if let Err(error) = block_on_companion_range_lock(
             &self.file,
             PUBLICATION_LOCK_OFFSET,
             RangeLockMode::Exclusive,
         ) {
             release_exclusive_admission(&self.file);
-            return Err(Error::Other(format!(
-                "acquire purge recovery fence: {error}"
-            )));
+            return Err(Error::Other(
+                (format!("acquire purge recovery fence: {error}")).into(),
+            ));
         }
         let result = (|| {
-            let State::Pending(pending) = read_latest(&mut self.file)
-                .map_err(|error| Error::Other(format!("read purge recovery fence: {error}")))?
+            let State::Pending(pending) = read_latest(&mut self.file).map_err(|error| {
+                Error::Other((format!("read purge recovery fence: {error}")).into())
+            })?
             else {
                 return Ok(());
             };
@@ -1374,7 +1648,7 @@ impl Fence {
             });
             if committed {
                 let tables = manifest_tables(&mut self.file, &pending).map_err(|error| {
-                    Error::Other(format!("read purge recovery manifest: {error}"))
+                    Error::Other((format!("read purge recovery manifest: {error}")).into())
                 })?;
                 finish_commit(&mut self.file, &pending, &tables)
             } else {
@@ -1387,50 +1661,62 @@ impl Fence {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn finish_commit(file: &mut File, pending: &PendingState, tables: &[[u8; 32]]) -> Result<()> {
-    apply_pending(file, pending, tables)
-        .map_err(|error| Error::Other(format!("apply purge publication frontiers: {error}")))?;
+    apply_pending(file, pending, tables).map_err(|error| {
+        Error::Other((format!("apply purge publication frontiers: {error}")).into())
+    })?;
     let clear = ClearState {
-        sequence: pending
-            .sequence
-            .checked_add(1)
-            .ok_or_else(|| Error::Other("purge publication sequence overflow".to_owned()))?,
+        sequence: pending.sequence.checked_add(1).ok_or_else(|| {
+            Error::Other(("purge publication sequence overflow".to_owned()).into())
+        })?,
         generation: pending.generation,
         frontier: pending.frontier,
         index_offset: pending.index_offset,
         capacity: pending.capacity,
         count: pending.count,
     };
-    write_state(file, &State::Clear(clear.clone()))
-        .map_err(|error| Error::Other(format!("commit purge publication fence: {error}")))?;
+    write_state(file, &State::Clear(clear.clone())).map_err(|error| {
+        Error::Other((format!("commit purge publication fence: {error}")).into())
+    })?;
     if pending.index_offset == pending.prior.index_offset {
         file.set_len(
             index_end(clear.index_offset, clear.capacity).map_err(|error| {
-                Error::Other(format!("size committed purge frontier index: {error}"))
+                Error::Other((format!("size committed purge frontier index: {error}")).into())
             })?,
         )
         .and_then(|_| file.sync_data())
-        .map_err(|error| Error::Other(format!("trim committed purge manifest: {error}")))?;
+        .map_err(|error| {
+            Error::Other((format!("trim committed purge manifest: {error}")).into())
+        })?;
     }
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn finish_abort(file: &mut File, prior: &ClearState, pending: &PendingState) -> Result<()> {
     let clear = ClearState {
-        sequence: pending
-            .sequence
-            .checked_add(1)
-            .ok_or_else(|| Error::Other("purge publication sequence overflow".to_owned()))?,
+        sequence: pending.sequence.checked_add(1).ok_or_else(|| {
+            Error::Other(("purge publication sequence overflow".to_owned()).into())
+        })?,
         ..prior.clone()
     };
-    write_state(file, &State::Clear(clear.clone()))
-        .map_err(|error| Error::Other(format!("abort purge publication fence: {error}")))?;
+    write_state(file, &State::Clear(clear.clone())).map_err(|error| {
+        Error::Other((format!("abort purge publication fence: {error}")).into())
+    })?;
     file.set_len(
-        index_end(clear.index_offset, clear.capacity)
-            .map_err(|error| Error::Other(format!("size aborted purge frontier index: {error}")))?,
+        index_end(clear.index_offset, clear.capacity).map_err(|error| {
+            Error::Other((format!("size aborted purge frontier index: {error}")).into())
+        })?,
     )
     .and_then(|_| file.sync_data())
-    .map_err(|error| Error::Other(format!("trim aborted purge manifest: {error}")))?;
+    .map_err(|error| Error::Other((format!("trim aborted purge manifest: {error}")).into()))?;
     Ok(())
 }
 
@@ -1442,13 +1728,28 @@ impl PreparedPublication {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn commit(mut self) -> Result<()> {
+        #[cfg(any(test, feature = "test-seams"))]
+        if super::read_persistence_test_scaffold::take_purge_pending_for_test() {
+            // Left exactly as a writer that died here leaves it: Pending.
+            return Err(Error::Other(
+                ("injected: the purge publication was left Pending".to_owned()).into(),
+            ));
+        }
         finish_commit(&mut self.fence.file, &self.pending, &self.tables)?;
         self.resolved = true;
         self.fence.release_writer();
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn abort(mut self) -> Result<()> {
         finish_abort(&mut self.fence.file, &self.prior, &self.pending)?;
         self.resolved = true;
@@ -1581,6 +1882,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn file_publication_wait_has_no_false_timer_refusal_repoll_or_lost_release_wake() {
         let (_runtime, mut reader, writer) = contended_fences();
         let (clock, polled, release) = controlled_clock(20, None, true);
@@ -1613,6 +1918,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn file_publication_wait_wakes_for_cancellation_and_refuses_only_after_elapsed_deadline() {
         let (_runtime, mut reader, writer) = contended_fences();
         let cancellation = OwnerReadCancellation::new();
@@ -2034,5 +2343,115 @@ mod tests {
         file.write_all(&[0xff]).unwrap();
         file.sync_data().unwrap();
         assert_erased(first_reader.publish(Lsn(1), &tables, ()));
+    }
+
+    fn fence_path(runtime: &Path, identity: (u64, u64), database: DatabaseIdentity) -> PathBuf {
+        path(runtime, identity, database)
+    }
+
+    #[test]
+    fn a_clear_unheld_fence_is_removed_and_its_opener_sees_it_depart() {
+        let runtime = runtime();
+        let identity = (61, 67);
+        let database_identity = DatabaseIdentity([61; 16]);
+        let reader = open_for_reader(runtime.path(), identity, database_identity).unwrap();
+        assert!(reader.path_still_names());
+        let fence = fence_path(runtime.path(), identity, database_identity);
+        assert_eq!(remove_if_clear(&fence), FenceRemoval::Removed);
+        assert!(!fence.exists());
+        assert!(
+            !reader.path_still_names(),
+            "an opener of a removed fence must reopen before it registers"
+        );
+        let reopened = open_for_reader(runtime.path(), identity, database_identity).unwrap();
+        assert!(reopened.path_still_names());
+    }
+
+    #[test]
+    fn a_pending_fence_is_never_removed() {
+        let runtime = runtime();
+        let identity = (71, 73);
+        let database_identity = DatabaseIdentity([71; 16]);
+        let tables = BTreeSet::from(["erased".to_owned()]);
+        drop(open_for_reader(runtime.path(), identity, database_identity).unwrap());
+        let prepared = open_for_writer(runtime.path(), identity, database_identity)
+            .unwrap()
+            .unwrap()
+            .prepare(Lsn(8), &tables)
+            .unwrap();
+        drop(prepared);
+        let fence = fence_path(runtime.path(), identity, database_identity);
+        assert_eq!(
+            remove_if_clear(&fence),
+            FenceRemoval::Kept,
+            "a Pending fence is crash-recovery state only a writer may reconcile"
+        );
+        assert!(fence.exists());
+        open_for_writer(runtime.path(), identity, database_identity)
+            .unwrap()
+            .unwrap()
+            .recover(None)
+            .unwrap();
+        assert_eq!(remove_if_clear(&fence), FenceRemoval::Removed);
+    }
+
+    #[test]
+    fn an_unreadable_fence_is_never_removed() {
+        let runtime = runtime();
+        let identity = (79, 83);
+        let database_identity = DatabaseIdentity([79; 16]);
+        drop(open_for_reader(runtime.path(), identity, database_identity).unwrap());
+        let fence = fence_path(runtime.path(), identity, database_identity);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fence)
+            .unwrap()
+            .set_len(3)
+            .unwrap();
+        assert_eq!(remove_if_clear(&fence), FenceRemoval::Kept);
+        assert!(fence.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fence_whose_locks_are_held_is_never_removed() {
+        for admission in [true, false] {
+            let runtime = runtime();
+            let identity = (89, 97);
+            let database_identity = DatabaseIdentity([89; 16]);
+            let held =
+                hold_reader_lock_for_test(runtime.path(), identity, database_identity, admission);
+            let fence = fence_path(runtime.path(), identity, database_identity);
+            assert_eq!(
+                remove_if_clear(&fence),
+                FenceRemoval::Kept,
+                "a holder of the {} lock keeps the fence",
+                if admission {
+                    "admission"
+                } else {
+                    "publication"
+                }
+            );
+            drop(held);
+            assert_eq!(remove_if_clear(&fence), FenceRemoval::Removed);
+        }
+    }
+
+    #[test]
+    fn a_fence_path_naming_another_file_is_never_removed() {
+        let runtime = runtime();
+        let identity = (101, 103);
+        let database_identity = DatabaseIdentity([101; 16]);
+        drop(open_for_reader(runtime.path(), identity, database_identity).unwrap());
+        let fence = fence_path(runtime.path(), identity, database_identity);
+        let displaced = fence.with_extension("displaced");
+        std::fs::rename(&fence, &displaced).unwrap();
+        std::fs::hard_link(&displaced, &fence).unwrap();
+        assert_eq!(
+            remove_if_clear(&fence),
+            FenceRemoval::Kept,
+            "a fence with a second name is not a trusted single-name fence"
+        );
+        assert!(fence.exists());
     }
 }

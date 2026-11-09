@@ -1,6 +1,6 @@
 # Architecture
 
-contextdb is an eleven-crate Rust workspace. This document covers the crate structure, subsystem design, key traits, and extension points.
+contextdb has ten Rust workspace members plus the maintained `contextdb-redb` dependency fork outside the workspace. This document covers the crate structure, subsystem design, key traits, and extension points.
 
 ---
 
@@ -13,8 +13,7 @@ contextdb-tx            MVCC transaction manager, WriteSet, WriteSetApplicator t
     │
     ├── contextdb-relational    Row storage, scan, insert, upsert, delete
     ├── contextdb-graph         Adjacency index, bounded BFS, DAG enforcement
-    └── contextdb-vector        Partitioned maintained search, durable base/change/tail generations
-            └── contextdb-hnsw  Vendored third-party HNSW index (see below)
+    └── contextdb-vector        Partitioned exact vector search
             │
 contextdb-parser        pest grammar → AST (SQL + GRAPH_TABLE + vector extensions)
     │
@@ -24,16 +23,27 @@ contextdb-engine        Database struct — wires all subsystems, plugin API, su
     │
     ├── contextdb-server    SyncServer + SyncClient (dial-by-key transport, conflict resolution)
     └── contextdb-cli       Interactive REPL binary
+
+contextdb-redb          Maintained storage dependency of the engine; outside the workspace
 ```
 
-Dependencies flow downward. `contextdb-engine` owns the `Database` struct and is the crate applications depend on.
+Modules that carry the bounded writer working set (details in each crate's `AGENTS.md`):
 
-`contextdb-hnsw` is the eleventh crate and the one exception to "in-house surface": it is a
-**vendored third-party crate** — the upstream `hnsw_rs` 0.3.4 HNSW implementation, carried here
-under its own upstream authorship and its `MIT OR Apache-2.0` licence, with deterministic seeded
-builds on top. Treat it as vendored dependency code: `contextdb-vector` is where a change to how
-contextdb *uses* an HNSW index belongs, and a change inside `contextdb-hnsw` itself is a change to
-vendored upstream code, to be made deliberately and kept minimal.
+| Crate | Module | What it does |
+|---|---|---|
+| `contextdb-redb` | `tree_store/page_store/allocator_pager.rs` | Pages allocator bitmap words through 32 fixed windows with same-directory scratch spill |
+| `contextdb-vector` | `ivf/`, `store/membership.rs` | Clustered index pages read and written a page at a time; durable raw-membership sources with no retained directory |
+| `contextdb-relational` | `source.rs` | Root-pinned row and index reads with staged-row merge |
+| `contextdb-graph` | `source.rs` | Root-pinned adjacency reads with an edge overlay |
+| `contextdb-tx` | `commit_directory.rs`, `ordered_staged.rs` | Durable commit-history seam; ordered staged rows |
+| `contextdb-engine` | `persistence/writer_*.rs`, `database/writer_read.rs` | Pinned-root writer reads, durable history cursors, open bounds, statement read scope |
+
+A writable file store keeps a bounded working set however long its history is: it opens without
+reading row versions, change log or commit index, serves reads from roots pinned at publication,
+and releases pages, indexes and history after use; readers keep the view they opened with.
+<!-- enforced by: writable_open_never_touches_history_families::writable_open_never_touches_history_families, writer_reopen_and_doubling_keep_a_fixed_resident_envelope::writer_reopen_and_doubling_keep_a_fixed_resident_envelope, writer_reader_root_survives_commit_eviction_and_cleanup::writer_reader_root_survives_commit_eviction_and_cleanup -->
+
+Dependencies flow downward. `contextdb-engine` owns the `Database` struct and is the crate applications depend on.
 
 The engine depends on the maintained **`contextdb-redb`** package (library name `redb`) at
 `crates/contextdb-redb`, based on upstream redb 4.1.0
@@ -76,7 +86,21 @@ Dedicated adjacency index maintained incrementally as edges are inserted/deleted
 - Edge-type filtering per hop
 - Direction control (outgoing, incoming, bidirectional)
 - DAG cycle detection on insert (BFS from target back to source)
-- Deduplication: `(source_id, target_id, edge_type)` is a natural key
+- Edge identity follows its table's declared key. Without a wider declared key,
+  duplicate `(source_id, target_id, edge_type)` writes name one logical edge.
+
+One logical edge can be witnessed through both the graph insertion API and its
+relational row. Readers see one binding when the table uses the triple or has no
+edge key; rows distinguished by a wider declared key remain distinct bindings.
+The graph-door record keeps ownership of its properties, including later updates.
+The row-owned witness keeps its exact row and version coordinates for history and
+purge authentication. Visibility and authorization apply to each witness before
+the shared traversal merge coalesces their alias. On a wider-key table, the
+standalone triple aliases only the row whose extra identity columns equal their
+literal or NULL defaults. Other key values remain distinct; without a matching
+row, the standalone remains its own binding. A volatile default such as `NOW()`
+cannot name one row, so its standalone binding stays distinct.
+<!-- enforced by: crates/contextdb-engine/tests/sql_surface/one_edge_through_both_doors_reads_the_same_through_every_door.rs::one_edge_written_graph_door_first_reads_as_one_edge_through_every_door, crates/contextdb-engine/tests/sql_surface/one_edge_through_both_doors_reads_the_same_through_every_door.rs::one_edge_written_row_door_first_reads_as_one_edge_through_every_door, crates/contextdb-engine/tests/sql_surface/one_edge_through_both_doors_reads_the_same_through_every_door.rs::a_wider_key_sibling_of_an_edge_written_through_both_doors_stays_a_second_binding, crates/contextdb-engine/tests/sql_surface/mixed_edge_updates_duplicates_and_gated_views.rs::a_graph_property_update_keeps_the_mixed_edge_visible_once_through_every_door, crates/contextdb-engine/tests/sql_surface/mixed_edge_updates_duplicates_and_gated_views.rs::memory_file_and_principal_gated_views_agree_on_the_single_mixed_binding, crates/contextdb-engine/tests/sql_surface/a_volatile_default_keeps_mixed_edge_bindings_distinct.rs::a_volatile_default_in_a_wider_edge_key_keeps_the_graph_and_row_bindings_distinct -->
 
 ### Vector (`contextdb-vector`)
 
@@ -86,27 +110,15 @@ audio, or policy embeddings with different dimensions and quantization choices.
 
 - Cosine similarity via `<=>` operator
 - `VECTOR(N) WITH (quantization = 'F32'|'SQ8'|'SQ4')` per column
-- SQ8/SQ4 columns keep quantized live payloads and quantized HNSW payloads;
+- SQ8/SQ4 columns keep quantized live payloads and quantized index payloads;
   f32 is reconstructed only at API/materialization boundaries
 - A two-level local registry: `(table, column)` identifies a vector index and a typed declared
   partition key identifies one local search layout. The unpartitioned column has one empty key.
   This is a search layout only, never an authorization boundary, tenant, or sync direction.
   <!-- enforced by: vector_partition_query_contract::equality_on_every_partition_component_selects_one_named_tuple, vector_partition_query_contract::partition_scope_does_not_weaken_context_scope_or_principal_filters, vector_partition_sync_inspection_contract::partitioned_sync_derives_receiver_membership_without_changing_owner_pairing -->
-- A commit updates the durable base/change/tail lifecycle for the affected layout. Inserts enter a
-  fresh searchable tail; deletes and replacements add tombstones. Searches merge the valid base,
-  sealed committed changes, and tail under one MVCC snapshot.
-  <!-- enforced by: vector_serving_merge_contract::updated_base_and_tail_publish_one_visible_row_per_identity, vector_search_mode_bounded_contract::old_snapshot_keeps_each_partition_graph_after_a_later_write, vector_tail_transaction_contract::local_tail_admission_refuses_the_complete_transaction_before_durability -->
-- `AUTO_INDEX_AT` and HNSW (`M`, `EF_CONSTRUCTION`, `EF_SEARCH`) are declarable per-column
-  workload policy; silence keeps the compatibility profile. `AUTO` applies its effective threshold
-  to the aggregate allowed set, while `EXACT` and `INDEXED` remain explicit whole-query contracts.
-  The canonical SQL reference defines syntax, defaults, and online effects.
-  <!-- enforced by: vector_policy_resolver_contract::declared_vector_policy_resolves_consistently_at_default_and_declared_boundaries, vector_search_mode_bounded_contract::auto_admits_indexed_planning_by_aggregate_then_exact_compares_each_small_partition, vector_search_mode_bounded_contract::exact_override_is_exhaustive_across_partitions_and_matches_rust_and_bounded_reads, vector_search_mode_bounded_contract::indexed_small_nonempty_scope_refuses_until_maintenance_then_keeps_a_staged_delta_visible -->
-- Filtered and broad searches stay bounded. Selected layouts are searched independently with a
-  global candidate heap, then one final top-k; the engine does not load every selected graph at once.
-  <!-- enforced by: vector_partition_query_contract::finite_in_partition_scope_merges_before_one_limit, vector_search_mode_bounded_contract::filtered_many_partition_search_reuses_partition_local_candidates, vector_lazy_raw_residency_contract::indexed_many_partition_reads_point_load_only_visible_versioned_candidates -->
-- Indexed routes have an acceptance target of at least 95% recall-at-10 against `EXACT` on the
-  same stored column.
-  <!-- enforced by: vector_held_out_native_reference::held_out_unfiltered_native_reference_recovers_the_required_neighbors, vector_serving_merge_contract::held_out_filtered_graph_search_preserves_quality_at_sparse_and_broad_selectivities -->
+- This release ships exact vector search only. `AUTO` and `EXACT` compare allowed stored vectors within the active budgets; `INDEXED` returns `VectorIndexedRouteUnavailable`. The clustered index is switched off: commits and maintenance do not build or write it, and queries and inspection do not read it. Index policy declarations are retained but do not enable an index.
+<!-- enforced by: a_search_is_exact_with_no_index_built::an_auto_find_answers_exactly_after_commit_with_no_maintenance, a_search_is_exact_with_no_index_built::indexed_is_refused_at_every_door, a_search_is_exact_with_no_index_built::no_cycle_or_commit_builds_or_writes_an_index, a_search_is_exact_with_no_index_built::declared_index_policy_is_recorded_and_has_no_effect -->
+
 
 ---
 
@@ -144,20 +156,24 @@ one of two routes when it opens. Ordinary reads keep that route for the session:
   unchanged. Several direct readers coexist on one store.
 
 The two directions see each other. A writable open of a store a writer already
-owns is refused with `held_by_writer`, and a writable open while direct readers
-are still hydrating is refused with `held_by_readers` — a reader takes a hold
-beside the store for exactly as long as it is hydrating, precisely so a starting
-writer waits rather than tearing the file out from under it, and publishes a
-best-effort record of itself so that refusal can name who to go and look at. A direct read that finds committed state a writable open
-would have to mend refuses with `direct_read_requires_writer` instead of serving
-something the file cannot back.
+owns is refused with `held_by_writer`. A starting direct reader holds writers out
+only while it selects and registers its committed snapshot, at fixed cost
+independent of store size. It releases that admission hold before loading the
+image; its session and cursors retain their registered snapshot afterward.
 
-An in-memory database has no backing file, companion, or owner channel.
-<!-- enforced by: crates/contextdb-cli/tests/read_cli_journeys_invocation.rs::memory_store_emits_no_route_notice_and_reports_owner_state_not_applicable -->
+A writable open waits exactly once for the operating-system store lock. There is
+no engine timeout and no application reopen/retry loop. Only actual caller
+cancellation or the caller's deadline can end that wait early. An already-expired
+caller deadline returns the immediate typed `held_by_readers` refusal while
+readers hold admission, including
+the real observed count and identifiable reader names. A direct read that finds
+committed state a writable open would have to mend refuses with
+`direct_read_requires_writer` instead of serving something the file cannot back.
 
 The supplied runtime directory names the owner channel; a channel startup failure leaves the
 database open with a `not_serving` status. Reader coordination uses the platform per-user
-directory when available, otherwise the supplied directory. Inventories inspect every known
+directory when available, with an automatically prepared private data-home fallback on headless
+Linux; an explicit supplied directory also participates in discovery. Inventories inspect every known
 candidate directory, and an empty inventory does not prove that no reader exists. A writer
 publishes purge fences to each candidate. If one cannot be authenticated, the affected purge or
 reclamation refuses with a typed error naming that directory while database open remains
@@ -167,6 +183,21 @@ reclamation with `ReaderCoordinationUnavailable`, covering readers with differen
 when no platform root exists. The filesystem must support Linux OFD locks. Other Unix systems
 without a common platform root retain a conservative floor and refuse these operations when
 the inventory cannot be proved complete.
+<!-- enforced by: local_transport_runtime::linux_process_fallback_is_derived_from_the_effective_uid_not_the_request, crates/contextdb-engine/src/persistence/reader_registration_privacy_tests.rs::reader_data_home_uses_effective_user_when_home_is_unset -->
+
+**Holder presence.** A process that owns background work beside a store, and keeps working while
+its `Database` handle is closed, proves it is alive with `persistence::holder_presence::hold`: an
+exclusive Linux OFD lock on one byte of the store's empty `<store>.holders` companion, chosen from
+the work's 16-byte token. The lock lasts as long as the returned guard, independent of any
+`Database` handle, and the kernel releases it when the holder exits for any reason, a kill or a
+crash included; a stopped or suspended process keeps it. `probe` asks whether a token's holder is
+alive without changing a byte or creating the companion, and `wait_released` blocks in the kernel
+until the holder releases or exits, with no polling and no timeout. A filesystem that cannot take
+the lock refuses with `HolderPresenceUnavailable` before anything is written, and so does any
+platform without OFD locks. Holder locks never touch the data file or the `.lock` companion, so
+they neither hide nor impersonate a reader or the writer. Presence reports liveness only: a
+consumer that publishes work under a claim still fences that publication on its own token inside
+the publishing transaction, because a holder can lose its lock without exiting.
 
 Once a file reader has captured its committed image, it publishes an authenticated registration
 for that physical store incarnation and exact storage root for the lifetime of the shared session
@@ -262,10 +293,109 @@ still held by the session or another reader stays charged until its last holder 
 Evicting the cache entry alone does not release that charge.
 <!-- enforced by: session_charged_bytes::public_charged_bytes_reports_and_releases_cursor_hydration_on_both_routes, direct_file_image_memory_lifetime::a_read_within_limit_succeeds_and_keeps_its_page_charged_until_the_session_drops, crates/contextdb-engine/src/persistence/search_page_reuse_tests.rs::a_proof_page_a_statement_still_holds_stays_charged_after_the_cache_evicts_it, crates/contextdb-engine/src/persistence/search_page_reuse_tests.rs::statement_cleanup_after_success_refusal_and_cancellation_leaves_no_uncharged_page -->
 
+The file reader's page-cache policy is declared per session through
+`ReadSessionOptions::read_cache_share`, an optional integer percent from 0 to 100.
+The declaration persists for the session and travels to each direct-file open.
+The policy default is **default (14%)**: exactly `(B - F) / 7`, saturating at zero,
+where `B` is the declared session memory ceiling, or `limits.memory` when no
+session ceiling is declared, and
+`F` is the 64 KiB source overhead plus the verifier, LSN and history-open control
+reservations. An explicit percent applies to `B - F`. There is no fixed byte cap.
+`ReadSession::read_cache_share_status()` returns `Result<ReadCacheShareStatus>` and
+resolves writer turnover before inspecting the declared percent, default percent,
+budget, fixed reservation, cache capacity and effective percent of the remaining
+budget after fixed source reservations. Route-selection failures remain typed errors;
+inspection never silently substitutes declaration-only status for a failed route.
+The options-only `ReadSessionOptions::read_cache_share_status()` remains infallible
+and does not open or select a route. The file reader's admitted read root now follows the session's declared
+`memory_limit`, falling back to `limits.memory` when no session limit is declared.
+For example, `memory_limit = 1 GiB` with the shipped 16 MiB `limits.memory` gives
+the file reader a 1 GiB root for loaded state and cache; previously that root was
+bounded by 16 MiB. Each statement remains bounded by `limits.memory`.
+
+`ReadSession::set_read_cache_share` resolves writer turnover before accessing the
+selected cache, propagating typed route failures. It changes capacity immediately
+under the cache insertion lock, without reopening or changing its snapshot. Growth is admitted before
+publication; shrink retires entries while cursor-held backing keeps its invoice
+until final physical release. Zero disables file page caching; 100 selects the
+whole remainder and is still subject to total admission. A 100% declaration is
+valid, but a file open or resize then refuses it when the reservation consumes
+all B and leaves no room for the prepaid index and decoded state. `None` restores
+the derived default. A refused change keeps the previous declaration and capacity.
+
+On the owner route, inspection reports the session's formula values for its file
+cache policy, with `prepaid_index_bytes` and `held_page_bytes` both `None`; it does
+not report or resize the writer's shared cache. The owner route can retain a 100%
+declaration without allocating a file cache; a later file open must still pass
+total admission. Newly selected file readers resolve the current declaration when they open.
+An owner cursor retains the policy it opened under for its first continuation page;
+a current shrink applies immediately, while growth waits for that reader's first real page
+measurement. Later fetches also resolve the current declaration, using that reader's
+admitted memory budget. It resizes the existing retained source, preserving
+the exact registered root and delivered-row position. Cache growth leaves room for the running
+cursor's measured page work: production kernel memory telemetry, actual row credits, encoded
+buffer/control credits and the encoder diagnostic Layout supply the measurement. The maximum
+observed page need is retained in the cursor's existing memory-control object. The encoder's
+original payer admits a temporary stack credit for that room while real cache admission finds
+the largest byte capacity that still fits. No new backing or parallel budget is created.
+If the continuation cannot follow a declaration fully, it keeps that bounded capacity and
+continues fetching; the session's declared share remains unchanged. `last_refusal` names the
+cursor and the capacity it kept. Each fetch rechecks its room, and shrink applies immediately.
+
+The SQL session surface is `SET READ_CACHE_SHARE = <percent> | DEFAULT` and
+`SHOW READ_CACHE_SHARE`. It uses the same live mutation path as the Rust API and
+never writes a durable setting. The show row includes the declared and effective
+values, last refused value, and `last_query_resident_percent`. Out-of-range
+cache shares and memory limits above their startup ceiling use the common
+`Error::InvalidSetting { name, value, allowed }` vocabulary. Admission refusals
+keep their memory-budget fields and leave the prior declaration intact.
+
+Successful file data statements publish residency from a bounded distinct-page window,
+including ordinary, byte-window and native cache hits. Non-data inspections and failed statements
+preserve the previous observation. Empty, zero-share and superseded windows report Null;
+Null means no pages were measured. Owner routes also have no session-owned file
+cache to measure.
+
+Identifiers and their intrusive list links live in the existing prepaid native index arena;
+its original exact Layout invoice covers the metadata through physical free. A statement captures
+its arena from the live read index and retains that existing control only until its final probe;
+the file keeps no stale alias after writer startup replaces the index. Recording uses atomic
+controls, without the free-slot mutex or cache stripe locks. The hash table stays at most
+half full; the sample is also bounded by selected cache capacity divided by page size. The final
+residency walk follows recorded links only, never the capacity array, and probes production cache
+residency without I/O or CLOCK changes. A superseding epoch or an in-flight writer invalidates the
+measurement instead of inventing zero percent. Window initialization alone serializes its reset.
+
+The native index slots are prepaid for the maximum selectable capacity `B - F`
+and reused across changes. Session inspection reports `prepaid_index_bytes`,
+even at share zero, and the physical page bytes still held by cursors. The index
+has its own admitted Layouts; it is separate from the selected page reserve.
+Cache capacity remains inside the original memory ceiling; opening and query
+work still refuse before allocation if their total does not fit.
+
 A stored value too large for a read's memory budget is refused before its source buffer is
 allocated. Opening a session need not read that value: the refusal belongs to the statement that
 selects it, on both the file and owner routes, and leaves no new charge behind.
 <!-- enforced by: direct_file_image_memory_lifetime::one_oversized_durable_value_is_refused_before_its_source_buffer_is_allocated -->
+Reader memory refusals name the allocation refused in their typed operation field.
+Each phase charges the same executing reader.
+
+| Operation | Allocation refused |
+|---|---|
+| `decode_owner` | The native control that establishes an operation's decoder owner, before stored-value decoding begins. |
+| `query_decode` | Payload storage allocated while decoding selected stored values. |
+| `materialize_answer` | Storage allocated to materialize the answer. |
+
+
+Fallible engine reads that return history-sized results use a per-operation reader child and
+admit retained output as it is built. `trigger_audit_history` and `changes_since_with_arrivals`
+therefore refuse with `MemoryBudgetExceeded` when their selected history exceeds that child;
+`get_edge_properties` uses the same pattern for its returned properties. Configuration-scale
+metadata reads (`table_names`, `table_meta`, `retention_sync_peer`, `list_triggers`, and
+`registered_trigger_callbacks`) remain infallible and are exempt from per-operation admission.
+`plugin_describe` returns host-supplied plugin output, and `RowChange`/`ChangeSet` DTO cloning and
+transformations operate on values already owned by the caller; those allocations belong to the
+host. `trigger_audit_log` is a bounded recent ring rather than persisted unbounded history.
 
 This is still the standard embedded-database model — the same shape as SQLite,
 LMDB, or redb: the application that mutates the data **owns the handle for its
@@ -394,13 +524,12 @@ Two implementations:
 
 | Implementation | Used by | Behavior |
 |---------------|---------|----------|
-| `CompositeStore` (in-memory) | `Database::open_memory()` | Applies to in-memory stores directly |
-| `PersistentCompositeStore` | `Database::open(path)` | Applies to in-memory stores + flushes to redb |
+| `PersistentCompositeStore` | `Database::open(path)` | Applies to the engine's working stores + flushes to redb |
 
 This trait is the extension point for additional backends if required. The
 applicator borrows the commit `WriteSet`; stores clone only the row, edge, or
-vector data they retain. The engine owns compute state (in-memory stores, HNSW
-cache). The applicator owns durability.
+vector data they retain. The engine owns compute state (in-memory stores and
+index caches). The applicator owns durability.
 
 ### Persistence (`redb`)
 
@@ -410,7 +539,7 @@ Single-file storage via redb:
 - On open: relational rows load with table-local index maintenance. Vector lifecycle metadata opens
   first; valid base and change graphs and raw-vector pages are loaded or mapped only for the active
   working set, rather than rebuilding every vector index.
-  <!-- enforced by: vector_lazy_restart_residency_contract::reopen_keeps_saved_partitions_dormant_then_reclaims_one_least_recently_used_route_under_pressure, vector_lazy_consumer_restart_contract::point_lookup_after_reopen_loads_only_the_row_partition_and_returns_its_vector -->
+  <!-- enforced by: vector_lazy_consumer_restart_contract::point_lookup_after_reopen_loads_only_the_row_partition_and_returns_its_vector -->
 - Crash-safe: redb provides atomic transactions
 - Committed row bodies: a file-backed store keeps key, index, constraint and policy columns and
   values up to 1 KiB resident; larger text/JSON values and vectors stay only in redb. Anything that
@@ -431,93 +560,8 @@ Single-file storage via redb:
 
 ### Vector generations, restart, and repair
 
-Vector base generations, committed-change graphs, tombstones, and their checksums are durable local
-state. Publishing a replacement writes temporary state, verifies it, then atomically switches the
-authoritative pointer. A crash therefore leaves either the previous complete generation or the new
-complete generation, never a half-published one. Loaded base and sealed change graphs are immutable:
-inserts go into a fresh mutable tail, and deletes/replacements use snapshot-visible tombstones.
-A deletion does not remove a node from a sealed graph in place. Search excludes invisible versions
-and resolves candidates against the snapshot's authoritative vector. Maintenance publishes a
-replacement that omits obsolete entries; an already-open snapshot keeps its compatible generation
-until it releases its pin.
-<!-- enforced by: vector_generation_quarantine_compaction_lock_contract::later_mutations_publish_a_new_generation_truncate_only_covered_journal_and_replay_the_suffix, vector_resource_maintenance_contract::replacement_refusal_precedes_workspace_and_keeps_the_serving_generation, vector_generation_authoritative_purge_replacement_contract::partial_purge_atomically_publishes_a_survivor_generation_from_a_dormant_route, vector_generation_quarantine_compaction_lock_contract::pinned_old_snapshot_keeps_its_indexed_generation_until_release_then_reclaims_superseded_bytes, vector_partition_restart_contract::an_open_old_snapshot_and_a_later_historical_snapshot_keep_their_complete_vector_views -->
-
-Restart validates lightweight lifecycle metadata, keeps the last valid generation available, and
-replays only verified changes after that generation into a new mutable tail as needed. It does not
-reconstruct every vector before serving the first query. A corrupt or incompatible newest generation
-is quarantined; a maintained indexed query for that layout refuses until repair, while `AUTO` may use
-exact work only within the active budget. Repair and first build run through maintenance outside the
-query path, so an older valid route and ordinary relational/graph reads remain usable.
-<!-- enforced by: vector_partition_restart_contract::partitioned_indexed_search_survives_two_clean_restarts_without_a_query_rebuild, vector_lazy_replay_budget_contract::first_bounded_restart_query_charges_lazy_decode_and_replay_to_the_request_ceiling, vector_generation_quarantine_compaction_lock_contract::corrupt_lazy_base_becomes_typed_unavailable_then_repairs_from_raw_vectors, vector_generation_quarantine_compaction_lock_contract::newer_catalog_format_quarantines_only_that_route, vector_generation_quarantine_compaction_lock_contract::corrupt_journal_quarantines_and_repairs_one_route_while_a_cold_neighbour_builds, vector_generation_quarantine_compaction_lock_contract::caller_driven_repair_replaces_the_quarantined_generation_and_survives_restart, vector_generation_quarantine_compaction_lock_contract::engine_owned_worker_repairs_the_quarantined_route_without_a_caller_cycle -->
-
-Raw vectors, base graphs, change graphs, and compaction workspace are independently accounted for.
-Generation admission counts raw versions separately from selected live graph points at one committed
-frontier. Ordinary resident generations price and copy only their consumed frontier-live entries,
-with an optional LSN boundary for a change graph. Selection preserves every retained membership,
-MVCC interval and canonical digest, including when writes advance after the captured frontier;
-refusal precedes body copying. Tombstone metadata does not add ordinary graph points. Full cold
-snapshots and delete-only carriers retain their raw-history path; change graphs use the actual live
-delta and the existing delete-only carrier rule.
-<!-- enforced by: crates/contextdb-engine/src/database/maintenance_resource_tests.rs::durable_generation_workspace_separates_build_and_persistence_owners, crates/contextdb-engine/src/database/maintenance_resource_tests.rs::a_retained_raw_body_has_decode_scratch_even_without_live_graph_points, vector_generation_admission_contract::retained_versions_and_tombstones_admit_base_replacement_and_serve_old_graph, vector_generation_delta_admission_contract::small_delta_refuses_growing_prior_base_candidate_before_allocation_then_retries -->
-<!-- enforced by: crates/contextdb-engine/src/database/maintenance_resource_tests.rs::resident_generation_selection_preserves_retained_canonical_digests, crates/contextdb-engine/src/database/maintenance_resource_tests.rs::resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_writes, crates/contextdb-engine/src/database/maintenance_resource_tests.rs::resident_generation_selection_admits_history_below_the_full_copy_bound_and_refuses_before_bodies, crates/contextdb-vector/src/store/generation_selection_tests.rs::selected_generation_materialization_preserves_all_representations_and_snapshot_intervals, crates/contextdb-vector/src/store/generation_selection_tests.rs::selected_generation_refuses_inconsistent_metadata_before_body_materialization -->
-
-A resident partition snapshot funds its copies without a generation-owned decoder. Dormant or
-evicted raw partitions admit loader decode scratch separately; direct cold reads and delete-only
-carriers retain the generation decoder's 1 MiB serde scratch floor as well as declared-body scratch,
-even when retained history has no live graph points.
-<!-- enforced by: crates/contextdb-engine/src/database/vector_generation_decode_owner_tests.rs::resident_f32_generation_funds_snapshot_without_a_decoder_owner, crates/contextdb-engine/src/database/vector_generation_decode_owner_tests.rs::resident_sq8_generation_funds_snapshot_without_a_decoder_owner, crates/contextdb-engine/src/database/vector_generation_decode_owner_tests.rs::resident_sq4_generation_funds_snapshot_without_a_decoder_owner, crates/contextdb-engine/src/database/vector_generation_decode_owner_tests.rs::direct_cold_and_delete_carrier_generations_keep_the_decode_floor, crates/contextdb-engine/src/database/vector_generation_decode_owner_tests.rs::dormant_partition_loader_admits_its_decode_floor_before_reads_and_releases -->
-
-Construction owns the raw snapshot, selected input and
-builder workspace; after input clones drop, encoding owns the builder and one checked codec
-envelope bound and encoder scratch. After the builder drops, the raw snapshot coexists with the
-candidate. The state digest equals the BLAKE3 hash of the canonical encoding of sorted snapshot-live entries
-(the proof checks byte identity, not streaming or peak allocation). After the raw snapshot drops, persistence
-owns the candidate and its encoding, validation and durable-write copies. Only change publication
-loads the prior base. The shared accountant atomically replaces each phase's held charge without
-exposing its capacity or charging both phases; refusal leaves the old charge intact.
-<!-- enforced by: crates/contextdb-engine/src/database/maintenance_resource_tests.rs::durable_generation_workspace_separates_build_and_persistence_owners, crates/contextdb-vector/src/hnsw.rs::durable_codec_capacity_bounds_all_stored_representations_and_checks_overflow, crates/contextdb-engine/src/database/maintenance_resource_tests.rs::streamed_state_digest_preserves_the_canonical_live_entry_encoding, vector_generation_admission_contract::encoding_shrink_transfers_held_workspace_without_additive_headroom, vector_generation_admission_contract::candidate_shrink_transfers_held_workspace_without_additive_headroom, vector_generation_admission_contract::growing_persistence_transitions_refuse_atomically_for_base_and_change_publication, vector_generation_delta_admission_contract::small_delta_refuses_growing_prior_base_candidate_before_allocation_then_retries -->
-Page preparation
-retains one graph body and frames each physical key and page only during insertion. Reader-held
-old generations remain charged until their final holder releases them.
-<!-- enforced by: crates/contextdb-engine/src/persistence/generation_admission_tests.rs::near_extent_sized_page_roots_are_streamed_and_every_disk_key_is_counted, vector_generation_admission_contract::multiple_pinned_generations_remain_charged_until_their_final_snapshot_release -->
-An immutable candidate refines only its graph-page frame bound: sequential base/change page
-insertion needs the larger frame, rather than their sum, and no frame for empty graph bytes.
-The conservative constructor and payload bounds still apply.
-<!-- enforced by: crates/contextdb-engine/src/persistence/vector_streamed_frame_tests.rs::concrete_streamed_frame_covers_exact_capacities_and_root_edges, crates/contextdb-engine/src/persistence/vector_streamed_frame_tests.rs::candidate_streamed_frame_is_sequential_max_and_empty_zero, vector_generation_admission_contract::fresh_ten_thousand_dense_vectors_publish_and_restart_under_writer_limit, vector_generation_admission_contract::tiny_limit_refuses_with_typed_details_without_partial_generation -->
-Actual Redb source extents
-are admitted before allocation independently of decode/build workspace; uncached pages retain
-that charge until their final access guard drops.
-Their pages are mapped or loaded for the active working set and can be evicted when idle; an active
-query pins what it needs. When a declared `MEMORY_LIMIT` cannot admit a selected graph, idle graph
-chains are reclaimed in least-recently-used order only until the complete load fits. Without a
-declared memory limit, loaded graphs remain resident. <!-- enforced by: vector_lazy_restart_residency_contract::reopen_keeps_saved_partitions_dormant_then_reclaims_one_least_recently_used_route_under_pressure, vector_resource_maintenance_contract::unlimited_memory_keeps_loaded_graphs_warm_across_search_and_idle_maintenance, vector_resource_maintenance_contract::working_set_releases_other_partitions_before_the_next_selected_load --> A read session searching saved graphs keeps the graph pages it filled warm across repeated
-queries when its declared memory covers every selected graph's pages: after the first wide query,
-repeating it reads no further pages. Under a tighter declaration the selected graphs share the
-remaining memory, and a declaration too small to hold the graphs a query needs is refused with
-`MemoryBudgetExceeded` while its charge stays within the declaration. <!-- enforced by: a_wide_find_keeps_its_entry_pages_warm::repeated_wide_finds_stop_filling_pages_within_the_declared_memory, a_wide_find_keeps_its_entry_pages_warm::a_short_declaration_keeps_its_charge_and_refuses_missing_topologies --> Charged bytes are ContextDB's memory-accountant
-view, not a claim about the operating system's physical mapped pages. Disk budget covers durable
-vector and index state before a write is accepted. The memory target is the product declaration
-`SET MEMORY_LIMIT 2G`, exactly 2147483648 bytes. <!-- enforced by: statement_effect_contract::binary_memory_declaration_accepts_quoted_and_unquoted_sizes --> Whole-process RSS, which also covers opening,
-writes, queries, maintenance and replay, is separate from the charged vector/index categories.
-
-Scalar publications keep all vector memberships and intervals while unchanged stored raw bodies
-share one immutable allocation. Sharing requires bit-identical F32/SQ8/SQ4 representations,
-including signed zero and quantized bounds. Body and shared-header charges follow each allocation
-through moves, eviction and store removal until its final holder drops; directories remain charged
-per version. `HISTORY ALL` therefore grows version metadata and writer retention with retained
-version count, even when unchanged vector bodies stay shared and bounded. A finite memory ceiling
-still limits admission of additional history.
-<!-- enforced by: crates/contextdb-vector/src/store/shared_payload_tests.rs::retained_scalar_memberships_share_one_body_and_keep_all_snapshot_intervals, crates/contextdb-vector/src/store/shared_payload_tests.rs::hydration_shares_only_bit_identical_history_in_every_stored_representation, crates/contextdb-vector/src/store/shared_payload_tests.rs::shared_cross_partition_body_survives_source_removal_and_final_external_holder, crates/contextdb-vector/src/store/shared_payload_tests.rs::shared_allocation_header_stays_charged_until_final_holder_after_store_drop, vector_memory_ownership_reconciliation_contract::retained_journey_scalar_publications_bound_unique_payloads_and_admit_a_small_write -->
-
-Received columns may own accounting without a store-wide accountant. Batch preparation reserves
-each touched column's directory, shared-header and required copied-move body growth with its actual
-funder before publication. Inserted bodies are caller-admitted beforehand; abort or refusal releases
-only preparation reservations and retains that caller-admitted body charge. Publication adopts payload
-charges until the final holder drops; settlement returns unused reserved bytes to their funder. Mixed
-legacy columns keep their existing insertion protocol. Detached-copy hydration moves unique uncharged
-loaded bodies out of shared headers without cloning; shared histories and charged or resident
-sources retain their owners. Refused copy hydration releases workspace and remains retryable.
-<!-- enforced by: crates/contextdb-vector/src/store/received_publication_accounting_tests.rs::received_publication_prepares_next_insert_and_releases_its_last_holder, crates/contextdb-vector/src/store/received_publication_accounting_tests.rs::received_columns_keep_distinct_funders_and_legacy_columns_in_a_mixed_batch, crates/contextdb-vector/src/store/detached_copy_payload_tests.rs::detached_copy_unique_unwrap_moves_the_body_and_preserves_shared_or_charged_owners, crates/contextdb-vector/src/store/detached_copy_payload_tests.rs::detached_copy_hydration_retains_only_new_singleton_bodies_and_releases_headers, crates/contextdb-vector/src/store/detached_copy_payload_tests.rs::detached_copy_header_refusal_releases_loader_body_workspace_and_retries, crates/contextdb-vector/src/store/detached_copy_payload_tests.rs::detached_copy_mixed_history_preserves_bits_and_shared_final_holder_charges, crates/contextdb-vector/src/store/detached_copy_payload_tests.rs::detached_copy_already_resident_sources_keep_representation_charge_and_funder -->
+This release ships exact vector search only. `AUTO` and `EXACT` compare allowed stored vectors within active budgets. `INDEXED` returns `VectorIndexedRouteUnavailable`; the clustered index is switched off. Index policy declarations do not enable construction, maintenance or indexed serving.
+<!-- enforced by: a_search_is_exact_with_no_index_built::an_auto_find_answers_exactly_after_commit_with_no_maintenance, a_search_is_exact_with_no_index_built::indexed_is_refused_at_every_door, a_search_is_exact_with_no_index_built::no_cycle_or_commit_builds_or_writes_an_index, a_search_is_exact_with_no_index_built::declared_index_policy_is_recorded_and_has_no_effect -->
 
 ---
 
@@ -546,7 +590,6 @@ Inject a custom plugin:
 ```rust
 let plugin = Arc::new(MyPlugin::new());
 let db = Database::open_with_plugin(path, plugin)?;
-// or: Database::open_memory_with_plugin(plugin)?
 ```
 
 ---
@@ -555,71 +598,39 @@ let db = Database::open_with_plugin(path, plugin)?;
 
 contextdb starts one background maintenance thread per database, under the default engine-owned
 policy, when the database declares something to maintain: a `RETAIN` window, `HISTORY CURRENT ONLY`,
-a durable trigger with audit history, or maintained vector work. It advances a finite batch and does
+a durable trigger with audit history, or other declared maintenance work. It advances a finite batch and does
 near-zero work when nothing is pending. An embedding host may explicitly choose caller-driven
 maintenance instead: then ContextDB starts no hidden thread and each existing
 `Database::run_maintenance_cycle` call (or CLI `.maintenance run`) advances one finite batch.
-Declarations, writes, open, and a first query never wait for every vector to be indexed.
-<!-- enforced by: tests/integration/maintenance_ownership_tests.rs::a_fresh_database_defaults_to_engine_owned_maintenance, tests/integration/maintenance_ownership_tests.rs::caller_driven_spawns_no_thread_however_much_is_declared, vector_maintained_lifecycle_contract::caller_driven_vector_indexes_are_built_and_maintained_only_by_maintenance, vector_maintained_lifecycle_contract::engine_owned_file_maintenance_publishes_a_durable_indexed_route_for_a_reopened_reader -->
+Vector index construction is disabled in this release.
+<!-- enforced by: a_search_is_exact_with_no_index_built::an_auto_find_answers_exactly_after_commit_with_no_maintenance, a_search_is_exact_with_no_index_built::indexed_is_refused_at_every_door, a_search_is_exact_with_no_index_built::no_cycle_or_commit_builds_or_writes_an_index, a_search_is_exact_with_no_index_built::declared_index_policy_is_recorded_and_has_no_effect -->
+<!-- enforced by: tests/integration/maintenance_ownership_tests.rs::a_fresh_database_defaults_to_engine_owned_maintenance, tests/integration/maintenance_ownership_tests.rs::caller_driven_spawns_no_thread_however_much_is_declared -->
 
-Each cycle advances retention, trigger-audit retention, version cleanup, and maintained vector
-work. The default engine-owned loop polls every 60 seconds; callers can persist a different database
-interval through `SET MAINTENANCE_POLL_INTERVAL`, `Database::set_maintenance_poll_interval`, or the
-CLI's millisecond-only `--maintenance-poll-ms`; omitting the CLI flag uses the database's persisted
-interval. The timer is only the trigger for evaluating work: per-column thresholds decide whether a
-healthy route joins that wake. Each wake samples the finite vector backlog and advances every needy
-partition sequentially within declared memory and work limits, with never-built partitions first.
-There is no separate per-wake partition-count limit; finiteness comes from the fixed sample. A
-per-column `CONSOLIDATION` policy decides when healthy graphs need rebuilding (rules and defaults:
-[Vector Similarity Search](query-language.md#vector-similarity-search)); `CONSOLIDATION NONE`
-suppresses only those threshold rebuilds, never construction, topology replacement, or quarantine
-repair. Graph construction uses an immutable sample outside the short partition publication section, so
-a same-partition write can finish into the newer fresh tail while the sampled generation publishes.
-That write stays searchable and remains pending for a later publication. Retention runs before
-current-only version cleanup, so an expiring row is not first collapsed as history. Initial graph
-construction and repair use this maintenance path exclusively. Caller-driven policy is an open option
-and CLI mode, starts no background worker, and uses the same all-needy cycle when the host calls it.
-<!-- enforced by: vector_partition_declaration_contract::consolidation_and_maintenance_poll_declarations_round_trip_and_reset, vector_resource_maintenance_contract::changing_the_poll_interval_returns_while_engine_maintenance_is_active, read_cli_journeys_invocation::maintenance_flags_require_write_and_configure_the_writer, vector_resource_maintenance_contract::in_memory_maintenance_honours_declared_consolidation_thresholds, vector_resource_maintenance_contract::in_memory_construction_leaves_same_partition_vector_writes_usable, vector_resource_maintenance_contract::failed_partition_does_not_starve_actual_work_and_reports_active_progress -->
+Each cycle advances retention, trigger-audit retention, and version cleanup. No vector index is
+built in this release, so a cycle's vector report counts no built indexes or partitions, whether the
+host calls the cycle or the engine-owned loop wakes. The default engine-owned loop polls every 60
+seconds; callers can persist a different database interval through `SET MAINTENANCE_POLL_INTERVAL`,
+`Database::set_maintenance_poll_interval`, or the CLI's millisecond-only `--maintenance-poll-ms`;
+omitting the CLI flag uses the database's persisted interval. A per-column `CONSOLIDATION` policy is
+retained as declared (rules and defaults:
+[Vector Similarity Search](query-language.md#vector-similarity-search)) and no cycle acts on it,
+because there is no graph to rebuild. Retention runs before current-only version cleanup, so an
+expiring row is not first collapsed as history. Caller-driven policy is an open option and CLI mode,
+starts no background worker, and runs the same cycle when the host calls it.
+<!-- enforced by: vector_partition_declaration_contract::consolidation_and_maintenance_poll_declarations_round_trip_and_reset, read_cli_journeys_invocation::maintenance_flags_require_write_and_configure_the_writer, a_search_is_exact_with_no_index_built::no_cycle_or_commit_builds_or_writes_an_index -->
 
-A partition-local build refusal is attached to the vector maintenance report alongside successful
-index and partition counts. It does not short-circuit the wake's closing graph reclamation, empty
-partition retirement, automatic-compaction attempt, or cycle stamp; cancellation remains a typed
-interruption, is checked around inventory, before and after each covered-journal cleanup retry,
-and during normal post-publication cleanup. Both `ReadCancelled` and `PublicationInterrupted`
-return before later partitions advance. Validation, key collection and deletion check cancellation
-every 64 records and before commit. Uncommitted cleanup aborts, temporary reservations
-release, earlier committed cleanup remains valid across restart, and the interrupted cycle receives
-no closing stamp.
-<!-- enforced by: vector_resource_maintenance_contract::refused_partition_still_closes_the_cycle_and_retires_a_sibling_partition, vector_resource_maintenance_contract::dropping_a_sampled_vector_column_does_not_abort_cycle_closing, crates/contextdb-engine/src/database/vector_journal_cleanup_cancellation_tests.rs::cancellation_after_inventory_capture_skips_all_cleanup_and_releases_reservations, crates/contextdb-engine/src/database/vector_journal_cleanup_cancellation_tests.rs::cancellation_after_committed_journal_retry_leaves_later_partitions_untouched_on_restart, crates/contextdb-engine/src/database/vector_journal_cleanup_cancellation_tests.rs::publication_interruption_at_normal_t2_is_terminal_and_preserves_the_restart_frontier, crates/contextdb-engine/src/persistence/bounded_catalog_tests.rs::journal_cleanup_scan_cancellation_aborts_validation_collection_and_deletion -->
+Because no vector index is built, a maintenance cycle has no partition-local build to refuse or
+cancel: its vector report counts zero built indexes and partitions and carries no first failure, and
+neither a commit, an explicit cycle, an engine-owned wake, erasure, retention nor compaction writes
+index state.
+<!-- enforced by: a_search_is_exact_with_no_index_built::no_cycle_or_commit_builds_or_writes_an_index -->
 
-Public and background cycles use an admitted committed catalog inventory, separate from startup
-inspection. A caller-refused singleton body permits the root-pinned cursor to continue to siblings;
-navigation or container refusal makes the inventory incomplete and authorizes no catalog-dependent
-reclaim or retirement. Already-clean installed catalogs skip journal cleanup. Pending cleanup
-admits its existing three-key reservation before materialization and retains that owner throughout.
-Source pins and borrowed views end inside the commit boundary before scalar marks are applied;
-sampling and marking do not copy giant partition keys. Candidate sorting admits its heap scratch
-before allocation, releases partial work on refusal and retries from a fresh inventory.
-The cursor continues when a refused giant body follows a healthy catalog and can still discover a
-later durable-only catalog. Closing route-slot refusal preserves publication and skips removal;
-wide typed route metadata is admitted before a cold catalog lookup.
-<!-- enforced by: crates/contextdb-redb/src/tree_store/bounded_bytes.rs::cursor_continues_after_refused_singleton_in_every_sibling_position, crates/contextdb-redb/src/tree_store/bounded_bytes.rs::cursor_navigation_refusal_is_terminal_and_has_no_backend_read, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_incomplete_container_sample_preserves_serving_and_closes, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_sampled_route_slot_refusal_drops_partial_work_and_closes, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_candidate_slot_refusal_drops_partial_work_and_closes, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_closing_route_slot_refusal_preserves_publication_and_skips_removal, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_candidate_sort_heap_refusal_releases_and_retries_stably, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_cold_covered_cleanup_refusal_keeps_serving_and_closes, crates/contextdb-vector/tests/borrowed_route_metadata_adapter.rs::giant_source_metadata_and_marking_allocate_no_giant_key_copy_or_encoding -->
+The storage layer's bounded byte cursor keeps reading siblings after a caller-refused singleton
+body, whatever its position among them. A navigation or container refusal ends that cursor with no
+backend read, and a fresh cursor retries once the admission condition has changed.
+<!-- enforced by: crates/contextdb-redb/src/tree_store/bounded_bytes.rs::cursor_continues_after_refused_singleton_in_every_sibling_position, crates/contextdb-redb/src/tree_store/bounded_bytes.rs::cursor_navigation_refusal_is_terminal_and_has_no_backend_read -->
 
-Frontier metadata can reject unrelated extents through charged bounded windows; selected or
-possibly matching metadata admits the complete physical extent before backend read or decoding,
-using `prepare_vector_generation`. Generation-body admission starts after construction reservation
-succeeds. Cleanup-only journal pages use `truncate_vector_partition_journal`; catalog reclamation
-uses the preparation operation. Unknown invalid catalogs do not quarantine unrelated routes;
-miskeyed authenticated catalogs quarantine their canonical route, and raised limits retry fresh.
-<!-- enforced by: crates/contextdb-engine/src/database/vector_frontier_metadata_admission_tests.rs::cold_oversized_catalog_extent_refuses_during_preparation_before_decode, crates/contextdb-engine/src/database/vector_frontier_metadata_admission_tests.rs::cold_oversized_journal_extent_refuses_during_frontier_count_before_decode, crates/contextdb-engine/src/database/vector_frontier_metadata_admission_tests.rs::cold_oversized_membership_extent_refuses_before_fallback_count_decode, crates/contextdb-engine/src/database/vector_quarantine_inventory_admission_tests.rs::missing_catalog_inventory_admits_cold_oversized_source_after_construction, crates/contextdb-engine/src/database/vector_quarantine_inventory_admission_tests.rs::corrupt_catalog_inventory_admits_cold_oversized_source_after_construction, crates/contextdb-engine/src/database/vector_source_page_admission.rs::cleanup_page_admissions_keep_typed_attribution_and_release_their_source_owner, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_small_unknown_invalid_catalog_does_not_quarantine, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_miskey_before_valid_catalog_quarantines_canonical_route, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_possible_match_blocks_until_raised_limit_retries_fresh -->
-
-A covered-journal refusal skips only that route's build and keeps its serving/catalog state while a
-sibling publishes. An incomplete `INDEXED` frontier refuses; `AUTO` uses that partition's complete
-exact fallback and preserves the sibling's indexed route. Historical raw-only routes with uncovered
-deletes remain candidates and physically clean their journals before retirement.
-<!-- enforced by: crates/contextdb-engine/src/database/vector_retry_frontier_integrity_tests.rs::cleanup_refusal_skips_its_build_while_sibling_and_complete_query_frontiers_progress, vector_delete_only_journal_progress_contract::delete_only_unpinned_final_route_physically_cleans_its_journal_before_retirement, vector_delete_only_journal_progress_contract::delete_only_final_route_truncates_covered_history_before_snapshot_release_can_retire_it -->
-
-**Version cleanup and a held read snapshot.** Every in-flight statement registers its own read snapshot for the call's duration, and a caller that needs to reuse a `SnapshotId` ACROSS separate calls (on a table declaring `HISTORY CURRENT ONLY`) registers it explicitly via `Database::pin_snapshot`, holding the returned guard for as long as the snapshot is still wanted. A version-cleanup pass samples every currently-registered snapshot (not merely the oldest) plus the committed watermark, atomically, once at the start of the pass, and defers any superseded version still visible to ANY of those registered snapshots to a later cycle — a version created between two registered snapshots and superseded after both is protected by the higher one even though the lower one alone would not see it. Protection begins when `pin_snapshot` RETURNS: a pin requested while a removal pass is already mid-flight, for a snapshot at or before that pass's sampled watermark, waits for the pass to finish first (bounded by one pass duration) before registering, so the pin can never return with a false promise of protection the SAME in-flight pass is still free to violate — the next cleanup cycle honors it instead. A pin for a snapshot strictly after the pass's watermark registers immediately: nothing that pass can prune was ever visible to it. Versions a pass already reclaimed before the pin is requested cannot come back; that boundary is unchanged.
+**Version cleanup and a held read snapshot.** Every in-flight statement registers its own read snapshot for the call's duration, and a caller that needs to reuse a `SnapshotId` ACROSS separate calls (on a table declaring `HISTORY CURRENT ONLY`) registers it explicitly via `Database::pin_snapshot`, holding the returned guard for as long as the snapshot is still wanted. Each open store prepays `ReadLimits::SHIPPED_SNAPSHOT_PIN_SLOTS` (64) pin slots. Further pins charge their exact registration bytes against the store's declared reader memory and release that charge at unpin; `pin_snapshot` returns the typed `snapshot_pin` memory refusal only when that budget cannot fund another pin. Dropping a prepaid pin returns its slot. Pin admission has no fixed count ceiling. A version-cleanup pass samples every currently-registered snapshot (not merely the oldest) plus the committed watermark, atomically, once at the start of the pass, and defers any superseded version still visible to ANY of those registered snapshots to a later cycle — a version created between two registered snapshots and superseded after both is protected by the higher one even though the lower one alone would not see it. Protection begins when `pin_snapshot` RETURNS: a pin requested while a removal pass is already mid-flight, for a snapshot at or before that pass's sampled watermark, waits for the pass to finish first (bounded by one pass duration) before registering, so the pin can never return with a false promise of protection the SAME in-flight pass is still free to violate — the next cleanup cycle honors it instead. A pin for a snapshot strictly after the pass's watermark registers immediately: nothing that pass can prune was ever visible to it. Versions a pass already reclaimed before the pin is requested cannot come back; that boundary is unchanged.
 
 **The cost model.** Version cleanup examines eligible table histories and the affected vector
 columns' partition-directory metadata to select exact version identities; selection does not load
@@ -717,9 +728,13 @@ Fan-out to multiple subscribers. Dead channels are cleaned up automatically. Gra
 
 `SET MEMORY_LIMIT`, `SHOW MEMORY_LIMIT`, and the `--memory-limit` startup option all
 feed the same global memory accountant.
+A read-only reader reserves a fixed source floor before it holds any data: a 64 KiB source window, a
+128 KiB verifier ledger and two small controls, 197,048 bytes (about 200 KB) in total, plus its
+cache share. A declared limit below the floor is refused, and the refusal names the floor. The floor
+is necessary, not sufficient: the schema the reader opens, its controls and its cache need more, and
+a reader charges the exact-probe filters it physically holds, not one per declared index.
 Vector operations attribute allocations with tags such as
-`vector_insert@evidence.vector_text` and `build_hnsw@evidence.vector_vision` so
-operators can identify the offending index from errors.
+`vector_insert@evidence.vector_text` so operators can identify the offending index from errors.
 
 The 2 GB edge working-set target guides constrained deployments. For a constrained device, SQ8 can
 reduce the stored vector footprint:
@@ -738,7 +753,7 @@ including aggregate counts and live vector payload byte totals. `SHOW
 VECTOR_PARTITIONS FOR table.column` supplies the typed-key, per-partition
 lifecycle detail, including each durable generation's state; use those
 surfaces instead of parsing memory operation tags.
-<!-- enforced by: vector_partition_sync_inspection_contract::existing_two_row_sync_keeps_each_vector_with_its_row_and_shows_summary, vector_partition_sync_inspection_contract::show_vector_partitions_supports_all_sql_forms, vector_inspection_explain_truth_contract::vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts -->
+<!-- enforced by: vector_partition_sync_inspection_contract::existing_two_row_sync_keeps_each_vector_with_its_row_and_shows_summary, vector_partition_sync_inspection_contract::show_vector_partitions_supports_all_sql_forms -->
 
 ---
 
@@ -984,9 +999,7 @@ loads or creates `<canonical-db-path>.fabric-identity.key`. Reopening that
 database and recreating the database file while retaining this adjacent key
 both keep the same node identity; a recreated database still has its new store
 incarnation. An endpoint that explicitly supplies `identity=<key-file>` always
-takes precedence over the adjacent key. An in-memory edge must supply that
-explicit persisted identity itself: a bare ticket is refused before it dials or
-signs a sync request. The lower-level raw transport may still use an ephemeral
+takes precedence over the adjacent key. The lower-level raw transport may still use an ephemeral
 identity only for protocol-level anonymous-refusal coverage where no database
 participates.
 
@@ -1123,16 +1136,22 @@ a product-level "erase this person" operation.
 - **Ingest** on the holder node: `ingest_bytes(&[u8]) -> BlobHash` or
   `ingest_file(&Path) -> BlobHash`. The returned `BlobHash` is the hash of the
   bytes, so ingesting the same content twice is idempotent.
-- **Serve** on the holder: `serve_on(&IrohServer)` registers the serving
+- **Serve** on the holder: `serve_on(&IrohServer) -> Result<()>` registers the serving
   handler. It checks the requesting peer's authorization against the ledger
   *before* any payload bytes move — the check is the gate, not an
-  after-the-fact audit.
+  after-the-fact audit. Each request obtains its own child of the store's declared reader memory.
+  Hosts supplying their existing provider use `serve_on_with_read_budget_provider`. Directory registration failures propagate.
 - **Fetch** on the consumer: `resolve_blob_ref(&BlobHash, holder_ticket, sink)`
   is async, fetches node-to-node, and is hash-verified — only bytes that hash
   to the requested `BlobHash` ever reach the sink. Errors are a matchable
   `ResolveError`: `Unentitled`, `PolicyForbidden`, `HashMismatch`,
   `HolderUnreachable`, `LocalStoreUnavailable`, `BlobNotFound`,
-  `TransferAborted`, `SinkWrite`, `FetchTimedOut`.
+  `TransferAborted`, `SinkWrite`, `FetchTimedOut`, `LedgerRead(Error)`.
+  The default creates an operation child internally; hosts supplying their actual
+  READ owner use `resolve_blob_ref_with_read_memory`. Ledger source refusals retain
+  their typed core error, including when returned by the holder on the same
+  blob stream before Bao payload data. A malformed or oversized control frame
+  returns a typed protocol refusal.
 - **Fetch deadline**: the whole `resolve_blob_ref` attempt — dial, the
   holder's tag bookkeeping, and the verified transfer loop — is bounded by a
   declared `BlobFetchPolicy { fetch_deadline_ms }` (documented default:
@@ -1159,7 +1178,11 @@ a product-level "erase this person" operation.
 - **Reclaim**: `reclaim_unreferenced(now_ms, grace_ms)` frees a blob once every
   job referencing it is terminal past the grace window (or once no job
   references it at all). A later resolve attempt against a reclaimed blob
-  returns `BlobNotFound`, even from an otherwise-entitled caller.
+  returns `BlobNotFound`, even from an otherwise-entitled caller. The captured ledger root stays funded by the operation child throughout
+  the sweep. `spawn_reclaim_driver(grace_ms)` obtains a child of the declared
+  reader parent for each cycle. Explicit host variants are
+  `reclaim_unreferenced_with_read_memory` and
+  `spawn_reclaim_driver_with_read_budget_provider`.
 - **Direct vs. relay**: whether a transfer goes direct or via a relay is a
   serve-time choice on the holder's endpoint spec. By default it's direct
   only — contextdb contacts no relay unless asked. The operator opts into the
@@ -1195,7 +1218,7 @@ install_work_ledger_schema(&db)?;
 
 let bytes = std::fs::read("frame.jpg")?;
 let blob_hash = blob_store.ingest_bytes(&bytes)?;
-blob_store.serve_on(&iroh_server);
+blob_store.serve_on_with_read_budget_provider(&iroh_server, read_budgets.clone())?;
 
 let spec = JobSpec::builder("job-1", "describe-image", "once", "node-a")
     .input_refs(vec![InputRef::blob_ref(blob_hash.clone())])
@@ -1208,7 +1231,7 @@ submit_job(&db, &spec, &no_direct_inputs)?;
 let claim = claim_job(&sync_client, "job-1", 1, "node-b", lease_deadline_ms, now_ms).await?;
 let mut sink = Vec::new();
 let bytes_written = blob_store
-    .resolve_blob_ref(&blob_hash, &holder_ticket, &mut sink)
+    .resolve_blob_ref_with_read_memory(read_memory.clone(), &blob_hash, &holder_ticket, &mut sink)
     .await?;
 ```
 
@@ -1220,6 +1243,31 @@ The on-disk store carries a format-version marker (current: `1.0.0`). Opening a
 store with an incompatible marker, schema layout, or versioned-key shape fails
 with `LegacyVectorStoreDetected`. A store written by an earlier build is not
 read. Move it aside and create the store again.
+
+### Reading a store whose writer died
+
+A writer killed at any point leaves a store that a direct reader on the same machine opens at once,
+without waiting for a writer to repair it. Every commit writes all of its pages to the file before
+the header that names it and syncs once, so after a process crash the header always names a commit
+whose pages are all in the file. The reader picks the commit slot exactly as a writer's repair would,
+verifies only its two root pages, and registers that root -- the same fixed admission work as a
+healthy read (`ADMISSION_PAGE_BUDGET`), with no allocator state, no walk of the store, and nothing
+written to it. What it serves is what the next writer's repair keeps.
+
+It does this only when the dead writer's published run names this boot and this exact data file
+(device, inode, birth time), and the file sits on a local filesystem (ext2/3/4, XFS, Btrfs, tmpfs,
+F2FS) on Linux. Otherwise it refuses with `DirectReadRequiresWriter` and a writable open repairs
+the store:
+- after a machine crash or power loss, a commit can be torn below its roots, and only repair's walk
+  of the whole tree can tell;
+- on other platforms and filesystems there is no such guarantee to lean on.
+
+Two limits are recorded:
+- A reader on the same boot can serve a commit whose sync the dead writer never completed; if the
+  machine then loses power before any writer repairs the store, that commit is gone.
+- Media damage below verified roots surfaces as `StoreCorrupted` when a read reaches it.
+
+<!-- enforced by: a_crashed_writers_store_opens_for_a_reader::a_writer_killed_at_any_write_of_a_commit_leaves_what_repair_keeps, a_crashed_writers_store_opens_for_a_reader::a_crashed_stores_admission_does_not_grow_with_the_store, a_crashed_writers_store_opens_for_a_reader::a_crashed_store_the_reader_cannot_vouch_for_is_left_to_a_writer -->
 
 ### Recovering a wedged or corrupt data root
 
@@ -1276,8 +1324,7 @@ The database tracks all row, graph, and vector allocations against one memory
 budget. Embedding callers use the durable
 `Database::set_memory_limit(Some(bytes))`; its setting survives reopen and
 remains runtime-configurable. A process that needs a non-raisable startup
-ceiling uses `contextdb_engine::database::open_with_startup_limits` (or
-`open_memory_with_startup_limit`). The CLI's `--memory-limit` uses that same
+ceiling uses `contextdb_engine::database::open_with_startup_limits`. The CLI's `--memory-limit` uses that same
 startup path. Budget exceeded →
 operations return `MemoryBudgetExceeded`. The raw mutable accountant is an
 engine implementation detail and is not attachable or reachable through the
@@ -1289,4 +1336,4 @@ File-backed databases also support a persisted disk budget:
 - runtime control via `SET DISK_LIMIT` / `SHOW DISK_LIMIT`
 - persisted live config in the redb file so reopen preserves the limit
 
-Disk enforcement happens in the engine write paths before `INSERT`, `UPDATE`, and sync-apply work begins. The storage allocator also reserves each projected physical file growth before allocating it, so pages retained for a live file reader and newly allocated writer pages cannot carry the file past the configured limit. Once the on-disk file is at or above the configured limit, or an allocator growth would cross it, further file-backed writes fail with `DiskBudgetExceeded` without poisoning the writer. In-memory databases accept the SQL but ignore disk budgeting because there is no backing file to measure.
+Disk enforcement happens in the engine write paths before `INSERT`, `UPDATE`, and sync-apply work begins. The storage allocator also reserves each projected physical file growth before allocating it, so pages retained for a live file reader and newly allocated writer pages cannot carry the file past the configured limit. Once the on-disk file is at or above the configured limit, or an allocator growth would cross it, further file-backed writes fail with `DiskBudgetExceeded` without poisoning the writer.

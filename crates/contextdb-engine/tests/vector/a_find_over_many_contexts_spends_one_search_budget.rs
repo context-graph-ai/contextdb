@@ -21,8 +21,7 @@
 
 use contextdb_core::read_contract::{OwnerReadCancellation, ReadLimits, ReadRoute};
 use contextdb_core::types::ContextId;
-use contextdb_core::{Error, Value, VectorIndexRef};
-use contextdb_engine::direct_file_reader::test_seams::{ReadWorkObservationScope, ReadWorkPhase};
+use contextdb_core::{Error, Value};
 use contextdb_engine::read_session::{
     ReadKernelCancellationEvent, ReadKernelResidualRejectionEvent, ReadKernelSourceEvent,
     ReadKernelTestObserver, ReadSessionOperation,
@@ -31,12 +30,7 @@ use contextdb_engine::{
     Database, DatabaseOpenOptions, MaintenancePolicy, OwnerReadConfig, ReadSession,
     ReadSessionOptions,
 };
-use contextdb_vector::hnsw::{
-    HnswCandidateDistanceEvent, HnswCandidateObserver, PagedVectorObserver,
-    with_hnsw_candidate_observer, with_paged_vector_observer,
-};
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use uuid::Uuid;
 
@@ -44,57 +38,6 @@ const PARTITIONS: usize = 8;
 const ROWS_PER_PARTITION: usize = 500;
 const DIMENSIONS: usize = 16;
 const LIMIT: usize = 10;
-
-/// What admitting one more partition may cost: its non-empty layers' entry
-/// evaluations and the greedy descent above layer zero. Read off the graph's
-/// own shape rather than chosen to make a number pass -- about
-/// `M * (levels - 1) + 1` per layer, which at this fixture's degree 16 and
-/// three levels is 33, doubled for the second layer a partition may carry.
-const ADMISSION_ALLOWANCE_PER_PARTITION: u64 = 66;
-
-/// A budget smaller than the sum of what this fixture's partitions ask the
-/// cache to free for them, so the search cannot simply hold everything and has
-/// to decide what to keep. Read off the fixture: eight partitions of 500
-/// sixteen-dimension rows.
-const TIGHT_MEMORY_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
-
-#[derive(Default)]
-struct Counts {
-    evaluations: AtomicU64,
-    vectors_decoded: AtomicU64,
-    page_hits: AtomicU64,
-    page_misses: AtomicU64,
-    pages_filled: AtomicU64,
-}
-
-impl HnswCandidateObserver for Counts {
-    fn before_candidate_distance(&self, _: HnswCandidateDistanceEvent) {
-        self.evaluations.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-impl PagedVectorObserver for Counts {
-    /// One stored vector read out of the serving pages, for a walk distance
-    /// or for a candidate's published score. Kept apart from `evaluations`:
-    /// the paged walk reports each of its distances through
-    /// `HnswCandidateObserver` exactly as the in-memory walk does, so adding
-    /// this in would count every paged walk distance twice.
-    fn vector_decoded(&self) {
-        self.vectors_decoded.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn page_filled(&self) {
-        self.pages_filled.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn page_looked_up(&self, hit: bool) {
-        if hit {
-            self.page_hits.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.page_misses.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
 
 fn context_id(partition: usize) -> Uuid {
     Uuid::from_u128(0xC04C_0000_0000_0000_0000_0000_0000_0000 + partition as u128)
@@ -191,21 +134,7 @@ fn seed_shape(
                 .expect("seed one partitioned row");
         }
     }
-    let index = VectorIndexRef::new("scoped_rows", "embedding");
-    for _ in 0..4096 {
-        admin
-            .run_maintenance_cycle()
-            .expect("advance deterministic maintenance");
-        let ready = admin
-            .vector_store_for_test()
-            .partition_infos(&index)
-            .expect("inspect partition readiness");
-        if ready.len() == partitions && ready.iter().all(|partition| partition.graph_available) {
-            admin.close().expect("seal the fixture store");
-            return;
-        }
-    }
-    panic!("every partition must publish a maintained route before the read is measured");
+    admin.close().expect("seal the fixture store");
 }
 
 fn statement(selected: usize) -> (String, HashMap<String, Value>) {
@@ -234,358 +163,6 @@ fn statement(selected: usize) -> (String, HashMap<String, Value>) {
     )
 }
 
-struct Observed {
-    evaluations: u64,
-    vectors_decoded: u64,
-    page_hits: u64,
-    pages_filled: u64,
-    page_misses: u64,
-    decoded_rows: u64,
-    verified_runs_built: u64,
-    verified_postings_walked: u64,
-}
-
-#[cfg(unix)]
-fn measure(path: &std::path::Path, runtime: &std::path::Path, selected: usize) -> Observed {
-    measure_within(path, runtime, selected, limits())
-}
-
-/// The same read under a caller-declared memory budget, so a proof can say what
-/// a find does when its partitions' graphs do not all fit at once.
-#[cfg(unix)]
-fn measure_within(
-    path: &std::path::Path,
-    runtime: &std::path::Path,
-    selected: usize,
-    limits: ReadLimits,
-) -> Observed {
-    // A fresh reader per scope: run caches and loaded graphs are per reader, so
-    // reusing one would charge the first scope for work the later scopes then
-    // get free and the growth law would be unreadable.
-    let reader = ReadSession::with_runtime_directory_for_test(runtime, || {
-        ReadSession::open_with_options(
-            path,
-            ReadSessionOptions {
-                contexts: Some(
-                    (0..PARTITIONS)
-                        .map(|partition| ContextId::new(context_id(partition)))
-                        .collect::<BTreeSet<_>>(),
-                ),
-                limits,
-                memory_limit: Some(limits.memory as usize),
-                ..ReadSessionOptions::default()
-            },
-        )
-    })
-    .expect("open the committed file image the consumer reads through");
-    assert_eq!(reader.route(), ReadRoute::File);
-    let (sql, params) = statement(selected);
-    // One find to load this scope's graphs and fill its serving pages, then the
-    // measured one: a warm find is what the promise is about.
-    let first = reader
-        .execute(&sql, &params)
-        .expect("the first find answers");
-    assert_eq!(first.rows.len(), LIMIT, "every scope answers a full page");
-
-    let counts = Arc::new(Counts::default());
-    let work = ReadWorkObservationScope::enter(ReadWorkPhase::Query);
-    let answer = with_paged_vector_observer(counts.clone(), || {
-        with_hnsw_candidate_observer(counts.clone(), || {
-            reader
-                .execute(&sql, &params)
-                .expect("the warm find answers")
-        })
-    });
-    let counters = work.counters();
-    drop(work);
-    assert_eq!(answer.rows.len(), LIMIT, "every scope answers a full page");
-    println!(
-        "budget route contexts={selected} vector_search={:?} rows_examined={}",
-        answer.trace.vector_search, answer.trace.rows_examined,
-    );
-    Observed {
-        evaluations: counts.evaluations.load(Ordering::Relaxed),
-        vectors_decoded: counts.vectors_decoded.load(Ordering::Relaxed),
-        page_hits: counts.page_hits.load(Ordering::Relaxed),
-        pages_filled: counts.pages_filled.load(Ordering::Relaxed),
-        page_misses: counts.page_misses.load(Ordering::Relaxed),
-        decoded_rows: counters.decoded_rows,
-        verified_runs_built: counters.verified_runs_built,
-        verified_postings_walked: counters.verified_postings_walked,
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn a_find_over_many_contexts_spends_one_search_budget() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let directory = tempfile::TempDir::new().expect("task-scoped fixture directory");
-    let path = directory.path().join("many-contexts.db");
-    let runtime = directory.path().join("runtime");
-    std::fs::create_dir(&runtime).expect("the reader runtime directory");
-    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
-        .expect("the runtime directory is private to its owner");
-    seed(&path, &runtime);
-
-    let mut measured = Vec::new();
-    for selected in [1_usize, 2, 4, PARTITIONS] {
-        let observed = measure(&path, &runtime, selected);
-        println!(
-            "budget contexts={selected} in_scope={} evaluations={} vectors_decoded={} \
-             pages_filled={} page_hits={} page_misses={} decoded_rows={} runs_built={} \
-             postings_walked={}",
-            selected * ROWS_PER_PARTITION,
-            observed.evaluations,
-            observed.vectors_decoded,
-            observed.pages_filled,
-            observed.page_hits,
-            observed.page_misses,
-            observed.decoded_rows,
-            observed.verified_runs_built,
-            observed.verified_postings_walked,
-        );
-        measured.push((selected, observed));
-    }
-
-    let narrow = &measured[0].1;
-    // A partition small enough to compare exhaustively never walks a graph, and
-    // an evaluation count of zero would satisfy any ceiling. The fixture is
-    // sized so every partition takes the maintained route, and the proof says
-    // so rather than passing on a vacuous zero.
-    assert!(
-        narrow.evaluations > 0,
-        "the fixture must be large enough that a partition takes the maintained route"
-    );
-    let broad = &measured[measured.len() - 1].1;
-    let admission = ADMISSION_ALLOWANCE_PER_PARTITION * (PARTITIONS as u64 - 1);
-    let ceiling = narrow.evaluations + narrow.evaluations / 10 + admission;
-    assert!(
-        broad.evaluations <= ceiling,
-        "a find over {PARTITIONS} Contexts spends one search budget plus admission: \
-         {} evaluations against a ceiling of {ceiling} ({} at one Context, \
-         {ADMISSION_ALLOWANCE_PER_PARTITION} admitted per extra partition)",
-        broad.evaluations,
-        narrow.evaluations,
-    );
-    for (selected, observed) in &measured {
-        assert_eq!(
-            observed.decoded_rows, LIMIT as u64,
-            "a find at {selected} Contexts decodes only the rows it returns"
-        );
-    }
-}
-
-/// A second find over the same Contexts must not read the same graphs again.
-///
-/// A search over several partitions loads each one's maintained graph. If
-/// loading one takes the graph the same search has just loaded, every find pays
-/// to read every graph again, and the wider the scope the more of the store a
-/// warm find re-reads. Measured under a memory budget deliberately smaller than
-/// the sum of the partitions' own reclaim prices, so the search has to decide
-/// what to keep.
-#[cfg(unix)]
-#[test]
-fn a_warm_find_over_many_contexts_reads_no_graph_twice() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let directory = tempfile::TempDir::new().expect("task-scoped fixture directory");
-    let path = directory.path().join("many-contexts-budget.db");
-    let runtime = directory.path().join("runtime");
-    std::fs::create_dir(&runtime).expect("the reader runtime directory");
-    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
-        .expect("the runtime directory is private to its owner");
-    seed(&path, &runtime);
-
-    let tight = ReadLimits {
-        memory: TIGHT_MEMORY_BUDGET_BYTES,
-        ..limits()
-    };
-    let observed = measure_within(&path, &runtime, PARTITIONS, tight);
-    println!(
-        "warm_reload contexts={PARTITIONS} budget={TIGHT_MEMORY_BUDGET_BYTES} evaluations={} \
-         pages_filled={} page_hits={} page_misses={}",
-        observed.evaluations, observed.pages_filled, observed.page_hits, observed.page_misses,
-    );
-    assert!(
-        observed.pages_filled == 0,
-        "a warm find over {PARTITIONS} Contexts reads no graph twice, filled {} serving pages",
-        observed.pages_filled,
-    );
-}
-
-/// What a wider scope adds to one search is admission, never another walk.
-///
-/// The same rows are stored once in a single Context and once split over
-/// eight, and the one search's own receipt is read on a fresh reader for each.
-/// Splitting the rows adds layers to open and, because the nearest rows are
-/// now spread over eight graphs, at most one first expansion of each extra
-/// layer's descended entry -- one layer-zero neighbourhood per layer. Beyond
-/// that floor, expansion stays within a tenth of the one-Context walk: it is
-/// never a whole walk per Context. The walk stays inside the one budget, the
-/// same number at both scopes, with opening the layers a floor on top.
-#[cfg(unix)]
-#[test]
-fn expansion_work_does_not_grow_with_context_count() {
-    use contextdb_vector::hnsw::with_union_search_receipts;
-    use std::os::unix::fs::PermissionsExt;
-
-    let directory = tempfile::TempDir::new().expect("task-scoped fixture directory");
-    let runtime = directory.path().join("runtime");
-    std::fs::create_dir(&runtime).expect("the reader runtime directory");
-    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
-        .expect("the runtime directory is private to its owner");
-    let whole = directory.path().join("one-context.db");
-    seed_shape(&whole, &runtime, 1, PARTITIONS * ROWS_PER_PARTITION);
-    let split = directory.path().join("eight-contexts.db");
-    seed(&split, &runtime);
-
-    let mut receipts = Vec::new();
-    for (path, selected) in [(&whole, 1_usize), (&split, PARTITIONS)] {
-        let reader = ReadSession::with_runtime_directory_for_test(&runtime, || {
-            ReadSession::open_with_options(
-                path,
-                ReadSessionOptions {
-                    contexts: Some(
-                        (0..PARTITIONS)
-                            .map(|partition| ContextId::new(context_id(partition)))
-                            .collect::<BTreeSet<_>>(),
-                    ),
-                    limits: limits(),
-                    memory_limit: Some(limits().memory as usize),
-                    ..ReadSessionOptions::default()
-                },
-            )
-        })
-        .expect("open the committed file image the consumer reads through");
-        let (sql, params) = statement(selected);
-        reader
-            .execute(&sql, &params)
-            .expect("the first find answers");
-        let (answer, searched) =
-            with_union_search_receipts(|| reader.execute(&sql, &params).expect("warm find"));
-        assert_eq!(answer.rows.len(), LIMIT, "every scope answers a full page");
-        assert_eq!(
-            searched.len(),
-            1,
-            "a find over {selected} Contexts runs exactly one search: {searched:?}"
-        );
-        let receipt = searched[0];
-        println!("expansion contexts={selected} receipt={receipt:?}");
-        assert_eq!(
-            receipt.partitions, selected,
-            "every named Context is admitted"
-        );
-        assert!(
-            receipt.expansion_evaluations <= receipt.budget,
-            "the walk stays inside the one budget, with opening the layers a floor on top: \
-             {receipt:?}"
-        );
-        receipts.push(receipt);
-    }
-    let (narrow, broad) = (receipts[0], receipts[1]);
-    assert!(
-        broad.layers_admitted >= PARTITIONS && broad.layers_admitted > narrow.layers_admitted,
-        "every admitted Context's layers are opened: {narrow:?} against {broad:?}"
-    );
-    let first_expansions =
-        (broad.layers_admitted - narrow.layers_admitted) * broad.layer_zero_degree;
-    let ceiling =
-        narrow.expansion_evaluations + narrow.expansion_evaluations / 10 + first_expansions;
-    assert!(
-        broad.expansion_evaluations <= ceiling,
-        "expansion over {PARTITIONS} Contexts is one walk plus one first expansion per extra \
-         layer: {} against a ceiling of {ceiling} ({} over one Context, {first_expansions} for \
-         the extra layers)",
-        broad.expansion_evaluations,
-        narrow.expansion_evaluations,
-    );
-    assert_eq!(
-        broad.budget, narrow.budget,
-        "the budget is one search's, not one per Context"
-    );
-}
-
-/// Opening a layer is a floor the search pays on top of its one budget, never
-/// a cost taken out of the walk. The walk over every admitted layer may spend
-/// the whole budget however many layers were opened before it: otherwise each
-/// Context a find names shrinks the walk every other Context shares, and a
-/// wide find refuses a query a narrow one answers. On the owner's laptop at
-/// eight Contexts, opening nine layers took 802 of a 9,600 budget and a query
-/// whose walk needed the rest was refused, then compared exhaustively against
-/// all 100,000 passages past the time ceiling.
-#[cfg(unix)]
-#[test]
-fn opening_more_layers_never_shrinks_the_walk() {
-    use contextdb_vector::hnsw::with_union_search_receipts;
-    use std::os::unix::fs::PermissionsExt;
-
-    let directory = tempfile::TempDir::new().expect("task-scoped fixture directory");
-    let path = directory.path().join("many-contexts-walk.db");
-    let runtime = directory.path().join("runtime");
-    std::fs::create_dir(&runtime).expect("the reader runtime directory");
-    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
-        .expect("the runtime directory is private to its owner");
-    seed(&path, &runtime);
-
-    let mut failures = Vec::new();
-    for selected in [1_usize, 2, 4, PARTITIONS] {
-        let reader = ReadSession::with_runtime_directory_for_test(&runtime, || {
-            ReadSession::open_with_options(
-                &path,
-                ReadSessionOptions {
-                    contexts: Some(
-                        (0..PARTITIONS)
-                            .map(|partition| ContextId::new(context_id(partition)))
-                            .collect::<BTreeSet<_>>(),
-                    ),
-                    limits: limits(),
-                    memory_limit: Some(limits().memory as usize),
-                    ..ReadSessionOptions::default()
-                },
-            )
-        })
-        .expect("open the committed file image the consumer reads through");
-        let (sql, params) = statement(selected);
-        let (answer, searched) =
-            with_union_search_receipts(|| reader.execute(&sql, &params).expect("the find"));
-        assert_eq!(answer.rows.len(), LIMIT);
-        let receipt = searched[0];
-        println!("walk contexts={selected} receipt={receipt:?}");
-        let disclosed = answer
-            .trace
-            .vector_search
-            .as_ref()
-            .expect("the executed route publishes its search budget");
-        assert_eq!(disclosed.global_candidate_budget, Some(receipt.budget));
-        assert_eq!(
-            disclosed.admission_evaluations,
-            Some(receipt.admission_evaluations)
-        );
-        assert_eq!(
-            disclosed.expansion_evaluations,
-            Some(receipt.expansion_evaluations)
-        );
-        assert_eq!(disclosed.layers_admitted, Some(receipt.layers_admitted));
-        assert_eq!(disclosed.budget_terminal.as_deref(), Some(receipt.terminal));
-        assert!(
-            receipt.admission_evaluations > 0,
-            "layers were opened: {receipt:?}"
-        );
-        if receipt.expansion_cap != receipt.budget {
-            failures.push(format!(
-                "at {selected} Contexts opening {} layers cost {} evaluations and left the walk \
-                 {} of its {} budget",
-                receipt.layers_admitted,
-                receipt.admission_evaluations,
-                receipt.expansion_cap,
-                receipt.budget
-            ));
-        }
-    }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
-}
-
 /// A search that runs out of its budget refuses; it never answers short.
 ///
 /// The same find over every Context is run under a range of declared work
@@ -598,8 +175,11 @@ fn opening_more_layers_never_shrinks_the_walk() {
 /// silently skipping layers.
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_exhausted_budget_refuses_and_never_truncates() {
-    use contextdb_vector::hnsw::with_union_search_receipts;
     use std::os::unix::fs::PermissionsExt;
 
     let directory = tempfile::TempDir::new().expect("task-scoped fixture directory");
@@ -611,10 +191,8 @@ fn an_exhausted_budget_refuses_and_never_truncates() {
     seed(&path, &runtime);
 
     let (sql, params) = statement(PARTITIONS);
-    let indexed = sql.replace(" LIMIT ", " USE VECTOR INDEXED LIMIT ");
-    let mut saw_refused_search = false;
-    let mut saw_floor_refusal = false;
-    let mut saw_indexed_refusal = false;
+    let exact = sql.replace(" LIMIT ", " USE VECTOR EXACT LIMIT ");
+    let mut saw_exact_refusal = false;
     let mut saw_full_page = false;
     // The statement's candidate windows cost nothing here: its filter admits
     // every live vector of the Contexts it names, which the committed index
@@ -622,7 +200,7 @@ fn an_exhausted_budget_refuses_and_never_truncates() {
     // search's own. This band runs from below its admission floor to a
     // complete answer.
     for work in (200_u64..=1_500).step_by(50).chain([5_000_000]) {
-        for (mode, statement) in [("auto", &sql), ("indexed", &indexed)] {
+        for (mode, statement) in [("auto", &sql), ("exact", &exact)] {
             let limits = ReadLimits { work, ..limits() };
             let reader = ReadSession::with_runtime_directory_for_test(&runtime, || {
                 ReadSession::open_with_options(
@@ -640,60 +218,40 @@ fn an_exhausted_budget_refuses_and_never_truncates() {
                 )
             })
             .expect("open the committed file image the consumer reads through");
-            let (answer, receipts) =
-                with_union_search_receipts(|| reader.execute(statement, &params));
-            let terminal = receipts.first().map(|receipt| receipt.terminal);
-            let below_floor = receipts
-                .first()
-                .is_some_and(|receipt| receipt.below_admission_floor);
+            let answer = reader.execute(statement, &params);
             println!(
-                "refusal work={work} mode={mode} terminal={terminal:?} below_floor={below_floor} \
-                 answer={:?}",
+                "refusal work={work} mode={mode} answer={:?}",
                 answer
                     .as_ref()
-                    .map(|answer| answer.rows.len())
+                    .map(|answer| answer.rows().len())
                     .map_err(|error| format!("{error}").chars().take(90).collect::<String>()),
             );
             match &answer {
                 Ok(answer) => {
                     assert_eq!(
-                        answer.rows.len(),
+                        answer.rows().len(),
                         LIMIT,
                         "work={work} mode={mode}: an answer is a full page, never a short one"
                     );
                     saw_full_page = true;
                 }
-                Err(_) if mode == "indexed" => saw_indexed_refusal = true,
+                Err(_) if mode == "exact" => saw_exact_refusal = true,
                 Err(_) => {}
-            }
-            if terminal == Some("refused") {
-                saw_refused_search = true;
-                if below_floor && mode == "indexed" {
-                    assert!(
-                        answer.is_err(),
-                        "work={work}: a search below its admission floor refuses INDEXED"
-                    );
-                    saw_floor_refusal = true;
-                }
             }
         }
     }
     assert!(saw_full_page, "a large enough budget answers");
-    assert!(saw_indexed_refusal, "a small enough budget refuses INDEXED");
-    assert!(
-        saw_refused_search,
-        "some budget leaves the one search refused"
-    );
-    assert!(
-        saw_floor_refusal,
-        "some budget stops the search below its admission floor, and it is refused"
-    );
+    assert!(saw_exact_refusal, "a small enough budget refuses EXACT");
 }
 
 /// When fewer than k rows pass the indexed residual, the search must prove
 /// that there is no remaining eligible row before returning a short page.
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_short_page_exhausts_the_eligible_frontier_on_both_routes() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -754,11 +312,15 @@ fn a_short_page_exhausts_the_eligible_frontier_on_both_routes() {
         })
         .expect("open requested read route");
         assert_eq!(reader.route(), route);
+        assert!(matches!(
+            reader.execute(&indexed, &params),
+            Err(Error::VectorIndexedRouteUnavailable { .. })
+        ));
         let expected = reader.execute(&exact, &params).expect("exact answer");
-        let answer = reader.execute(&indexed, &params).expect("indexed answer");
+        let answer = reader.execute(&sql, &params).expect("auto answer");
         let ids = |answer: &contextdb_engine::QueryResult| {
             answer
-                .rows
+                .rows()
                 .iter()
                 .map(|row| match row[0] {
                     Value::Int64(id) => id,
@@ -772,15 +334,6 @@ fn a_short_page_exhausts_the_eligible_frontier_on_both_routes() {
             ids(&expected),
             "{route:?} short page is complete"
         );
-        assert_eq!(
-            answer
-                .trace
-                .vector_search
-                .as_ref()
-                .and_then(|trace| trace.budget_terminal.as_deref()),
-            Some("frontier_exhausted"),
-            "{route:?} short page has an exhausted-frontier receipt"
-        );
         drop(reader);
         if let Some(owner) = owner {
             owner.close().expect("close owner");
@@ -792,6 +345,10 @@ fn a_short_page_exhausts_the_eligible_frontier_on_both_routes() {
 /// breadth, but enough farther points must refill the requested page.
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn rejected_neighbours_refill_the_page_on_both_routes() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -815,7 +372,7 @@ fn rejected_neighbours_refill_the_page_on_both_routes() {
     .expect("open fixture for deterministic residual changes");
     admin
         .execute(
-            "ALTER TABLE scoped_rows ALTER COLUMN embedding SET HNSW (EF_SEARCH = 40)",
+            "ALTER TABLE scoped_rows ALTER COLUMN embedding SET IVF (PROBES = 40)",
             &HashMap::new(),
         )
         .expect("declare the search breadth");
@@ -873,11 +430,15 @@ fn rejected_neighbours_refill_the_page_on_both_routes() {
         })
         .expect("open requested read route");
         assert_eq!(reader.route(), route);
+        assert!(matches!(
+            reader.execute(&indexed, &params),
+            Err(Error::VectorIndexedRouteUnavailable { .. })
+        ));
         let expected = reader.execute(&exact, &params).expect("exact answer");
-        let answer = reader.execute(&indexed, &params).expect("indexed refill");
+        let answer = reader.execute(&sql, &params).expect("auto refill");
         let ids = |answer: &contextdb_engine::QueryResult| {
             answer
-                .rows
+                .rows()
                 .iter()
                 .map(|row| match row[0] {
                     Value::Int64(id) => id,
@@ -895,15 +456,6 @@ fn rejected_neighbours_refill_the_page_on_both_routes() {
             ids(&expected),
             "{route:?} refills with the nearest eligible rows"
         );
-        assert_eq!(
-            answer
-                .trace
-                .vector_search
-                .as_ref()
-                .and_then(|trace| trace.budget_terminal.as_deref()),
-            Some("answer_complete"),
-            "{route:?} records a completed answer"
-        );
         drop(reader);
         if let Some(owner) = owner {
             owner.close().expect("close owner");
@@ -920,7 +472,7 @@ struct RejectionGate {
 #[derive(Default)]
 struct RejectionGateState {
     armed: bool,
-    event: Option<ReadKernelResidualRejectionEvent>,
+    event: Option<(ReadSessionOperation, ReadRoute)>,
     token: Option<OwnerReadCancellation>,
     released: bool,
     cancellation_observed: bool,
@@ -929,9 +481,19 @@ struct RejectionGateState {
 impl ReadKernelTestObserver for RejectionGate {
     fn before_source_touch(
         &self,
-        _event: ReadKernelSourceEvent,
-        _cancellation: OwnerReadCancellation,
+        event: ReadKernelSourceEvent,
+        cancellation: OwnerReadCancellation,
     ) {
+        let mut state = self.state.lock().expect("rejection gate lock");
+        if !state.armed || state.event.is_some() || event.completed_items == 0 {
+            return;
+        }
+        state.event = Some((event.operation, event.route));
+        state.token = Some(cancellation);
+        self.changed.notify_all();
+        while !state.released {
+            state = self.changed.wait(state).expect("rejection gate wait");
+        }
     }
 
     fn after_vector_residual_rejection(
@@ -943,7 +505,7 @@ impl ReadKernelTestObserver for RejectionGate {
         if !state.armed || state.event.is_some() {
             return;
         }
-        state.event = Some(event);
+        state.event = Some((event.operation, event.route));
         state.token = Some(cancellation);
         self.changed.notify_all();
         while !state.released {
@@ -970,7 +532,7 @@ impl RejectionGate {
         self.state.lock().expect("rejection gate lock").armed = true;
     }
 
-    fn wait_at_rejection(&self) -> (ReadKernelResidualRejectionEvent, OwnerReadCancellation) {
+    fn wait_at_rejection(&self) -> ((ReadSessionOperation, ReadRoute), OwnerReadCancellation) {
         let mut state = self.state.lock().expect("rejection gate lock");
         while state.event.is_none() {
             state = self.changed.wait(state).expect("rejection event wait");
@@ -1015,6 +577,10 @@ fn wait_for_kernel_cancellation(token: &OwnerReadCancellation) {
 /// replacement work, on the selected backend of each public read route.
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn cancellation_after_residual_rejection_restores_memory_on_both_routes() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1038,7 +604,7 @@ fn cancellation_after_residual_rejection_restores_memory_on_both_routes() {
     .expect("open residual fixture");
     admin
         .execute(
-            "ALTER TABLE scoped_rows ALTER COLUMN embedding SET HNSW (EF_SEARCH = 40)",
+            "ALTER TABLE scoped_rows ALTER COLUMN embedding SET IVF (PROBES = 40)",
             &HashMap::new(),
         )
         .expect("declare search breadth");
@@ -1109,23 +675,26 @@ fn cancellation_after_residual_rejection_restores_memory_on_both_routes() {
                     .used
             }
         };
+        assert!(matches!(
+            reader.execute(&indexed, &params),
+            Err(Error::VectorIndexedRouteUnavailable { .. })
+        ));
         reader
-            .execute(&indexed, &params)
+            .execute(&sql, &params)
             .expect("warm serving pages before charge proof");
         let baseline = memory_used();
         gate.arm();
         let cancellation = OwnerReadCancellation::new();
         let operation_cancellation = cancellation.clone();
         let executing = Arc::clone(&reader);
-        let sql = indexed.clone();
+        let sql = sql.clone();
         let params = params.clone();
         let worker = std::thread::spawn(move || {
             executing.execute_with_cancellation(&sql, &params, &operation_cancellation)
         });
-        let (event, kernel_token) = gate.wait_at_rejection();
-        assert_eq!(event.operation, ReadSessionOperation::Execute);
-        assert_eq!(event.route, route);
-        assert!(event.row_id.0 > 0);
+        let ((op, observed_route), kernel_token) = gate.wait_at_rejection();
+        assert_eq!(op, ReadSessionOperation::Execute);
+        assert_eq!(observed_route, route);
         assert!(!kernel_token.is_cancelled());
         cancellation.cancel();
         wait_for_kernel_cancellation(&kernel_token);

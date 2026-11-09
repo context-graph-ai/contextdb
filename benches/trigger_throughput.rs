@@ -42,6 +42,10 @@ fn uuid(n: u128) -> Uuid {
     Uuid::from_u128(n)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn collect_p99(register_trigger: bool, writers: usize, commits_per_writer: usize) -> Duration {
     let db = Arc::new(Database::open_memory());
     db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &empty())
@@ -138,6 +142,10 @@ fn collect_p99(register_trigger: bool, writers: usize, commits_per_writer: usize
     percentile_99(std::mem::take(&mut *samples.lock().unwrap()))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn bench_trigger_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("trigger_throughput");
     group.sample_size(20);

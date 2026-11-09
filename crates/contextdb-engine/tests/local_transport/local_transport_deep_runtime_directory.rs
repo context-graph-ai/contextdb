@@ -15,6 +15,7 @@
 //! require that the owner serves on it and that a reader connects and reads
 //! real rows back over that channel.
 
+use super::owner_cursor_test_support;
 use contextdb_core::read_contract::{
     DeadlineClock, LocalUserIdentity, ReadClientTimeouts, ReadLimits,
 };
@@ -25,7 +26,8 @@ use contextdb_engine::local_transport::{
 };
 use contextdb_engine::owner_read::OwnerClient;
 use contextdb_engine::persistence::read_persistence_test_scaffold::inspect_companion_record_for_test;
-use contextdb_engine::read_contract::decode_cursor_page;
+use owner_cursor_test_support::decode_owner_cursor_page as decode_cursor_page;
+
 use contextdb_engine::{Database, DatabaseOpenOptions};
 use std::collections::HashMap;
 use std::future::Future;
@@ -96,6 +98,10 @@ fn owner_channel(store: &Path, runtime_directory: &Path) -> PathBuf {
 }
 
 #[test]
+#[expect(
+    clippy::useless_conversion,
+    reason = "The fixture retains its explicit conversion at the ownership boundary."
+)]
 fn an_owner_serves_and_a_reader_reads_below_a_runtime_directory_past_the_address_limit() {
     let base = tempfile::Builder::new()
         .prefix("cdb")
@@ -141,6 +147,10 @@ fn an_owner_serves_and_a_reader_reads_below_a_runtime_directory_past_the_address
         owner_handshake(&store),
         ReadClientTimeouts::default(),
         clock,
+        database
+            .declared_reader_memory()
+            .expect("original reader owner")
+            .into(),
     ))
     .expect("a reader connects to the deep channel");
 

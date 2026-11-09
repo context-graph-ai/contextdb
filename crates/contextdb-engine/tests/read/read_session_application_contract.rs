@@ -54,7 +54,7 @@ fn seed_rows(database: &Database, table: &str, row_count: usize) {
 }
 
 fn cursor_page_ids(page: &CursorPage) -> Vec<i64> {
-    page.rows
+    page.rows()
         .iter()
         .map(|row| match row.as_slice() {
             [Value::Int64(id)] => *id,
@@ -189,9 +189,13 @@ fn application_fixture() -> ApplicationFixture {
     }
 }
 
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn payloads(result: QueryResult) -> BTreeSet<String> {
     result
-        .rows
+        .rows()
         .into_iter()
         .map(|row| match row.as_slice() {
             [Value::Text(payload)] => payload.clone(),
@@ -213,6 +217,10 @@ fn session_payloads(database: &Database) -> BTreeSet<String> {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn under_limit_application_query_runs_cross_thread_on_the_derived_owner_view() {
     let fixture = application_fixture();
     let constrained = fixture.admin.scoped_with_constraints(
@@ -237,7 +245,7 @@ fn under_limit_application_query_runs_cross_thread_on_the_derived_owner_view() {
             .expect("the application read thread completes")
     })
     .expect("the bounded kernel serves the scoped live view directly");
-    assert_eq!(result.rows.len(), fixture.visible_rows);
+    assert_eq!(result.rows().len(), fixture.visible_rows);
 }
 
 #[test]
@@ -347,6 +355,10 @@ impl ExecutionConvergenceObserver {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn database_execute_plans_once_and_drains_the_shared_pull_kernel_once_without_a_cap() {
     let database = Database::open_memory();
     let row_count = over_limit_row_count();
@@ -381,9 +393,22 @@ fn database_execute_plans_once_and_drains_the_shared_pull_kernel_once_without_a_
             )
         })
         .expect("the established embedding API remains uncapped");
-    assert_eq!(uncapped.rows.len(), row_count);
+    assert_eq!(uncapped.rows().len(), row_count);
     assert_eq!(
-        database.__relational_scan_rows_touched(),
+        u64::try_from(
+            observer
+                .events()
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ReadExecutionConvergenceEvent::PullKernelSourceTouch {
+                        source: ReadKernelSource::TableRow,
+                        ..
+                    }
+                ))
+                .count()
+        )
+        .unwrap(),
         u64::try_from(row_count).unwrap(),
         "the result must come from one physical table scan, not a pull execution plus an eager execution",
     );
@@ -408,6 +433,10 @@ fn database_execute_plans_once_and_drains_the_shared_pull_kernel_once_without_a_
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn legacy_execute_preserves_the_exact_parse_error_before_planning_or_pull() {
     let database = Database::open_memory();
     let observer = Arc::new(ExecutionConvergenceObserver::default());
@@ -425,12 +454,16 @@ fn legacy_execute_preserves_the_exact_parse_error_before_planning_or_pull() {
     ));
     assert_eq!(
         observer.events(),
-        vec![ReadExecutionConvergenceEvent::PublicExecuteEntered],
+        vec![],
         "parse refusal must happen before planning or pull execution",
     );
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn legacy_execute_preserves_the_exact_static_planning_error_without_entering_pull() {
     let database = Database::open_memory();
     let table = format!("planning_error_rows_{}", under_limit_row_count());
@@ -469,6 +502,10 @@ fn legacy_execute_preserves_the_exact_static_planning_error_without_entering_pul
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn legacy_execute_preserves_the_exact_execution_error_in_one_pull_execution() {
     let database = Database::open_memory();
     let table = format!("execution_error_rows_{}", under_limit_row_count());
@@ -506,7 +543,20 @@ fn legacy_execute_preserves_the_exact_execution_error_in_one_pull_execution() {
         Error::PlanError(message) if message == "division by zero"
     ));
     assert_eq!(
-        database.__relational_scan_rows_touched(),
+        u64::try_from(
+            observer
+                .events()
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ReadExecutionConvergenceEvent::PullKernelSourceTouch {
+                        source: ReadKernelSource::TableRow,
+                        ..
+                    }
+                ))
+                .count()
+        )
+        .unwrap(),
         1,
         "the failing row must be scanned once rather than by an eager engine and a pull engine",
     );
@@ -540,6 +590,10 @@ impl DatabasePlugin for RejectingQueryPlugin {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn legacy_execute_preserves_the_exact_plugin_error_before_planning_or_pull() {
     let limits = ReadLimits::default();
     let hook = format!("query-{}", limits.work);
@@ -692,7 +746,7 @@ fn no_token_convenience_methods_create_independent_fresh_tokens() {
     let mut cursor = session
         .open_cursor("SELECT id FROM fresh_token_rows", &HashMap::new())
         .expect("no-token cursor open reaches the bounded source loop");
-    assert!(cursor.first_page().has_more);
+    assert!(cursor.first_page().has_more());
     cursor
         .fetch(NonZeroUsize::new(1))
         .expect("no-token cursor fetch reaches the bounded source loop");
@@ -754,7 +808,7 @@ fn production_cursor_retains_a_real_multi_page_continuation_after_opening_handle
         .expect("open a production-owned suspended cursor");
     assert_eq!(cursor.retained_state_owners_for_test(), 1);
     assert_eq!(cursor.retained_session_owners_for_test(), 2);
-    assert!(cursor.first_page().has_more);
+    assert!(cursor.first_page().has_more());
     assert_eq!(
         cursor_page_ids(cursor.first_page()),
         (0..page_rows)
@@ -776,7 +830,7 @@ fn production_cursor_retains_a_real_multi_page_continuation_after_opening_handle
             .collect::<Vec<_>>(),
     );
     assert!(
-        next_page.has_more,
+        next_page.has_more(),
         "the dynamic fixture retains another page"
     );
     cursor.close().expect("close the production-owned cursor");
@@ -826,7 +880,7 @@ fn reader_startup_memory_ceiling_admits_loaded_state_without_rewriting_store_con
             .unwrap();
         let MetadataBody::ImageState {
             state: DirectImageState::Configuration(configuration),
-        } = configuration.body
+        } = configuration.body.clone()
         else {
             panic!("configuration inspection must keep its typed body");
         };
@@ -839,7 +893,7 @@ fn reader_startup_memory_ceiling_admits_loaded_state_without_rewriting_store_con
             reader
                 .execute("SELECT id FROM reader_memory ORDER BY id", &HashMap::new())
                 .unwrap()
-                .rows
+                .rows()
                 .len(),
             16
         );

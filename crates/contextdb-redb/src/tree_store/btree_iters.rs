@@ -499,7 +499,7 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
                 // A held page is not read again, so the failure a read would
                 // have reported -- the database closed, or an earlier I/O
                 // failure -- is checked here instead.
-                Some(page) => manager.check_io_errors().map(|()| page.clone()),
+                Some(page) => manager.check_read_errors().map(|()| page.clone()),
                 None => checked_page(
                     &manager,
                     root.root,

@@ -65,7 +65,7 @@ fn job_03_vector_search_with_explain() {
             &make_params(vec![("q", Value::Vector(embedding384(&[1.0, 0.0])))]),
         )
         .unwrap();
-    assert_eq!(out.rows.len(), 1);
+    assert_eq!(out.rows().len(), 1);
 
     let explain = db
         .explain("SELECT * FROM observations ORDER BY embedding <=> $q LIMIT 1")

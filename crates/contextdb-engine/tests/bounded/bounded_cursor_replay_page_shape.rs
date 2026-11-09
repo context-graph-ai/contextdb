@@ -27,9 +27,8 @@ impl DeadlineClock for FrozenClock {
     }
 
     fn wait_until(&self, _deadline_ms: u64) -> DeadlineWait<'_> {
-        // These reads are synchronous; the immediately-completing future
-        // satisfies the shared transport-facing clock trait.
-        Box::pin(async {})
+        // A frozen clock never reaches a deadline, so its wait never completes.
+        Box::pin(std::future::pending())
     }
 }
 
@@ -84,7 +83,7 @@ fn request(limits: ReadLimits) -> bounded::BoundedReadRequest {
 }
 
 fn ids(page: &contextdb_core::read_contract::CursorPage) -> Vec<i64> {
-    page.rows
+    page.rows()
         .iter()
         .map(|row| match row.as_slice() {
             [Value::Int64(id), Value::Text(_)] => *id,
@@ -99,15 +98,15 @@ fn a_cursor_under_a_wide_row_ceiling_answers_the_rows_the_store_holds() {
     let request = request(wide_row_ceiling_limits());
     let opened = bounded::open_cursor(Arc::clone(&db), &request)
         .expect("a wide result-row ceiling does not charge the cursor for rows nobody asked for");
-    let mut answered = opened.first_page.rows.len();
+    let mut answered = opened.first_page.rows().len();
     let mut cursor = opened.cursor;
-    let mut has_more = opened.first_page.has_more;
+    let mut has_more = opened.first_page.has_more();
     while has_more {
         let fetched = cursor
             .fetch(None, OwnerReadCancellation::new())
             .expect("the cursor keeps answering under the wide row ceiling");
-        answered = answered.saturating_add(fetched.page.rows.len());
-        has_more = fetched.page.has_more;
+        answered = answered.saturating_add(fetched.page.rows().len());
+        has_more = fetched.page.has_more();
     }
     assert_eq!(
         i64::try_from(answered).expect("the fixture row count fits this platform"),
@@ -131,7 +130,7 @@ fn an_explicit_fetch_equal_to_the_result_row_ceiling_still_succeeds() {
             OwnerReadCancellation::new(),
         )
         .expect("an explicit fetch equal to result_rows succeeds");
-    assert!(!fetched.page.has_more);
+    assert!(!fetched.page.has_more());
     cursor.close().expect("close the exact-fetch cursor");
 }
 
@@ -147,14 +146,14 @@ fn a_single_row_page_cursor_still_carries_its_unpublished_rows_between_pages() {
         .expect("open a single-row-page cursor under the wide row ceiling");
     let mut cursor = opened.cursor;
     let mut answered = ids(&opened.first_page);
-    let mut has_more = opened.first_page.has_more;
+    let mut has_more = opened.first_page.has_more();
     while has_more {
         let fetched = cursor
             .fetch(None, OwnerReadCancellation::new())
             .expect("the single-row-page cursor keeps answering");
-        assert!(fetched.page.rows.len() <= 1);
+        assert!(fetched.page.rows().len() <= 1);
         answered.extend(ids(&fetched.page));
-        has_more = fetched.page.has_more;
+        has_more = fetched.page.has_more();
     }
     assert_eq!(answered, (0..FIXTURE_ROWS).collect::<Vec<_>>());
     cursor.close().expect("close the single-row-page cursor");

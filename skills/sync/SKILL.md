@@ -386,7 +386,7 @@ it. The hub's writable handle then answers a matching exact `COUNT(*)`.
 This local scratch example shows the authoring syntax before you use it on your writable edge:
 
 ```bash
-contextdb :memory: --json <<'SQL'
+contextdb "$(mktemp -d)/scratch.db" --write --json <<'SQL'
 CREATE TABLE notes (id INT PRIMARY KEY, body TEXT);
 INSERT INTO notes VALUES (1, 'kept');
 ALTER TABLE notes RENAME COLUMN body TO content;
@@ -609,3 +609,12 @@ hub that lost accepted history revokes old credit automatically on the next stat
 Use `.sync outcomes FOR records` for metadata-only diagnosis. `DISCARD` obeys the persisted bound
 mode offline and leaves no tombstone; authoritative multi-table `PURGE` also carries listed
 node-local predicates so each edge erases its own independently keyed rows atomically.
+
+## Authority when a hub changes during pull
+
+Hub authority is checked for each received unit, including reconciliation and the purge tail,
+and checked again after a DDL upgrade. If the edge rebinds during a page, earlier completed
+units remain committed and later old-hub units refuse; no old-hub write may land after rebind.
+A page is not one authority grant. Data-only preflight and non-DDL units do not block local
+`SELECT` or `current_lsn`; a received DDL unit may still block reads while staging.
+<!-- enforced by: crates/contextdb-engine/src/database/event_bus/received_purge_discard_tests.rs::mid_page_hub_rebind_keeps_earlier_unit_and_refuses_old_hub_effects_legacy, crates/contextdb-engine/src/database/event_bus/received_purge_discard_tests.rs::ordinary_received_page_keeps_select_and_current_lsn_answering_legacy -->

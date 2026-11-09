@@ -95,6 +95,10 @@ pub(crate) struct Namespace {
     pub edge_incarnation: Incarnation,
 }
 impl Namespace {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn encode(&self, e: &mut Encoder) -> Result<()> {
         e.string(self.tenant.as_str());
         e.node(&self.hub_node)?;
@@ -103,6 +107,10 @@ impl Namespace {
         e.raw(&self.edge_incarnation.0.to_be_bytes());
         Ok(())
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn key(&self) -> Result<String> {
         let mut e = Encoder::default();
         self.encode(&mut e)?;
@@ -119,6 +127,10 @@ pub(crate) struct SignedBinding {
     pub signature: Vec<u8>,
 }
 impl SignedBinding {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn bytes(&self) -> Result<Vec<u8>> {
         let mut e = Encoder::domain("delivery-policy-binding.v1");
         e.u32(self.format);
@@ -135,6 +147,10 @@ impl SignedBinding {
         e.u32(self.issuance_source.1);
         Ok(e.0)
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn verify(&self) -> Result<()> {
         if self.format != 1
             || self.namespace.hub_incarnation != self.issuance_state.incarnation
@@ -162,6 +178,10 @@ pub(crate) struct RowEvidence {
     pub row_digest: Digest,
 }
 impl RowEvidence {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn origin_digest(&self, tenant: &TenantId) -> Result<Digest> {
         let mut e = Encoder::domain("delivery-origin-life.v1");
         e.string(tenant.as_str());
@@ -169,6 +189,10 @@ impl RowEvidence {
         self.encode_creator(&mut e)?;
         Ok(e.digest())
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn encode_creator(&self, e: &mut Encoder) -> Result<()> {
         e.node(&self.creator.author_node_id)?;
         e.raw(&self.creator.author_database_incarnation.0.to_be_bytes());
@@ -178,6 +202,10 @@ impl RowEvidence {
         e.bytes(&self.creator.attestation);
         Ok(())
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn encode_life(&self, e: &mut Encoder) -> Result<()> {
         self.reference.encode(e);
         self.encode_creator(e)?;
@@ -185,6 +213,10 @@ impl RowEvidence {
         e.u64(0);
         Ok(())
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn encode_projection(&self, tenant: &TenantId, e: &mut Encoder) -> Result<()> {
         self.reference.encode(e);
         e.u64(self.authored_source.0.0);
@@ -243,6 +275,10 @@ pub(crate) struct PolicyEvidence {
     pub agreement: bool,
 }
 impl PolicyEvidence {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn encode(&self, e: &mut Encoder) -> Result<()> {
         e.string(&self.table);
         e.policy(&self.installed)?;
@@ -269,6 +305,10 @@ impl PolicyEvidence {
 /// that binds no table instance (a trigger or sink drop) passes `None` for
 /// both table fields, which a bound record can never collide with because a
 /// bound record's generation is never zero.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn ddl_author_attestation_bytes(
     tenant: &TenantId,
     author_node: &str,
@@ -311,6 +351,10 @@ pub(crate) struct SchemaDependency {
     pub signature: Vec<u8>,
 }
 impl SchemaDependency {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn bytes(&self) -> Result<Vec<u8>> {
         ddl_author_attestation_bytes(
             &self.tenant,
@@ -325,6 +369,10 @@ impl SchemaDependency {
             &self.ddl_digest,
         )
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn verify(&self) -> Result<()> {
         let ddl: crate::protocol::WireDdlChange =
             rmp_serde::from_slice(&self.ddl_bytes).map_err(|_| invalid())?;
@@ -364,6 +412,10 @@ pub(crate) struct ManifestRecord {
     pub signature: Vec<u8>,
 }
 impl ManifestRecord {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn projection_bytes(&self) -> Result<Vec<u8>> {
         let mut e = Encoder::default();
         e.u8(0);
@@ -382,6 +434,10 @@ impl ManifestRecord {
         }
         Ok(e.0)
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn policy_bytes(&self) -> Result<Vec<u8>> {
         let mut e = Encoder::default();
         e.u64(self.policies.len() as u64);
@@ -391,6 +447,10 @@ impl ManifestRecord {
         e.u8(0);
         Ok(e.0)
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn authority_digest(&self) -> Result<Digest> {
         let mut e = Encoder::domain("delivery-authority-evidence.v1");
         e.raw(&self.policy_bytes()?);
@@ -403,6 +463,10 @@ impl ManifestRecord {
         e.u64(0);
         Ok(e.digest())
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn signed_bytes(&self) -> Result<Vec<u8>> {
         let mut e = Encoder::domain("delivery-submission.v1");
         e.string(self.tenant.as_str());
@@ -415,6 +479,10 @@ impl ManifestRecord {
         e.raw(&self.seal.authority_digest);
         Ok(e.0)
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn verify(&self) -> Result<()> {
         if let Some(binding) = &self.binding {
             binding.verify()?;
@@ -530,6 +598,10 @@ pub(crate) struct DiagnosticBlock {
     pub conflicts: Vec<Conflict>,
 }
 impl DiagnosticBlock {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn bytes(&self) -> Result<Vec<u8>> {
         let mut e = Encoder::default();
         e.raw(&self.salt);
@@ -554,6 +626,10 @@ impl DiagnosticBlock {
         }
         Ok(e.0)
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn commitment(&self) -> Result<Digest> {
         let mut e = Encoder::domain("delivery-diagnostics.v1");
         e.raw(&self.bytes()?);
@@ -568,6 +644,10 @@ pub(crate) struct DiagnosticClaim {
     pub commitment: Digest,
 }
 impl DiagnosticClaim {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn from_block(b: &DiagnosticBlock) -> Result<Self> {
         Ok(Self {
             subject_count: b.subjects.len() as u64,
@@ -576,6 +656,10 @@ impl DiagnosticClaim {
             commitment: b.commitment()?,
         })
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn matches(&self, b: &DiagnosticBlock) -> Result<bool> {
         Ok(self.subject_count == b.subjects.len() as u64
             && self.conflict_count == b.conflicts.len() as u64
@@ -600,12 +684,20 @@ pub(crate) struct TerminalRecord {
     pub signature: Vec<u8>,
 }
 impl TerminalRecord {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn signed_bytes(&self) -> Result<Vec<u8>> {
         let mut e = Encoder::default();
         e.bytes(&self.bytes()?);
         e.bytes(&self.signature);
         Ok(e.0)
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn wire(&self, block: &DiagnosticBlock) -> Result<crate::protocol::WireDeliveryOutcome> {
         self.verify()?;
         if !self.diagnostics.matches(block)? {
@@ -627,6 +719,10 @@ impl TerminalRecord {
         })
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn bytes(&self) -> Result<Vec<u8>> {
         let mut e = Encoder::domain("delivery-terminal-core.v1");
         e.u32(1);
@@ -654,6 +750,10 @@ impl TerminalRecord {
         e.raw(&self.diagnostics.commitment);
         Ok(e.0)
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn verify(&self) -> Result<()> {
         if self.kind > 2 || self.namespace.hub_incarnation != self.state.incarnation {
             return Err(invalid());
@@ -732,6 +832,10 @@ pub(crate) enum Record {
     },
 }
 impl Record {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn key(&self) -> Result<String> {
         Ok(match self {
             Self::CheckpointFrontier(f) => format!(
@@ -821,6 +925,10 @@ impl Record {
             Self::Destination(_) => "delivery_destination.v1".into(),
         })
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn verify(&self) -> Result<()> {
         match self {
             Self::CheckpointFrontier(f) => f.verify(),
@@ -848,6 +956,10 @@ pub(crate) fn owned_key(key: &str) -> bool {
 
 // Signatures are checked at admission; companions are
 // validated against the final touched-key overlay, without walking prior units.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn validate_record(record: &Record, records: &[&Record]) -> Result<()> {
     use super::authority::*;
     match record {
@@ -993,16 +1105,418 @@ pub(crate) fn validate_record(record: &Record, records: &[&Record]) -> Result<()
     Ok(())
 }
 
-pub(crate) fn encode(record: &Record) -> Result<Vec<u8>> {
-    rmp_serde::to_vec_named(record)
-        .map_err(|e| contextdb_core::Error::SyncError(format!("delivery metadata encode: {e}")))
+// Compact native COPY plans. A producer must use the source native Value
+// copier and exact-capacity containers; derived Clone is not a copy authority.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn native_sum(parts: impl IntoIterator<Item = Result<usize>>) -> Result<usize> {
+    parts.into_iter().try_fold(0usize, |sum, bytes| {
+        sum.checked_add(bytes?).ok_or_else(invalid)
+    })
 }
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn count_birth_native(birth: &super::authority::Birth) -> Result<usize> {
+    native_sum([
+        super::preparation::preparation_array_bytes::<Digest>(birth.triggers.len()),
+        super::preparation::preparation_array_bytes::<super::authority::BirthRef>(
+            birth.retired.len(),
+        ),
+    ])
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(crate) fn encode(record: &Record) -> Result<Vec<u8>> {
+    rmp_serde::to_vec_named(record).map_err(|e| {
+        contextdb_core::Error::SyncError((format!("delivery metadata encode: {e}")).into())
+    })
+}
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn decode(bytes: &[u8]) -> Result<Record> {
     let mut reader = std::io::Cursor::new(bytes);
-    let value = Record::deserialize(&mut rmp_serde::Deserializer::new(&mut reader))
-        .map_err(|e| contextdb_core::Error::SyncError(format!("delivery metadata decode: {e}")))?;
+    let value =
+        Record::deserialize(&mut rmp_serde::Deserializer::new(&mut reader)).map_err(|e| {
+            contextdb_core::Error::SyncError((format!("delivery metadata decode: {e}")).into())
+        })?;
     if reader.position() != bytes.len() as u64 || encode(&value)? != bytes {
         return Err(invalid());
     }
     Ok(value)
 }
+
+// Checked private canonical walks; original Legacy methods remain exact.
+impl RowRef {
+    pub(crate) fn encode_finite(&self, e: &mut super::canonical::FiniteEncoder<'_>) {
+        e.reference(&self.table, &self.key);
+    }
+}
+impl LocalLifeAnchor {
+    pub(crate) fn encode_finite(&self, e: &mut super::canonical::FiniteEncoder<'_>) {
+        e.string(&self.original_table);
+        e.u64(self.table_generation);
+        e.u64(self.local_row_id);
+        e.u64(self.creation_lsn.0);
+    }
+}
+impl StateRef {
+    pub(crate) fn encode_finite(&self, e: &mut super::canonical::FiniteEncoder<'_>) {
+        e.raw(self.logical_store_id.as_bytes());
+        e.raw(&self.incarnation.0.to_be_bytes());
+        e.raw(self.birth_id.as_bytes());
+        e.raw(&self.token);
+    }
+}
+impl Namespace {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn encode_finite(&self, e: &mut super::canonical::FiniteEncoder<'_>) -> Result<()> {
+        e.string(self.tenant.as_str());
+        e.node(&self.hub_node)?;
+        e.raw(&self.hub_incarnation.0.to_be_bytes());
+        e.node(&self.edge_node)?;
+        e.raw(&self.edge_incarnation.0.to_be_bytes());
+        Ok(())
+    }
+}
+impl Seal {
+    pub(crate) fn encode_finite(&self, e: &mut super::canonical::FiniteEncoder<'_>) {
+        self.root.encode_finite(e);
+        e.raw(&self.root_digest);
+        e.raw(&self.origin_life_digest);
+        e.raw(self.membership_revision.as_bytes());
+        e.u64(self.source.0.0);
+        e.u32(self.source.1);
+        e.u8(self.kind);
+        e.u64(self.registered_count);
+        e.raw(&self.unit_digest);
+        e.option(self.last_complete.as_ref(), |e, d| e.raw(d));
+        e.raw(&self.projection_digest);
+        e.raw(&self.authority_digest);
+    }
+}
+impl SignedBinding {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn bytes_finite(&self, e: &mut super::canonical::FiniteEncoder<'_>) -> Result<()> {
+        e.string("delivery-policy-binding.v1");
+        e.u32(self.format);
+        self.namespace.encode_finite(e)?;
+        e.u64(self.tables.len() as u64);
+        for p in &self.tables {
+            e.string(&p.table);
+            e.u64(p.version);
+            e.raw(&p.digest);
+            e.policy(&p.policy)?;
+        }
+        self.issuance_state.encode_finite(e);
+        e.u64(self.issuance_source.0.0);
+        e.u32(self.issuance_source.1);
+        Ok(())
+    }
+}
+impl TerminalRecord {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn bytes_finite(&self, e: &mut super::canonical::FiniteEncoder<'_>) -> Result<()> {
+        e.string("delivery-terminal-core.v1");
+        e.u32(1);
+        self.namespace.encode_finite(e)?;
+        self.root.encode_finite(e);
+        e.raw(&self.origin_life_digest);
+        e.u8(0);
+        e.raw(self.submission.as_bytes());
+        e.raw(&self.seal_digest);
+        e.u8(1);
+        e.raw(&self.unit_digest);
+        e.u8(1);
+        e.u8(0);
+        e.u64(self.source.0.0);
+        e.u32(self.source.1);
+        e.u8(self.kind);
+        e.option(self.cause.as_ref(), |e, c| e.string(c));
+        e.u64(self.position.0.0);
+        e.u32(self.position.1);
+        e.raw(&self.state.token);
+        e.u8(0);
+        e.u64(self.diagnostics.subject_count);
+        e.u64(self.diagnostics.conflict_count);
+        e.u64(self.diagnostics.canonical_bytes);
+        e.raw(&self.diagnostics.commitment);
+        Ok(())
+    }
+}
+impl DiagnosticBlock {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn bytes_finite(&self, e: &mut super::canonical::FiniteEncoder<'_>) -> Result<()> {
+        e.raw(&self.salt);
+        e.u64(self.subjects.len() as u64);
+        for (r, m) in &self.subjects {
+            r.encode_finite(e);
+            e.u8(*m);
+        }
+        e.u64(self.conflicts.len() as u64);
+        for c in &self.conflicts {
+            e.key(&c.natural_key);
+            e.u8(super::canonical::diagnostic_resolution(c.resolution));
+            e.option(c.reason.as_ref(), |e, v| e.string(v));
+            e.option(c.table.as_ref(), |e, v| e.string(v));
+            e.option(c.mutation_kind.as_ref(), |e, v| e.string(v));
+            e.option(c.winning_author_node_id.as_ref(), |e, v| e.string(v));
+            e.option(c.hub_acceptance_position.as_ref(), |e, v| e.u64(v.0));
+            e.option(c.refusal_cause.as_ref(), |e, v| {
+                e.string(&v.table);
+                e.key(&v.natural_key);
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Seal {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn digest_finite(&self) -> Result<Digest> {
+        super::canonical::finite_hash(|e| {
+            e.string("delivery-submission-seal.v1");
+            self.encode_finite(e);
+            Ok(())
+        })
+    }
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(crate) fn validate_record_owned(
+    db: &crate::Database,
+    record: &Record,
+    records: &[&Record],
+) -> Result<()> {
+    use super::authority::*;
+    use super::canonical::*;
+    use super::preparation::{OwnedPreparationValue, preparation_array_bytes};
+    match record {
+        Record::MaterializedOwner(o) => {
+            if !records.iter().any(|r|matches!(r,Record::Manifest(m) if m.id==o.submission&&m.tenant==o.namespace.tenant&&m.edge_node==o.namespace.edge_node&&m.edge_incarnation==o.namespace.edge_incarnation&&m.rows.contains(&o.source))) {return Err(invalid());}
+            if !records.iter().any(|r|matches!(r,Record::Terminal {edge:false,record:t} if t.submission==o.submission&&t.namespace==o.namespace&&t.kind!=2)){return Err(invalid());}
+        }
+        Record::Control(c) => {
+            if c.format != 1 {
+                return Err(invalid());
+            }
+            let count = records
+                .iter()
+                .filter(|r| matches!(r,Record::State(s) if BirthRef::from(&s.state)==c.identity))
+                .count();
+            let states = OwnedPreparationValue::try_produce(
+                db,
+                preparation_array_bytes::<&StateRecord>(count)?,
+                || {
+                    let mut states = Vec::with_capacity(count);
+                    for r in records {
+                        if let Record::State(s) = r
+                            && BirthRef::from(&s.state) == c.identity
+                        {
+                            states.push(s);
+                        }
+                    }
+                    Ok(states)
+                },
+            )?;
+            if states.with_value(|states| history_root_owned(db, states))? != c.active_history_root
+                || !records
+                    .iter()
+                    .any(|r| matches!(r,Record::Birth(b) if b.identity==c.identity))
+            {
+                return Err(invalid());
+            }
+            let birth = records
+                .iter()
+                .find_map(|r| match r {
+                    Record::Birth(b) if b.identity == c.identity => Some(b),
+                    _ => None,
+                })
+                .ok_or_else(invalid)?;
+            let mut bytes = preparation_array_bytes::<Birth>(birth.retired.len())?;
+            for id in &birth.retired {
+                let b = records
+                    .iter()
+                    .find_map(|r| match r {
+                        Record::Birth(b) if b.identity == *id => Some(b),
+                        _ => None,
+                    })
+                    .ok_or_else(invalid)?;
+                bytes = bytes
+                    .checked_add(birth_native_bytes_owned(b)?)
+                    .ok_or_else(invalid)?;
+            }
+            let retired = OwnedPreparationValue::try_produce(db, bytes, || {
+                let mut retired = Vec::with_capacity(birth.retired.len());
+                for id in &birth.retired {
+                    retired.push(
+                        (*records
+                            .iter()
+                            .find_map(|r| match r {
+                                Record::Birth(b) if b.identity == *id => Some(b),
+                                _ => None,
+                            })
+                            .ok_or_else(invalid)?)
+                        .clone(),
+                    );
+                }
+                Ok(retired)
+            })?;
+            retired.with_value(|retired| validate_retirement_closure_owned(db, birth, retired))?;
+            if retired.with_value(|retired| retirement_root_finite(retired))?
+                != c.retired_history_root
+                || states.with_value(|states| {
+                    states
+                        .iter()
+                        .any(|s| s.retirement_root != c.retired_history_root)
+                })
+            {
+                return Err(invalid());
+            }
+            retired.with_value(|retired|->Result<()>{for birth in std::iter::once(birth).chain(retired) {
+                for trigger in &birth.triggers {if !records.iter().any(|r|matches!(r,Record::Certificate(cert) if cert.id_finite().ok()==Some(*trigger))){return Err(invalid());}}
+            }Ok(())})?;
+            let mut seen: OwnedPreparationValue<Vec<Digest>> = OwnedPreparationValue::try_produce(
+                db,
+                preparation_array_bytes::<Digest>(count)?,
+                || Ok(Vec::with_capacity(count)),
+            )?;
+            let mut token = Some(c.head);
+            let mut child_sequence = None;
+            while let Some(t) = token {
+                if seen.with_value(|seen| seen.contains(&t)) {
+                    return Err(invalid());
+                }
+                if seen.with_value(|seen| seen.len() == count) {
+                    return Err(invalid());
+                }
+                seen.push_slot(t);
+                let pair = states
+                    .with_value(|states| {
+                        states
+                            .iter()
+                            .find(|s| s.state.token == t)
+                            .map(|s| (s.sequence, s.parent))
+                    })
+                    .ok_or_else(invalid)?;
+                if child_sequence.is_some_and(|sequence| pair.0.checked_add(1) != Some(sequence)) {
+                    return Err(invalid());
+                }
+                child_sequence = Some(pair.0);
+                token = pair.1;
+            }
+            if seen.with_value(|seen| seen.len()) != count || child_sequence != Some(0) {
+                return Err(invalid());
+            }
+        }
+        Record::Root { life, submission } => {
+            let m = records
+                .iter()
+                .find_map(|r| match r {
+                    Record::Manifest(m) if m.id == *submission && m.root_life == *life => Some(m),
+                    _ => None,
+                })
+                .ok_or_else(invalid)?;
+            let seal = m.seal.digest_finite()?;
+            if !records.iter().any(|r|matches!(r,Record::SourceHistory {root,submission,seal_digest,..} if root==life&&*submission==m.id&&*seal_digest==seal)){return Err(invalid());}
+            for member in &m.member_lives {
+                if !records.iter().any(|r|matches!(r,Record::MemberOwner {member:owner,root,submission} if owner==member&&root==life&&*submission==m.id)){return Err(invalid());}
+            }
+        }
+        Record::ObjectAdmission(a) => {
+            let certificate = records
+                .iter()
+                .find_map(|r| match r {
+                    Record::Certificate(c) if c.id_finite().ok() == Some(a.certificate) => Some(c),
+                    _ => None,
+                })
+                .ok_or_else(invalid)?;
+            if certificate.state.state != a.owning_state
+                || certificate.tenant != a.authority.namespace.tenant
+                || certificate.hub_node != a.authority.namespace.hub_node
+                || BirthRef::from(&a.owning_state) != a.authority.birth
+            {
+                return Err(invalid());
+            }
+            if !records.iter().any(|r| match r {
+                Record::Binding(b) => {
+                    object_digest_finite(0, |e| b.bytes_finite(e), &b.signature).ok()
+                        == Some(a.object_digest)
+                }
+                Record::Terminal { record: t, .. } => {
+                    object_digest_finite(1, |e| t.bytes_finite(e), &t.signature).ok()
+                        == Some(a.object_digest)
+                }
+                _ => false,
+            }) {
+                return Err(invalid());
+            }
+        }
+        Record::Terminal { edge, record: t } => {
+            let block = records
+                .iter()
+                .find_map(|r| match r {
+                    Record::Diagnostic {
+                        namespace,
+                        submission,
+                        block,
+                    } if *namespace == t.namespace && *submission == t.submission => Some(block),
+                    _ => None,
+                })
+                .ok_or_else(invalid)?;
+            if t.diagnostics.subject_count != block.subjects.len() as u64
+                || t.diagnostics.conflict_count != block.conflicts.len() as u64
+                || t.diagnostics.canonical_bytes != finite_len(|e| block.bytes_finite(e))? as u64
+                || t.diagnostics.commitment
+                    != finite_hash(|e| {
+                        e.string("delivery-diagnostics.v1");
+                        block.bytes_finite(e)
+                    })?
+            {
+                return Err(invalid());
+            }
+            if *edge {
+                let digest = object_digest_finite(1, |e| t.bytes_finite(e), &t.signature)?;
+                if !records.iter().any(|r|matches!(r,Record::ObjectAdmission(a) if a.object_digest==digest)){return Err(invalid());}
+            }else if !records.iter().any(|r|matches!(r,Record::Order {namespace,position,submission} if *namespace==t.namespace&&*position==t.position&&*submission==t.submission)){return Err(invalid());}
+        }
+        _ => {}
+    }
+    Ok(())
+}
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(crate) fn birth_native_bytes_owned(value: &super::authority::Birth) -> Result<usize> {
+    count_birth_native(value)
+}
+
+// Include the schema digest's Vec payload in the native copy plan.

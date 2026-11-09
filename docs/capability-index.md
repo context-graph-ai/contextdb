@@ -31,15 +31,9 @@ of truth.
 - **A CLI, a REPL, and a Rust library** — `contextdb`/`contextdb-server` binaries plus the
   `contextdb-engine` crate as an embeddable dependency. See [CLI Reference](cli.md) and
   [Getting Started](getting-started.md).
-- **Maintained vector search.** A vector column may declare local `PARTITION_KEY` layouts and an
-  effective default limit of 256 live-plus-snapshot-retained layouts. One, several, or all
-  authorized layouts produce one global top-k; a partition is not a tenant, authorization rule, or
-  sync direction. <!-- enforced by: vector_partition_declaration_contract::partitioned_vector_schema_survives_reopen_with_canonical_defaults, vector_partition_query_contract::finite_in_partition_scope_merges_before_one_limit, vector_partition_query_contract::no_partition_key_predicate_returns_one_global_limited_answer, vector_partition_query_contract::partition_scope_does_not_weaken_context_scope_or_principal_filters, vector_partition_sync_inspection_contract::partitioned_sync_derives_receiver_membership_without_changing_owner_pairing --> Maintained indexed routes have an at-least-95% recall-at-10 acceptance target
-  against exact search on the same stored column. <!-- enforced by: vector_held_out_native_reference::held_out_unfiltered_native_reference_recovers_the_required_neighbors, vector_serving_merge_contract::held_out_filtered_graph_search_preserves_quality_at_sparse_and_broad_selectivities -->
-  `AUTO_INDEX_AT` and HNSW (`M`, `EF_CONSTRUCTION`, `EF_SEARCH`) are
-  declarable per-column workload policy; default silence keeps the compatibility profile. See
-  [Query Language](query-language.md) and [Architecture](architecture.md).
-  <!-- enforced by: vector_policy_declaration_contract::create_and_add_column_declarations_render_inspect_and_survive_reopen_and_export, vector_policy_resolver_contract::declared_vector_policy_resolves_consistently_at_default_and_declared_boundaries -->
+- **Exact vector search.** This release ships exact vector search only. `AUTO` and `EXACT` compare allowed stored vectors within the active budgets; `INDEXED` returns `VectorIndexedRouteUnavailable`. The clustered index is switched off: commits and maintenance do not build or write it, and queries and inspection do not read it. Index policy declarations are retained but do not enable an index.
+<!-- enforced by: a_search_is_exact_with_no_index_built::an_auto_find_answers_exactly_after_commit_with_no_maintenance, a_search_is_exact_with_no_index_built::indexed_is_refused_at_every_door, a_search_is_exact_with_no_index_built::no_cycle_or_commit_builds_or_writes_an_index, a_search_is_exact_with_no_index_built::declared_index_policy_is_recorded_and_has_no_effect -->
+
 
 ## What contextdb is not
 
@@ -88,15 +82,14 @@ of truth.
   hard-coded default cap.
 - **A CLI read is bounded, and a bounded read is complete or refused**: one `SELECT` succeeds only
   within the declared ceilings — 500 rows and 4 MiB by default — and crossing either publishes no
-  rows and refuses with `owner_limit_exceeded`. Nothing is ever silently truncated, there is no
+  rows and refuses with `owner_limit_exceeded`. <!-- enforced by: read_cli_journeys_ordinary_results::a_result_at_the_shipped_row_ceiling_succeeds_complete, read_cli_journeys_ordinary_results::one_row_past_the_ceiling_publishes_nothing_and_names_the_ceiling, read_cli_journeys_ordinary_results::a_result_over_the_byte_ceiling_is_refused_naming_result_bytes --> Nothing is ever silently truncated, there is no
   flag that disables the ceiling, and `.cursor open` / `.cursor fetch` is how a larger result is
-  paged. The embedded `Database::execute` library call keeps its uncapped contract.
+  paged. <!-- enforced by: read_cli_journeys_cursor::the_cursor_pages_a_result_the_ordinary_ceiling_refuses --> The embedded `Database::execute` library call keeps its uncapped contract.
   See [CLI Reference](cli.md).
 - **All-scope vector search is bounded, not a promise to load every layout at once.** The engine
   fans out under the reader's work, memory, and cancellation limits and either returns one complete
-  global answer or refuses honestly. <!-- enforced by: vector_search_mode_bounded_contract::exact_memory_admission_uses_selected_authorized_rows_as_unrelated_vectors_grow, vector_search_mode_bounded_contract::filtered_many_partition_search_reuses_partition_local_candidates, vector_lazy_restart_residency_contract::reopen_keeps_saved_partitions_dormant_then_reclaims_one_least_recently_used_route_under_pressure --> The edge-device memory target is `SET MEMORY_LIMIT 2G`
-  (CLI `--memory-limit 2G`), exactly **2147483648 bytes**. <!-- enforced by: statement_effect_contract::binary_memory_declaration_accepts_quoted_and_unquoted_sizes --> Charged vector/index bytes and
-  whole-process RSS, including build/repair/restart lifecycle work, are reported separately. See
+  global answer or refuses honestly. <!-- enforced by: vector_search_mode_bounded_contract::exact_memory_admission_uses_selected_authorized_rows_as_unrelated_vectors_grow, vector_search_mode_bounded_contract::exact_override_is_exhaustive_across_partitions_and_matches_rust_and_bounded_reads --> The edge-device memory target is `SET MEMORY_LIMIT 2G`
+  (CLI `--memory-limit 2G`), exactly **2147483648 bytes**. <!-- enforced by: statement_effect_contract::binary_memory_declaration_accepts_quoted_and_unquoted_sizes --> See
   [Architecture](architecture.md) and [CLI Reference](cli.md).
 
 ---

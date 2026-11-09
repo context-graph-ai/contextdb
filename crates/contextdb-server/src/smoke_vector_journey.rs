@@ -38,7 +38,8 @@ impl Hub {
                 .map_err(|_| "cannot open vector verifier hub database".to_string())?,
         );
         declare(&db)?;
-        let server = SyncServer::new(db.clone(), &endpoint, TenantId::from(TENANT));
+        let server = SyncServer::new(db.clone(), &endpoint, TenantId::from(TENANT))
+            .map_err(|e| format!("cannot construct smoke server: {e}"))?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn({
             let shutdown = shutdown.clone();
@@ -90,7 +91,8 @@ fn edge(root: &Path, name: &str, ticket: &str) -> Result<Edge, String> {
         db.clone(),
         &peer_dial_spec(ticket, &directory.join("edge.identity")),
         TenantId::from(TENANT),
-    );
+    )
+    .map_err(|e| format!("cannot construct smoke client: {e}"))?;
     Ok(Edge { db, client })
 }
 
@@ -109,11 +111,12 @@ fn inspect(db: &Database, id: Uuid, place: &str) -> Result<(RowId, f32), String>
             &HashMap::from([("id".to_string(), Value::Uuid(id))]),
         )
         .map_err(|_| format!("cannot read enriched owner at {place}"))?;
-    if sql.rows
+    if sql.rows()
         != [vec![
             Value::Text("owner-first".to_string()),
             Value::Vector(vec![1.0, 0.0, 0.0]),
         ]]
+        .as_slice()
     {
         return Err(format!(
             "SQL did not return the exact enriched owner at {place}"
@@ -154,7 +157,7 @@ fn inspect_unenriched(db: &Database, id: Uuid, place: &str) -> Result<RowId, Str
             &HashMap::from([("id".to_string(), Value::Uuid(id))]),
         )
         .map_err(|_| format!("cannot read owner before enrichment at {place}"))?;
-    if sql.rows != [vec![Value::Text("owner-first".to_string()), Value::Null]] {
+    if sql.rows() != [vec![Value::Text("owner-first".to_string()), Value::Null]].as_slice() {
         return Err(format!(
             "owner was not present without an embedding at {place}"
         ));

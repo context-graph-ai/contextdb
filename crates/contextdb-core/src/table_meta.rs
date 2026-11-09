@@ -8,6 +8,9 @@ pub struct CompositeForeignKey {
     pub child_columns: Vec<String>,
     pub parent_table: String,
     pub parent_columns: Vec<String>,
+    /// `FOLLOWS PARENT PURGE`: a PURGE of the parent row erases this row too.
+    #[serde(default)]
+    pub follows_parent_purge: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -15,6 +18,9 @@ pub struct SingleColumnForeignKey {
     pub child_column: String,
     pub parent_table: String,
     pub parent_column: String,
+    /// `FOLLOWS PARENT PURGE` on this column's `REFERENCES`.
+    #[serde(default)]
+    pub follows_parent_purge: bool,
 }
 
 /// The time unit a `RETAIN` window was DECLARED in. The engine stores the
@@ -402,7 +408,39 @@ pub fn render_sql_identifier(name: &str) -> String {
 /// case -- matching the existing intent of
 /// every `.unwrap_or_default()` call on a trailing field here.
 fn is_bincode_tail_truncation<E: std::fmt::Display>(err: &E) -> bool {
-    err.to_string().contains("UnexpectedEnd")
+    // A formatter may split the token across write_str calls. Keep the same
+    // substring classification without creating an owning temporary String.
+    struct Match {
+        matched: usize,
+        found: bool,
+    }
+    impl std::fmt::Write for Match {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            const NEEDLE: &[u8] = b"UnexpectedEnd";
+            for byte in text.bytes() {
+                if self.found {
+                    break;
+                }
+                if byte == NEEDLE[self.matched] {
+                    self.matched += 1;
+                    if self.matched == NEEDLE.len() {
+                        self.found = true;
+                    }
+                } else {
+                    // No proper prefix of this token ends in 'U'.
+                    self.matched = usize::from(byte == NEEDLE[0]);
+                }
+            }
+            Ok(())
+        }
+    }
+    let mut matcher = Match {
+        matched: 0,
+        found: false,
+    };
+    std::fmt::write(&mut matcher, format_args!("{err}"))
+        .expect("tail error formatter previously had to produce a String");
+    matcher.found
 }
 
 /// Decode ONE trailing, defaultable field of a hand-written positional
@@ -845,20 +883,18 @@ pub struct ColumnDef {
     /// and remains silent in rendered schema.
     #[serde(default)]
     pub auto_index_at: Option<u32>,
-    /// Explicit HNSW neighbour-link count. `None` preserves the compatibility
-    /// profile and remains silent in rendered schema.
+    /// The explicit per-partition live-row count below which a partition is
+    /// served from its maintained flat representation instead of its graph.
+    /// `None` keeps the compatibility default, 0 (never flat), and remains
+    /// silent in rendered schema.
     #[serde(default)]
-    pub hnsw_m: Option<u32>,
+    pub flat_below: Option<u32>,
+    /// The explicit most of its walk budget, in percent, AUTO expects one
+    /// partition's graph search to spend when it prices the walk against
+    /// comparing every row. `None` keeps the compatibility default, 25.
     #[serde(default)]
-    /// Explicit HNSW build candidate-work setting. `None` preserves the
-    /// compatibility profile and remains silent in rendered schema.
-    pub hnsw_ef_construction: Option<u32>,
-    #[serde(default)]
-    /// Explicit HNSW query candidate-work setting. `None` preserves the
-    /// compatibility profile and remains silent in rendered schema.
-    pub hnsw_ef_search: Option<u32>,
-    /// Durable desired topology revision. AUTO_INDEX_AT and EF_SEARCH do not
-    /// advance it; M and EF_CONSTRUCTION changes do.
+    pub auto_expansion_ceiling: Option<u32>,
+    /// Durable desired policy revision.
     #[serde(default)]
     pub vector_policy_revision: u64,
     /// Percentage of the partition population that must accumulate as
@@ -875,6 +911,18 @@ pub struct ColumnDef {
     /// the maintained index and its operator-driven repair path.
     #[serde(default)]
     pub consolidation_disabled: bool,
+    #[serde(default)]
+    pub search_target_accuracy_hundredths: Option<u16>,
+    #[serde(default)]
+    pub search_expected_vectors: Option<u64>,
+    #[serde(default)]
+    pub ivf_lists: Option<u32>,
+    #[serde(default)]
+    pub ivf_probes: Option<u32>,
+    #[serde(default)]
+    pub ivf_refine_factor_hundredths: Option<u32>,
+    #[serde(default)]
+    pub vector_engine_policy: VectorEnginePolicy,
 }
 
 /// The effective `MAX_PARTITIONS` value for a partitioned vector declaration
@@ -950,9 +998,8 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                 let max_partitions = seq.next_element::<Option<u32>>()?.unwrap_or_default();
                 let search_mode = seq.next_element::<VectorSearchMode>()?.unwrap_or_default();
                 let auto_index_at = seq.next_element::<Option<u32>>()?.unwrap_or_default();
-                let hnsw_m = seq.next_element::<Option<u32>>()?.unwrap_or_default();
-                let hnsw_ef_construction = seq.next_element::<Option<u32>>()?.unwrap_or_default();
-                let hnsw_ef_search = seq.next_element::<Option<u32>>()?.unwrap_or_default();
+                let flat_below = seq.next_element::<Option<u32>>()?.unwrap_or_default();
+                let auto_expansion_ceiling = seq.next_element::<Option<u32>>()?.unwrap_or_default();
                 let vector_policy_revision = seq
                     .next_element::<u64>()?
                     .unwrap_or(DEFAULT_VECTOR_POLICY_REVISION);
@@ -961,6 +1008,18 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                 let consolidation_tombstone_percent =
                     seq.next_element::<Option<u32>>()?.unwrap_or_default();
                 let consolidation_disabled = seq.next_element::<bool>()?.unwrap_or_default();
+                let search_target_accuracy_hundredths =
+                    seq.next_element::<Option<u16>>()?.unwrap_or_default();
+                let search_expected_vectors =
+                    seq.next_element::<Option<u64>>()?.unwrap_or_default();
+                let ivf_lists = seq.next_element::<Option<u32>>()?.unwrap_or_default();
+                let ivf_probes = seq.next_element::<Option<u32>>()?.unwrap_or_default();
+                let ivf_refine_factor_hundredths =
+                    seq.next_element::<Option<u32>>()?.unwrap_or_default();
+                let vector_engine_policy = seq
+                    .next_element::<VectorEnginePolicy>()?
+                    .unwrap_or_default();
+
                 Ok(ColumnDef {
                     name,
                     column_type,
@@ -980,13 +1039,18 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                     max_partitions,
                     search_mode,
                     auto_index_at,
-                    hnsw_m,
-                    hnsw_ef_construction,
-                    hnsw_ef_search,
+                    flat_below,
+                    auto_expansion_ceiling,
                     vector_policy_revision,
                     consolidation_change_percent,
                     consolidation_tombstone_percent,
                     consolidation_disabled,
+                    search_target_accuracy_hundredths,
+                    search_expected_vectors,
+                    ivf_lists,
+                    ivf_probes,
+                    ivf_refine_factor_hundredths,
+                    vector_engine_policy,
                 })
             }
 
@@ -1012,13 +1076,18 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                 let mut max_partitions: Option<Option<u32>> = None;
                 let mut search_mode: Option<VectorSearchMode> = None;
                 let mut auto_index_at: Option<Option<u32>> = None;
-                let mut hnsw_m: Option<Option<u32>> = None;
-                let mut hnsw_ef_construction: Option<Option<u32>> = None;
-                let mut hnsw_ef_search: Option<Option<u32>> = None;
+                let mut flat_below: Option<Option<u32>> = None;
+                let mut auto_expansion_ceiling: Option<Option<u32>> = None;
                 let mut vector_policy_revision: Option<u64> = None;
                 let mut consolidation_change_percent: Option<Option<u32>> = None;
                 let mut consolidation_tombstone_percent: Option<Option<u32>> = None;
                 let mut consolidation_disabled: Option<bool> = None;
+                let mut search_target_accuracy_hundredths: Option<Option<u16>> = None;
+                let mut search_expected_vectors: Option<Option<u64>> = None;
+                let mut ivf_lists: Option<Option<u32>> = None;
+                let mut ivf_probes: Option<Option<u32>> = None;
+                let mut ivf_refine_factor_hundredths: Option<Option<u32>> = None;
+                let mut vector_engine_policy: Option<VectorEnginePolicy> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -1040,9 +1109,10 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                         "max_partitions" => max_partitions = Some(map.next_value()?),
                         "search_mode" => search_mode = Some(map.next_value()?),
                         "auto_index_at" => auto_index_at = Some(map.next_value()?),
-                        "hnsw_m" => hnsw_m = Some(map.next_value()?),
-                        "hnsw_ef_construction" => hnsw_ef_construction = Some(map.next_value()?),
-                        "hnsw_ef_search" => hnsw_ef_search = Some(map.next_value()?),
+                        "flat_below" => flat_below = Some(map.next_value()?),
+                        "auto_expansion_ceiling" => {
+                            auto_expansion_ceiling = Some(map.next_value()?)
+                        }
                         "vector_policy_revision" => {
                             vector_policy_revision = Some(map.next_value()?)
                         }
@@ -1052,6 +1122,18 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                         "consolidation_tombstone_percent" => {
                             consolidation_tombstone_percent = Some(map.next_value()?)
                         }
+                        "search_target_accuracy_hundredths" => {
+                            search_target_accuracy_hundredths = Some(map.next_value()?)
+                        }
+                        "search_expected_vectors" => {
+                            search_expected_vectors = Some(map.next_value()?)
+                        }
+                        "ivf_lists" => ivf_lists = Some(map.next_value()?),
+                        "ivf_probes" => ivf_probes = Some(map.next_value()?),
+                        "ivf_refine_factor_hundredths" => {
+                            ivf_refine_factor_hundredths = Some(map.next_value()?)
+                        }
+                        "vector_engine_policy" => vector_engine_policy = Some(map.next_value()?),
                         "consolidation_disabled" => {
                             consolidation_disabled = Some(map.next_value()?)
                         }
@@ -1083,15 +1165,21 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                     max_partitions: max_partitions.unwrap_or_default(),
                     search_mode: search_mode.unwrap_or_default(),
                     auto_index_at: auto_index_at.unwrap_or_default(),
-                    hnsw_m: hnsw_m.unwrap_or_default(),
-                    hnsw_ef_construction: hnsw_ef_construction.unwrap_or_default(),
-                    hnsw_ef_search: hnsw_ef_search.unwrap_or_default(),
+                    flat_below: flat_below.unwrap_or_default(),
+                    auto_expansion_ceiling: auto_expansion_ceiling.unwrap_or_default(),
                     vector_policy_revision: vector_policy_revision
                         .unwrap_or(DEFAULT_VECTOR_POLICY_REVISION),
                     consolidation_change_percent: consolidation_change_percent.unwrap_or_default(),
                     consolidation_tombstone_percent: consolidation_tombstone_percent
                         .unwrap_or_default(),
                     consolidation_disabled: consolidation_disabled.unwrap_or_default(),
+                    search_target_accuracy_hundredths: search_target_accuracy_hundredths
+                        .unwrap_or_default(),
+                    search_expected_vectors: search_expected_vectors.unwrap_or_default(),
+                    ivf_lists: ivf_lists.unwrap_or_default(),
+                    ivf_probes: ivf_probes.unwrap_or_default(),
+                    ivf_refine_factor_hundredths: ivf_refine_factor_hundredths.unwrap_or_default(),
+                    vector_engine_policy: vector_engine_policy.unwrap_or_default(),
                 })
             }
         }
@@ -1115,13 +1203,18 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
             "max_partitions",
             "search_mode",
             "auto_index_at",
-            "hnsw_m",
-            "hnsw_ef_construction",
-            "hnsw_ef_search",
+            "flat_below",
+            "auto_expansion_ceiling",
             "vector_policy_revision",
             "consolidation_change_percent",
             "consolidation_tombstone_percent",
             "consolidation_disabled",
+            "search_target_accuracy_hundredths",
+            "search_expected_vectors",
+            "ivf_lists",
+            "ivf_probes",
+            "ivf_refine_factor_hundredths",
+            "vector_engine_policy",
         ];
         deserializer.deserialize_struct("ColumnDef", FIELDS, ColumnDefVisitor)
     }
@@ -1142,6 +1235,9 @@ pub struct RankPolicy {
 pub struct ForeignKeyReference {
     pub table: String,
     pub column: String,
+    /// `FOLLOWS PARENT PURGE`: a PURGE of the parent row erases this row too.
+    #[serde(default)]
+    pub follows_parent_purge: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1184,8 +1280,11 @@ impl VectorQuantization {
 }
 
 impl TableMeta {
-    /// The fixed exact-probe bitmap every exact-only index storage on this
-    /// table allocates and keeps for as long as the index exists. Separate
+    /// The largest exact-probe bitmap the exact-only index storages of this
+    /// table can come to hold, one per exact-only index, once each has stored a
+    /// posting. A writer admits this maximum when it declares the indexes; a
+    /// committed-image reader is charged for the filters it holds instead.
+    /// Separate
     /// from [`TableMeta::metadata_bytes`] because it is a durable retention,
     /// not schema text: a staging reservation that copies the declaration
     /// while it builds a projection must not multiply this as well.
@@ -1400,7 +1499,21 @@ impl ColumnDef {
                     .sum::<usize>()
             })
             .unwrap_or(0);
-        8 + self.name.len() * 16
+        let policy = &self.vector_engine_policy;
+        let policy_bytes = std::mem::size_of::<VectorEnginePolicy>()
+            .saturating_add(std::mem::size_of::<Option<u16>>())
+            .saturating_add(std::mem::size_of::<Option<u64>>())
+            .saturating_add(3 * std::mem::size_of::<Option<u32>>())
+            .saturating_add(policy.calibration_depths.as_ref().map_or(0, |v| {
+                v.capacity().saturating_mul(std::mem::size_of::<u32>())
+            }))
+            .saturating_add(policy.refine_factors.as_ref().map_or(0, |v| {
+                v.capacity().saturating_mul(std::mem::size_of::<u32>())
+            }))
+            .saturating_add(policy.calibration_queries.as_ref().map_or(0, |v| {
+                v.table.capacity().saturating_add(v.column.capacity())
+            }));
+        policy_bytes.saturating_add(8 + self.name.len() * 16)
             + self.column_type.estimated_bytes()
             + default_bytes
             + reference_bytes
@@ -1443,6 +1556,12 @@ mod vector_declaration_tests {
 
     fn vector_column() -> ColumnDef {
         ColumnDef {
+            search_target_accuracy_hundredths: None,
+            search_expected_vectors: None,
+            ivf_lists: None,
+            ivf_probes: None,
+            ivf_refine_factor_hundredths: None,
+            vector_engine_policy: Default::default(),
             name: "embedding".to_owned(),
             column_type: ColumnType::Vector(3),
             nullable: true,
@@ -1461,9 +1580,8 @@ mod vector_declaration_tests {
             max_partitions: Some(32),
             search_mode: VectorSearchMode::Indexed,
             auto_index_at: None,
-            hnsw_m: None,
-            hnsw_ef_construction: None,
-            hnsw_ef_search: None,
+            flat_below: None,
+            auto_expansion_ceiling: None,
             vector_policy_revision: DEFAULT_VECTOR_POLICY_REVISION,
             consolidation_change_percent: None,
             consolidation_tombstone_percent: None,
@@ -1550,4 +1668,35 @@ mod vector_declaration_tests {
             assert!(!refused.is_vector_partition_key_type(), "{refused:?}");
         }
     }
+}
+
+/// Persisted optional engineering declarations; absence selects the default program.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorEnginePolicy {
+    pub calibration_max_k: Option<u64>,
+    pub calibration_depths: Option<Vec<u32>>,
+    pub probe_grid: Option<u64>,
+    pub refine_factors: Option<Vec<u32>>,
+    pub refine_growth: Option<u32>,
+    pub calibration_samples: Option<u64>,
+    pub calibration_queries: Option<VectorCalibrationSource>,
+    pub min_lists: Option<u64>,
+    pub vectors_per_list: Option<u64>,
+    pub centroid_memory_percent: Option<u32>,
+    pub training_samples: Option<u64>,
+    pub training_iterations: Option<u64>,
+    pub training_seed: Option<u64>,
+    pub max_delta_runs: Option<u64>,
+    pub write_buffer_bytes: Option<u64>,
+    pub ingest_batch_keys: Option<u64>,
+    pub coalesce_pages_per_step: Option<u64>,
+    pub build_batch_entries: Option<u64>,
+    pub remap_batch_entries: Option<u64>,
+    pub directory_window_objects: Option<u64>,
+    pub page_window_bytes: Option<u64>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorCalibrationSource {
+    pub table: String,
+    pub column: String,
 }

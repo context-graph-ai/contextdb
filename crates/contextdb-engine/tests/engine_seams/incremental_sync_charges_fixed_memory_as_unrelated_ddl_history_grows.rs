@@ -1,0 +1,407 @@
+//! Incremental sync uses bounded declaration summaries and preserves historical policy.
+use contextdb_core::{Incarnation, TenantId, Value};
+use contextdb_engine::database::resident_history_test_seams::observe as summaries;
+use contextdb_engine::sync_types::SchemaSyncCapability;
+use contextdb_engine::writer_query_test_seams::observe as history;
+use contextdb_engine::{Database, DatabaseOpenOptions, MaintenancePolicy};
+use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+fn open(path: &Path) -> Database {
+    Database::open_with_options(
+        path,
+        DatabaseOpenOptions {
+            memory_limit: Some(64 << 20),
+            maintenance_policy: MaintenancePolicy::CallerDriven,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+/// A fabric identity from a fixed seed, so every run signs the same bytes.
+fn fixed_identity(directory: &Path, name: &str, byte: u8) -> Arc<FabricIdentity> {
+    let path = directory.join(name);
+    std::fs::write(&path, [byte; 32]).unwrap();
+    Arc::new(FabricIdentity::load_or_generate(&path).unwrap())
+}
+fn sql(db: &Database, statement: &str) {
+    db.execute(statement, &HashMap::new()).unwrap();
+}
+fn ids(db: &Database, table: &str) -> Vec<Vec<Value>> {
+    db.execute(
+        &format!("SELECT id FROM {table} ORDER BY id"),
+        &HashMap::new(),
+    )
+    .unwrap()
+    .rows()
+    .to_vec()
+}
+async fn serve(
+    db: Arc<Database>,
+    broker: &InProcessBroker,
+    identity: Arc<FabricIdentity>,
+    tenant: &TenantId,
+) -> (
+    Arc<AtomicBool>,
+    tokio::task::JoinHandle<()>,
+    Arc<SyncServer>,
+) {
+    let node = identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            db,
+            broker.server_as(&node),
+            tenant.clone(),
+            node,
+            identity,
+        )
+        .expect("construct the authenticated sync endpoint"),
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let task = tokio::spawn({
+        let server = server.clone();
+        let stop = stop.clone();
+        async move {
+            server.run_until(stop).await;
+        }
+    });
+    broker
+        .wait_for_registered_route_for_test(&contextdb_server::subjects::push_subject(
+            tenant.as_str(),
+        ))
+        .await;
+    (stop, task, server)
+}
+async fn stop_server(
+    stop: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+    server: Arc<SyncServer>,
+) {
+    stop.store(true, Ordering::SeqCst);
+    task.await.unwrap();
+    drop(server);
+}
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn incremental_sync_samples(sizes: &[usize], nightly: bool, bootstrap: bool) {
+    // Rows carry their write time, and the push envelope encodes each payload
+    // byte at or above 0x80 in two bytes, so a live clock moves the measured
+    // peak with the millisecond. One fixed clock on this thread and on every
+    // runtime worker makes both sizes stamp the same bytes.
+    const FIXED_WALLCLOCK_MS: u64 = 1_800_000_000_000;
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| FIXED_WALLCLOCK_MS);
+    let runtime = super::outbound_declaration_walk_support::runtime();
+    let mut peaks = Vec::new();
+    let mut bootstrap_push_peaks = Vec::new();
+    let mut payloads = Vec::new();
+    for &occurrences in sizes {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("source.redb");
+        let hub_path = directory.path().join("hub.redb");
+        let source = Arc::new(open(&source_path));
+        let hub = Arc::new(open(&hub_path));
+        // Both sizes sign the same row lineages: a fixed fabric key and a
+        // fixed sync incarnation per store. A minted incarnation is random,
+        // and the signature over it is pushed as a byte array whose encoded
+        // size depends on its byte values, so the peaks would differ by noise.
+        let tenant = TenantId::from("declaration-summary-growth");
+        source
+            .pin_sync_incarnation_for_test(
+                &tenant,
+                Incarnation(0x5eed_0000_0000_0000_0000_0000_0000_0001),
+            )
+            .unwrap();
+        hub.pin_sync_incarnation_for_test(
+            &tenant,
+            Incarnation(0x5eed_0000_0000_0000_0000_0000_0000_0002),
+        )
+        .unwrap();
+        sql(
+            &source,
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT) SYNC TWO WAY",
+        );
+        for _ in 0..occurrences / 4 {
+            sql(
+                &source,
+                "CREATE TABLE unrelated (id INTEGER PRIMARY KEY) SYNC OFF",
+            );
+            sql(&source, "ALTER TABLE unrelated ADD COLUMN spare INTEGER");
+            sql(&source, "ALTER TABLE unrelated SET SYNC OFF");
+            sql(&source, "DROP TABLE unrelated");
+        }
+        sql(
+            &source,
+            "CREATE TABLE reincarnated (id INTEGER PRIMARY KEY) SYNC OFF",
+        );
+        sql(&source, "INSERT INTO reincarnated VALUES (10)");
+        sql(&source, "ALTER TABLE reincarnated SET SYNC PUSH ONLY");
+        sql(&source, "INSERT INTO reincarnated VALUES (20)");
+        sql(&source, "ALTER TABLE reincarnated SET SYNC PULL ONLY");
+        sql(&source, "INSERT INTO reincarnated VALUES (30)");
+        sql(&source, "DROP TABLE reincarnated");
+        sql(
+            &source,
+            "CREATE TABLE reincarnated (id INTEGER PRIMARY KEY) SYNC TWO WAY",
+        );
+        sql(&source, "INSERT INTO reincarnated VALUES (40)");
+        sql(
+            &source,
+            "CREATE TABLE held (id INTEGER PRIMARY KEY, owner INTEGER) SYNC TWO WAY",
+        );
+        sql(&source, "CREATE INDEX held_owner ON held (owner)");
+        sql(&source, "ALTER TABLE held SET MAINTAIN COUNT (owner)");
+        sql(&source, "ALTER TABLE held SET MAINTAIN COUNT NONE");
+        // A final deliverable data commit confirms every preceding declaration.
+        sql(&source, "INSERT INTO notes VALUES (1,'bootstrap')");
+        let source_identity = fixed_identity(directory.path(), "source.identity", 0x11);
+        let hub_identity = fixed_identity(directory.path(), "hub.identity", 0x22);
+        let broker = InProcessBroker::new();
+        let (stop, task, server) =
+            runtime.block_on(serve(hub.clone(), &broker, hub_identity.clone(), &tenant));
+        let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+            source.clone(),
+            broker.client_as(&source_identity.node_id()),
+            tenant.clone(),
+            source_identity.clone(),
+        )
+        .expect("construct the authenticated sync endpoint");
+        runtime.block_on(client.push()).unwrap();
+        runtime.block_on(client.pull_default()).unwrap();
+        // Pull installs received schema after the first push's watermark.
+        // Measure the first post-pull push separately, then the later data-only delta.
+        sql(
+            &source,
+            "UPDATE notes SET body = 'bootstrap-settled' WHERE id = 1",
+        );
+        sql(&source, "UPDATE notes SET body = 'bootstrap' WHERE id = 1");
+        let settled_frontier = source.current_lsn();
+        source.accountant().reset_high_water_for_test();
+        let bootstrap_baseline = source.accountant().usage().used;
+        runtime.block_on(client.push()).unwrap();
+        let bootstrap_peak = source
+            .accountant()
+            .high_water_for_test()
+            .checked_sub(bootstrap_baseline)
+            .unwrap();
+        bootstrap_push_peaks.push(bootstrap_peak);
+        eprintln!("INCREMENTAL_BOOTSTRAP declarations={occurrences} peak={bootstrap_peak}");
+        assert!(client.push_watermark() >= settled_frontier);
+        assert_eq!(
+            ids(&hub, "reincarnated"),
+            vec![vec![Value::Int64(40)]],
+            "dropped generation must not leak into its replacement"
+        );
+        assert_eq!(ids(&hub, "notes"), vec![vec![Value::Int64(1)]]);
+        assert_eq!(
+            source.table_meta("held").unwrap().maintained_counts,
+            Some(contextdb_core::MaintainedCounts::None)
+        );
+        drop(client);
+        runtime.block_on(stop_server(stop, task, server));
+        source.close().unwrap();
+        hub.close().unwrap();
+        drop(source);
+        drop(hub);
+
+        let source = Arc::new(open(&source_path));
+        let hub = Arc::new(open(&hub_path));
+        let broker = InProcessBroker::new();
+        let (stop, task, server) =
+            runtime.block_on(serve(hub.clone(), &broker, hub_identity.clone(), &tenant));
+        let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+            source.clone(),
+            broker.client_as(&source_identity.node_id()),
+            tenant.clone(),
+            source_identity.clone(),
+        )
+        .expect("construct the authenticated sync endpoint");
+        client.set_peer_vector_schema_support_for_test(false);
+        sql(&source, "INSERT INTO notes VALUES (2,'fixed-delta')");
+        sql(&source, "INSERT INTO held VALUES (99,7)");
+        // This phase contains data positions only, so declaration history may
+        // not be walked even though an actual earlier schema bootstrap did.
+        let ((pending, reads), work) = summaries(|| history(|| client.pending_push_change_count()));
+        assert_eq!(pending.unwrap(), 2);
+        assert_eq!(
+            work.direction_summary_reads, 2,
+            "one predecessor lookup for each distinct table/LSN"
+        );
+        assert_eq!(work.capability_summary_reads, 0);
+        assert_eq!(
+            reads.history.ddl_occurrences, 0,
+            "direction reduction must not walk unrelated immutable declarations"
+        );
+        source.accountant().reset_high_water_for_test();
+        let baseline = source.accountant().usage().used;
+        contextdb_engine::memory_accounting::watch_budget_ledger_for_test();
+        let ((result, reads), work) = summaries(|| history(|| runtime.block_on(client.push())));
+        let ledger = contextdb_engine::memory_accounting::take_budget_ledger_for_test();
+        let mut named = std::collections::BTreeMap::<String, (usize, usize, usize)>::new();
+        for entry in &ledger {
+            let sample = named.entry(entry.what.clone()).or_default();
+            sample.0 += 1;
+            sample.1 += entry.bytes;
+            sample.2 = sample.2.max(entry.used_after);
+        }
+        let result = result.unwrap();
+        let peak = source
+            .accountant()
+            .high_water_for_test()
+            .checked_sub(baseline)
+            .unwrap();
+        let source_peak = baseline + peak;
+        let peak_positions = ledger
+            .iter()
+            .enumerate()
+            .filter_map(|(position, entry)| (entry.used_after == source_peak).then_some(position))
+            .collect::<Vec<_>>();
+        for position in peak_positions {
+            let _first = position.saturating_sub(8);
+            let _last = (position + 9).min(ledger.len());
+        }
+        assert_eq!(
+            work.capability_summary_reads, 2,
+            "one capability point read for each changed table, including sticky held vocabulary"
+        );
+        assert_eq!(
+            reads.history.ddl_occurrences, 0,
+            "no DDL delta exists in this data-only phase"
+        );
+        assert_eq!(
+            result.applied_rows, 1,
+            "compatible fixed row still reaches the authenticated hub"
+        );
+        assert_eq!(
+            ids(&hub, "notes"),
+            vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+        );
+        assert!(
+            ids(&hub, "held").is_empty(),
+            "clearing a current count declaration must not erase immutable capability holdback"
+        );
+        assert!(
+            client
+                .schema_sync_holdbacks()
+                .iter()
+                .any(|held| held.table == "held"
+                    && held.capability == SchemaSyncCapability::MaintainedIndexCounts)
+        );
+        peaks.push(peak);
+        payloads.push((
+            ids(&hub, "notes"),
+            ids(&hub, "held"),
+            ids(&hub, "reincarnated"),
+        ));
+        drop(client);
+        runtime.block_on(stop_server(stop, task, server));
+        source.close().unwrap();
+        hub.close().unwrap();
+        drop(source);
+        drop(hub);
+
+        let source = Arc::new(open(&source_path));
+        let hub = Arc::new(open(&hub_path));
+        let broker = InProcessBroker::new();
+        let (stop, task, server) =
+            runtime.block_on(serve(hub.clone(), &broker, hub_identity, &tenant));
+        let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+            source.clone(),
+            broker.client_as(&source_identity.node_id()),
+            tenant.clone(),
+            source_identity,
+        )
+        .expect("construct the authenticated sync endpoint");
+        assert!(
+            client
+                .schema_sync_holdbacks()
+                .iter()
+                .any(|held| held.table == "held"
+                    && held.capability == SchemaSyncCapability::MaintainedIndexCounts),
+            "sticky holdback survives both peers reopening"
+        );
+        client.set_peer_vector_schema_support_for_test(true);
+        runtime.block_on(client.push()).unwrap();
+        runtime.block_on(client.pull_default()).unwrap();
+        assert_eq!(
+            ids(&hub, "held"),
+            vec![vec![Value::Int64(99)]],
+            "capability catchup resumes actual signed work"
+        );
+        assert!(client.schema_sync_holdbacks().is_empty());
+        assert_eq!(ids(&hub, "reincarnated"), vec![vec![Value::Int64(40)]]);
+        drop(client);
+        runtime.block_on(stop_server(stop, task, server));
+        source.close().unwrap();
+        hub.close().unwrap();
+    }
+    for pair in payloads.windows(2) {
+        assert_eq!(
+            pair[0], pair[1],
+            "unrelated immutable declarations cannot change the fixed authenticated payload"
+        );
+    }
+    let (phase, measured) = if bootstrap {
+        ("bootstrap", bootstrap_push_peaks.as_slice())
+    } else {
+        ("fixed_delta", peaks.as_slice())
+    };
+    assert_push_growth(phase, measured, nightly);
+}
+
+fn assert_push_growth(phase: &str, peaks: &[usize], nightly: bool) {
+    // A reply commit touches a bounded set of B-tree leaves plus their depth.
+    // Allow that logarithmic term while rejecting a retained per-declaration term.
+    const PAGE_INVOICE: i128 = 4_224;
+    let first_delta = peaks[1] as i128 - peaks[0] as i128;
+    if nightly {
+        let next_delta = peaks[2] as i128 - peaks[1] as i128;
+        eprintln!(
+            "INCREMENTAL_CURVATURE phase={phase} peaks={peaks:?} first_delta={first_delta} next_delta={next_delta} slack={}",
+            2 * PAGE_INVOICE
+        );
+        assert!(
+            next_delta <= first_delta + 2 * PAGE_INVOICE,
+            "declaration growth must add only a B-tree-depth term, not linear retained history: peaks={peaks:?}, first_delta={first_delta}, next_delta={next_delta}, slack={}",
+            2 * PAGE_INVOICE
+        );
+    } else {
+        eprintln!(
+            "INCREMENTAL_PR_BOUND phase={phase} peaks={peaks:?} delta={first_delta} bound={}",
+            8 * PAGE_INVOICE
+        );
+        assert!(
+            first_delta <= 8 * PAGE_INVOICE,
+            "{phase} push may add at most eight reply-commit page invoices: peaks={peaks:?}, delta={first_delta}, bound={}",
+            8 * PAGE_INVOICE
+        );
+    }
+}
+
+#[test]
+fn incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows() {
+    incremental_sync_samples(&[32, 256], false, true);
+}
+
+#[cfg(feature = "nightly-tests")]
+#[test]
+#[ignore = "incremental sync over a growing unrelated schema history does not finish within five minutes"]
+fn incremental_sync_charges_sublinear_memory_as_unrelated_ddl_history_grows() {
+    incremental_sync_samples(&[32, 256, 1_024], true, true);
+}
+
+// Separate rows keep both bounds visible; bootstrap of 2_048 still refuses at 64 MiB.
+#[test]
+fn incremental_sync_fixed_delta_charges_bounded_memory_as_unrelated_ddl_history_grows() {
+    incremental_sync_samples(&[32, 256], false, false);
+}
+
+#[cfg(feature = "nightly-tests")]
+#[test]
+#[ignore = "incremental sync of a fixed change over a growing unrelated schema history does not finish within five minutes"]
+fn incremental_sync_fixed_delta_charges_sublinear_memory_as_unrelated_ddl_history_grows() {
+    incremental_sync_samples(&[32, 256, 1_024], true, false);
+}

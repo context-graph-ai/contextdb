@@ -158,7 +158,7 @@ fn cte_params() -> HashMap<String, Value> {
 }
 
 fn answer(result: &QueryResult) -> String {
-    format!("columns={:?} rows={:?}", result.columns, result.rows)
+    format!("columns={:?} rows={:?}", result.columns(), result.rows())
 }
 
 #[test]
@@ -169,12 +169,12 @@ fn a_neighbour_search_over_candidates_a_named_query_produced_answers_through_a_b
         .execute(CTE_NEIGHBOURS, &cte_params())
         .expect("the executor answers the candidate-filtered neighbour search");
     assert_eq!(
-        eager.rows.len(),
+        eager.rows().len(),
         2,
         "the fixture keeps two candidates after the named queries have narrowed them"
     );
     let names: Vec<String> = eager
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(1) {
             Some(Value::Text(name)) => name.clone(),

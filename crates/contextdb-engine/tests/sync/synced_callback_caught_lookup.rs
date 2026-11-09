@@ -21,6 +21,10 @@ struct Calls {
     missing: AtomicUsize,
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn register_callback(db: &Database, parent_id: i64, calls: Arc<Calls>) {
     db.register_transactional_trigger_callback("prepare_received", move |handle, context| {
         // A genuinely absent table remains an ordinary error that the callback
@@ -101,6 +105,10 @@ fn unit() -> ChangeSet {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn apply(db: &Database) -> contextdb_core::Result<contextdb_engine::sync_types::ApplyResult> {
     db.apply_changes(
         unit(),
@@ -112,13 +120,13 @@ fn assert_control(db: &Database) {
     assert_eq!(
         db.execute("SELECT id, body FROM unrelated", &empty())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(99), Value::Text("preserved".to_owned())]]
     );
     assert_eq!(
         db.execute("SELECT id FROM received_parent", &empty())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(7)]]
     );
 }
@@ -132,13 +140,13 @@ fn assert_absent(db: &Database, before: Lsn) {
     assert!(
         db.execute("SELECT id FROM received_source", &empty())
             .unwrap()
-            .rows
+            .rows()
             .is_empty()
     );
     assert!(
         db.execute("SELECT id FROM received_derived", &empty())
             .unwrap()
-            .rows
+            .rows()
             .is_empty()
     );
     assert!(
@@ -148,7 +156,9 @@ fn assert_absent(db: &Database, before: Lsn) {
             .iter()
             .all(|column| column.name != "note")
     );
-    let log = db.changes_since(before);
+    let log = db
+        .changes_since(before)
+        .expect("read or construct the declared fixture result");
     assert!(log.rows.is_empty());
     assert!(log.ddl.is_empty());
     assert_control(db);
@@ -158,16 +168,18 @@ fn assert_complete(db: &Database, before: Lsn) {
     assert_eq!(
         db.execute("SELECT id, note FROM received_source", &empty())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1), Value::Null]]
     );
     assert_eq!(
         db.execute("SELECT id, parent_id FROM received_derived", &empty())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1), Value::Int64(7)]]
     );
-    let log = db.changes_since(before);
+    let log = db
+        .changes_since(before)
+        .expect("read or construct the declared fixture result");
     assert_eq!(
         log.rows.len(),
         2,

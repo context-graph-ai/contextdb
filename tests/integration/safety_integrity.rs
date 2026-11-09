@@ -108,7 +108,7 @@ fn si_01_mixed_recovery_survives_crash_and_hides_uncommitted_work() {
     )
     .unwrap();
     db.commit(tx).unwrap();
-    assert_eq!(db.change_log_since(Lsn(0)).len(), 5);
+    assert_eq!(db.change_log_since(Lsn(0)).unwrap().len(), 5);
     drop(db);
 
     let reopened = Database::open(&path).unwrap();
@@ -163,7 +163,7 @@ fn si_01_mixed_recovery_survives_crash_and_hides_uncommitted_work() {
             .iter()
             .any(|(rid, _)| *rid == committed_child_rid)
     );
-    assert_eq!(reopened.change_log_since(Lsn(0)).len(), 5);
+    assert_eq!(reopened.change_log_since(Lsn(0)).unwrap().len(), 5);
 
     let tx2 = reopened.begin_or_panic();
     let ghost = Uuid::new_v4();
@@ -215,27 +215,40 @@ fn si_01_mixed_recovery_survives_crash_and_hides_uncommitted_work() {
         )
         .unwrap();
     assert!(ghost_vectors.iter().all(|(rid, _)| *rid != ghost_rid));
-    assert_eq!(reopened_again.change_log_since(Lsn(0)).len(), 5);
+    assert_eq!(reopened_again.change_log_since(Lsn(0)).unwrap().len(), 5);
 }
 
 // si_07 and si_08 are retired as separate placeholders.
 // Their graph/vector crash-reopen intent is covered by si_01 and the existing p24/p25 persistence guards.
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn si_09_reopen_preserves_configured_memory_limit() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("memory-limit.db");
+    // SETUP: room to open a store and declare a table in it: the page cache
+    // floor and the exact-probe filters a table with a key reserves, both the
+    // engine's own figures. BOUND: a row twice the size of the whole limit.
+    let limit =
+        contextdb_engine::page_cache_floor_bytes() + 4 * contextdb_core::EXACT_PROBE_FILTER_BYTES;
+    assert_eq!(limit % 1024, 0, "the limit is written to SET in KiB");
     let db = Database::open(&path).unwrap();
-    db.execute("SET MEMORY_LIMIT '1K'", &HashMap::new())
-        .unwrap();
+    db.execute(
+        &format!("SET MEMORY_LIMIT '{}K'", limit / 1024),
+        &HashMap::new(),
+    )
+    .unwrap();
     db.close().unwrap();
 
     let reopened = Database::open(&path).unwrap();
     let show = reopened
         .execute("SHOW MEMORY_LIMIT", &HashMap::new())
         .unwrap();
-    assert_eq!(show.rows.len(), 1);
-    assert_eq!(show.rows[0][0], Value::Int64(1024));
+    assert_eq!(show.rows().len(), 1);
+    assert_eq!(show.rows()[0][0], Value::Int64(limit as i64));
 
     let err = reopened
         .execute(
@@ -247,7 +260,7 @@ fn si_09_reopen_preserves_configured_memory_limit() {
                 "INSERT INTO big (id, payload) VALUES ($id, $payload)",
                 &make_params(vec![
                     ("id", Value::Uuid(Uuid::new_v4())),
-                    ("payload", Value::Text("x".repeat(4096))),
+                    ("payload", Value::Text("x".repeat(limit * 2))),
                 ]),
             )
         })

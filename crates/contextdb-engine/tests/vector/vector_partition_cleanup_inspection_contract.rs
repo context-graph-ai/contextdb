@@ -4,9 +4,8 @@
 //! accounting. Deterministic lifecycle inspection checks retained states and the
 //! operator's recovery action without substituting guessed counters.
 
-use contextdb_core::{Error, Value, VectorIndexRef, VectorPartitionKey};
+use contextdb_core::{Error, Value, VectorIndexRef};
 use contextdb_engine::{Database, MaintenancePolicy, QueryResult};
-use contextdb_vector::VectorPartitionRef;
 use std::collections::HashMap;
 use std::sync::{Arc, Barrier};
 use tempfile::TempDir;
@@ -26,9 +25,11 @@ const INDEX_COLUMNS: &[&str] = &[
     "search_mode",
     "declared_auto_index_at",
     "effective_auto_index_at",
-    "declared_hnsw_m",
-    "declared_hnsw_ef_construction",
-    "declared_hnsw_ef_search",
+    "declared_target_accuracy",
+    "declared_expected_vectors",
+    "declared_lists",
+    "declared_probes",
+    "declared_refine_factor",
     "declared_consolidation_mode",
     "declared_consolidation_change_percent",
     "declared_consolidation_tombstone_percent",
@@ -44,6 +45,8 @@ const INDEX_COLUMNS: &[&str] = &[
     "durable_index_bytes",
     "charged_index_bytes",
     "query_state",
+    "indexed_available",
+    "objective_status",
     "maintenance_state",
     "maintenance_vectors_total",
     "maintenance_vectors_done",
@@ -58,6 +61,8 @@ const INDEX_COLUMNS: &[&str] = &[
     "broad_route_vectors_remaining",
     "broad_route_reason",
     "broad_route_recovery_action",
+    "recovery_action",
+    "state",
 ];
 
 const PARTITION_COLUMNS: &[&str] = &[
@@ -82,12 +87,15 @@ const PARTITION_COLUMNS: &[&str] = &[
     "maintenance_vectors_done",
     "maintenance_vectors_remaining",
     "maintenance_checkpoint_tx",
-    "desired_hnsw_m",
-    "desired_hnsw_ef_construction",
-    "desired_hnsw_ef_search",
-    "serving_hnsw_m",
-    "serving_hnsw_ef_construction",
-    "serving_hnsw_ef_search",
+    "indexed_available",
+    "codebook_identity",
+    "objective_status",
+    "lists",
+    "lists_source",
+    "probes",
+    "probes_source",
+    "refine_factor",
+    "refine_factor_source",
     "declared_consolidation_mode",
     "declared_consolidation_change_percent",
     "declared_consolidation_tombstone_percent",
@@ -97,6 +105,7 @@ const PARTITION_COLUMNS: &[&str] = &[
     "desired_policy_revision",
     "serving_policy_revision",
     "recovery_action",
+    "state",
 ];
 
 fn empty() -> HashMap<String, Value> {
@@ -112,15 +121,15 @@ fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
 
 fn column(result: &QueryResult, name: &str) -> usize {
     result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == name)
-        .unwrap_or_else(|| panic!("inspection has {name}: {:?}", result.columns))
+        .unwrap_or_else(|| panic!("inspection has {name}: {:?}", result.columns()))
 }
 
 fn value<'a>(result: &'a QueryResult, row: usize, name: &str) -> &'a Value {
     result
-        .rows
+        .rows()
         .get(row)
         .and_then(|row| row.get(column(result, name)))
         .unwrap_or_else(|| panic!("inspection has row {row} and {name}: {result:?}"))
@@ -144,7 +153,7 @@ fn scope_key(scope: &str) -> Value {
 }
 
 fn assert_index_presence(result: &QueryResult, table: &str, column_name: &str, expected: bool) {
-    let present = result.rows.iter().any(|row| {
+    let present = result.rows().iter().any(|row| {
         row[column(result, "table")] == Value::Text(table.to_owned())
             && row[column(result, "column")] == Value::Text(column_name.to_owned())
     });
@@ -191,7 +200,7 @@ fn held_snapshot_blocks_at_cap_key_move_then_cleanup_admits_it_and_inspects_stab
     }
 
     let snapshot = db.snapshot();
-    let pin = db.pin_snapshot(snapshot);
+    let pin = db.pin_snapshot(snapshot).unwrap();
     let refusal = db
         .execute(
             "UPDATE partition_items SET scope = 'charlie' WHERE id = $id",
@@ -214,7 +223,10 @@ fn held_snapshot_blocks_at_cap_key_move_then_cleanup_admits_it_and_inspects_stab
             &params(vec![("id", Value::Uuid(first))]),
         )
         .expect("read the refused row");
-    assert_eq!(unchanged.rows, vec![vec![Value::Text("alpha".to_owned())]]);
+    assert_eq!(
+        unchanged.rows(),
+        vec![vec![Value::Text("alpha".to_owned())]]
+    );
     drop(pin);
 
     db.execute(
@@ -225,27 +237,27 @@ fn held_snapshot_blocks_at_cap_key_move_then_cleanup_admits_it_and_inspects_stab
 
     let partitions = partition_rows(&db, "partition_items", "embedding");
     assert_eq!(
-        partitions.columns,
+        partitions.columns(),
         PARTITION_COLUMNS
             .iter()
             .map(|name| (*name).to_owned())
             .collect::<Vec<_>>(),
         "partition inspection has one fixed public shape"
     );
-    assert_eq!(partitions.rows.len(), 2);
+    assert_eq!(partitions.rows().len(), 2);
     assert_eq!(value(&partitions, 0, "partition_key"), &scope_key("bravo"));
     assert_eq!(
         value(&partitions, 1, "partition_key"),
         &scope_key("charlie")
     );
-    for row in 0..partitions.rows.len() {
+    for row in 0..partitions.rows().len() {
         assert_eq!(value(&partitions, row, "live_rows"), &Value::Int64(1));
         assert_eq!(value(&partitions, row, "retained_rows"), &Value::Int64(0));
     }
 
     let summary = index_rows(&db);
     assert_eq!(
-        summary.columns,
+        summary.columns(),
         INDEX_COLUMNS
             .iter()
             .map(|name| (*name).to_owned())
@@ -253,7 +265,7 @@ fn held_snapshot_blocks_at_cap_key_move_then_cleanup_admits_it_and_inspects_stab
         "whole-index inspection has one fixed public shape"
     );
     let row = summary
-        .rows
+        .rows()
         .iter()
         .position(|row| {
             row[column(&summary, "table")] == Value::Text("partition_items".to_owned())
@@ -340,15 +352,15 @@ fn concurrent_first_partitions_share_one_atomic_cap_admission() {
             &empty(),
         )
         .expect("read the one committed winner");
-    assert_eq!(rows.rows.len(), 1, "the losing row never commits");
+    assert_eq!(rows.rows().len(), 1, "the losing row never commits");
     assert!(
-        rows.rows
+        rows.rows()
             .iter()
             .all(|row| row.first() != Some(&Value::Uuid(refused.0))),
         "the typed refusal rolls back the losing relational row"
     );
     let partitions = partition_rows(&db, "concurrent_partition_items", "embedding");
-    assert_eq!(partitions.rows.len(), 1);
+    assert_eq!(partitions.rows().len(), 1);
     assert_eq!(value(&partitions, 0, "live_rows"), &Value::Int64(1));
     assert_eq!(value(&partitions, 0, "retained_rows"), &Value::Int64(0));
 }
@@ -408,14 +420,14 @@ fn second_vector_column_cap_refusal_rolls_back_the_row_and_both_columns() {
             &params(vec![("id", Value::Uuid(refused_id))]),
         )
         .unwrap()
-        .rows
+        .rows()
         .is_empty(),
         "the row is absent after vector admission fails"
     );
     for column_name in ["embedding_a", "embedding_b"] {
         let partitions = partition_rows(&db, "two_column_partition_items", column_name);
         assert_eq!(
-            partitions.rows.len(),
+            partitions.rows().len(),
             1,
             "{column_name} keeps only its original partition"
         );
@@ -425,7 +437,7 @@ fn second_vector_column_cap_refusal_rolls_back_the_row_and_both_columns() {
 }
 
 #[test]
-fn cap_admission_keeps_every_untouched_live_partition_indexed_and_counted() {
+fn cap_admission_keeps_every_untouched_live_partition_searchable_and_counted() {
     let root = TempDir::new().expect("temporary vector store directory");
     let path = root.path().join("live-cap-admission.db");
     let db = Database::open(&path).expect("open file-backed cap fixture");
@@ -435,7 +447,7 @@ fn cap_admission_keeps_every_untouched_live_partition_indexed_and_counted() {
             id UUID PRIMARY KEY,
             scope TEXT NOT NULL,
             embedding VECTOR(3) PARTITION_KEY (scope) MAX_PARTITIONS 3
-                SEARCH_MODE INDEXED AUTO_INDEX_AT 1
+                SEARCH_MODE EXACT
         ) SYNC OFF",
         &empty(),
     )
@@ -456,14 +468,6 @@ fn cap_admission_keeps_every_untouched_live_partition_indexed_and_counted() {
         )
         .expect("seed one live partition");
     }
-    assert_eq!(
-        db.run_maintenance_cycle()
-            .expect("build both initially populated partitions")
-            .vector
-            .built_partitions,
-        2
-    );
-
     let charlie = Uuid::from_u128(0x363);
     db.execute(
         "INSERT INTO live_cap_items (id, scope, embedding) \
@@ -474,14 +478,6 @@ fn cap_admission_keeps_every_untouched_live_partition_indexed_and_counted() {
         ]),
     )
     .expect("the third live partition is admitted at the declared boundary");
-    assert_eq!(
-        db.run_maintenance_cycle()
-            .expect("build the admitted boundary partition")
-            .vector
-            .built_partitions,
-        1
-    );
-
     let refusal = db
         .execute(
             "INSERT INTO live_cap_items (id, scope, embedding) \
@@ -500,43 +496,32 @@ fn cap_admission_keeps_every_untouched_live_partition_indexed_and_counted() {
         }
     ));
 
-    let index = VectorIndexRef::new("live_cap_items", "embedding");
     let expected = seeded
         .into_iter()
         .chain([(charlie, "charlie", vec![0.0, 0.0, 1.0])]);
     for (id, scope, query) in expected {
-        let key = VectorPartitionKey::from_values(&[Value::Text(scope.to_owned())])
-            .expect("scope has a canonical partition key");
-        let info = db
-            .vector_store_for_test()
-            .partition_info(&index, &key)
-            .expect("the live partition keeps its inspection state");
-        assert!(
-            info.graph_available,
-            "untouched live partition {scope} keeps its indexed route"
-        );
         let result = db
             .execute(
                 "SELECT id FROM live_cap_items WHERE scope = $scope \
-                 ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 1",
+                 ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 1",
                 &params(vec![
                     ("scope", Value::Text(scope.to_owned())),
                     ("query", Value::Vector(query)),
                 ]),
             )
-            .expect("the retained indexed route remains searchable");
-        assert_eq!(result.rows, vec![vec![Value::Uuid(id)]]);
+            .expect("the live partition remains searchable");
+        assert_eq!(result.rows(), vec![vec![Value::Uuid(id)]]);
     }
 
     let partitions = partition_rows(&db, "live_cap_items", "embedding");
-    assert_eq!(partitions.rows.len(), 3);
-    assert!(partitions.rows.iter().all(|row| {
+    assert_eq!(partitions.rows().len(), 3);
+    assert!(partitions.rows().iter().all(|row| {
         row[column(&partitions, "live_rows")] == Value::Int64(1)
-            && row[column(&partitions, "query_state")] == Value::Text("ready".to_owned())
+            && row[column(&partitions, "query_state")] == Value::Text("exact".to_owned())
     }));
     let indexes = index_rows(&db);
     let row = indexes
-        .rows
+        .rows()
         .iter()
         .position(|row| row[column(&indexes, "table")] == Value::Text("live_cap_items".to_owned()))
         .expect("whole-index inspection contains the cap fixture");
@@ -575,7 +560,7 @@ fn historical_only_partition_stays_inspectable_and_counted_until_unpin() {
     )
     .expect("seed the sole partition");
 
-    let pin = db.pin_snapshot(db.snapshot());
+    let pin = db.pin_snapshot(db.snapshot()).unwrap();
     db.execute(
         "DELETE FROM retained_partition_items WHERE id = $id",
         &params(vec![("id", Value::Uuid(alpha))]),
@@ -583,7 +568,7 @@ fn historical_only_partition_stays_inspectable_and_counted_until_unpin() {
     .expect("delete the last live vector while its old image is pinned");
 
     let retained = partition_rows(&db, "retained_partition_items", "embedding");
-    assert_eq!(retained.rows.len(), 1);
+    assert_eq!(retained.rows().len(), 1);
     assert_eq!(value(&retained, 0, "partition_key"), &scope_key("alpha"));
     assert_eq!(value(&retained, 0, "live_rows"), &Value::Int64(0));
     assert_eq!(value(&retained, 0, "retained_rows"), &Value::Int64(1));
@@ -609,7 +594,7 @@ fn historical_only_partition_stays_inspectable_and_counted_until_unpin() {
     db.run_maintenance_cycle()
         .expect("the first post-unpin maintenance pass retires historical-only state");
     let retired = partition_rows(&db, "retained_partition_items", "embedding");
-    assert_eq!(retired.rows.len(), 0);
+    assert_eq!(retired.rows().len(), 0);
     db.execute(
         "INSERT INTO retained_partition_items (id, scope, embedding) \
          VALUES ($id, 'beta', $embedding)",
@@ -620,247 +605,14 @@ fn historical_only_partition_stays_inspectable_and_counted_until_unpin() {
     )
     .expect("after unpin the retired partition releases its slot");
     let released = partition_rows(&db, "retained_partition_items", "embedding");
-    assert_eq!(released.rows.len(), 1);
+    assert_eq!(released.rows().len(), 1);
     assert_eq!(value(&released, 0, "partition_key"), &scope_key("beta"));
 }
 
-#[test]
-fn file_backed_retirement_releases_a_snapshot_free_slot_while_a_sibling_tail_stays_active() {
-    let root = TempDir::new().expect("temporary vector store directory");
-    let path = root.path().join("continuous-sibling-retirement.db");
-    let db = Database::open(&path).expect("open file-backed retirement fixture");
-    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-    db.execute(
-        "CREATE TABLE retirement_items (
-            id UUID PRIMARY KEY,
-            scope TEXT NOT NULL,
-            embedding VECTOR(3) PARTITION_KEY (scope) MAX_PARTITIONS 2 AUTO_INDEX_AT 1
-                CONSOLIDATION (CHANGE_PERCENT = 100, TOMBSTONE_PERCENT = 100)
-        ) SYNC OFF",
-        &empty(),
-    )
-    .expect("create a durable two-slot partitioned table");
-    let alpha = Uuid::from_u128(0x401);
-    let bravo = Uuid::from_u128(0x402);
-    for (id, scope, embedding) in [
-        (alpha, "alpha", vec![1.0, 0.0, 0.0]),
-        (bravo, "bravo", vec![0.0, 1.0, 0.0]),
-    ] {
-        db.execute(
-            "INSERT INTO retirement_items (id, scope, embedding) VALUES ($id, $scope, $embedding)",
-            &params(vec![
-                ("id", Value::Uuid(id)),
-                ("scope", Value::Text(scope.to_owned())),
-                ("embedding", Value::Vector(embedding)),
-            ]),
-        )
-        .expect("seed one occupied partition");
-    }
-    let initial = db
-        .run_maintenance_cycle()
-        .expect("one wake builds every never-built partition");
-    assert_eq!(initial.vector.built_partitions, 2);
-    assert_eq!(
-        initial.vector.built_indexes, 1,
-        "two partitions built for one vector column count as one built index"
-    );
-
-    let held = db.pin_snapshot(db.snapshot());
-    db.execute(
-        "DELETE FROM retirement_items WHERE id = $id",
-        &params(vec![("id", Value::Uuid(alpha))]),
-    )
-    .expect("delete alpha's last vector while its old image is pinned");
-    db.execute(
-        "INSERT INTO retirement_items (id, scope, embedding) VALUES ($id, 'bravo', $embedding)",
-        &params(vec![
-            ("id", Value::Uuid(Uuid::from_u128(0x403))),
-            ("embedding", Value::Vector(vec![0.0, 0.9, 0.1])),
-        ]),
-    )
-    .expect("leave bravo with a live unconsolidated tail");
-    let retained = partition_rows(&db, "retirement_items", "embedding");
-    let alpha_row = retained
-        .rows
-        .iter()
-        .position(|row| row[column(&retained, "partition_key")] == scope_key("alpha"))
-        .expect("alpha remains visible while pinned");
-    let bravo_row = retained
-        .rows
-        .iter()
-        .position(|row| row[column(&retained, "partition_key")] == scope_key("bravo"))
-        .expect("bravo remains visible");
-    assert_eq!(
-        value(&retained, alpha_row, "retained_rows"),
-        &Value::Int64(1)
-    );
-    assert_eq!(
-        value(&retained, alpha_row, "tombstones"),
-        &Value::Int64(1),
-        "alpha's final delete remains pending while its old snapshot is pinned"
-    );
-    assert_eq!(
-        value(&retained, bravo_row, "pending_inserts"),
-        &Value::Int64(1)
-    );
-    let alpha_route = VectorPartitionRef::new(
-        VectorIndexRef::new("retirement_items", "embedding"),
-        VectorPartitionKey::from_values(&[Value::Text("alpha".to_owned())]).unwrap(),
-    );
-    let alpha_journal = db.__debug_vector_partition_journal_file_for_test(&alpha_route);
-    assert!(
-        alpha_journal
-            .physical_record_lsns
-            .iter()
-            .any(|lsn| *lsn > alpha_journal.truncated_through_lsn),
-        "alpha's final delete remains physically uncovered before the release wake: {alpha_journal:?}"
-    );
-    let before_release = db.vector_memory_ownership_receipt_for_test();
-    assert!(
-        before_release.base_graph > 0,
-        "the retained alpha route owns charged graph bytes before release"
-    );
-    drop(held);
-
-    let cycle = db
-        .run_maintenance_cycle()
-        .expect("the next wake represents alpha's delete and retires it despite bravo's tail");
-    assert_eq!(
-        cycle.vector.built_partitions, 1,
-        "bravo stays below its declared consolidation threshold"
-    );
-    let released = partition_rows(&db, "retirement_items", "embedding");
-    assert_eq!(released.rows.len(), 1, "alpha's inspection row is released");
-    assert_eq!(value(&released, 0, "partition_key"), &scope_key("bravo"));
-    assert_eq!(value(&released, 0, "pending_inserts"), &Value::Int64(1));
-    assert_eq!(
-        value(&released, 0, "maintenance_reason"),
-        &Value::Text("none".to_owned()),
-        "a healthy tail below both declared thresholds is not maintenance work"
-    );
-    assert_eq!(
-        value(&released, 0, "recovery_action"),
-        &Value::Text("none".to_owned())
-    );
-    let after_release = db.vector_memory_ownership_receipt_for_test();
-    assert!(
-        after_release.base_graph <= before_release.base_graph,
-        "retirement cannot increase charged base-graph ownership"
-    );
-    let alpha_status = db
-        .vector_store_for_test()
-        .partition_graph_generation_status(&alpha_route)
-        .expect("raw historical alpha state remains addressable to the lifecycle seam");
-    assert!(
-        alpha_status.base.is_none()
-            && alpha_status.change.is_none()
-            && alpha_status.dormant_base.is_none()
-            && alpha_status.dormant_change.is_none()
-            && !alpha_status.base_resident
-            && !alpha_status.change_resident,
-        "retirement releases every charged and reloadable alpha graph owner: {alpha_status:?}"
-    );
-
-    db.execute(
-        "INSERT INTO retirement_items (id, scope, embedding) VALUES ($id, 'charlie', $embedding)",
-        &params(vec![
-            ("id", Value::Uuid(Uuid::from_u128(0x404))),
-            ("embedding", Value::Vector(vec![0.0, 0.0, 1.0])),
-        ]),
-    )
-    .expect("alpha's released MAX_PARTITIONS slot admits charlie");
-    let reused = partition_rows(&db, "retirement_items", "embedding");
-    assert_eq!(reused.rows.len(), 2);
-    assert!(
-        reused
-            .rows
-            .iter()
-            .any(|row| { row[column(&reused, "partition_key")] == scope_key("charlie") })
-    );
-}
-
-#[test]
-fn explicit_storage_compaction_cannot_retire_the_index_needed_by_a_pinned_old_snapshot() {
-    let root = TempDir::new().expect("temporary vector store directory");
-    let path = root.path().join("compaction-old-snapshot.db");
-    let db = Database::open(&path).expect("open file-backed snapshot fixture");
-    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-    db.execute(
-        "CREATE TABLE snapshot_items (
-            id UUID PRIMARY KEY,
-            scope TEXT NOT NULL,
-            embedding VECTOR(3) PARTITION_KEY (scope) MAX_PARTITIONS 2
-                SEARCH_MODE INDEXED AUTO_INDEX_AT 1
-                CONSOLIDATION (CHANGE_PERCENT = 100, TOMBSTONE_PERCENT = 100)
-        ) SYNC OFF",
-        &empty(),
-    )
-    .expect("create a durable snapshot fixture");
-    let id = Uuid::from_u128(0x501);
-    db.execute(
-        "INSERT INTO snapshot_items (id, scope, embedding) VALUES ($id, 'alpha', $embedding)",
-        &params(vec![
-            ("id", Value::Uuid(id)),
-            ("embedding", Value::Vector(vec![1.0, 0.0, 0.0])),
-        ]),
-    )
-    .expect("seed alpha");
-    assert_eq!(
-        db.run_maintenance_cycle().unwrap().vector.built_partitions,
-        1
-    );
-    let old_snapshot = db.snapshot();
-    let old_pin = db.pin_snapshot(old_snapshot);
-    db.execute(
-        "DELETE FROM snapshot_items WHERE id = $id",
-        &params(vec![("id", Value::Uuid(id))]),
-    )
-    .expect("delete the final live vector after the old snapshot");
-    db.run_maintenance_cycle()
-        .expect("publish the delete-only generation while the old snapshot keeps its route");
-
-    db.compact_now()
-        .expect("run explicit storage compaction through its production door");
-    let index = VectorIndexRef::new("snapshot_items", "embedding");
-    let alpha_key = VectorPartitionKey::from_values(&[Value::Text("alpha".to_owned())])
-        .expect("canonical alpha partition key");
-    assert!(
-        !db.vector_store_for_test()
-            .raw_partition_resident_for_test(&index, &alpha_key),
-        "explicit compaction evicts alpha's reloadable raw bodies"
-    );
-    db.run_maintenance_cycle()
-        .expect("the idle retirement pass consults the eviction-proof directory");
-    let retained = partition_rows(&db, "snapshot_items", "embedding");
-    assert_eq!(retained.rows.len(), 1);
-    assert_eq!(value(&retained, 0, "retained_rows"), &Value::Int64(1));
-    assert!(
-        !matches!(value(&retained, 0, "base_generation"), Value::Null),
-        "the retained old-snapshot route keeps a generation after raw-body eviction"
-    );
-    let result = db
-        .execute_at_snapshot(
-            "SELECT id FROM snapshot_items WHERE scope = 'alpha' \
-             ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 1",
-            &params(vec![("query", Value::Vector(vec![1.0, 0.0, 0.0]))]),
-            old_snapshot,
-        )
-        .expect("the already-open snapshot retains its compatible indexed route");
-    assert_eq!(result.rows, vec![vec![Value::Uuid(id)]]);
-    drop(old_pin);
-    db.run_maintenance_cycle()
-        .expect("a later unpinned pass may retire the route");
-    assert!(
-        partition_rows(&db, "snapshot_items", "embedding")
-            .rows
-            .is_empty()
-    );
-}
-
-/// A populated partition with no maintained graph reports initial construction
+/// A populated partition with no index reports that it is answered exactly
 /// and the operator's next action through ordinary lifecycle inspection.
 #[test]
-fn inspection_names_the_lifecycle_of_a_populated_unavailable_partition() {
+fn inspection_names_the_lifecycle_of_a_populated_partition_with_no_index() {
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE lifecycle_inspection (
@@ -881,15 +633,11 @@ fn inspection_names_the_lifecycle_of_a_populated_unavailable_partition() {
     .expect("create one partition waiting for its first maintained route");
 
     let partitions = partition_rows(&db, "lifecycle_inspection", "embedding");
-    assert_eq!(partitions.rows.len(), 1);
+    assert_eq!(partitions.rows().len(), 1);
     assert_eq!(
         value(&partitions, 0, "query_state"),
-        &Value::Text("unavailable".to_owned())
-    );
-    assert_eq!(
-        value(&partitions, 0, "availability_reason"),
-        &Value::Text("initial_build".to_owned()),
-        "an unavailable first-build partition must name initial build rather than leave an operator guessing"
+        &Value::Text("exact".to_owned()),
+        "a populated partition with no index is answered exactly and says so"
     );
     assert!(
         matches!(
@@ -973,7 +721,7 @@ fn rename_then_drop_removes_the_only_vector_identity_after_reopen_and_releases_m
             &params(vec![("query", Value::Vector(vec![1.0, 0.0, 0.0]))]),
         )
         .expect("renamed vector remains searchable after reopen");
-    assert_eq!(found.rows, vec![vec![Value::Uuid(id)]]);
+    assert_eq!(found.rows(), vec![vec![Value::Uuid(id)]]);
     assert!(matches!(
         reopened.execute(
             "SELECT id FROM cleanup_items ORDER BY embedding <=> $query LIMIT 1",

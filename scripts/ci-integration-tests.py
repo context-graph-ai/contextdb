@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -57,8 +58,8 @@ class IntegrationControls(unittest.TestCase):
             'schema-replay-work-limited-to-affected-tables': ('schema replay / work limited to affected tables', 'custody_schema_replay_work_limited_to_affected_tables'),
             'schema-replay-identical-schema-does-no-artifact-work': ('schema replay / identical schema avoids rebuilding data', 'custody_schema_replay_identical_schema_does_no_artifact_work'),
         }
-        self.assertEqual(len(i.matrix(self.rows, False)['include']), 32)
-        self.assertEqual(len(i.matrix(self.rows, True)['include']), 36)
+        self.assertEqual(len(i.matrix(self.rows, False)['include']), 25)
+        self.assertEqual(len(i.matrix(self.rows, True)['include']), 29)
         path = ROOT / 'scripts/ci-integration-targets.json'
         original = json.loads(path.read_text()); read = Path.read_text
         for slice_id, (family, target) in expected.items():
@@ -90,74 +91,34 @@ class IntegrationControls(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'three separate named slices'):
                     i.load_manifest()
 
-    def test_vector_corpora_are_four_required_jobs_with_exact_metadata(self):
-        self.assertEqual(len(i.matrix(self.rows, False)['include']), 32)
-        self.assertEqual(len(i.matrix(self.rows, True)['include']), 36)
-        for slice_id, (family, target) in i.VECTOR_PROFILE_SLICES.items():
-            row = next(r for r in self.rows if r['id'] == slice_id)
-            self.assertEqual(row, dict(id=slice_id, family=family, kind='engine-tests', targets=[target]))
-            self.assertEqual(i.metadata(row), dict(features='nightly-tests,test-seams,iroh',
-                profile='test-profile', name=f'engine / test-profile / {family}', test_threads='1'))
-            self.assertEqual(i.commands(row), [['cargo', 'test', '--locked', '-p', 'contextdb-engine',
-                '--features', 'nightly-tests,test-seams,iroh', '--test', target, '--', '--test-threads=1']])
-            for default in (False, True):
-                for mutation in ('missing', 'duplicate', 'wrong-name', 'wrong-id'):
-                    bad = self.needs(default=default)
-                    matrix = json.loads(bad['plan']['outputs']['matrix'])
-                    item = next(r for r in matrix['include'] if r['id'] == slice_id)
-                    if mutation == 'missing': matrix['include'].remove(item)
-                    elif mutation == 'duplicate': matrix['include'].append(copy.deepcopy(item))
-                    elif mutation == 'wrong-name': item['name'] += ' changed'
-                    else: item['id'] = 'wrong-profile'
-                    bad['plan']['outputs']['matrix'] = json.dumps(matrix)
-                    with self.subTest(slice_id=slice_id, default=default, mutation=mutation), self.assertRaises(ValueError):
-                        i.required(bad, self.rows, True, default)
-
-    def test_vector_manifest_rejects_missing_duplicate_combined_and_wrong_mapping(self):
-        path = ROOT / 'scripts/ci-integration-targets.json'
-        original = json.loads(path.read_text()); read = Path.read_text
-        for slice_id in i.VECTOR_PROFILE_SLICES:
-            for mutation in ('missing', 'duplicate', 'combined', 'wrong-target', 'optional', 'wrong-label'):
-                data = copy.deepcopy(original)
-                row = next(r for r in data['slices'] if r['id'] == slice_id)
-                if mutation in ('missing', 'combined'):
-                    data['slices'].remove(row)
-                    if mutation == 'combined': data['slices'][0]['targets'].extend(row['targets'])
-                elif mutation == 'duplicate': data['slices'].append(copy.deepcopy(row))
-                elif mutation == 'wrong-target': row['targets'] = ['vector_graph_route_profile_quality']
-                elif mutation == 'optional': row['kind'] = 'production'
-                else: row['family'] += ' changed'
-                with self.subTest(slice_id=slice_id, mutation=mutation), patch.object(
-                        Path, 'read_text', lambda p, *a, **kw: json.dumps(data) if p == path else read(p, *a, **kw)):
-                    with self.assertRaises(ValueError): i.load_manifest()
-
-    def test_vector_source_mapping_registration_and_coverage_fail_closed(self):
-        base = ROOT / 'crates/contextdb-engine/tests'
-        helper = base / 'vector/graph_route_profile_support.rs'
-        source = helper.read_text()
-        mutations = [(helper, source.replace('(50_001, "anisotropic", 17)', '(5_000_usize, "anisotropic", 17_usize)')),
-                     (helper, source.replace('(50_000, "isotropic", 29)', '(50_000, "isotropic", 17)')),
-                     (helper, source.replace('(50_000, "isotropic", 29),', '')),
-                     (helper, source.replace('Self::Several, ', '')),
-                     (helper, source.replace('("narrow", "bucket = 0")', '("narrow", "bucket = 1")')),
-                     (helper, source.replace('cells, 6,', 'cells, 3,')),
-                     (helper, source.replace('        24,', '        12,'))]
-        cargo = ROOT / 'crates/contextdb-engine/Cargo.toml'
-        for index, (_, target) in enumerate(i.VECTOR_PROFILE_SLICES.values()):
-            wrapper = base / f'{target}.rs'; text = wrapper.read_text()
-            for a, b in [(f'run_build_quality_profile({index});', f'run_build_quality_profile({(index+1)%4});'),
-                         ('#[test]', '#[test]\n    #[ignore]'),
-                         ('#![cfg(feature = "nightly-tests")]', '#![cfg(feature = "test-seams")]'),
-                         ('#[allow(dead_code, unused_imports)]', '#[allow(dead_code)]')]:
-                mutations.append((wrapper, text.replace(a, b)))
-            block = f'name = "{target}"\npath = "tests/{target}.rs"\nrequired-features = ["test-seams"]'
-            mutations.append((cargo, cargo.read_text().replace(block, block.replace('["test-seams"]', '["nightly-tests"]'))))
-            mutations.append((cargo, cargo.read_text() + '\n[[test]]\n' + block + '\n'))
-        read = Path.read_text
-        for path, text in mutations:
-            with self.subTest(path=path, text=text[-100:]), patch.object(
-                    Path, 'read_text', lambda p, *a, **kw: text if p == path else read(p, *a, **kw)):
-                with self.assertRaises(ValueError): i.load_manifest()
+    def test_integration_commands_never_stop_at_the_first_failing_target(self):
+        several = ['cargo', 'test', '--locked', '-p', 'contextdb-engine', '--features', 'test-seams,iroh',
+                   '--lib', '--bins', '--test', 'engine', '--', '--test-threads=1']
+        with self.assertRaisesRegex(ValueError, 'first failing target'):
+            i.no_fail_fast_contract(several)
+        i.no_fail_fast_contract(several[:3] + [i.NO_FAIL_FAST] + several[3:])
+        i.no_fail_fast_contract(['cargo', 'test', '--locked', '--test', 'one', '--', '--test-threads=1'])
+        i.no_fail_fast_contract(several[:-2] + ['--no-run'])
+        for mode in ('full',):
+            for row in self.rows:
+                if row['kind'] != 'engine-tests':
+                    continue
+                ordinary = [t for t in row['targets'] if t not in {'custody', 'vector', 'custody_schema_replay_bounded_contract'}]
+                selected = i.commands(row, mode=mode)
+                if ordinary:
+                    self.assertEqual(selected[0][:4], ['cargo', 'test', '--locked', i.NO_FAIL_FAST], row['id'])
+        # Removing the flag from the runner is refused by its own contract and by the inventory.
+        source = (ROOT / 'scripts/ci-integration.py').read_text()
+        self.assertEqual(source.count('base[:3] + [NO_FAIL_FAST] + base[3:]'), 1)
+        stripped = source.replace('base[:3] + [NO_FAIL_FAST] + base[3:]', 'base')
+        spec = importlib.util.spec_from_loader('stripped_integration', loader=None)
+        stripped_module = importlib.util.module_from_spec(spec)
+        stripped_module.__file__ = str(ROOT / 'scripts/ci-integration.py')
+        exec(compile(stripped, stripped_module.__file__, 'exec'), stripped_module.__dict__)
+        multi = next(row for row in self.rows if row['kind'] == 'engine-tests'
+                     and len([t for t in row['targets'] if t not in {'custody', 'vector', 'custody_schema_replay_bounded_contract'}]) > 1)
+        with self.assertRaisesRegex(ValueError, 'first failing target'):
+            stripped_module.commands(multi, mode='full')
 
     def test_exact_original_command_classes_and_thread_modes(self):
         kinds = {row['kind']: row for row in self.rows if row['kind'] != 'release-acceptance'}
@@ -172,22 +133,40 @@ class IntegrationControls(unittest.TestCase):
         production = ['cargo', 'test', '--locked', '-p', 'contextdb-engine', '--features', 'nightly-tests']
         self.assertEqual(i.commands(kinds['production']), [production])
         self.assertEqual(i.commands(kinds['production-release']),
-                         [production + ['--release', '--test', target]
+                         [(production[:-1] + ['nightly-tests,test-seams']
+                           if target in ('acceptance', 'acceptance_sync') else production)
+                          + ['--release', '--test', target]
                           for target in i.ACCEPTANCE_TARGETS])
+        required = {row['name']: set(row.get('required-features', []))
+                    for row in tomllib.loads((ROOT / 'crates/contextdb-engine/Cargo.toml').read_text())['test']}
+        for command in i.commands(kinds['production-release']):
+            target = command[command.index('--test') + 1]
+            features = set(command[command.index('--features') + 1].split(','))
+            self.assertLessEqual(required[target], features)
         self.assertEqual(i.commands(kinds['workspace']), [['cargo', 'test', '--locked', '--workspace']])
         with patch.dict(os.environ, {'CARGO_TARGET_DIR': '/tmp/isolated-target'}):
-            self.assertEqual(i.commands(kinds['redb']), [['cargo', 'test', '--manifest-path', 'crates/contextdb-redb/Cargo.toml', '--target-dir', '/tmp/isolated-target/redb', '--locked']])
+            default = ['cargo', 'test', '--manifest-path', 'crates/contextdb-redb/Cargo.toml',
+                       '--target-dir', '/tmp/isolated-target/redb', '--locked']
+            expected = [('named_root_capture_contract', 'contextdb-internal,test-seams'), ('reclaim_step_contract', 'contextdb-internal,test-seams'), ('open_table_registry_allocations', 'contextdb-internal,test-seams'), ('admission_reads_are_bounded_by_the_format', 'contextdb-internal,test-seams'), ('growth_after_compaction_contract', 'contextdb-internal'), ('cache_residency', 'contextdb-internal'), ('page_window_contract', 'contextdb-internal,test-seams'), ('startup_settle_releases_the_replaced_cache_index', 'contextdb-internal,test-seams'), ('allocator_residency_contract', 'contextdb-internal,test-seams')]
+            self.assertEqual(i.commands(kinds['redb']), [default] + [
+                default + ['--features', features, '--test', name, '--', '--test-threads=1']
+                for name, features in expected])
         for row in self.rows:
             if row['kind'] == 'engine-tests':
-                expected = base.copy()
+                expected = base[:3] + ['--no-fail-fast'] + base[3:]
                 for target in row['targets']:
+                    if target in {'custody', 'vector', 'custody_schema_replay_bounded_contract'}:
+                        continue
                     expected += ['--lib', '--bins'] if target == 'lib' else ['--test', target]
                 selected = i.commands(row, mode='full')
                 self.assertEqual(selected[0], expected + ['--', '--test-threads=1'])
                 if set(row['targets']) & i.FULL_SCHEMA or 'sync_schema_transactions' in row['targets']:
                     self.assertEqual(selected[1][selected[1].index('--features') + 1], 'test-seams,iroh')
                 else:
-                    self.assertEqual(len(selected), 1)
+                    self.assertEqual(len(selected), 1 + len(set(row['targets']) & {'custody', 'vector', 'custody_schema_replay_bounded_contract'}))
+                for target, command in zip([t for t in row['targets'] if t in {'custody', 'vector', 'custody_schema_replay_bounded_contract'}],
+                                           selected[2:] if set(row['targets']) & i.FULL_SCHEMA else selected[1:]):
+                    i.aggregate_module(ROOT).validate_command(ROOT, target, command)
 
     def test_union_omissions_duplicates_acceptance_profiles_and_optional_classes(self):
         path = ROOT / 'scripts/ci-integration-targets.json'
@@ -252,17 +231,16 @@ class IntegrationControls(unittest.TestCase):
         jobs = c.load(text)['jobs']
         self.assertEqual(set(jobs), {'plan','slice','result'})
         self.assertEqual(jobs['slice']['strategy']['fail-fast'], False)
-        test_profile = {'CARGO_PROFILE_TEST_OPT_LEVEL': '1',
-                        'CARGO_PROFILE_TEST_DEBUG_ASSERTIONS': 'true',
-                        'CARGO_PROFILE_TEST_OVERFLOW_CHECKS': 'true'}
-        self.assertEqual(jobs['slice']['env'], test_profile)
+        self.assertNotIn('env', jobs['slice'])
         self.assertEqual(jobs['result']['if'], 'always()')
         validator = doc['jobs']['integration']
         self.assertEqual(validator['needs'], ['impact', 'test-bundles'])
         self.assertEqual(validator['if'], 'always()')
         bundle_job = doc['jobs']['test-bundles']
-        self.assertEqual(bundle_job['needs'], 'impact')
-        self.assertEqual(bundle_job['env'], test_profile)
+        self.assertEqual(bundle_job['needs'], ['impact', 'test-builds'])
+        self.assertEqual(doc['jobs']['test-builds']['strategy']['matrix'],
+                         '${{ fromJSON(needs.impact.outputs.build_matrix) }}')
+        self.assertNotIn('env', bundle_job)
         self.assertEqual(bundle_job['strategy']['matrix'],
                          '${{ fromJSON(needs.impact.outputs.bundle_matrix) }}')
         self.assertNotIn('max-parallel', bundle_job['strategy'])
@@ -297,38 +275,43 @@ class IntegrationControls(unittest.TestCase):
                         SLOT3_KIND='', SLOT3_PR='skipped', SLOT3_INTEGRATION='skipped',
                         SLOT4_KIND='', SLOT4_PR='skipped', SLOT4_INTEGRATION='skipped')
         self.assertNotEqual(subprocess.run(['bash', '-c', final], env=outcomes).returncode, 0)
-        self.assertEqual(len(i.pr_inventory()), 26)
+        self.assertEqual(len(i.pr_inventory()), 25)
 
     def test_mixed_normal_matrix_is_exact_and_fail_closed(self):
         identity = {'source_sha': '1' * 40, 'source_fingerprint': '2' * 64}
         certificate = {'targets': {t: {} for t in i.NORMAL_DEDUP_TARGETS},
                        'sha256': 'a' * 64, 'reason': 'fixture proof applies'}
         fallback = {'targets': {}, 'reason': 'fixture proof unavailable'}
-        for proof, integration_count in [(certificate, 23), (fallback, 27)]:
+        for proof, integration_count in [(certificate, 22), (fallback, 24)]:
             with patch.object(i, 'source_identity', return_value=identity), \
                  patch.object(i, 'normal_dedup_certificate', return_value=proof):
                 decision = i.plan_decision('normal', False)
                 value = i.combined_matrix(self.rows, True, decision)
-                self.assertEqual(len(value['include']), 26 + integration_count)
-                self.assertEqual(sum(row['kind'] == 'pr' for row in value['include']), 26)
+                self.assertEqual(len(value['include']), 25 + integration_count)
+                self.assertEqual(sum(row['kind'] == 'pr' for row in value['include']), 25)
                 tuples = [tuple(x[k] for k in ('shard', 'crate', 'features'))
                           for row in i.pr_inventory()
                           for x in row.get('constituents', [row])]
-                self.assertEqual(len(tuples), 33)
-                self.assertEqual(len(set(tuples)), 33)
+                self.assertEqual(len(tuples), 31)
+                self.assertEqual(len(set(tuples)), 31)
                 logical_tuples = {(x.get('cache_parent', x['shard']), x['crate'], x['features'])
                                   for row in i.pr_inventory()
                                   for x in row.get('constituents', [row])}
-                self.assertEqual(len(logical_tuples), 29)
+                self.assertEqual(len(logical_tuples), 28)
                 i.validate_combined(value, self.rows, True, decision)
                 bundles = i.bundle_matrix(value, self.rows, True, decision)
-                self.assertEqual(len(bundles['include']), 16)
+                job_count = json.loads((ROOT / 'scripts/ci-integration-targets.json').read_text())['normal_bundles']['job_count']
+                self.assertLessEqual(len(bundles['include']), job_count)
+                if proof is fallback:
+                    self.assertEqual(len(bundles['include']), job_count)
                 flattened = [bundle[f'slot{slot}'] for bundle in bundles['include']
                              for slot in range(1, 5) if bundle[f'slot{slot}'] is not None]
-                self.assertEqual(len(flattened), len(value['include']))
+                self.assertGreaterEqual(len(flattened), len(value['include']))
                 self.assertEqual({row['id'] for row in flattened},
                                  {row['id'] for row in value['include']})
-                self.assertEqual(len(flattened), 26 + integration_count)
+                self.assertEqual(len([s for s in flattened if s['fragment'] is None]
+                                     + list({s['id']: s for s in flattened if s['fragment'] is not None}.values())),
+                                 25 + integration_count)
                 i.validate_bundle_matrix(bundles, value, self.rows, True, decision)
                 for mutation in ('missing', 'duplicate', 'cache', 'source', 'profile'):
                     changed_bundles = copy.deepcopy(bundles)
@@ -354,9 +337,9 @@ class IntegrationControls(unittest.TestCase):
                 original = manifest_path.read_text()
                 for mutation in ('missing', 'duplicate', 'tampered'):
                     changed = json.loads(original)
-                    ids = changed['normal_bundles']['bundles'][0]
+                    ids = changed['normal_bundles']['jobs'][0]
                     if mutation == 'missing': ids.clear()
-                    elif mutation == 'duplicate': ids.append(changed['normal_bundles']['bundles'][1][0])
+                    elif mutation == 'duplicate': ids.append(changed['normal_bundles']['jobs'][1][0])
                     else: ids[0] = 'pr-contextdb-cli'
                     encoded = json.dumps(changed)
                     read = Path.read_text
@@ -383,12 +366,17 @@ class IntegrationControls(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         i.validate_combined(bad, self.rows, True, decision)
                 disabled = i.combined_matrix(self.rows, False, decision)
-                self.assertEqual(len(disabled['include']), 26)
+                self.assertEqual(len(disabled['include']), 25)
                 self.assertTrue(all(row['kind'] == 'pr' for row in disabled['include']))
                 disabled_bundles = i.bundle_matrix(disabled, self.rows, False, decision)
-                self.assertEqual(len(disabled_bundles['include']), 11)
-                self.assertEqual(sum(bundle[f'slot{slot}'] is not None
-                                     for bundle in disabled_bundles['include'] for slot in range(1, 5)), 26)
+                layout = json.loads((ROOT / 'scripts/ci-integration-targets.json').read_text())['normal_bundles']['jobs']
+                pr_jobs = [job for job in layout if any(
+                    (slot if isinstance(slot, str) else slot['row']).startswith('pr-') for slot in job)]
+                self.assertEqual(len(disabled_bundles['include']), len(pr_jobs))
+                disabled_slots = [bundle[f'slot{slot}'] for bundle in disabled_bundles['include'] for slot in range(1, 5)
+                                  if bundle[f'slot{slot}'] is not None]
+                self.assertEqual({slot['id'] for slot in disabled_slots}, {row['id'] for row in disabled['include']})
+                self.assertTrue(all(slot['kind'] == 'pr' for slot in disabled_slots))
                 # A disabled partition is empty, not an exemption from binding
                 # the published source and certificate decision.
                 for field, value in [('source_sha', '0' * 40),
@@ -440,6 +428,155 @@ if '--no-run' not in sys.argv and sys.argv[1]=='test':
                 else:
                     self.assertEqual(receipt['targets'],[])
 
+    def test_fragments_place_every_test_exactly_once(self):
+        layout = json.loads((ROOT / 'scripts/ci-integration-targets.json').read_text())['normal_bundles']['jobs']
+        fragments = {}
+        for job in layout:
+            for slot in job:
+                if isinstance(slot, dict):
+                    fragments.setdefault(slot['row'], []).append(slot)
+        self.assertGreaterEqual(len(fragments), 10)
+        sliced = 0
+        for row_id, slots in fragments.items():
+            universe = sorted({t for slot in slots for t in slot['targets']})
+            i.validate_fragments(row_id, universe, slots)
+            groups = {}
+            for slot in slots:
+                for target, spec in slot.get('tests', {}).items():
+                    groups.setdefault(target, []).append(spec)
+            for target, specs in groups.items():
+                sliced += 1
+                named = sorted({n for spec in specs for n in spec.get('only', [])})
+                # Every named test, and a test added later, runs in exactly one slice.
+                for test in named + ['a_test_added_after_this_layout_was_reviewed']:
+                    self.assertEqual(sum(i.slice_selects(spec, test) for spec in specs), 1, (row_id, target, test))
+                for label in ('rest forgets a named test', 'a name in two slices',
+                              'a slice loses a name the rest still skips', 'a slice is dropped'):
+                    changed = copy.deepcopy(slots)
+                    owners = [slot for slot in changed if target in slot.get('tests', {})]
+                    changed_specs = [slot['tests'][target] for slot in owners]
+                    changed_rest = next(spec for spec in changed_specs if 'except' in spec)
+                    changed_only = [spec for spec in changed_specs if 'only' in spec]
+                    if label == 'rest forgets a named test':
+                        changed_rest['except'].pop()
+                    elif label == 'a name in two slices':
+                        changed_only[-1]['only'].append(changed_only[0]['only'][0])
+                    elif label == 'a slice loses a name the rest still skips':
+                        changed_only[0]['only'].pop()
+                    else:
+                        owner = next(slot for slot in owners if slot['tests'][target] is changed_only[0])
+                        del owner['tests'][target]
+                        owner['targets'].remove(target)
+                    with self.subTest(row=row_id, target=target, mutation=label), self.assertRaises(ValueError):
+                        i.validate_fragments(row_id, universe, [slot for slot in changed if slot['targets']])
+        self.assertGreaterEqual(sliced, 7)
+        # A whole target in no fragment, or in two, is refused.
+        row_id, slots = next((k, v) for k, v in fragments.items() if len(v) > 1)
+        universe = sorted({t for slot in slots for t in slot['targets']})
+        lost = copy.deepcopy(slots)
+        lost[0]['targets'].pop(0)
+        lost[0].pop('tests', None)
+        with self.assertRaises(ValueError):
+            i.validate_fragments(row_id, universe, lost)
+
+    def test_a_sliced_library_target_runs_with_lib_not_test(self):
+        row = next(r for r in i.active_rows(self.rows, False, 'normal') if r['id'] == 'engine-family-1')
+        fragment = dict(row='integration-engine-family-1', part=1, targets=['lib'],
+                        tests={'lib': {'only': ['database::a_slow_unit_test']}})
+        commands = i.commands(row, mode='normal', fragment=fragment)
+        self.assertEqual(len(commands), 1)
+        self.assertIn('--lib', commands[0])
+        self.assertNotIn('--test', commands[0])
+        self.assertEqual(commands[0][commands[0].index('--') + 1:][-2:], ['database::a_slow_unit_test', '--exact'])
+
+    def test_shared_builds_compile_with_their_consumers_rustflags(self):
+        # A different RUSTFLAGS gives Cargo different units, so the restored build would be rebuilt.
+        for name, spec in i.SHARED_BUILDS.items():
+            integration = 'nightly-tests' in spec['features']
+            self.assertEqual(spec['rustflags'], i.INTEGRATION_RUSTFLAGS if integration else '', name)
+        self.assertIn("RUSTFLAGS=INTEGRATION_RUSTFLAGS", (ROOT / 'scripts/ci-integration.py').read_text())
+        workflow = (ROOT / '.github/workflows/ci.yml').read_text()
+        self.assertIn('RUSTFLAGS: ""', workflow)
+
+    def test_slice_status_contract_refuses_skipped_or_hidden_failures(self):
+        ok, red = dict(exit_status=0), dict(exit_status=37)
+        i.slice_status_contract([ok, ok], 2, 0)
+        i.slice_status_contract([red, ok, dict(exit_status=5)], 3, 37)
+        for ran, planned, status in [([red], 3, 37), ([ok, red], 2, 0), ([ok, red], 2, 1), ([], 1, 0)]:
+            with self.subTest(ran=ran, planned=planned, status=status), self.assertRaises(ValueError):
+                i.slice_status_contract(ran, planned, status)
+
+    def test_slice_runs_every_command_after_a_failing_one(self):
+        row = next(r for r in self.rows if r['kind'] == 'engine-tests' and len(i.commands(r, mode='full')) > 1
+                   and 'sync_schema_transactions' not in r['targets'] and r['id'] not in i.LONG_RUNNING_PARTITIONS)
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp); tools = directory / 'bin'; tools.mkdir()
+            cargo = tools / 'cargo'
+            cargo.write_text('''#!/usr/bin/env python3
+import json,os,sys
+with open(os.environ['CALLS'],'a') as out: out.write(json.dumps(sys.argv[1:])+'\\n')
+if sys.argv[1] == 'test' and '--no-run' not in sys.argv:
+    seen = os.path.join(os.environ['CALLS'] + '.first')
+    first = not os.path.exists(seen)
+    open(seen, 'a').close()
+    print('     Running tests/x.rs (target/debug/deps/x-123)')
+    print('running 1 test')
+    print('test result: %s. %d passed; %d failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s' % (('FAILED', 0, 1) if first else ('ok', 1, 0)))
+    sys.exit(37 if first else 0)
+''')
+            cargo.chmod(0o755)
+            rustc = tools / 'rustc'; rustc.write_text('#!/bin/sh\necho synthetic-rustc\n'); rustc.chmod(0o755)
+            env = dict(os.environ, PATH=str(tools) + ':' + os.environ['PATH'], CALLS=str(directory / 'calls'),
+                       CI_INTEGRATION_OUT=str(directory / 'out'), CARGO_TARGET_DIR=str(directory / 'target'),
+                       CI_INTEGRATION_DEFAULT='true', RUST_TEST_THREADS='3', PYTHONDONTWRITEBYTECODE='1')
+            env.pop('CI_INTEGRATION_ENABLED', None)
+            run = subprocess.run(['bash', 'scripts/verify', 'integration', row['id']], cwd=ROOT, env=env,
+                                 capture_output=True, text=True, timeout=30)
+            self.assertEqual(run.returncode, 37, run.stderr)
+            with patch.dict(os.environ, env):
+                planned = i.commands(row)
+            calls = [json.loads(line) for line in (directory / 'calls').read_text().splitlines()]
+            self.assertEqual(calls[1:], [command[1:] for command in planned])
+            receipt = json.loads(next((directory / 'out').rglob('receipt.json')).read_text())
+            self.assertEqual([c['exit_status'] for c in receipt['commands']], [37] + [0] * (len(planned) - 1))
+            self.assertEqual(receipt['exit_status'], 37)
+
+    def test_a_run_may_select_only_registered_ignores(self):
+        registered = next(iter(sorted(i.registered_ignored_functions())))
+        def log(passed, ignored):
+            names = ''.join('test m::%s ... ignored\n' % name for name in ignored)
+            return 'running 1 test\n' + names + 'test result: ok. %d passed; 0 failed; %d ignored; 0 measured; 77 filtered out' % (passed, len(ignored))
+        self.assertEqual(i.run_verdict(log(1, [])), (True, ''))
+        self.assertTrue(i.run_verdict(log(0, [registered]))[0])
+        self.assertFalse(i.run_verdict(log(0, [registered, 'an_unregistered_one']))[0])
+        self.assertFalse(i.run_verdict(log(0, ['an_unregistered_one']))[0])
+        self.assertFalse(i.run_verdict(log(0, []))[0])
+        self.assertFalse(i.run_verdict('')[0])
+
+    def test_a_slice_that_ran_no_test_cannot_pass(self):
+        row = next(r for r in self.rows if r['kind'] == 'engine-tests' and r['id'] not in i.LONG_RUNNING_PARTITIONS
+                   and 'sync_schema_transactions' not in r['targets']
+                   and any('--skip' in command or '--exact' in command for command in i.commands(r, mode='full')))
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp); tools = directory / 'bin'; tools.mkdir()
+            cargo = tools / 'cargo'
+            cargo.write_text('''#!/usr/bin/env python3
+import sys
+if sys.argv[1] == 'test' and '--no-run' not in sys.argv:
+    print('     Running tests/x.rs (target/debug/deps/x-123)')
+    print('running 0 tests')
+    print('test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s')
+''')
+            cargo.chmod(0o755)
+            rustc = tools / 'rustc'; rustc.write_text('#!/bin/sh\necho synthetic-rustc\n'); rustc.chmod(0o755)
+            env = dict(os.environ, PATH=str(tools) + ':' + os.environ['PATH'], CI_INTEGRATION_OUT=str(directory / 'out'),
+                       CARGO_TARGET_DIR=str(directory / 'target'), CI_INTEGRATION_DEFAULT='true', PYTHONDONTWRITEBYTECODE='1')
+            env.pop('CI_INTEGRATION_ENABLED', None)
+            run = subprocess.run(['bash', 'scripts/verify', 'integration', row['id']], cwd=ROOT, env=env,
+                                 capture_output=True, text=True, timeout=30)
+            self.assertNotEqual(run.returncode, 0, run.stdout)
+            self.assertIn('ran no test', run.stderr)
+
     def test_local_full_run_keeps_other_slices_after_failure(self):
         selected = []
         def execute(row, out, mode=None):
@@ -479,9 +616,18 @@ if '--no-run' not in sys.argv and sys.argv[1]=='test':
                 run=subprocess.run([sys.executable,'-B','scripts/ci-integration.py',*args],cwd=ROOT,env=dict(os.environ,GITHUB_OUTPUT=str(Path(tmp)/'outputs'),**env),capture_output=True,text=True,timeout=10)
                 self.assertNotEqual(run.returncode,0)
         with tempfile.TemporaryDirectory() as tmp:
-            run=subprocess.run([sys.executable,'-B','scripts/ci-integration.py','plan'],cwd=ROOT,env=dict(os.environ,GITHUB_OUTPUT=str(Path(tmp)/'outputs'),CI_INTEGRATION_ENABLED='false',CI_INTEGRATION_DEFAULT='false',IMPACT_REASON='documentation-only',PATH_CLASSES='{"README.md":"docs"}'),capture_output=True,text=True,timeout=10)
+            classes = {'README.md': 'documentation-only'}
+            classes_file = Path(tmp) / 'path-classes.json'
+            classes_file.write_text(json.dumps(classes))
+            run=subprocess.run([sys.executable,'-B','scripts/ci-integration.py','plan'],cwd=ROOT,env=dict(os.environ,GITHUB_OUTPUT=str(Path(tmp)/'outputs'),CI_INTEGRATION_ENABLED='false',CI_INTEGRATION_DEFAULT='false',IMPACT_REASON='documentation-only',PATH_CLASSES_FILE=str(classes_file)),capture_output=True,text=True,timeout=10)
             self.assertEqual(run.returncode,0,run.stderr)
-            self.assertIn('documentation-only',run.stdout)
+            self.assertEqual(run.stdout.splitlines(), [
+                'Extended integration deliberately not required: documentation-only',
+                'Path classes: ' + json.dumps(classes, ensure_ascii=True),
+                'Performance measurement: measurement pending (not a qualification and not a required gate)',
+                'All original PR checks remain required.',
+            ])
+            self.assertEqual(json.loads(next(line.removeprefix('Path classes: ') for line in run.stdout.splitlines() if line.startswith('Path classes: '))), classes)
             self.assertIn('enabled=false',(Path(tmp)/'outputs').read_text())
 
 

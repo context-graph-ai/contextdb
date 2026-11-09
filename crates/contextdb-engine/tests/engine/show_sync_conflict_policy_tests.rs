@@ -19,7 +19,7 @@ fn policy_rows(db: &Database) -> Vec<String> {
         .execute("SHOW SYNC_CONFLICT_POLICY", &HashMap::new())
         .expect("show");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[0] {
             Value::Text(t) => t.clone(),

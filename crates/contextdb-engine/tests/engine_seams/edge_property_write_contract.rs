@@ -168,3 +168,90 @@ fn naming_no_properties_asks_only_whether_the_edge_exists() {
         "a caller who named no properties made no claim about them, so the edge keeps its own"
     );
 }
+
+#[test]
+fn replacing_a_small_property_preserves_and_funds_the_large_existing_payload() {
+    let root = tempfile::tempdir().expect("scratch directory");
+    let path = root.path().join("merged-edges.db");
+    let db = Database::open(&path).expect("open the store");
+    let source = Uuid::from_u128(7);
+    let target = Uuid::from_u128(8);
+    let payload = Value::Text("retained".repeat(8192));
+    assert!(attach(
+        &db,
+        source,
+        target,
+        properties([("payload", payload.clone()), ("weight", Value::Int64(1)),])
+    ));
+    assert!(!attach(
+        &db,
+        source,
+        target,
+        properties([("weight", Value::Int64(2))])
+    ));
+    assert_eq!(
+        edge_properties(&db, source, target),
+        properties([("payload", payload.clone()), ("weight", Value::Int64(2)),])
+    );
+    assert!(!attach(
+        &db,
+        source,
+        target,
+        properties([("weight", Value::Int64(2))])
+    ));
+    let tx = db.begin().expect("begin a replacement to roll back");
+    assert!(
+        !db.insert_edge(
+            tx,
+            source,
+            target,
+            "links".into(),
+            properties([("weight", Value::Int64(3))])
+        )
+        .expect("stage replacement")
+    );
+    db.rollback(tx).expect("roll back replacement");
+    assert_eq!(
+        edge_properties(&db, source, target),
+        properties([("payload", payload.clone()), ("weight", Value::Int64(2)),])
+    );
+    db.close()
+        .expect("close without refunding another owner's charge");
+    let reopened = Database::open(&path).expect("reopen");
+    assert_eq!(
+        edge_properties(&reopened, source, target),
+        properties([("payload", payload), ("weight", Value::Int64(2)),])
+    );
+    reopened.close().expect("close reopened store");
+}
+
+#[test]
+fn deleting_then_reinserting_an_edge_does_not_merge_retired_properties() {
+    let db = Database::open_memory();
+    let source = Uuid::from_u128(9);
+    let target = Uuid::from_u128(10);
+    assert!(attach(
+        &db,
+        source,
+        target,
+        properties([("retired", Value::Int64(1))])
+    ));
+    let tx = db.begin().expect("begin delete and reinsert");
+    db.delete_edge(tx, source, target, "links")
+        .expect("delete edge");
+    assert!(
+        db.insert_edge(
+            tx,
+            source,
+            target,
+            "links".into(),
+            properties([("current", Value::Int64(2))])
+        )
+        .expect("reinsert edge")
+    );
+    db.commit(tx).expect("commit reinsert");
+    assert_eq!(
+        edge_properties(&db, source, target),
+        properties([("current", Value::Int64(2))])
+    );
+}

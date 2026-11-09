@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # Cargo runs each libtest binary in its own process; test-hook builds serialize tests within it.
 set -euo pipefail
+# Fails with a message unless libtest passed or failed a test in the given logs, or selected only registered ignores:
+# a filtered or sliced run that executed nothing proves nothing.
+ran_a_test() {
+  local label=$1
+  shift
+  cat "$@" 2>/dev/null | python3 -B "$(dirname -- "${BASH_SOURCE[0]}")/ci-integration.py" ran-tests "$label"
+}
 # A bundle shares setup/cache only; every invocation retains its original tuple.
 if [[ -n "${CI_BUNDLE:-}" ]]; then
   bundle_plan=$(python3 -B "$(dirname -- "${BASH_SOURCE[0]}")/ci-inventory.py" --bundle "$CI_BUNDLE")
@@ -64,22 +71,53 @@ fi
 # A split shard runs only its listed targets (scripts/ci-shard-targets.txt);
 # examples and doctests run once, in the shard that lists `lib`.
 run_extras=true
+run_maintenance=false
+if [[ "$crate" == contextdb-engine && "$features" == *test-seams* ]]; then run_maintenance=true; fi
+maintenance_case=paged_initial_replacement_and_reclamation_progress_under_writes::paged_initial_replacement_and_reclamation_progress_under_writes
 skip_case=""
+aggregate_names=()
 manifest="$(dirname -- "${BASH_SOURCE[0]}")/ci-shard-targets.txt"
 while read -r name items; do
   [[ "$name" == "$shard:" ]] || continue
+  routing=$(python3 -B "$(dirname -- "${BASH_SOURCE[0]}")/ci-integration.py" shard-plan "$shard")
+  split_items=${routing%%|*}
+  skip_case=${routing#*|}
+done < <(grep -v '^#' "$manifest")
+# A fragment runs only the targets (and test slices) the reviewed job layout gives it.
+fragment_slices=()
+slice_run=(--no-fail-fast)
+fragment_rest_lib=false
+fragment_extras=keep
+if [[ -n "${CI_FRAGMENT:-}" && "${CI_FRAGMENT}" != null ]]; then
+  fragment_plan=$(python3 -B "$(dirname -- "${BASH_SOURCE[0]}")/ci-integration.py" fragment-plan "$shard") || exit 2
+  split_items=$(sed -n 1p <<< "$fragment_plan")
+  fragment_extras=$(sed -n 2p <<< "$fragment_plan")
+  mapfile -t fragment_slices < <(tail -n +3 <<< "$fragment_plan")
+  # The library slice that runs every test the others do not name also owns the examples and doctests.
+  for fragment_slice in "${fragment_slices[@]}"; do
+    if [[ "$fragment_slice" == lib$'\t'*--skip* ]]; then fragment_rest_lib=true; fi
+  done
+  if [[ -z "${split_items// /}" ]]; then split_items=none; fi
+fi
+if [[ -n "${split_items:-}" ]]; then
   targets=()
   run_extras=false
-  routing=$(python3 -B "$(dirname -- "${BASH_SOURCE[0]}")/ci-integration.py" shard-plan "$shard")
-  items=${routing%%|*}
-  skip_case=${routing#*|}
-  for item in $items; do
+  run_maintenance=false
+  for item in $split_items; do
+    [[ "$item" == none ]] && continue
+    if [[ "$item" == engine_seams ]]; then run_maintenance=true; fi
+    if [[ "$item" == custody || "$item" == vector || ( "$item" == custody_schema_replay_bounded_contract && "${CI_GATE_MODE:-full}" == full ) ]]; then
+      aggregate_names+=("$item")
+      continue
+    fi
     if [[ "$item" == lib ]]; then targets+=(--lib --bins); run_extras=true; else targets+=(--test "$item"); fi
   done
-done < <(grep -v '^#' "$manifest")
+  if [[ "$fragment_extras" == none ]]; then run_extras=false; fi
+  if [[ "$fragment_rest_lib" == true ]]; then run_extras=true; fi
+fi
 # Reflect the actual libtest mode; the command-line seam override wins over env.
 thread_mode="${RUST_TEST_THREADS:-default-parallel}"
-if [[ "$features" == *test-seams* ]]; then thread_mode=1; fi
+if [[ "$crate" == contextdb-engine || "$features" == *test-seams* ]]; then thread_mode=1; fi
 # Exact exclusion is visible in receipts and remains executable in full mode.
 start=$(date +%s)
 # shellcheck disable=SC2329 # Invoked by the EXIT trap.
@@ -138,24 +176,83 @@ trap finish EXIT
 if [[ "$crate" == contextdb-engine || "$crate" == contextdb-server ]]; then
   timeout 30m cargo build --locked -p contextdb-cli -p contextdb-server
 fi
-# Test-hook builds run one test at a time, as scripts/verify does; default builds run in parallel.
+# Engine cfg(test) also installs process-wide proof observers and counters.
+# Keep their cases isolated, using the existing test-hook execution policy.
 threads=()
-if [[ "$features" == *test-seams* ]]; then threads=(--test-threads=1); fi
-if [[ -n "$skip_case" ]]; then threads+=(--skip "$skip_case"); fi
+if [[ "$crate" == contextdb-engine || "$features" == *test-seams* ]]; then threads=(--test-threads=1); fi
+for relocated in $skip_case; do threads+=(--skip "$relocated"); done
+if [[ "$run_maintenance" == true ]]; then threads+=(--skip "$maintenance_case"); fi
 set +e
 # Explicit libtest targets avoid forwarding libtest flags to Criterion benches.
 # Keep ignored tests ignored. Ordinary elapsed time is a receipt, not a threshold.
+statuses=(0 0)
+# No whole-target command when the fragment has only aggregate or sliced targets: with no target flag Cargo would run the whole crate.
+if [[ "${#targets[@]}" != 0 ]]; then
 if [[ "$crate" == contextdb-engine || "$crate" == contextdb-server ]]; then
   env "CARGO_BIN_EXE_contextdb=$target_dir/debug/contextdb" \
       "CARGO_BIN_EXE_contextdb-server=$target_dir/debug/contextdb-server" \
-    timeout 300m cargo test --locked "${args[@]}" "${targets[@]}" -- "${threads[@]}" 2>&1 | tee "$receipt_dir/$shard.log"
+    timeout 300m cargo test --locked --no-fail-fast "${args[@]}" "${targets[@]}" -- "${threads[@]}" 2>&1 | tee "$receipt_dir/$shard.log"
 else
-  timeout 300m cargo test --locked "${args[@]}" "${targets[@]}" -- "${threads[@]}" 2>&1 | tee "$receipt_dir/$shard.log"
+  timeout 300m cargo test --locked --no-fail-fast "${args[@]}" "${targets[@]}" -- "${threads[@]}" 2>&1 | tee "$receipt_dir/$shard.log"
 fi
 statuses=("${PIPESTATUS[@]}")
+fi
 status=${statuses[0]}
 if [[ "$status" == 0 ]]; then status=${statuses[1]}; fi
+# Each sliced target runs alone with its exact only/except test filters.
+for fragment_slice in "${fragment_slices[@]}"; do
+  [[ -n "$fragment_slice" ]] || continue
+  IFS=$'\t' read -r -a slice_parts <<< "$fragment_slice"
+  slice_target=${slice_parts[0]}
+  slice_select=(--test "$slice_target")
+  if [[ "$slice_target" == lib ]]; then slice_select=(--lib); fi
+  env "CARGO_BIN_EXE_contextdb=$target_dir/debug/contextdb" \
+      "CARGO_BIN_EXE_contextdb-server=$target_dir/debug/contextdb-server" \
+    timeout 300m cargo test --locked "${slice_run[@]}" "${args[@]}" "${slice_select[@]}" -- "${threads[@]}" "${slice_parts[@]:1}" 2>&1 | tee "$receipt_dir/$shard.slice-$slice_target.log"
+  statuses=("${PIPESTATUS[@]}")
+  slice_status=${statuses[0]}
+  if [[ "$slice_status" == 0 ]]; then slice_status=${statuses[1]}; fi
+  if [[ "$slice_status" == 0 ]] && ! ran_a_test "the $slice_target slice of $shard" "$receipt_dir/$shard.slice-$slice_target.log"; then
+    slice_status=1
+  fi
+  if [[ "$status" == 0 ]]; then status=$slice_status; fi
+done
+# The maintenance journey has its own runner limit; its body remains unchanged.
+if [[ "$run_maintenance" == true ]]; then
+  env "CARGO_BIN_EXE_contextdb=$target_dir/debug/contextdb" \
+      "CARGO_BIN_EXE_contextdb-server=$target_dir/debug/contextdb-server" \
+    bash "$(dirname -- "${BASH_SOURCE[0]}")/ci-maintenance-journey.sh" "$receipt_dir" "${args[@]}"
+  maintenance_status=$?
+  if [[ "$status" == 0 ]]; then status=$maintenance_status; fi
+fi
+# Each filter belongs only to its isolated binary, never its execution owner.
+for aggregate_name in "${aggregate_names[@]}"; do
+  if ! python3 -B "$(dirname -- "${BASH_SOURCE[0]}")/ci-integration.py" aggregate-emits "$aggregate_name" --aggregate-features "$features"; then
+    continue
+  fi
+  if ! aggregate_plan=$(python3 -B "$(dirname -- "${BASH_SOURCE[0]}")/ci-integration.py" aggregate-skips "$aggregate_name" --aggregate-features "$features"); then
+    if [[ "$status" == 0 ]]; then status=2; fi
+    continue
+  fi
+  aggregate_flags=(--test-threads=1)
+  while IFS= read -r prefix; do
+    [[ -n "$prefix" ]] && aggregate_flags+=(--skip "$prefix")
+  done <<< "$aggregate_plan"
+  env "CARGO_BIN_EXE_contextdb=$target_dir/debug/contextdb" \
+      "CARGO_BIN_EXE_contextdb-server=$target_dir/debug/contextdb-server" \
+    timeout 300m cargo test --locked --no-fail-fast "${args[@]}" --test "$aggregate_name" -- "${aggregate_flags[@]}" 2>&1 | tee "$receipt_dir/$shard.aggregate-$aggregate_name.log"
+  statuses=("${PIPESTATUS[@]}")
+  aggregate_status=${statuses[0]}
+  if [[ "$aggregate_status" == 0 ]]; then aggregate_status=${statuses[1]}; fi
+  if [[ "$aggregate_status" == 0 ]] && ! ran_a_test "the $aggregate_name binary of $shard" "$receipt_dir/$shard.aggregate-$aggregate_name.log"; then
+    aggregate_status=1
+  fi
+  if [[ "$status" == 0 ]]; then status=$aggregate_status; fi
+done
 set -e
+if [[ "$status" == 0 ]] && ! ran_a_test "shard $shard" "$receipt_dir"/*.log; then
+  status=1
+fi
 if [[ "$status" == 0 && "$run_extras" == true ]]; then
   # cargo test's default example compilation and doctests remain required.
   timeout 30m cargo test --locked "${args[@]}" --examples --no-run 2>&1 | tee "$receipt_dir/$shard.examples.log"

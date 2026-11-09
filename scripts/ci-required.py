@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 import sys
 
-REQUIRED = {"lint", "lint-macos", "test-bundles", "build", "features",
+REQUIRED = {"lint", "lint-macos", "test-builds", "test-bundles", "build", "features",
             "installed-smoke", "cross-compile", "impact", "integration"}
 
 
@@ -88,8 +88,10 @@ def integration_caller(workflow):
             or fields['if'].strip() != 'always()'
             or fields['runs-on'].strip() != 'ubuntu-latest' or fields['timeout-minutes'].strip() != '5'
             or 'python3 -B scripts/ci-integration.py normal-required' not in fields['steps']
-            or 'CI_COMBINED_MATRIX: ${{ needs.impact.outputs.combined_matrix }}' not in fields['steps']
-            or 'CI_BUNDLE_MATRIX: ${{ needs.impact.outputs.bundle_matrix }}' not in fields['steps']):
+            or any(token not in fields['steps'] for token in (
+                '${{ needs.impact.outputs.combined_matrix }}', '${{ needs.impact.outputs.bundle_matrix }}',
+                '${{ needs.impact.outputs.build_matrix }}', '${{ toJSON(needs) }}',
+                'CI_COMBINED_MATRIX_FILE', 'CI_BUNDLE_MATRIX_FILE', 'CI_BUILD_MATRIX_FILE', 'CI_INTEGRATION_NEEDS_FILE'))):
         raise ValueError("integration must validate the published matrix after bundle execution")
 
 
@@ -135,7 +137,8 @@ def main():
         dependencies = [name.strip() for name in declared[0].split(",")] if len(declared) == 1 else []
         if len(dependencies) != len(set(dependencies)) or set(dependencies) != REQUIRED:
             raise ValueError("aggregate needs must include every required correctness job")
-        needs = json.loads(os.environ["CI_NEEDS"])
+        with open(os.environ["CI_NEEDS_FILE"]) as needs_file:
+            needs = json.load(needs_file)
         if not isinstance(needs, dict) or set(needs) != REQUIRED:
             raise ValueError("required job inventory does not match")
         failed = [name for name, job in needs.items()

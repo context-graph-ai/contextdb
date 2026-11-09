@@ -9,27 +9,14 @@
 //! container — is the flat part and is the only flat part.
 
 use contextdb_core::Value;
-use contextdb_core::read_contract::{
-    DeadlineClock, DeadlineWait, OwnerReadCancellation, ReadLimits,
-};
+use contextdb_core::read_contract::{OwnerReadCancellation, ReadLimits};
 use contextdb_engine::Database;
 use contextdb_engine::executor::bounded_read_test_support as bounded;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Every assertion here is decided by bytes and rows, never by elapsed time.
-#[derive(Clone, Copy)]
-struct FrozenClock;
-
-impl DeadlineClock for FrozenClock {
-    fn now_ms(&self) -> u64 {
-        0
-    }
-
-    fn wait_until(&self, _deadline_ms: u64) -> DeadlineWait<'_> {
-        Box::pin(async {})
-    }
-}
+use contextdb_engine::local_transport::ManualDeadlineClock;
 
 /// Rows wide enough that one of them held back is a visible charge rather than
 /// a rounding difference against the page scaffolding.
@@ -82,12 +69,13 @@ fn request(limits: ReadLimits) -> bounded::BoundedReadRequest {
         "SELECT id, payload FROM wide_rows ORDER BY id",
         HashMap::new(),
         limits,
-        Arc::new(FrozenClock),
+        Arc::new(ManualDeadlineClock::at(0)),
     )
 }
 
 fn used(db: &Database) -> usize {
-    db.accountant().usage().used
+    usize::try_from(db.declared_read_memory_for_test().retained_bytes_for_test())
+        .expect("reader charge fits this platform")
 }
 
 #[test]
@@ -97,11 +85,11 @@ fn a_row_the_cursor_defers_is_charged_for_until_a_page_publishes_it() {
     let request = request(one_row_per_page_limits());
     let opened = bounded::open_cursor(Arc::clone(&db), &request).expect("open a wide-row cursor");
     assert_eq!(
-        opened.first_page.rows.len(),
+        opened.first_page.rows().len(),
         1,
         "the byte ceiling admits one wide row"
     );
-    assert!(opened.first_page.has_more);
+    assert!(opened.first_page.has_more());
 
     // The page stopped at the byte ceiling, so the row it had already pulled
     // is waiting inside the cursor. A cursor that only carried scaffolding
@@ -113,14 +101,15 @@ fn a_row_the_cursor_defers_is_charged_for_until_a_page_publishes_it() {
     );
 
     let mut cursor = opened.cursor;
-    let mut answered = opened.first_page.rows.len();
-    let mut has_more = opened.first_page.has_more;
+    let mut answered = opened.first_page.rows().len();
+    let mut has_more = opened.first_page.has_more();
+    drop(opened.first_page);
     while has_more {
         let fetched = cursor
             .fetch(None, OwnerReadCancellation::new())
             .expect("the wide-row cursor keeps answering");
-        answered = answered.saturating_add(fetched.page.rows.len());
-        has_more = fetched.page.has_more;
+        answered = answered.saturating_add(fetched.page.rows().len());
+        has_more = fetched.page.has_more();
     }
     assert_eq!(
         i64::try_from(answered).expect("the fixture row count fits this platform"),
@@ -128,6 +117,7 @@ fn a_row_the_cursor_defers_is_charged_for_until_a_page_publishes_it() {
     );
 
     cursor.close().expect("close the wide-row cursor");
+    drop(cursor);
     assert_eq!(
         used(&db),
         baseline,
@@ -142,8 +132,9 @@ fn an_interrupted_fetch_keeps_the_rows_the_cursor_is_still_holding_charged() {
     let opened = bounded::open_cursor(Arc::clone(&db), &request(one_row_per_page_limits()))
         .expect("open a wide-row cursor");
     let mut cursor = opened.cursor;
-    let mut answered = opened.first_page.rows.len();
-    assert!(opened.first_page.has_more);
+    let mut answered = opened.first_page.rows().len();
+    assert!(opened.first_page.has_more());
+    drop(opened.first_page);
 
     // A fetch that is already withdrawn when it starts publishes nothing and
     // leaves the cursor exactly as it was: still alive, still holding the row
@@ -166,8 +157,8 @@ fn an_interrupted_fetch_keeps_the_rows_the_cursor_is_still_holding_charged() {
         let fetched = cursor
             .fetch(None, OwnerReadCancellation::new())
             .expect("the resumed cursor keeps answering");
-        answered = answered.saturating_add(fetched.page.rows.len());
-        has_more = fetched.page.has_more;
+        answered = answered.saturating_add(fetched.page.rows().len());
+        has_more = fetched.page.has_more();
     }
     assert_eq!(
         i64::try_from(answered).expect("the fixture row count fits this platform"),
@@ -176,6 +167,7 @@ fn an_interrupted_fetch_keeps_the_rows_the_cursor_is_still_holding_charged() {
     );
 
     cursor.close().expect("close the resumed cursor");
+    drop(cursor);
     assert_eq!(
         used(&db),
         baseline,

@@ -88,7 +88,7 @@ fn where_bare_boolean_column_filters_true_rows_only() {
         .execute("SELECT tag FROM t WHERE flag", &empty())
         .expect("a bare boolean column predicate is standard SQL and must succeed");
     let mut got: Vec<String> = r
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[0] {
             Value::Text(s) => s.clone(),
@@ -100,7 +100,7 @@ fn where_bare_boolean_column_filters_true_rows_only() {
         got,
         vec!["a".to_string(), "c".to_string()],
         "WHERE flag must keep only the rows where flag = TRUE, got rows {:?}",
-        r.rows
+        r.rows()
     );
 }
 
@@ -122,10 +122,10 @@ fn where_negated_bare_boolean_column_filters_false_rows_only() {
         .execute("SELECT tag FROM t WHERE NOT flag", &empty())
         .expect("NOT of a bare boolean column predicate is standard SQL and must succeed");
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![vec![Value::Text("b".to_string())]],
         "WHERE NOT flag must keep only the row where flag = FALSE, got rows {:?}",
-        r.rows
+        r.rows()
     );
 }
 
@@ -150,10 +150,10 @@ fn where_boolean_parameter_true_selects_all_rows() {
         )
         .expect("a boolean $param predicate is standard SQL and must succeed");
     assert_eq!(
-        r.rows.len(),
+        r.rows().len(),
         2,
         "WHERE $want with want=true must select every row, got {:?}",
-        r.rows
+        r.rows()
     );
 }
 
@@ -171,10 +171,10 @@ fn where_boolean_parameter_false_selects_no_rows() {
         )
         .expect("a boolean $param predicate is standard SQL and must succeed");
     assert_eq!(
-        r.rows.len(),
+        r.rows().len(),
         0,
         "WHERE $want with want=false must select no rows, got {:?}",
-        r.rows
+        r.rows()
     );
 }
 
@@ -201,10 +201,10 @@ fn where_null_literal_is_empty_result_never_an_error() {
         .execute("SELECT tag FROM t WHERE NULL", &empty())
         .expect("a literal NULL predicate must be an empty result, never a statement error");
     assert_eq!(
-        r.rows.len(),
+        r.rows().len(),
         0,
         "WHERE NULL must match no rows, got {:?}",
-        r.rows
+        r.rows()
     );
 }
 
@@ -254,7 +254,7 @@ fn order_by_coalesce_expression_sorts_by_the_evaluated_value() {
         )
         .expect("ORDER BY COALESCE(...) is an already-evaluated SELECT-list form and must succeed");
     let got: Vec<String> = r
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[0] {
             Value::Text(s) => s.clone(),
@@ -265,7 +265,7 @@ fn order_by_coalesce_expression_sorts_by_the_evaluated_value() {
         got,
         vec!["row2".to_string(), "row3".to_string(), "row1".to_string()],
         "must sort ascending by COALESCE(pref, fallback) = [5, 10, 30], got {:?}",
-        r.rows
+        r.rows()
     );
 }
 
@@ -360,5 +360,5 @@ fn select_list_valid_column_with_no_where_clause_still_works() {
     let r = db
         .execute("SELECT a FROM t", &empty())
         .expect("a real column with no WHERE clause must keep working");
-    assert_eq!(r.rows, vec![vec![Value::Int64(42)]]);
+    assert_eq!(r.rows(), vec![vec![Value::Int64(42)]]);
 }

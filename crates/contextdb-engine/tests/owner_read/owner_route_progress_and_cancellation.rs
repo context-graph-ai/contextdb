@@ -10,6 +10,8 @@
 //! the session and its cursor usable, and a report belonging to one request
 //! is never mistaken for another's.
 
+#[cfg(unix)]
+use super::owner_cursor_test_support;
 use contextdb_core::read_contract::{
     DatabaseIdentity, DeadlineClock, LocalUserIdentity, OwnerReadCancellation, OwnerReadLimits,
     OwnerReadStatus, OwnerServiceTimeouts, OwnerServingState, ReadClientTimeouts, ReadLimits,
@@ -27,7 +29,8 @@ use contextdb_engine::owner_read::{
     OwnerServiceSpec, ValidatedOwnerListener,
 };
 #[cfg(unix)]
-use contextdb_engine::read_contract::decode_cursor_page;
+use owner_cursor_test_support::decode_owner_cursor_page as decode_cursor_page;
+
 use contextdb_engine::read_session::{
     ReadKernelCancellationEvent, ReadKernelSource, ReadKernelSourceEvent, ReadKernelTestObserver,
     ReadSessionOperation,
@@ -199,9 +202,9 @@ fn seed_ordered_rows(database: &Database) {
 }
 
 #[cfg(unix)]
-fn one_page_id(page: &contextdb_core::read_contract::CursorPage) -> i64 {
-    let [row] = page.rows.as_slice() else {
-        panic!("the one-row cursor page returned {:?}", page.rows);
+fn one_page_id(rows: &[Vec<Value>]) -> i64 {
+    let [row] = rows else {
+        panic!("the one-row cursor page returned {:?}", rows);
     };
     let [Value::Int64(id)] = row.as_slice() else {
         panic!("the cursor id projection returned {row:?}");
@@ -547,6 +550,10 @@ fn one_row_page_reader_options() -> ReadSessionOptions {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn owner_active_readers(path: &Path, runtime_root: &Path) -> u64 {
     let report = ReadSession::with_runtime_directory_for_test(runtime_root, || {
         ReadSession::owner_report(path, ReadSessionOptions::default())
@@ -560,6 +567,10 @@ fn owner_active_readers(path: &Path, runtime_root: &Path) -> u64 {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_statement_over_the_owner_channel_reports_progress_before_the_result_returns_and_never_decreases()
  {
     let directory = tempfile::TempDir::new().expect("task-scoped owner-progress directory");
@@ -587,7 +598,7 @@ fn a_statement_over_the_owner_channel_reports_progress_before_the_result_returns
             &HashMap::new(),
         )
         .expect("the scan over the owner channel answers");
-    assert_eq!(answered.rows.len(), FIXTURE_ROWS as usize);
+    assert_eq!(answered.rows().len(), FIXTURE_ROWS as usize);
 
     let executing = recorder.of_phase(ReadPhase::Executing);
     assert!(
@@ -621,6 +632,10 @@ fn a_statement_over_the_owner_channel_reports_progress_before_the_result_returns
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn cancelling_a_statement_from_inside_the_owner_channel_observer_frees_the_owner_slot_and_leaves_the_session_usable()
  {
     let directory = tempfile::TempDir::new().expect("task-scoped owner-cancellation directory");
@@ -681,10 +696,14 @@ fn cancelling_a_statement_from_inside_the_owner_channel_observer_frees_the_owner
             "the SAME reader session's next statement succeeds: cancelling one statement did \
              not lose the session, its route, or its channel connection",
         );
-    assert_eq!(next.rows.len(), 1);
+    assert_eq!(next.rows().len(), 1);
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn cancelling_a_cursor_fetch_from_inside_the_owner_channel_observer_leaves_the_cursor_open() {
     let directory = tempfile::TempDir::new().expect("task-scoped owner-cursor-cancel directory");
     let path = directory.path().join("owner-cancel-cursor.db");
@@ -760,7 +779,7 @@ fn cancelling_a_cursor_fetch_from_inside_the_owner_channel_observer_leaves_the_c
         .fetch(None)
         .expect("the cursor survives the cancelled fetch and answers the next one");
     assert!(
-        !page.rows.is_empty() || !page.has_more,
+        !page.rows().is_empty() || !page.has_more(),
         "the cursor resumes cleanly after the cancelled fetch: {page:?}"
     );
 
@@ -774,6 +793,14 @@ fn cancelling_a_cursor_fetch_from_inside_the_owner_channel_observer_leaves_the_c
 
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[expect(
+    clippy::useless_conversion,
+    reason = "The fixture retains its explicit conversion at the ownership boundary."
+)]
 fn cancellation_received_before_owner_cursor_page_publication_withdraws_and_replays_the_page() {
     let directory = tempfile::TempDir::new().expect("task-scoped publication directory");
     let path = directory.path().join("owner-publication.db");
@@ -835,9 +862,14 @@ fn cancellation_received_before_owner_cursor_page_publication_withdraws_and_repl
         handshake,
         timeouts,
         Arc::clone(&clock),
+        database
+            .declared_reader_memory()
+            .expect("original reader owner")
+            .into(),
     ))
     .expect("connect through the observed owner carrier");
     let limits = one_row_page_reader_options().limits;
+    service.wait_for_carrier_requests_for_test(|| {});
     let baseline = service.resources();
 
     let opened = block_on(client.request(LocalRequestEnvelope {
@@ -856,8 +888,9 @@ fn cancellation_received_before_owner_cursor_page_publication_withdraws_and_repl
     };
     let cursor_id = opened.cursor_id;
     let first_page = decode_cursor_page(&opened.payload).expect("decode the first cursor page");
-    assert_eq!(one_page_id(&first_page), 200);
+    assert_eq!(one_page_id(first_page.rows()), 200);
     assert!(first_page.has_more);
+    service.wait_for_carrier_requests_for_test(|| {});
     let after_open = service.resources();
     assert_eq!(after_open.cursor_count, 1);
     assert_eq!(after_open.active_slots, 1);
@@ -893,6 +926,7 @@ fn cancellation_received_before_owner_cursor_page_publication_withdraws_and_repl
         ),
         "owner publication cancellation keeps the route-neutral typed result: {cancelled:?}"
     );
+    drop(cancelled);
     gate.assert_first_page_was_withdrawn(request_ordinal);
 
     // A status request can only run after the prior request's publication
@@ -902,17 +936,17 @@ fn cancellation_received_before_owner_cursor_page_publication_withdraws_and_repl
         request: LocalRequest::OwnerStatus,
     }))
     .expect("the cancelled request releases the owner connection");
+    service.wait_for_carrier_requests_for_test(|| {});
     let after_cancellation = service.resources();
     assert_eq!(after_cancellation.cursor_count, 1);
     assert_eq!(after_cancellation.active_slots, after_open.active_slots);
     assert_eq!(after_cancellation.active_cancellations, 0);
     assert!(after_cancellation.cursor_retained_bytes > 0);
     assert_eq!(
-        i128::from(after_cancellation.accountant_used_bytes)
-            - i128::from(after_open.accountant_used_bytes),
+        i128::from(after_cancellation.reader_used_bytes) - i128::from(after_open.reader_used_bytes),
         i128::from(after_cancellation.cursor_retained_bytes)
             - i128::from(after_open.cursor_retained_bytes),
-        "the pending page moves the database and owner cursor accounts by the same bytes"
+        "the pending page moves the reader and owner cursor accounts by the same bytes"
     );
 
     let replayed = block_on(client.request(LocalRequestEnvelope {
@@ -928,7 +962,7 @@ fn cancellation_received_before_owner_cursor_page_publication_withdraws_and_repl
     };
     let replayed = decode_cursor_page(&replayed.payload).expect("decode the replayed page");
     assert_eq!(
-        one_page_id(&replayed),
+        one_page_id(replayed.rows()),
         2_500,
         "no withheld row may be skipped"
     );
@@ -947,8 +981,8 @@ fn cancellation_received_before_owner_cursor_page_publication_withdraws_and_repl
             .cursor_retained_bytes
             .checked_sub(after_partial_replay.cursor_retained_bytes),
         after_cancellation
-            .accountant_used_bytes
-            .checked_sub(after_partial_replay.accountant_used_bytes),
+            .reader_used_bytes
+            .checked_sub(after_partial_replay.reader_used_bytes),
         "publishing part of a replay releases the same exact bytes from both accounts"
     );
 
@@ -965,7 +999,7 @@ fn cancellation_received_before_owner_cursor_page_publication_withdraws_and_repl
     };
     let next = decode_cursor_page(&next.payload).expect("decode the continued page");
     assert_eq!(
-        one_page_id(&next),
+        one_page_id(next.rows()),
         3_500,
         "the replay must not duplicate a row"
     );
@@ -986,6 +1020,9 @@ fn cancellation_received_before_owner_cursor_page_publication_withdraws_and_repl
         request: LocalRequest::CursorClose { cursor_id },
     }))
     .expect("close the replayed cursor");
+    // No later request orders the close's request registration release before
+    // this snapshot, so wait for the carrier to finish the close first.
+    service.wait_for_carrier_requests_for_test(|| {});
     assert_eq!(
         service.resources(),
         baseline,
@@ -1032,13 +1069,17 @@ fn cancellation_received_before_owner_cursor_page_publication_withdraws_and_repl
     let direct_replay = direct_cursor
         .fetch(None)
         .expect("the direct cursor also remains usable after typed cancellation");
-    assert_eq!(one_page_id(&direct_replay), 2_500);
+    assert_eq!(one_page_id(direct_replay.rows()), 2_500);
     direct_cursor
         .close()
         .expect("close the direct parity cursor");
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_report_from_a_finished_request_is_never_attributed_to_the_next_request_on_the_owner_channel() {
     let directory = tempfile::TempDir::new().expect("task-scoped owner-attribution directory");
     let path = directory.path().join("owner-attribution.db");
@@ -1066,7 +1107,7 @@ fn a_report_from_a_finished_request_is_never_attributed_to_the_next_request_on_t
             &HashMap::new(),
         )
         .expect("the large scan over the owner channel answers");
-    assert_eq!(big.rows.len(), FIXTURE_ROWS as usize);
+    assert_eq!(big.rows().len(), FIXTURE_ROWS as usize);
     let big_reporting_interval_crossings = recorder
         .of_phase(ReadPhase::Executing)
         .iter()
@@ -1088,7 +1129,7 @@ fn a_report_from_a_finished_request_is_never_attributed_to_the_next_request_on_t
             &HashMap::new(),
         )
         .expect("the tiny second scan over the owner channel answers");
-    assert_eq!(tiny.rows.len(), 1);
+    assert_eq!(tiny.rows().len(), 1);
     for report in recorder.of_phase(ReadPhase::Executing) {
         assert!(
             report.work < 1_000 && report.rows <= 1,
@@ -1099,35 +1140,44 @@ fn a_report_from_a_finished_request_is_never_attributed_to_the_next_request_on_t
     }
 }
 
-/// The fourth clock read after entering cursor-page authorization is made
-/// after the commit-lock attempt failed and its first cancellable wait ended.
-/// Count only the authorizing thread, since the carrier also uses this clock.
+// The timer is polled only after the real erasure gate is contended.
+// Carrier/client timers cannot masquerade as the authorizing worker's wait.
 #[cfg(unix)]
 struct PublicationCommitWaitClock {
     armed: AtomicBool,
-    reads: std::sync::atomic::AtomicUsize,
+    now: std::sync::atomic::AtomicU64,
     authorizing_thread: Mutex<Option<std::thread::ThreadId>>,
     waiting: std::sync::mpsc::SyncSender<()>,
+    announced: AtomicBool,
 }
 
 #[cfg(unix)]
 impl DeadlineClock for PublicationCommitWaitClock {
     fn now_ms(&self) -> u64 {
-        if self.armed.load(Ordering::SeqCst)
-            && *self.authorizing_thread.lock().expect("authorizing thread")
-                == Some(std::thread::current().id())
-            && self.reads.fetch_add(1, Ordering::SeqCst) == 3
-        {
-            self.waiting
-                .send(())
-                .expect("observe publication commit wait");
-        }
-        0
+        self.now.load(Ordering::SeqCst)
     }
 
     fn wait_until(&self, _deadline_ms: u64) -> contextdb_core::read_contract::DeadlineWait<'_> {
-        Box::pin(std::future::pending())
+        Box::pin(std::future::poll_fn(move |_| {
+            if self.armed.load(Ordering::SeqCst)
+                && *self.authorizing_thread.lock().unwrap() == Some(std::thread::current().id())
+                && !self.announced.swap(true, Ordering::SeqCst)
+            {
+                self.waiting
+                    .send(())
+                    .expect("actual erasure-gate timer poll");
+            }
+            Poll::Pending
+        }))
     }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PublicationContention {
+    OrdinaryWriter,
+    FailedPurgeCancellation,
+    SuccessfulPurge,
 }
 
 #[cfg(unix)]
@@ -1136,11 +1186,14 @@ struct WriterContendedPublicationObserver {
     resume: Barrier,
     clock: Arc<PublicationCommitWaitClock>,
     published: std::sync::atomic::AtomicUsize,
+    request: std::sync::atomic::AtomicU64,
+    cancelled_request: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(unix)]
 impl OwnerServicePublicationObserver for WriterContendedPublicationObserver {
-    fn before_cursor_page_publication(&self, _request_ordinal: u64) {
+    fn before_cursor_page_publication(&self, request_ordinal: u64) {
+        self.request.store(request_ordinal, Ordering::SeqCst);
         // Only the first fetch waits; a cancelled page is replayed by the
         // same cursor after the writer is released.
         if !self.clock.armed.load(Ordering::SeqCst) {
@@ -1157,7 +1210,10 @@ impl OwnerServicePublicationObserver for WriterContendedPublicationObserver {
         }
     }
 
-    fn cancellation_received(&self, _request_ordinal: u64) {}
+    fn cancellation_received(&self, request_ordinal: u64) {
+        self.cancelled_request
+            .store(request_ordinal, Ordering::SeqCst);
+    }
 
     fn cursor_page_published(&self, _request_ordinal: u64) {
         self.published.fetch_add(1, Ordering::SeqCst);
@@ -1165,7 +1221,15 @@ impl OwnerServicePublicationObserver for WriterContendedPublicationObserver {
 }
 
 #[cfg(unix)]
-fn owner_cursor_publication_behind_writer(cancel: bool) {
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[expect(
+    clippy::useless_conversion,
+    reason = "The fixture retains its explicit conversion at the ownership boundary."
+)]
+fn owner_cursor_publication_beside_a_paused_writer(contention: PublicationContention) {
     use std::collections::BTreeMap;
     use std::sync::mpsc::sync_channel;
     use std::time::Duration;
@@ -1201,7 +1265,8 @@ fn owner_cursor_publication_behind_writer(cancel: bool) {
     let (waiting, waiting_rx) = sync_channel(1);
     let clock = Arc::new(PublicationCommitWaitClock {
         armed: AtomicBool::new(false),
-        reads: std::sync::atomic::AtomicUsize::new(0),
+        now: std::sync::atomic::AtomicU64::new(0),
+        announced: AtomicBool::new(false),
         authorizing_thread: Mutex::new(None),
         waiting,
     });
@@ -1211,6 +1276,8 @@ fn owner_cursor_publication_behind_writer(cancel: bool) {
         resume: Barrier::new(2),
         clock: clock.clone(),
         published: std::sync::atomic::AtomicUsize::new(0),
+        request: std::sync::atomic::AtomicU64::new(0),
+        cancelled_request: std::sync::atomic::AtomicU64::new(0),
     });
     let user = LocalUserIdentity(nix::unistd::Uid::effective().as_raw() as u64);
     let handshake = LocalHandshake::current(
@@ -1250,6 +1317,10 @@ fn owner_cursor_publication_behind_writer(cancel: bool) {
             response_ms: 60_000,
         },
         clock,
+        database
+            .declared_reader_memory()
+            .expect("original reader owner")
+            .into(),
     ))
     .unwrap();
     let limits = one_row_page_reader_options().limits;
@@ -1265,7 +1336,7 @@ fn owner_cursor_publication_behind_writer(cancel: bool) {
         panic!("one cursor-open response");
     };
     assert_eq!(
-        one_page_id(&decode_cursor_page(&opened.payload).unwrap()),
+        one_page_id(decode_cursor_page(&opened.payload).unwrap().rows()),
         1
     );
     let cursor_id = opened.cursor_id;
@@ -1291,57 +1362,182 @@ fn owner_cursor_publication_behind_writer(cancel: bool) {
     boundary_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("fetch completed before publication");
-    let pause = database.pause_after_relational_apply_for_test();
+    let is_purge = contention != PublicationContention::OrdinaryWriter;
+    let pause = (!is_purge).then(|| database.pause_after_relational_apply_for_test());
+    let purge_park = is_purge.then(|| {
+        contextdb_engine::persistence::read_persistence_test_scaffold::arm_purge_park_before_durable_commit_for_test()
+    });
     let writer_database = database.clone();
     let writer = std::thread::spawn(move || {
-        writer_database
-            .execute(
-                "INSERT INTO publication_wait_rows VALUES (4)",
-                &HashMap::new(),
-            )
-            .unwrap()
+        if contention == PublicationContention::FailedPurgeCancellation {
+            // The fault is TLS: arm it on the thread that executes real PURGE.
+            writer_database.arm_authoritative_purge_point_remove_persistence_failure_for_test();
+        }
+        writer_database.execute(
+            if is_purge {
+                "PURGE FROM publication_wait_rows WHERE id = 2"
+            } else {
+                "INSERT INTO publication_wait_rows VALUES (4)"
+            },
+            &HashMap::new(),
+        )
     });
-    assert!(
-        pause.wait_until_reached(Duration::from_secs(5)),
-        "writer pauses while holding commit lock"
-    );
+    if let Some(park) = &purge_park {
+        park.parked
+            .recv_timeout(Duration::from_secs(5))
+            .expect("real purge owns publication fences and erasure gate before durability");
+    } else {
+        assert!(
+            pause
+                .as_ref()
+                .unwrap()
+                .wait_until_reached(Duration::from_secs(5)),
+            "ordinary writer pauses while holding commit lock"
+        );
+    }
     observer.resume.wait();
-    waiting_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("cursor authorization actually waits behind writer");
-    let (mut client, result) = if cancel {
+    if is_purge {
+        waiting_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("authorizing worker actually polls its pending erasure-gate timer");
+    }
+    if contention == PublicationContention::SuccessfulPurge {
+        purge_park.as_ref().unwrap().resume.send(()).unwrap();
+        writer
+            .join()
+            .unwrap()
+            .expect("successful purge commits authoritative erasure");
+        let (mut client, result) = answered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            matches!(&result,
+            Err(OwnerReadScaffoldError::Database(Error::ReadFailure(failure)))
+            | Err(OwnerReadScaffoldError::Refused(failure))
+                if failure.kind() == contextdb_core::read_contract::ReadFailureKind::AuthoritativeErasure),
+            "a successful purge forbids publication or replay of erased bytes: {result:?}"
+        );
+        fetch.join().unwrap();
+        block_on(client.request(LocalRequestEnvelope {
+            limits,
+            request: LocalRequest::OwnerStatus,
+        }))
+        .unwrap();
+        assert_eq!(observer.published.load(Ordering::SeqCst), 0);
+        let erased_resources = service.resources();
+        assert_eq!(erased_resources.active_cancellations, 0);
+        assert_eq!(erased_resources.active_slots, 0);
+        assert_eq!(erased_resources.cursor_count, 0);
+        assert_eq!(erased_resources.cursor_retained_bytes, 0);
+        assert_eq!(erased_resources.buffered_bytes, 0);
+        assert!(
+            database
+                .execute(
+                    "SELECT id FROM publication_wait_rows WHERE id = 2",
+                    &HashMap::new()
+                )
+                .unwrap()
+                .rows()
+                .is_empty()
+        );
+        drop(client);
+        service.shutdown_and_drain().unwrap();
+        database.close().unwrap();
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .execute(
+                    "SELECT id FROM publication_wait_rows ORDER BY id",
+                    &HashMap::new()
+                )
+                .unwrap()
+                .rows(),
+            vec![vec![Value::Int64(1)], vec![Value::Int64(3)]],
+            "successful purge remains erased after reopen"
+        );
+        reopened.close().unwrap();
+        return;
+    }
+    if contention == PublicationContention::FailedPurgeCancellation {
         cancellation.cancel();
-        // Receive the typed refusal while the writer still owns its lock.
-        let answer = answered_rx.recv_timeout(Duration::from_secs(5));
-        pause.release();
-        let answer = answer.expect("owner cancellation refuses before writer release");
+    }
+    // Cancellation must answer while the purge still holds its gate. The
+    // ordinary writer control must publish while its commit lock stays held.
+    let (mut client, result) = answered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("answer arrives before releasing the contending writer/purge");
+    block_on(client.request(LocalRequestEnvelope {
+        limits,
+        request: LocalRequest::OwnerStatus,
+    }))
+    .unwrap();
+    assert_eq!(service.resources().active_cancellations, 0);
+    if contention == PublicationContention::FailedPurgeCancellation {
         assert!(
             matches!(
-                answer.1,
+                &result,
                 Err(OwnerReadScaffoldError::Database(Error::ReadCancelled))
             ),
-            "typed cancellation refusal: {:?}",
-            answer.1
+            "real channel cancellation retains its typed refusal: {result:?}"
         );
+        assert_eq!(
+            observer.cancelled_request.load(Ordering::SeqCst),
+            observer.request.load(Ordering::SeqCst)
+        );
+        assert_ne!(observer.request.load(Ordering::SeqCst), 0);
         assert_eq!(observer.published.load(Ordering::SeqCst), 0);
-        answer
+        assert_eq!(service.resources().cursor_count, 1);
+        purge_park.as_ref().unwrap().resume.send(()).unwrap();
+        let error = writer
+            .join()
+            .unwrap()
+            .expect_err("armed real purge must fail and roll back");
+        assert!(
+            error
+                .to_string()
+                .contains("authoritative purge point-remove persistence failure injected"),
+            "failure comes from the intended durable transaction: {error}"
+        );
+        let replay = block_on(client.request(LocalRequestEnvelope {
+            limits,
+            request: LocalRequest::CursorFetch {
+                cursor_id,
+                rows: None,
+            },
+        }))
+        .expect("same cursor replays only after failed purge rollback");
+        let [LocalResponse::CursorPage { page }] = replay.as_slice() else {
+            panic!("one replay page");
+        };
+        assert_eq!(
+            one_page_id(decode_cursor_page(&page.payload).unwrap().rows()),
+            2
+        );
+        assert_eq!(
+            database
+                .execute(
+                    "SELECT id FROM publication_wait_rows ORDER BY id",
+                    &HashMap::new()
+                )
+                .unwrap()
+                .rows(),
+            vec![
+                vec![Value::Int64(1)],
+                vec![Value::Int64(2)],
+                vec![Value::Int64(3)]
+            ]
+        );
     } else {
-        pause.release();
-        answered_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("publication resumes with writer release")
-    };
-    fetch.join().unwrap();
-    writer.join().unwrap();
-    if cancel {
-        assert!(result.is_err());
-    } else {
-        let responses = result.expect("uncancelled publication succeeds");
+        pause.as_ref().unwrap().release();
+        writer.join().unwrap().expect("ordinary writer succeeds");
+        let responses = result.expect("the page publishes without waiting for the writer");
         let [LocalResponse::CursorPage { page }] = responses.as_slice() else {
             panic!("exactly one successful page: {responses:?}");
         };
-        assert_eq!(one_page_id(&decode_cursor_page(&page.payload).unwrap()), 2);
+        assert_eq!(
+            one_page_id(decode_cursor_page(&page.payload).unwrap().rows()),
+            2
+        );
     }
+    fetch.join().unwrap();
     // A status exchange is an ordering fence after page publication and guard
     // release. The cancelled page must replay; the successful one advances.
     block_on(client.request(LocalRequestEnvelope {
@@ -1349,10 +1545,7 @@ fn owner_cursor_publication_behind_writer(cancel: bool) {
         request: LocalRequest::OwnerStatus,
     }))
     .unwrap();
-    assert_eq!(
-        observer.published.load(Ordering::SeqCst),
-        usize::from(!cancel)
-    );
+    assert_eq!(observer.published.load(Ordering::SeqCst), 1);
     assert_eq!(service.resources().active_cancellations, 0);
     let next = block_on(client.request(LocalRequestEnvelope {
         limits,
@@ -1366,9 +1559,9 @@ fn owner_cursor_publication_behind_writer(cancel: bool) {
         panic!("one continuation page");
     };
     let next_page = decode_cursor_page(&page.payload).unwrap();
-    assert_eq!(one_page_id(&next_page), if cancel { 2 } else { 3 });
-    assert_eq!(
-        next_page.has_more, cancel,
+    assert_eq!(one_page_id(next_page.rows()), 3);
+    assert!(
+        !next_page.has_more,
         "the opened snapshot excludes the writer's later row"
     );
     block_on(client.request(LocalRequestEnvelope {
@@ -1376,10 +1569,7 @@ fn owner_cursor_publication_behind_writer(cancel: bool) {
         request: LocalRequest::OwnerStatus,
     }))
     .unwrap();
-    assert_eq!(
-        observer.published.load(Ordering::SeqCst),
-        usize::from(!cancel) + 1
-    );
+    assert_eq!(observer.published.load(Ordering::SeqCst), 2);
     block_on(client.request(LocalRequestEnvelope {
         limits,
         request: LocalRequest::CursorClose { cursor_id },
@@ -1398,16 +1588,44 @@ fn owner_cursor_publication_behind_writer(cancel: bool) {
     assert_eq!(released.active_cancellations, 0);
     drop(client);
     service.shutdown_and_drain().unwrap();
+    database.close().unwrap();
+    let reopened = Database::open(&path).unwrap();
+    let expected = if contention == PublicationContention::OrdinaryWriter {
+        vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(3)],
+            vec![Value::Int64(4)],
+        ]
+    } else {
+        vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(3)],
+        ]
+    };
+    assert_eq!(
+        reopened
+            .execute(
+                "SELECT id FROM publication_wait_rows ORDER BY id",
+                &HashMap::new()
+            )
+            .unwrap()
+            .rows(),
+        expected,
+        "failed purge publishes no durable erasure; ordinary commit stays durable"
+    );
+    reopened.close().unwrap();
 }
 
 #[cfg(unix)]
 #[test]
-fn owner_channel_cancellation_reaches_cursor_publication_while_writer_is_paused() {
-    owner_cursor_publication_behind_writer(true);
-}
-
-#[cfg(unix)]
-#[test]
-fn owner_channel_cursor_publication_after_writer_release_completes_exactly_once() {
-    owner_cursor_publication_behind_writer(false);
+fn owner_channel_cursor_publication_is_not_held_by_a_paused_writer() {
+    for contention in [
+        PublicationContention::OrdinaryWriter,
+        PublicationContention::FailedPurgeCancellation,
+        PublicationContention::SuccessfulPurge,
+    ] {
+        owner_cursor_publication_beside_a_paused_writer(contention);
+    }
 }

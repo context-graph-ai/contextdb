@@ -21,17 +21,38 @@
 // This private production module is a public façade only for `test-seams`
 // integration proofs, so its reexports are intentionally unused by the
 // default build.
-#![cfg_attr(not(feature = "test-seams"), allow(unused_imports))]
-#![allow(dead_code)]
 
 mod admission;
 mod client;
+mod native_request;
 mod service;
 
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from admission.rs"
+    )
+)]
 pub use admission::{OwnerAdmission, RequestLease};
 pub use client::OwnerClient;
 #[cfg(unix)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 pub use client::OwnerDisconnectHandle;
+pub(crate) use native_request::NativeReadRequest;
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_service_contract.rs"
+    )
+)]
 pub use service::{
     ConnectionState, CursorEntry, CursorIdentifierAllocator, OwnerReadResourceSnapshot,
     OwnerReadService, OwnerServiceSpec, ValidatedOwnerListener,
@@ -55,7 +76,7 @@ pub enum OwnerReadScaffoldError {
     #[error("read-contract prerequisite failed: {0}")]
     ReadContract(#[from] ReadContractViolation),
     #[error("local transport prerequisite failed: {0}")]
-    LocalTransport(#[from] LocalTransportError),
+    LocalTransport(LocalTransportError),
     #[error("owner request refused: {0:?}")]
     Refused(ReadFailure),
     #[error("database prerequisite failed: {0}")]
@@ -68,6 +89,17 @@ impl OwnerReadScaffoldError {
     }
 
     pub(crate) fn from_local(error: LocalTransportError) -> Self {
+        let error = match error.into_admission_error() {
+            Ok(error) => {
+                return match crate::local_transport::query_funding::memory_refusal_ceiling(&error) {
+                    Some(ceiling) => Self::Refused(
+                        crate::local_transport::memory_ceiling_read_failure(ceiling, None),
+                    ),
+                    None => Self::from_local(crate::local_transport::invalid_channel_data()),
+                };
+            }
+            Err(error) => error,
+        };
         match error {
             LocalTransportError::Refusal(failure) => Self::Refused(failure),
             // A payload that is exactly what it claims to be and simply too
@@ -76,9 +108,12 @@ impl OwnerReadScaffoldError {
             // invalid-channel-data document instead tells them their owner is
             // sending garbage when the ceiling they themselves declared is
             // what was reached -- so they can neither act on it nor raise it.
-            LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded { ceiling }) => {
-                Self::Refused(crate::local_transport::memory_ceiling_read_failure(ceiling))
-            }
+            LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded {
+                ceiling,
+                required,
+            }) => Self::Refused(crate::local_transport::memory_ceiling_read_failure(
+                ceiling, required,
+            )),
             LocalTransportError::Frame(_) | LocalTransportError::Payload(_) => Self::Refused(
                 ReadFailure::new(
                     contextdb_core::read_contract::ReadFailureKind::InvalidChannelData,
@@ -108,3 +143,9 @@ fn response_expectation(request: &LocalRequest) -> LocalResponseExpectation {
 }
 
 pub type OwnerReadScaffoldResult<T> = std::result::Result<T, OwnerReadScaffoldError>;
+
+impl From<LocalTransportError> for OwnerReadScaffoldError {
+    fn from(error: LocalTransportError) -> Self {
+        Self::from_local(error)
+    }
+}

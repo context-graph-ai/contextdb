@@ -5,8 +5,6 @@
 //! directory and each harness asks for it by size, so a harness seeds what it
 //! needs instead of depending on a sibling having run first.
 
-#![allow(dead_code)]
-
 use contextdb_core::read_contract::ReadRoute;
 use contextdb_core::types::ContextId;
 use contextdb_core::{Value, VectorIndexRef};
@@ -58,7 +56,7 @@ pub fn find_sql(mode: &str, limit: usize) -> String {
 
 pub fn answer_ids(answer: &contextdb_engine::QueryResult) -> Vec<i64> {
     answer
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.first() {
             Some(Value::Int64(id)) => *id,
@@ -91,6 +89,10 @@ pub fn seeded(rows: usize) -> (std::path::PathBuf, std::path::PathBuf) {
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn open_reader(
     path: &std::path::Path,
     runtime: &std::path::Path,
@@ -169,11 +171,17 @@ fn seed(path: &std::path::Path, runtime: &std::path::Path, rows: usize) {
         admin
             .run_maintenance_cycle()
             .expect("advance deterministic maintenance");
+        let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+            admin
+                .declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         let ready = admin
             .vector_store_for_test()
-            .partition_infos(&index)
+            .partition_infos(&index, &mut partition_observation_owner_1)
             .expect("inspect partition readiness");
-        if !ready.is_empty() && ready.iter().all(|partition| partition.graph_available) {
+        if !ready.is_empty() && ready.iter().all(|partition| db.__debug_vector_partition_indexed_for_test(partition.partition.index.clone(), partition.partition.partition_key.clone())) {
             break;
         }
     }

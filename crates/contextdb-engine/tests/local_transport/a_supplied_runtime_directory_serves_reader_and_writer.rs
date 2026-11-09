@@ -103,7 +103,7 @@ fn every_reading_opener_that_takes_the_directory_reaches_the_owner_through_it() 
     let answer = session
         .execute("SELECT label FROM shared ORDER BY id", &HashMap::new())
         .expect("the owner answers over its channel");
-    assert_eq!(answer.rows.len(), 1, "the seeded row travels the channel");
+    assert_eq!(answer.rows().len(), 1, "the seeded row travels the channel");
     drop(session);
 
     let owner_only = ReadSession::open_owner_only_in_runtime_dir(
@@ -165,7 +165,7 @@ fn the_same_directory_reads_the_committed_file_when_nobody_owns_the_store() {
     let answer = session
         .execute("SELECT label FROM shared ORDER BY id", &HashMap::new())
         .expect("the committed file answers");
-    assert_eq!(answer.rows.len(), 1);
+    assert_eq!(answer.rows().len(), 1);
     drop(session);
 
     let refusal = ReadSession::open_owner_only_in_runtime_dir(
@@ -197,7 +197,7 @@ fn a_supplied_root_reads_a_stopped_store_without_a_platform_runtime_root() {
         let answer = session
             .execute("SELECT label FROM shared ORDER BY id", &HashMap::new())
             .expect("the committed row is readable");
-        assert_eq!(answer.rows, vec![vec![Value::Text("kept".to_owned())]]);
+        assert_eq!(answer.rows(), vec![vec![Value::Text("kept".to_owned())]]);
         return;
     }
 

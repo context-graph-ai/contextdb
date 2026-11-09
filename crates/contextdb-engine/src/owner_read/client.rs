@@ -1,12 +1,18 @@
 //! Thin owner client over one selected local carrier connection.
 
 use super::{OwnerReadScaffoldError, OwnerReadScaffoldResult, response_expectation};
+use crate::local_transport::FundedResultReceiveOutcome;
+use crate::local_transport::query_funding::{Funded, FundedVec};
 use crate::local_transport::{
     FrameBufferAllocator, FrameReader, LocalHandshake, LocalInboundKind, LocalInboundMessage,
     LocalOutboundMessage, LocalProtocolBoundary, LocalRequest, LocalRequestEnvelope, LocalResponse,
     LocalResponseExpectation, OrdinaryResultReceiver, ResultReceiveOutcome,
 };
 #[cfg(unix)]
+#[allow(
+    unused_imports,
+    reason = "KEEP-SHARED: shared test helper used by owner_read"
+)]
 use crate::local_transport::{LocalDeadlineOperation, UnixLocalCarrier, handshake_with_deadline};
 use crate::read_progress::ReadProgressObserver;
 use contextdb_core::read_contract::{
@@ -27,16 +33,18 @@ pub struct OwnerClient {
     presented_handshake: LocalHandshake,
     timeouts: ReadClientTimeouts,
     clock: Arc<dyn DeadlineClock>,
+    connection_owner: contextdb_core::read_memory::ReadMemoryOwner,
     requests_sent: u64,
     cancellations: Arc<CancelCoordination>,
     /// What the owner said about itself when it accepted this reader.
     accepted_status: Option<contextdb_core::read_contract::OwnerReadStatus>,
+    accepted_lsn: Option<contextdb_core::Lsn>,
     /// A draining owner sends this terminal refusal before ending an idle
     /// connection. Remember it so every later operation on the same selected
     /// route receives the owner's typed answer instead of reclassifying the
     /// now-closed carrier as an unexpected disconnect.
     terminal_refusal: Option<contextdb_core::read_contract::ReadFailure>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     response_frames: Option<Arc<dyn Fn(bool) + Send + Sync>>,
     #[cfg(unix)]
     stream: UnixStream,
@@ -63,37 +71,46 @@ impl OwnerClient {
         presented_handshake: LocalHandshake,
         timeouts: ReadClientTimeouts,
         clock: Arc<dyn DeadlineClock>,
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> OwnerReadScaffoldResult<Self> {
         timeouts.validate()?;
         let channel_path = channel_path.as_ref().to_path_buf();
         let deadline_ms = checked_deadline(clock.as_ref(), timeouts.connect_ms)?;
         let carrier = UnixLocalCarrier;
         let mut stream = carrier
-            .connect(&channel_path, clock.as_ref(), deadline_ms)
+            .connect_funded(&channel_path, clock.as_ref(), deadline_ms, owner.clone())
             .await
             .map_err(OwnerReadScaffoldError::from_local)?;
         let boundary = LocalProtocolBoundary::with_effective_limits(ReadLimits::default());
-        let handshake: LocalDeadlineOperation<'_> = Box::pin(async {
-            UnixLocalCarrier::send_message(
-                &carrier,
-                &mut stream,
-                &boundary,
-                LocalOutboundMessage::Handshake(&presented_handshake),
-            )
-        });
-        handshake_with_deadline(clock.as_ref(), deadline_ms, handshake)
-            .await
-            .map_err(OwnerReadScaffoldError::from_local)?;
+        boundary.set_query_funding(Some(owner.clone()));
+        crate::local_transport::deadline_operation_funded(
+            clock.as_ref(),
+            crate::local_transport::DeadlineStage::Handshake,
+            deadline_ms,
+            owner.clone(),
+            || async {
+                UnixLocalCarrier::send_message(
+                    &carrier,
+                    &mut stream,
+                    &boundary,
+                    LocalOutboundMessage::Handshake(&presented_handshake),
+                )
+            },
+        )
+        .await
+        .map_err(OwnerReadScaffoldError::from_local)?;
         let mut client = Self {
             channel_path,
             presented_handshake,
             timeouts,
             clock,
+            connection_owner: owner,
             requests_sent: 0,
             cancellations: Arc::new(CancelCoordination::default()),
             accepted_status: None,
+            accepted_lsn: None,
             terminal_refusal: None,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             response_frames: None,
             stream,
         };
@@ -117,10 +134,13 @@ impl OwnerClient {
     #[cfg(unix)]
     async fn confirm_the_owner_accepted_this_reader(&mut self) -> OwnerReadScaffoldResult<()> {
         let answered = self
-            .request(LocalRequestEnvelope {
-                limits: ReadLimits::default(),
-                request: LocalRequest::OwnerStatus,
-            })
+            .request_with_original_owner(
+                LocalRequestEnvelope {
+                    limits: ReadLimits::default(),
+                    request: LocalRequest::OwnerStatus,
+                },
+                self.connection_owner.clone(),
+            )
             .await?;
         for response in answered {
             match response {
@@ -128,6 +148,7 @@ impl OwnerClient {
                 // connection has to know whether this owner is actually
                 // serving, and this answer is the owner's own word for it.
                 LocalResponse::OwnerStatus { status } => {
+                    self.accepted_lsn = Some(status.committed_lsn);
                     self.accepted_status = Some(status.status);
                     return Ok(());
                 }
@@ -159,6 +180,13 @@ impl OwnerClient {
         ))
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_session.rs"
+        )
+    )]
     pub fn channel_path(&self) -> &Path {
         &self.channel_path
     }
@@ -173,18 +201,31 @@ impl OwnerClient {
         self.accepted_status.clone()
     }
 
+    /// The committed frontier the authenticated owner published at acceptance.
+    pub(crate) fn accepted_lsn(&self) -> Option<contextdb_core::Lsn> {
+        self.accepted_lsn
+    }
+
     /// Watch this connection's reply frames arrive, one call per frame, with
     /// the frame's own terminality. A caller that must act between the frames
     /// of one answer -- to prove a partial answer is discarded when its owner
     /// dies mid-reply -- has nowhere else to stand, and re-reading the carrier
     /// elsewhere would be a second transport.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn observe_response_frames_for_test(
         &mut self,
         observer: Option<Arc<dyn Fn(bool) + Send + Sync>>,
     ) {
         self.response_frames = observer;
+    }
+
+    pub(crate) fn deadline_clock(&self) -> Arc<dyn DeadlineClock> {
+        self.clock.clone()
+    }
+
+    pub(crate) fn original_connection_owner(&self) -> contextdb_core::read_memory::ReadMemoryOwner {
+        self.connection_owner.clone()
     }
 
     /// Decode one request only after the length prefix has passed the shared
@@ -194,6 +235,17 @@ impl OwnerClient {
     /// of the carrier's own blanket collapse for unauthenticated socket
     /// peers -- this is not a live connection, so that collapse does not
     /// apply here.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from every_public_route_installs_its_own_memory_owner.rs"
+        )
+    )]
     pub fn read_envelope(
         reader: &mut dyn FrameReader,
         allocator: &mut dyn FrameBufferAllocator,
@@ -214,10 +266,24 @@ impl OwnerClient {
 
     /// Encode a request through the shared payload and frame codecs, via the
     /// same typed protocol boundary the carrier uses to write one.
-    pub fn encode_envelope(envelope: &LocalRequestEnvelope) -> OwnerReadScaffoldResult<Vec<u8>> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_client_contract.rs"
+        )
+    )]
+    pub fn encode_envelope(
+        envelope: &LocalRequestEnvelope,
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> OwnerReadScaffoldResult<crate::read_contract::EncodedReadBytes> {
         let boundary = LocalProtocolBoundary::with_effective_limits(ReadLimits::default());
         boundary
-            .encode_frame(LocalOutboundMessage::Request(envelope))
+            .encode_frame(LocalOutboundMessage::Request(envelope), owner)
             .map_err(OwnerReadScaffoldError::from_local)
     }
 
@@ -229,7 +295,38 @@ impl OwnerClient {
         &mut self,
         envelope: LocalRequestEnvelope,
     ) -> OwnerReadScaffoldResult<Vec<LocalResponse>> {
-        self.request_watching(envelope, None, None).await
+        let custody = Some(
+            crate::local_transport::query_funding::QueryMemory::with_original_owner(
+                self.connection_owner.clone(),
+                envelope.limits.memory,
+            )
+            .map_err(OwnerReadScaffoldError::Database)?,
+        );
+        let answered = self
+            .request_watching_funded(envelope, None, None, None, custody.as_ref(), None)
+            .await;
+        match answered {
+            Ok(responses) => responses
+                .into_public()
+                .map_err(OwnerReadScaffoldError::Database),
+            Err(error) => Err(custody
+                .as_ref()
+                .and_then(|q| q.take_stop())
+                .map(OwnerReadScaffoldError::Database)
+                .unwrap_or(error)),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn request_with_original_owner(
+        &mut self,
+        envelope: LocalRequestEnvelope,
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> OwnerReadScaffoldResult<Vec<LocalResponse>> {
+        self.request_watching_funded(envelope, None, None, None, None, Some(owner))
+            .await?
+            .into_public()
+            .map_err(OwnerReadScaffoldError::Database)
     }
 
     /// Send one request, hear what the owner's read is doing while it runs,
@@ -245,12 +342,115 @@ impl OwnerClient {
     /// the owner reports at the same interval it does for a caller in its own
     /// process.
     #[cfg(unix)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_route_progress_and_cancellation.rs"
+        )
+    )]
     pub async fn request_watching(
         &mut self,
         envelope: LocalRequestEnvelope,
         progress: Option<&Arc<dyn ReadProgressObserver>>,
         cancellation: Option<&OwnerReadCancellation>,
     ) -> OwnerReadScaffoldResult<Vec<LocalResponse>> {
+        if cancellation.is_some_and(OwnerReadCancellation::is_cancelled) {
+            return Err(OwnerReadScaffoldError::Database(
+                contextdb_core::Error::ReadCancelled,
+            ));
+        }
+        let custody = Some(
+            crate::local_transport::query_funding::QueryMemory::with_original_owner(
+                self.connection_owner.clone(),
+                envelope.limits.memory,
+            )
+            .map_err(OwnerReadScaffoldError::Database)?,
+        );
+        let answered = self
+            .request_watching_funded(
+                envelope,
+                progress,
+                cancellation,
+                None,
+                custody.as_ref(),
+                None,
+            )
+            .await;
+        match answered {
+            Ok(responses) => responses
+                .into_public()
+                .map_err(OwnerReadScaffoldError::Database),
+            Err(error) => Err(custody
+                .as_ref()
+                .and_then(|q| q.take_stop())
+                .map(OwnerReadScaffoldError::Database)
+                .unwrap_or(error)),
+        }
+    }
+
+    /// Cursor retention is already owned by the caller. Carry its remaining
+    /// allowance explicitly into the same transport boundary before allocation.
+    #[cfg(unix)]
+    pub(crate) async fn request_watching_under_cursor_memory(
+        &mut self,
+        envelope: LocalRequestEnvelope,
+        progress: Option<&Arc<dyn ReadProgressObserver>>,
+        cancellation: Option<&OwnerReadCancellation>,
+        cursor_memory: Option<u64>,
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> OwnerReadScaffoldResult<Vec<LocalResponse>> {
+        if cancellation.is_some_and(OwnerReadCancellation::is_cancelled) {
+            return Err(OwnerReadScaffoldError::Database(
+                contextdb_core::Error::ReadCancelled,
+            ));
+        }
+        if let Some(failure) = &self.terminal_refusal {
+            return Err(OwnerReadScaffoldError::Refused(failure.clone()));
+        }
+        self.request_watching_funded(
+            envelope,
+            progress,
+            cancellation,
+            cursor_memory,
+            None,
+            Some(owner),
+        )
+        .await?
+        .into_public()
+        .map_err(OwnerReadScaffoldError::Database)
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn request_watching_with_query_memory(
+        &mut self,
+        request: Funded<LocalRequest>,
+        limits: ReadLimits,
+        progress: Option<&Arc<dyn ReadProgressObserver>>,
+        cancellation: Option<&OwnerReadCancellation>,
+        memory: &crate::local_transport::query_funding::QueryMemory,
+    ) -> OwnerReadScaffoldResult<FundedVec<Funded<LocalResponse>>> {
+        // This is the original DTO-clone invoice. The awaited future consumes
+        // the whole envelope before this outside invoice may settle.
+        let Funded {
+            value: request,
+            credit: _request_credit,
+        } = request;
+        let envelope = LocalRequestEnvelope { limits, request };
+        self.request_watching_funded(envelope, progress, cancellation, None, Some(memory), None)
+            .await
+    }
+
+    #[cfg(unix)]
+    async fn request_watching_funded(
+        &mut self,
+        envelope: LocalRequestEnvelope,
+        progress: Option<&Arc<dyn ReadProgressObserver>>,
+        cancellation: Option<&OwnerReadCancellation>,
+        cursor_memory: Option<u64>,
+        query_custody: Option<&crate::local_transport::query_funding::QueryMemory>,
+        supplied_owner: Option<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> OwnerReadScaffoldResult<FundedVec<Funded<LocalResponse>>> {
         // A statement its caller has already withdrawn is not sent at all.
         // Sending it and interrupting it a moment later makes the answer a
         // race the caller cannot see or influence: an owner that finishes the
@@ -266,6 +466,9 @@ impl OwnerClient {
             return Err(OwnerReadScaffoldError::Refused(failure.clone()));
         }
         let deadline_ms = checked_deadline(self.clock.as_ref(), self.timeouts.response_ms)?;
+        if let Some(custody) = query_custody {
+            custody.bind_client(self.clock.clone(), deadline_ms, cancellation.cloned());
+        }
         // The ordinal this request will carry, read before it is sent so the
         // interrupt below names the very request this call is about and never
         // the one after it. The handle is a second one onto the same carrier,
@@ -275,8 +478,26 @@ impl OwnerClient {
             None => None,
         };
         self.requests_sent = self.requests_sent.saturating_add(1);
-        let boundary = LocalProtocolBoundary::with_effective_limits(envelope.limits);
+        let boundary = LocalProtocolBoundary::with_effective_limits(envelope.limits)
+            .with_cursor_receive_memory(cursor_memory);
         let expectation = response_expectation(&envelope.request);
+        let query_memory = if expectation == LocalResponseExpectation::OrdinaryResult {
+            Some(match query_custody {
+                Some(memory) => memory.image(),
+                None => {
+                    return Err(OwnerReadScaffoldError::unimplemented(
+                        "ordinary query requires its original terminal custody",
+                    ));
+                }
+            })
+        } else {
+            None
+        };
+        let operation_owner = query_custody
+            .map(|memory| memory.image().owner())
+            .or(supplied_owner)
+            .expect("internal request carries its original read owner");
+        boundary.set_query_funding(Some(operation_owner));
         let carrier = UnixLocalCarrier;
         // An owner that refuses a connection answers it and then closes, so
         // the request going out and the answer coming back cross: the write
@@ -335,12 +556,16 @@ impl OwnerClient {
             _ => None,
         };
 
-        let mut unpublished = Vec::new();
+        let mut unpublished = FundedVec::new_owned(query_memory.as_ref().map(|m| m.owner()));
         let mut ordinary_receiver = if expectation == LocalResponseExpectation::OrdinaryResult {
             Some(
-                OrdinaryResultReceiver::with_effective_ceilings(
+                OrdinaryResultReceiver::with_query_memory(
                     envelope.limits.result_bytes,
                     envelope.limits.memory,
+                    query_memory
+                        .as_ref()
+                        .expect("ordinary query has an owner")
+                        .clone(),
                 )
                 .map_err(OwnerReadScaffoldError::from_local)?,
             )
@@ -354,18 +579,65 @@ impl OwnerClient {
         // own observer callback cannot, and is told so by this registration.
         let _reading = self.cancellations.clone().reading_here();
         loop {
-            let response = match UnixLocalCarrier::receive_response(
-                &carrier,
-                &mut self.stream,
-                &boundary,
-                expectation.clone(),
-                self.clock.as_ref(),
-                deadline_ms,
-            )
-            .await
-            {
+            let received = if let Some(memory) = query_memory.as_ref() {
+                UnixLocalCarrier::receive_query_response(
+                    &carrier,
+                    &mut self.stream,
+                    &boundary,
+                    memory.clone(),
+                    self.clock.as_ref(),
+                    deadline_ms,
+                )
+                .await
+            } else {
+                UnixLocalCarrier::receive_response(
+                    &carrier,
+                    &mut self.stream,
+                    &boundary,
+                    expectation.clone(),
+                    self.clock.as_ref(),
+                    deadline_ms,
+                )
+                .await
+                .map(Funded::external)
+            };
+            let response = match received {
                 Ok(response) => response,
                 Err(error) => {
+                    let error = match (cursor_memory, error) {
+                        (
+                            Some(_),
+                            crate::local_transport::LocalTransportError::Payload(
+                                crate::local_transport::PayloadViolation::MemoryCeilingExceeded {
+                                    ceiling,
+                                    required,
+                                },
+                            ),
+                        ) => crate::local_transport::LocalTransportError::Payload(
+                            crate::local_transport::PayloadViolation::MemoryCeilingExceeded {
+                                ceiling: envelope.limits.memory,
+                                required: required.map(|bytes| {
+                                    bytes.saturating_add(
+                                        envelope.limits.memory.saturating_sub(ceiling),
+                                    )
+                                }),
+                            },
+                        ),
+                        (_, other) => other,
+                    };
+                    // Prefix admission may leave the rejected payload unread.
+                    // Close this selected carrier before a caller attempts a
+                    // best-effort cursor close on that incomplete exchange.
+                    if (cursor_memory.is_some() || query_memory.is_some())
+                        && matches!(
+                            &error,
+                            crate::local_transport::LocalTransportError::Payload(
+                                crate::local_transport::PayloadViolation::MemoryCeilingExceeded { .. }
+                            )
+                        )
+                    {
+                        let _ = self.stream.shutdown(Shutdown::Both);
+                    }
                     if let Some(receiver) = ordinary_receiver.as_mut() {
                         let _discarded = receiver
                             .disconnect()
@@ -374,7 +646,7 @@ impl OwnerClient {
                     return Err(OwnerReadScaffoldError::from_local(error));
                 }
             };
-            if let LocalResponse::CancelApplied { request_ordinal } = &response {
+            if let LocalResponse::CancelApplied { request_ordinal } = &response.value {
                 // Nonterminal, like a progress frame: it ends nothing and
                 // carries no part of the answer. It releases the thread that
                 // cancelled, which is waiting to know the owner has really
@@ -382,7 +654,7 @@ impl OwnerClient {
                 self.cancellations.note_applied(*request_ordinal);
                 continue;
             }
-            if let LocalResponse::Progress { progress: reported } = &response {
+            if let LocalResponse::Progress { progress: reported } = &response.value {
                 // Nonterminal: it belongs to this request but carries no part
                 // of the answer, so the assembly the owner is still building
                 // stays untouched and the exchange goes on.
@@ -392,44 +664,83 @@ impl OwnerClient {
                 continue;
             }
             if let Some(receiver) = ordinary_receiver.as_mut() {
+                // Copy leading pieces only; the terminal's original invoice
+                // moves back out of validation with its unchanged bytes.
+                let retained_chunk = if let LocalResponse::ResultChunk { chunk } = &response.value {
+                    Some(
+                        Funded::allocate_owned(
+                            query_memory.as_ref().map(|m| m.owner()),
+                            chunk.bytes.len(),
+                            || LocalResponse::ResultChunk {
+                                chunk: crate::local_transport::ResultChunk {
+                                    bytes: chunk.bytes.to_vec(),
+                                },
+                            },
+                        )
+                        .map_err(OwnerReadScaffoldError::Database)?,
+                    )
+                } else {
+                    None
+                };
                 let outcome = receiver
-                    .receive(response.clone())
+                    .receive_funded(response)
                     .map_err(OwnerReadScaffoldError::from_local)?;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 if let Some(observe) = self.response_frames.as_ref() {
-                    observe(!matches!(outcome, ResultReceiveOutcome::Pending));
+                    observe(!matches!(outcome, FundedResultReceiveOutcome::Pending));
                 }
                 match outcome {
-                    ResultReceiveOutcome::Pending => unpublished.push(response),
-                    ResultReceiveOutcome::Published(_) => {
-                        unpublished.push(response);
+                    FundedResultReceiveOutcome::Pending => {
+                        unpublished
+                            .push(retained_chunk.ok_or_else(|| {
+                                OwnerReadScaffoldError::unimplemented(
+                                    "ordinary pending receiver did not consume a result chunk",
+                                )
+                            })?)
+                            .map_err(OwnerReadScaffoldError::Database)?;
+                    }
+                    FundedResultReceiveOutcome::Published(result) => {
+                        let crate::local_transport::FundedOrdinaryResult { bytes, terminal } =
+                            result;
+                        drop(bytes);
+                        unpublished
+                            .push(Funded {
+                                value: LocalResponse::TerminalSuccess {
+                                    success: terminal.value,
+                                },
+                                credit: terminal.credit,
+                            })
+                            .map_err(OwnerReadScaffoldError::Database)?;
                         return Ok(unpublished);
                     }
-                    ResultReceiveOutcome::Failed(failure) => {
-                        if failure.kind()
+                    FundedResultReceiveOutcome::Failed(failure) => {
+                        if failure.value.kind()
                             == contextdb_core::read_contract::ReadFailureKind::OwnerNotServing
                         {
-                            self.terminal_refusal = Some(failure.clone());
+                            self.terminal_refusal = Some(failure.value.clone());
                         }
-                        return Err(OwnerReadScaffoldError::Refused(failure));
+                        return Err(OwnerReadScaffoldError::Refused(failure.into_retained()));
                     }
-                    ResultReceiveOutcome::EngineFailed(failure) => {
+                    FundedResultReceiveOutcome::EngineFailed(failure) => {
+                        query_custody
+                            .expect("ordinary query retains its original custody")
+                            .terminal();
                         return Err(OwnerReadScaffoldError::Database(
-                            failure.into_error(envelope.limits.memory),
-                        ));
-                    }
-                    ResultReceiveOutcome::Disconnected => {
-                        return Err(OwnerReadScaffoldError::unimplemented(
-                            "ordinary terminal receiver disconnected without carrier EOF/HUP",
+                            crate::local_transport::query_funding::query_error(
+                                failure,
+                                query_memory.as_ref().expect("ordinary query has an owner"),
+                                envelope.limits.memory,
+                            )
+                            .into_retained(),
                         ));
                     }
                 }
             } else {
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 if let Some(observe) = self.response_frames.as_ref() {
                     observe(true);
                 }
-                match response {
+                match response.value {
                     // A leading piece of an answer larger than one local
                     // frame. The boundary below is holding it and will hand
                     // the whole answer back on the frame that ends the
@@ -448,7 +759,12 @@ impl OwnerClient {
                             failure.into_error(envelope.limits.memory),
                         ));
                     }
-                    response => return Ok(vec![response]),
+                    response => {
+                        unpublished
+                            .push(Funded::external(response))
+                            .map_err(OwnerReadScaffoldError::Database)?;
+                        return Ok(unpublished);
+                    }
                 }
             }
         }
@@ -467,6 +783,17 @@ impl OwnerClient {
 
     /// A chunk remains private to the shared terminal receiver until a
     /// `TerminalSuccess` arrives.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_client_contract.rs"
+        )
+    )]
     pub fn receive_ordinary(
         receiver: &mut OrdinaryResultReceiver,
         response: LocalResponse,
@@ -484,6 +811,10 @@ impl OwnerClient {
     /// Create a real carrier handle that can interrupt the request already in
     /// flight while the reading thread is blocked awaiting its reply.
     #[cfg(unix)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn cancel_handle(&self) -> OwnerReadScaffoldResult<OwnerCancelHandle> {
         let stream = self.stream.try_clone().map_err(|_| {
             OwnerReadScaffoldError::unimplemented("clone selected owner carrier for cancellation")
@@ -498,6 +829,17 @@ impl OwnerClient {
     /// Create a real carrier shutdown handle before moving the client into a
     /// blocked request worker.
     #[cfg(unix)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_service_contract.rs"
+        )
+    )]
     pub fn disconnect_handle(&self) -> OwnerReadScaffoldResult<OwnerDisconnectHandle> {
         let stream = self.stream.try_clone().map_err(|_| {
             OwnerReadScaffoldError::unimplemented("clone selected owner carrier for EOF/HUP")
@@ -508,6 +850,17 @@ impl OwnerClient {
     /// EOF/HUP discards staged result chunks and closes only the selected
     /// carrier. It cannot call a service object or choose another route.
     #[cfg(unix)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_service_contract.rs"
+        )
+    )]
     pub fn disconnect(
         &self,
         receiver: &mut OrdinaryResultReceiver,
@@ -534,7 +887,7 @@ impl OwnerClient {
 /// over, which is the strongest form of stopped.
 #[derive(Default)]
 pub(crate) struct CancelCoordination {
-    reading: Mutex<Option<std::thread::ThreadId>>,
+    reading: Mutex<Option<crate::owned_worker::CurrentThreadId>>,
     awaiting: Mutex<std::collections::BTreeMap<u64, Arc<CancelApplication>>>,
 }
 
@@ -545,7 +898,8 @@ impl CancelCoordination {
         *self
             .reading
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(std::thread::current().id());
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(crate::owned_worker::current_thread_id());
         ReadingHere { coordination: self }
     }
 
@@ -557,7 +911,7 @@ impl CancelCoordination {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
         {
-            Some(reader) => reader != std::thread::current().id(),
+            Some(reader) => reader != crate::owned_worker::current_thread_id(),
             None => false,
         }
     }
@@ -700,6 +1054,10 @@ impl OwnerCancelHandle {
     /// there could only ever end in the deadline. It returns as soon as the
     /// interrupt is on the wire and hears the answer where it was always going
     /// to hear it -- in the read's own outcome, which is the cancellation.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn cancel(
         mut self,
         limits: ReadLimits,
@@ -745,6 +1103,13 @@ impl OwnerCancelHandle {
 }
 
 #[cfg(unix)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from mod.rs"
+    )
+)]
 pub struct OwnerDisconnectHandle {
     stream: UnixStream,
 }
@@ -756,6 +1121,17 @@ impl OwnerDisconnectHandle {
     /// request that was in flight with the disconnected refusal -- so the
     /// caller learns its work is over only once the owner has actually put
     /// every resource down, rather than while it is still running.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_service_contract.rs"
+        )
+    )]
     pub fn disconnect(self) -> OwnerReadScaffoldResult<()> {
         self.stream
             .shutdown(Shutdown::Write)
@@ -763,6 +1139,10 @@ impl OwnerDisconnectHandle {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn checked_deadline(clock: &dyn DeadlineClock, duration_ms: u64) -> OwnerReadScaffoldResult<u64> {
     clock
         .now_ms()

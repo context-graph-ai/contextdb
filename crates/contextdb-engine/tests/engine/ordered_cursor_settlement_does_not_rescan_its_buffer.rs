@@ -138,13 +138,13 @@ fn open_and_take(
 ) -> Option<usize> {
     let session = database.read_session(limits).ok()?;
     let mut cursor = session.open_cursor(ORDERED, &bucket(which)).ok()?;
-    let mut delivered = cursor.first_page().rows.len();
-    let mut has_more = cursor.first_page().has_more;
+    let mut delivered = cursor.first_page().rows().len();
+    let mut has_more = cursor.first_page().has_more();
     let mut taken = 0_usize;
     while has_more && fetches.is_none_or(|wanted| taken < wanted) {
         let page = cursor.fetch(NonZeroUsize::new(PAGE_ROWS as usize)).ok()?;
-        delivered += page.rows.len();
-        has_more = page.has_more;
+        delivered += page.rows().len();
+        has_more = page.has_more();
         taken += 1;
     }
     let _ = cursor.close();
@@ -161,7 +161,7 @@ fn settling_one_page_costs_the_same_whether_much_or_little_is_still_buffered() {
             .execute(ORDERED, &bucket(which))
             .unwrap_or_else(|error| panic!("the executor answers the {which} answer: {error}"));
         assert_eq!(
-            whole.rows.len() as i64,
+            whole.rows().len() as i64,
             rows,
             "the fixture holds the {which} answer this shape is about"
         );
@@ -206,7 +206,7 @@ fn taking_a_buffered_answer_a_page_at_a_time_costs_what_taking_it_at_once_costs(
     let whole = database
         .execute(ORDERED, &bucket("large"))
         .expect("the executor answers the large answer");
-    let expected = whole.rows.len();
+    let expected = whole.rows().len();
 
     let in_one_call = smallest_work_ceiling("the whole ordered answer in one call", |limits| {
         database

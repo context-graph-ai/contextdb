@@ -12,9 +12,9 @@
 //! pair that holds postings, and none for a pair with no rows; and a find whose
 //! filter admits every live vector of the pairs it names enumerates nothing.
 
+use contextdb_core::Value;
 use contextdb_core::read_contract::{ReadLimits, ReadRoute};
 use contextdb_core::types::ContextId;
-use contextdb_core::{Value, VectorIndexRef};
 use contextdb_engine::direct_file_reader::test_seams::{ReadWorkObservationScope, ReadWorkPhase};
 use contextdb_engine::{
     Database, DatabaseOpenOptions, MaintenancePolicy, OwnerReadConfig, ReadSession,
@@ -137,20 +137,6 @@ fn seed(db: &Database, plant: bool) {
         )
         .expect("seed one row");
     }
-    for _ in 0..512 {
-        db.run_maintenance_cycle()
-            .expect("advance deterministic maintenance");
-        let ready = db
-            .vector_store_for_test()
-            .partition_infos(&VectorIndexRef::new("lane_rows", "embedding"))
-            .expect("inspect partition readiness");
-        if ready.len() == CONTEXTS * GENERATIONS
-            && ready.iter().all(|partition| partition.graph_available)
-        {
-            return;
-        }
-    }
-    panic!("every partition must publish a maintained route before the read is measured");
 }
 
 struct Fixture {
@@ -189,6 +175,10 @@ fn sealed_fixture(plant: bool) -> Fixture {
 /// A fresh reader over the committed file image, authorized for every
 /// Context: the route a consumer reads through, and the only one that proves
 /// its candidates through authenticated windows.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn reader(fixture: &Fixture) -> ReadSession {
     let reader = ReadSession::with_runtime_directory_for_test(&fixture.runtime, || {
         ReadSession::open_with_options(
@@ -230,11 +220,20 @@ fn pair_list(pairs: &[(usize, usize)], params: &mut HashMap<String, Value>) -> S
     format!("(context_id, generation_id) IN ({})", listed.join(", "))
 }
 
-fn cosine_distance(left: &[f32], right: &[f32]) -> f32 {
-    let dot: f32 = left.iter().zip(right).map(|(a, b)| a * b).sum();
-    let left_norm: f32 = left.iter().map(|a| a * a).sum::<f32>().sqrt();
-    let right_norm: f32 = right.iter().map(|a| a * a).sum::<f32>().sqrt();
-    1.0 - dot / (left_norm * right_norm)
+/// The canonical cosine distance, written out independently: f64 per
+/// coordinate, a zero norm is distance 1.0.
+fn cosine_distance(left: &[f32], right: &[f32]) -> f64 {
+    let (dot, left_norm, right_norm) = left.iter().zip(right).fold(
+        (0.0_f64, 0.0_f64, 0.0_f64),
+        |(dot, left_norm, right_norm), (&a, &b)| {
+            let (a, b) = (f64::from(a), f64::from(b));
+            (dot + a * b, left_norm + a * a, right_norm + b * b)
+        },
+    );
+    if left_norm == 0.0 || right_norm == 0.0 {
+        return 1.0;
+    }
+    1.0 - dot / (left_norm.sqrt() * right_norm.sqrt())
 }
 
 /// The ten nearest rows among those the statement admits, computed from the
@@ -274,7 +273,7 @@ fn find(reader: &ReadSession, sql: &str, params: &HashMap<String, Value>) -> Mea
     drop(work);
     Measured {
         ids: answer
-            .rows
+            .rows()
             .iter()
             .map(|row| match row.first() {
                 Some(Value::Int64(id)) => *id,
@@ -300,6 +299,10 @@ fn sorted(mut ids: Vec<i64>) -> Vec<i64> {
 /// whole, a NULL element makes the comparison unknown rather than false, and
 /// the column order of the row value is the caller's, not the index's.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_row_value_list_selects_exactly_the_listed_pairs() {
     let directory = tempfile::TempDir::new().expect("task-scoped fixture directory");
     let path = directory.path().join("row-values.db");
@@ -391,7 +394,7 @@ fn a_row_value_list_selects_exactly_the_listed_pairs() {
                 .execute(&sql, &params)
                 .unwrap_or_else(|error| panic!("`{sql}` answers: {error:?}"));
             let ids = answer
-                .rows
+                .rows()
                 .iter()
                 .map(|row| match row.first() {
                     Some(Value::Int64(id)) => *id,
@@ -417,7 +420,7 @@ fn a_row_value_list_selects_exactly_the_listed_pairs() {
                 .execute(&sql, &params)
                 .unwrap_or_else(|error| panic!("`{sql}` answers on the reader: {error:?}"));
             let ids = answer
-                .rows
+                .rows()
                 .iter()
                 .map(|row| match row.first() {
                     Some(Value::Int64(id)) => *id,

@@ -188,6 +188,11 @@ pub struct PageImpl {
 }
 
 impl PageImpl {
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn memory_for_test(&self) -> &PageMemory {
+        &self.mem
+    }
+
     pub(crate) fn to_arc(&self) -> PageMemory {
         self.mem.clone()
     }
@@ -208,6 +213,9 @@ impl Drop for PageImpl {
         *value -= 1;
         if *value == 0 {
             open_pages.remove(&self.page_number);
+            if open_pages.is_empty() {
+                *open_pages = HashMap::new();
+            }
         }
     }
 }
@@ -271,13 +279,23 @@ impl Page for PageMut<'_> {
 impl Drop for PageMut<'_> {
     fn drop(&mut self) {
         #[cfg(debug_assertions)]
-        assert!(self.open_pages.lock().unwrap().remove(&self.page_number));
+        {
+            let mut open_pages = self.open_pages.lock().unwrap();
+            assert!(open_pages.remove(&self.page_number));
+            if open_pages.is_empty() {
+                *open_pages = HashSet::new();
+            }
+        }
     }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub(crate) enum PageHint {
     None,
+    /// Private immutable builder input may use spare cache room without
+    /// promoting historical working pages over serving data.
+    #[cfg(feature = "contextdb-internal")]
+    Transient,
     Clean,
     /// This page belongs to a retained external snapshot. B-tree readers
     /// validate each page against the checksum carried by its root or parent
@@ -286,6 +304,18 @@ pub(crate) enum PageHint {
 }
 
 impl PageHint {
+    pub(crate) fn is_transient(self) -> bool {
+        #[cfg(feature = "contextdb-internal")]
+        {
+            matches!(self, Self::Transient)
+        }
+        #[cfg(not(feature = "contextdb-internal"))]
+        {
+            let _ = self;
+            false
+        }
+    }
+
     pub(crate) fn verifies_path(self) -> bool {
         matches!(self, Self::Verified)
     }

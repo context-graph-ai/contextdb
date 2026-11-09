@@ -1,17 +1,15 @@
-//! Durable-generation cleanup contracts for legal vector-column DDL.
+//! Vector identity contracts for legal vector-column DDL.
 //!
 //! These journeys use only the public database door to create, populate,
-//! maintain, rename, drop, close, and reopen a store.  The test-only vector
-//! observations merely prove that an already-maintained route is present or
-//! absent; they never build, repair, or select one.
+//! rename, drop, close, and reopen a store.  The test-only vector observation
+//! merely proves that a vector identity is present or absent.
 
-use contextdb_core::{Error, Value, VectorIndexRef, VectorPartitionKey};
-use contextdb_engine::{Database, MaintenancePolicy, QueryResult};
+use contextdb_core::{Error, Value, VectorIndexRef};
+use contextdb_engine::{Database, QueryResult};
 use std::collections::HashMap;
 use tempfile::TempDir;
 use uuid::Uuid;
 
-const MAX_MAINTENANCE_CYCLES: usize = 16;
 const SEEDED_ROWS: usize = 8;
 
 fn empty() -> HashMap<String, Value> {
@@ -25,38 +23,30 @@ fn params(pairs: impl IntoIterator<Item = (&'static str, Value)>) -> HashMap<Str
         .collect()
 }
 
-fn partition(scope: Uuid) -> VectorPartitionKey {
-    VectorPartitionKey::from_values(&[Value::Uuid(scope)])
-        .expect("one UUID partition component has one canonical key")
-}
-
-fn graph_available(db: &Database, index: &VectorIndexRef, scope: Uuid) -> bool {
-    db.vector_store_for_test()
-        .partition_info(index, &partition(scope))
-        .map(|info| info.graph_available)
-        .unwrap_or(false)
-}
-
-fn graph_serial(db: &Database, index: &VectorIndexRef, scope: Uuid) -> Option<u64> {
-    db.vector_store_for_test()
-        .raw_hnsw_build_serial_for_partition_for_test(index, &partition(scope))
-}
-
 fn index_is_present(db: &Database, expected: &VectorIndexRef) -> bool {
-    db.vector_store_for_test()
-        .index_infos()
-        .into_iter()
-        .any(|info| info.index == *expected)
+    let vector_fixture_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_1 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_1.clone());
+
+    db.with_vector_store_for_test(|store| {
+        store
+            .index_infos(&mut vector_fixture_copy_1)
+            .expect("read or publish the admitted vector fixture")
+    })
+    .into_iter()
+    .any(|info| info.index == *expected)
 }
 
 fn ids(result: &QueryResult) -> Vec<Uuid> {
     let id_column = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "id" || column.rsplit('.').next() == Some("id"))
         .expect("vector search projects id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(id_column) {
             Some(Value::Uuid(id)) => *id,
@@ -65,28 +55,27 @@ fn ids(result: &QueryResult) -> Vec<Uuid> {
         .collect()
 }
 
-fn indexed_search(db: &Database, column: &str, scope: Uuid, query: Vec<f32>) -> Vec<Uuid> {
+fn exact_search(db: &Database, column: &str, scope: Uuid, query: Vec<f32>) -> Vec<Uuid> {
     ids(&db
         .execute(
             &format!(
                 "SELECT id FROM generation_ddl_items WHERE scope_id = $scope \
-                 ORDER BY {column} <=> $query USE VECTOR INDEXED LIMIT 1"
+                 ORDER BY {column} <=> $query USE VECTOR EXACT LIMIT 1"
             ),
             &params([
                 ("scope", Value::Uuid(scope)),
                 ("query", Value::Vector(query)),
             ]),
         )
-        .unwrap_or_else(|error| panic!("indexed search through {column}: {error}")))
+        .unwrap_or_else(|error| panic!("exact search through {column}: {error}")))
 }
 
-fn create_and_seal_partition(db: &Database, scope: Uuid, first: Uuid) {
-    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+fn create_and_seed_partition(db: &Database, scope: Uuid, first: Uuid) {
     db.execute(
         "CREATE TABLE generation_ddl_items (
             id UUID PRIMARY KEY,
             scope_id UUID NOT NULL,
-            embedding VECTOR(3) PARTITION_KEY (scope_id) MAX_PARTITIONS 4 SEARCH_MODE INDEXED
+            embedding VECTOR(3) PARTITION_KEY (scope_id) MAX_PARTITIONS 4 SEARCH_MODE EXACT
         )",
         &empty(),
     )
@@ -110,26 +99,12 @@ fn create_and_seal_partition(db: &Database, scope: Uuid, first: Uuid) {
         )
         .expect("commit one deterministic partitioned vector");
     }
-
-    let index = VectorIndexRef::new("generation_ddl_items", "embedding");
-    for _ in 0..MAX_MAINTENANCE_CYCLES {
-        if graph_available(db, &index, scope) {
-            return;
-        }
-        db.run_maintenance_cycle()
-            .expect("one caller-driven maintenance cycle returns");
-    }
-    panic!(
-        "caller-driven maintenance did not durably publish the partition route within \
-         {MAX_MAINTENANCE_CYCLES} finite cycles"
-    );
 }
 
-/// A caller that renames a maintained vector column keeps its one saved route:
-/// reopening may use the renamed route, but must neither retain the old
-/// identity nor make the first indexed search reconstruct it.
+/// A caller that renames a vector column keeps its one vector: reopening uses
+/// the renamed identity and does not retain the old one.
 #[test]
-fn rename_moves_a_durably_sealed_partition_generation_to_the_new_identity() {
+fn rename_moves_a_partitioned_vector_column_to_the_new_identity() {
     let root = TempDir::new().expect("temporary store directory");
     let path = root.path().join("rename-generation.db");
     let scope = Uuid::from_u128(0xD001);
@@ -139,14 +114,10 @@ fn rename_moves_a_durably_sealed_partition_generation_to_the_new_identity() {
 
     {
         let db = Database::open(&path).expect("open file-backed fixture");
-        create_and_seal_partition(&db, scope, first);
+        create_and_seed_partition(&db, scope, first);
         assert!(
-            graph_available(&db, &old_index, scope),
-            "caller-driven maintenance must publish the original maintained route before DDL"
-        );
-        assert!(
-            graph_serial(&db, &old_index, scope).is_some(),
-            "the fixture must observe a built route before proving that DDL moves it"
+            index_is_present(&db, &old_index),
+            "the fixture declares the vector identity before DDL"
         );
 
         db.execute(
@@ -160,13 +131,12 @@ fn rename_moves_a_durably_sealed_partition_generation_to_the_new_identity() {
         );
         assert!(
             index_is_present(&db, &renamed_index),
-            "rename moves the maintained identity instead of creating an unmaintained copy"
+            "rename moves the vector identity instead of creating a copy"
         );
         db.close().expect("close the renamed store cleanly");
     }
 
     let db = Database::open(&path).expect("clean reopen after vector-column rename");
-    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     assert!(
         !index_is_present(&db, &old_index),
         "clean reopen must not restore the old vector identity"
@@ -175,25 +145,14 @@ fn rename_moves_a_durably_sealed_partition_generation_to_the_new_identity() {
         index_is_present(&db, &renamed_index),
         "clean reopen must retain the renamed vector identity"
     );
-    assert!(
-        graph_available(&db, &renamed_index, scope),
-        "the renamed saved route must be available before any post-reopen query"
-    );
-    let before_query = graph_serial(&db, &renamed_index, scope)
-        .expect("the reopened renamed route has a stable observed identity");
     assert_eq!(
-        indexed_search(&db, "embedding_v2", scope, vec![1.0, 0.0, 0.0]),
+        exact_search(&db, "embedding_v2", scope, vec![1.0, 0.0, 0.0]),
         vec![first],
-        "the renamed maintained INDEXED route returns the sealed vector after clean reopen"
-    );
-    assert_eq!(
-        graph_serial(&db, &renamed_index, scope),
-        Some(before_query),
-        "the first query after reopen must use the renamed saved route rather than rebuild it"
+        "the renamed vector column returns the stored vector after clean reopen"
     );
     assert!(matches!(
         db.execute(
-            "SELECT id FROM generation_ddl_items ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 1",
+            "SELECT id FROM generation_ddl_items ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 1",
             &params([("query", Value::Vector(vec![1.0, 0.0, 0.0]))]),
         ),
         Err(Error::UnknownVectorIndex { index }) if index == old_index
@@ -214,15 +173,15 @@ fn drop_of_a_renamed_generated_vector_column_leaves_no_identity_after_clean_reop
 
     {
         let db = Database::open(&path).expect("open file-backed fixture");
-        create_and_seal_partition(&db, scope, first);
+        create_and_seed_partition(&db, scope, first);
         db.execute(
             "ALTER TABLE generation_ddl_items RENAME COLUMN embedding TO embedding_v2",
             &empty(),
         )
         .expect("rename the generated vector column before dropping it");
         assert!(
-            graph_available(&db, &renamed_index, scope),
-            "rename must carry the built route up to the legal drop"
+            index_is_present(&db, &renamed_index),
+            "rename must carry the vector identity up to the legal drop"
         );
         db.execute(
             "ALTER TABLE generation_ddl_items DROP COLUMN embedding_v2",
@@ -246,11 +205,68 @@ fn drop_of_a_renamed_generated_vector_column_leaves_no_identity_after_clean_reop
             db.execute(
                 &format!(
                     "SELECT id FROM generation_ddl_items \
-                     ORDER BY {column} <=> $query USE VECTOR INDEXED LIMIT 1"
+                     ORDER BY {column} <=> $query USE VECTOR EXACT LIMIT 1"
                 ),
                 &params([("query", Value::Vector(vec![1.0, 0.0, 0.0]))]),
             ),
             Err(Error::UnknownVectorIndex { index: actual }) if actual == index
         ));
+    }
+}
+
+/// Catalog and paged bindings share a commit: either name is wholly usable.
+#[test]
+#[cfg(unix)]
+fn rename_crash_keeps_catalog_and_paged_bindings_atomic() {
+    use std::os::unix::process::ExitStatusExt;
+    const CHILD_PATH: &str = "CONTEXTDB_SEALED_RENAME_CRASH_PATH";
+    const CHILD_BOUNDARY: &str = "CONTEXTDB_SEALED_RENAME_CRASH_BOUNDARY";
+    if let Ok(path) = std::env::var(CHILD_PATH) {
+        let boundary = std::env::var(CHILD_BOUNDARY).unwrap().parse().unwrap();
+        let db = Database::open(path).unwrap();
+        db.arm_table_meta_rewrite_crash_for_test(boundary);
+        let outcome = db.execute(
+            "ALTER TABLE generation_ddl_items RENAME COLUMN embedding TO embedding_v2",
+            &empty(),
+        );
+        panic!("armed rename checkpoint did not abort: {outcome:?}");
+    }
+    for boundary in [1, 2, 3] {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("atomic-rename.db");
+        let scope = Uuid::from_u128(0xD001);
+        let first = Uuid::from_u128(0xD100);
+        {
+            let db = Database::open(&path).unwrap();
+            create_and_seed_partition(&db, scope, first);
+            db.close().unwrap();
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "vector_generation_ddl_cleanup_contract::rename_crash_keeps_catalog_and_paged_bindings_atomic", "--nocapture"])
+            .env(CHILD_PATH, &path)
+            .env(CHILD_BOUNDARY, boundary.to_string())
+            .output().unwrap();
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains(&format!("TABLE_META_REWRITE_CRASH={boundary}"))
+        );
+        assert_eq!(output.status.signal(), Some(6));
+        let db = Database::open(&path).unwrap();
+        let (present, absent) = if boundary == 3 {
+            ("embedding_v2", "embedding")
+        } else {
+            ("embedding", "embedding_v2")
+        };
+        let present_index = VectorIndexRef::new("generation_ddl_items", present);
+        assert!(index_is_present(&db, &present_index));
+        assert!(!index_is_present(
+            &db,
+            &VectorIndexRef::new("generation_ddl_items", absent)
+        ));
+        assert_eq!(
+            exact_search(&db, present, scope, vec![1.0, 0.0, 0.0]),
+            vec![first]
+        );
+        db.close().unwrap();
     }
 }

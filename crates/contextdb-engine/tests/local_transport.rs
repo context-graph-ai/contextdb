@@ -1,3 +1,9 @@
+#[path = "support/wire_fixture_test_support.rs"]
+mod wire_fixture_test_support;
+
+#[path = "owner_cursor_test_support.rs"]
+mod owner_cursor_test_support;
+
 #[cfg(unix)]
 #[path = "local_transport/a_supplied_runtime_directory_serves_reader_and_writer.rs"]
 mod a_supplied_runtime_directory_serves_reader_and_writer;

@@ -109,22 +109,22 @@ fn insert_vectors_direct(
 fn vector_index_bytes(db: &Database, table: &str, column: &str) -> usize {
     let result = db.execute("SHOW VECTOR_INDEXES", &HashMap::new()).unwrap();
     let table_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == "table")
         .unwrap();
     let column_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == "column")
         .unwrap();
     let bytes_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == "bytes")
         .unwrap();
     result
-        .rows
+        .rows()
         .iter()
         .find_map(|row| {
             let table_matches = matches!(&row[table_idx], Value::Text(value) if value == table);
@@ -244,6 +244,10 @@ fn sql_insert_throughput(c: &mut Criterion) {
 }
 
 fn sql_query_throughput(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function("sql_query/select_after_1k_rows", |_| {});
+        return;
+    }
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE items (id UUID PRIMARY KEY, category TEXT, seq INTEGER, name TEXT)",

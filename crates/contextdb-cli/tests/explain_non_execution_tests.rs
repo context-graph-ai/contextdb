@@ -10,7 +10,9 @@ use std::process::{Command, Stdio};
 
 fn run_cli(extra_args: &[&str], stdin_sql: &str) -> (Option<i32>, String, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_contextdb"));
-    cmd.arg(":memory:");
+    let session_dir = tempfile::tempdir().expect("session directory");
+    cmd.arg(session_dir.path().join("session.db"))
+        .arg("--write");
     for a in extra_args {
         cmd.arg(a);
     }
@@ -233,11 +235,18 @@ fn vector_select_and_with_explain_publish_passive_route_facts_even_when_indexed_
         assert_eq!(vector["layers"]["tail"], "present");
         let partitions = vector["partitions"]
             .as_array()
-            .expect("effective HNSW policy is structured per redacted partition");
+            .expect("effective native policy is structured per redacted partition");
         assert_eq!(partitions.len(), 1);
         assert_eq!(partitions[0]["partition"], "<redacted:1>");
-        assert!(partitions[0]["hnsw_ef_search"].as_u64().is_some());
-        assert!(partitions[0]["ef_search_source"].as_str().is_some());
+        // The fixture declares no IVF member, so each is unknown (null).
+        for member in ["lists", "probes", "refine_factor"] {
+            assert!(partitions[0][member].is_null(), "{member} is undeclared");
+            assert!(
+                partitions[0][format!("{member}_source")].is_null(),
+                "{member} has no declared source"
+            );
+        }
+        assert!(partitions[0]["policy_revision"].as_u64().is_some());
     }
 
     let (human_code, human_stdout, human_stderr) = run_cli(&[], &format!("{setup}{select}"));
@@ -252,10 +261,10 @@ fn vector_select_and_with_explain_publish_passive_route_facts_even_when_indexed_
         "aggregate_allowed_vectors=1",
         "route=indexed",
         "refusal=indexed_route_unavailable",
-        "recovery=run vector maintenance and retry",
+        "recovery=no vector index ships in this release; use EXACT or AUTO",
         "tail=present",
         "partition=<redacted:1>",
-        "hnsw_ef_search=",
+        "policy_revision=",
     ] {
         assert!(
             human_stdout.contains(fact),
@@ -290,6 +299,9 @@ fn trace_on_publishes_the_vector_route_that_actually_executed() {
     assert_eq!(vector["resolved_mode"], "EXACT");
     assert_eq!(vector["aggregate_allowed_vectors"], 1);
     assert_eq!(vector["route"], "exact");
-    assert_eq!(vector["fallback"], "aggregate_below_auto_index_at");
+    assert_eq!(
+        vector["fallback"],
+        "no vector index ships in this release; AUTO_INDEX_AT and CALIBRATION_SAMPLES have no effect"
+    );
     assert!(trace["rows_examined"].as_u64().is_some());
 }

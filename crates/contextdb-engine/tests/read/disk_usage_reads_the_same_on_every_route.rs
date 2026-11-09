@@ -42,16 +42,16 @@ fn seed(database: &Database) {
 
 fn column(answered: &QueryResult, name: &str) -> Value {
     let position = answered
-        .columns
+        .columns()
         .iter()
         .position(|column| column == name)
-        .unwrap_or_else(|| panic!("`{name}` is one of {:?}", answered.columns));
+        .unwrap_or_else(|| panic!("`{name}` is one of {:?}", answered.columns()));
     answered
-        .rows
+        .rows()
         .first()
         .and_then(|row| row.get(position))
         .cloned()
-        .unwrap_or_else(|| panic!("`SHOW DISK_LIMIT` answers one row: {:?}", answered.rows))
+        .unwrap_or_else(|| panic!("`SHOW DISK_LIMIT` answers one row: {:?}", answered.rows()))
 }
 
 fn number(answered: &QueryResult, name: &str) -> i64 {
@@ -62,6 +62,10 @@ fn number(answered: &QueryResult, name: &str) -> i64 {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn disk_usage_is_the_same_number_from_the_owner_and_from_the_file() {
     let directory = tempfile::TempDir::new().expect("task-scoped store directory");
     let runtime_root = secure_runtime_root(directory.path(), "disk-usage-runtime");
@@ -107,7 +111,8 @@ fn disk_usage_is_the_same_number_from_the_owner_and_from_the_file() {
         .expect("the file answers what the same store is using");
 
     assert_eq!(
-        from_the_file.columns, over_the_channel.columns,
+        from_the_file.columns(),
+        over_the_channel.columns(),
         "one question, one shape of answer"
     );
     assert_eq!(

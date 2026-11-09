@@ -89,7 +89,8 @@ fn start_hub_with_identity(
             TenantId::from(tenant),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -110,7 +111,8 @@ fn edge_with_ddl(broker: &InProcessBroker, tenant: &str, ddl: &str) -> (Arc<Data
         broker.client_as(&node_id),
         TenantId::from(tenant),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     (db, client)
 }
 
@@ -133,17 +135,22 @@ fn edge_with_ledger(broker: &InProcessBroker, tenant: &str) -> (Arc<Database>, S
         broker.client_as(&node_id),
         TenantId::from(tenant),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     (db, client)
 }
 
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn only_body(db: &Database, id: i64) -> Option<String> {
     let mut params = p();
     params.insert("id".to_string(), Value::Int64(id));
     let result = db
         .execute("SELECT body FROM notes WHERE id = $id", &params)
         .expect("notes scan");
-    result.rows.into_iter().next().map(|row| match &row[0] {
+    result.rows().into_iter().next().map(|row| match &row[0] {
         Value::Text(body) => body.clone(),
         other => panic!("expected a text body, got {other:?}"),
     })
@@ -169,6 +176,10 @@ fn write_key(db: &Database, id: i64, body: &str) {
 
 /// The `work_capabilities.tags` JSON array for `node_id`, as plain strings —
 /// `None` when the hub holds no row for it.
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn capability_tags(db: &Database, node_id: &str) -> Option<Vec<String>> {
     let mut params = p();
     params.insert("node_id".to_string(), Value::Text(node_id.to_string()));
@@ -178,7 +189,7 @@ fn capability_tags(db: &Database, node_id: &str) -> Option<Vec<String>> {
             &params,
         )
         .expect("work_capabilities scan");
-    result.rows.into_iter().next().map(|row| match &row[0] {
+    result.rows().into_iter().next().map(|row| match &row[0] {
         Value::Json(serde_json::Value::Array(items)) => items
             .iter()
             .map(|item| item.as_str().expect("tag must be a string").to_string())

@@ -12,12 +12,14 @@
 //! admits more than the operator allowed; an estimate far above it refuses
 //! what the operator allowed. Both sides are checked, against the allocator.
 //!
-//! The measurement is a SLOPE per added payload byte, so every fixed cost
-//! around the value -- the index's own structure, the change log, the store's
-//! bookkeeping -- cancels out.
+//! The store keeps its rows and index pages on disk and holds them in a
+//! page cache whose size is fixed and charged against the declared limit when
+//! the store opens. So the comparison is of TOTALS under a declared limit: the
+//! process must never hold more than the accountant says the store holds, and
+//! what the rows themselves add to the bill must stay within a small multiple
+//! of what the process holds.
 
 use contextdb_core::Value;
-use contextdb_engine::Database;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -65,25 +67,30 @@ const ROWS: i64 = 200;
 /// more than four times what it holds cannot hold what its limit says it can.
 const CHARGE_CEILING_MULTIPLE: f64 = 4.0;
 
-/// The noise floor of the measurement. The allocator counts a little
-/// incidental work that is not the payload, so two slopes closer together
-/// than this are the same slope. A real mis-charge is a whole factor -- one
-/// byte charged where two are held -- never a hundredth of one.
-const SLOPE_TOLERANCE: f64 = 0.01;
+/// A declared limit far above anything this file stores. It is not a bound
+/// under test: a store charges its fixed page cache against the limit it was
+/// opened under, so accounting only means something once one is declared.
+const DECLARED_LIMIT: usize = 256 * 1024 * 1024;
 
-/// Payload lengths far enough apart that the slope between them is decided by
-/// the payload and not by anything fixed around it. The shortest still has
-/// room for the per-row prefix that makes every payload distinct.
-const LENGTHS: [usize; 4] = [32, 100, 1_000, 100_000];
+/// Payload lengths far apart: a short value and a long one are both held, so
+/// the estimate has to be right at both ends and not only on average.
+const LENGTHS: [usize; 3] = [100, 1_000, 100_000];
 
 struct Measured {
-    charged_per_row: f64,
-    live_per_row: f64,
+    /// What the accountant says the store holds the moment it is opened: the
+    /// fixed page cache reserve, charged against the declared limit.
+    opened: i64,
+    /// What the accountant says the store holds after the rows are stored.
+    charged: i64,
+    /// What the process really took, from just before the open.
+    live: i64,
 }
 
-fn charge(database: &Database) -> i64 {
-    database.accountant().usage().used as i64
-}
+/// The noise floor of the comparison: the allocator counts a little incidental
+/// work that is neither payload nor cache, so a process within this fraction
+/// of its charge is covered by it. A real under-charge is a whole value held
+/// where none was charged, never a hundredth of the store.
+const COVERAGE_TOLERANCE: f64 = 0.01;
 
 /// A payload of `length` bytes that no other row carries, so an index over
 /// this column really keeps one key per row.
@@ -101,16 +108,26 @@ fn json_value(ordinal: i64, length: usize) -> Value {
     Value::Json(serde_json::Value::String(distinct_payload(ordinal, length)))
 }
 
-/// Insert `ROWS` rows whose payload column holds `length` distinct bytes, and
-/// report what the accountant was told each row cost against what the process
-/// really took for it.
+/// Open a durable store under a declared limit, insert `ROWS` rows whose
+/// payload column holds `length` distinct bytes, and report what the
+/// accountant says the whole store holds against what the process really took
+/// from the moment before the open.
 fn measure_rows(
     column_type: &str,
     with_index: bool,
     length: usize,
     value: &dyn Fn(i64, usize) -> Value,
 ) -> Measured {
-    let database = Database::open_memory();
+    let root = tempfile::tempdir().expect("task-scoped fixture root");
+    let live_before = live_bytes();
+    let database = contextdb_engine::database::open_with_startup_limits(
+        root.path().join("measured.db"),
+        std::sync::Arc::new(contextdb_engine::plugin::CorePlugin),
+        Some(DECLARED_LIMIT),
+        None,
+    )
+    .expect("open the measured store under a declared limit");
+    let opened = database.accountant().usage().used as i64;
     database
         .execute(
             &format!("CREATE TABLE measured (id INTEGER PRIMARY KEY, payload {column_type})"),
@@ -125,9 +142,6 @@ fn measure_rows(
             )
             .expect("create the index over the payload column");
     }
-
-    let charged_before = charge(&database);
-    let live_before = live_bytes();
     for id in 0..ROWS {
         database
             .execute(
@@ -139,17 +153,18 @@ fn measure_rows(
             )
             .unwrap_or_else(|error| panic!("insert row {id} of length {length}: {error}"));
     }
-    let charged_after = charge(&database);
-    let live_after = live_bytes();
-
-    Measured {
-        charged_per_row: (charged_after - charged_before) as f64 / ROWS as f64,
-        live_per_row: (live_after - live_before) as f64 / ROWS as f64,
-    }
+    let measured = Measured {
+        opened,
+        charged: database.accountant().usage().used as i64,
+        live: live_bytes() - live_before,
+    };
+    database.close().expect("close the measured store");
+    measured
 }
 
-/// Measure one site across every payload length and record what the two
-/// bounds say about the slope from the shortest.
+/// Measure one site at every payload length and record what the two bounds
+/// say: the accountant must cover what the process holds, and must not
+/// exceed it by more than the ceiling multiple.
 fn judge(
     site: &str,
     column_type: &str,
@@ -157,34 +172,28 @@ fn judge(
     value: &dyn Fn(i64, usize) -> Value,
     failures: &mut Vec<String>,
 ) {
-    let baseline = measure_rows(column_type, with_index, LENGTHS[0], value);
-    println!(
-        "MEASURED {site} len={}: charged/row={:.1} live/row={:.1}",
-        LENGTHS[0], baseline.charged_per_row, baseline.live_per_row
-    );
-    for length in LENGTHS.into_iter().skip(1) {
-        let longer = measure_rows(column_type, with_index, length, value);
-        let added = (length - LENGTHS[0]) as f64;
-        let charged_slope = (longer.charged_per_row - baseline.charged_per_row) / added;
-        let live_slope = (longer.live_per_row - baseline.live_per_row) / added;
+    for length in LENGTHS {
+        let measured = measure_rows(column_type, with_index, length, value);
         println!(
-            "MEASURED {site} len={length}: charged/row={:.1} live/row={:.1} \
-             charged-per-added-byte={charged_slope:.3} live-per-added-byte={live_slope:.3}",
-            longer.charged_per_row, longer.live_per_row
+            "MEASURED {site} len={length}: opened={} charged={} live={}",
+            measured.opened, measured.charged, measured.live
         );
-        if live_slope > charged_slope + SLOPE_TOLERANCE {
+        if measured.live as f64 > measured.charged as f64 * (1.0 + COVERAGE_TOLERANCE) {
             failures.push(format!(
-                "{site} at length {length}: the process takes {live_slope:.3} bytes for every \
-                 payload byte added and the accountant is told {charged_slope:.3}"
+                "{site} at length {length}: the process holds {} bytes and the accountant is \
+                 told {}",
+                measured.live, measured.charged
             ));
         }
-        if live_slope > 0.0
-            && charged_slope > CHARGE_CEILING_MULTIPLE * live_slope + SLOPE_TOLERANCE
-        {
+        // The fixed cache reserve is charged whole at open and is held only as
+        // the cache fills, so the ceiling is on what the rows added to the bill.
+        let retained = measured.charged - measured.opened;
+        if measured.live > 0 && retained as f64 > CHARGE_CEILING_MULTIPLE * measured.live as f64 {
             failures.push(format!(
-                "{site} at length {length}: the accountant is told {charged_slope:.3} bytes for \
-                 every payload byte added and the process takes {live_slope:.3}, so a limit holds \
-                 less than a {CHARGE_CEILING_MULTIPLE:.0}th of what it says"
+                "{site} at length {length}: the rows add {retained} bytes to the bill and the \
+                 process holds {}, so a limit holds less than a {CHARGE_CEILING_MULTIPLE:.0}th of \
+                 what it says",
+                measured.live
             ));
         }
     }

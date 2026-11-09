@@ -1,3 +1,9 @@
+#[path = "support/wire_fixture_test_support.rs"]
+mod wire_fixture_test_support;
+
+#[path = "owner_cursor_test_support.rs"]
+mod owner_cursor_test_support;
+
 /// Harness filter for a child process of this test binary: `--exact` needs
 /// the module-qualified test name.
 pub(crate) fn child_test_filter(module_path: &str, fn_name: &str) -> String {

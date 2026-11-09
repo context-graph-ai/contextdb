@@ -87,7 +87,7 @@ fn both_doors_refuse(
             "{what}: the executor refuses with {eager_refusal:?} and a bounded read answers with \
              {} rows -- a forbidden read that comes back empty looks exactly like a read that \
              found nothing",
-            answered.rows.len()
+            answered.rows().len()
         )),
         Err(bounded_refusal) => {
             if format!("{bounded_refusal:?}") != format!("{eager_refusal:?}") {
@@ -227,8 +227,8 @@ fn a_row_the_principals_grants_hide_is_refused_by_both_doors() {
         .execute(allowed_sql, &allowed)
         .expect("the granted row answers through a bounded read");
     assert_eq!(
-        format!("{:?}", bounded.rows),
-        format!("{:?}", eager.rows),
+        format!("{:?}", bounded.rows()),
+        format!("{:?}", eager.rows()),
         "the row the principal is granted reads the same through both doors"
     );
 

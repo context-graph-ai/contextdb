@@ -1,5 +1,4 @@
 //! Shared production-path schema assertions and authenticated sync fixture.
-#![allow(dead_code)]
 
 pub mod largest;
 #[path = "../pinned_cg_startup/mod.rs"]
@@ -23,6 +22,14 @@ pub fn empty() -> HashMap<String, Value> {
 
 /// Test callbacks are explicit host registrations, as at cg startup. Preserve
 /// specialized callbacks already installed by behavior tests; never enable relay mode.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody, custody_schema_replay_bounded_contract, custody_schema_replay_identical"
+)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn initialize_fixture_callbacks(db: &Database) {
     let registered = db.registered_trigger_callbacks();
     for trigger in db.list_triggers() {
@@ -38,18 +45,54 @@ pub fn initialize_fixture_callbacks(db: &Database) {
 /// Existing dependent tables must be staged in full, not merely a subset.
 /// New-table tests keep the separate affected-only bound: those tables do not
 /// have old images to copy. This equality is for the existing-table migration.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_is_proportional_to_affected_tables"
+)]
 pub fn assert_dependency_complete(
     observation: &ReceivedSchemaApplyObservationForTest,
     affected: &BTreeSet<String>,
+    indexes: &BTreeSet<String>,
     contact_exchanges: u64,
 ) {
     assert_eq!(
         &observation.staged_table_names, affected,
         "every FK/propagation/trigger dependent is staged, and no unrelated table is staged"
     );
-    assert_affected_only(observation, affected, contact_exchanges);
+    assert_affected_only(observation, affected, indexes, contact_exchanges);
 }
 
+/// The physical index tables `tables` own in `db`'s current schema, by the
+/// engine's naming rule: one per declared index, and its `_current` companion.
+/// A caller passes the union of the schema before and after the apply it
+/// observes, so a dropped or added index is still owned.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_is_proportional_to_affected_tables, custody_schema_replay_"
+)]
+pub fn physical_index_tables(db: &Database, tables: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for table in tables {
+        let Some(meta) = db.table_meta(table) else {
+            continue;
+        };
+        for index in &meta.indexes {
+            let mut hash = blake3::Hasher::new();
+            hash.update(table.as_bytes());
+            hash.update(&[0]);
+            hash.update(index.name.as_bytes());
+            let base = format!("__rel_index_{}", hash.finalize().to_hex());
+            names.insert(format!("{base}_current"));
+            names.insert(base);
+        }
+    }
+    names
+}
+
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody, custody_schema_replay_is_proportional_to_affected_tables, custody_the_w"
+)]
 pub fn declare(db: &Database, ddls: &[&str]) {
     for (ordinal, ddl) in ddls.iter().enumerate() {
         db.execute(ddl, &empty()).unwrap_or_else(|error| {
@@ -58,6 +101,10 @@ pub fn declare(db: &Database, ddls: &[&str]) {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction, sync_schema_transa"
+)]
 pub fn install(db: &Database, ddls: &[&str]) {
     let tx = db.begin().expect("begin whole source migration");
     for (ordinal, ddl) in ddls.iter().enumerate() {
@@ -73,6 +120,10 @@ pub fn install(db: &Database, ddls: &[&str]) {
         .expect("commit every startup declaration once");
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody, custody_schema_replay_bounded_contract, custody_schema_replay_identical"
+)]
 pub fn schema(db: &Database) -> Vec<String> {
     let mut answer = db
         .table_names()
@@ -118,6 +169,10 @@ pub fn schema(db: &Database) -> Vec<String> {
     answer
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody, custody_schema_replay_bounded_contract, custody_schema_replay_identical"
+)]
 fn canonical_json(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::Object(map) => {
@@ -147,6 +202,10 @@ fn canonical_json(value: &serde_json::Value) -> String {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction, sync_schema_transa"
+)]
 pub fn reference(ddls: &[&str]) -> Database {
     let db = Database::open_memory();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
@@ -154,6 +213,10 @@ pub fn reference(ddls: &[&str]) -> Database {
     db
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction, sync_schema_transa"
+)]
 pub fn assert_full_schema(db: &Database, expected: &Database) {
     let actual = schema(db);
     let expected = schema(expected);
@@ -184,6 +247,10 @@ pub fn assert_full_schema(db: &Database, expected: &Database) {
 /// constraints and indexes, its vector/rank/partition and DAG declarations,
 /// and every trigger, event type, sink and route, by complete serialized
 /// metadata, not by name.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by sync_schema_transactions"
+)]
 pub fn assert_whole_image(db: &Database, expected: &Database, phase: &str) {
     let actual = schema(db);
     let expected = schema(expected);
@@ -205,6 +272,10 @@ pub fn assert_whole_image(db: &Database, expected: &Database, phase: &str) {
 /// The same whole-image claim, stated from the DDL text the image is built
 /// from. Every crash-boundary assertion names its image this way so the old
 /// complete state and the complete startup schema are written in one register.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by sync_schema_transactions"
+)]
 pub fn assert_whole_image_of(db: &Database, statements: &[&str], phase: &str) {
     assert_whole_image(db, &reference(statements), phase);
 }
@@ -213,8 +284,12 @@ pub fn assert_whole_image_of(db: &Database, statements: &[&str], phase: &str) {
 /// receiver's durable DDL log exactly once, under one commit boundary, with no
 /// unrelated declaration regrouped into it -- so a retry that re-applied a
 /// prefix, or a receiver that split the migration, fails here.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by sync_schema_transactions"
+)]
 pub fn assert_unit_kept_once(db: &Database, expected: &[DdlChange], phase: &str) -> Lsn {
-    let changes = db.changes_since(Lsn(0));
+    let changes = db.changes_since(Lsn(0)).expect("read the declared changes");
     let occurrences = changes
         .ddl
         .windows(expected.len())
@@ -262,6 +337,10 @@ pub fn assert_unit_kept_once(db: &Database, expected: &[DdlChange], phase: &str)
     lsn
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction"
+)]
 pub fn assert_schema_contains(db: &Database, expected: &Database) {
     let actual = schema(db);
     let missing = schema(expected)
@@ -274,8 +353,12 @@ pub fn assert_schema_contains(db: &Database, expected: &Database) {
     );
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction"
+)]
 pub fn assert_one_ordered_unit(db: &Database, after: Lsn, expected: &[DdlChange]) -> Lsn {
-    let changes = db.changes_since(after);
+    let changes = db.changes_since(after).expect("read the declared changes");
     assert_eq!(
         changes.ddl, expected,
         "exact authored DDL vector, with neither regrouping nor duplicate prefix"
@@ -292,13 +375,17 @@ pub fn assert_one_ordered_unit(db: &Database, after: Lsn, expected: &[DdlChange]
     lsn
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction, sync_schema_transa"
+)]
 pub fn assert_contains_one_ordered_unit(
     db: &Database,
     after: Lsn,
     expected: &[DdlChange],
     phase: &str,
 ) -> Lsn {
-    let changes = db.changes_since(after);
+    let changes = db.changes_since(after).expect("read the declared changes");
     let positions = changes
         .ddl
         .windows(expected.len())
@@ -334,13 +421,26 @@ pub fn assert_contains_one_ordered_unit(
     lsn
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction, sync_schema_transa"
+)]
 pub fn assert_no_schema(db: &Database) {
     assert_schema_not_visible(db);
-    assert!(db.changes_since(Lsn(0)).ddl.is_empty());
+    assert!(
+        db.changes_since(Lsn(0))
+            .expect("read the declared changes")
+            .ddl
+            .is_empty()
+    );
 }
 
 /// Metadata inspection is available at an armed commit fence. Change-log
 /// extraction deliberately waits for the commit mutex and belongs after reopen.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction, sync_schema_transa"
+)]
 pub fn assert_schema_not_visible(db: &Database) {
     assert!(
         schema(db).is_empty(),
@@ -354,6 +454,10 @@ pub fn assert_schema_not_visible(db: &Database) {
     assert!(events.routes.is_empty());
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction, sync_schema_transa"
+)]
 pub fn seed_cg_artifacts(db: &Database, seed: u128) {
     initialize_fixture_callbacks(db);
     let tx = db.begin().expect("real cg row/vector/graph transaction");
@@ -372,6 +476,10 @@ pub fn seed_cg_artifacts(db: &Database, seed: u128) {
         .expect("publish actual cg vector/graph artifacts");
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction, sync_schema_transa"
+)]
 pub fn cg_artifact_params(seed: u128) -> HashMap<String, Value> {
     let mut vector = vec![0.0; 768];
     vector[0] = 1.0;
@@ -395,8 +503,12 @@ pub fn cg_artifact_params(seed: u128) -> HashMap<String, Value> {
     ])
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction, sync_schema_transa"
+)]
 pub fn assert_cg_artifact_queries(
-    mut execute: impl FnMut(&str, &HashMap<String, Value>) -> Vec<Vec<Value>>,
+    mut execute: impl FnMut(&str, &HashMap<String, Value>) -> contextdb_engine::QueryResult,
     seed: u128,
 ) {
     let p = cg_artifact_params(seed);
@@ -404,31 +516,35 @@ pub fn assert_cg_artifact_queries(
         execute(
             "SELECT id FROM digests WHERE context_id = $context ORDER BY vector_text <=> $query LIMIT 1",
             &p
-        ),
+        ).rows(),
         vec![vec![p["digest"].clone()]]
     );
     assert_eq!(
         execute(
             "SELECT target FROM GRAPH_TABLE(edges MATCH (a)-[:CITES]->(b) WHERE a.id = $context COLUMNS (b.id AS target))",
             &p
-        ),
+        ).rows(),
         vec![vec![p["target"].clone()]]
     );
     assert_eq!(
         execute(
             "SELECT source FROM GRAPH_TABLE(edges MATCH (a)<-[:CITES]-(b) WHERE a.id = $target COLUMNS (b.id AS source))",
             &p
-        ),
+        ).rows(),
         vec![vec![p["context"].clone()]]
     );
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction, sync_schema_transa"
+)]
 pub fn assert_cg_artifacts(db: &Database, seed: u128) {
     assert!(
         db.column_has_covering_index("edges", "source_id"),
         "the actual cg composite source index is installed"
     );
-    assert_cg_artifact_queries(|sql, p| db.execute(sql, p).unwrap().rows, seed);
+    assert_cg_artifact_queries(|sql, p| db.execute(sql, p).unwrap(), seed);
     let mut p = cg_artifact_params(seed);
     p.insert(
         "back_edge".into(),
@@ -438,9 +554,21 @@ pub fn assert_cg_artifacts(db: &Database, seed: u128) {
     assert!(db.execute("INSERT INTO edges (id, source_id, target_id, edge_type, context_id, valid_from) VALUES ($back_edge, $target, $context, 'CITES', $context, $tx)", &p).is_err(), "the recovered actual cg DAG still refuses a cycle");
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody, custody_schema_replay_bounded_contract, custody_schema_replay_identical"
+)]
 pub struct Hub {
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read, sql, sync_schema_transactions"
+    )]
     pub db: Arc<Database>,
     pub broker: InProcessBroker,
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read, sql, sync_schema_transactions"
+    )]
     pub server: Arc<SyncServer>,
     stop: Arc<AtomicBool>,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -448,6 +576,10 @@ pub struct Hub {
 }
 
 impl Hub {
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by custody, custody_schema_replay_bounded_contract, custody_schema_replay_identical"
+    )]
     pub async fn start(db: Arc<Database>, tenant: &str) -> Self {
         let broker = InProcessBroker::new();
         let identity = Arc::new(FabricIdentity::generate());
@@ -459,7 +591,8 @@ impl Hub {
                 TenantId::from(tenant),
                 node,
                 identity,
-            ),
+            )
+            .expect("construct the authenticated sync endpoint"),
         );
         let stop = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn({
@@ -484,6 +617,10 @@ impl Hub {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by custody, custody_schema_replay_bounded_contract, custody_schema_replay_identical"
+    )]
     pub fn client(&self, db: Arc<Database>) -> SyncClient {
         let identity = Arc::new(FabricIdentity::generate());
         SyncClient::with_authenticated_transport_and_identity_for_test(
@@ -492,8 +629,13 @@ impl Hub {
             TenantId::from(self.tenant.as_str()),
             identity,
         )
+        .expect("construct the authenticated sync endpoint")
     }
 
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by custody, custody_schema_replay_bounded_contract, custody_schema_replay_identical"
+    )]
     pub async fn bind(&self, client: &SyncClient) {
         // These fixtures declare no tenant-governed application table. An empty
         // expectation still authenticates and durably binds the exact hub life.
@@ -503,12 +645,20 @@ impl Hub {
             .expect("bind the actual authenticated tenant hub before installing schema");
     }
 
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by custody, custody_schema_replay_bounded_contract, custody_schema_replay_identical"
+    )]
     pub async fn stop(mut self) {
         self.stop.store(true, Ordering::SeqCst);
         self.task.take().unwrap().await.expect("stop schema hub");
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_bounded_contract, custody_schema_replay_identical_schema_d"
+)]
 pub fn is_data_table(table: &str) -> bool {
     // Receipt/log/format bookkeeping and the required per-exchange liveness
     // row with its authenticated roots are excluded from the schema-image
@@ -523,6 +673,7 @@ pub fn is_data_table(table: &str) -> bool {
         table,
         "config"
             | "change_log"
+            | "change_log_by_table"
             | "ddl_log"
             | "commit_index"
             | "metadata"
@@ -530,11 +681,35 @@ pub fn is_data_table(table: &str) -> bool {
             | CONTACT_TABLE
             | "__content_identity_nodes"
             | "__content_identity_roots"
+            | "__content_identity_metadata"
+            | "__content_identity_payloads"
+            | "__content_identity_retired_slots"
+            | "__history_root_witness_v1"
+            | "change_log_lsn_count"
+            | "committed_read_lsn_bounds"
+            | "content_size_row_live"
+            | "content_size_totals"
+            | "ddl_capabilities_by_table"
+            | "ddl_directions_by_table"
+            | "ddl_eligible_occurrences"
+            | "ddl_unmarked_lsn_count"
+            | "retention_clock_bounds"
+            | "writer_change_log"
+            | "writer_recovery"
+            | "writer_row_heads"
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_bounded_contract, custody_schema_replay_identical_schema_d"
+)]
 const CONTACT_TABLE: &str = "rel_work_node_contacts";
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_identical_schema_does_no_artifact_work, custody_schema_rep"
+)]
 pub fn is_data_write(event: &TableWriteForTest) -> bool {
     if event.table == "config" {
         return event.key == b"__trigger_declarations"
@@ -549,6 +724,10 @@ pub fn is_data_write(event: &TableWriteForTest) -> bool {
 
 /// Actual serialized payload inserted/removed, grouped by operation in receipts.
 /// Table deletion has no row payload; its directory removal is observed separately.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_bounded_contract, custody_schema_replay_identical_schema_d"
+)]
 pub fn serialized_bytes(event: &TableWriteForTest, count: u64) -> u64 {
     match event.operation {
         TableWriteOperationForTest::DeleteTable => 0,
@@ -556,6 +735,10 @@ pub fn serialized_bytes(event: &TableWriteForTest, count: u64) -> u64 {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_identical_schema_does_no_artifact_work, custody_schema_rep"
+)]
 pub fn assert_zero_images(observation: &ReceivedSchemaApplyObservationForTest) {
     assert!(
         observation.durable_observer_attached,
@@ -585,9 +768,14 @@ pub fn assert_zero_images(observation: &ReceivedSchemaApplyObservationForTest) {
     );
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_is_proportional_to_affected_tables, custody_schema_replay_"
+)]
 pub fn assert_affected_only(
     observation: &ReceivedSchemaApplyObservationForTest,
     affected: &BTreeSet<String>,
+    indexes: &BTreeSet<String>,
     contact_exchanges: u64,
 ) {
     assert!(observation.durable_observer_attached);
@@ -599,6 +787,40 @@ pub fn assert_affected_only(
         observation.durable_table_names.is_subset(affected),
         "unrelated relational rewrites: {observation:?}"
     );
+    // These reductions are committed atomically with the declarations they
+    // summarize. They remain actual affected work, bounded by that DDL unit.
+    let declaration_writes: u64 = observation
+        .artifact_writes
+        .iter()
+        .filter(|(event, _)| {
+            event.table == "ddl_log" && event.operation == TableWriteOperationForTest::Insert
+        })
+        .map(|(_, count)| *count)
+        .sum();
+    for summary in ["ddl_directions_by_table", "ddl_capabilities_by_table"] {
+        let writes: u64 = observation
+            .artifact_writes
+            .iter()
+            .filter(|(event, _)| event.table == summary)
+            .map(|(_, count)| *count)
+            .sum();
+        let directory_writes: u64 = observation
+            .artifact_writes
+            .iter()
+            .filter(|(event, _)| {
+                event.table == "__redb_user_table_directory" && event.key == summary.as_bytes()
+            })
+            .map(|(_, count)| *count)
+            .sum();
+        assert!(
+            writes <= declaration_writes,
+            "summary work exceeds actual declaration unit: {summary} {observation:?}"
+        );
+        assert!(
+            directory_writes <= declaration_writes,
+            "summary directory work exceeds actual declaration unit: {summary} {observation:?}"
+        );
+    }
     let identity_writes = observation
         .artifact_writes
         .iter()
@@ -622,15 +844,46 @@ pub fn assert_affected_only(
         .iter()
         .filter(|(event, _)| {
             event.table.starts_with("__rel_index_")
-                || (event.table == "__redb_user_table_directory"
+                || ((event.table == "__redb_user_table_directory"
+                    || event.table == "__history_root_witness_v1")
                     && event.key.starts_with(b"__rel_index_"))
         })
+        .map(|(_, count)| *count)
+        .sum::<u64>();
+    let witness_writes = observation
+        .artifact_writes
+        .iter()
+        .filter(|(event, _)| event.table == "__history_root_witness_v1")
         .map(|(_, count)| *count)
         .sum::<u64>();
     assert!(
         index_artifact_writes <= affected.len() as u64 * 8,
         "physical index work exceeded the affected schema closure: {observation:?}"
     );
+    // Each (table, index) keeps a postings state and a versions state, so the
+    // commitment work is bounded by the affected tables' indexes.
+    let commitment_writes = observation
+        .artifact_writes
+        .iter()
+        .filter(|(event, _)| event.table == "__historical_index_commitments")
+        .map(|(_, count)| *count)
+        .sum::<u64>();
+    assert!(
+        commitment_writes <= affected.len() as u64 * 16,
+        "historical index commitment work exceeded the affected schema closure: {observation:?}"
+    );
+    let rewritten_row_routes = observation
+        .artifact_writes
+        .iter()
+        .filter_map(|(event, _)| {
+            let owner = event.table.strip_prefix("rel_")?;
+            if event.operation != TableWriteOperationForTest::Insert || event.key.len() != 24 {
+                return None;
+            }
+            let row = u64::from_be_bytes(event.key[..8].try_into().unwrap());
+            Some((owner.to_owned(), row))
+        })
+        .collect::<BTreeSet<_>>();
     let mut contact_versions = 0;
     let mut contact_directory_installs = 0;
     for (event, count) in &observation.artifact_writes {
@@ -647,6 +900,136 @@ pub fn assert_affected_only(
         } else {
             &event.table
         };
+        if matches!(
+            table,
+            "ddl_directions_by_table" | "ddl_capabilities_by_table"
+        ) {
+            if event.table == "__redb_user_table_directory" {
+                assert_eq!(event.operation, TableWriteOperationForTest::DirectoryInsert);
+                assert!(
+                    observation
+                        .artifact_writes
+                        .iter()
+                        .any(|(write, _)| write.table == table
+                            && write.operation == TableWriteOperationForTest::Insert),
+                    "declaration summary directory requires an actual affected summary insert: {event:?}"
+                );
+            } else {
+                assert_eq!(event.operation, TableWriteOperationForTest::Insert);
+                let key = std::str::from_utf8(&event.key).unwrap();
+                let owner = if table == "ddl_capabilities_by_table" {
+                    key.to_owned()
+                } else {
+                    let (hex_owner, lsn) = key
+                        .split_once(':')
+                        .expect("direction has owner and local LSN");
+                    assert_eq!(lsn.len(), 20, "exact local declaration LSN: {event:?}");
+                    assert!(lsn.bytes().all(|byte| byte.is_ascii_digit()));
+                    lsn.parse::<u64>().expect("local LSN fits u64");
+                    assert!(!hex_owner.is_empty() && hex_owner.len().is_multiple_of(2));
+                    assert!(
+                        hex_owner
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    );
+                    let owner = (0..hex_owner.len())
+                        .step_by(2)
+                        .map(|position| {
+                            u8::from_str_radix(&hex_owner[position..position + 2], 16).unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    String::from_utf8(owner).expect("direction owner is a UTF-8 table name")
+                };
+                assert!(
+                    affected.contains(&owner),
+                    "unrelated declaration summary owner {event:?}"
+                );
+                assert!(
+                    event.value_bytes > 0,
+                    "summary insert retains its actual reduction payload"
+                );
+            }
+            continue;
+        }
+        if table == "writer_recovery" {
+            if event.table == "__redb_user_table_directory" {
+                assert_eq!(event.operation, TableWriteOperationForTest::DirectoryInsert);
+                // A fixed number of recovery controls open and update the table root on
+                // each commit: four, measured on the largest replay (the bounds, commit
+                // directory and row-heads roots among them). It never grows with tables.
+                assert!(
+                    *count <= 4 * (1 + contact_exchanges),
+                    "writer recovery root rewritten {count} times {event:?}"
+                );
+            } else {
+                assert_eq!(event.operation, TableWriteOperationForTest::Insert);
+                assert!(
+                    matches!(
+                        event.key.as_slice(),
+                        b"bounds" | b"commit_directory_root" | b"row_heads_root"
+                    ),
+                    "unexpected recovery control coordinate {event:?}"
+                );
+                assert!(
+                    *count <= 1 + contact_exchanges,
+                    "recovery control written {count} times {event:?}"
+                );
+            }
+            continue;
+        }
+        if table == "writer_row_heads" {
+            if event.table == "__redb_user_table_directory" {
+                assert_eq!(event.operation, TableWriteOperationForTest::DirectoryInsert);
+                assert!(
+                    *count
+                        <= 1 + observation.durable_rows_rewritten as u64 * 2
+                            + contact_exchanges * 2
+                );
+            } else {
+                assert_eq!(event.operation, TableWriteOperationForTest::Insert);
+                let owner_len = u64::from_le_bytes(event.key[..8].try_into().unwrap()) as usize;
+                assert_eq!(event.key.len(), owner_len + 24);
+                let owner = std::str::from_utf8(&event.key[8..8 + owner_len]).unwrap();
+                assert!(
+                    affected.contains(owner) || owner == "work_node_contacts",
+                    "unaffected row-head owner {event:?}"
+                );
+                assert_eq!(
+                    u64::from_le_bytes(
+                        event.key[8 + owner_len..16 + owner_len].try_into().unwrap()
+                    ),
+                    8
+                );
+                let row_id = u64::from_le_bytes(event.key[16 + owner_len..].try_into().unwrap());
+                assert!(
+                    rewritten_row_routes.contains(&(owner.to_owned(), row_id)),
+                    "row-head route must match an actual affected relational rewrite {event:?}"
+                );
+                assert_eq!(event.value_bytes, 56);
+                assert!(*count <= 2 + contact_exchanges * 2);
+            }
+            continue;
+        }
+        if table == "change_log_by_table" {
+            if event.table != "__redb_user_table_directory" {
+                let end = event
+                    .key
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .expect("table-selected history key has an owner delimiter");
+                let owner = std::str::from_utf8(&event.key[..end]).unwrap();
+                assert!(
+                    affected.contains(owner) || owner == "work_node_contacts",
+                    "unrelated table-selected history write {event:?}"
+                );
+                assert_eq!(
+                    event.key.len(),
+                    end + 1 + 16,
+                    "table-selected history carries an exact LSN/ordinal coordinate"
+                );
+            }
+            continue;
+        }
         if table == CONTACT_TABLE {
             match event.operation {
                 TableWriteOperationForTest::Insert if event.table == CONTACT_TABLE => {
@@ -662,6 +1045,114 @@ pub fn assert_affected_only(
             continue;
         }
         if table.starts_with("__content_identity_") || table.starts_with("__rel_index_") {
+            continue;
+        }
+        // Each relation a commit opens records its new historical root, keyed
+        // by the physical table name. Only an affected relation may be
+        // witnessed; an unrelated one means the commit touched it.
+        // Declaration occurrence bookkeeping is keyed by (LSN, ordinal): one
+        // entry per received declaration, and every declaration names an
+        // affected table, so its writes are bounded by the affected set.
+        if table == "ddl_eligible_occurrences" {
+            let writes = observation
+                .artifact_writes
+                .iter()
+                .filter(|(write, _)| write.table == table)
+                .map(|(_, count)| *count)
+                .sum::<u64>();
+            assert!(
+                writes != 0 && writes <= affected.len() as u64,
+                "declaration occurrence writes exceed the affected declarations {event:?}: {writes}"
+            );
+            continue;
+        }
+        // Current-row sizes (`table \0 row id`) and per-table content totals
+        // (`table`) move with the affected rows; an unrelated owner is a leak.
+        if matches!(table, "content_size_row_live" | "content_size_totals") {
+            if event.table == "__redb_user_table_directory" {
+                assert!(
+                    observation
+                        .artifact_writes
+                        .iter()
+                        .any(|(write, _)| write.table == table
+                            && write.operation != TableWriteOperationForTest::DirectoryInsert),
+                    "content-size directory rewrite without a content-size write {event:?}"
+                );
+            } else {
+                let owner_bytes = match table {
+                    "content_size_row_live" => event
+                        .key
+                        .split(|byte| *byte == 0)
+                        .next()
+                        .expect("a row size key names its table"),
+                    _ => event.key.as_slice(),
+                };
+                let owner =
+                    std::str::from_utf8(owner_bytes).expect("content-size owners are names");
+                assert!(
+                    affected.contains(owner),
+                    "unrelated content-size write {event:?}"
+                );
+            }
+            continue;
+        }
+        if table == "__historical_index_commitments" {
+            if event.table == "__redb_user_table_directory" {
+                assert!(
+                    *count <= commitment_writes,
+                    "commitment directory rewritten {count} times for {commitment_writes} \
+                     commitment writes {event:?}"
+                );
+            } else {
+                // Keys are length-framed (table, index, side).
+                let mut parts = Vec::new();
+                let mut rest = event.key.as_slice();
+                while !rest.is_empty() {
+                    let (len, tail) = rest.split_at(8);
+                    let len = u64::from_be_bytes(len.try_into().unwrap()) as usize;
+                    let (part, tail) = tail.split_at(len);
+                    parts.push(part);
+                    rest = tail;
+                }
+                assert!(
+                    parts.len() == 3 && matches!(parts[2], b"P" | b"V"),
+                    "malformed historical index commitment key {event:?}"
+                );
+                let owner =
+                    std::str::from_utf8(parts[0]).expect("commitment owners are table names");
+                assert!(
+                    affected.contains(owner),
+                    "historical index commitment of an unrelated table {event:?}"
+                );
+            }
+            continue;
+        }
+        if table == "__history_root_witness_v1" && event.table == "__redb_user_table_directory" {
+            // Every historical-root hook event opens the witness table: the
+            // check before a relation opens or is deleted, and the write after
+            // it closes. Each witness write therefore carries a few directory
+            // rewrites (measured 1,399 for 600 writes on the largest replay),
+            // all bounded by the witness work the affected tables did.
+            assert!(
+                *count <= 3 * witness_writes,
+                "witness directory rewritten {count} times for {witness_writes} witness writes \
+                 {event:?}"
+            );
+            continue;
+        }
+        if event.table == "__history_root_witness_v1" {
+            let physical = std::str::from_utf8(&event.key).expect("witness keys are table names");
+            if let Some(owner) = physical.strip_prefix("rel_") {
+                assert!(
+                    affected.contains(owner),
+                    "unrelated relation witnessed by an affected-set commit: {event:?}"
+                );
+            } else {
+                assert!(
+                    indexes.contains(physical),
+                    "historical root witness of an index no affected table owns: {event:?}"
+                );
+            }
             continue;
         }
         if let Some(owner) = table.strip_prefix("rel_") {
@@ -683,6 +1174,37 @@ pub fn assert_affected_only(
             "an unanticipated durable artifact cannot be omitted from the affected-set proof: {event:?}"
         );
     }
+    let row_head_writes = observation
+        .artifact_writes
+        .iter()
+        .filter(|(event, _)| event.table == "writer_row_heads")
+        .map(|(_, count)| *count)
+        .sum::<u64>();
+    assert!(
+        row_head_writes <= observation.durable_rows_rewritten as u64 * 2 + contact_exchanges * 2,
+        "row-head publication exceeds actual affected mutations: {observation:?}"
+    );
+    let recovery_writes = observation
+        .artifact_writes
+        .iter()
+        .filter(|(event, _)| event.table == "writer_recovery")
+        .map(|(_, count)| *count)
+        .sum::<u64>();
+    assert!(recovery_writes <= 3 * (1 + contact_exchanges));
+    let table_history_writes = observation
+        .artifact_writes
+        .iter()
+        .filter(|(event, _)| {
+            event.table == "change_log_by_table"
+                || (event.table == "__redb_user_table_directory"
+                    && event.key == b"change_log_by_table")
+        })
+        .map(|(_, count)| *count)
+        .sum::<u64>();
+    assert!(
+        table_history_writes <= affected.len() as u64 * 2 + contact_exchanges * 4 + 1,
+        "derived history work must stay inside the affected set, never replay unrelated history: {observation:?}"
+    );
     assert!(
         contact_versions == contact_exchanges.saturating_mul(2),
         "each authenticated exchange has exactly its old and new contact versions: observed={contact_versions} exchanges={contact_exchanges}"
@@ -704,6 +1226,10 @@ impl Drop for Hub {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction, sync_schema_transa"
+)]
 pub fn assert_authored_wire(
     broker: &InProcessBroker,
     expected: &[DdlChange],
@@ -775,6 +1301,10 @@ pub fn assert_authored_wire(
     units
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction, sync_schema_transa"
+)]
 struct Clock;
 impl contextdb_core::read_contract::DeadlineClock for Clock {
     fn now_ms(&self) -> u64 {
@@ -785,6 +1315,10 @@ impl contextdb_core::read_contract::DeadlineClock for Clock {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction, sync_schema_transa"
+)]
 pub fn committed_identity(path: &std::path::Path) -> [u8; 32] {
     use contextdb_engine::direct_file_reader::test_seams::{
         DirectReaderConfig, open_for_test, verified_image_digest_for_test,

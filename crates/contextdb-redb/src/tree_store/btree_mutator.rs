@@ -1,6 +1,6 @@
 use crate::tree_store::btree_base::{
     BRANCH, BranchAccessor, BranchBuilder, BranchMutator, Checksum, DEFERRED, LEAF, LeafAccessor,
-    LeafBuilder, LeafMutator,
+    LeafBuilder, LeafMutator, LeafValue,
 };
 use crate::tree_store::btree_mutator::DeletionResult::{
     DeletedBranch, DeletedLeaf, PartialBranch, PartialLeaf, Subtree,
@@ -88,7 +88,9 @@ struct InsertionResult<'a, V: Value + 'static> {
     additional_sibling: Option<(InsertionKey, PageNumber, Checksum)>,
     // The inserted value for .insert_reserve() to use
     inserted_value: AccessGuardMutInPlace<'a, V>,
-    // The previous value, if any
+    // Whether the key existed, including reservations that discard old bytes.
+    replaced: bool,
+    // The previous value, if requested by an ordinary insertion.
     old_value: Option<AccessGuard<'a, V>>,
 }
 
@@ -228,24 +230,25 @@ impl<'a, 'b, K: Key + 'static, V: Value> MutateHelper<'a, 'b, K, V> {
         key: &K::SelfType<'_>,
         value: &V::SelfType<'_>,
     ) -> Result<(Option<AccessGuard<'a, V>>, AccessGuardMutInPlace<'a, V>)> {
+        let value_bytes = V::as_bytes(value);
+        self.insert_value(key, LeafValue::Bytes(value_bytes.as_ref()))
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(super) fn insert_value(
+        &mut self,
+        key: &K::SelfType<'_>,
+        value: LeafValue<'_>,
+    ) -> Result<(Option<AccessGuard<'a, V>>, AccessGuardMutInPlace<'a, V>)> {
         let (new_root, old_value, guard) = if let Some(BtreeHeader {
             root: p,
             checksum,
             length,
         }) = *self.root
         {
-            let result = self.insert_helper(
-                p,
-                checksum,
-                K::as_bytes(key).as_ref(),
-                V::as_bytes(value).as_ref(),
-            )?;
+            let result = self.insert_helper(p, checksum, K::as_bytes(key).as_ref(), value)?;
 
-            let new_length = if result.old_value.is_some() {
-                length
-            } else {
-                length + 1
-            };
+            let new_length = if result.replaced { length } else { length + 1 };
 
             let new_root = if let Some((key, page2, page2_checksum)) = result.additional_sibling {
                 let mut builder =
@@ -261,9 +264,7 @@ impl<'a, 'b, K: Key + 'static, V: Value> MutateHelper<'a, 'b, K, V> {
             (new_root, result.old_value, result.inserted_value)
         } else {
             let key_bytes = K::as_bytes(key);
-            let value_bytes = V::as_bytes(value);
             let key_bytes = key_bytes.as_ref();
-            let value_bytes = value_bytes.as_ref();
             let mut builder = LeafBuilder::new(
                 &self.mem,
                 &self.allocated,
@@ -271,13 +272,13 @@ impl<'a, 'b, K: Key + 'static, V: Value> MutateHelper<'a, 'b, K, V> {
                 K::fixed_width(),
                 V::fixed_width(),
             );
-            builder.push(key_bytes, value_bytes);
+            builder.push_value(key_bytes, value);
             let page = builder.build()?;
 
             let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
             let offset = accessor.offset_of_first_value();
             let page_num = page.get_page_number();
-            let guard = AccessGuardMutInPlace::new(page, offset, value_bytes.len());
+            let guard = AccessGuardMutInPlace::new(page, offset, value.len());
 
             (BtreeHeader::new(page_num, DEFERRED, 1), None, guard)
         };
@@ -290,7 +291,7 @@ impl<'a, 'b, K: Key + 'static, V: Value> MutateHelper<'a, 'b, K, V> {
         page_number: PageNumber,
         page_checksum: Checksum,
         key: &[u8],
-        value: &[u8],
+        value: LeafValue<'_>,
     ) -> Result<InsertionResult<'a, V>> {
         // Preserve the existing singleton split without faulting its unrelated
         // value. Restrict this ordering shortcut to the built-in byte key.
@@ -336,7 +337,7 @@ impl<'a, 'b, K: Key + 'static, V: Value> MutateHelper<'a, 'b, K, V> {
                     K::fixed_width(),
                     V::fixed_width(),
                 );
-                builder.push(key, value);
+                builder.push_value(key, value);
                 let new_page = builder.build()?;
                 let new_root = new_page.get_page_number();
                 let offset =
@@ -353,6 +354,7 @@ impl<'a, 'b, K: Key + 'static, V: Value> MutateHelper<'a, 'b, K, V> {
                     root_checksum,
                     additional_sibling: Some((separator, sibling, sibling_checksum)),
                     inserted_value: AccessGuardMutInPlace::new(new_page, offset, value.len()),
+                    replaced: false,
                     old_value: None,
                 });
             }
@@ -375,7 +377,7 @@ impl<'a, 'b, K: Key + 'static, V: Value> MutateHelper<'a, 'b, K, V> {
                         K::fixed_width(),
                         V::fixed_width(),
                     );
-                    builder.push(key, value);
+                    builder.push_value(key, value);
                     let new_page = builder.build()?;
                     let new_page_number = new_page.get_page_number();
                     let new_page_accessor =
@@ -392,6 +394,7 @@ impl<'a, 'b, K: Key + 'static, V: Value> MutateHelper<'a, 'b, K, V> {
                                 page_checksum,
                             )),
                             inserted_value: guard,
+                            replaced: false,
                             old_value: None,
                         })
                     } else {
@@ -401,6 +404,7 @@ impl<'a, 'b, K: Key + 'static, V: Value> MutateHelper<'a, 'b, K, V> {
                             root_checksum: page_checksum,
                             additional_sibling: Some((split_key.into(), new_page_number, DEFERRED)),
                             inserted_value: guard,
+                            replaced: false,
                             old_value: None,
                         })
                     };
@@ -414,7 +418,7 @@ impl<'a, 'b, K: Key + 'static, V: Value> MutateHelper<'a, 'b, K, V> {
                             position,
                             K::fixed_width(),
                             V::fixed_width(),
-                            value,
+                            value.len(),
                         )
                     } else {
                         LeafMutator::sufficient_insert_inplace_space(
@@ -423,7 +427,7 @@ impl<'a, 'b, K: Key + 'static, V: Value> MutateHelper<'a, 'b, K, V> {
                             K::fixed_width(),
                             V::fixed_width(),
                             key,
-                            value,
+                            value.len(),
                         )
                     }
                 };
@@ -432,10 +436,12 @@ impl<'a, 'b, K: Key + 'static, V: Value> MutateHelper<'a, 'b, K, V> {
                     && has_inplace_space()
                 {
                     let page_number = page.get_page_number();
-                    let existing_value = if found {
+                    let existing_value = if found && matches!(value, LeafValue::Bytes(_)) {
                         let copied_value = accessor.entry(position).unwrap().value().to_vec();
                         Some(AccessGuard::with_owned_value(copied_value))
                     } else {
+                        // Reservations discard old bytes, avoiding a second
+                        // value-sized owner during in-place replacement.
                         None
                     };
                     drop(page);
@@ -443,9 +449,9 @@ impl<'a, 'b, K: Key + 'static, V: Value> MutateHelper<'a, 'b, K, V> {
                     let mut mutator =
                         LeafMutator::new(page_mut.memory_mut(), K::fixed_width(), V::fixed_width());
                     if found {
-                        mutator.replace(position, value);
+                        mutator.replace_value(position, value);
                     } else {
-                        mutator.insert(position, key, value);
+                        mutator.insert_value(position, key, value);
                     }
                     let new_page_accessor =
                         LeafAccessor::new(page_mut.memory(), K::fixed_width(), V::fixed_width());
@@ -456,6 +462,7 @@ impl<'a, 'b, K: Key + 'static, V: Value> MutateHelper<'a, 'b, K, V> {
                         root_checksum: DEFERRED,
                         additional_sibling: None,
                         inserted_value: guard,
+                        replaced: found,
                         old_value: existing_value,
                     });
                 }
@@ -469,7 +476,7 @@ impl<'a, 'b, K: Key + 'static, V: Value> MutateHelper<'a, 'b, K, V> {
                 );
                 for i in 0..accessor.num_pairs() {
                     if i == position {
-                        builder.push(key, value);
+                        builder.push_value(key, value);
                     }
                     if !found || i != position {
                         let entry = accessor.entry(i).unwrap();
@@ -477,13 +484,13 @@ impl<'a, 'b, K: Key + 'static, V: Value> MutateHelper<'a, 'b, K, V> {
                     }
                 }
                 if accessor.num_pairs() == position {
-                    builder.push(key, value);
+                    builder.push_value(key, value);
                 }
                 if !builder.should_split() {
                     let new_page = builder.build()?;
 
                     let page_number = page.get_page_number();
-                    let existing_value = if found {
+                    let existing_value = if found && matches!(value, LeafValue::Bytes(_)) {
                         let (start, end) = accessor.value_range(position).unwrap();
                         if self.modify_uncommitted && self.mem.uncommitted(page_number) {
                             let arc = page.to_arc();
@@ -514,13 +521,14 @@ impl<'a, 'b, K: Key + 'static, V: Value> MutateHelper<'a, 'b, K, V> {
                         root_checksum: DEFERRED,
                         additional_sibling: None,
                         inserted_value: guard,
+                        replaced: found,
                         old_value: existing_value,
                     }
                 } else {
                     let (new_page1, split_key, new_page2) = builder.build_split()?;
                     let split_key = split_key.to_vec();
                     let page_number = page.get_page_number();
-                    let existing_value = if found {
+                    let existing_value = if found && matches!(value, LeafValue::Bytes(_)) {
                         let (start, end) = accessor.value_range(position).unwrap();
                         if self.modify_uncommitted && self.mem.uncommitted(page_number) {
                             let arc = page.to_arc();
@@ -568,6 +576,7 @@ impl<'a, 'b, K: Key + 'static, V: Value> MutateHelper<'a, 'b, K, V> {
                         root_checksum: DEFERRED,
                         additional_sibling: Some((split_key.into(), new_page_number2, DEFERRED)),
                         inserted_value: guard,
+                        replaced: found,
                         old_value: existing_value,
                     }
                 }
@@ -591,6 +600,7 @@ impl<'a, 'b, K: Key + 'static, V: Value> MutateHelper<'a, 'b, K, V> {
                         root_checksum: page_checksum,
                         additional_sibling: None,
                         inserted_value: sub_result.inserted_value,
+                        replaced: sub_result.replaced,
                         old_value: sub_result.old_value,
                     });
                 }
@@ -613,6 +623,7 @@ impl<'a, 'b, K: Key + 'static, V: Value> MutateHelper<'a, 'b, K, V> {
                         root_checksum: DEFERRED,
                         additional_sibling: None,
                         inserted_value: sub_result.inserted_value,
+                        replaced: sub_result.replaced,
                         old_value: sub_result.old_value,
                     });
                 }
@@ -678,6 +689,7 @@ impl<'a, 'b, K: Key + 'static, V: Value> MutateHelper<'a, 'b, K, V> {
                             DEFERRED,
                         )),
                         inserted_value: sub_result.inserted_value,
+                        replaced: sub_result.replaced,
                         old_value: sub_result.old_value,
                     }
                 } else {
@@ -687,6 +699,7 @@ impl<'a, 'b, K: Key + 'static, V: Value> MutateHelper<'a, 'b, K, V> {
                         root_checksum: DEFERRED,
                         additional_sibling: None,
                         inserted_value: sub_result.inserted_value,
+                        replaced: sub_result.replaced,
                         old_value: sub_result.old_value,
                     }
                 };
