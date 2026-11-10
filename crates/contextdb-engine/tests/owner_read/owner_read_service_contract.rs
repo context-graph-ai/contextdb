@@ -1677,6 +1677,9 @@ fn prove_request_and_response_deadline_jump(jump_to_ms: u64) {
     );
     let baseline = harness.service.resources();
     let client = harness.client(93);
+    // The connection's setup is carrier work: snapshot only after it has finished,
+    // so transient setup storage is not counted as this connection's resting charge.
+    harness.service.wait_for_carrier_requests_for_test(|| {});
     let live_client = harness.service.resources();
     assert!(live_client.reader_used_bytes > baseline.reader_used_bytes);
     assert!(live_client.reader_control_bytes > baseline.reader_control_bytes);
@@ -1719,12 +1722,18 @@ fn prove_request_and_response_deadline_jump(jump_to_ms: u64) {
         .join()
         .expect("deadline request joins")
         .expect_err("request/response deadline publishes no custom response");
-    assert!(matches!(
-        timeout,
-        OwnerReadScaffoldError::Refused(failure)
-            if failure.kind() == ReadFailureKind::OwnerTimeout
-                && failure.detail() == &ReadFailureDetail::None
-    ));
+    // The client reports its deadline as the same typed failure whether the
+    // refusal reaches it from the owner or from its own transport.
+    assert!(
+        matches!(
+            &timeout,
+            OwnerReadScaffoldError::Refused(failure)
+                | OwnerReadScaffoldError::Database(Error::ReadFailure(failure))
+                if failure.kind() == ReadFailureKind::OwnerTimeout
+                    && failure.detail() == &ReadFailureDetail::None
+        ),
+        "jump to {jump_to_ms}: the client's deadline result: {timeout:?}"
+    );
     assert_eq!(handler.cancellation_observed(), 1);
     assert_eq!(harness.service.resources().active_slots, 1);
 
@@ -1776,7 +1785,33 @@ fn exact_and_plus_one_request_response_deadlines_timeout_once_without_publicatio
 #[test]
 fn peer_and_every_handshake_identity_field_are_refused_before_admission_or_handler() {
     let handler = GatedHandler::default();
-    let harness = Harness::new(limits(), 4, Some(Arc::new(handler.clone())));
+    let observer = Arc::new(ProductionObserver::default());
+    let observer_seam: Arc<dyn OwnerBoundedExecutionObserver> = observer.clone();
+    let harness = Harness::start(
+        OwnerReadConfig {
+            enabled: true,
+            limits: OwnerReadLimits {
+                limits: limits(),
+                concurrency: 4,
+            },
+            timeouts: OwnerServiceTimeouts {
+                request_ms: 10,
+                shutdown_drain_ms: 10,
+            },
+            runtime_dir: None,
+            handler: Some(Arc::new(handler.clone())),
+            test_hooks: None,
+        },
+        LocalConfigurationSource::Override,
+        ManualDeadlineClock::at(100),
+        ReadClientTimeouts {
+            connect_ms: 1_000,
+            routing_retry_ms: 1_000,
+            response_ms: 11_000,
+        },
+        Some(observer_seam),
+        None,
+    );
     harness.connect_clients(&[90, 91, 92]);
     let baseline = harness.service.resources();
     let expected = harness.handshake.clone();
@@ -1814,13 +1849,16 @@ fn peer_and_every_handshake_identity_field_are_refused_before_admission_or_handl
         ),
     ];
 
-    for (presented, expected_kind, field) in cases {
+    for (refused_connections, (presented, expected_kind, field)) in (1_u64..).zip(cases) {
         let failure = refusal(harness.request_with_handshake(
             presented,
             limits(),
             custom("proof.echo", b"must-not-enter"),
         ));
         assert_simple_refusal(&failure, expected_kind);
+        // The refused connection's storage is released by the owner after the
+        // client has gone: its release signal orders that before the snapshot.
+        observer.wait_for_released_connections(refused_connections);
         assert_resources(&harness.service, baseline);
         assert_eq!(
             handler.invocations(),

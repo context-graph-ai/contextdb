@@ -167,12 +167,12 @@ flaky-test issue. It is diagnostic, not a gate.
 ## PR checks (`ci.yml`)
 
 Cargo.toml owns the test optimisation and checked-arithmetic settings for local,
-PR, rc2 and integration builds. CI does not override them with
+PR and integration builds. CI does not override them with
 CARGO_PROFILE_TEST_OPT_LEVEL, CARGO_PROFILE_TEST_DEBUG_ASSERTIONS or
 CARGO_PROFILE_TEST_OVERFLOW_CHECKS. The manifest-binding test checks manifest
 text; external Cargo configuration and environment can still override a local build.
 
-The PR/integration engine-seams shard and the rc2 engine test-seams shard run the initial-build/replacement/reclamation journey
+The PR/integration engine-seams shard runs the initial-build/replacement/reclamation journey
 once through `scripts/ci-maintenance-journey.sh`, outside the ordinary libtest
 invocation. The helper compiles first, then applies a 600-second process limit
 with a five-second forced-cleanup grace to that exact case. Both logs and the helper’s exact
@@ -619,10 +619,5 @@ consumers download that artifact, and reusable integration accepts its name thro
 `path_classes_artifact`. No path-class payload is passed through an environment
 variable, workflow input, or job output. Manual integration needs no artifact.
 
-The `rc2-tests` workflow runs on pushes and pull requests to `main` or `dev`,
-and through manual dispatch. Each shard executes library, binary and integration-test
-targets with its original feature selection. Examples and benches compile with
-`cargo test --examples --benches --no-run`; Criterion benchmarks are not executed
-on shared hosted runners. Compilation failures still fail the shard.
 Every ignored test in the source tree must match
 one registered path, test name and reason; conditional ignores are included.

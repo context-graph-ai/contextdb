@@ -398,59 +398,6 @@ os.execvp(args[0],args)
                 self.assertIn('exit='+str(expected), (receipt/'contextdb-engine-test-seams-7.time').read_text())
                 self.assertEqual((receipt/'maintenance.exit').read_text().strip(), str(expected))
 
-    def test_rc2_step_routes_the_journey_through_the_same_limit(self):
-        import textwrap
-        workflow = (i.ROOT/'.github/workflows/rc2-tests.yml').read_text()
-        body = workflow.split('        id: run\n        run: |\n', 1)[1].split('      - name:', 1)[0]
-        body = textwrap.dedent(body)
-        for key, value in [('standalone', ''), ('crate', 'contextdb-engine'),
-                           ('features', 'test-seams,iroh'), ('shard', 'contextdb-engine-test-seams')]:
-            body = body.replace('${{ matrix.'+key+' }}', value)
-        case = ('paged_initial_replacement_and_reclamation_progress_under_writes::'
-                'paged_initial_replacement_and_reclamation_progress_under_writes')
-        for test_exit in [0, 124]:
-            with self.subTest(test_exit=test_exit), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                (root/'scripts').symlink_to(i.ROOT/'scripts', target_is_directory=True)
-                cargo = root/'cargo'
-                cargo.write_text('''#!/usr/bin/env python3
-import os,sys,json
-args=sys.argv[1:]
-with open(os.environ['CALLS'],'a') as out: out.write(json.dumps(args)+'\\n')
-print('test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s')
-sys.exit(int(os.environ['TEST_EXIT']) if os.environ['MAINTENANCE_CASE'] in args and '--skip' not in args else 0)
-''')
-                cargo.chmod(0o755)
-                timeout = root/'timeout'
-                timeout.write_text('''#!/usr/bin/env python3
-import os,sys,json
-args=sys.argv[1:]
-with open(os.environ['DEADLINES'],'a') as out: out.write(json.dumps(args)+'\\n')
-if args[0]=='30m': args=args[1:]
-elif args[:2]==['--kill-after=5s','600s']: args=args[2:]
-else: sys.exit(98)
-os.execvp(args[0],args)
-''')
-                timeout.chmod(0o755)
-                env = dict(os.environ, PATH=str(root)+':'+os.environ['PATH'],
-                           CALLS=str(root/'calls'), DEADLINES=str(root/'deadlines'),
-                           BASH_ENV='/dev/null', TEST_EXIT=str(test_exit), MAINTENANCE_CASE=case)
-                run = subprocess.run(['/bin/bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', body],
-                                     cwd=root, env=env, capture_output=True, text=True, timeout=15)
-                self.assertEqual(run.returncode, test_exit, run.stderr)
-                calls = [json.loads(line) for line in (root/'calls').read_text().splitlines()]
-                self.assertEqual(len(calls), 4)
-                self.assertIn('--skip', calls[0])
-                self.assertIn('--no-run', calls[1])
-                self.assertIn(case, calls[2])
-                self.assertIn('--exact', calls[2])
-                self.assertIn('--benches', calls[3])
-                self.assertTrue((root/'deadlines').exists(), run.stdout+run.stderr+'\n'+str(calls))
-                deadlines = [json.loads(line) for line in (root/'deadlines').read_text().splitlines()]
-                self.assertEqual(deadlines[1][:2], ['--kill-after=5s', '600s'])
-                receipt = root/'shard-out/contextdb-engine-test-seams-maintenance/maintenance.exit'
-                self.assertEqual(receipt.read_text().strip(), str(test_exit))
-
     def test_compile_is_outside_deadline_and_failures_are_preserved(self):
         runner = i.ROOT / 'scripts/ci-maintenance-journey.sh'
         case = ('paged_initial_replacement_and_reclamation_progress_under_writes::'

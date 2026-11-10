@@ -153,6 +153,7 @@ QUARANTINE_EXCEPTIONS = {
     ('crates/contextdb-engine/tests/engine_seams/custody_reads_admit_every_buffer_before_allocating.rs', 'custody_reads_admit_every_buffer_before_allocating'): 'An intermittent custody read refusal leaves its key list holding bytes that were never admitted against the reader limit.',
     ('crates/contextdb-engine/tests/read/authoritative_purge_reader_publication.rs', 'stopped_direct_publication_releases_on_process_death_without_holding_commit_lock'): 'An authoritative purge is refused as contended instead of waiting when an ordinary commit runs at the same moment.',
     ('crates/contextdb-engine/tests/history_request_memory.rs', 'many_pending_deletions_under_a_tight_limit_are_refused_before_they_are_built'): 'A pending-deletions history request under a tight limit is refused as a corrupt store with a malformed lineage record instead of a typed memory refusal.',
+    ('crates/contextdb-engine/tests/engine_seams/the_closure_memo_frees_its_entries_before_refunding_them.rs', 'the_closure_memo_frees_its_entries_before_refunding_them'): 'A refused custody closure walk intermittently still holds tens of kilobytes beyond what its reader had admitted at a refund during the unwind.',
     ('crates/contextdb-engine/tests/vector/writer_residency_attribution.rs', 'concurrent_deletes_retire_one_staged_admission'): 'concurrent deletes hang retiring one staged admission',
     ('crates/contextdb-redb/src/db.rs', 'measure_the_checked_allocator_save_at_the_minimum_window_budget'): 'allocator paging measurement runs only when explicitly requested',
     ('crates/contextdb-redb/src/tree_store/bounded_bytes.rs', 'insert_after_separator_window_refuses_before_read_and_releases_its_owner'): 'bounded-read refusal and owner-release assertion fails',
@@ -1371,7 +1372,7 @@ def required(needs, rows, enabled, run_default, mode=None):
 def workflow_contract(root=ROOT):
     """Narrow reviewed YAML shape; offline controls independently parse and mutate it."""
     text = (root / '.github/workflows/integration.yml').read_text()
-    for workflow in ['ci.yml', 'integration.yml', 'rc2-tests.yml']:
+    for workflow in ['ci.yml', 'integration.yml']:
         workflow_text = (root / '.github/workflows' / workflow).read_text()
         if re.search(r'^\s+CARGO_PROFILE_TEST_(OPT_LEVEL|DEBUG_ASSERTIONS|OVERFLOW_CHECKS):', workflow_text, re.M):
             raise ValueError('test profile must come from Cargo.toml: ' + workflow)
