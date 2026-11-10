@@ -102,6 +102,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "contextdb-redb"
+version = "4.1.0"
+dependencies = [
+ "bincode",
+ "chrono",
+ "libc",
+ "log",
+ "rand",
+ "redb",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -351,20 +365,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cef6a6d3a65ea334d6cdfb31fa2525c20184b7aa7bd1ad1e2e37502610d4609f"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "redb"
-version = "4.1.0"
-dependencies = [
- "bincode",
- "chrono",
- "libc",
- "log",
- "rand",
- "redb 2.6.0",
- "tempfile",
- "uuid",
 ]
 
 [[package]]

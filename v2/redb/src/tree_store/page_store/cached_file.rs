@@ -427,7 +427,22 @@ impl PagedCachedFile {
 
     // Read with caching. Caller must not read overlapping ranges without first calling invalidate_cache().
     // Doing so will not cause UB, but is a logic error.
+    //
+    // Data that is not in the cache is read from the file and is not cached.
     pub(super) fn read(&self, offset: u64, len: usize, hint: PageHint) -> Result<Arc<[u8]>> {
+        self.read_checked(offset, len, hint, None::<fn(&[u8]) -> Result>)
+    }
+
+    // Like `read`, but data that is read from the file must pass `check`, and is then cached.
+    // The read cache therefore only holds data that passed a check, or that was written through
+    // this file.
+    pub(super) fn read_checked(
+        &self,
+        offset: u64,
+        len: usize,
+        hint: PageHint,
+        check: Option<impl FnOnce(&[u8]) -> Result>,
+    ) -> Result<Arc<[u8]>> {
         debug_assert_eq!(0, offset % self.page_size);
         #[cfg(feature = "cache_metrics")]
         self.reads_total.fetch_add(1, Ordering::AcqRel);
@@ -454,6 +469,10 @@ impl PagedCachedFile {
         }
 
         let buffer = self.read_direct_into_arc(offset, len)?;
+        let Some(check) = check else {
+            return Ok(buffer);
+        };
+        check(&buffer)?;
         let cache_size = self.read_cache_bytes.fetch_add(len, Ordering::AcqRel);
         let mut write_lock = self.read_cache[cache_slot].write().unwrap();
         let cache_size = if let Some(replaced) = write_lock.insert(offset, buffer.clone()) {

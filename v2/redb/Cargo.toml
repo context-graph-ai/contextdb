@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 rust-version = "1.89"
-name = "redb"
+name = "contextdb-redb"
 version = "4.1.0"
 authors = ["Christopher Berner <me@cberner.com>"]
 build = "build.rs"
@@ -22,7 +22,7 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Rust Embedded DataBase"
+description = "redb 4.1.0 with changes for contextdb: a file its writer holds opens for reading, and page checksums are checked on read"
 homepage = "https://www.redb.org"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
@@ -63,6 +63,10 @@ path = "tests/backward_compatibility.rs"
 [[test]]
 name = "basic_tests"
 path = "tests/basic_tests.rs"
+
+[[test]]
+name = "contextdb_changes"
+path = "tests/contextdb_changes.rs"
 
 [[test]]
 name = "integration_tests"
@@ -116,3 +120,7 @@ host_endian_bytes = "deny"
 
 [profile.bench]
 debug = 2
+
+# The storage library is built and tested from this folder with the lock file above it,
+# apart from every other package in the repository.
+[workspace]

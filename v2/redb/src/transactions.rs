@@ -2105,6 +2105,7 @@ impl Drop for WriteTransaction {
 pub struct ReadTransaction {
     mem: Arc<TransactionalMemory>,
     tree: TableTree,
+    commit_id: TransactionId,
 }
 
 impl ReadTransaction {
@@ -2112,13 +2113,20 @@ impl ReadTransaction {
         mem: Arc<TransactionalMemory>,
         guard: TransactionGuard,
     ) -> Result<Self, TransactionError> {
-        let root_page = mem.get_data_root();
+        let (root_page, commit_id) = mem.get_data_root_and_transaction_id();
         let guard = Arc::new(guard);
         Ok(Self {
             mem: mem.clone(),
             tree: TableTree::new(root_page, PageHint::Clean, guard, mem)
                 .map_err(TransactionError::Storage)?,
+            commit_id,
         })
+    }
+
+    /// The id of the commit this transaction reads. Ids rise with every commit of a file, and
+    /// two transactions that read the same commit give the same id.
+    pub fn commit_id(&self) -> u64 {
+        self.commit_id.raw_id()
     }
 
     /// Open the given table

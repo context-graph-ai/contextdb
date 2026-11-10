@@ -704,7 +704,7 @@ impl TableTreeMut<'_> {
                     ..
                 } => {
                     let subtree_stats = btree_stats(
-                        table_root.map(|x| x.root),
+                        table_root,
                         &self.mem,
                         fixed_key_size,
                         fixed_value_size,
@@ -724,7 +724,7 @@ impl TableTreeMut<'_> {
                     ..
                 } => {
                     let subtree_stats = multimap_btree_stats(
-                        table_root.map(|x| x.root),
+                        table_root,
                         &self.mem,
                         fixed_key_size,
                         fixed_value_size,

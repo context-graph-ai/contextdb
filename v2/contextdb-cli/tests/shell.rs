@@ -1,0 +1,732 @@
+//! Runs the built `contextdb` program the way a script does: statements piped to its standard
+//! input, and its output, its error stream and its exit status read back.
+//!
+//! Each test has its own folder under the build's temporary folder, left behind for inspection.
+
+use std::io::{ErrorKind, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use contextdb::{Database, params};
+use serde_json::{Value as Json, json};
+
+/// What one run of the program gave back.
+struct Run {
+    stdout: String,
+    stderr: String,
+    code: Option<i32>,
+}
+
+impl Run {
+    /// The lines of the error stream that report a refused statement to a person.
+    fn errors(&self) -> Vec<&str> {
+        self.stderr
+            .lines()
+            .filter(|line| line.starts_with("Error:"))
+            .collect()
+    }
+}
+
+/// An empty folder of this test's own.
+fn folder(test: &str) -> PathBuf {
+    let folder = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("shell-{test}"));
+    if folder.exists() {
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+    std::fs::create_dir_all(&folder).unwrap();
+    folder
+}
+
+/// Runs `contextdb` in `dir` with these arguments and this text piped to its standard input.
+///
+/// The input is written before anything is read back. Every input here is far smaller than a
+/// pipe holds, so the write cannot wait on the program.
+fn shell(dir: &Path, args: &[&str], input: &str) -> Run {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_contextdb"))
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // A program that refuses its command line exits without reading its input.
+    match child.stdin.take().unwrap().write_all(input.as_bytes()) {
+        Err(error) if error.kind() != ErrorKind::BrokenPipe => panic!("{error}"),
+        _ => {}
+    }
+    let output = child.wait_with_output().unwrap();
+    let run = Run {
+        stdout: String::from_utf8(output.stdout).unwrap(),
+        stderr: String::from_utf8(output.stderr).unwrap(),
+        code: output.status.code(),
+    };
+    assert!(
+        !run.stderr.contains("panicked at"),
+        "the program panicked:\n{}",
+        run.stderr
+    );
+    run
+}
+
+/// A path as a command-line argument.
+fn arg(path: &Path) -> &str {
+    path.to_str().unwrap()
+}
+
+/// Every line of a stream as a JSON document.
+fn documents(stream: &str) -> Vec<Json> {
+    stream
+        .lines()
+        .map(|line| {
+            serde_json::from_str(line).unwrap_or_else(|_| panic!("not a JSON document: {line}"))
+        })
+        .collect()
+}
+
+/// The names in a folder, sorted.
+fn listing(folder: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(folder)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+const CREATE_NOTES: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);\n";
+const SELECT_NOTES: &str = "SELECT id, body FROM notes ORDER BY id;\n";
+
+const ONE_NOTE: &str = "\
++----+-------+
+| id | body  |
++----+-------+
+| 1  | first |
++----+-------+
+(1 row)
+";
+
+const TWO_NOTES: &str = "\
++----+--------+
+| id | body   |
++----+--------+
+| 1  | first  |
+| 2  | second |
++----+--------+
+(2 rows)
+";
+
+#[test]
+fn reading_a_missing_store_is_refused_and_creates_nothing() {
+    let dir = folder("reading-a-missing-store");
+    let store = dir.join("store");
+
+    let run = shell(&dir, &[arg(&store)], SELECT_NOTES);
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
+    assert_eq!(run.stdout, "");
+    assert!(
+        run.stderr.contains("there is no store at this path")
+            && run.stderr.contains("--write creates it"),
+        "{}",
+        run.stderr
+    );
+    assert_eq!(
+        listing(&dir),
+        Vec::<String>::new(),
+        "a refused read creates nothing"
+    );
+
+    // The same refusal for a program that reads it: one document on the error stream.
+    let run = shell(&dir, &[arg(&store), "--json"], SELECT_NOTES);
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
+    assert_eq!(run.stdout, "");
+    let refusals = documents(&run.stderr);
+    assert_eq!(refusals.len(), 1, "{}", run.stderr);
+    assert_eq!(refusals[0]["error"]["detail"]["kind"], "store_not_found");
+    assert_eq!(
+        listing(&dir),
+        Vec::<String>::new(),
+        "a refused read creates nothing"
+    );
+}
+
+#[test]
+fn write_creates_a_missing_store() {
+    let dir = folder("write-creates-a-missing-store");
+    let store = dir.join("store");
+
+    let insert = "INSERT INTO notes (id, body) VALUES (1, 'first');\n";
+    let run = shell(
+        &dir,
+        &[arg(&store), "--write"],
+        &format!("{CREATE_NOTES}{insert}"),
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.errors(), Vec::<&str>::new());
+    assert!(
+        store.is_dir(),
+        "the store is one folder at the path that was given"
+    );
+    assert_eq!(
+        listing(&dir),
+        ["store"],
+        "nothing is written beside the store's folder"
+    );
+
+    // It was a whole read-write session: the next shell reads what it wrote.
+    let run = shell(&dir, &[arg(&store)], SELECT_NOTES);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.stdout, ONE_NOTE);
+
+    // On a store that is there, --write opens it and keeps what it holds.
+    let insert = "INSERT INTO notes (id, body) VALUES (2, 'second');\n";
+    let run = shell(
+        &dir,
+        &[arg(&store), "--write"],
+        &format!("{insert}{SELECT_NOTES}"),
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert!(run.stdout.contains(TWO_NOTES), "{}", run.stdout);
+}
+
+#[test]
+fn a_removed_option_is_refused_by_name_with_exit_2_before_the_store_opens() {
+    let dir = folder("a-removed-option-is-refused");
+    let store = dir.join("store");
+    let removed = [
+        ["--read-owner-connect-ms", "1000"],
+        ["--read-owner-routing-retry-ms", "1000"],
+        ["--read-owner-response-ms", "11000"],
+        ["--owner-read-concurrency", "4"],
+        ["--owner-read-request-ms", "10000"],
+        ["--owner-read-result-rows", "500"],
+    ];
+    for [option, value] in removed {
+        // With --write a store would be created here if the program got as far as opening one.
+        for extra in [&[][..], &["--json"][..]] {
+            let mut args = vec![arg(&store), "--write", option, value];
+            args.extend_from_slice(extra);
+            let run = shell(&dir, &args, CREATE_NOTES);
+            assert_eq!(run.code, Some(2), "{option}: {}", run.stderr);
+            assert!(
+                run.stderr.contains(option),
+                "{option} is not named in: {}",
+                run.stderr
+            );
+            assert_eq!(run.stdout, "", "{option}");
+            // The command line is refused in the argument parser's own words, with or
+            // without --json.
+            assert!(
+                !run.stderr.trim_start().starts_with('{'),
+                "{option}: {}",
+                run.stderr
+            );
+            assert_eq!(
+                listing(&dir),
+                Vec::<String>::new(),
+                "{option}: the store was opened"
+            );
+        }
+    }
+
+    // An option the program never had, and a command line with no store on it, are refused the
+    // same way: exit 2 in the argument parser's words, with nothing opened or created.
+    let unknown = shell(
+        &dir,
+        &[arg(&store), "--write", "--frobnicate"],
+        CREATE_NOTES,
+    );
+    assert_eq!(unknown.code, Some(2), "{}", unknown.stderr);
+    assert!(
+        unknown.stderr.contains("--frobnicate"),
+        "{}",
+        unknown.stderr
+    );
+    assert_eq!(unknown.stdout, "");
+    for no_path in [&[][..], &["--write"][..], &["--write", "--json"][..]] {
+        let run = shell(&dir, no_path, CREATE_NOTES);
+        assert_eq!(run.code, Some(2), "{no_path:?}: {}", run.stderr);
+        assert_eq!(run.stdout, "", "{no_path:?}");
+        assert!(
+            !run.stderr.trim_start().starts_with('{'),
+            "{no_path:?}: {}",
+            run.stderr
+        );
+    }
+    assert_eq!(
+        listing(&dir),
+        Vec::<String>::new(),
+        "a refused command line created something"
+    );
+}
+
+#[test]
+fn a_folder_named_like_a_command_opens_when_written_as_a_path() {
+    let dir = folder("a-folder-named-like-a-command");
+    let made = shell(
+        &dir,
+        &["./server", "--write"],
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY);\nINSERT INTO notes (id) VALUES (7);\n",
+    );
+    assert_eq!(made.code, Some(0), "{}", made.stderr);
+    assert!(dir.join("server").is_dir());
+
+    // Written as a path, the folder is the store.
+    let as_path = shell(&dir, &["./server"], "SELECT id FROM notes;\n");
+    assert_eq!(as_path.code, Some(0), "{}", as_path.stderr);
+    assert_eq!(
+        as_path.stdout,
+        "+----+\n| id |\n+----+\n| 7  |\n+----+\n(1 row)\n"
+    );
+
+    // Written bare, the word is the command, which this version refuses by name; the store
+    // beside it is not opened as a shell.
+    let as_command = shell(&dir, &["server"], "SELECT id FROM notes;\n");
+    assert_ne!(as_command.code, Some(0));
+    assert!(
+        as_command.stderr.contains("server"),
+        "{}",
+        as_command.stderr
+    );
+    assert!(!as_command.stdout.contains("| 7"), "{}", as_command.stdout);
+}
+
+#[test]
+fn piped_statements_all_run_and_a_refused_one_fails_the_run() {
+    let dir = folder("piped-statements-all-run");
+    let store = dir.join("store");
+    let input = "\
+CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);
+.tables
+INSERT INTO notes (id, body) VALUES (1, 'first');
+INSERT INTO notes (id, body) VALUES (1, 'again');
+SELECT id,
+       body
+  FROM notes
+ ORDER BY id;
+SELECT nope FROM notes;
+INSERT INTO notes (id, body) VALUES (2, 'second');
+SELECT COUNT(*) AS n FROM notes;
+";
+    let run = shell(&dir, &[arg(&store), "--write"], input);
+
+    // A statement may span lines, a command is one line, and every result is on the output.
+    let first = run
+        .stdout
+        .find(ONE_NOTE)
+        .expect("the statement written over four lines ran");
+    assert!(
+        run.stdout.lines().any(|line| line == "notes"),
+        "{}",
+        run.stdout
+    );
+
+    // Each refused statement is reported on the error stream, never as a result and never as
+    // a success: three statements changed something and three say so.
+    assert_eq!(run.errors().len(), 2, "{}", run.stderr);
+    assert!(!run.stdout.contains("Error"), "{}", run.stdout);
+    let ok: Vec<&str> = run
+        .stdout
+        .lines()
+        .filter(|line| line.starts_with("ok ("))
+        .collect();
+    assert_eq!(
+        ok,
+        [
+            "ok (rows_affected=0)",
+            "ok (rows_affected=1)",
+            "ok (rows_affected=1)"
+        ]
+    );
+
+    // The statements after a refused one still ran.
+    let count = "+---+\n| n |\n+---+\n| 2 |\n+---+\n(1 row)\n";
+    let last = run
+        .stdout
+        .find(count)
+        .expect("the statements after a refused one ran");
+    assert!(first < last);
+
+    // No prompt and no banner on either stream, and the run failed because a statement did.
+    for stream in [&run.stdout, &run.stderr] {
+        assert!(
+            !stream.contains("contextdb>") && !stream.contains("contextdb(ro)>"),
+            "{stream}"
+        );
+        assert!(!stream.contains("session"), "{stream}");
+    }
+    assert_eq!(run.code, Some(1));
+
+    // A run in which every statement succeeded exits 0 and prints its results and nothing else.
+    let run = shell(&dir, &[arg(&store)], SELECT_NOTES);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.stdout, TWO_NOTES);
+}
+
+#[test]
+fn json_prints_one_document_per_statement_with_columns_in_declared_order() {
+    let dir = folder("json-prints-one-document-per-statement");
+    let store = dir.join("store");
+    let input = "\
+CREATE TABLE notes (id INTEGER PRIMARY KEY, zeta TEXT, alpha TEXT);
+INSERT INTO notes (id, zeta, alpha) VALUES (1, 'z1', 'a1'), (2, 'z2', NULL);
+SELECT zeta, id, alpha FROM notes ORDER BY id;
+SELECT * FROM notes WHERE id = 404;
+SELECT nope FROM notes;
+.tables
+";
+    let run = shell(&dir, &[arg(&store), "--write", "--json"], input);
+
+    // One document per statement that gave a result, in the order they were given. `columns`
+    // is the order the statement or the table declared, which the keys of a row cannot carry.
+    let results = documents(&run.stdout);
+    assert_eq!(results.len(), 5, "{}", run.stdout);
+    assert_eq!(results[0], json!({"rows_affected": 0}));
+    assert_eq!(results[1], json!({"rows_affected": 2}));
+    assert_eq!(
+        results[2],
+        json!({"result": {
+            "columns": ["zeta", "id", "alpha"],
+            "rows": [
+                {"zeta": "z1", "id": 1, "alpha": "a1"},
+                {"zeta": "z2", "id": 2, "alpha": null},
+            ],
+        }})
+    );
+    assert_eq!(
+        results[3],
+        json!({"result": {"columns": ["id", "zeta", "alpha"], "rows": []}})
+    );
+    assert_eq!(results[4]["tables"]["items"], json!(["notes"]));
+
+    // The keys of a row come in the order of `columns` too, so a consumer that reads the row
+    // as written sees zeta, id, alpha and not the alphabet.
+    let line = run.stdout.lines().nth(2).unwrap();
+    let rows = &line[line.find("\"rows\"").expect("the document has rows")..];
+    let at = |key: &str| {
+        rows.find(&format!("\"{key}\""))
+            .expect("the row has the key")
+    };
+    assert!(at("zeta") < at("id") && at("id") < at("alpha"), "{rows}");
+
+    // The refused statement is a document too, on the error stream.
+    let refusals: Vec<Json> = documents(&run.stderr)
+        .into_iter()
+        .filter(|document| document.get("error").is_some())
+        .collect();
+    assert_eq!(refusals.len(), 1, "{}", run.stderr);
+    assert_eq!(refusals[0]["error"]["class"], "sql");
+    assert!(refusals[0]["error"]["message"].is_string());
+    assert_eq!(run.code, Some(1));
+}
+
+#[test]
+fn a_read_shell_refuses_a_write_by_name() {
+    let dir = folder("a-read-shell-refuses-a-write");
+    let store = dir.join("store");
+    let insert = "INSERT INTO notes (id, body) VALUES (1, 'first');\n";
+    let made = shell(
+        &dir,
+        &[arg(&store), "--write"],
+        &format!("{CREATE_NOTES}{insert}"),
+    );
+    assert_eq!(made.code, Some(0), "{}", made.stderr);
+
+    let writes = "\
+INSERT INTO notes (id, body) VALUES (2, 'second');
+UPDATE notes SET body = 'changed';
+DELETE FROM notes;
+CREATE TABLE other (id INTEGER PRIMARY KEY);
+BEGIN;
+";
+    // Each of the five is refused, telling the person what to add, and the read after them
+    // answers with the row as it was.
+    let run = shell(&dir, &[arg(&store)], &format!("{writes}{SELECT_NOTES}"));
+    assert_eq!(run.code, Some(1));
+    assert_eq!(run.errors().len(), 5, "{}", run.stderr);
+    assert!(
+        run.errors().iter().all(|line| line.contains("--write")),
+        "{}",
+        run.stderr
+    );
+    assert!(run.stdout.contains(ONE_NOTE), "{}", run.stdout);
+    assert!(!run.stdout.contains("ok ("), "{}", run.stdout);
+
+    // A program reads the refusal's kind.
+    let run = shell(&dir, &[arg(&store), "--json"], writes);
+    assert_eq!(run.code, Some(1));
+    let refusals: Vec<Json> = documents(&run.stderr)
+        .into_iter()
+        .filter(|document| document.get("error").is_some())
+        .collect();
+    assert_eq!(refusals.len(), 5, "{}", run.stderr);
+    for refusal in &refusals {
+        assert_eq!(
+            refusal["error"]["detail"]["kind"], "write_requires_flag",
+            "{refusal}"
+        );
+    }
+
+    // Nothing was written: one row, one table.
+    let run = shell(
+        &dir,
+        &[arg(&store), "--json"],
+        &format!("{SELECT_NOTES}.tables\n"),
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let results = documents(&run.stdout);
+    assert_eq!(
+        results[0]["result"]["rows"],
+        json!([{"id": 1, "body": "first"}])
+    );
+    assert_eq!(results[1]["tables"]["items"], json!(["notes"]));
+}
+
+#[test]
+fn a_read_shell_answers_while_a_writer_holds_the_store() {
+    let dir = folder("a-read-shell-answers-while-a-writer-holds");
+    let store = dir.join("store");
+
+    // This test is the writer, and holds the store until the end.
+    let writer = Database::open(&store).unwrap();
+    writer
+        .execute(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
+            &params! {},
+        )
+        .unwrap();
+    writer
+        .execute(
+            "INSERT INTO notes (id, body) VALUES (1, 'first')",
+            &params! {},
+        )
+        .unwrap();
+
+    // The store really is held: a second writer is refused, naming this process.
+    let second = shell(&dir, &[arg(&store), "--write"], SELECT_NOTES);
+    assert_eq!(second.code, Some(1), "{}", second.stderr);
+    assert!(
+        second.stderr.contains(&std::process::id().to_string()),
+        "{}",
+        second.stderr
+    );
+
+    // A read shell needs nothing from the writer and answers.
+    let run = shell(&dir, &[arg(&store)], SELECT_NOTES);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.stdout, ONE_NOTE);
+
+    // The writer was not held up by it, and the next read shell reads its next commit.
+    writer
+        .execute(
+            "INSERT INTO notes (id, body) VALUES (2, 'second')",
+            &params! {},
+        )
+        .unwrap();
+    let run = shell(&dir, &[arg(&store)], SELECT_NOTES);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.stdout, TWO_NOTES);
+
+    writer.close().unwrap();
+}
+
+#[test]
+fn begin_commit_and_rollback_run_a_transaction() {
+    let dir = folder("begin-commit-and-rollback");
+    let store = dir.join("store");
+    let input = "\
+CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);
+BEGIN;
+INSERT INTO notes (id, body) VALUES (1, 'first');
+INSERT INTO notes (id, body) VALUES (2, 'second');
+COMMIT;
+BEGIN;
+INSERT INTO notes (id, body) VALUES (3, 'third');
+DELETE FROM notes WHERE id = 1;
+SELECT id FROM notes ORDER BY id;
+ROLLBACK;
+SELECT id, body FROM notes ORDER BY id;
+";
+    let run = shell(&dir, &[arg(&store), "--write"], input);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.errors(), Vec::<&str>::new());
+
+    // Inside the second transaction its own changes are read; after ROLLBACK they are gone and
+    // what the first one committed is there.
+    let inside = "+----+\n| id |\n+----+\n| 2  |\n| 3  |\n+----+\n(2 rows)\n";
+    let seen_inside = run
+        .stdout
+        .find(inside)
+        .expect("a transaction reads its own changes");
+    let seen_after = run
+        .stdout
+        .find(TWO_NOTES)
+        .expect("ROLLBACK left what COMMIT stored");
+    assert!(seen_inside < seen_after);
+
+    // The committed transaction reached the store, and the rolled-back one never did.
+    let run = shell(&dir, &[arg(&store)], SELECT_NOTES);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.stdout, TWO_NOTES);
+}
+
+#[test]
+fn tables_and_schema_print_what_was_declared() {
+    let dir = folder("tables-and-schema");
+    let store = dir.join("store");
+    // What `.schema notes` prints: the declaration as SQL. A column with no rule prints its name
+    // and type alone, and nothing the author did not write is printed: no index behind the key
+    // or the unique rules, no table option.
+    let notes = "\
+CREATE TABLE notes (
+  id INTEGER PRIMARY KEY,
+  title TEXT NOT NULL,
+  body TEXT,
+  stars INTEGER DEFAULT 3,
+  slug TEXT UNIQUE,
+  UNIQUE (title, stars)
+);
+";
+    let authors = "CREATE TABLE authors (id UUID PRIMARY KEY, name TEXT);\n";
+    let made = shell(
+        &dir,
+        &[arg(&store), "--write"],
+        &format!("{notes}{authors}"),
+    );
+    assert_eq!(made.code, Some(0), "{}", made.stderr);
+
+    // `.tables` lists the names in order, one a line.
+    let tables = shell(&dir, &[arg(&store)], ".tables\n");
+    assert_eq!(tables.code, Some(0), "{}", tables.stderr);
+    let names: Vec<&str> = tables
+        .stdout
+        .lines()
+        .filter(|line| ["authors", "notes"].contains(line))
+        .collect();
+    assert_eq!(names, ["authors", "notes"], "{}", tables.stdout);
+
+    let schema = shell(&dir, &[arg(&store)], ".schema notes\n");
+    assert_eq!(schema.code, Some(0), "{}", schema.stderr);
+    assert_eq!(schema.stdout, notes);
+
+    // Each command has a short spelling that prints the same.
+    assert_eq!(shell(&dir, &[arg(&store)], "\\dt\n").stdout, tables.stdout);
+    assert_eq!(
+        shell(&dir, &[arg(&store)], "\\d notes\n").stdout,
+        schema.stdout
+    );
+
+    // What `.schema` printed declares the same table again in another store.
+    let copy = dir.join("copy");
+    let made = shell(&dir, &[arg(&copy), "--write"], &schema.stdout);
+    assert_eq!(made.code, Some(0), "{}", made.stderr);
+    assert_eq!(shell(&dir, &[arg(&copy)], ".schema notes\n").stdout, notes);
+}
+
+#[test]
+fn the_memory_limit_option_is_the_sessions_ceiling() {
+    let dir = folder("the-memory-limit-option");
+    let store = dir.join("store");
+
+    // The option is the ceiling the session reports, in bytes, with K, M and G as powers of
+    // 1024; without it there is none.
+    let limit = |args: &[&str]| {
+        let run = shell(&dir, args, "SHOW MEMORY_LIMIT;\n");
+        assert_eq!(run.code, Some(0), "{}", run.stderr);
+        documents(&run.stdout)[0]["result"]["rows"][0]["limit"].clone()
+    };
+    assert_eq!(limit(&[arg(&store), "--write", "--json"]), json!("none"));
+    for (size, bytes) in [
+        ("65536K", 67_108_864_u64),
+        ("64M", 67_108_864),
+        ("1G", 1_073_741_824),
+    ] {
+        let args = [arg(&store), "--write", "--json", "--memory-limit", size];
+        assert_eq!(limit(&args), json!(bytes), "--memory-limit {size}");
+    }
+
+    // A read shell answers the same statement without --write, with all five columns and with
+    // the ceiling of its own session.
+    let columns = [
+        "limit",
+        "used",
+        "available",
+        "startup_ceiling",
+        "ceiling_refresh_failures",
+    ];
+    let run = shell(&dir, &[arg(&store), "--json"], "SHOW MEMORY_LIMIT;\n");
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(
+        documents(&run.stdout)[0]["result"]["columns"],
+        json!(columns)
+    );
+    let args = [arg(&store), "--json", "--memory-limit", "64M"];
+    assert_eq!(
+        limit(&args),
+        json!(67_108_864_u64),
+        "a read shell's --memory-limit"
+    );
+
+    // A size that cannot be read is a mistake in the command line: exit 2, nothing opened.
+    let unread = dir.join("unread");
+    let run = shell(
+        &dir,
+        &[arg(&unread), "--write", "--memory-limit", "12Q"],
+        CREATE_NOTES,
+    );
+    assert_eq!(run.code, Some(2), "{}", run.stderr);
+    assert!(!unread.exists());
+
+    // 64 rows of one mebibyte each, written with no ceiling.
+    let big = dir.join("big");
+    let writer = Database::open(&big).unwrap();
+    writer
+        .execute(
+            "CREATE TABLE blobs (id INTEGER PRIMARY KEY, body TEXT)",
+            &params! {},
+        )
+        .unwrap();
+    for id in 1..=64_i64 {
+        let body = format!("{id:08}").repeat(131_072);
+        writer
+            .execute(
+                "INSERT INTO blobs (id, body) VALUES ($id, $body)",
+                &params! { "id" => id, "body" => body },
+            )
+            .unwrap();
+    }
+    writer.close().unwrap();
+
+    // Under a 16 MiB ceiling, reading or writing, the statement that would bring all 64 MiB
+    // into memory is refused by name with the numbers of the refusal, and gives no result; the
+    // session goes on, and a statement that fits is answered.
+    let statements = "SELECT id, body FROM blobs ORDER BY id;\nSELECT COUNT(*) AS n FROM blobs;\n";
+    for mode in [&[][..], &["--write"][..]] {
+        let mut args = vec![arg(&big), "--json", "--memory-limit", "16M"];
+        args.extend_from_slice(mode);
+        let run = shell(&dir, &args, statements);
+        assert_eq!(run.code, Some(1), "{mode:?}: {}", run.stderr);
+        let refusals: Vec<Json> = documents(&run.stderr)
+            .into_iter()
+            .filter(|document| document.get("error").is_some())
+            .collect();
+        assert_eq!(refusals.len(), 1, "{mode:?}: {}", run.stderr);
+        let error = &refusals[0]["error"];
+        assert_eq!(error["class"], "io", "{mode:?}: {error}");
+        assert_eq!(
+            error["detail"]["kind"], "memory_budget_exceeded",
+            "{mode:?}: {error}"
+        );
+        for number in ["requested_bytes", "available_bytes", "budget_limit_bytes"] {
+            assert!(
+                error["detail"][number].is_u64(),
+                "{mode:?}: no {number} in {error}"
+            );
+        }
+        assert_eq!(
+            documents(&run.stdout),
+            [json!({"result": {"columns": ["n"], "rows": [{"n": 64}]}})],
+            "{mode:?}"
+        );
+    }
+}

@@ -1,0 +1,25 @@
+[package]
+name = "contextdb-cli"
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.89"
+license = "Apache-2.0"
+description = "The contextdb program: a SQL shell for a contextdb store"
+repository = "https://github.com/context-graph-ai/contextdb"
+
+[[bin]]
+name = "contextdb"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+contextdb = { version = "2.0.0", path = "../contextdb" }
+# Line editing and recall at a terminal, without its history-file and key-binding features.
+# Version 19 needs a newer compiler than this workspace builds with.
+rustyline = { version = "17", default-features = false }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

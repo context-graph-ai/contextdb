@@ -7,7 +7,7 @@ use std::collections::btree_map::BTreeMap;
 use std::collections::{BTreeSet, HashMap};
 use std::mem;
 use std::mem::size_of;
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 #[derive(Copy, Clone, Hash, Ord, PartialOrd, Eq, PartialEq, Debug)]
 pub(crate) struct TransactionId(u64);
@@ -91,13 +91,20 @@ struct State {
     unprocessed_freed_non_durable_commits: BTreeSet<TransactionId>,
 }
 
+// Answers with the oldest commit that is read by a reader this tracker cannot see
+pub(crate) type HeldCommitsCallback = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
 pub(crate) struct TransactionTracker {
     state: Mutex<State>,
     live_write_transaction_available: Condvar,
+    oldest_held: HeldCommitsCallback,
 }
 
 impl TransactionTracker {
-    pub(crate) fn new(next_transaction_id: TransactionId) -> Self {
+    pub(crate) fn new(
+        next_transaction_id: TransactionId,
+        oldest_held: HeldCommitsCallback,
+    ) -> Self {
         Self {
             state: Mutex::new(State {
                 next_savepoint_id: SavepointId(0),
@@ -109,6 +116,7 @@ impl TransactionTracker {
                 unprocessed_freed_non_durable_commits: Default::default(),
             }),
             live_write_transaction_available: Condvar::new(),
+            oldest_held,
         }
     }
 
@@ -292,14 +300,22 @@ impl TransactionTracker {
             .map(|x| (*x.0, *x.1))
     }
 
+    // Includes the commits held by readers that only the held commits callback knows of
     pub(crate) fn oldest_live_read_transaction(&self) -> Option<TransactionId> {
-        self.state
+        // Called without the lock, because the callback is the caller's code
+        let held = (self.oldest_held)().map(TransactionId::new);
+        let live = self
+            .state
             .lock()
             .unwrap()
             .live_read_transactions
             .keys()
             .next()
-            .copied()
+            .copied();
+        match (held, live) {
+            (Some(held), Some(live)) => Some(held.min(live)),
+            (held, live) => held.or(live),
+        }
     }
 
     // Returns the transaction id of the oldest non-durable transaction which has not been processed

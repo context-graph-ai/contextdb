@@ -1,4 +1,4 @@
-use crate::transaction_tracker::{TransactionId, TransactionTracker};
+use crate::transaction_tracker::{HeldCommitsCallback, TransactionId, TransactionTracker};
 use crate::tree_store::{
     BtreeHeader, InternalTableDefinition, PAGE_SIZE, PageHint, PageNumber, ReadOnlyBackend,
     ShrinkPolicy, TableTree, TableType, TransactionalMemory,
@@ -360,7 +360,7 @@ pub trait ReadableDatabase {
 /// Use [`Self::begin_read`] to get a [`ReadTransaction`] object that can be used to read from the database
 ///
 /// Multiple processes may open a [`ReadOnlyDatabase`], but it may not be opened concurrently
-/// with a [`Database`].
+/// with a [`Database`], unless it is opened with [`Builder::open_read_only_with_backend`].
 ///
 /// # Examples
 ///
@@ -398,10 +398,18 @@ pub trait ReadableDatabase {
 pub struct ReadOnlyDatabase {
     mem: Arc<TransactionalMemory>,
     transaction_tracker: Arc<TransactionTracker>,
+    // True if another handle may be writing to the file
+    beside_writer: bool,
 }
 
 impl ReadableDatabase for ReadOnlyDatabase {
     fn begin_read(&self) -> Result<ReadTransaction, TransactionError> {
+        if self.beside_writer {
+            self.mem.load_newest_commit().map_err(|err| match err {
+                DatabaseError::Storage(storage) => storage,
+                other => StorageError::Corrupted(other.to_string()),
+            })?;
+        }
         let id = self
             .transaction_tracker
             .register_read_transaction(&self.mem)?;
@@ -459,7 +467,11 @@ impl ReadOnlyDatabase {
         let next_transaction_id = mem.get_last_committed_transaction_id()?.next();
         let db = Self {
             mem,
-            transaction_tracker: Arc::new(TransactionTracker::new(next_transaction_id)),
+            transaction_tracker: Arc::new(TransactionTracker::new(
+                next_transaction_id,
+                Arc::new(|| None),
+            )),
+            beside_writer: false,
         };
 
         Ok(db)
@@ -536,6 +548,14 @@ impl Database {
     }
 
     pub(crate) fn verify_primary_checksums(mem: Arc<TransactionalMemory>) -> Result<bool> {
+        // The root page of a table tree is read, and checked, as soon as the tree is opened
+        match Self::verify_primary_checksums_inner(mem) {
+            Err(StorageError::Corrupted(_)) => Ok(false),
+            result => result,
+        }
+    }
+
+    fn verify_primary_checksums_inner(mem: Arc<TransactionalMemory>) -> Result<bool> {
         let table_tree = TableTree::new(
             mem.get_data_root(),
             PageHint::None,
@@ -898,6 +918,7 @@ impl Database {
         region_size: Option<u64>,
         cache_size: usize,
         repair_callback: &(dyn Fn(&mut RepairSession) + 'static),
+        oldest_held: HeldCommitsCallback,
     ) -> Result<Self, DatabaseError> {
         #[cfg(feature = "logging")]
         let file_path = format!("{:?}", &file);
@@ -944,7 +965,10 @@ impl Database {
 
         let db = Database {
             mem,
-            transaction_tracker: Arc::new(TransactionTracker::new(next_transaction_id)),
+            transaction_tracker: Arc::new(TransactionTracker::new(
+                next_transaction_id,
+                oldest_held,
+            )),
         };
 
         // Restore the tracker state for any persistent savepoints
@@ -1106,6 +1130,7 @@ pub struct Builder {
     region_size: Option<u64>,
     cache_size: usize,
     repair_callback: Box<dyn Fn(&mut RepairSession)>,
+    oldest_held: HeldCommitsCallback,
 }
 
 impl Builder {
@@ -1125,6 +1150,7 @@ impl Builder {
             // TODO: Default should probably take into account the total system memory
             cache_size: 1024 * 1024 * 1024,
             repair_callback: Box::new(|_| {}),
+            oldest_held: Arc::new(|| None),
         }
     }
 
@@ -1189,6 +1215,7 @@ impl Builder {
             self.region_size,
             self.cache_size,
             &self.repair_callback,
+            self.oldest_held.clone(),
         )
     }
 
@@ -1203,6 +1230,7 @@ impl Builder {
             None,
             self.cache_size,
             &self.repair_callback,
+            self.oldest_held.clone(),
         )
     }
 
@@ -1225,6 +1253,51 @@ impl Builder {
         )
     }
 
+    /// Opens an existing database for reading through `backend`, whether or not another handle,
+    /// in this process or another, has it open for writing.
+    ///
+    /// No lock is taken and nothing is repaired or written: whoever supplies the backend answers
+    /// for there being at most one writer. Each [`ReadableDatabase::begin_read`] on the returned
+    /// database reads the commit that is newest on disk when it is called, and that commit stays
+    /// whole for as long as the writer is told it is held (see
+    /// [`Builder::set_held_commits_callback`]).
+    pub fn open_read_only_with_backend(
+        &self,
+        backend: impl StorageBackend,
+    ) -> Result<ReadOnlyDatabase, DatabaseError> {
+        let mem = TransactionalMemory::new_beside_writer(
+            Box::new(ReadOnlyBackend::new(Box::new(backend))),
+            self.page_size,
+            self.cache_size,
+        )?;
+        let next_transaction_id = mem.get_last_committed_transaction_id()?.next();
+
+        Ok(ReadOnlyDatabase {
+            mem: Arc::new(mem),
+            transaction_tracker: Arc::new(TransactionTracker::new(
+                next_transaction_id,
+                Arc::new(|| None),
+            )),
+            beside_writer: true,
+        })
+    }
+
+    /// Tells a database opened for writing which commits are still read by readers it cannot
+    /// see, such as ones opened with [`Builder::open_read_only_with_backend`].
+    ///
+    /// Before the writer reuses pages that a commit freed, it calls `oldest_held`. The answer is
+    /// the id of the oldest commit such a reader holds (see [`ReadTransaction::commit_id`]), or
+    /// `None` when none is held; no page that the named commit, or a later one, can reach is
+    /// reused. The callback is called while a commit is in progress, so it must not wait on
+    /// that commit.
+    pub fn set_held_commits_callback(
+        &mut self,
+        oldest_held: impl Fn() -> Option<u64> + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.oldest_held = Arc::new(oldest_held);
+        self
+    }
+
     /// Open an existing or create a new database in the given `file`.
     ///
     /// The file must be empty or contain a valid database.
@@ -1236,6 +1309,7 @@ impl Builder {
             self.region_size,
             self.cache_size,
             &self.repair_callback,
+            self.oldest_held.clone(),
         )
     }
 
@@ -1251,6 +1325,7 @@ impl Builder {
             self.region_size,
             self.cache_size,
             &self.repair_callback,
+            self.oldest_held.clone(),
         )
     }
 }

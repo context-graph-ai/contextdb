@@ -1,3 +1,37 @@
+# contextdb-redb
+
+redb 4.1.0 with changes for contextdb. Upstream version: [redb](https://github.com/cberner/redb)
+4.1.0, as published on crates.io. The library is still named `redb`, the file format is
+unchanged, and upstream's own tests pass unchanged.
+
+This version changes the following and nothing else. Each change is written so that it can be
+proposed upstream.
+
+Reading a file while its writer has it open:
+
+- `Builder::open_read_only_with_backend` is new: it opens a database for reading whether or not
+  another handle has it open for writing, takes no lock and writes nothing, and each
+  `begin_read()` on it reads the commit that is newest in the file at that moment.
+- `ReadTransaction::commit_id` is new: it returns the id of the commit a read transaction reads,
+  and ids rise with every commit of a file.
+- `Builder::set_held_commits_callback` is new: before a writer reuses freed pages it asks the
+  given function for the oldest commit that a reader it cannot see still holds and keeps every
+  page that this commit or a later one can reach, and `Database::compact` returns
+  `TransactionInProgress` while such a commit is held.
+- Every commit now writes its pages to the file before it writes the header that names them, so
+  a reader of the file never finds a header ahead of its pages.
+
+Checking pages when they are read:
+
+- A committed page that is read from the file is now checked, before it is cached or returned,
+  against the checksum that its parent page or the root of its tree holds for it, and a mismatch
+  is `StorageError::Corrupted`; upstream compares these checksums only during repair.
+- The page walks of repair and compaction, which have no checksum at hand, no longer put the
+  pages they read into the page cache, so the cache only holds pages that were checked or that
+  were written through the same handle.
+
+Everything below is upstream's README.
+
 # redb
 
 ![CI](https://github.com/cberner/redb/actions/workflows/ci.yml/badge.svg)

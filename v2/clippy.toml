@@ -1,0 +1,10 @@
+# The one lint list of this workspace: calls the library never makes, and the clock read that
+# only its `system` module makes.
+disallowed-methods = [
+    { path = "std::thread::sleep", reason = "wait on something a process announces; nothing in the engine sleeps" },
+    { path = "std::thread::spawn", reason = "the engine starts no thread" },
+    { path = "std::thread::Builder::spawn", reason = "the engine starts no thread" },
+    { path = "std::time::Instant::now", reason = "read the time through contextdb::Clock" },
+    { path = "std::time::SystemTime::now", reason = "read the time through contextdb::Clock" },
+    { path = "uuid::Uuid::new_v4", reason = "the engine draws no random number; a test uses fixed ids" },
+]

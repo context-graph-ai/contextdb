@@ -121,7 +121,13 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
         }) = *self.root
         {
             let (deletion_result, found) = self.delete_helper(
-                self.mem.get_page(p, PageHint::None)?,
+                self.mem.get_checked_page(
+                    p,
+                    checksum,
+                    K::fixed_width(),
+                    V::fixed_width(),
+                    PageHint::None,
+                )?,
                 checksum,
                 K::as_bytes(key).as_ref(),
             )?;
@@ -191,7 +197,13 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
         }) = *self.root
         {
             let result = self.insert_helper(
-                self.mem.get_page(p, PageHint::None)?,
+                self.mem.get_checked_page(
+                    p,
+                    checksum,
+                    K::fixed_width(),
+                    V::fixed_width(),
+                    PageHint::None,
+                )?,
                 checksum,
                 K::as_bytes(key).as_ref(),
                 V::as_bytes(value).as_ref(),
@@ -463,7 +475,7 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                 let (child_index, child_page) = accessor.child_for_key::<K>(key);
                 let child_checksum = accessor.child_checksum(child_index).unwrap();
                 let sub_result = self.insert_helper(
-                    self.mem.get_page(child_page, PageHint::None)?,
+                    accessor.get_child(child_index, V::fixed_width(), &self.mem, PageHint::None)?,
                     child_checksum,
                     key,
                     value,
@@ -747,7 +759,7 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
         let (child_index, child_page_number) = accessor.child_for_key::<K>(key);
         let child_checksum = accessor.child_checksum(child_index).unwrap();
         let (result, found) = self.delete_helper(
-            self.mem.get_page(child_page_number, PageHint::None)?,
+            accessor.get_child(child_index, V::fixed_width(), &self.mem, PageHint::None)?,
             child_checksum,
             key,
         )?;
@@ -831,9 +843,8 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
 
                 let merge_with = if child_index == 0 { 1 } else { child_index - 1 };
                 debug_assert!(merge_with < accessor.count_children());
-                let merge_with_page = self
-                    .mem
-                    .get_page(accessor.child_page(merge_with).unwrap(), PageHint::None)?;
+                let merge_with_page =
+                    accessor.get_child(merge_with, V::fixed_width(), &self.mem, PageHint::None)?;
                 let merge_with_accessor =
                     LeafAccessor::new(merge_with_page.memory(), K::fixed_width(), V::fixed_width());
 
@@ -921,9 +932,8 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
             }
             DeletedBranch(only_grandchild, grandchild_checksum) => {
                 let merge_with = if child_index == 0 { 1 } else { child_index - 1 };
-                let merge_with_page = self
-                    .mem
-                    .get_page(accessor.child_page(merge_with).unwrap(), PageHint::None)?;
+                let merge_with_page =
+                    accessor.get_child(merge_with, V::fixed_width(), &self.mem, PageHint::None)?;
                 let merge_with_accessor = BranchAccessor::new(&merge_with_page, K::fixed_width());
                 debug_assert!(merge_with < accessor.count_children());
                 for i in 0..accessor.count_children() {
@@ -983,9 +993,8 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                 keys: partial_keys,
             } => {
                 let merge_with = if child_index == 0 { 1 } else { child_index - 1 };
-                let merge_with_page = self
-                    .mem
-                    .get_page(accessor.child_page(merge_with).unwrap(), PageHint::None)?;
+                let merge_with_page =
+                    accessor.get_child(merge_with, V::fixed_width(), &self.mem, PageHint::None)?;
                 let merge_with_accessor = BranchAccessor::new(&merge_with_page, K::fixed_width());
                 debug_assert!(merge_with < accessor.count_children());
                 for i in 0..accessor.count_children() {

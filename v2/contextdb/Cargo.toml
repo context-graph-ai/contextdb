@@ -1,0 +1,20 @@
+[package]
+name = "contextdb"
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.89"
+license = "Apache-2.0"
+description = "An embedded SQL database in one folder: typed tables, transactions, one writer with any number of readers in other processes, and a memory limit that holds"
+repository = "https://github.com/context-graph-ai/contextdb"
+readme = "README.md"
+
+[dependencies]
+pest = "2.8.6"
+pest_derive = "2.8.6"
+redb = { package = "contextdb-redb", version = "4.1.0", path = "../redb" }
+# Numbers in a stored JSON value are read back exactly as they were written.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+uuid = { version = "1", features = ["v4"] }
+
+[lints]
+workspace = true
