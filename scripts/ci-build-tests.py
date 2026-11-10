@@ -181,7 +181,7 @@ class CurrentRunControls(unittest.TestCase):
                 self.assertEqual(path, f'repos/{c.REPO}/actions/workflows/ci.yml/runs?event=push&head_sha={SHA}&per_page=100')
                 return [run]
             self.assertEqual(key, 'jobs', 'automatic admission must not search completed CI runs')
-            self.assertEqual(path, f'repos/{c.REPO}/actions/runs/12/attempts/2/jobs?per_page=100',
+            self.assertEqual(path, f'repos/{c.REPO}/actions/runs/12/attempts/2/jobs?per_page=30',
                              'only current run/latest attempt may prove aggregate success')
             return jobs
         with tempfile.TemporaryDirectory() as tmp:
