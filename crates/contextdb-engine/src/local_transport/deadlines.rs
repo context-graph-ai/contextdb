@@ -2037,6 +2037,18 @@ mod independent_owned_driver_tests {
     fn threads() -> usize {
         std::fs::read_dir("/proc/self/task").unwrap().count()
     }
+    /// A joined thread stays listed in /proc/self/task until the kernel has
+    /// reaped it, which can trail the join by a moment. Wait on that observed
+    /// state, not on time, and fail with the census if it never settles.
+    fn assert_threads_settle_to(expected: usize) {
+        for _ in 0..50_000_000 {
+            if threads() == expected {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(threads(), expected);
+    }
     fn linked(clock: &MonotonicDeadlineClock) -> (usize, usize) {
         let list = clock.owned_waits.lock().unwrap();
         let mut count = 0;
@@ -2058,6 +2070,27 @@ mod independent_owned_driver_tests {
     #[test]
     #[serial_test::serial]
     fn one_clock_worker_keeps_pending_waits_after_caller_departure_rows() {
+        // The rows count the process's threads, so they run alone in a fresh
+        // process: a thread another test started or has not yet joined would
+        // change the census.
+        const CHILD: &str = "CONTEXTDB_CLOCK_WORKER_ROWS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let name = format!(
+                "{}::one_clock_worker_keeps_pending_waits_after_caller_departure_rows",
+                module_path!()
+            );
+            let filter = name.split_once("::").unwrap().1;
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", filter, "--nocapture"])
+                .env(CHILD, "1")
+                .status()
+                .expect("start the isolated clock worker census");
+            assert!(
+                status.success(),
+                "the clock worker rows failed alone: {status}"
+            );
+            return;
+        }
         // The process finisher may be cold here; exclude its permanent
         // worker from the clock driver's own creation/release delta.
         crate::owned_worker::ensure_finisher().unwrap();
@@ -2117,13 +2150,7 @@ mod independent_owned_driver_tests {
         drop(worker);
         assert_eq!(linked(&clock), (0, 0));
         assert_eq!(actual.usage().used, 0);
-        for _ in 0..100_000 {
-            if threads() == before {
-                break;
-            }
-            std::thread::yield_now();
-        }
-        assert_eq!(threads(), before);
+        assert_threads_settle_to(before);
     }
 }
 
