@@ -69,6 +69,8 @@ import yaml
 
 WORKFLOW = '.github/workflows/ci.yml'
 BOX_CPUS = 4
+# Free memory the shared parent slice must have before another box step starts.
+STEP_HEADROOM = 8 * 1024 ** 3
 BOX_CPU_QUOTA = '400%'
 BOX_MEMORY = 16 * 1024 ** 3
 # Free bytes the workflow's cleanup step reported on hosted ubuntu-latest runners (November 2026,
@@ -532,13 +534,15 @@ class Box:
             self.cancelled, self.cause = True, 'timeout'
             log.write_text('job timeout reached before this step\n')
             return False
-        self.unit = f'cilocal-{r.run_id}-{seq:04d}.service'
-        argv = [sys.executable, str(Path(__file__).resolve()), '_box', '--unit', self.unit, '--runtime', str(remaining),
+        unit = f'cilocal-{r.run_id}-{seq:04d}.service'
+        argv = [sys.executable, str(Path(__file__).resolve()), '_box', '--unit', unit, '--runtime', str(remaining),
                 '--cwd', str(cwd), '--cpu-model', r.a.cpu_model, '--cpu-pool', str(r.work / 'cpu-pool.json'),
-                '--env-file', str(files['env']), '--stamp', str(files['start']), str(files['sh'])]
+                '--env-file', str(files['env']), '--stamp', str(files['start']), '--stop-file', str(r.stop_file),
+                str(files['sh'])]
         compile_step = not NO_COMPILE.search(run)
         if compile_step and r.launcher:
             argv = [r.launcher] + argv
+        r.wait_for_step_headroom(self, unit)   # admission, not box time: the box clock starts with the step
         oom_before = r.slice_oom()
         r.say(f'[run ] {tag}')
         t0 = time.time()
@@ -606,6 +610,7 @@ class LocalRun:
         self.boxes = {}
         self.drift = None
         self.interrupted = False
+        self.stop_file = self.work / 'STOP'
         self.t0 = time.time()
         self.artifacts = self.work / 'artifacts'
         self.doc = yaml.safe_load((self.tree / WORKFLOW).read_text())
@@ -652,7 +657,7 @@ class LocalRun:
         event_file = box.runner_temp.parent / 'event.json'
         if not event_file.exists():
             event_file.write_text(json.dumps(box.ctx['github']['event']))
-        env.update(CI='true', GITHUB_ACTIONS='true', GITHUB_SHA=self.sha, GITHUB_REF='refs/pull/0/merge',
+        env.update(LD_PRELOAD=str(self.cpu_shim), CI='true', GITHUB_ACTIONS='true', GITHUB_SHA=self.sha, GITHUB_REF='refs/pull/0/merge',
                    GITHUB_EVENT_NAME='pull_request', GITHUB_EVENT_PATH=str(event_file), GITHUB_WORKSPACE=str(box.ws),
                    GITHUB_REPOSITORY='context-graph-ai/contextdb', GITHUB_RUN_ID=self.run_id, GITHUB_RUN_ATTEMPT='1',
                    GITHUB_JOB=box.jobid, GITHUB_BASE_REF='dev', GITHUB_HEAD_REF='local', RUNNER_OS='Linux',
@@ -733,6 +738,29 @@ class LocalRun:
                             capture_output=True, text=True).stdout.strip()
         return Path('/sys/fs/cgroup' + cg) if cg else None
 
+    def slice_anon(self):
+        cg = self.slice_cgroup()
+        try:
+            m = re.search(r'^anon (\d+)', (cg / 'memory.stat').read_text(), re.M) if cg else None
+        except OSError:
+            return 0
+        return int(m.group(1)) if m else 0
+
+    def wait_for_step_headroom(self, box, unit):
+        """Start a step only while the boxes' shared memory has STEP_HEADROOM free. A parent slice
+        squeezed to its cap reclaims page cache from every box and stalls their I/O, which no hosted
+        runner experiences; a wait here keeps that contention out of every job's timings. A box takes
+        its unit only when admitted, so boxes still waiting never count as running steps and two
+        waiting boxes cannot hold each other back once every running step has finished."""
+        while not self.interrupted:
+            with self.lock:
+                others = [b for b in self.boxes_running() if b is not box and b.unit]
+                if not others or self.slice_cap - self.slice_anon() >= STEP_HEADROOM:
+                    box.unit = unit
+                    return
+            time.sleep(5)
+        box.unit = unit
+
     def slice_oom(self):
         cg = self.slice_cgroup()
         try:
@@ -783,8 +811,28 @@ class LocalRun:
 
     def stop_all(self, *_):
         self.interrupted = True
-        subprocess.run(['systemctl', '--user', 'kill', '--signal=SIGKILL', f'cilocal-{self.run_id}-*'], capture_output=True)
-        subprocess.run(['systemctl', '--user', 'stop', f'cilocal-{self.run_id}-*'], capture_output=True)
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, signal.SIG_IGN)
+        self.stop_file.write_text('stopped\n')   # a step admitted from now on never starts
+        # first the launchers still waiting for admission, so none of them starts a step afterwards
+        for pid in descendants(os.getpid()):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        pattern, quiet = f'cilocal-{self.run_id}-*', 0
+        for _ in range(30):   # until none of the run's units is left, including one that was starting
+            live = subprocess.run(['systemctl', '--user', 'list-units', '--all', '--plain', '--no-legend', pattern],
+                                  capture_output=True, text=True).stdout.split()
+            if not live:
+                quiet += 1
+                if quiet >= 3:
+                    break
+            else:
+                quiet = 0
+                subprocess.run(['systemctl', '--user', 'kill', '--signal=SIGKILL', pattern], capture_output=True)
+                subprocess.run(['systemctl', '--user', 'stop', pattern], capture_output=True)
+            time.sleep(1)
         try:   # what finished stays reported; the rest is marked interrupted
             self.report(time.time() - self.t0)
         finally:
@@ -843,10 +891,18 @@ class LocalRun:
     def run(self):
         for d in (self.out / 'logs', self.out / 'scripts', self.artifacts, self.tmp):
             d.mkdir(parents=True, exist_ok=True)
+        self.cpu_shim = build_cpu_shim(Path(self.a.work).resolve() / 'cpu-shim')
+        probe = subprocess.run([sys.executable, '-c', 'import os; print(os.cpu_count())'], capture_output=True, text=True,
+                               env=dict(os.environ, LD_PRELOAD=str(self.cpu_shim)))
+        if probe.stdout.strip() != str(BOX_CPUS):
+            raise SystemExit(f'the CPU-count shim does not make python count {BOX_CPUS} CPUs: {probe.stderr.strip()[:300]}')
         jobs = self.doc['jobs']
         self.budget, budget_why = self.disk_budget()
         avail = int(re.search(r'MemAvailable:\s+(\d+)', Path('/proc/meminfo').read_text()).group(1)) * 1024
+        if not self.a.boxes:   # as many boxes as the host's memory holds at a typical 8G each, at most 8
+            self.a.boxes = max(1, min(8, (avail - 8 * 1024 ** 3) // STEP_HEADROOM))
         cap = self.a.host_memory or min(self.a.boxes * BOX_MEMORY, avail - 8 * 1024 ** 3)
+        self.slice_cap = cap
         subprocess.run(['systemctl', '--user', 'set-property', '--runtime', SLICE, f'MemoryMax={cap}', 'MemorySwapMax=0'], check=True)
         meta = dict(tree=str(self.tree), sha=self.sha, base=self.base, run_id=self.run_id, work=str(self.work),
                     tmp=str(self.tmp), boxes=self.a.boxes, box=dict(cpu=BOX_CPU_QUOTA, memory=BOX_MEMORY, swap=0),
@@ -967,6 +1023,22 @@ class LocalRun:
 
 
 # ------------------------------------------------------------------------------------------------
+def descendants(root):
+    children = {}
+    for stat in Path('/proc').glob('[0-9]*/stat'):
+        try:
+            fields = stat.read_text().rsplit(')', 1)[1].split()
+        except OSError:
+            continue
+        children.setdefault(int(fields[1]), []).append(int(stat.parent.name))
+    out, todo = [], list(children.get(root, []))
+    while todo:
+        pid = todo.pop()
+        out.append(pid)
+        todo += children.get(pid, [])
+    return out
+
+
 def take_cores(pool, unit, offered, count):
     """Give this step `count` CPUs of the admitted set that no other running box step holds; wait while
     fewer are free, since a 4-vCPU runner never shares its CPUs (the wait is admission, not box time)."""
@@ -999,11 +1071,43 @@ def release_cores(pool, unit):
         Path(pool).write_text(json.dumps(held))
 
 
+CPU_SHIM_C = r"""
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <unistd.h>
+static long (*real_sysconf)(int);
+long sysconf(int name) {
+    if (name == _SC_NPROCESSORS_ONLN || name == _SC_NPROCESSORS_CONF) return CPUS;
+    if (!real_sysconf) real_sysconf = (long (*)(int))dlsym(RTLD_NEXT, "sysconf");
+    return real_sysconf(name);
+}
+int get_nprocs(void) { return CPUS; }
+int get_nprocs_conf(void) { return CPUS; }
+"""
+
+
+def build_cpu_shim(where):
+    """Compile the CPU-count shim once per source; returns its path."""
+    digest = hashlib.sha256(f'{CPU_SHIM_C}{BOX_CPUS}'.encode()).hexdigest()[:16]
+    lib = where / f'cpu{BOX_CPUS}-{digest}.so'
+    if not lib.exists():
+        where.mkdir(parents=True, exist_ok=True)
+        src = where / f'cpu{BOX_CPUS}-{digest}.c'
+        src.write_text(CPU_SHIM_C)
+        part = lib.with_suffix(f'.part{os.getpid()}')
+        r = subprocess.run(['cc', '-shared', '-fPIC', '-O2', f'-DCPUS={BOX_CPUS}', '-o', str(part), str(src), '-ldl'],
+                           capture_output=True, text=True)
+        if r.returncode:
+            raise SystemExit(f'cannot build the CPU-count shim with cc: {r.stderr.strip()[:300]}')
+        os.replace(part, lib)
+    return lib
+
+
 def box_main(argv):
     """Inside the admission wrapper: start one step as a capped transient service and wait for it."""
     p = argparse.ArgumentParser(prog='ci-local.py _box')
     for flag in ('--unit', '--runtime', '--cwd', '--cpu-model',
-                 '--cpu-pool', '--env-file', '--stamp'):
+                 '--cpu-pool', '--env-file', '--stamp', '--stop-file'):
         p.add_argument(flag, required=True)
     p.add_argument('script')
     a = p.parse_args(argv)
@@ -1021,7 +1125,7 @@ def box_main(argv):
            '--',
            'env', '-i', 'bash', '--noprofile', '--norc', '-c', inner, 'box', a.env_file, a.stamp, a.script]
     try:
-        rc = subprocess.run(cmd).returncode
+        rc = 130 if Path(a.stop_file).exists() else subprocess.run(cmd).returncode
     finally:
         if a.cpu_model == 'cores':
             release_cores(a.cpu_pool, a.unit)
@@ -1039,7 +1143,7 @@ def main():
     p.add_argument('--tmp', default=os.environ.get('CI_LOCAL_TMP', str(here / 'target/ci-local/tmp')),
                    help='per-box RUNNER_TEMP and TMPDIR')
     p.add_argument('--out', help='report directory (default: <work>/<run>/report)')
-    p.add_argument('--boxes', type=int, default=8, help='job boxes running at once (default 8)')
+    p.add_argument('--boxes', type=int, help='job boxes running at once (default: what available memory holds, at most 8)')
     p.add_argument('--only', help='run only job instances whose name or job id matches this regex')
     p.add_argument('--base', help='pull-request base commit (default: merge-base with origin/dev)')
     p.add_argument('--disk-budget', type=int, help='bytes a box may add after checkout (default: hosted figure)')
