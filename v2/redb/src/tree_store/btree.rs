@@ -267,7 +267,7 @@ impl UntypedBtreeMut {
     ) -> Result<bool> {
         if let Some(root) = self.get_root()
             && let Some((new_root, new_checksum)) =
-                self.relocate_helper(root.root, relocation_map)?
+                self.relocate_helper(root.root, root.checksum, relocation_map)?
         {
             self.root = Some(BtreeHeader::new(new_root, new_checksum, root.length));
             return Ok(true);
@@ -279,14 +279,22 @@ impl UntypedBtreeMut {
     fn relocate_helper(
         &mut self,
         page_number: PageNumber,
+        checksum: Checksum,
         relocation_map: &HashMap<PageNumber, PageNumber>,
     ) -> Result<Option<(PageNumber, Checksum)>> {
-        let old_page = self.mem.get_page(page_number, PageHint::None)?;
         let mut new_page = if let Some(new_page_number) = relocation_map.get(&page_number) {
             self.mem.get_page_mut(*new_page_number)?
         } else {
             return Ok(None);
         };
+        // Only a page that moves is read
+        let old_page = self.mem.get_checked_page(
+            page_number,
+            checksum,
+            self.key_width,
+            self.value_width,
+            PageHint::None,
+        )?;
         new_page.memory_mut().copy_from_slice(old_page.memory());
 
         let node_mem = old_page.memory();
@@ -299,8 +307,9 @@ impl UntypedBtreeMut {
                 let mut mutator = BranchMutator::new(new_page.memory_mut());
                 for i in 0..accessor.count_children() {
                     let child = accessor.child_page(i).unwrap();
+                    let child_checksum = accessor.child_checksum(i).unwrap();
                     if let Some((new_child, new_checksum)) =
-                        self.relocate_helper(child, relocation_map)?
+                        self.relocate_helper(child, child_checksum, relocation_map)?
                     {
                         mutator.write_child_page(i, new_child, new_checksum);
                     }
@@ -366,7 +375,7 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<'_, K, V> {
 
     #[allow(dead_code)]
     pub(crate) fn all_pages_iter(&self) -> Result<Option<AllPageNumbersBtreeIter>> {
-        if let Some(root) = self.root.map(|x| x.root) {
+        if let Some(root) = self.root {
             Ok(Some(AllPageNumbersBtreeIter::new(
                 root,
                 K::fixed_width(),
@@ -479,7 +488,7 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<'_, K, V> {
 
     pub(crate) fn stats(&self) -> Result<BtreeStats> {
         btree_stats(
-            self.get_root().map(|x| x.root),
+            self.get_root(),
             &self.mem,
             K::fixed_width(),
             V::fixed_width(),
@@ -518,7 +527,13 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<'_, K, V> {
                     .try_into()
                     .unwrap();
                 let mut new_page = self.mem.allocate(required, &mut allocated)?;
-                let old_page = self.mem.get_page(root.root, PageHint::None)?;
+                let old_page = self.mem.get_checked_page(
+                    root.root,
+                    root.checksum,
+                    K::fixed_width(),
+                    V::fixed_width(),
+                    PageHint::None,
+                )?;
                 new_page.memory_mut().copy_from_slice(old_page.memory());
                 drop(old_page);
                 freed_pages.push(root.root);
@@ -576,7 +591,13 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<'_, K, V> {
                         .try_into()
                         .unwrap();
                     let mut new_page = self.mem.allocate(required, &mut allocated)?;
-                    let old_child_page = self.mem.get_page(child_page, PageHint::None)?;
+                    let accessor = BranchAccessor::new(&page, K::fixed_width());
+                    let old_child_page = accessor.get_child(
+                        child_index,
+                        V::fixed_width(),
+                        &self.mem,
+                        PageHint::None,
+                    )?;
                     new_page
                         .memory_mut()
                         .copy_from_slice(old_child_page.memory());
@@ -742,7 +763,7 @@ impl RawBtree {
 
     pub(crate) fn stats(&self) -> Result<BtreeStats> {
         btree_stats(
-            self.root.map(|x| x.root),
+            self.root,
             &self.mem,
             self.fixed_key_size,
             self.fixed_value_size,
@@ -822,7 +843,13 @@ impl<K: Key, V: Value> Btree<K, V> {
         mem: Arc<TransactionalMemory>,
     ) -> Result<Self> {
         let cached_root = if let Some(header) = root {
-            Some(mem.get_page(header.root, hint)?)
+            Some(mem.get_checked_page(
+                header.root,
+                header.checksum,
+                K::fixed_width(),
+                V::fixed_width(),
+                hint,
+            )?)
         } else {
             None
         };
@@ -898,8 +925,9 @@ impl<K: Key, V: Value> Btree<K, V> {
             }
             BRANCH => {
                 let accessor = BranchAccessor::new(page, K::fixed_width());
-                let (_, child_page) = accessor.child_for_key::<K>(query);
-                let child_page = self.mem.get_page(child_page, self.hint)?;
+                let (child_index, _) = accessor.child_for_key::<K>(query);
+                let child_page =
+                    accessor.get_child(child_index, V::fixed_width(), &self.mem, self.hint)?;
                 self.get_helper(&child_page, query)
             }
             _ => unreachable!(),
@@ -931,8 +959,7 @@ impl<K: Key, V: Value> Btree<K, V> {
             }
             BRANCH => {
                 let accessor = BranchAccessor::new(&page, K::fixed_width());
-                let child_page = accessor.child_page(0).unwrap();
-                self.first_helper(self.mem.get_page(child_page, self.hint)?)
+                self.first_helper(accessor.get_child(0, V::fixed_width(), &self.mem, self.hint)?)
             }
             _ => unreachable!(),
         }
@@ -964,8 +991,12 @@ impl<K: Key, V: Value> Btree<K, V> {
             }
             BRANCH => {
                 let accessor = BranchAccessor::new(&page, K::fixed_width());
-                let child_page = accessor.child_page(accessor.count_children() - 1).unwrap();
-                self.last_helper(self.mem.get_page(child_page, self.hint)?)
+                self.last_helper(accessor.get_child(
+                    accessor.count_children() - 1,
+                    V::fixed_width(),
+                    &self.mem,
+                    self.hint,
+                )?)
             }
             _ => unreachable!(),
         }
@@ -975,12 +1006,7 @@ impl<K: Key, V: Value> Btree<K, V> {
         &self,
         range: &'_ T,
     ) -> Result<BtreeRangeIter<K, V>> {
-        BtreeRangeIter::new(
-            range,
-            self.root.map(|x| x.root),
-            self.mem.clone(),
-            self.hint,
-        )
+        BtreeRangeIter::new(range, self.root, self.mem.clone(), self.hint)
     }
 
     pub(crate) fn len(&self) -> Result<u64> {
@@ -989,7 +1015,7 @@ impl<K: Key, V: Value> Btree<K, V> {
 
     pub(crate) fn stats(&self) -> Result<BtreeStats> {
         btree_stats(
-            self.root.map(|x| x.root),
+            self.root,
             &self.mem,
             K::fixed_width(),
             V::fixed_width(),
@@ -1042,14 +1068,21 @@ impl<K: Key, V: Value> Drop for Btree<K, V> {
 }
 
 pub(crate) fn btree_stats(
-    root: Option<PageNumber>,
+    root: Option<BtreeHeader>,
     mem: &TransactionalMemory,
     fixed_key_size: Option<usize>,
     fixed_value_size: Option<usize>,
     hint: PageHint,
 ) -> Result<BtreeStats> {
     if let Some(root) = root {
-        stats_helper(root, mem, fixed_key_size, fixed_value_size, hint)
+        stats_helper(
+            root.root,
+            root.checksum,
+            mem,
+            fixed_key_size,
+            fixed_value_size,
+            hint,
+        )
     } else {
         Ok(BtreeStats {
             tree_height: 0,
@@ -1064,12 +1097,19 @@ pub(crate) fn btree_stats(
 
 fn stats_helper(
     page_number: PageNumber,
+    checksum: Checksum,
     mem: &TransactionalMemory,
     fixed_key_size: Option<usize>,
     fixed_value_size: Option<usize>,
     hint: PageHint,
 ) -> Result<BtreeStats> {
-    let page = mem.get_page(page_number, hint)?;
+    let page = mem.get_checked_page(
+        page_number,
+        checksum,
+        fixed_key_size,
+        fixed_value_size,
+        hint,
+    )?;
     let node_mem = page.memory();
     match node_mem[0] {
         LEAF => {
@@ -1096,7 +1136,14 @@ fn stats_helper(
             let mut fragmented_bytes = (page.memory().len() - accessor.total_length()) as u64;
             for i in 0..accessor.count_children() {
                 if let Some(child) = accessor.child_page(i) {
-                    let stats = stats_helper(child, mem, fixed_key_size, fixed_value_size, hint)?;
+                    let stats = stats_helper(
+                        child,
+                        accessor.child_checksum(i).unwrap(),
+                        mem,
+                        fixed_key_size,
+                        fixed_value_size,
+                        hint,
+                    )?;
                     max_child_height = max(max_child_height, stats.tree_height);
                     leaf_pages += stats.leaf_pages;
                     branch_pages += stats.branch_pages;

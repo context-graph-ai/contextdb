@@ -1,0 +1,9 @@
+# A test that runs past its limit is stopped and fails by name. Nothing is retried.
+[profile.default]
+retries = 0
+slow-timeout = { period = "30s", terminate-after = 2 }
+
+# The million-row load is the one test that needs longer.
+[[profile.default.overrides]]
+filter = 'test(a_million_rows_load_and_scan_under_64_mib)'
+slow-timeout = { period = "120s", terminate-after = 5 }

@@ -21,14 +21,21 @@ use std::ops::{RangeBounds, RangeFull};
 use std::sync::{Arc, Mutex};
 
 pub(crate) fn multimap_btree_stats(
-    root: Option<PageNumber>,
+    root: Option<BtreeHeader>,
     mem: &TransactionalMemory,
     fixed_key_size: Option<usize>,
     fixed_value_size: Option<usize>,
     hint: PageHint,
 ) -> Result<BtreeStats> {
     if let Some(root) = root {
-        multimap_stats_helper(root, mem, fixed_key_size, fixed_value_size, hint)
+        multimap_stats_helper(
+            root.root,
+            root.checksum,
+            mem,
+            fixed_key_size,
+            fixed_value_size,
+            hint,
+        )
     } else {
         Ok(BtreeStats {
             tree_height: 0,
@@ -43,12 +50,19 @@ pub(crate) fn multimap_btree_stats(
 
 fn multimap_stats_helper(
     page_number: PageNumber,
+    checksum: Checksum,
     mem: &TransactionalMemory,
     fixed_key_size: Option<usize>,
     fixed_value_size: Option<usize>,
     hint: PageHint,
 ) -> Result<BtreeStats> {
-    let page = mem.get_page(page_number, hint)?;
+    let page = mem.get_checked_page(
+        page_number,
+        checksum,
+        fixed_key_size,
+        DynamicCollection::<()>::fixed_width_with(fixed_value_size),
+        hint,
+    )?;
     let node_mem = page.memory();
     match node_mem[0] {
         LEAF => {
@@ -94,7 +108,7 @@ fn multimap_stats_helper(
                     SubtreeV2 => {
                         // this is a sub-tree, so traverse it
                         let stats = btree_stats(
-                            Some(collection.as_subtree().root),
+                            Some(collection.as_subtree()),
                             mem,
                             fixed_value_size,
                             <() as Value>::fixed_width(),
@@ -129,8 +143,14 @@ fn multimap_stats_helper(
             let mut fragmented_bytes = (page.memory().len() - accessor.total_length()) as u64;
             for i in 0..accessor.count_children() {
                 if let Some(child) = accessor.child_page(i) {
-                    let stats =
-                        multimap_stats_helper(child, mem, fixed_key_size, fixed_value_size, hint)?;
+                    let stats = multimap_stats_helper(
+                        child,
+                        accessor.child_checksum(i).unwrap(),
+                        mem,
+                        fixed_key_size,
+                        fixed_value_size,
+                        hint,
+                    )?;
                     max_child_height = max(max_child_height, stats.tree_height);
                     leaf_pages += stats.leaf_pages;
                     branch_pages += stats.branch_pages;
@@ -175,7 +195,7 @@ pub(crate) fn verify_tree_and_subtree_checksums(
         }
 
         let table_pages_iter = AllPageNumbersBtreeIter::new(
-            header.root,
+            header,
             key_size,
             DynamicCollection::<()>::fixed_width_with(value_size),
             mem.clone(),
@@ -212,7 +232,13 @@ pub(crate) fn relocate_subtrees(
     freed_pages: Arc<Mutex<Vec<PageNumber>>>,
     relocation_map: &HashMap<PageNumber, PageNumber>,
 ) -> Result<(PageNumber, Checksum)> {
-    let old_page = mem.get_page(root.0, PageHint::None)?;
+    let old_page = mem.get_checked_page(
+        root.0,
+        root.1,
+        key_size,
+        UntypedDynamicCollection::fixed_width_with(value_size),
+        PageHint::None,
+    )?;
     let mut new_page = if let Some(new_page_number) = relocation_map.get(&root.0) {
         mem.get_page_mut(*new_page_number)?
     } else {
@@ -667,7 +693,7 @@ impl<V: Key> DynamicCollection<V> {
                 MultimapValue::new_inline(leaf_iter, guard)
             }
             SubtreeV2 => {
-                let root = collection.value().as_subtree().root;
+                let root = collection.value().as_subtree();
                 MultimapValue::new_subtree(
                     BtreeRangeIter::new::<RangeFull, &V::SelfType<'_>>(
                         &(..),
@@ -698,7 +724,7 @@ impl<V: Key> DynamicCollection<V> {
                 MultimapValue::new_inline(leaf_iter, guard)
             }
             SubtreeV2 => {
-                let root = collection.value().as_subtree().root;
+                let root = collection.value().as_subtree();
                 let inner = BtreeRangeIter::new::<RangeFull, &V::SelfType<'_>>(
                     &(..),
                     Some(root),
@@ -1271,7 +1297,13 @@ impl<'txn, K: Key + 'static, V: Key + 'static> MultimapTable<'txn, K, V> {
                     length: new_length,
                 }) = subtree.get_root()
                 {
-                    let page = self.mem.get_page(new_root, PageHint::None)?;
+                    let page = self.mem.get_checked_page(
+                        new_root,
+                        new_checksum,
+                        V::fixed_width(),
+                        <() as Value>::fixed_width(),
+                        PageHint::None,
+                    )?;
                     match page.memory()[0] {
                         LEAF => {
                             let accessor = LeafAccessor::new(
@@ -1338,7 +1370,7 @@ impl<'txn, K: Key + 'static, V: Key + 'static> MultimapTable<'txn, K, V> {
                 collection.value().collection_type(),
                 DynamicCollectionType::SubtreeV2
             ) {
-                let root = collection.value().as_subtree().root;
+                let root = collection.value().as_subtree();
                 let all_pages = AllPageNumbersBtreeIter::new(
                     root,
                     V::fixed_width(),
@@ -1381,7 +1413,7 @@ impl<'txn, K: Key + 'static, V: Key + 'static> MultimapTable<'txn, K, V> {
 impl<K: Key + 'static, V: Key + 'static> ReadableTableMetadata for MultimapTable<'_, K, V> {
     fn stats(&self) -> Result<TableStats> {
         let tree_stats = multimap_btree_stats(
-            self.tree.get_root().map(|x| x.root),
+            self.tree.get_root(),
             &self.mem,
             K::fixed_width(),
             V::fixed_width(),
@@ -1479,7 +1511,7 @@ impl ReadableTableMetadata for ReadOnlyUntypedMultimapTable {
     /// Retrieves information about storage usage for the table
     fn stats(&self) -> Result<TableStats> {
         let tree_stats = multimap_btree_stats(
-            self.tree.get_root().map(|x| x.root),
+            self.tree.get_root(),
             &self.mem,
             self.fixed_key_size,
             self.fixed_value_size,
@@ -1592,7 +1624,7 @@ impl<K: Key + 'static, V: Key + 'static> ReadOnlyMultimapTable<K, V> {
 impl<K: Key + 'static, V: Key + 'static> ReadableTableMetadata for ReadOnlyMultimapTable<K, V> {
     fn stats(&self) -> Result<TableStats> {
         let tree_stats = multimap_btree_stats(
-            self.tree.get_root().map(|x| x.root),
+            self.tree.get_root(),
             &self.mem,
             K::fixed_width(),
             V::fixed_width(),

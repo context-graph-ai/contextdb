@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches: [dev, main]
+    paths-ignore: ['v2/**', '.github/workflows/check.yml']
   pull_request:
     branches: [dev, main]
+    paths-ignore: ['v2/**', '.github/workflows/check.yml']
   workflow_dispatch:
 
 permissions:

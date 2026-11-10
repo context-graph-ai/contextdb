@@ -1,0 +1,12 @@
+# The library, the program and the storage library of contextdb 2. They have their own lock file,
+# and nothing outside this folder depends on them. Every command that checks or tests them is run
+# from the repository root with `--manifest-path v2/Cargo.toml`; see README.md beside this file.
+[workspace]
+resolver = "3"
+members = ["contextdb", "contextdb-cli"]
+# The storage library keeps the manifest and the lock file it was published with.
+exclude = ["redb"]
+
+# A hash map is walked in a different order in every process, so nothing is built by walking one.
+[workspace.lints.clippy]
+iter_over_hash_type = "deny"

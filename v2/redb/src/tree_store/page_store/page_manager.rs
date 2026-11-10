@@ -1,6 +1,6 @@
 use crate::transaction_tracker::TransactionId;
 use crate::transactions::{AllocatorStateKey, AllocatorStateTree, AllocatorStateTreeMut};
-use crate::tree_store::btree_base::{BtreeHeader, Checksum};
+use crate::tree_store::btree_base::{BtreeHeader, Checksum, verify_page_checksum};
 use crate::tree_store::page_store::base::{MAX_PAGE_INDEX, PageHint};
 use crate::tree_store::page_store::buddy_allocator::BuddyAllocator;
 use crate::tree_store::page_store::cached_file::PagedCachedFile;
@@ -20,7 +20,6 @@ use std::collections::HashSet;
 use std::convert::TryInto;
 use std::io::ErrorKind;
 use std::marker::PhantomData;
-#[cfg(debug_assertions)]
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -278,6 +277,70 @@ impl TransactionalMemory {
             region_size,
             region_header_with_padding_size: region_header_size,
         })
+    }
+
+    // Opens a database file for reading while another handle may have it open for writing.
+    // Nothing is written or repaired, and no allocator state is loaded.
+    pub(crate) fn new_beside_writer(
+        file: Box<dyn StorageBackend>,
+        page_size: usize,
+        cache_size: usize,
+    ) -> Result<Self, DatabaseError> {
+        let storage = PagedCachedFile::new(file, page_size as u64, cache_size)?;
+        if storage.raw_file_len()? < DB_HEADER_SIZE as u64 {
+            return Err(StorageError::Io(ErrorKind::InvalidData.into()).into());
+        }
+        let header = Self::read_newest_header(&storage)?;
+        assert_eq!(header.page_size() as usize, page_size);
+        let layout = header.layout();
+
+        Ok(Self {
+            allocated_since_commit: Mutex::new(Default::default()),
+            unpersisted: Mutex::new(Default::default()),
+            needs_recovery: AtomicBool::new(false),
+            storage,
+            state: Mutex::new(InMemoryState::new(header)),
+            #[cfg(debug_assertions)]
+            open_dirty_pages: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(debug_assertions)]
+            read_page_ref_counts: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(debug_assertions)]
+            allocated_pages: Arc::new(Mutex::new(Default::default())),
+            read_from_secondary: AtomicBool::new(false),
+            page_size: page_size.try_into().unwrap(),
+            region_size: layout.full_region_layout().len(),
+            region_header_with_padding_size: layout.full_region_layout().data_section().start,
+        })
+    }
+
+    // Reads the header of a file that its writer may be committing to, and makes the newest
+    // whole commit its primary. The read may catch the writer's rewrite of the header half done:
+    // the byte that names the primary slot already written and that slot not yet, or only in
+    // part. So the slot is chosen as repair chooses it, by the checksums and transaction ids of
+    // the two slots. Every page of a commit is in the file before its slot is written.
+    fn read_newest_header(storage: &PagedCachedFile) -> Result<DatabaseHeader, DatabaseError> {
+        let header_bytes = storage.read_direct(0, DB_HEADER_SIZE)?;
+        if header_bytes[..MAGICNUMBER.len()] != MAGICNUMBER {
+            return Err(StorageError::Io(ErrorKind::InvalidData.into()).into());
+        }
+        let (mut header, repair_info) = DatabaseHeader::from_bytes(&header_bytes)?;
+        header.pick_primary_for_repair(repair_info)?;
+
+        Ok(header)
+    }
+
+    // Moves a database opened with new_beside_writer() to the newest commit in the file
+    pub(crate) fn load_newest_commit(&self) -> Result<(), DatabaseError> {
+        let header = Self::read_newest_header(&self.storage)?;
+        let mut state = self.state.lock().unwrap();
+        if header.primary_slot().transaction_id != state.header.primary_slot().transaction_id {
+            // The writer may have written again to any page that none of the commits read so far
+            // can reach, so nothing cached before this commit is served to a read of it
+            self.storage.invalidate_cache_all();
+            state.header = header;
+        }
+
+        Ok(())
     }
 
     pub(crate) fn cache_stats(&self) -> CacheStats {
@@ -613,6 +676,11 @@ impl TransactionalMemory {
         let mut header = state.header.clone();
         drop(state);
 
+        // Hand every page of this commit to the file before the header that names it, so that
+        // whoever reads the file while it is being committed to never finds a header ahead of
+        // its pages
+        self.storage.write_barrier()?;
+
         let old_transaction_id = header.secondary_slot().transaction_id;
         let secondary = header.secondary_slot_mut();
         secondary.transaction_id = transaction_id;
@@ -744,7 +812,48 @@ impl TransactionalMemory {
         Ok(())
     }
 
+    // Returns the page without checking it. Unless it is already cached, it is read from the
+    // file and is not cached.
     pub(crate) fn get_page(&self, page_number: PageNumber, hint: PageHint) -> Result<PageImpl> {
+        self.read_page(page_number, |offset, len| {
+            self.storage.read(offset, len, hint)
+        })
+    }
+
+    // Returns the page. `expected` is the checksum that its parent page, or the root of its
+    // tree, holds for it. When the page is read from the file, rather than found in the cache,
+    // it must match that checksum; a page that does not is reported as corrupted.
+    pub(crate) fn get_checked_page(
+        &self,
+        page_number: PageNumber,
+        expected: Checksum,
+        fixed_key_size: Option<usize>,
+        fixed_value_size: Option<usize>,
+        hint: PageHint,
+    ) -> Result<PageImpl> {
+        let check = |memory: &[u8]| {
+            // A page of the transaction in progress gets its checksum when that commits
+            if self.uncommitted(page_number) {
+                return Ok(());
+            }
+            verify_page_checksum(
+                memory,
+                page_number,
+                expected,
+                fixed_key_size,
+                fixed_value_size,
+            )
+        };
+        self.read_page(page_number, |offset, len| {
+            self.storage.read_checked(offset, len, hint, Some(check))
+        })
+    }
+
+    fn read_page(
+        &self,
+        page_number: PageNumber,
+        read: impl FnOnce(u64, usize) -> Result<Arc<[u8]>>,
+    ) -> Result<PageImpl> {
         let range = page_number.address_range(
             self.page_size.into(),
             self.region_size,
@@ -752,7 +861,7 @@ impl TransactionalMemory {
             self.page_size,
         );
         let len: usize = (range.end - range.start).try_into().unwrap();
-        let mem = self.storage.read(range.start, len, hint)?;
+        let mem = read(range.start, len)?;
 
         // We must not retrieve an immutable reference to a page which already has a mutable ref to it
         #[cfg(debug_assertions)]
@@ -831,6 +940,17 @@ impl TransactionalMemory {
         } else {
             state.header.primary_slot().user_root
         }
+    }
+
+    // The data root of the newest commit, and that commit's id
+    pub(crate) fn get_data_root_and_transaction_id(&self) -> (Option<BtreeHeader>, TransactionId) {
+        let state = self.state.lock().unwrap();
+        let slot = if self.read_from_secondary.load(Ordering::Acquire) {
+            state.header.secondary_slot()
+        } else {
+            state.header.primary_slot()
+        };
+        (slot.user_root, slot.transaction_id)
     }
 
     pub(crate) fn get_system_root(&self) -> Option<BtreeHeader> {

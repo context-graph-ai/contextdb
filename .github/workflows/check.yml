@@ -1,0 +1,58 @@
+name: Check
+
+# The check of the packages under v2/. Every step is one cargo command that runs as written from
+# the repository root.
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: cargo fmt --manifest-path v2/Cargo.toml --all --check
+      - run: cargo clippy --manifest-path v2/Cargo.toml --workspace --all-targets --locked -- -D warnings
+      - name: Shipped lines stay under 150,000
+        run: test "$(find v2/contextdb/src v2/contextdb-cli/src \( -name '*.rs' -o -name '*.pest' \) ! -name tests.rs -exec cat {} + | wc -l)" -le 150000
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+        with:
+          tool: cargo-nextest@0.9.138
+      - run: cargo nextest run --manifest-path v2/Cargo.toml --workspace --locked --no-tests=pass
+      - run: cargo test --manifest-path v2/Cargo.toml --workspace --locked --doc
+      - name: The storage library's own tests
+        run: cargo test --manifest-path v2/redb/Cargo.toml --locked --lib --tests
+      # A test is one the runner lists, or one script file.
+      - name: Tests stay under 1,000
+        run: test "$(( $(cargo nextest list --manifest-path v2/Cargo.toml --workspace --locked -T oneline | wc -l) + $(find v2/contextdb/tests/sql -name '*.sql' | wc -l) ))" -le 1000
+
+  minimum-rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: rustup toolchain install 1.89 --profile minimal
+      - run: cargo +1.89 check --manifest-path v2/Cargo.toml --workspace --locked

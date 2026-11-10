@@ -1,4 +1,6 @@
-use crate::tree_store::page_store::{Page, PageImpl, PageMut, TransactionalMemory, xxh3_checksum};
+use crate::tree_store::page_store::{
+    Page, PageHint, PageImpl, PageMut, TransactionalMemory, xxh3_checksum,
+};
 use crate::tree_store::{PageNumber, PageTrackerPolicy};
 use crate::types::{Key, MutInPlaceValue, Value};
 use crate::{Result, StorageError};
@@ -75,6 +77,46 @@ pub(super) fn branch_checksum<T: Page>(
         )))
     } else {
         Ok(xxh3_checksum(&page.memory()[..end]))
+    }
+}
+
+// Checks the bytes of a page, as they were read from the file, against the checksum that its
+// parent page or the root of its tree holds for it
+pub(crate) fn verify_page_checksum(
+    memory: &[u8],
+    page_number: PageNumber,
+    expected: Checksum,
+    fixed_key_size: Option<usize>,
+    fixed_value_size: Option<usize>,
+) -> Result<(), StorageError> {
+    struct FilePage<'a>(&'a [u8], PageNumber);
+
+    impl Page for FilePage<'_> {
+        fn memory(&self) -> &[u8] {
+            self.0
+        }
+
+        fn get_page_number(&self) -> PageNumber {
+            self.1
+        }
+    }
+
+    let page = FilePage(memory, page_number);
+    let computed = match memory[0] {
+        LEAF => leaf_checksum(&page, fixed_key_size, fixed_value_size)?,
+        BRANCH => branch_checksum(&page, fixed_key_size)?,
+        page_type => {
+            return Err(StorageError::Corrupted(format!(
+                "Page {page_number:?} corrupted. Unknown page type {page_type}"
+            )));
+        }
+    };
+    if computed == expected {
+        Ok(())
+    } else {
+        Err(StorageError::Corrupted(format!(
+            "Page {page_number:?} corrupted. Its checksum does not match the one stored for it"
+        )))
     }
 }
 
@@ -1388,6 +1430,24 @@ impl<'a: 'b, 'b, T: Page + 'a> BranchAccessor<'a, 'b, T> {
                 .try_into()
                 .unwrap(),
         ))
+    }
+
+    // Returns child `n`, which is checked against the checksum that this page holds for it
+    // when it is read from the file
+    pub(crate) fn get_child(
+        &self,
+        n: usize,
+        fixed_value_size: Option<usize>,
+        mem: &TransactionalMemory,
+        hint: PageHint,
+    ) -> Result<PageImpl> {
+        mem.get_checked_page(
+            self.child_page(n).unwrap(),
+            self.child_checksum(n).unwrap(),
+            self.fixed_key_size,
+            fixed_value_size,
+            hint,
+        )
     }
 
     fn num_keys(&self) -> usize {
