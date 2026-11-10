@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import time
 import tarfile
 import tempfile
 import tomllib
@@ -43,7 +44,16 @@ def api(path, **fields):
 
 
 def pages(path, key):
-    data = json.loads(command(['gh', 'api', '--paginate', '--slurp', path]))
+    # GitHub's API intermittently answers a large listing with a server error (502); a few spaced
+    # attempts keep one such answer from refusing a delivery whose run actually passed.
+    for attempt in range(4):
+        try:
+            data = json.loads(command(['gh', 'api', '--paginate', '--slurp', path]))
+            break
+        except subprocess.CalledProcessError:
+            if attempt == 3:
+                raise
+            time.sleep(15 * (attempt + 1))
     return [item for page in data for item in page[key]]
 
 
@@ -114,7 +124,7 @@ def guard():
             else:
                 require(run['status'] == 'completed'
                         and run['conclusion'] in ('success', 'failure'), 'manual CI must complete')
-            jobs = pages(f"repos/{REPO}/actions/runs/{run['id']}/attempts/{run['run_attempt']}/jobs?per_page=100", 'jobs')
+            jobs = pages(f"repos/{REPO}/actions/runs/{run['id']}/attempts/{run['run_attempt']}/jobs?per_page=30", 'jobs')
             aggregate_guard(jobs, run)
             if not automatic:
                 unsuccessful = [j for j in jobs if j['conclusion'] != 'success']

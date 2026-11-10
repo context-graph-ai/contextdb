@@ -114,7 +114,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install lint script tools
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
+        run: bash scripts/ci-install-ripgrep.sh
       - name: Offline CI script controls
         run: |
           python3 -B scripts/ci-build-tests.py
@@ -223,7 +223,7 @@ jobs:
             crates/contextdb-redb -> ../../target/redb
       - name: Install test tools for constituent 1
         if: always() && !cancelled() && matrix.slot1.kind == 'pr'
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
+        run: bash scripts/ci-install-ripgrep.sh
       - id: slot1_pr
         name: Run constituent 1 / ${{ matrix.slot1.name }}
         if: always() && !cancelled() && matrix.slot1.kind == 'pr'
@@ -283,7 +283,7 @@ jobs:
             crates/contextdb-redb -> ../../target/redb
       - name: Install test tools for constituent 2
         if: always() && !cancelled() && matrix.slot2.kind == 'pr'
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
+        run: bash scripts/ci-install-ripgrep.sh
       - id: slot2_pr
         name: Run constituent 2 / ${{ matrix.slot2.name }}
         if: always() && !cancelled() && matrix.slot2.kind == 'pr'
@@ -343,7 +343,7 @@ jobs:
             crates/contextdb-redb -> ../../target/redb
       - name: Install test tools for constituent 3
         if: always() && !cancelled() && matrix.slot3.kind == 'pr'
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
+        run: bash scripts/ci-install-ripgrep.sh
       - id: slot3_pr
         name: Run constituent 3 / ${{ matrix.slot3.name }}
         if: always() && !cancelled() && matrix.slot3.kind == 'pr'
@@ -403,7 +403,7 @@ jobs:
             crates/contextdb-redb -> ../../target/redb
       - name: Install test tools for constituent 4
         if: always() && !cancelled() && matrix.slot4.kind == 'pr'
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
+        run: bash scripts/ci-install-ripgrep.sh
       - id: slot4_pr
         name: Run constituent 4 / ${{ matrix.slot4.name }}
         if: always() && !cancelled() && matrix.slot4.kind == 'pr'
