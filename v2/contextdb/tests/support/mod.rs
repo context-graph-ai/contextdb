@@ -1175,9 +1175,16 @@ impl Child {
 
     /// Kills the child where it stands. It must still be running: a child that is to be killed
     /// has announced a point and is waiting there.
+    ///
+    /// The child's standard input stays open until the child is gone. Waiting for a process
+    /// closes the input this side holds for it, and a kill has only been sent when it returns:
+    /// a child that read the end of its input before the kill reached it would leave the
+    /// point by itself.
     pub fn kill(&mut self) {
+        let input = self.process.stdin.take();
         self.process.kill().expect("kill the child");
         let status = self.process.wait().expect("wait for the child");
+        drop(input);
         if status.signal().is_none() {
             self.fail("had already ended by itself when it was to be killed");
         }
