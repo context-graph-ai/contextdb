@@ -466,3 +466,73 @@ fn a_transaction_that_declares_a_table_may_not_also_write_rows() {
         Error::TableNotFound(_)
     ));
 }
+
+#[test]
+fn a_statement_commits_while_a_cycle_works_out_a_step() {
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    // 2,000 sealed vectors of 256 numbers in three blocks, and their build begun.
+    const DIMENSION: usize = 256;
+    let folder = support::folder("commit-beside-a-step");
+    let db = support::open(&folder);
+    support::declare_docs(&db, DIMENSION, "AUTO_INDEX_AT 1000");
+    support::load_docs(&db, 1..=2000, "a", |n| support::gathered(n, DIMENSION));
+    let report = support::cycle(&db);
+    assert_eq!(
+        (report.maintenance_vectors_done, report.remaining_partitions),
+        (2000, 1)
+    );
+    support::close(db);
+
+    // The storage door holds the first read of 64 KiB or more made once it is armed: a block
+    // read by the step the cycle works out. It says so, and waits to be let go.
+    let armed = Arc::new(AtomicBool::new(false));
+    let (holding, held) = mpsc::channel::<()>();
+    let (let_go, go) = mpsc::channel::<()>();
+    let go = Mutex::new(go);
+    let mut options = DatabaseOpenOptions::default();
+    options.storage = Some(support::storage({
+        let armed = armed.clone();
+        move |call| {
+            let large = matches!(&call, Call::Read(_, bytes) if bytes.len() >= 64 << 10);
+            if large && armed.swap(false, Ordering::SeqCst) {
+                holding.send(()).expect("the test listens");
+                let go = go.lock().expect("one read is held");
+                go.recv().expect("the test lets the read go");
+            }
+        }
+    }));
+    let db = support::open_with(&folder, options).expect("open");
+    let before = db.committed_watermark();
+    armed.store(true, Ordering::SeqCst);
+
+    let db = &db;
+    let (inserted, in_time, cycled) = std::thread::scope(|scope| {
+        let cycle = scope.spawn(|| db.run_maintenance_cycle());
+        held.recv_timeout(Duration::from_secs(20))
+            .expect("a step of the build reads a block");
+        // The cycle is inside its step. An INSERT on another thread returns while it is.
+        let (done, returned) = mpsc::channel::<()>();
+        let insert = scope.spawn(move || {
+            let row = support::gathered(9001, DIMENSION);
+            let outcome = support::insert_doc(db, 9001, "a", Some(row));
+            done.send(()).expect("the test listens");
+            outcome.map(|_| db.committed_watermark())
+        });
+        let in_time = returned.recv_timeout(Duration::from_secs(20)).is_ok();
+        let_go.send(()).expect("the held read listens");
+        let inserted = insert.join().expect("the thread of the INSERT");
+        (inserted, in_time, cycle.join().expect("the cycle's thread"))
+    });
+    assert!(
+        in_time,
+        "the INSERT waited for the step the cycle was working out"
+    );
+    let after = inserted.expect("an INSERT beside a cycle");
+    assert!(after > before, "the INSERT committed");
+    cycled.expect("the cycle whose read was held");
+    assert_eq!(support::int(db, "SELECT COUNT(*) FROM docs"), 2001);
+}

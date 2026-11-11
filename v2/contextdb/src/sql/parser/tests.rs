@@ -1,6 +1,7 @@
 use super::parse;
 use crate::sql::ast::{
-    BinOp, ColumnRef, DataType, Expr, Literal, Select, Statement, VectorClauses,
+    BinOp, ColumnRef, ConsolidationClause, DataType, Expr, Literal, Select, Statement,
+    VectorClauses,
 };
 use crate::sql::plan;
 use crate::sql::plan::{Effect, PhysicalPlan};
@@ -236,10 +237,6 @@ fn what_a_later_version_reads_is_refused_by_its_name() {
         (
             "CREATE TABLE t (id UUID PRIMARY KEY, o UUID REFERENCES p(id))",
             "REFERENCES",
-        ),
-        (
-            "CREATE TABLE t (id UUID PRIMARY KEY, v VECTOR(3) WITH (quantization = 'SQ8'))",
-            "WITH",
         ),
         (
             "CREATE TABLE t (a INT, b INT, FOREIGN KEY (a, b) REFERENCES o (a, b))",
@@ -494,20 +491,6 @@ fn a_row_value_and_any_right_side_of_a_distance_are_read_and_refused_when_planne
             other => panic!("{sql}\nwas planned as {other:?}"),
         }
     }
-    // The two statements that describe an index and its partitions are a later version's.
-    for (sql, name) in [
-        ("SHOW VECTOR_INDEXES", "VECTOR_INDEXES"),
-        ("show vector_partitions docs", "VECTOR_PARTITIONS"),
-    ] {
-        match parse(sql) {
-            Err(Error::PlanError(text)) => assert!(
-                text.to_uppercase().contains(name)
-                    && text.ends_with("is not supported in this version of the library"),
-                "{sql}: {text}"
-            ),
-            other => panic!("{sql}\nwas not refused by name: {other:?}"),
-        }
-    }
 }
 
 #[test]
@@ -526,6 +509,7 @@ fn the_clauses_of_a_vector_column_and_in_lists_are_read() {
         partition_key: key.iter().map(|column| (*column).to_owned()).collect(),
         max_partitions: max.map(str::to_owned),
         search_mode: mode,
+        ..VectorClauses::default()
     };
     let none = VectorClauses::default();
     assert_eq!(
@@ -570,4 +554,102 @@ fn the_clauses_of_a_vector_column_and_in_lists_are_read() {
         filter("a IN (1, 2) AND NOT b IN (3) OR c = 4"),
         Expr::BinaryOp { op: BinOp::Or, .. }
     ));
+}
+
+#[test]
+fn the_index_clauses_of_a_vector_column_are_read_as_written() {
+    let Statement::CreateTable(table) = parse(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, \
+         a VECTOR(4) WITH (quantization = 'sq8') PARTITION_KEY (id) MAX_PARTITIONS 2 \
+         SEARCH_MODE AUTO AUTO_INDEX_AT -5 \
+         CONSOLIDATION (TOMBSTONE_PERCENT = 0, CHANGE_PERCENT = 101), \
+         b VECTOR(4) auto_index_at 18446744073709551616 consolidation none, \
+         c VECTOR(4) CONSOLIDATION (CHANGE_PERCENT = 7))",
+    )
+    .unwrap() else {
+        panic!("not a CREATE TABLE");
+    };
+    // Every number and the quantization's text are kept as written: `schema` judges them.
+    let written = |text: &str| Some(text.to_owned());
+    let wanted = [
+        VectorClauses::default(),
+        VectorClauses {
+            partition_key: vec!["id".to_owned()],
+            max_partitions: written("2"),
+            search_mode: Some(VectorSearchMode::Auto),
+            auto_index_at: written("-5"),
+            consolidation: Some(ConsolidationClause::Percent {
+                change: written("101"),
+                tombstone: written("0"),
+            }),
+            quantization: written("sq8"),
+        },
+        VectorClauses {
+            auto_index_at: written("18446744073709551616"),
+            consolidation: Some(ConsolidationClause::None),
+            ..VectorClauses::default()
+        },
+        VectorClauses {
+            consolidation: Some(ConsolidationClause::Percent {
+                change: written("7"),
+                tombstone: None,
+            }),
+            ..VectorClauses::default()
+        },
+    ];
+    let read: Vec<VectorClauses> = table.columns.into_iter().map(|c| c.vector).collect();
+    assert_eq!(read, wanted);
+
+    // The clauses stand in one order, and a CONSOLIDATION list names one or both of its two
+    // members, each once.
+    for clauses in [
+        "AUTO_INDEX_AT 5 SEARCH_MODE AUTO",
+        "CONSOLIDATION NONE AUTO_INDEX_AT 5",
+        "SEARCH_MODE AUTO WITH (quantization = 'SQ8')",
+        "CONSOLIDATION ()",
+        "CONSOLIDATION (CHANGE_PERCENT = 1, CHANGE_PERCENT = 2)",
+        "CONSOLIDATION (PROBES = 1)",
+        "AUTO_INDEX_AT",
+    ] {
+        refusal(&format!(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR(4) {clauses})"
+        ));
+    }
+}
+
+#[test]
+fn the_inspection_statements_are_planned_as_reads() {
+    assert!(matches!(
+        planned("show vector_indexes"),
+        PhysicalPlan::ShowVectorIndexes
+    ));
+    let partitions = |sql: &str| match planned(sql) {
+        PhysicalPlan::ShowVectorPartitions {
+            column,
+            limit,
+            offset,
+        } => (column, limit, offset),
+        other => panic!("{sql}\nwas planned as {other:?}"),
+    };
+    let docs_v = Some(("docs".to_owned(), "v".to_owned()));
+    assert_eq!(partitions("SHOW VECTOR_PARTITIONS"), (None, None, 0));
+    assert_eq!(
+        partitions("show vector_partitions for docs.v"),
+        (docs_v.clone(), None, 0)
+    );
+    assert_eq!(
+        partitions("SHOW VECTOR_PARTITIONS LIMIT 3"),
+        (None, Some(3), 0)
+    );
+    assert_eq!(
+        partitions("SHOW VECTOR_PARTITIONS FOR docs.v LIMIT 5 OFFSET 2"),
+        (docs_v, Some(5), 2)
+    );
+    for sql in ["SHOW VECTOR_INDEXES", "SHOW VECTOR_PARTITIONS LIMIT 1"] {
+        assert_eq!(planned(sql).effect(), Effect::Reads, "{sql}");
+    }
+    // OFFSET stands only after LIMIT, and FOR names a table and a column.
+    refusal("SHOW VECTOR_PARTITIONS OFFSET 2");
+    refusal("SHOW VECTOR_PARTITIONS FOR docs");
+    refusal("SHOW VECTOR_INDEXES FOR docs.v");
 }

@@ -4,8 +4,7 @@
 
 mod support;
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use contextdb::{
     Database, Error, ReadSession, ReadSessionOptions, Value, VectorIndexRef,
@@ -125,14 +124,11 @@ fn vector_search_mode_routes_each_request() {
                     let result = support::assert_nearest(&on, &sql, &query, &wanted, &what);
                     result.rows_examined()
                 };
-                let refused = |clause: &str| {
-                    let sql = search_sql(table, filter, clause, 10);
-                    refused_as_indexed(support::search(&on, &sql, &query), table, &sql);
-                };
-                // USE VECTOR overrides the column's mode both ways: EXACT and AUTO answer on
-                // every table, the one declared INDEXED too, and INDEXED is refused on every
-                // table, the one declared EXACT too. AUTO and EXACT are one search: the same
-                // rows for the same counted work.
+                // USE VECTOR overrides the column's mode: each of the three answers on every
+                // table. No column here holds the 100,000 vectors from which AUTO uses a
+                // grouping, so AUTO and EXACT are one search: the same rows for the same
+                // counted work. And no partition has a grouping, so INDEXED searches it whole
+                // and returns the same rows.
                 let exact = answer("USE VECTOR EXACT");
                 assert_eq!(
                     answer("USE VECTOR AUTO"),
@@ -140,12 +136,11 @@ fn vector_search_mode_routes_each_request() {
                     "AUTO and EXACT on {table}"
                 );
                 assert_eq!(answer("use vector exact"), exact, "{table}");
-                refused("USE VECTOR INDEXED");
+                answer("USE VECTOR INDEXED");
                 // With no clause the column's mode is in force, and no mode is AUTO.
-                if table == "indexed" {
-                    refused("");
-                } else {
-                    assert_eq!(answer(""), exact, "no clause on {table}");
+                let own = answer("");
+                if table != "indexed" {
+                    assert_eq!(own, exact, "no clause on {table}");
                 }
             }
         }
@@ -176,34 +171,43 @@ fn vector_search_mode_routes_each_request() {
     assert_eq!(support::found(&found, "the table of one row"), [wanted]);
 }
 
+/// The most pages holding rows that a refused INDEXED search may read. It reads small records
+/// only, and a small record can lie in a page that also holds rows where the two kinds meet:
+/// one page a level in a tree of at most four levels.
+const SMALL_RECORD_READS: usize = 4;
+
 #[test]
 fn indexed_search_is_refused_at_every_door() {
     let folder = support::folder("indexed-refused");
     let db = support::open(&folder);
-    declare(&db, "plain", "PARTITION_KEY (ctx)");
-    declare(&db, "indexed", "PARTITION_KEY (ctx) SEARCH_MODE INDEXED");
+    declare(&db, "plain", "PARTITION_KEY (ctx) AUTO_INDEX_AT 1000");
+    declare(
+        &db,
+        "indexed",
+        "PARTITION_KEY (ctx) SEARCH_MODE INDEXED AUTO_INDEX_AT 1000",
+    );
     declare(&db, "empty", "SEARCH_MODE INDEXED");
-    // Two thousand pending rows in each: a search that read rows would read them all.
+    declare(&db, "small", "PARTITION_KEY (ctx) AUTO_INDEX_AT 1000");
+    let tx = db.transaction().expect("begin");
+    fill(&tx, "small", 1..=300);
+    tx.commit().expect("commit");
+    // Two thousand pending rows in each of three partitions: twice the vectors a column of
+    // these clauses may have outside a grouping, so the index is behind its writes.
     for table in ["plain", "indexed"] {
         let tx = db.transaction().expect("begin");
-        fill(&tx, table, 1..=2000);
+        fill(&tx, table, 1..=6000);
         tx.commit().expect("commit");
     }
     let query = support::vector(91_000, DIMENSION);
-    // Every way a search asks for an index: in the statement, by the column's declaration,
-    // both, on a table with no row, and for a partition no row is in.
+    // Every way a search asks for an index that is behind: in the statement, by the column's
+    // declaration, and both.
     let asking: Vec<(&str, String)> = vec![
         ("plain", search_sql("plain", None, "USE VECTOR INDEXED", 5)),
         (
             "plain",
             search_sql("plain", Some("ctx = 'c1'"), "USE VECTOR INDEXED", 5),
         ),
-        (
-            "plain",
-            search_sql("plain", Some("ctx = 'zz'"), "USE VECTOR INDEXED", 5),
-        ),
         ("indexed", search_sql("indexed", None, "", 5)),
-        ("indexed", search_sql("indexed", Some("ctx = 'zz'"), "", 5)),
         (
             "indexed",
             search_sql("indexed", None, "USE VECTOR INDEXED", 5),
@@ -212,8 +216,13 @@ fn indexed_search_is_refused_at_every_door() {
             "indexed",
             "SELECT * FROM indexed ORDER BY v <=> $q LIMIT 1".to_owned(),
         ),
-        ("empty", search_sql("empty", None, "", 5)),
-        ("empty", search_sql("empty", None, "USE VECTOR INDEXED", 5)),
+    ];
+    // A partition no row is in, and a table with no row, select nothing and refuse nothing.
+    let nothing = [
+        search_sql("plain", Some("ctx = 'zz'"), "USE VECTOR INDEXED", 5),
+        search_sql("indexed", Some("ctx = 'zz'"), "", 5),
+        search_sql("empty", None, "", 5),
+        search_sql("empty", None, "USE VECTOR INDEXED", 5),
     ];
     let before = (
         db.committed_watermark(),
@@ -227,8 +236,43 @@ fn indexed_search_is_refused_at_every_door() {
         refused_as_indexed(support::search(&tx, sql, &query), table, sql);
         refused_as_indexed(support::search(&reader, sql, &query), table, sql);
     }
+    // A partition with no grouping and fewer vectors outside one than twice AUTO_INDEX_AT is
+    // the index's one-group case: INDEXED answers it, and its answer and its work are EXACT's.
+    let small = support::stored(&db, "SELECT id, ctx, tag, v FROM small");
+    type Scope = (Option<&'static str>, fn(&[Value]) -> bool);
+    let scopes: [Scope; 2] = [
+        (None, |_| true),
+        (Some("ctx = 'c1'"), |row| row[1] == support::text("c1")),
+    ];
+    for (filter, passes) in scopes {
+        let wanted = small.nearest(passes, &query, 5);
+        assert_eq!(wanted.len(), 5);
+        let exact = search_sql("small", filter, "USE VECTOR EXACT", 5);
+        let exact = support::assert_nearest(&db, &exact, &query, &wanted, "EXACT");
+        let sql = search_sql("small", filter, "USE VECTOR INDEXED", 5);
+        let by_writer = support::assert_nearest(&db, &sql, &query, &wanted, "the writer");
+        assert_eq!(
+            by_writer.distance_evaluations(),
+            exact.distance_evaluations(),
+            "{sql}\nthe one-group case does EXACT's distance evaluations"
+        );
+        support::assert_nearest(&tx, &sql, &query, &wanted, "a transaction");
+        support::assert_nearest(&reader, &sql, &query, &wanted, "a reader");
+    }
+    for sql in &nothing {
+        for outcome in [
+            support::search(&db, sql, &query),
+            support::search(&tx, sql, &query),
+            support::search(&reader, sql, &query),
+        ] {
+            match outcome {
+                Ok(result) => assert!(result.rows().is_empty(), "{sql}"),
+                Err(error) => panic!("{sql}\nselects nothing and was refused: {error:?}"),
+            }
+        }
+    }
     // The refused transaction is as usable as before, and nothing changed.
-    fill(&tx, "indexed", 2001..=2001);
+    fill(&tx, "indexed", 6001..=6001);
     tx.rollback();
     assert_eq!(
         (
@@ -245,45 +289,98 @@ fn indexed_search_is_refused_at_every_door() {
     support::close(db);
 
     // At once, with no row read. Each statement runs first in a session of its own, whose
-    // storage door counts the reads of the data file. The refused search reads no more of the
-    // file than a count of the whole table, which reads no row; a search that answers reads
-    // more than that count, so the comparison can tell.
-    let reads_of = |sql: &str| -> (u64, contextdb::Result<contextdb::QueryResult>) {
-        let reads = Arc::new(AtomicU64::new(0));
+    // storage door notes where every read of the data file falls. The pages that hold the
+    // table's rows are those a read of every row makes and a count of the table, which reads
+    // no row, does not. A refusal reads the small records of the partitions it selects (the
+    // record of each, and one for each of its pending rows, which is how far it is behind)
+    // and no row: of the pages of rows, at most `SMALL_RECORD_READS`. A search that answers
+    // reads the rows, so the comparison can tell.
+    type Reads = Vec<(u64, u64)>;
+    let reads_of = |sql: &str| -> (Reads, contextdb::Result<contextdb::QueryResult>) {
+        let reads = Arc::new(Mutex::new(Reads::new()));
         let mut options = ReadSessionOptions::default();
         options.storage = Some(support::storage({
             let reads = reads.clone();
             move |call| {
-                if matches!(call, Call::Read(..)) {
-                    reads.fetch_add(1, Ordering::SeqCst);
+                if let Call::Read(at, bytes) = call {
+                    let read = (at, at + bytes.len() as u64);
+                    reads.lock().expect("the reads").push(read);
                 }
             }
         }));
         let session = ReadSession::open_with_options(&folder, options).expect("open for reading");
-        let opened = reads.load(Ordering::SeqCst);
+        let opened = reads.lock().expect("the reads").len();
         let outcome = support::search(&session, sql, &query);
-        (reads.load(Ordering::SeqCst) - opened, outcome)
+        let made = reads.lock().expect("the reads")[opened..].to_vec();
+        (made, outcome)
+    };
+    let touching = |reads: &Reads, pages: &Reads| -> usize {
+        let touches =
+            |read: &&(u64, u64)| pages.iter().any(|page| read.0 < page.1 && page.0 < read.1);
+        reads.iter().filter(touches).count()
     };
     let (count_reads, count) = reads_of("SELECT COUNT(*) FROM indexed");
     let count = count.expect("count the table");
-    assert_eq!(count.rows(), [[Value::Int64(2000)]]);
+    assert_eq!(count.rows(), [[Value::Int64(6000)]]);
     assert_eq!(count.rows_examined(), 0);
+    let (every_read, every_row) = reads_of("SELECT id, ctx, tag, v FROM indexed");
+    assert_eq!(every_row.expect("read every row").rows().len(), 6000);
+    let of_rows: Reads = every_read
+        .into_iter()
+        .filter(|read| touching(&vec![*read], &count_reads) == 0)
+        .collect();
     for (table, sql) in asking.iter().filter(|(table, _)| *table == "indexed") {
         let (reads, outcome) = reads_of(sql);
         refused_as_indexed(outcome, table, sql);
+        let rows_read = touching(&reads, &of_rows);
         assert!(
-            reads <= count_reads,
-            "{sql}\nwas refused after {reads} storage reads; a count that reads no row made \
-             {count_reads}"
+            rows_read <= SMALL_RECORD_READS,
+            "{sql}\nwas refused after {} storage reads, {rows_read} of them of the {} pages \
+             that hold the table's rows",
+            reads.len(),
+            of_rows.len()
         );
     }
     let (exact_reads, exact) = reads_of(&sql);
     assert_eq!(exact.expect("the exact search").rows().len(), 5);
+    let rows_read = touching(&exact_reads, &of_rows);
     assert!(
-        exact_reads > count_reads,
-        "an exact search of 2,000 pending rows made {exact_reads} storage reads, a count \
-         {count_reads}"
+        rows_read > SMALL_RECORD_READS,
+        "an exact search of 6,000 pending rows made {} storage reads, {rows_read} of them of \
+         the {} pages that hold the table's rows",
+        exact_reads.len(),
+        of_rows.len()
     );
+}
+
+#[test]
+fn the_largest_auto_index_at_is_declared_and_served() {
+    let folder = support::folder("largest-auto-index-at");
+    let db = support::open(&folder);
+    declare(&db, "largest", "AUTO_INDEX_AT 18446744073709551615");
+    fill(&db, "largest", 1..=20);
+    let query = support::vector(91_500, DIMENSION);
+    // The column is below its size: every mode answers exactly, before a cycle and after.
+    let served = |state: &str| {
+        let stored = support::stored(&db, "SELECT id, ctx, tag, v FROM largest");
+        let wanted = stored.nearest(|_| true, &query, 5);
+        assert_eq!(wanted.len(), 5);
+        for clause in [
+            "USE VECTOR EXACT",
+            "",
+            "USE VECTOR AUTO",
+            "USE VECTOR INDEXED",
+        ] {
+            let sql = search_sql("largest", None, clause, 5);
+            support::assert_nearest(&db, &sql, &query, &wanted, state);
+        }
+        let partitions = support::shown(&db, "SHOW VECTOR_PARTITIONS FOR largest.v");
+        assert_eq!(partitions.len(), 1, "{state}: partitions shown");
+    };
+    served("twenty pending rows");
+    let report = db.run_maintenance_cycle().expect("a maintenance cycle");
+    assert_eq!(report.vector.maintenance_vectors_done, 20);
+    served("twenty sealed rows");
 }
 
 #[test]
@@ -609,22 +706,14 @@ fn what_the_parser_reads_and_this_version_does_not_run_is_refused_when_planned()
         names_row_vector_beside_a_distance(&sentence),
         "{sql}\nwas refused without naming both ROW_VECTOR and <=>: {sentence}"
     );
-    // The two statements that describe an index and its partitions, and a search with no
-    // LIMIT, are refused as every statement of a later version is, each by its name.
-    for (sql, name) in [
-        ("SHOW VECTOR_INDEXES", "VECTOR_INDEXES"),
-        ("SHOW VECTOR_PARTITIONS", "VECTOR_PARTITIONS"),
-        (
-            "SELECT id FROM pairs ORDER BY v <=> [1.0, 0.0, 0.0]",
-            "vector search without LIMIT",
-        ),
-    ] {
-        let sentence = refused_when_planned(sql);
-        assert!(
-            sentence.contains(name) && sentence.ends_with(LATER_VERSION),
-            "{sql}\nwas refused in the sentence: {sentence}"
-        );
-    }
+    // A search with no LIMIT is refused as every statement of a later version is, by its
+    // name.
+    let sql = "SELECT id FROM pairs ORDER BY v <=> [1.0, 0.0, 0.0]";
+    let sentence = refused_when_planned(sql);
+    assert!(
+        sentence.contains("vector search without LIMIT") && sentence.ends_with(LATER_VERSION),
+        "{sql}\nwas refused in the sentence: {sentence}"
+    );
 
     // Each of them left the store as it was, and the column still answers.
     assert!(state(&db) == before);
@@ -891,13 +980,12 @@ fn vector_column_declarations_are_checked_stored_and_printed_back() {
             }
             other => panic!("{state}: a third partition of `capped` got {other:?}"),
         }
-        // And the mode that was printed is the mode in force.
+        // A column declared SEARCH_MODE INDEXED that no row has a vector in selects nothing
+        // and refuses nothing: its answer is complete and empty.
         let sql = "SELECT id FROM t ORDER BY by_index <=> $q LIMIT 1";
         match db.execute(sql, &params! { "q" => vec![0.5_f32; 3] }) {
-            Err(Error::VectorIndexedRouteUnavailable { index }) => {
-                assert_eq!(index, column("t", "by_index"), "{state}");
-            }
-            other => panic!("{state}: {sql}\ngot {other:?}"),
+            Ok(result) => assert!(result.rows().is_empty(), "{state}: {sql}"),
+            Err(error) => panic!("{state}: {sql}\nselects nothing and was refused: {error:?}"),
         }
     };
     holds(&db, "as declared");
@@ -1173,4 +1261,260 @@ fn a_distance_in_the_where_of_a_write_is_refused_on_a_table_with_no_row() {
         support::rows(&db, "SELECT id, r FROM docs"),
         [[Value::Int64(1), Value::Float64(0.25)]]
     );
+}
+
+/// A table `t` whose one VECTOR column `v` is declared with this text, as a statement.
+fn with_vector(declared: &str) -> String {
+    format!("CREATE TABLE t (id INTEGER PRIMARY KEY, ctx TEXT NOT NULL, v {declared})")
+}
+
+#[test]
+fn the_index_clauses_are_read_checked_and_printed_back() {
+    let folder = support::folder("index-clauses");
+    let db = support::open(&folder);
+    // Each column as it is declared, and the words its declaration prints back: a clause
+    // that was not written is not printed, F32 is the silent quantization, and
+    // MAX_PARTITIONS is printed for every column with a PARTITION_KEY.
+    let columns: [(&str, &str, &[&str]); 5] = [
+        (
+            "a",
+            "VECTOR(4) WITH (quantization = 'sq8')",
+            &["a", "VECTOR", "4", "WITH", "quantization", "=", "'SQ8'"],
+        ),
+        (
+            "b",
+            "VECTOR(4) WITH (quantization = 'F32') AUTO_INDEX_AT 5000",
+            &["b", "VECTOR", "4", "AUTO_INDEX_AT", "5000"],
+        ),
+        (
+            "c",
+            "VECTOR(4) PARTITION_KEY (ctx) SEARCH_MODE INDEXED \
+             AUTO_INDEX_AT 18446744073709551615 CONSOLIDATION NONE",
+            &[
+                "c",
+                "VECTOR",
+                "4",
+                "PARTITION_KEY",
+                "ctx",
+                "MAX_PARTITIONS",
+                "256",
+                "SEARCH_MODE",
+                "INDEXED",
+                "AUTO_INDEX_AT",
+                "18446744073709551615",
+                "CONSOLIDATION",
+                "NONE",
+            ],
+        ),
+        (
+            "d",
+            "VECTOR(4) consolidation (tombstone_percent = 100)",
+            &[
+                "d",
+                "VECTOR",
+                "4",
+                "CONSOLIDATION",
+                "TOMBSTONE_PERCENT",
+                "=",
+                "100",
+            ],
+        ),
+        (
+            "e",
+            "VECTOR(4) CONSOLIDATION (CHANGE_PERCENT = 1, TOMBSTONE_PERCENT = 100)",
+            &[
+                "e",
+                "VECTOR",
+                "4",
+                "CONSOLIDATION",
+                "CHANGE_PERCENT",
+                "=",
+                "1",
+                "TOMBSTONE_PERCENT",
+                "=",
+                "100",
+            ],
+        ),
+    ];
+    let declared: Vec<String> = columns
+        .iter()
+        .map(|(name, clauses, _)| format!("{name} {clauses}"))
+        .collect();
+    support::run(
+        &db,
+        &format!(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, ctx TEXT NOT NULL, {})",
+            declared.join(", ")
+        ),
+    );
+    let check = |printed: &str, state: &str| {
+        for (name, _, wanted) in columns {
+            assert_eq!(words(printed, name), wanted, "{state}: {name}");
+        }
+    };
+    let printed = db.declaration("t").expect("the declaration");
+    check(&printed, "as declared");
+
+    // After reopen the same text, through the writer and through a reader; and the printed
+    // text declares the same table in a new store.
+    support::close(db);
+    let db = support::open(&folder);
+    assert_eq!(db.declaration("t").expect("the declaration"), printed);
+    let reader = ReadSession::open(&folder).expect("open the store for reading");
+    assert_eq!(reader.declaration("t").expect("a reader's"), printed);
+    let again = support::open(&support::folder("index-clauses-again"));
+    for statement in printed.split_inclusive(";\n") {
+        support::run(&again, statement);
+    }
+    assert_eq!(again.declaration("t").expect("the declaration"), printed);
+}
+
+#[test]
+fn the_index_clauses_are_refused_by_kind() {
+    let folder = support::folder("index-clauses-refused");
+    let db = support::open(&folder);
+    let fresh = db.committed_watermark();
+    use VectorPolicyDeclarationIssue as Issue;
+    let quantization = Issue::InvalidMember {
+        member: "quantization",
+    };
+    let refused: [(&str, Issue, &str); 9] = [
+        (
+            "VECTOR(4) WITH (quantization = 'SQ16')",
+            quantization,
+            "quantization has an invalid vector policy value",
+        ),
+        (
+            "VECTOR(4) WITH (quantization = '')",
+            quantization,
+            "quantization has an invalid vector policy value",
+        ),
+        (
+            "VECTOR(4) AUTO_INDEX_AT 0",
+            Issue::AutoIndexAtNotPositive,
+            "AUTO_INDEX_AT must be a positive integer",
+        ),
+        (
+            "VECTOR(4) AUTO_INDEX_AT -1",
+            Issue::AutoIndexAtNotPositive,
+            "AUTO_INDEX_AT must be a positive integer",
+        ),
+        (
+            "VECTOR(4) AUTO_INDEX_AT 18446744073709551616",
+            Issue::AutoIndexAtOutOfRange,
+            "AUTO_INDEX_AT is outside the persisted numeric range",
+        ),
+        (
+            "VECTOR(4) CONSOLIDATION (CHANGE_PERCENT = 0)",
+            Issue::ConsolidationPercentOutOfRange,
+            "vector consolidation percentages must be integers from 1 through 100",
+        ),
+        (
+            "VECTOR(4) CONSOLIDATION (CHANGE_PERCENT = 101)",
+            Issue::ConsolidationPercentOutOfRange,
+            "vector consolidation percentages must be integers from 1 through 100",
+        ),
+        (
+            "VECTOR(4) CONSOLIDATION (TOMBSTONE_PERCENT = -5)",
+            Issue::ConsolidationPercentOutOfRange,
+            "vector consolidation percentages must be integers from 1 through 100",
+        ),
+        (
+            "VECTOR(4) CONSOLIDATION (CHANGE_PERCENT = 20, TOMBSTONE_PERCENT = 0)",
+            Issue::ConsolidationPercentOutOfRange,
+            "vector consolidation percentages must be integers from 1 through 100",
+        ),
+    ];
+    for (declared, wanted, sentence) in refused {
+        let sql = with_vector(declared);
+        let error = support::refusal(&db, &sql);
+        assert!(error.to_string().ends_with(sentence), "{sql}: {error}");
+        match error {
+            Error::InvalidVectorPolicyDeclaration { index, issue } => {
+                assert_eq!(index, column("t", "v"), "{sql}");
+                assert_eq!(issue, wanted, "{sql}");
+            }
+            other => panic!("{sql}\nwas refused as {other:?}"),
+        }
+    }
+    // What a later version reads is refused by its name.
+    for (declared, name) in [
+        (
+            "VECTOR(4) WITH (quantization = 'SQ4')",
+            "WITH (quantization = 'SQ4')",
+        ),
+        ("VECTOR(4) IVF (LISTS = 4, PROBES = 2)", "IVF"),
+        (
+            "VECTOR(4) SEARCH (TARGET_ACCURACY = 0.9, EXPECTED_VECTORS = 100)",
+            "SEARCH",
+        ),
+    ] {
+        let sql = with_vector(declared);
+        let sentence = support::refusal(&db, &sql).to_string();
+        assert!(
+            sentence.ends_with(&format!("{name} {LATER_VERSION}")),
+            "{sql}\nwas refused in the sentence: {sentence}"
+        );
+    }
+    // A CONSOLIDATION list that is empty, names a member twice or names another member, and
+    // a clause out of its place, are syntax errors.
+    for declared in [
+        "VECTOR(4) CONSOLIDATION ()",
+        "VECTOR(4) CONSOLIDATION (CHANGE_PERCENT = 20, CHANGE_PERCENT = 30)",
+        "VECTOR(4) CONSOLIDATION (LISTS = 20)",
+        "VECTOR(4) AUTO_INDEX_AT 1000 SEARCH_MODE EXACT",
+        "VECTOR(4) AUTO_INDEX_AT 1000 WITH (quantization = 'SQ8')",
+    ] {
+        let sql = with_vector(declared);
+        match support::refusal(&db, &sql) {
+            Error::ParseError(_) => {}
+            other => panic!("{sql}\nwas refused as {other:?}"),
+        }
+    }
+    assert!(db.table_names().is_empty(), "a refused statement declared");
+    assert_eq!(db.committed_watermark(), fresh);
+}
+
+#[test]
+fn the_inspection_statements_are_read() {
+    let folder = support::folder("inspection-statements");
+    let db = support::open(&folder);
+    declare(&db, "docs", "");
+    let reader = ReadSession::open(&folder).expect("open the store for reading");
+    // Every form, in any letter case, with the rows it returns from a store of one column
+    // with no key and no vector: one index and its one partition.
+    let forms = [
+        ("SHOW VECTOR_INDEXES", 1),
+        ("show vector_indexes", 1),
+        ("SHOW VECTOR_PARTITIONS", 1),
+        ("SHOW VECTOR_PARTITIONS FOR docs.v", 1),
+        ("show vector_partitions for docs.v limit 5", 1),
+        ("SHOW VECTOR_PARTITIONS LIMIT 0", 0),
+        ("SHOW VECTOR_PARTITIONS LIMIT 1 OFFSET 0", 1),
+        ("SHOW VECTOR_PARTITIONS FOR docs.v LIMIT 1 OFFSET 1", 0),
+    ];
+    let before = db.committed_watermark();
+    let tx = db.transaction().expect("begin");
+    for (sql, rows) in forms {
+        assert_eq!(support::rows(&db, sql).len(), rows, "{sql}");
+        assert_eq!(
+            support::rows(&tx, sql).len(),
+            rows,
+            "{sql}, in a transaction"
+        );
+        assert_eq!(support::rows(&reader, sql).len(), rows, "{sql}, a reader");
+    }
+    tx.rollback();
+    assert_eq!(db.committed_watermark(), before);
+    // OFFSET stands only after LIMIT, and FOR names a table and a column.
+    for sql in [
+        "SHOW VECTOR_PARTITIONS OFFSET 1",
+        "SHOW VECTOR_PARTITIONS FOR docs",
+        "SHOW VECTOR_INDEXES FOR docs.v",
+    ] {
+        match support::refusal(&db, sql) {
+            Error::ParseError(_) => {}
+            other => panic!("{sql}\nwas refused as {other:?}"),
+        }
+    }
 }

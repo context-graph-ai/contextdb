@@ -10,17 +10,24 @@
 # when it is done. Packages cargo has downloaded before are not downloaded again, so the two
 # build times leave the download out.
 #
-# Three groups of lines are taken on data the script is given, each in a variable of the
+# Four groups of lines are taken on data the script is given, each in a variable of the
 # environment, and are printed as `unavailable` without it:
 #
-#     SESSIONS=<folder>:<list file>:<count>          text files loaded one row a line: the
-#                                                    first <count> names of the list, each a
-#                                                    path under the folder
-#     PASSAGES=<dump folder>:<answers folder>        a dump of search passages and the answers
-#     PASSAGES_LARGE=<dump folder>:<answers folder>  recorded for it; a second, larger one
+#     SESSIONS=<folder>:<list file>:<count>           text files loaded one row a line: the
+#                                                     first <count> names of the list, each a
+#                                                     path under the folder
+#     PASSAGES=<dump folder>:<answers folder>         a dump of search passages and the answers
+#     PASSAGES_LARGE=<dump folder>:<answers folder>   recorded for it; a second, larger one;
+#     PASSAGES_LARGER=<dump folder>:<answers folder>  and a third, larger still
 #
 # The head of contextdb/examples/passages.rs says what a dump and its answers hold. A store's
 # size is the bytes of every file in its folder after it was closed.
+#
+# Every time of a similarity search is taken by one thread, in a read session opened under the
+# memory limit that `index_reader_limit` prints unless the line's name says another, and each
+# group of such lines opens with a line ending in `_session` that says both. NUMBERS_LARGE=1
+# adds five million generated sightings, which takes the better part of an hour and is run
+# once for a landing.
 set -u
 cd "$(dirname "$0")/.." || exit 1
 scratch=$(mktemp -d) || exit 1
@@ -56,6 +63,15 @@ fi
 # number from a build made for one processor is not read as an ordinary build's.
 flags="${RUSTFLAGS:-}${CARGO_ENCODED_RUSTFLAGS:+ $CARGO_ENCODED_RUSTFLAGS}${CARGO_BUILD_RUSTFLAGS:+ $CARGO_BUILD_RUSTFLAGS}"
 echo "find_build_rustflags $(printf '%s' "${flags:-none}" | tr -s ' \037' '__') -"
+# The first pass of an indexed search counts bits, with the processor's bit-count instruction
+# where the processor says it has one: this line says which arm of that loop the times are of.
+if grep -m 1 '^flags' /proc/cpuinfo 2>/dev/null | grep -qw popcnt; then
+  echo "find_counting popcnt -"
+else
+  echo "find_counting plain -"
+fi
+echo "index_reader_limit $((1 << 30)) bytes"
+echo "index_threads 1 threads"
 example() {
   cargo run --quiet --release --locked --manifest-path v2/Cargo.toml -p contextdb --example "$@"
 }
@@ -77,16 +93,39 @@ else
   echo "sessions_measurements unavailable -"
 fi
 
-# Search passages: load, seal, search through SQL, and the answers beside the recorded ones.
-given=0
-for input in "${PASSAGES:-}" "${PASSAGES_LARGE:-}"; do
-  [ -n "$input" ] || continue
-  given=1
-  example passages -- "${input%%:*}" "${input#*:}" "$scratch/passages" ||
-    echo "passages_measurements unavailable -"
+# Similarity search under each mode on generated vectors: a million of the index pilot's, then
+# a million sightings; and five million sightings when asked.
+example measure -- index "$scratch/index" || echo "index_measurements unavailable -"
+rm -rf -- "$scratch/index"
+if [ "${NUMBERS_LARGE:-}" = 1 ]; then
+  example measure -- sightings 5000000 "$scratch/index" ||
+    echo "sightings_5000000_measurements unavailable -"
+  rm -rf -- "$scratch/index"
+fi
+
+# Search passages: load, seal, build the index, search through SQL under each mode, and the
+# answers beside the recorded ones. First 10,000 passages of one partition of the second
+# dump; then each dump whole, the second and the third also with a tail written after the
+# build, the first and the second also kept as reduced vectors.
+if [ -n "${PASSAGES_LARGE:-}" ]; then
+  example passages -- single "${PASSAGES_LARGE%%:*}" "$scratch/passages" ||
+    echo "single_measurements unavailable -"
   rm -rf -- "$scratch/passages"
-done
-[ "$given" = 1 ] || echo "passages_measurements unavailable -"
+else
+  echo "single_measurements unavailable -"
+fi
+passages() {
+  if [ -n "$2" ]; then
+    example passages -- "${2%%:*}" "${2#*:}" "$scratch/passages" "$3" ||
+      echo "$1 unavailable -"
+    rm -rf -- "$scratch/passages"
+  else
+    echo "$1 unavailable -"
+  fi
+}
+passages passages_measurements "${PASSAGES:-}" sq8
+passages passages_large_measurements "${PASSAGES_LARGE:-}" sq8,tail
+passages passages_larger_measurements "${PASSAGES_LARGER:-}" tail
 
 # From a fresh clone to a green `cargo test`: nothing built before.
 start=$SECONDS

@@ -67,14 +67,6 @@ error: TableNotFound
 
 # The clauses that describe or steer an index are read by a later version. Each is refused by
 # its name, alone or after the clauses this version reads, and never as a syntax error.
-CREATE TABLE docs (id INTEGER PRIMARY KEY, v VECTOR(3) WITH (quantization = 'SQ8'));
-----
-error: PlanError
-
-CREATE TABLE docs (id INTEGER PRIMARY KEY, v VECTOR(3) AUTO_INDEX_AT 10000);
-----
-error: PlanError
-
 CREATE TABLE docs (id INTEGER PRIMARY KEY, v VECTOR(3) SEARCH (TARGET_ACCURACY = 95, EXPECTED_VECTORS = 1000000));
 ----
 error: PlanError
@@ -83,14 +75,10 @@ CREATE TABLE docs (id INTEGER PRIMARY KEY, v VECTOR(3) IVF (LISTS = 64, PROBES =
 ----
 error: PlanError
 
-CREATE TABLE docs (id INTEGER PRIMARY KEY, v VECTOR(3) CONSOLIDATION (CHANGE_PERCENT = 25, TOMBSTONE_PERCENT = 5));
-----
-error: PlanError
-
 CREATE TABLE docs (
   id INTEGER PRIMARY KEY,
   tenant TEXT NOT NULL,
-  v VECTOR(3) PARTITION_KEY (tenant) MAX_PARTITIONS 4 SEARCH_MODE AUTO AUTO_INDEX_AT 10000
+  v VECTOR(3) PARTITION_KEY (tenant) MAX_PARTITIONS 4 SEARCH_MODE AUTO IVF (LISTS = 64, PROBES = 8)
 );
 ----
 error: PlanError
@@ -100,7 +88,7 @@ SELECT id FROM docs;
 error: TableNotFound
 
 # The name was free all along. ALTER is a later version's too: refused, each leaves the column
-# as it was declared, with room for one partition and searched INDEXED.
+# as it was declared, with room for one partition and searched INDEXED, which answers.
 CREATE TABLE docs (
   id INTEGER PRIMARY KEY,
   tenant TEXT NOT NULL,
@@ -121,7 +109,8 @@ error: VectorPartitionLimitExceeded
 
 SELECT id FROM docs ORDER BY v <=> [1.0, 0.0, 0.0] LIMIT 1;
 ----
-error: VectorIndexedRouteUnavailable
+id
+1
 
 SELECT id FROM docs ORDER BY v <=> [1.0, 0.0, 0.0] USE VECTOR EXACT LIMIT 1;
 ----

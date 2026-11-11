@@ -16,16 +16,6 @@ SELECT id, v <=> [1.0, 0.0, 0.0] AS distance FROM docs ORDER BY distance;
 ----
 error: PlanError
 
-# The statements that describe an index and its partitions belong to a later version too, and
-# are refused by name, not as a syntax error.
-SHOW VECTOR_INDEXES;
-----
-error: PlanError
-
-SHOW VECTOR_PARTITIONS;
-----
-error: PlanError
-
 # USE VECTOR belongs to a search, not to a plain ORDER BY.
 SELECT id FROM docs ORDER BY id USE VECTOR EXACT LIMIT 2;
 ----
@@ -44,11 +34,13 @@ SELECT id FROM docs ORDER BY v <=> '[1,0,0,0]' LIMIT 2;
 ----
 error: VectorIndexDimensionMismatch
 
-# This version keeps no index. INDEXED is refused, asked for in the statement or declared on the
-# column, and never answered by an exact search under that name; EXACT and AUTO answer.
+# INDEXED is not refused for rows that no maintenance cycle has grouped yet: asked for in the
+# statement or declared on the column, it searches every one of them, as EXACT and AUTO do.
 SELECT id FROM docs ORDER BY v <=> [1.0, 0.0, 0.0] USE VECTOR INDEXED LIMIT 2;
 ----
-error: VectorIndexedRouteUnavailable
+id
+1
+2
 
 SELECT id FROM docs ORDER BY v <=> [1.0, 0.0, 0.0] USE VECTOR EXACT LIMIT 2;
 ----
@@ -60,7 +52,9 @@ CREATE TABLE indexed (id INTEGER PRIMARY KEY, v VECTOR(3) SEARCH_MODE INDEXED);
 INSERT INTO indexed (id, v) VALUES (1, [0.0, 1.0, 0.0]), (2, [1.0, 0.0, 0.0]);
 SELECT id FROM indexed ORDER BY v <=> [1.0, 0.0, 0.0] LIMIT 2;
 ----
-error: VectorIndexedRouteUnavailable
+id
+2
+1
 
 SELECT id FROM indexed ORDER BY v <=> [1.0, 0.0, 0.0] USE VECTOR EXACT LIMIT 2;
 ----

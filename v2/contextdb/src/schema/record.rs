@@ -8,7 +8,7 @@
 //! every page it reads. Where a byte says which of several kinds follows, the last kind is read
 //! for any byte the earlier ones do not claim.
 
-use super::{Table, VectorColumn};
+use super::{Consolidation, Quantization, Table, VectorColumn};
 use crate::store::{IndexId, TableId, VectorId};
 use crate::types::{
     ColumnDef, ColumnDefault, ColumnType, IndexDecl, SortDirection, TableMeta, Value,
@@ -94,6 +94,16 @@ pub(super) fn encode(table: &Table) -> Vec<u8> {
             Some(VectorSearchMode::Exact) => 2,
             Some(VectorSearchMode::Indexed) => 3,
         });
+        // A declared AUTO_INDEX_AT and a declared percentage are never zero either.
+        out.extend(vector.auto_index_at.unwrap_or(0).to_le_bytes());
+        out.extend(match vector.consolidation {
+            None => [0, 0, 0],
+            Some(Consolidation::None) => [1, 0, 0],
+            Some(Consolidation::Percent { change, tombstone }) => {
+                [2, change.unwrap_or(0), tombstone.unwrap_or(0)]
+            }
+        });
+        out.push(u8::from(vector.quantization == Quantization::Sq8));
     }
     out
 }
@@ -161,6 +171,20 @@ pub(super) fn decode(record: &[u8]) -> Table {
             1 => Some(VectorSearchMode::Auto),
             2 => Some(VectorSearchMode::Exact),
             _ => Some(VectorSearchMode::Indexed),
+        },
+        auto_index_at: Some(u64::from_le_bytes(read.array())).filter(|at| *at != 0),
+        consolidation: match read.array::<3>() {
+            [0, ..] => None,
+            [1, ..] => Some(Consolidation::None),
+            [_, change, tombstone] => Some(Consolidation::Percent {
+                change: Some(change).filter(|percent| *percent != 0),
+                tombstone: Some(tombstone).filter(|percent| *percent != 0),
+            }),
+        },
+        quantization: if read.flag() {
+            Quantization::Sq8
+        } else {
+            Quantization::F32
         },
     });
     Table {

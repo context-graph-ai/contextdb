@@ -14,6 +14,23 @@
 //!   not empty of the first `count` files the list names, 500 rows to a commit, and prints the
 //!   files' bytes, the bytes put in (each line's and 8 for its number) and the store's size.
 //!   It prints nothing of a file but those counts.
+//! - `measure index <folder>` measures similarity search under each mode on a million generated
+//!   vectors of 768 numbers in one partition, a row being an INTEGER key and the vector, and
+//!   then on a million generated sightings: lines `synthetic_1000000_...` and
+//!   `sightings_1000000_...`. `measure synthetic <rows> <folder>` and `measure sightings <rows>
+//!   <folder>` do one of the two at another size. The first are the index pilot's vectors, to
+//!   the number: a xorshift from `0x9E37_79B9_7F4A_7C15`, 300 hidden centres, each vector a
+//!   centre plus 0.06 of noise a number, and 100 questions with four thirds of that noise. The
+//!   second stand in for a camera store: three classes, a subject for every 2,500 rows with
+//!   eight directions of its own for its appearance, tracks of ten sightings whose appearance
+//!   drifts, a little noise on every number; 100 questions, eighty new sightings of stored
+//!   subjects and twenty of subjects never stored. Each case loads two stores, 500 rows to a
+//!   commit: one whose column declares `AUTO_INDEX_AT 1000000000`, so that nothing is grouped,
+//!   sealed and searched under EXACT; and one that declares nothing, with every maintenance
+//!   cycle run, opened and searched once in a new process (`measure first ...`, which the
+//!   program starts itself as) and then searched, in one read session under 1 GiB, under
+//!   EXACT, INDEXED and AUTO in turn: every question once after 5 searches of each mode that
+//!   are not timed. On sightings a hundred stored vectors are then each searched for by itself.
 //!
 //! The store's folder must be missing or empty. A store's size is the bytes of every file in
 //! its folder after it was closed.
@@ -23,12 +40,16 @@
 
 mod support;
 
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use contextdb::{Database, DatabaseOpenOptions, Result, Uuid, params};
-use support::{bytes_on_disk, line, mebibytes, milliseconds, percentile, ratio, seconds, timed};
+use support::{
+    EXACT, Fallible, READER_LIMIT, Values, bytes_on_disk, line, mebibytes, milliseconds,
+    percentile, ratio, seconds, timed,
+};
 
 #[global_allocator]
 static ALLOCATOR: support::Counting = support::Counting;
@@ -266,29 +287,347 @@ fn sessions(corpus: &Path, list: &Path, count: usize, folder: &Path) -> Result<(
     Ok(())
 }
 
+/// The index pilot's generator of numbers: a xorshift, and a number near a normal one made of
+/// six of its draws.
+struct Random(u64);
+
+impl Random {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+
+    fn g(&mut self) -> f32 {
+        let s: f32 = (0..6)
+            .map(|_| (self.next() >> 40) as f32 / (1u64 << 24) as f32)
+            .sum();
+        (s - 3.0) * 1.414
+    }
+}
+
+const DIMENSIONS: usize = 768;
+
+/// What a case's rows are handed to, one vector after another.
+type Each<'a> = &'a mut dyn FnMut(Vec<f32>) -> Fallible<()>;
+
+/// The index pilot's vectors, to the number: hands `each` every row in order and answers the
+/// 100 questions, which the generator makes after the rows.
+fn synthetic(rows: usize, each: Each<'_>) -> Fallible<Vec<Vec<f32>>> {
+    fn norm(v: &mut [f32]) {
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter_mut().for_each(|x| *x /= n);
+    }
+    let mut rng = Random(0x9E37_79B9_7F4A_7C15);
+    let (nc, noise) = (300_u64, 0.06_f32);
+    let mut centers = Vec::new();
+    for _ in 0..nc {
+        let mut c: Vec<f32> = (0..DIMENSIONS).map(|_| rng.g()).collect();
+        norm(&mut c);
+        centers.push(c);
+    }
+    for _ in 0..rows {
+        let c = &centers[(rng.next() % nc) as usize];
+        let mut v: Vec<f32> = c.iter().map(|x| x + noise * rng.g()).collect();
+        norm(&mut v);
+        each(v)?;
+    }
+    let mut questions = Vec::new();
+    for _ in 0..100 {
+        let c = &centers[(rng.next() % nc) as usize];
+        let mut q: Vec<f32> = c.iter().map(|x| x + noise * 4.0 / 3.0 * rng.g()).collect();
+        norm(&mut q);
+        questions.push(q);
+    }
+    Ok(questions)
+}
+
+/// Generated sightings, to the number as the second measurement of the index made them. A
+/// subject is a direction of its own beside its class's; its appearances vary along eight
+/// directions of its own; a track is ten sightings in a row whose appearance drifts; every
+/// sighting has a little noise on every number.
+struct Sightings {
+    subjects: usize,
+    classes: Vec<Vec<f32>>,
+    bases: Vec<Vec<f32>>,
+    axes: Vec<Vec<f32>>,
+    /// The generator's state after the directions, from which the questions are made.
+    after: u64,
+}
+
+impl Sightings {
+    const AXES: usize = 8;
+    const TRACK: usize = 10;
+
+    fn unit(v: &mut [f32]) {
+        let n = v.iter().map(|x| f64::from(*x) * f64::from(*x));
+        let n = n.sum::<f64>().sqrt();
+        if n > 0.0 {
+            for x in v {
+                *x = (f64::from(*x) / n) as f32;
+            }
+        }
+    }
+
+    fn new(rows: usize) -> Sightings {
+        let subjects = (rows / 2500).max(8);
+        let mut random = Random(0x51A7_1265_0BAD_CAFE);
+        let mut directions = |count: usize| -> Vec<Vec<f32>> {
+            let direction = |_| {
+                let mut c: Vec<f32> = (0..DIMENSIONS).map(|_| random.g()).collect();
+                Sightings::unit(&mut c);
+                c
+            };
+            (0..count).map(direction).collect()
+        };
+        Sightings {
+            subjects,
+            classes: directions(3),
+            bases: directions(subjects + 20),
+            axes: directions((subjects + 20) * Sightings::AXES),
+            after: random.0,
+        }
+    }
+
+    /// One sighting of a subject with this appearance.
+    fn make(&self, subject: usize, appearance: &[f32; 8], random: &mut Random) -> Vec<f32> {
+        let class = &self.classes[subject % 3];
+        let base = &self.bases[subject];
+        let mut out: Vec<f32> = (0..DIMENSIONS)
+            .map(|d| {
+                0.5 * class[d] + 0.6 * base[d] + 0.25 * random.g() / (DIMENSIONS as f32).sqrt()
+            })
+            .collect();
+        for (j, a) in appearance.iter().enumerate() {
+            let axis = &self.axes[subject * Sightings::AXES + j];
+            let weight = 0.5 * a / (Sightings::AXES as f32).sqrt();
+            for (x, along) in out.iter_mut().zip(axis) {
+                *x += weight * along;
+            }
+        }
+        Sightings::unit(&mut out);
+        out
+    }
+
+    /// The first `count` sightings of one track.
+    fn track(&self, track: usize, count: usize) -> Vec<Vec<f32>> {
+        let seed = (track as u64 + 1).wrapping_mul(0x2545_F491_4F6C_DD1D);
+        let mut random = Random(0x51A7_1265_0BAD_CAFE ^ seed);
+        random.next();
+        let subject = random.below(self.subjects);
+        let mut appearance = [0f32; 8];
+        for a in &mut appearance {
+            *a = random.g();
+        }
+        let mut sightings = Vec::with_capacity(count);
+        for _ in 0..count {
+            sightings.push(self.make(subject, &appearance, &mut random));
+            for a in &mut appearance {
+                *a = 0.9 * *a + 0.436 * random.g();
+            }
+        }
+        sightings
+    }
+
+    /// Hands `each` the first `rows` sightings, track after track.
+    fn rows(&self, rows: usize, each: Each<'_>) -> Fallible<()> {
+        for track in 0..rows.div_ceil(Sightings::TRACK) {
+            let count = Sightings::TRACK.min(rows - track * Sightings::TRACK);
+            for sighting in self.track(track, count) {
+                each(sighting)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The 100 questions: eighty new sightings of stored subjects, twenty of subjects never
+    /// stored.
+    fn questions(&self) -> Vec<Vec<f32>> {
+        let mut random = Random(self.after);
+        let mut questions = Vec::new();
+        for j in 0..100 {
+            let subject = if j % 5 == 4 {
+                self.subjects + j / 5
+            } else {
+                random.below(self.subjects)
+            };
+            let mut appearance = [0f32; 8];
+            for a in &mut appearance {
+                *a = random.g();
+            }
+            questions.push(self.make(subject, &appearance, &mut random));
+        }
+        questions
+    }
+}
+
+/// The search of a generated case: what follows `ORDER BY distance`, and the vector.
+fn nearest(tail: &str, question: &[f32]) -> (String, Values) {
+    let sql =
+        format!("SELECT id, embedding <=> $query AS distance FROM items ORDER BY distance{tail}");
+    (sql, params! { "query" => question.to_vec() })
+}
+
+/// A new store of the generated cases' table, its vector column declared with `clauses`, and
+/// every row that `rows` hands over inserted, 500 to a commit, under the keys 0, 1, 2 and so
+/// on. Answers the store and what `rows` answers.
+fn filled<T>(
+    store: &Path,
+    clauses: &str,
+    rows: &dyn Fn(Each<'_>) -> Fallible<T>,
+) -> Fallible<(Database, T)> {
+    let db = Database::open(store)?;
+    db.execute(
+        &format!("CREATE TABLE items (id INTEGER PRIMARY KEY, embedding VECTOR(768){clauses})"),
+        &params! {},
+    )?;
+    let mut tx = db.transaction()?;
+    let mut id = 0_i64;
+    let answered = rows(&mut |vector| {
+        tx.execute(
+            "INSERT INTO items (id, embedding) VALUES ($id, $embedding)",
+            &params! { "id" => id, "embedding" => vector },
+        )?;
+        id += 1;
+        if id % 500 == 0 {
+            std::mem::replace(&mut tx, db.transaction()?).commit()?;
+        }
+        Ok(())
+    })?;
+    tx.commit()?;
+    Ok((db, answered))
+}
+
+/// One generated case: the two stores and every line taken on them. `rows` hands over the
+/// case's rows and answers its questions; `stored` are rows to search for by themselves, each
+/// with its key.
+fn index(
+    prefix: &str,
+    folder: &Path,
+    count: usize,
+    rows: &dyn Fn(Each<'_>) -> Fallible<Vec<Vec<f32>>>,
+    stored: &[(u128, Vec<f32>)],
+) -> Fallible<()> {
+    support::must_be_empty(folder);
+    std::fs::create_dir_all(folder)?;
+    let store = folder.join("sealed");
+    let ((db, questions), load) = {
+        let (filled, load) = timed(|| filled(&store, " AUTO_INDEX_AT 1000000000", rows));
+        (filled?, load)
+    };
+    line(&format!("{prefix}load"), seconds(load), "s");
+    let sealed = support::sealed(prefix, &db, &store)?;
+    let reader = support::session(&store, READER_LIMIT)?;
+    let before = support::ask(&reader, &nearest, &[EXACT], &questions, 1)?;
+    let name = format!("{prefix}find_exact_before");
+    support::setting(&name, READER_LIMIT);
+    support::times(&name, &before[0]);
+    support::counted(&name, &before[0]);
+    drop(reader);
+
+    let store = folder.join("built");
+    let (db, _) = filled(&store, "", rows)?;
+    let held = count as u64 * (8 + 4 * DIMENSIONS as u64);
+    let parts = support::built(prefix, &db, &store, (held, sealed, DIMENSIONS))?;
+    let question = folder.join("question.f32");
+    let bytes = questions[0].iter().flat_map(|number| number.to_le_bytes());
+    std::fs::write(&question, bytes.collect::<Vec<u8>>())?;
+    let first = [OsStr::new("first"), store.as_os_str(), OsStr::new(prefix)];
+    support::in_new_process(&[first[0], first[1], first[2], question.as_os_str()])?;
+    let reader = support::session(&store, READER_LIMIT)?;
+    let find = format!("{prefix}find");
+    let every = support::selected(&parts, &[]);
+    support::modes(&find, &reader, &nearest, &questions, (1, &every[..]))?;
+    if !stored.is_empty() {
+        let name = format!("{find}_own_grouped_found");
+        support::own(&name, &reader, &nearest, stored)?;
+    }
+    Ok(())
+}
+
+/// The index pilot's vectors in one partition.
+fn synthetic_case(rows: usize, folder: &Path) -> Fallible<()> {
+    let prefix = format!("synthetic_{rows}_");
+    index(&prefix, folder, rows, &|each| synthetic(rows, each), &[])
+}
+
+/// Generated sightings in one partition, and a hundred of them, evenly spread, each searched
+/// for by itself.
+fn sightings_case(rows: usize, folder: &Path) -> Fallible<()> {
+    let sightings = Sightings::new(rows);
+    let mut stored = Vec::new();
+    for row in (0..100).map(|i| i * rows / 100) {
+        let (track, place) = (row / Sightings::TRACK, row % Sightings::TRACK);
+        if let Some(vector) = sightings.track(track, place + 1).pop() {
+            stored.push((row as u128, vector));
+        }
+    }
+    let load = |each: Each<'_>| {
+        sightings.rows(rows, each)?;
+        Ok(sightings.questions())
+    };
+    index(&format!("sightings_{rows}_"), folder, rows, &load, &stored)
+}
+
+/// What the program does when it starts itself: opens the built store and runs one search for
+/// the vector the file holds.
+fn first(store: &Path, prefix: &str, question: &Path) -> Fallible<()> {
+    let question = std::fs::read(question)?;
+    let (numbers, _) = question.as_chunks::<4>();
+    let question: Vec<f32> = numbers
+        .iter()
+        .map(|four| f32::from_le_bytes(*four))
+        .collect();
+    let names = (format!("{prefix}open"), format!("{prefix}find_auto_first"));
+    support::first(
+        store,
+        (&names.0, &names.1),
+        &nearest(support::AUTO, &question),
+    )
+}
+
 fn usage() -> ! {
     eprintln!(
-        "usage: measure readme|million|vectors <folder>\n       \
-         measure sessions <corpus folder> <list file> <count> <folder>"
+        "usage: measure readme|million|vectors|index <folder>\n       \
+         measure sessions <corpus folder> <list file> <count> <folder>\n       \
+         measure synthetic|sightings <rows> <folder>"
     );
     std::process::exit(2);
 }
 
-fn main() -> Result<()> {
+fn main() -> Fallible<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    if let ["first", store, prefix, question] = arguments.as_slice() {
+        return first(Path::new(store), prefix, Path::new(question));
+    }
     let Some(folder) = arguments.last().map(Path::new) else {
         usage();
     };
     support::must_be_empty(folder);
     match arguments.as_slice() {
-        ["readme", _] => readme(folder),
-        ["million", _] => million(folder),
-        ["vectors", _] => vectors(folder),
+        ["readme", _] => readme(folder)?,
+        ["million", _] => million(folder)?,
+        ["vectors", _] => vectors(folder)?,
         ["sessions", corpus, list, count, _] => match count.parse() {
-            Ok(count) => sessions(Path::new(corpus), Path::new(list), count, folder),
+            Ok(count) => sessions(Path::new(corpus), Path::new(list), count, folder)?,
             Err(_) => usage(),
+        },
+        ["index", _] => {
+            synthetic_case(1_000_000, &folder.join("synthetic"))?;
+            sightings_case(1_000_000, &folder.join("sightings"))?;
+        }
+        [which @ ("synthetic" | "sightings"), rows, _] => match (*which, rows.parse()) {
+            ("synthetic", Ok(rows)) => synthetic_case(rows, folder)?,
+            (_, Ok(rows)) => sightings_case(rows, folder)?,
+            _ => usage(),
         },
         _ => usage(),
     }
+    Ok(())
 }

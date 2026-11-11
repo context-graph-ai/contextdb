@@ -45,6 +45,16 @@ pub enum PhysicalPlan {
     },
     SetMemoryLimit(SetMemoryLimitValue),
     ShowMemoryLimit,
+    /// `SHOW VECTOR_INDEXES`: one row for each VECTOR column of the store.
+    ShowVectorIndexes,
+    /// `SHOW VECTOR_PARTITIONS [FOR table.column] [LIMIT count [OFFSET start]]`: one row for
+    /// each partition, of the named column or of every VECTOR column.
+    ShowVectorPartitions {
+        /// The table and column after `FOR`.
+        column: Option<(String, String)>,
+        limit: Option<u64>,
+        offset: u64,
+    },
 }
 
 /// What a planned statement does to the store.
@@ -79,7 +89,9 @@ impl PhysicalPlan {
             | PhysicalPlan::Project { .. }
             | PhysicalPlan::Limit { .. }
             | PhysicalPlan::VectorSearch { .. }
-            | PhysicalPlan::ShowMemoryLimit => Effect::Reads,
+            | PhysicalPlan::ShowMemoryLimit
+            | PhysicalPlan::ShowVectorIndexes
+            | PhysicalPlan::ShowVectorPartitions { .. } => Effect::Reads,
         }
     }
 }

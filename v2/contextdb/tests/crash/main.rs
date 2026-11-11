@@ -612,3 +612,133 @@ fn stopping_before_call(stop_at: u64) -> (WrapStorage, Arc<AtomicU64>) {
     });
     (storage, calls)
 }
+
+// ---- a kill inside a build ----
+
+/// A closed store whose `docs` has `rows` pending vectors in a column that is at its size from
+/// a third of them on: the cycles seal them and build one grouping of `round(sqrt(rows))`
+/// groups, 17 for 300 rows and 3 for 12.
+fn store_to_build(name: &str, rows: i64) -> PathBuf {
+    let folder = support::folder(name);
+    let db = support::open(&folder);
+    support::declare_docs(&db, DIMENSION, &format!("AUTO_INDEX_AT {}", rows / 3));
+    support::load_docs(&db, 1..=rows, "a", |n| support::gathered(n, DIMENSION));
+    support::close(db);
+    folder
+}
+
+/// Asserts that an exact search returns every one of the `rows` rows once, and that INDEXED
+/// answers with true distances or is refused by its own kind.
+fn every_vector_is_found(db: &Database, rows: usize, state: &str) {
+    let stored = support::stored(db, support::DOCS);
+    assert_eq!(stored.rows().len(), rows, "{state}: the rows of docs");
+    for seed in [98_101, 98_102] {
+        let query = support::gathered(seed, DIMENSION);
+        let wanted = stored.nearest(|_| true, &query, 1000);
+        let sql = support::by_mode(None, "EXACT", 1000);
+        support::assert_nearest(db, &sql, &query, &wanted, state);
+        match support::search(db, &support::by_mode(None, "INDEXED", 10), &query) {
+            Ok(result) => {
+                support::assert_sound(&result, &stored, |_| true, &query, 10, state);
+            }
+            Err(Error::VectorIndexedRouteUnavailable { .. }) => {}
+            Err(other) => panic!("{state}: INDEXED gave {other:?}"),
+        }
+    }
+}
+
+fn groups(db: &Database) -> Value {
+    support::field(&support::the_partition(db), "lists").clone()
+}
+
+#[test]
+fn a_kill_at_any_storage_call_of_a_build_leaves_every_vector_found() {
+    if let Some(role) = support::role() {
+        return one_build(role);
+    }
+    let test = "a_kill_at_any_storage_call_of_a_build_leaves_every_vector_found";
+    // Twelve rows: a build finds centres only for more than one group, which takes
+    // `round(sqrt(rows))` of 2 or more, and the INDEXED search asks for ten rows. The test's
+    // length is one store built for every storage call of the sixteen cycles.
+    const ROWS: i64 = 12;
+    // Run once to the end to learn which storage calls belong to the cycles of the build.
+    let folder = store_to_build("kill-build-count", ROWS);
+    let lines = Child::start(test, "builder stop_at=0", &folder).end();
+    let begins = support::last_number(&lines, "building").expect("the builder announces it");
+    let calls = support::last_number(&lines, "calls").expect("the builder announces its calls");
+    assert_eq!(support::last_number(&lines, "cycles"), Some(16));
+    assert_eq!(groups(&support::open(&folder)), Value::Int64(3));
+
+    for k in begins + 1..=calls {
+        let folder = store_to_build(&format!("kill-build-at-{k}"), ROWS);
+        let mut builder = Child::start(test, &format!("builder stop_at={k}"), &folder);
+        builder.until("stopped");
+        builder.kill();
+        // The store opens with nothing to mend and every vector is found, whichever step's
+        // commit the kill fell in; the next cycles finish the build.
+        let db = support::open(&folder);
+        let state = format!("killed at storage call {k} of a build");
+        every_vector_is_found(&db, ROWS as usize, &state);
+        support::upkeep(&db);
+        assert_eq!(groups(&db), Value::Int64(3), "{state}");
+        every_vector_is_found(&db, ROWS as usize, &format!("{state}, then built"));
+    }
+}
+
+#[test]
+fn a_killed_build_goes_on_from_its_record() {
+    if let Some(role) = support::role() {
+        return one_build(role);
+    }
+    let test = "a_killed_build_goes_on_from_its_record";
+    let folder = store_to_build("killed-build-count", 300);
+    let lines = Child::start(test, "builder stop_at=0", &folder).end();
+    let begins = support::last_number(&lines, "building").expect("the builder announces it");
+    let calls = support::last_number(&lines, "calls").expect("the builder announces its calls");
+    let whole = support::last_number(&lines, "cycles").expect("the builder counts its cycles");
+    assert_eq!(whole, 16);
+
+    // Killed at the middle storage call of the build's cycles.
+    let folder = store_to_build("killed-build-goes-on", 300);
+    let stop_at = begins + (calls - begins) / 2;
+    let mut builder = Child::start(test, &format!("builder stop_at={stop_at}"), &folder);
+    let told = builder.until("stopped");
+    builder.kill();
+    let returned = support::last_number(&told, "cycles").unwrap_or(0);
+    assert!(
+        0 < returned && returned + 1 < whole,
+        "{returned} of {whole} cycles had returned at storage call {stop_at}"
+    );
+    // The cycles after reopening are those the build had left: the killed cycle's step is
+    // there or it is not, and no step that was committed is worked out again.
+    let db = support::open(&folder);
+    let (ran, _) = support::upkeep(&db);
+    assert!(
+        ran == whole - returned || ran == whole - returned - 1,
+        "{returned} of {whole} cycles had returned; the build then took {ran} more"
+    );
+    assert_eq!(groups(&db), Value::Int64(17));
+    every_vector_is_found(&db, 300, "built after the kill");
+}
+
+/// Runs maintenance cycles until nothing is left. Announces `building <n>` with the storage
+/// calls made so far before the first, `cycles <n>` as each returns, and `calls <total>` once
+/// the store is closed.
+fn one_build(role: support::Role) {
+    let (storage, calls) = stopping_before_call(role.number("stop_at"));
+    let mut options = DatabaseOpenOptions::default();
+    options.storage = Some(storage);
+    let db = support::open_with(&role.folder, options).expect("open");
+    support::say(format!("building {}", calls.load(Ordering::SeqCst)));
+    for cycles in 1_u64.. {
+        let report = support::cycle(&db);
+        support::say(format!("cycles {cycles}"));
+        if report.maintenance_vectors_remaining == 0
+            && report.remaining_partitions <= report.stalled_partitions
+        {
+            break;
+        }
+    }
+    support::close(db);
+    support::say(format!("calls {}", calls.load(Ordering::SeqCst)));
+}

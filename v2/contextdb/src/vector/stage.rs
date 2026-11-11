@@ -4,7 +4,10 @@
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 
+use super::build::Build;
 use super::directory::{self, Partition};
+use super::pack;
+use super::seal::room;
 use super::tally::{position, tuples};
 use crate::memory::{Budget, Reservation};
 use crate::schema::Catalog;
@@ -41,9 +44,10 @@ struct Count {
 /// For every staged row of a table with a VECTOR column, the row as the change set's committed
 /// moment has it is compared with the row as staged. A vector that is new, changed, or under
 /// other partition key values goes on its partition's pending list; the list it was on, if it
-/// was on one, lets it go. A partition is made when its first vector arrives and removed, with
-/// its blocks, when its last one leaves. A row whose vector and partition key values are as
-/// they were stages nothing.
+/// was on one, lets it go, and a vector that was on none leaves a sealed slot, which a `Left`
+/// record says from then on. A partition is made when its first vector arrives and removed,
+/// with every record kept for it, when its last one leaves. A row whose vector and partition
+/// key values are as they were stages nothing.
 ///
 /// Every vector that leaves is taken out before any arrives, so at the limit a commit may
 /// move the last vector of one partition into a new one.
@@ -73,16 +77,26 @@ pub(crate) fn stage(changes: &mut ChangeSet, catalog: &Catalog, budget: &Budget)
             changes.delete_vector(waiting)?;
             let fewer = pending.checked_sub(1);
             pending = fewer.ok_or_else(|| changes.damaged(directory::SHORT))?;
+        } else {
+            // The row leaves a sealed slot: every slot of its key sealed so far is stale.
+            let sealed = left.sealed.to_le_bytes().to_vec();
+            changes.put_vector(
+                VectorRecord::Left(moved.vector, left.number, &moved.row),
+                sealed,
+            )?;
         }
     }
-    // A partition whose last vector left goes, with its blocks.
-    for ((vector, _), Touched { now: emptied, .. }) in &mut touched {
+    // A partition whose last vector left goes, with every record kept for it.
+    for ((vector, tuple), Touched { now: emptied, .. }) in &mut touched {
         if emptied.live == 0 {
-            for block in 0..emptied.blocks {
-                changes.delete_vector(VectorRecord::Block(*vector, emptied.number, block))?;
+            empty(changes, catalog, *vector, emptied, &mut held)?;
+            let leaving =
+                |moved: &&Move| moved.vector == *vector && moved.leaves.as_ref() == Some(tuple);
+            for moved in moves.iter().filter(leaving) {
+                changes.delete_vector(VectorRecord::Left(*vector, emptied.number, &moved.row))?;
             }
             counts.entry(*vector).or_default().change -= 1;
-            emptied.blocks = 0;
+            *emptied = Partition::default();
         }
     }
     for moved in &moves {
@@ -138,6 +152,58 @@ pub(crate) fn stage(changes: &mut ChangeSet, catalog: &Catalog, budget: &Budget)
                 max_partitions: limit,
             });
         }
+    }
+    Ok(())
+}
+
+/// Stages the removal of every record kept for a partition but its entry and the `Left`
+/// records this commit staged: its tail blocks with their sketches, its mean, the records of
+/// its grouping and of its build, and its `Left` records, whose keys are held until then.
+fn empty(
+    changes: &mut ChangeSet,
+    catalog: &Catalog,
+    vector: VectorId,
+    emptied: &Partition,
+    held: &mut Reservation,
+) -> Result<()> {
+    let number = emptied.number;
+    for block in emptied.first..emptied.blocks {
+        changes.delete_vector(VectorRecord::Block(vector, number, block))?;
+        changes.delete_vector(VectorRecord::Sketch(vector, number, block))?;
+    }
+    changes.delete_vector(VectorRecord::Mean(vector, number))?;
+    let (table, column) = catalog.vector(vector).expect("a staged row's column");
+    let dimension = table.dimension(column);
+    if let Some(grouped) = emptied.grouping {
+        for record in pack::records_of(vector, grouped, dimension) {
+            changes.delete_vector(record)?;
+        }
+    }
+    if emptied.building.is_some()
+        && let Some(build) = Build::read(&*changes, vector, number)?
+    {
+        for record in build.written(vector, number, dimension) {
+            changes.delete_vector(record)?;
+        }
+    }
+    let first = Key::from_values(&[], &[])?;
+    let mut left: Vec<Key> = Vec::new();
+    changes.vectors(
+        VectorRecord::Left(vector, number, &first),
+        &mut |record, _| match record {
+            VectorRecord::Left(column, partition, key)
+                if (column, partition) == (vector, number) =>
+            {
+                room(&mut left, usize::MAX, held)?;
+                held.grow(key.as_bytes().len() as u64)?;
+                left.push(key.clone());
+                Ok(true)
+            }
+            _ => Ok(false),
+        },
+    )?;
+    for key in &left {
+        changes.delete_vector(VectorRecord::Left(vector, number, key))?;
     }
     Ok(())
 }
@@ -198,11 +264,17 @@ fn touch<'a>(
     tuple: &Key,
     held: &mut Reservation,
 ) -> Result<&'a mut Touched> {
+    // The tuple is copied to look it up: its bytes are taken first, and kept with a new entry.
+    let bytes = tuple.as_bytes().len() as u64 + 64;
+    held.grow(bytes)?;
     Ok(match touched.entry((vector, tuple.clone())) {
-        Entry::Occupied(known) => known.into_mut(),
+        Entry::Occupied(known) => {
+            let known = known.into_mut();
+            held.shrink(bytes);
+            known
+        }
         Entry::Vacant(first) => {
             let was = directory::partition(read, vector, tuple)?;
-            held.grow(tuple.as_bytes().len() as u64 + 64)?;
             let now = was.unwrap_or_default();
             first.insert(Touched { was, now })
         }

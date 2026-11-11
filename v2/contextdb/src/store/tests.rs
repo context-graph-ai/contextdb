@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use lz4_flex::block::{compress_into, get_maximum_output_size};
 use redb::ReadableTable;
 
-use super::{Cell, ChangeSet, Key, Read, Store, TableId, keys, record};
+use super::{
+    Cell, ChangeSet, Compact, Key, Read, Store, TableId, VectorId, VectorRecord, keys, record,
+};
 use crate::memory::Budget;
 use crate::types::{Error, SortDirection, TxId, Uuid, Value};
 
@@ -149,7 +151,7 @@ fn a_row_reads_back_as_written_with_its_large_values_beside_it() {
     ];
 
     let mut kept = Vec::new();
-    let row = record::encode_row(&values, |large| {
+    let row = record::encode_row(&values, &[], |large| {
         kept.push(large.to_vec());
         Ok::<_, ()>(kept.len() as u64 - 1)
     })
@@ -196,7 +198,7 @@ fn a_compressed_value_whose_recorded_length_is_wrong_is_damage_and_takes_no_memo
     let mut changes = ChangeSet::new(store.view().expect("a view"), &budget).expect("begin");
     let row = vec![Value::Int64(1), text(&body)];
     changes
-        .put_row(table, row_key.clone(), row, true)
+        .put_row(table, row_key.clone(), row, Vec::new(), true)
         .expect("stage");
     store.commit(changes).expect("commit");
     drop(store);
@@ -340,7 +342,9 @@ fn store_one_row(folder: &Path, value: Value) {
     let store = Store::open_for_writing(folder, &budget, None).expect("open a fresh store");
     let mut changes = ChangeSet::new(store.view().expect("a view"), &budget).expect("begin");
     let row = vec![Value::Int64(1), value];
-    changes.put_row(table, row_key, row, true).expect("stage");
+    changes
+        .put_row(table, row_key, row, Vec::new(), true)
+        .expect("stage");
     store.commit(changes).expect("commit");
 }
 
@@ -496,4 +500,192 @@ fn a_compressed_json_that_decodes_to_bytes_that_are_not_json_is_damage() {
     let json = Value::Json(serde_json::Value::String("a".repeat(LEN - 2)));
     let wrong = format!("{{{}}}", "a".repeat(LEN - 2));
     a_block_of_other_bytes_is_damage("not-json", &json, wrong.as_bytes());
+}
+
+#[test]
+fn a_key_gives_its_values_back() {
+    let lists = [
+        vec![],
+        vec![Value::Bool(false), Value::Bool(true)],
+        vec![
+            Value::Int64(i64::MIN),
+            Value::Int64(-1),
+            Value::Int64(i64::MAX),
+        ],
+        vec![
+            Value::Float64(-1.5),
+            Value::Float64(0.0),
+            Value::Float64(f64::INFINITY),
+        ],
+        vec![
+            text(""),
+            text("a"),
+            text("a\0b\0"),
+            text("\u{65e5}\u{672c}"),
+        ],
+        vec![Value::Uuid(Uuid::from_u128(7)), Value::Timestamp(-1)],
+        vec![
+            Value::TxId(TxId(u64::MAX)),
+            Value::Null,
+            text("after a NULL"),
+        ],
+    ];
+    for values in lists {
+        let made = key(&values);
+        assert_eq!(made.values(), Some(values.clone()), "{values:?}");
+        assert_eq!(key(&made.values().expect("the values")), made);
+    }
+    // Bytes that are no key of ascending columns: an unknown tag, and a value cut short.
+    assert_eq!(Key::from_bytes(&[0x7F]).values(), None);
+    for whole in [key(&[Value::Int64(5)]), key(&[text("cut")])] {
+        let bytes = whole.as_bytes();
+        let short = Key::from_bytes(&bytes[..bytes.len() - 1]);
+        assert_eq!(short.values(), None, "{bytes:?} without its last byte");
+    }
+}
+
+/// `count` numbers that are each a whole code from -127 to 127 times one scale, with the
+/// scale and the codes.
+fn reduced(count: usize) -> (Vec<f32>, f32, Vec<i8>) {
+    let scale = 0.031_25_f32;
+    let codes: Vec<i8> = (0..count)
+        .map(|at| ((at % 255) as i16 - 127) as i8)
+        .collect();
+    let numbers = codes.iter().map(|code| scale * f32::from(*code)).collect();
+    (numbers, scale, codes)
+}
+
+/// Writes a store of rows 1 to `rows`, each the number and then one vector of `count` reduced
+/// numbers, handed to the store with its scale and codes when `compact`. Returns the bytes of
+/// the data file once the store is closed.
+fn store_vectors(folder: &Path, rows: i64, count: usize, compact: bool) -> u64 {
+    let (numbers, scale, codes) = reduced(count);
+    let budget = Budget::new(None).expect("a budget");
+    let store = Store::open_for_writing(folder, &budget, None).expect("open a fresh store");
+    let mut changes = ChangeSet::new(store.view().expect("a view"), &budget).expect("begin");
+    for id in 1..=rows {
+        let row = vec![Value::Int64(id), Value::Vector(numbers.clone())];
+        let kept = if compact {
+            vec![Compact {
+                at: 1,
+                scale,
+                codes: codes.clone(),
+            }]
+        } else {
+            Vec::new()
+        };
+        changes
+            .put_row(TableId(1), key(&[Value::Int64(id)]), row, kept, true)
+            .expect("stage");
+    }
+    store.commit(changes).expect("commit");
+    drop(store);
+    std::fs::metadata(folder.join("data"))
+        .expect("the data file")
+        .len()
+}
+
+#[test]
+fn a_reduced_vector_reads_back_number_for_number_in_a_quarter_of_the_room() {
+    let folder = fresh_folder("reduced-vector");
+    // 4,000 rows, so that both files are well past the size a data file starts at.
+    let compact = store_vectors(&folder, 4000, 768, true);
+    // 781 bytes stay in the row, and read back as exactly the numbers that were put.
+    let (numbers, ..) = reduced(768);
+    let budget = Budget::new(None).expect("a budget");
+    let store = Store::open_for_writing(&folder, &budget, None).expect("open the store");
+    let view = store.view().expect("a view");
+    for id in [1, 250, 500] {
+        let row = view.row(TableId(1), &key(&[Value::Int64(id)]));
+        let row = row.expect("read the row").expect("the row is there");
+        match &row.cells[1] {
+            Cell::Here(Value::Vector(read)) => {
+                let bits = |numbers: &[f32]| -> Vec<u32> {
+                    numbers.iter().map(|number| number.to_bits()).collect()
+                };
+                assert_eq!(bits(read), bits(&numbers), "row {id}");
+            }
+            other => panic!("the vector of row {id} was read as {other:?}"),
+        }
+    }
+    drop((view, store));
+    let plain_folder = fresh_folder("reduced-vector-plain");
+    let plain = store_vectors(&plain_folder, 4000, 768, false);
+    assert!(
+        3 * compact < plain,
+        "4,000 vectors of 768 numbers take {compact} bytes of file reduced and {plain} as written"
+    );
+    for folder in [folder, plain_folder] {
+        std::fs::remove_dir_all(&folder).expect("remove the test's folder");
+    }
+}
+
+#[test]
+fn a_reduced_record_of_another_length_is_damage() {
+    // 2,000 reduced numbers are a record of 2,013 bytes, kept beside the row.
+    const COUNT: usize = 2000;
+    let folder = fresh_folder("reduced-length");
+    store_vectors(&folder, 1, COUNT, true);
+    let (loaded, beside, _, _) = load_the_value(&folder);
+    assert!(loaded.expect("load the value as it was written") == Value::Vector(reduced(COUNT).0));
+    assert_eq!(
+        beside.bytes,
+        13 + COUNT as u64,
+        "the record of a reduced vector"
+    );
+
+    // The record now says it holds one number more than its bytes do.
+    let data = redb::Database::open(folder.join("data")).expect("open the data file");
+    let write = data.begin_write().expect("begin");
+    {
+        let mut kept = write.open_table(BESIDE).expect("the large values");
+        let first = kept.get(beside.place).expect("read the first slice");
+        let mut first = first.expect("the first slice is there").value().to_vec();
+        assert_eq!(first[0], 0x88, "the tag of a reduced vector");
+        assert_eq!(first[1..9], (COUNT as u64).to_le_bytes());
+        first[1..9].copy_from_slice(&(COUNT as u64 + 1).to_le_bytes());
+        kept.insert(beside.place, first.as_slice())
+            .expect("write the slice");
+    }
+    write.commit().expect("commit");
+    drop(data);
+
+    loading_is_damage(&folder, "a reduced vector whose count is not its bytes'");
+    std::fs::remove_dir_all(&folder).expect("remove the test's folder");
+}
+
+#[test]
+fn the_records_of_a_grouping_keep_their_keys_apart() {
+    use VectorRecord::*;
+    let column = VectorId(3);
+    let (tuple, row) = (key(&[text("a")]), key(&[Value::Int64(1)]));
+    // A partition numbered 5 and its grouping numbered 6: every kind of record of the two.
+    let records = [
+        Partition(column, &tuple),
+        Pending(column, 5, &row),
+        Block(column, 5, 0),
+        Block(column, 6, 0),
+        Grouping(column, 6),
+        Centres(column, 6, 0),
+        Build(column, 5),
+        Assigned(column, 6, 0),
+        Sketch(column, 5, 0),
+        Sketch(column, 6, 0),
+        Mean(column, 5),
+        Left(column, 5, &row),
+    ];
+    let stored = records.map(keys::vector);
+    let apart: std::collections::BTreeSet<&Vec<u8>> = stored.iter().collect();
+    assert_eq!(apart.len(), records.len(), "two records share a key");
+    for (record, stored) in records.iter().zip(&stored) {
+        let mut held = key(&[]);
+        assert_eq!(keys::vector_of(stored, &mut held), Some(*record));
+        // Blocks, centres and sketches are kept together; everything else is small.
+        let large = matches!(record, Block(..) | Centres(..) | Sketch(..));
+        assert_eq!(keys::with_blocks(stored[0]), large, "{record:?}");
+    }
+    // The sketches of a grouping's blocks come in the order of the blocks, before the next
+    // number's.
+    let sketch = |under, block| keys::vector(Sketch(column, under, block));
+    assert!(sketch(6, 0) < sketch(6, 1) && sketch(6, 1) < sketch(7, 0));
 }

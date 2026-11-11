@@ -357,3 +357,125 @@ fn scanner_stopped_inside_its_scan(test: &str, folder: &Path, rows: i64) -> Chil
     scanner.expect("reading");
     scanner
 }
+
+// ---- a reader beside a build ----
+
+const GROUPED: usize = 16;
+
+/// The search of the two tests below, and the vector it asks for.
+fn indexed_ten() -> String {
+    support::by_mode(None, "INDEXED", 10)
+}
+
+fn asked() -> Vec<f32> {
+    support::gathered(97_000, GROUPED)
+}
+
+/// A search's counted work and answer as one line: its distance evaluations, then each key
+/// with the bits of its distance. Two searches of one commit give the same line.
+fn told(result: &contextdb::QueryResult) -> String {
+    let rows: Vec<String> = support::found(result, "the indexed search")
+        .iter()
+        .map(|near| format!("{:?}:{:016x}", near.key, near.distance.to_bits()))
+        .collect();
+    format!("{} {}", result.distance_evaluations(), rows.join(","))
+}
+
+#[test]
+fn a_reader_sees_one_grouping_whole_while_the_writer_builds_and_switches() {
+    if let Some(role) = support::role() {
+        return searcher(&role);
+    }
+    let test = "a_reader_sees_one_grouping_whole_while_the_writer_builds_and_switches";
+    let (folder, db) = support::built("reader-beside-build", GROUPED, "AUTO_INDEX_AT 1000", 2000);
+    let line = |db: &contextdb::Database| told(&support::answer(db, &indexed_ten(), &asked()));
+    let first = line(&db);
+
+    // One reader is stopped halfway through the storage reads of a search of the first
+    // grouping; where halfway is comes from a run of the same search to its end.
+    let lines = Child::start(test, "searcher pause_at=0", &folder).end();
+    assert_eq!(lines.first(), Some(&first), "a search nothing stopped");
+    let reads = support::last_number(&lines, "reads").expect("the reader announces its reads");
+    assert!(reads > 1, "an indexed search made {reads} storage reads");
+    let role = format!("searcher pause_at={}", reads.div_ceil(2));
+    let mut held = Child::start(test, &role, &folder);
+    held.expect("reading");
+
+    // The writer adds a fifth, and builds and switches to the grouping that makes due. The
+    // switch removes every record of the grouping the reader is inside.
+    support::load_docs(&db, 2001..=2400, "a", |n| support::gathered(n, GROUPED));
+    support::upkeep(&db);
+    assert_eq!(
+        support::field(&support::the_partition(&db), "lists"),
+        &Value::Int64(49)
+    );
+    let second = line(&db);
+    assert!(
+        second != first,
+        "the new grouping changed nothing a search tells"
+    );
+
+    // The stopped reader answers from the grouping it began in, whole; its next search, and
+    // a reader that starts now, see the new one.
+    held.tell("go");
+    assert_eq!(
+        held.line().as_ref(),
+        Some(&first),
+        "the search that was stopped"
+    );
+    assert!(held.line().is_some_and(|line| line.starts_with("reads ")));
+    assert_eq!(
+        held.line().as_ref(),
+        Some(&second),
+        "the stopped reader's next search"
+    );
+    held.end();
+    let lines = Child::start(test, "searcher pause_at=0", &folder).end();
+    assert_eq!(
+        lines.first(),
+        Some(&second),
+        "a reader that starts after the switch"
+    );
+}
+
+/// Opens the store for reading and searches once. At storage read number `pause_at` of that
+/// search it announces `reading` and waits for a line; `pause_at` 0 never stops. Then it
+/// announces the answer's line and `reads <n>`, searches once more and announces that line.
+fn searcher(role: &support::Role) {
+    let (door, searching, reads) = support::pausing_at_read(role.number("pause_at"));
+    let mut options = ReadSessionOptions::default();
+    options.storage = Some(door);
+    let reader =
+        ReadSession::open_with_options(&role.folder, options).expect("open the store for reading");
+    searching.store(true, Ordering::SeqCst);
+    let result = support::search(&reader, &indexed_ten(), &asked())
+        .expect("a reader is not refused because a build ran");
+    searching.store(false, Ordering::SeqCst);
+    support::say(told(&result));
+    support::say(format!("reads {}", reads.load(Ordering::SeqCst)));
+    let next = support::search(&reader, &indexed_ten(), &asked()).expect("the next search");
+    support::say(told(&next));
+}
+
+#[test]
+fn a_new_process_searches_a_built_grouping_at_once() {
+    if let Some(role) = support::role() {
+        // Opens the store for writing and searches twice: each answer's line, then how far
+        // the two searches moved the committed position.
+        let db = support::open(&role.folder);
+        let before = db.committed_watermark();
+        for _ in 0..2 {
+            support::say(told(&support::answer(&db, &indexed_ten(), &asked())));
+        }
+        support::say(format!("moved {}", db.committed_watermark().0 - before.0));
+        return;
+    }
+    let test = "a_new_process_searches_a_built_grouping_at_once";
+    let (folder, db) = support::built("first-search", GROUPED, "AUTO_INDEX_AT 1000", 2000);
+    let wanted = told(&support::answer(&db, &indexed_ten(), &asked()));
+    support::close(db);
+    // The first search of a fresh process does the work of its second and of the process
+    // that built the grouping: nothing is built or mended at open.
+    let lines = Child::start(test, "first", &folder).end();
+    assert_eq!(lines, [wanted.clone(), wanted, "moved 0".to_owned()]);
+}

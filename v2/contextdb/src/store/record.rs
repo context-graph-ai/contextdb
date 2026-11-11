@@ -11,10 +11,14 @@
 //! bytes and runs to the end. A text or JSON value of at most 1 MiB is stored compressed when
 //! that saves an eighth of its bytes; a longer one and a vector are always stored plain, and a
 //! value that stays in its row is never touched. Either form reads back as the same value.
+//!
+//! A vector cell that comes with a scale and codes is written in a third form, in its row or
+//! beside it: the tag `0x88`, the count of its numbers as a `u64`, the scale as an `f32` and
+//! one signed byte a number. It reads back as each code times the scale.
 
 use lz4_flex::block::{compress_into, decompress_into, get_maximum_output_size};
 
-use super::{Beside, Cell};
+use super::{Beside, Cell, Compact};
 use crate::memory::Reservation;
 use crate::types::{self, TxId, Uuid, Value};
 
@@ -43,25 +47,40 @@ const JSON: u8 = 7;
 const VECTOR: u8 = 8;
 const TXID: u8 = 9;
 const BESIDE: u8 = 10;
+/// A vector as a scale and one signed byte a number.
+const REDUCED: u8 = 0x88;
+
+/// The tag, the count and the scale in front of the codes of such a vector.
+const REDUCED_FRONT: u64 = 13;
 
 /// Writes a row. The record of each large value is handed to `beside`, which may put the
 /// record's other form in its place, keeps it, and answers with its place. The row's cell
-/// holds the length of what was kept.
+/// holds the length of what was kept. A cell that `compact` names is written as its scale and
+/// codes.
 pub(super) fn encode_row<E>(
     values: &[Value],
+    compact: &[Compact],
     mut beside: impl FnMut(&mut Vec<u8>) -> Result<u64, E>,
 ) -> Result<Vec<u8>, E> {
     let mut row = Vec::new();
     // The record of one value that can be large, so that a large one never passes through
     // the row.
     let mut record = Vec::new();
-    for value in values {
+    for (at, value) in values.iter().enumerate() {
         if !matches!(value, Value::Text(_) | Value::Json(_) | Value::Vector(_)) {
             put_value(&mut row, value);
             continue;
         }
         record.clear();
-        put_value(&mut record, value);
+        match compact.iter().find(|cell| cell.at == at) {
+            Some(cell) => {
+                let count = cell.codes.len() as u64;
+                put(&mut record, REDUCED, &count.to_le_bytes());
+                record.extend(cell.scale.to_le_bytes());
+                record.extend(cell.codes.iter().map(|code| code.cast_unsigned()));
+            }
+            None => put_value(&mut record, value),
+        }
         if record.len() > BESIDE_FROM {
             let place = beside(&mut record)?;
             row.push(BESIDE);
@@ -84,7 +103,10 @@ pub(super) fn encode_row<E>(
 pub(super) fn compress(record: &mut Vec<u8>, reservation: &mut Reservation) -> u64 {
     let len = record.len() - FRONT;
     let room = get_maximum_output_size(len);
-    if record[0] == VECTOR || len > COMPRESS_TO || reservation.grow(room as u64).is_err() {
+    if matches!(record[0], VECTOR | REDUCED)
+        || len > COMPRESS_TO
+        || reservation.grow(room as u64).is_err()
+    {
         return 0;
     }
     let mut block = vec![0; room];
@@ -172,6 +194,17 @@ pub(super) fn load(
     let Some(front) = stored.first_chunk::<FRONT>() else {
         return Ok(Err("a large value is shorter than its tag and length"));
     };
+    if front[0] == REDUCED {
+        let count = u64::from_le_bytes(take_array(&mut &front[1..]));
+        if (stored.len() as u64).checked_sub(REDUCED_FRONT) != Some(count) {
+            return Ok(Err("a reduced vector gives a length its bytes are not"));
+        }
+        // The numbers are four bytes each where the record has one.
+        reservation.grow(4 * count)?;
+        let value = decode_value(&stored);
+        reservation.shrink(REDUCED_FRONT - FRONT as u64 + count);
+        return Ok(Ok(value));
+    }
     if front[0] & COMPRESSED != 0 {
         let len = u64::from_le_bytes(take_array(&mut &front[1..]));
         // No LZ4 block decodes to more than 255 times its own bytes.
@@ -238,6 +271,16 @@ fn take_value(tag: u8, bytes: &mut &[u8]) -> Value {
             Value::Vector(
                 numbers
                     .map(|number| f32::from_le_bytes(std::array::from_fn(|at| number[at])))
+                    .collect(),
+            )
+        }
+        REDUCED => {
+            let count = u64::from_le_bytes(take_array(bytes));
+            let scale = f32::from_le_bytes(take_array(bytes));
+            let codes = take(bytes, count as usize).iter();
+            Value::Vector(
+                codes
+                    .map(|code| scale * f32::from(code.cast_signed()))
                     .collect(),
             )
         }

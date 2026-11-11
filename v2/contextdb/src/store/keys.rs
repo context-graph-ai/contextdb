@@ -12,7 +12,7 @@
 use std::ops::Bound;
 
 use super::{Key, VectorId, VectorRecord};
-use crate::types::{Error, Result, SortDirection, Value};
+use crate::types::{Error, Result, SortDirection, TxId, Uuid, Value};
 
 /// No value's form begins with this byte, turned or not, so a key followed by it sorts after
 /// every key that begins with that key and before every other key above it.
@@ -117,6 +117,20 @@ pub(super) fn stored(id: u32, key: &[u8]) -> Vec<u8> {
 pub(super) const BLOCK: u8 = 0;
 const PARTITION: u8 = 1;
 const PENDING: u8 = 2;
+const GROUPING: u8 = 3;
+/// The first byte of the stored key of a record of centres, which is kept with the blocks.
+pub(super) const CENTRES: u8 = 4;
+const BUILD: u8 = 5;
+const ASSIGNED: u8 = 6;
+/// The first byte of the stored key of a record of sketches, which is kept with the blocks.
+pub(super) const SKETCH: u8 = 7;
+const MEAN: u8 = 8;
+const LEFT: u8 = 9;
+
+/// True for the kinds of record that are kept in the table of blocks.
+pub(super) fn with_blocks(kind: u8) -> bool {
+    kind == BLOCK || kind == CENTRES || kind == SKETCH
+}
 
 /// A record of the vector part as the data file keys it: one byte for its kind, the column,
 /// and then the rest of its fields in order, every number most significant byte first. So the
@@ -136,6 +150,34 @@ pub(super) fn vector(record: VectorRecord<'_>) -> Vec<u8> {
             let numbers = [number(column.0), number(partition)];
             [&[PENDING][..], numbers.as_flattened(), &row.0].concat()
         }
+        VectorRecord::Grouping(column, grouping) => {
+            let numbers = [number(column.0), number(grouping)];
+            [&[GROUPING][..], numbers.as_flattened()].concat()
+        }
+        VectorRecord::Centres(column, grouping, place) => {
+            let numbers = [number(column.0), number(grouping), number(place)];
+            [&[CENTRES][..], numbers.as_flattened()].concat()
+        }
+        VectorRecord::Build(column, partition) => {
+            let numbers = [number(column.0), number(partition)];
+            [&[BUILD][..], numbers.as_flattened()].concat()
+        }
+        VectorRecord::Assigned(column, grouping, place) => {
+            let numbers = [number(column.0), number(grouping), number(place)];
+            [&[ASSIGNED][..], numbers.as_flattened()].concat()
+        }
+        VectorRecord::Sketch(column, under, block) => {
+            let numbers = [number(column.0), number(under), number(block)];
+            [&[SKETCH][..], numbers.as_flattened()].concat()
+        }
+        VectorRecord::Mean(column, partition) => {
+            let numbers = [number(column.0), number(partition)];
+            [&[MEAN][..], numbers.as_flattened()].concat()
+        }
+        VectorRecord::Left(column, partition, row) => {
+            let numbers = [number(column.0), number(partition)];
+            [&[LEFT][..], numbers.as_flattened(), &row.0].concat()
+        }
     }
 }
 
@@ -151,10 +193,70 @@ pub(super) fn vector_of<'a>(stored: &[u8], key: &'a mut Key) -> Option<VectorRec
             key.0.extend_from_slice(&stored[5..]);
             VectorRecord::Partition(column, key)
         }
-        _ => {
+        PENDING => {
             let partition = number(5)?;
             key.0.extend_from_slice(&stored[9..]);
             VectorRecord::Pending(column, partition, key)
         }
+        GROUPING => VectorRecord::Grouping(column, number(5)?),
+        CENTRES => VectorRecord::Centres(column, number(5)?, number(9)?),
+        BUILD => VectorRecord::Build(column, number(5)?),
+        ASSIGNED => VectorRecord::Assigned(column, number(5)?, number(9)?),
+        SKETCH => VectorRecord::Sketch(column, number(5)?, number(9)?),
+        MEAN => VectorRecord::Mean(column, number(5)?),
+        LEFT => {
+            let partition = number(5)?;
+            key.0.extend_from_slice(&stored[9..]);
+            VectorRecord::Left(column, partition, key)
+        }
+        _ => return None,
     })
+}
+
+/// The values a key of ascending columns was made from; `None` for bytes that are no such key.
+pub(super) fn decode(mut key: &[u8]) -> Option<Vec<Value>> {
+    let whole = |bytes: [u8; 8]| i64::from_be_bytes(bytes) ^ i64::MIN;
+    let mut values = Vec::new();
+    while let Some([tag]) = take(&mut key) {
+        values.push(match tag {
+            0xFE => Value::Null,
+            1 => Value::Bool(take::<1>(&mut key)? != [0]),
+            2 => Value::Int64(whole(take(&mut key)?)),
+            3 => {
+                let ordered = u64::from_be_bytes(take(&mut key)?);
+                let bits = if ordered >> 63 == 0 {
+                    !ordered
+                } else {
+                    ordered ^ (1 << 63)
+                };
+                Value::Float64(f64::from_bits(bits))
+            }
+            4 => {
+                let mut text = Vec::new();
+                loop {
+                    match take(&mut key)? {
+                        [0] => match take(&mut key)? {
+                            [0] => break,
+                            [0xFF] => text.push(0),
+                            _ => return None,
+                        },
+                        [byte] => text.push(byte),
+                    }
+                }
+                Value::Text(String::from_utf8(text).ok()?)
+            }
+            5 => Value::Uuid(Uuid::from_bytes(take(&mut key)?)),
+            6 => Value::Timestamp(whole(take(&mut key)?)),
+            7 => Value::TxId(TxId(u64::from_be_bytes(take(&mut key)?))),
+            _ => return None,
+        });
+    }
+    Some(values)
+}
+
+/// The next bytes of a key, `None` when it is cut short.
+fn take<const N: usize>(key: &mut &[u8]) -> Option<[u8; N]> {
+    let (taken, rest) = key.split_first_chunk()?;
+    *key = rest;
+    Some(*taken)
 }

@@ -12,6 +12,8 @@ stmt = _{
     | update_stmt
     | set_memory_limit
     | show_memory_limit
+    | show_vector_indexes
+    | show_vector_partitions
     | select_stmt
     | later
 }
@@ -25,8 +27,7 @@ stmt = _{
 later = { later_name ~ ANY* }
 later_name = @{
     (
-        ^"SHOW" ~ SPACE+ ~ (^"VECTOR_INDEXES" | ^"VECTOR_PARTITIONS")
-        | ^"ALTER" | ^"DROP" | ^"WITH" | ^"BEGIN" | ^"COMMIT" | ^"ROLLBACK" | ^"PURGE" | ^"DISCARD"
+        ^"ALTER" | ^"DROP" | ^"WITH" | ^"BEGIN" | ^"COMMIT" | ^"ROLLBACK" | ^"PURGE" | ^"DISCARD"
         | ^"DECLARE" | ^"DISTINCT" | ^"GRAPH_TABLE"
         | ((^"LEFT" | ^"INNER" | ^"CROSS") ~ SPACE+)? ~ ^"JOIN"
         | ^"GROUP" ~ SPACE+ ~ ^"BY" | ^"HAVING" | ^"UNION" | ^"OFFSET"
@@ -35,7 +36,7 @@ later_name = @{
         | (^"NOT" ~ SPACE+)? ~ (^"LIKE" | ^"BETWEEN")
         | ^"FOREIGN" ~ SPACE+ ~ ^"KEY" | ^"REFERENCES" | ^"EXPIRES" | ^"IMMUTABLE"
         | ^"RANK_POLICY" | ^"CONTEXT_ID" | ^"SCOPE_LABEL_READ" | ^"SCOPE_LABEL" | ^"ACL"
-        | ^"AUTO_INDEX_AT" | ^"SEARCH" | ^"IVF" | ^"CONSOLIDATION"
+        | ^"SEARCH" | ^"IVF"
         | ^"RETAIN" | ^"HISTORY" | ^"SYNC" | ^"STATE_MACHINE" | ^"STATE" ~ SPACE+ ~ ^"MACHINE"
         | ^"DAG" | ^"PROPAGATE" | ^"DELIVERY" ~ SPACE+ ~ ^"MANIFEST"
         | ^"EDGE" ~ SPACE+ ~ ^"DISCARD" | ^"MAINTAIN" ~ SPACE+ ~ ^"COUNT"
@@ -51,6 +52,13 @@ set_memory_limit = { ^"SET" ~ ^"MEMORY_LIMIT" ~ "="? ~ ("'" ~ memory_limit_value
 show_memory_limit = { ^"SHOW" ~ ^"MEMORY_LIMIT" }
 memory_limit_value = { ^"none" | size_with_unit }
 size_with_unit = @{ ASCII_DIGIT+ ~ ("G" | "M" | "K") }
+
+show_vector_indexes = { ^"SHOW" ~ ^"VECTOR_INDEXES" }
+show_vector_partitions = {
+    ^"SHOW" ~ ^"VECTOR_PARTITIONS" ~ (^"FOR" ~ identifier ~ "." ~ identifier)?
+    ~ (limit_clause ~ offset_clause?)?
+}
+offset_clause = { ^"OFFSET" ~ integer }
 
 select_stmt = {
     ^"SELECT"
@@ -92,11 +100,28 @@ data_type = {
 }
 vector_type = {
     ^"VECTOR" ~ "(" ~ integer ~ ")"
-    ~ partition_key? ~ (^"MAX_PARTITIONS" ~ partition_count)? ~ (^"SEARCH_MODE" ~ search_mode)?
+    ~ quantization? ~ partition_key? ~ max_partitions? ~ (^"SEARCH_MODE" ~ search_mode)?
+    ~ auto_index_at? ~ consolidation?
+    // WITH stands first or nowhere: after another clause it is no clause of a later version.
+    ~ !(^"WITH" ~ !ident_char)
 }
+quantization = { ^"WITH" ~ "(" ~ ^"quantization" ~ "=" ~ string ~ ")" }
 partition_key = { ^"PARTITION_KEY" ~ "(" ~ identifier ~ ("," ~ identifier)* ~ ")" }
+max_partitions = { ^"MAX_PARTITIONS" ~ signed }
+auto_index_at = { ^"AUTO_INDEX_AT" ~ signed }
+consolidation = {
+    ^"CONSOLIDATION"
+    ~ (
+        ^"NONE"
+        | "("
+          ~ (change_percent ~ ("," ~ tombstone_percent)? | tombstone_percent ~ ("," ~ change_percent)?)
+          ~ ")"
+    )
+}
+change_percent = { ^"CHANGE_PERCENT" ~ "=" ~ signed }
+tombstone_percent = { ^"TOMBSTONE_PERCENT" ~ "=" ~ signed }
 // Read with its sign, so that `schema` refuses zero and a negative number by their kind.
-partition_count = @{ "-"? ~ ASCII_DIGIT+ }
+signed = @{ "-"? ~ ASCII_DIGIT+ }
 column_constraint = _{ not_null | nullable_marker | primary_key | unique | default_clause }
 not_null = { ^"NOT" ~ ^"NULL" }
 nullable_marker = { ^"NULL" }

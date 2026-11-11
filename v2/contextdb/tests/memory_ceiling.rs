@@ -450,3 +450,91 @@ fn one_cycle_under_the_limit(role: &support::Role) {
     support::say(format!("before {before}"));
     support::say(format!("peak {}", ALLOCATED.peak.load(Ordering::Relaxed)));
 }
+
+// ---- a build and an indexed search under the limit ----
+
+/// The limit of the build test: the cache's 8 MiB, the open's ninth, and room for the steps.
+const BUILD_LIMIT: usize = 16 << 20;
+
+#[test]
+fn an_indexed_search_and_a_build_stay_under_the_limit() {
+    if let Some(role) = support::role() {
+        return a_build_under_the_limit(&role);
+    }
+    let folder = support::folder("build-under-the-limit");
+    let db = support::open(&folder);
+    write_the_filler(&db);
+    support::declare_docs(&db, 64, "AUTO_INDEX_AT 1000");
+    support::load_docs(&db, 1..=2000, "a", |n| support::gathered(n, 64));
+    support::close(db);
+
+    let lines = support::Child::start(
+        "an_indexed_search_and_a_build_stay_under_the_limit",
+        "builder",
+        &folder,
+    )
+    .end();
+    let refused: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.starts_with("refused "))
+        .collect();
+    assert!(refused.is_empty(), "under {BUILD_LIMIT} bytes: {refused:?}");
+    let told = |key: &str| support::last_number(&lines, key);
+    assert_eq!(
+        (told("stalled"), told("lists"), told("rows")),
+        (Some(0), Some(45), Some(10)),
+        "the build's stalled partitions and groups, and the rows of the indexed search"
+    );
+    // What the process took for the store, from before the open to the end, every step of
+    // the build and the search included, is within the limit. Each began with the cache full.
+    let before = told("before").expect("the builder announces it");
+    let peak = told("peak").expect("the builder announces it");
+    assert!(
+        peak <= before + BUILD_LIMIT as u64,
+        "with {before} bytes allocated before the store was opened, the process reached {peak}: \
+         {} bytes on the store's account under a limit of {BUILD_LIMIT}",
+        peak - before
+    );
+}
+
+/// Opens the store under [`BUILD_LIMIT`] and, with the cache filled before each, runs every
+/// maintenance cycle and one indexed search. Announces `refused <the refusal>` for a cycle or
+/// a search that was refused, `stalled <partitions>`, `lists <groups>`, `rows <returned>`,
+/// and, once the store is closed, `before <bytes>` and `peak <bytes>` as the sealing test does.
+fn a_build_under_the_limit(role: &support::Role) {
+    let before = ALLOCATED.now.load(Ordering::Relaxed);
+    ALLOCATED.peak.store(before, Ordering::Relaxed);
+    let mut options = DatabaseOpenOptions::default();
+    options.memory_limit = Some(BUILD_LIMIT);
+    let db = support::open_with(&role.folder, options).expect("open the store under the limit");
+    for _ in 0..100 {
+        fill_the_cache(&db);
+        match db.run_maintenance_cycle() {
+            Ok(report) => {
+                let report = report.vector;
+                support::say(format!("stalled {}", report.stalled_partitions));
+                if report.maintenance_vectors_remaining == 0
+                    && report.remaining_partitions <= report.stalled_partitions
+                {
+                    break;
+                }
+            }
+            Err(error) => {
+                support::say(format!("refused {error:?}"));
+                break;
+            }
+        }
+    }
+    if let Value::Int64(lists) = support::field(&support::the_partition(&db), "lists") {
+        support::say(format!("lists {lists}"));
+    }
+    fill_the_cache(&db);
+    let query = support::gathered(93_000, 64);
+    match support::search(&db, &support::by_mode(None, "INDEXED", 10), &query) {
+        Ok(result) => support::say(format!("rows {}", result.rows().len())),
+        Err(error) => support::say(format!("refused {error:?}")),
+    }
+    support::close(db);
+    support::say(format!("before {before}"));
+    support::say(format!("peak {}", ALLOCATED.peak.load(Ordering::Relaxed)));
+}

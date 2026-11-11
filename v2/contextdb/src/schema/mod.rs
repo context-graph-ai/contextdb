@@ -57,7 +57,47 @@ pub(crate) struct VectorColumn {
     pub max_partitions: Option<u32>,
     /// SEARCH_MODE as declared; `None` when the declaration names none.
     pub search_mode: Option<VectorSearchMode>,
+    /// AUTO_INDEX_AT as declared; `None` when the declaration names none.
+    pub auto_index_at: Option<u64>,
+    /// CONSOLIDATION as declared; `None` when the declaration names none.
+    pub consolidation: Option<Consolidation>,
+    /// How the column keeps a vector: what `WITH (quantization = ...)` declared.
+    pub quantization: Quantization,
 }
+
+/// What `CONSOLIDATION` declares: when the vectors written since a partition was grouped, and
+/// the slots its rows have left behind, call for grouping it again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Consolidation {
+    /// `CONSOLIDATION NONE`: never for those reasons.
+    None,
+    /// `CONSOLIDATION (CHANGE_PERCENT = n, TOMBSTONE_PERCENT = n)`; a member that was not
+    /// written is `None` and takes its default.
+    Percent {
+        change: Option<u8>,
+        tombstone: Option<u8>,
+    },
+}
+
+/// How a VECTOR column keeps its vectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Quantization {
+    /// Every number as it was written, in 32 bits.
+    #[default]
+    F32,
+    /// One scale and one byte a number: a write keeps the nearest such vector.
+    Sq8,
+}
+
+/// AUTO_INDEX_AT of a column that declares none: a comparison of every vector of this many
+/// takes about a hundredth of a second on one core, and past it the groupings are worth using.
+const DEFAULT_INDEX_AT: u64 = 100_000;
+/// A partition is given its first grouping when it holds this share of AUTO_INDEX_AT: one in
+/// a hundred, so that the groupings of a store spread over many partitions are in place before
+/// AUTO begins to use them.
+const GROUPED_SHARE: u64 = 100;
+/// CHANGE_PERCENT and TOMBSTONE_PERCENT of a column that declares none.
+const DEFAULT_CONSOLIDATION: (u8, u8) = (20, 10);
 
 impl VectorColumn {
     /// The most partitions the column may have: what was declared, 256 when a PARTITION_KEY
@@ -72,6 +112,32 @@ impl VectorColumn {
     pub(crate) fn mode(&self) -> VectorSearchMode {
         self.search_mode.unwrap_or_default()
     }
+
+    /// AUTO_INDEX_AT in force: what was declared, else 100,000. The count of vectors in the
+    /// selected partitions together from which AUTO uses their groupings.
+    pub(crate) fn index_at(&self) -> u64 {
+        self.auto_index_at.unwrap_or(DEFAULT_INDEX_AT)
+    }
+
+    /// How many slots a partition's tail holds when its first grouping is due: a hundredth of
+    /// AUTO_INDEX_AT in force and one at least, so 1,000 where nothing is declared.
+    pub(crate) fn grouped_from(&self) -> u64 {
+        (self.index_at() / GROUPED_SHARE).max(1)
+    }
+
+    /// CHANGE_PERCENT and TOMBSTONE_PERCENT in force, 20 and 10 where none was declared;
+    /// `None` under `CONSOLIDATION NONE`.
+    pub(crate) fn consolidation(&self) -> Option<(u8, u8)> {
+        let (change, tombstone) = DEFAULT_CONSOLIDATION;
+        match self.consolidation {
+            None => Some((change, tombstone)),
+            Some(Consolidation::None) => None,
+            Some(Consolidation::Percent {
+                change: c,
+                tombstone: t,
+            }) => Some((c.unwrap_or(change), t.unwrap_or(tombstone))),
+        }
+    }
 }
 
 impl Table {
@@ -79,6 +145,16 @@ impl Table {
     /// column or the column is of another type.
     pub(crate) fn vector(&self, column: &str) -> Option<&VectorColumn> {
         self.vectors.iter().find(|vector| vector.column == column)
+    }
+
+    /// How many numbers a vector of this VECTOR column has.
+    pub(crate) fn dimension(&self, column: &VectorColumn) -> usize {
+        let columns = self.meta.columns.iter();
+        let mut sizes = columns.filter_map(|declared| match declared.column_type {
+            ColumnType::Vector(size) if declared.name == column.column => Some(size),
+            _ => None,
+        });
+        sizes.next().unwrap_or_default()
     }
 
     /// The column as a refusal names it.

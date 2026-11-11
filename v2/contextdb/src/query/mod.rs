@@ -7,6 +7,7 @@
 
 mod access;
 mod expression;
+mod inspect;
 mod search;
 #[cfg(test)]
 mod tests;
@@ -16,6 +17,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 pub(crate) use expression::eval;
+pub(crate) use inspect::explain;
 pub(crate) use search::vector_from_text;
 
 use crate::memory::{Budget, Reservation};
@@ -37,6 +39,7 @@ pub struct QueryResult {
     rows: Vec<Vec<Value>>,
     rows_affected: u64,
     rows_examined: u64,
+    distance_evaluations: u64,
     /// Never read: held so that the memory the rows take stays counted against the limit, and
     /// dropping it with the result gives that memory back.
     _reservation: Option<Reservation>,
@@ -49,6 +52,7 @@ impl fmt::Debug for QueryResult {
             .field("rows", &self.rows)
             .field("rows_affected", &self.rows_affected)
             .field("rows_examined", &self.rows_examined)
+            .field("distance_evaluations", &self.distance_evaluations)
             .finish_non_exhaustive()
     }
 }
@@ -76,6 +80,18 @@ impl QueryResult {
         self.rows_examined
     }
 
+    /// How many distance evaluations a similarity search made to produce this result: the
+    /// group centres it compared with the vector searched for, the sketches it estimated, the
+    /// stored vectors it screened through their one-byte copies, and the rows whose distance
+    /// it worked out. An exact count, the same on every run over the same store, and zero for
+    /// any other statement. A search that used the index usually made fewer than the same
+    /// search under `USE VECTOR EXACT`, and can make more: where it leaves few groups out, or
+    /// goes over its sketches again because rows were turned away, the sketches it estimates
+    /// come to more than the stored vectors EXACT screens.
+    pub fn distance_evaluations(&self) -> u64 {
+        self.distance_evaluations
+    }
+
     /// The result of a write that changed `rows` rows.
     pub(crate) fn affected(rows: u64) -> QueryResult {
         QueryResult {
@@ -92,6 +108,7 @@ impl QueryResult {
             rows,
             rows_affected: 0,
             rows_examined: 0,
+            distance_evaluations: 0,
             _reservation: None,
         }
     }
@@ -145,6 +162,9 @@ pub(crate) fn run(
 ) -> Result<QueryResult> {
     if let Some(found) = search::run(plan, params, catalog, read, budget, now)? {
         return Ok(found);
+    }
+    if let Some(shown) = inspect::show(plan, catalog, read, budget)? {
+        return Ok(shown);
     }
     let select = Select::of(plan)?;
     let table = catalog
@@ -265,6 +285,7 @@ pub(crate) fn run(
         rows,
         rows_affected: 0,
         rows_examined: examined,
+        distance_evaluations: 0,
         _reservation: Some(reservation),
     })
 }

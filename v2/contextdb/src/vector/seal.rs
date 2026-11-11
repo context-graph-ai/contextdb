@@ -2,6 +2,8 @@
 
 use super::block::{BLOCK_BYTES, BROKEN, BlockReader, BlockWriter};
 use super::directory;
+use super::grouping;
+use super::sketch::{sketch_len, sketches_of};
 use super::tally::{position, tuples};
 use crate::memory::{Budget, Reservation};
 use crate::schema::Catalog;
@@ -24,17 +26,20 @@ const WAITING: &str = "a pending record of the vector part is of no row with a v
 /// Stages the sealing of the first `most` pending vectors, in the order of column number,
 /// partition number and row key.
 ///
-/// The vectors of a partition are added to its last block while that block has room and to new
-/// blocks after it, so every block of a partition but the last is full. Each is read from its
-/// row at full precision, one at a time, and its pending record is removed. Nothing is staged
-/// when nothing is pending.
+/// The vectors of a partition are added to its last tail block while that block has room and
+/// is not closed, and to new blocks after it, so every block from the first that is not closed
+/// on but the last is full. Each is read from its row at full precision, one at a time, and
+/// its pending record is removed. In a partition that has a mean every block that is staged
+/// comes with the record of its sketches, each taken from the mean. Nothing is staged when
+/// nothing is pending.
 ///
 /// Every byte is reserved before it is taken. The blocks, the removals and the partition
 /// records it stages are charged to the change set's reservation as they are staged. What it
 /// works with is held by one reservation it takes from `budget`, named `maintenance`: the keys
 /// of the pending records it collected, one block being put together (`BLOCK_BYTES`, taken once
-/// and kept for the call), the partition record it is adding to, and one row with its vector,
-/// given back before the next is read.
+/// and kept for the call), the partition record it is adding to, the partition's mean, the
+/// record of one block's sketches until it is staged, and one row with its vector, given back
+/// before the next is read.
 ///
 /// A pending record, a partition record, a block or a count that does not agree with the rows
 /// is `StoreCorrupted`, and nothing is staged.
@@ -108,13 +113,7 @@ fn seal_partition(
                 following = Some((vector, number));
                 return Ok(false);
             }
-            // No place left: the list is made again with as many more, the old held until then.
-            if keys.len() == keys.capacity() {
-                let more = keys.capacity().max(4).min(most - keys.len());
-                held.grow(((keys.len() + more) * size_of::<Key>()) as u64)?;
-                keys.reserve_exact(more);
-                held.shrink((keys.len() * size_of::<Key>()) as u64);
-            }
+            room(&mut keys, most, held)?;
             held.grow(key.as_bytes().len() as u64)?;
             keys.push(key.clone());
             Ok(keys.len() < most)
@@ -138,15 +137,28 @@ fn seal_partition(
     let partition = directory::partition(&*changes, vector, &tuple)?;
     let mut partition = partition.ok_or_else(|| changes.damaged(WAITING))?;
 
-    // Its last block is added to while it has room. A writer is made, after the block before
-    // it is staged, with room for exactly the slots still to come, which `left` counts.
-    let mut block = partition.blocks.saturating_sub(1);
-    let last = VectorRecord::Block(vector, number, block);
+    // The mean is read once, and held until the partition is done.
+    let mean = partition
+        .mean
+        .then(|| grouping::mean(&*changes, vector, number, dimension, held))
+        .transpose()?;
+    let mean = mean.as_deref();
+
+    // Its last block is added to while it has room and is not closed. A writer is made, after
+    // the block before it is staged, with room for exactly the slots still to come, which
+    // `left` counts.
+    let open = partition.blocks > partition.closed;
+    let mut block = partition.blocks - u32::from(open);
     let begun = |last: &[u8]| {
         let whole = BlockReader::new(last, dimension).is_whole();
         whole.then(|| BlockWriter::new(dimension, Some(last), &keys))
     };
-    let (mut writer, mut left) = match directory::kept(&*changes, last, begun)? {
+    let last = if open {
+        directory::kept(&*changes, VectorRecord::Block(vector, number, block), begun)?
+    } else {
+        None
+    };
+    let (mut writer, mut left) = match last {
         Some(begun) => begun.ok_or_else(|| changes.damaged(BROKEN))?,
         None => BlockWriter::new(dimension, None, &keys),
     };
@@ -169,8 +181,7 @@ fn seal_partition(
         if left == 0 {
             // A block that was full before this call is left as it is.
             if !writer.is_empty() {
-                let record = VectorRecord::Block(vector, number, block);
-                put_block(changes, held, record, writer)?;
+                put_block(changes, held, (vector, number, block), writer, mean)?;
             }
             block += 1;
             (writer, left) = BlockWriter::new(dimension, None, &keys[done..]);
@@ -181,30 +192,59 @@ fn seal_partition(
         held.shrink(held.bytes() - taken);
         changes.delete_vector(VectorRecord::Pending(vector, number, key))?;
     }
-    let record = VectorRecord::Block(vector, number, block);
-    put_block(changes, held, record, writer)?;
+    put_block(changes, held, (vector, number, block), writer, mean)?;
     partition.blocks = block + 1;
-    changes.put_vector(VectorRecord::Partition(vector, &tuple), partition.encode())?;
     let sealed = keys.len() as u64;
+    partition.slots += sealed;
+    partition.sealed += sealed;
+    changes.put_vector(VectorRecord::Partition(vector, &tuple), partition.encode())?;
     let left = remaining.checked_sub(sealed);
     let left = left.ok_or_else(|| changes.damaged(directory::SHORT))?;
     changes.put_vector_number(VectorNumber::Pending, left)?;
     Ok((sealed, following))
 }
 
-/// Stages a block of `bytes` bytes. `finish` makes those bytes while the writer still holds
-/// its own, so they are asked for before it. When it returns the writer's own are gone, and
-/// the finished block is the one block the call keeps `BLOCK_BYTES` for: what was asked is
-/// given back, and the change set counts the block once, as the record it stages.
+/// Stages a block of `bytes` bytes under its column, the number its blocks are kept under and
+/// its own. `finish` makes those bytes while the writer still holds its own, so they are asked
+/// for before it. When it returns the writer's own are gone, and the finished block is the one
+/// block the call keeps `BLOCK_BYTES` for: what was asked is given back, and the change set
+/// counts the block once, as the record it stages.
+///
+/// With the `mean` of a partition that has one, the record of the block's sketches is staged
+/// under the same numbers, each sketch taken from the mean: its bytes are asked for before
+/// they are made and given back when the change set counts them.
 fn put_block(
     changes: &mut ChangeSet,
     held: &mut Reservation,
-    record: VectorRecord<'_>,
+    (vector, under, number): (VectorId, u32, u32),
     writer: BlockWriter,
+    mean: Option<&[f32]>,
 ) -> Result<()> {
     let bytes = writer.bytes();
     held.grow(bytes as u64)?;
     let block = writer.finish();
     held.shrink(bytes as u64);
-    changes.put_vector(record, block)
+    if let Some(mean) = mean {
+        let slots = BlockReader::new(&block, mean.len()).len();
+        let bytes = (4 + slots * sketch_len(mean.len())) as u64;
+        held.grow(bytes)?;
+        let sketches = sketches_of(&block, mean.len(), &mut |_| mean);
+        held.shrink(bytes);
+        changes.put_vector(VectorRecord::Sketch(vector, under, number), sketches)?;
+    }
+    changes.put_vector(VectorRecord::Block(vector, under, number), block)
+}
+
+/// Makes room for one more entry in a list that has no place left: the list is made again
+/// with as many more, and never past `most` entries, the bytes of the new one taken from
+/// `held` before it is made and those of the old one given back once it is gone. What an
+/// entry points at is the caller's to take.
+pub(super) fn room<T>(list: &mut Vec<T>, most: usize, held: &mut Reservation) -> Result<()> {
+    if list.len() == list.capacity() {
+        let more = list.capacity().max(4).min(most - list.len());
+        held.grow(((list.len() + more) * size_of::<T>()) as u64)?;
+        list.reserve_exact(more);
+        held.shrink((list.len() * size_of::<T>()) as u64);
+    }
+    Ok(())
 }

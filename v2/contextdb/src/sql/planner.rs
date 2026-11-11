@@ -54,6 +54,16 @@ pub(super) fn plan(statement: &Statement) -> Result<PhysicalPlan> {
         Statement::Select(select) => plan_select(select)?,
         Statement::SetMemoryLimit(limit) => PhysicalPlan::SetMemoryLimit(limit.clone()),
         Statement::ShowMemoryLimit => PhysicalPlan::ShowMemoryLimit,
+        Statement::ShowVectorIndexes => PhysicalPlan::ShowVectorIndexes,
+        Statement::ShowVectorPartitions {
+            column,
+            limit,
+            offset,
+        } => PhysicalPlan::ShowVectorPartitions {
+            column: column.clone(),
+            limit: *limit,
+            offset: *offset,
+        },
     })
 }
 

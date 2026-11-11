@@ -44,7 +44,7 @@ pub(crate) fn distance(stored: &[f32], query: &[f32]) -> f64 {
 }
 
 /// The length of a vector, in 64 bits: the square of the largest `f32` does not fit in 32.
-fn length(vector: &[f32]) -> f64 {
+pub(super) fn length(vector: &[f32]) -> f64 {
     let squares = vector.iter().map(|x| f64::from(*x) * f64::from(*x));
     squares.sum::<f64>().sqrt()
 }
@@ -76,22 +76,27 @@ pub(super) fn write_slot(vector: &[f32], out: &mut [u8]) {
     out[4..SLOT_HEADER].copy_from_slice(&error.to_le_bytes());
 }
 
-/// The codes of a slot multiplied by the numbers of `unit` and added up, in 32 bits. Sixteen
-/// sums run side by side, so the compiler turns the loop into the widest instructions of the
-/// machine the library is built for.
-fn product(codes: &[u8], unit: &[f32]) -> f32 {
+/// The numbers `number` gives for `kept` multiplied by the numbers of `unit` and added up, in
+/// 32 bits. Sixteen sums run side by side, so the compiler turns the loop into the widest
+/// instructions of the machine the library is built for.
+pub(super) fn summed<T: Copy>(kept: &[T], unit: &[f32], number: impl Fn(T) -> f32) -> f32 {
     let mut lanes = [0.0_f32; 16];
-    let (code_runs, code_rest) = codes.as_chunks::<16>();
+    let (kept_runs, kept_rest) = kept.as_chunks::<16>();
     let (unit_runs, unit_rest) = unit.as_chunks::<16>();
-    for (codes, unit) in code_runs.iter().zip(unit_runs) {
-        for ((lane, code), number) in lanes.iter_mut().zip(codes).zip(unit) {
-            *lane += f32::from(code.cast_signed()) * number;
+    for (kept, unit) in kept_runs.iter().zip(unit_runs) {
+        for ((lane, one), other) in lanes.iter_mut().zip(kept).zip(unit) {
+            *lane += number(*one) * other;
         }
     }
-    for ((lane, code), number) in lanes.iter_mut().zip(code_rest).zip(unit_rest) {
-        *lane += f32::from(code.cast_signed()) * number;
+    for ((lane, one), other) in lanes.iter_mut().zip(kept_rest).zip(unit_rest) {
+        *lane += number(*one) * other;
     }
     lanes.iter().sum()
+}
+
+/// The codes of a slot multiplied by the numbers of `unit` and added up, by [`summed`].
+pub(super) fn product(codes: &[u8], unit: &[f32]) -> f32 {
+    summed(codes, unit, |code| f32::from(code.cast_signed()))
 }
 
 /// What a search works out once from its vector and then uses for every slot it screens.
@@ -141,6 +146,11 @@ impl Screen {
         }
     }
 
+    /// The vector of the search at length one.
+    pub(super) fn unit(&self) -> &[f32] {
+        &self.unit
+    }
+
     /// The range that the similarity of a slot's vector is proven to lie in: `(low, high)`
     /// with `low <= 1 - distance(x, query) <= high` for the vector `x` the slot was written
     /// from.
@@ -188,5 +198,53 @@ impl Screen {
             ((middle - half) as f32).next_down(),
             ((middle + half) as f32).next_up(),
         )
+    }
+}
+
+/// A vector in one byte a number: what a column declared `WITH (quantization = 'SQ8')` keeps
+/// in place of the vector a statement wrote. This is the one place a vector is brought to
+/// whole steps for storing: `write` asks for it, and the store writes the scale and the codes
+/// it is handed.
+pub(crate) struct Reduced {
+    /// What every code is multiplied by.
+    pub scale: f32,
+    /// One whole number from -127 to 127 for each number of the vector.
+    pub codes: Vec<i8>,
+}
+
+impl Reduced {
+    /// The reduced form nearest `vector`; `None` for a vector of zeros or of no number, which
+    /// is kept as it is. `scale` begins as the largest size among the numbers over 127 and is
+    /// moved until `(scale * 127.0) / 127.0` gives it back in 32-bit arithmetic; each code is
+    /// its number over the scale, rounded. `Reduced::of(&r.numbers())` is `r` to the bit. The
+    /// caller has reserved a byte for each number before it calls.
+    pub(crate) fn of(vector: &[f32]) -> Option<Reduced> {
+        let largest = vector.iter().fold(0.0_f32, |most, x| most.max(x.abs()));
+        let mut scale = largest / 127.0;
+        // Four moves to the value the arithmetic gives back, then one step up, and again.
+        let mut moves = 0;
+        while (scale * 127.0) / 127.0 != scale {
+            scale = if moves < 4 {
+                (scale * 127.0) / 127.0
+            } else {
+                scale.next_up()
+            };
+            moves = (moves + 1) % 5;
+        }
+        if scale == 0.0 {
+            return None;
+        }
+        let code = |x: &f32| (x / scale).round().clamp(-127.0, 127.0) as i8;
+        Some(Reduced {
+            scale,
+            codes: vector.iter().map(code).collect(),
+        })
+    }
+
+    /// The vector the column keeps: each code times the scale, in 32-bit arithmetic. The
+    /// caller has reserved four bytes for each number before it calls.
+    pub(crate) fn numbers(&self) -> Vec<f32> {
+        let codes = self.codes.iter();
+        codes.map(|code| self.scale * f32::from(*code)).collect()
     }
 }
