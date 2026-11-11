@@ -324,9 +324,10 @@ impl Read for View {
         // Every key of a kind begins with the kind's byte, so the kind ends before the next.
         let start = keys::vector(from);
         let end = [start[0] + 1];
-        let table = match start[0] {
-            keys::BLOCK => &moment.blocks,
-            _ => &moment.vectors,
+        let table = if keys::with_blocks(start[0]) {
+            &moment.blocks
+        } else {
+            &moment.vectors
         };
         let records = table.range::<&[u8]>(start.as_slice()..end.as_slice());
         let mut key = Key(Vec::new());
@@ -404,17 +405,18 @@ pub(super) fn write(data: &redb::Database, changes: &mut ChangeSet) -> Stored<u6
                 // The row that was there, when there was one, still has its large values.
                 let before = match &row.values {
                     Some(values) => {
-                        let row = record::encode_row(values, |large| -> Stored<u64> {
-                            // The compressor's buffer is counted until the value is written.
-                            let room = record::compress(large, &mut changes.reserved);
-                            let first = free;
-                            for slice in large.chunks(SLICE) {
-                                beside.insert(free, slice)?;
-                                free += 1;
-                            }
-                            changes.reserved.shrink(room);
-                            Ok(first)
-                        })?;
+                        let row =
+                            record::encode_row(values, &row.compact, |large| -> Stored<u64> {
+                                // The compressor's buffer is counted until the value is written.
+                                let room = record::compress(large, &mut changes.reserved);
+                                let first = free;
+                                for slice in large.chunks(SLICE) {
+                                    beside.insert(free, slice)?;
+                                    free += 1;
+                                }
+                                changes.reserved.shrink(room);
+                                Ok(first)
+                            })?;
                         let before = rows.insert(key.as_slice(), row.as_slice())?;
                         before.map(|row| record::decode_row(row.value()))
                     }
@@ -472,9 +474,10 @@ pub(super) fn write(data: &redb::Database, changes: &mut ChangeSet) -> Stored<u6
         let mut blocks = write.open_table(BLOCKS)?;
         let mut vectors = write.open_table(VECTORS)?;
         for (key, value) in &changes.vectors {
-            let table = match key.0[0] {
-                keys::BLOCK => &mut blocks,
-                _ => &mut vectors,
+            let table = if keys::with_blocks(key.0[0]) {
+                &mut blocks
+            } else {
+                &mut vectors
             };
             match value {
                 Some(value) => drop(table.insert(key.0.as_slice(), value.as_slice())?),

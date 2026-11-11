@@ -133,6 +133,19 @@ impl ReadSession {
         query::run(&plan, params, &catalog, &view, &self.budget, now)
     }
 
+    /// What a statement would do, without running it: as [`crate::Database::explain`], for
+    /// the newest commit this session can read.
+    ///
+    /// # Errors
+    ///
+    /// As [`ReadSession::execute`] for a statement that reads.
+    pub fn explain(&self, sql: &str) -> Result<String> {
+        let plan = sql::plan(&sql::parse(sql)?)?;
+        let now = system::now_millis(&*self.clock);
+        let (view, catalog) = self.newest()?;
+        query::explain(&plan, &catalog, &view, &self.budget, now)
+    }
+
     /// The names of the store's tables as of the newest commit, in name order. A store with no
     /// table gives an empty list.
     ///

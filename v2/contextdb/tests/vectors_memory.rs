@@ -792,3 +792,81 @@ fn the_memory_of_a_search_is_given_back_when_its_result_is_dropped() {
     tx.commit().expect("commit");
     assert_eq!(support::int(&db, "SELECT COUNT(*) FROM docs"), 420);
 }
+
+#[test]
+fn a_commit_with_no_room_for_its_vector_records_changes_nothing() {
+    const DIMENSION: usize = 16;
+    let (folder, db) = support::built("commit-no-room", DIMENSION, "AUTO_INDEX_AT 1000", 2000);
+    let rows = "SELECT id, ctx, tag, v FROM docs ORDER BY id";
+    let untouched = (support::rows(&db, rows), db.committed_watermark());
+    support::close(db);
+    let query = support::gathered(96_500, DIMENSION);
+    // Every search agrees with the rows that are there: EXACT returns the reference, and
+    // INDEXED rows with their true distances.
+    let searches_agree = |db: &Database, state: &str| {
+        let stored = support::stored(db, support::DOCS);
+        let wanted = stored.nearest(|_| true, &query, 10);
+        let sql = support::by_mode(None, "EXACT", 10);
+        support::assert_nearest(db, &sql, &query, &wanted, state);
+        let result = support::answer(db, &support::by_mode(None, "INDEXED", 10), &query);
+        support::assert_sound(&result, &stored, |_| true, &query, 10, state);
+    };
+
+    // One transaction under each limit, from one with no room at all upward: 300 sealed rows
+    // get another vector, which leaves a record for each slot they left and one for each
+    // vector that waits, and 300 rows are new.
+    let attempt = |db: &Database| -> contextdb::Result<()> {
+        let tx = db.transaction()?;
+        for id in 1..=300_i64 {
+            tx.execute(
+                "UPDATE docs SET v = $v WHERE id = $id",
+                &params! { "id" => id, "v" => support::vector(96_600 + id, DIMENSION) },
+            )?;
+            support::insert_doc(
+                &tx,
+                5000 + id,
+                "a",
+                Some(support::gathered(5000 + id, DIMENSION)),
+            )?;
+        }
+        tx.commit()
+    };
+    let mut refused = 0;
+    let mut committed = false;
+    let spares = (0..=32).map(|step| step * 64 * KIB).chain([55 * MIB]);
+    for spare in spares {
+        let limit = 9 * MIB + spare;
+        let db = open_limited(&folder, limit);
+        let before = used(&db);
+        let outcome = attempt(&db);
+        assert_eq!(
+            used(&db),
+            before,
+            "memory in use after a commit under {limit}"
+        );
+        let db = reopen(db, &folder);
+        match outcome {
+            Ok(()) => {
+                assert_eq!(support::int(&db, "SELECT COUNT(*) FROM docs"), 2300);
+                searches_agree(&db, &format!("committed under {limit} bytes"));
+                committed = true;
+                break;
+            }
+            Err(Error::MemoryBudgetExceeded { .. }) => {
+                let state = format!("refused under {limit} bytes");
+                assert!(
+                    (support::rows(&db, rows), db.committed_watermark()) == untouched,
+                    "{state}: the rows or the committed position changed"
+                );
+                searches_agree(&db, &state);
+                refused += 1;
+            }
+            Err(other) => panic!("a commit under {limit} bytes gave {other:?}"),
+        }
+        support::close(db);
+    }
+    assert!(
+        refused > 0 && committed,
+        "{refused} limits refused the commit; committed at the last: {committed}"
+    );
+}

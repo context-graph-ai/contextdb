@@ -252,8 +252,10 @@ pub enum Error {
         max_partitions: u32,
     },
     /// A search asked for `INDEXED`, with `USE VECTOR INDEXED` or through the column's
-    /// `SEARCH_MODE INDEXED`, and this version keeps no index. It never answers such a search
-    /// with an exact scan under the indexed name; `EXACT` and `AUTO` answer.
+    /// `SEARCH_MODE INDEXED`, and the index cannot answer it now: a partition it selects is
+    /// behind its writes, or its filter on rows leaves the index nothing to choose among. Such
+    /// a search is never answered with an exact scan under the indexed name; `EXACT` and
+    /// `AUTO` answer, and a maintenance cycle brings the index up to its writes.
     VectorIndexedRouteUnavailable { index: VectorIndexRef },
     /// `USE VECTOR` was written in a SELECT that does not order by `<=>`.
     UseVectorRequiresVectorOrder,
@@ -388,8 +390,9 @@ impl fmt::Display for Error {
             ),
             Error::VectorIndexedRouteUnavailable { index } => write!(
                 f,
-                "no vector index ships in this version, so {index} cannot be searched INDEXED; \
-                 use EXACT or AUTO"
+                "{index} cannot be searched INDEXED for this statement now: its index is behind \
+                 its writes, or the statement's filter leaves the index nothing to choose among; \
+                 run a maintenance cycle, or use EXACT or AUTO"
             ),
             Error::UseVectorRequiresVectorOrder => {
                 f.write_str("USE VECTOR requires ORDER BY embedding <=> $param in the same query")
@@ -489,13 +492,31 @@ impl fmt::Display for VectorPartitionDeclarationIssue {
 pub enum VectorPolicyDeclarationIssue {
     /// `VECTOR(0)`.
     DimensionsNotPositive,
+    /// `WITH (...)` gives this member a value it does not take.
+    InvalidMember { member: &'static str },
+    /// `AUTO_INDEX_AT` is zero or negative.
+    AutoIndexAtNotPositive,
+    /// `AUTO_INDEX_AT` is larger than the engine keeps.
+    AutoIndexAtOutOfRange,
+    /// A percentage of `CONSOLIDATION` is not a whole number from 1 to 100.
+    ConsolidationPercentOutOfRange,
 }
 
 impl fmt::Display for VectorPolicyDeclarationIssue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::DimensionsNotPositive => "vector dimensions must be at least 1",
-        })
+        match self {
+            Self::DimensionsNotPositive => f.write_str("vector dimensions must be at least 1"),
+            Self::InvalidMember { member } => {
+                write!(f, "{member} has an invalid vector policy value")
+            }
+            Self::AutoIndexAtNotPositive => f.write_str("AUTO_INDEX_AT must be a positive integer"),
+            Self::AutoIndexAtOutOfRange => {
+                f.write_str("AUTO_INDEX_AT is outside the persisted numeric range")
+            }
+            Self::ConsolidationPercentOutOfRange => {
+                f.write_str("vector consolidation percentages must be integers from 1 through 100")
+            }
+        }
     }
 }
 
@@ -503,12 +524,13 @@ impl fmt::Display for VectorPolicyDeclarationIssue {
 /// `USE VECTOR` asks for in one statement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VectorSearchMode {
-    /// The engine chooses. This version has no index, so it answers exactly.
+    /// The engine chooses: through the index from the column's `AUTO_INDEX_AT` vectors on,
+    /// wherever the index is usable, and exactly otherwise. The answer is never short.
     #[default]
     Auto,
     /// Every allowed vector is compared: the true nearest rows.
     Exact,
-    /// Only through an index; refused when there is none.
+    /// Only through the index; refused when the index cannot answer the statement now.
     Indexed,
 }
 

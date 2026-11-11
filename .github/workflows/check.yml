@@ -20,8 +20,8 @@ env:
   # The size of the shipped code, rounded up to 500 lines, and the number of tests, rounded up
   # to 10. A change that crosses either number edits it here, in the same change, where its
   # reader sees that the code grew or shrank. Neither ever passes 150,000 lines or 1,000 tests.
-  SHIPPED_LINES: 11000
-  TESTS: 180
+  SHIPPED_LINES: 15500
+  TESTS: 260
 
 jobs:
   lint:

@@ -9,7 +9,8 @@ use std::fs;
 use std::sync::atomic::Ordering;
 
 use contextdb::{
-    Database, MaintenanceReport, QueryResult, ReadSession, ReadSessionOptions, params,
+    Database, DatabaseOpenOptions, MaintenanceReport, QueryResult, ReadSession, ReadSessionOptions,
+    Value, params,
 };
 
 use support::{Child, Run};
@@ -31,7 +32,12 @@ fn sealing_advances_only_when_asked_and_in_bounded_cycles() {
     const DIMENSION: usize = 8;
     let folder = support::folder("sealing-in-cycles");
     let db = support::open(&folder);
-    support::declare_docs(&db, DIMENSION, "PARTITION_KEY (ctx)");
+    // The column declares a size it never reaches, so no partition here is ever grouped.
+    support::declare_docs(
+        &db,
+        DIMENSION,
+        "PARTITION_KEY (ctx) AUTO_INDEX_AT 1000000000",
+    );
     // Five thousand vectors: three thousand under a, the partition made first, and two
     // thousand under b.
     for first in (1..=5000_i64).step_by(1000) {
@@ -387,7 +393,7 @@ fn a_small_fixed_store_stays_within_its_recorded_size() {
     let db = support::open(&folder);
     support::run(
         &db,
-        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, embedding VECTOR(384))",
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, embedding VECTOR(384) AUTO_INDEX_AT 1000000000)",
     );
     // Nothing in the content, its order or the store depends on a clock, a random number or a
     // thread, so the file has the same length on every machine and every run.
@@ -420,4 +426,338 @@ fn a_small_fixed_store_stays_within_its_recorded_size() {
         "the data file is {length} bytes long; the most recorded for this store is {RECORDED} \
          bytes, and {PUT_IN} bytes were put in"
     );
+}
+
+// ---- groupings ----
+
+/// The dimension of the tests of a grouping, and the clause under which a partition of 2,000
+/// rows is cut into groups.
+const GROUPED: usize = 16;
+const AT_1000: &str = "AUTO_INDEX_AT 1000";
+
+fn gathered(n: i64) -> Vec<f32> {
+    support::gathered(n, GROUPED)
+}
+
+/// A partition's `maintenance_state` and `maintenance_reason`.
+fn state_of(partition: &support::Shown) -> (String, String) {
+    (
+        support::word(partition, "maintenance_state"),
+        support::word(partition, "maintenance_reason"),
+    )
+}
+
+/// A partition's `lists`: the groups of the grouping in force, `None` with none.
+fn lists_of(partition: &support::Shown) -> Option<i64> {
+    match support::field(partition, "lists") {
+        Value::Null => None,
+        _ => Some(support::whole(partition, "lists")),
+    }
+}
+
+/// What a build reports of itself in a partition's row: the slots it reads, has packed and
+/// has left.
+fn progress(partition: &support::Shown) -> [i64; 3] {
+    ["total", "done", "remaining"]
+        .map(|part| support::whole(partition, &format!("maintenance_vectors_{part}")))
+}
+
+#[test]
+fn a_grouping_is_built_in_bounded_cycles_and_switched_in_one() {
+    let folder = support::folder("grouping-in-cycles");
+    let db = support::open(&folder);
+    // 2,000 rows are this column's size, and half of the 4,000 vectors a partition of it may
+    // have outside a grouping and still be searched INDEXED: every search below is served.
+    support::declare_docs(&db, GROUPED, "AUTO_INDEX_AT 2000");
+    support::load_docs(&db, 1..=2000, "a", gathered);
+    let query = gathered(60_000);
+    let late = support::vector(60_001, GROUPED);
+    let late_sql = support::by_mode(None, "INDEXED", 1);
+    let found_late = |state: &str| {
+        let stored = support::stored(&db, support::DOCS);
+        let result = support::answer(&db, &late_sql, &late);
+        let answer = support::assert_sound(&result, &stored, |_| true, &late, 1, state);
+        assert_eq!(answer[0].key, Value::Int64(2001), "{state}");
+    };
+
+    for number in 1..=17_u64 {
+        if number == 6 {
+            // A write between two cycles commits and is found.
+            support::insert_doc(&db, 2001, "a", Some(late.clone())).expect("a write in a build");
+            found_late("written between two cycles");
+        }
+        let before = db.committed_watermark().0;
+        let report = support::cycle(&db);
+        let commits = db.committed_watermark().0 - before;
+        // The vectors the cycle reports done and left, the partitions left, and its commits:
+        // the first cycle seals and begins, ten find centres, one gives every slot its group,
+        // one packs, two measure, one switches, and the seventeenth has nothing to do. The
+        // sixth also seals the row written before it.
+        let wanted = match number {
+            1 => (2000, 2000, 1, 2),
+            6 => (1, 2000, 1, 2),
+            13 => (2000, 0, 1, 1),
+            14 | 15 => (0, 0, 1, 1),
+            16 => (0, 0, 0, 1),
+            17 => (0, 0, 0, 0),
+            _ => (0, 2000, 1, 1),
+        };
+        assert_eq!(
+            (
+                report.maintenance_vectors_done,
+                report.maintenance_vectors_remaining,
+                report.remaining_partitions,
+                commits
+            ),
+            wanted,
+            "cycle {number}"
+        );
+        let partition = support::the_partition(&db);
+        let probes = support::field(&partition, "probes").clone();
+        if number < 16 {
+            assert_eq!(state_of(&partition).0, "building", "after cycle {number}");
+            assert_eq!((lists_of(&partition), probes), (None, Value::Null));
+            let packed = if number < 13 { 0 } else { 2000 };
+            assert_eq!(progress(&partition), [2000, packed, 2000 - packed]);
+            // Until the switch every mode returns what EXACT returns.
+            let wanted = support::stored(&db, support::DOCS).nearest(|_| true, &query, 10);
+            for mode in ["EXACT", "AUTO", "INDEXED"] {
+                let sql = support::by_mode(None, mode, 10);
+                let state = format!("{mode} after cycle {number}");
+                support::assert_nearest(&db, &sql, &query, &wanted, &state);
+            }
+        } else {
+            assert_eq!(state_of(&partition).0, "idle", "after cycle {number}");
+            assert_eq!(lists_of(&partition), Some(45), "round(sqrt(2000))");
+            assert!(
+                matches!(probes, Value::Int64(1..=45)),
+                "probes after the switch: {probes:?}"
+            );
+            assert_eq!(progress(&partition), [0, 0, 0]);
+        }
+    }
+    found_late("after the switch");
+}
+
+/// The bytes inspection reports for the index of the one partition.
+fn index_bytes(db: &Database) -> i64 {
+    support::whole(&support::the_partition(db), "durable_index_bytes")
+}
+
+#[test]
+fn a_grouping_keeps_a_sketch_of_every_slot_and_measures_its_width() {
+    let (_, db) = support::built("grouping-index-bytes", GROUPED, AT_1000, 2000);
+    let partition = support::the_partition(&db);
+    assert_eq!(lists_of(&partition), Some(45));
+    // 2,000 slots of 24 bytes with keys of 9 are one block. The index is 45 centres of 16
+    // numbers, the record of 45 groups, the block's 2,000 sketches of 4 bytes behind their
+    // count, and the mean.
+    assert_eq!(
+        support::whole(&partition, "durable_vector_bytes"),
+        2000 * 24
+    );
+    assert_eq!(
+        index_bytes(&db),
+        45 * 4 * 16 + (12 + 8 * 46) + (4 + 2000 * 4) + 4 * 16
+    );
+}
+
+#[test]
+fn sealing_after_a_grouping_keeps_a_sketch_of_every_slot() {
+    let (_, db) = support::built("sealing-after-grouping", GROUPED, AT_1000, 2000);
+    let before = index_bytes(&db);
+    support::load_docs(&db, 2001..=2300, "a", gathered);
+    assert_eq!(support::cycle(&db).maintenance_vectors_done, 300);
+    // 300 sketches, and the count of the one tail block they are in.
+    assert_eq!(index_bytes(&db) - before, 300 * 4 + 4);
+    let stored = support::stored(&db, support::DOCS);
+    let sql = support::by_mode(None, "INDEXED", 1);
+    for id in 2001..=2300 {
+        let query = gathered(id);
+        let result = support::answer(&db, &sql, &query);
+        let state = format!("row {id}, sealed after the grouping");
+        let answer = support::assert_sound(&result, &stored, |_| true, &query, 1, &state);
+        assert_eq!(answer[0].key, Value::Int64(id), "{state}");
+    }
+}
+
+#[test]
+fn vectors_sealed_while_a_first_build_starts_are_found_after_the_switch() {
+    // Vectors of 64 numbers, of which a block takes 3,083: fewer than one cycle seals.
+    const WIDE: usize = 64;
+    let wide = |n: i64| support::gathered(n, WIDE);
+    let folder = support::folder("sealed-while-first-build-starts");
+    let db = support::open(&folder);
+    // The grouping is never built again, so the vectors sealed after it stay in its tail.
+    support::declare_docs(&db, WIDE, "AUTO_INDEX_AT 1000 CONSOLIDATION NONE");
+    support::load_docs(&db, 1..=2000, "a", wide);
+    // The first cycle seals and begins the partition's first build. The 3,500 rows written
+    // then are sealed by the second, before the build's first round: a whole block of them
+    // and the start of the next.
+    assert_eq!(support::cycle(&db).maintenance_vectors_done, 2000);
+    assert_eq!(state_of(&support::the_partition(&db)).0, "building");
+    support::load_docs(&db, 2001..=5500, "a", wide);
+    assert_eq!(support::cycle(&db).maintenance_vectors_done, 3500);
+    support::upkeep(&db);
+    let partition = support::the_partition(&db);
+    assert_eq!(state_of(&partition).0, "idle");
+    assert_eq!(lists_of(&partition), Some(45));
+
+    // Every search under INDEXED answers, and a row sealed in those cycles is the first row
+    // of a search for its own vector, from the block that was filled and from the one begun.
+    let stored = support::stored(&db, support::DOCS);
+    let sql = support::by_mode(None, "INDEXED", 1);
+    for id in (2001..=5500).step_by(233) {
+        let query = wide(id);
+        let result = support::answer(&db, &sql, &query);
+        let state = format!("row {id}, sealed while the first build was starting");
+        let answer = support::assert_sound(&result, &stored, |_| true, &query, 1, &state);
+        assert_eq!(answer[0].key, Value::Int64(id), "{state}");
+    }
+    let query = wide(60_002);
+    let result = support::answer(&db, &support::by_mode(None, "INDEXED", 10), &query);
+    support::assert_sound(&result, &stored, |_| true, &query, 10, "ten rows of 5,500");
+}
+
+#[test]
+fn a_grouping_holds_every_live_vector_once_and_no_stale_slot() {
+    let clauses = "PARTITION_KEY (ctx) AUTO_INDEX_AT 1000";
+    let (_, db) = support::built("grouping-no-stale", GROUPED, clauses, 1000);
+    support::load_docs(&db, 1001..=2000, "b", gathered);
+    support::upkeep(&db);
+    // 150 rows of a get another vector and 150 rows of b are deleted: each leaves a slot.
+    let tx = db.transaction().expect("begin");
+    for id in 1..=150_i64 {
+        tx.execute(
+            "UPDATE docs SET v = $v WHERE id = $id",
+            &params! { "id" => id, "v" => support::vector(61_000 + id, GROUPED) },
+        )
+        .expect("change a vector");
+    }
+    tx.commit().expect("commit");
+    support::run(&db, "DELETE FROM docs WHERE id > 1850");
+    let stale = |db: &Database| -> Vec<i64> {
+        support::shown(db, "SHOW VECTOR_PARTITIONS")
+            .iter()
+            .map(|partition| support::whole(partition, "tombstones"))
+            .collect()
+    };
+    assert_eq!(stale(&db), [150, 150]);
+
+    support::upkeep(&db);
+    assert_eq!(stale(&db), [0, 0], "after the regrouping");
+    let stored = support::stored(&db, support::DOCS);
+    let query = gathered(60_002);
+    for (ctx, rows) in [("a", 1000), ("b", 850)] {
+        let wanted = stored.nearest(|row| row[1] == support::text(ctx), &query, 5000);
+        assert_eq!(wanted.len(), rows);
+        let sql = support::by_mode(Some(&format!("ctx = '{ctx}'")), "EXACT", 5000);
+        support::assert_nearest(&db, &sql, &query, &wanted, ctx);
+    }
+}
+
+#[test]
+fn a_partition_is_grouped_again_only_when_its_changes_reach_the_declared_share() {
+    let state = |db: &Database| state_of(&support::the_partition(db));
+    let lists = |db: &Database| lists_of(&support::the_partition(db));
+    let named = |state: &str, reason: &str| (state.to_owned(), reason.to_owned());
+
+    // New vectors: 20 in 100 of the grouping's 2,000 slots when nothing is declared, and the
+    // declared 50.
+    for (name, clause, share) in [
+        ("regroup-default", "", 400_i64),
+        (
+            "regroup-declared",
+            " CONSOLIDATION (CHANGE_PERCENT = 50)",
+            1000,
+        ),
+    ] {
+        let clauses = format!("{AT_1000}{clause}");
+        let (_, db) = support::built(name, GROUPED, &clauses, 2000);
+        support::load_docs(&db, 2001..=1999 + share, "a", gathered);
+        support::upkeep(&db);
+        assert_eq!(state(&db), named("idle", "none"), "{name}: one below");
+        assert_eq!(lists(&db), Some(45), "{name}: one below");
+        support::load_docs(&db, 2000 + share..=2000 + share, "a", gathered);
+        support::cycle(&db);
+        assert_eq!(state(&db), named("building", "changes"), "{name}");
+        support::upkeep(&db);
+        let groups = ((2000 + share) as f64).sqrt().round() as i64;
+        assert_eq!(lists(&db), Some(groups), "{name}: grouped again");
+    }
+
+    // Slots rows have left: 10 in 100.
+    let (_, db) = support::built("regroup-tombstones", GROUPED, AT_1000, 2000);
+    support::run(&db, "DELETE FROM docs WHERE id < 200");
+    support::upkeep(&db);
+    assert_eq!(state(&db), named("idle", "none"), "199 slots left behind");
+    support::run(&db, "DELETE FROM docs WHERE id = 200");
+    support::cycle(&db);
+    assert_eq!(state(&db), named("building", "tombstones"));
+
+    // Under CONSOLIDATION NONE the first grouping stays, whatever changes.
+    let clauses = format!("{AT_1000} CONSOLIDATION NONE");
+    let (_, db) = support::built("regroup-none", GROUPED, &clauses, 2000);
+    support::load_docs(&db, 2001..=3000, "a", gathered);
+    support::run(&db, "DELETE FROM docs WHERE id <= 500");
+    support::upkeep(&db);
+    assert_eq!(state(&db), named("idle", "none"));
+    assert_eq!(lists(&db), Some(45));
+    let partition = support::the_partition(&db);
+    assert_eq!(support::whole(&partition, "tombstones"), 500);
+}
+
+#[test]
+fn a_cycle_under_a_tight_limit_records_the_stall_and_the_old_grouping_serves() {
+    // A round over 49 centres of 256 numbers takes 150,528 bytes for its sums and centres;
+    // the limit leaves 98,304 over what an open sets aside.
+    const WIDE: usize = 256;
+    const LIMIT: usize = (9 << 20) + (96 << 10);
+    let (folder, db) = support::built("stalled-build", WIDE, AT_1000, 2000);
+    support::load_docs(&db, 2001..=2400, "a", |n| support::gathered(n, WIDE));
+    // This cycle seals the 400 and begins the regrouping they make due.
+    assert_eq!(support::cycle(&db).maintenance_vectors_done, 400);
+    let stored = support::stored(&db, support::DOCS);
+    support::close(db);
+
+    let mut options = DatabaseOpenOptions::default();
+    options.memory_limit = Some(LIMIT);
+    let db = support::open_with(&folder, options).expect("open under the limit");
+    let report = match db.run_maintenance_cycle() {
+        Ok(report) => report.vector,
+        Err(error) => panic!("a cycle whose step does not fit was refused: {error:?}"),
+    };
+    assert_eq!(
+        (report.stalled_partitions, report.remaining_partitions),
+        (1, 1)
+    );
+    let partition = support::the_partition(&db);
+    assert_eq!(
+        state_of(&partition),
+        ("stalled".to_owned(), "memory_limit".to_owned())
+    );
+    assert_eq!(
+        support::word(&partition, "recovery_action"),
+        "raise the memory limit"
+    );
+    let index = support::shown(&db, "SHOW VECTOR_INDEXES").remove(0);
+    assert_eq!(support::word(&index, "maintenance_state"), "stalled");
+    assert_eq!(support::whole(&index, "stalled_partitions"), 1);
+    assert_eq!(
+        support::word(&index, "recovery_action"),
+        "raise the memory limit"
+    );
+
+    // The grouping in force still serves.
+    assert_eq!(lists_of(&partition), Some(45));
+    let query = support::gathered(60_003, WIDE);
+    let result = support::answer(&db, &support::by_mode(None, "INDEXED", 10), &query);
+    support::assert_sound(&result, &stored, |_| true, &query, 10, "while stalled");
+
+    support::run(&db, "SET MEMORY_LIMIT 64M");
+    support::upkeep(&db);
+    let partition = support::the_partition(&db);
+    assert_eq!(state_of(&partition), ("idle".to_owned(), "none".to_owned()));
+    assert_eq!(lists_of(&partition), Some(49), "round(sqrt(2400))");
+    assert_eq!(support::cycle(&db).stalled_partitions, 0);
 }

@@ -322,3 +322,60 @@ fn a_declared_table_gets_its_numbers_and_the_index_behind_each_rule() {
     let keyless = create("keyless", vec![declared("word", DataType::Text)], &[]);
     assert!(not_supported(&keyless, "a table without a PRIMARY KEY"));
 }
+
+#[test]
+fn the_index_clauses_of_a_vector_column_are_stored_and_give_the_numbers_in_force() {
+    use super::{Consolidation, Quantization, VectorColumn};
+    use crate::store::VectorId;
+    let column = |id, auto_index_at, consolidation, quantization| VectorColumn {
+        id: VectorId(id),
+        column: format!("v{id}"),
+        partition_key: Vec::new(),
+        max_partitions: None,
+        search_mode: None,
+        auto_index_at,
+        consolidation,
+        quantization,
+    };
+    let percent = |change, tombstone| Some(Consolidation::Percent { change, tombstone });
+    let vectors = vec![
+        column(0, None, None, Quantization::F32),
+        column(1, Some(1000), Some(Consolidation::None), Quantization::Sq8),
+        column(
+            2,
+            Some(u64::MAX),
+            percent(Some(50), None),
+            Quantization::F32,
+        ),
+        column(3, Some(1), percent(None, Some(100)), Quantization::Sq8),
+        column(4, Some(50), percent(Some(1), Some(2)), Quantization::F32),
+    ];
+    // The size from which the column is grouped, the size from which a partition of it is,
+    // and the two shares at which a partition is grouped again.
+    let in_force: Vec<_> = vectors
+        .iter()
+        .map(|vector| {
+            (
+                vector.index_at(),
+                vector.grouped_from(),
+                vector.consolidation(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        in_force,
+        [
+            (100_000, 1000, Some((20, 10))),
+            (1000, 10, None),
+            (u64::MAX, u64::MAX / 100, Some((50, 10))),
+            (1, 1, Some((20, 100))),
+            (50, 1, Some((1, 2))),
+        ]
+    );
+    // What was written is what the record gives back: a clause that was not stays unwritten.
+    let table = Table {
+        vectors: vectors.clone(),
+        ..notes()
+    };
+    assert_eq!(record::decode(&record::encode(&table)).vectors, vectors);
+}

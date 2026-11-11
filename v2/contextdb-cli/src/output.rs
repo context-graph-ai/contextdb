@@ -40,6 +40,32 @@ impl Output {
         }
     }
 
+    /// The rows of an inspection statement: one `name: value` to a line, with an empty line
+    /// between rows.
+    pub fn fields(self, result: &QueryResult) {
+        if self.json {
+            return self.result(result);
+        }
+        for (at, row) in result.rows().iter().enumerate() {
+            if at > 0 {
+                println!();
+            }
+            for (name, value) in result.columns().iter().zip(row) {
+                println!("{name}: {}", text(value));
+            }
+        }
+    }
+
+    /// What `.explain` answers: its lines.
+    pub fn explain(self, lines: &str) {
+        if self.json {
+            let lines: Vec<&str> = lines.lines().collect();
+            println!("{}", json!({ "explain": { "lines": lines } }));
+        } else {
+            println!("{lines}");
+        }
+    }
+
     /// A statement that returns no rows succeeded and changed this many.
     pub fn rows_affected(self, rows: u64) {
         if self.json {

@@ -64,3 +64,10 @@ UPDATE_EXPECTED=1 cargo test --manifest-path v2/Cargo.toml -p contextdb --test s
 
 `v2/numbers.sh` prints the numbers in the library's README for the commit it is run at. It only
 measures: it never passes or fails, and the check does not run it.
+
+The lines about vector search are taken by the programs in `contextdb/examples/`, the generated
+vectors always and the groups of lines about real search passages only on data given in the
+environment variables named at the head of the script (without them each of those lines prints
+`unavailable`). Every time of a search is taken by one thread, in a read session under the memory
+limit that a line of the output states; `NUMBERS_LARGE=1` adds five million generated vectors and
+takes the better part of an hour. Run it on a machine that is doing nothing else.

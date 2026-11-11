@@ -12,6 +12,14 @@ pub enum Statement {
     Select(Select),
     SetMemoryLimit(SetMemoryLimitValue),
     ShowMemoryLimit,
+    ShowVectorIndexes,
+    ShowVectorPartitions {
+        /// The table and column after `FOR`.
+        column: Option<(String, String)>,
+        limit: Option<u64>,
+        /// Zero when OFFSET was not written.
+        offset: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +187,25 @@ pub struct VectorClauses {
     pub max_partitions: Option<String>,
     /// `SEARCH_MODE AUTO | EXACT | INDEXED`, when it was written.
     pub search_mode: Option<VectorSearchMode>,
+    /// The number after `AUTO_INDEX_AT`, kept as written for `schema` to judge.
+    pub auto_index_at: Option<String>,
+    /// `CONSOLIDATION NONE` or `CONSOLIDATION (...)`, when it was written.
+    pub consolidation: Option<ConsolidationClause>,
+    /// The text of `WITH (quantization = '...')`, kept as written for `schema` to judge.
+    pub quantization: Option<String>,
+}
+
+/// `CONSOLIDATION` as it was written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsolidationClause {
+    /// `CONSOLIDATION NONE`.
+    None,
+    /// `CONSOLIDATION (CHANGE_PERCENT = n, TOMBSTONE_PERCENT = n)`: each number as written,
+    /// `None` for a member that was not.
+    Percent {
+        change: Option<String>,
+        tombstone: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

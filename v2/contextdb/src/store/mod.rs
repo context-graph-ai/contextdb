@@ -91,8 +91,32 @@ pub(crate) enum VectorRecord<'a> {
     /// A row whose vector is in no block yet: the partition's number, then the row's key. Its
     /// value is empty.
     Pending(VectorId, u32, &'a Key),
-    /// One block of a partition: the partition's number, then the block's.
+    /// One block: the number its blocks are kept under, then the block's own. A partition's
+    /// tail blocks are kept under the partition's number and the blocks of a grouping under
+    /// the grouping's; both come from the column's one run of numbers, so they never meet.
     Block(VectorId, u32, u32),
+    /// A grouping of a partition's blocks, under the grouping's number: how far from its
+    /// nearest group a search scans, and where each group's slots begin in its blocks.
+    Grouping(VectorId, u32),
+    /// The centres of a grouping, some to a record: the grouping's number, then the record's
+    /// place among them. Kept with the blocks, as records of the same size.
+    Centres(VectorId, u32, u32),
+    /// A grouping being built for a partition, under the partition's number: how far it has
+    /// come.
+    Build(VectorId, u32),
+    /// The group each slot of one block goes to in a grouping being built: the number of that
+    /// grouping, then the block's place among the blocks it is built from.
+    Assigned(VectorId, u32, u32),
+    /// The sketches of one block, one for each of its slots in their order: the two numbers
+    /// of the block. Kept with the blocks, an eighth of a block each.
+    Sketch(VectorId, u32, u32),
+    /// The mean the sketches of a partition's tail blocks are taken from, under the
+    /// partition's number.
+    Mean(VectorId, u32),
+    /// A row that had a sealed slot in a partition has left it: the partition's number and the
+    /// row's key. The value is how many slots had been sealed into the partition's tail by
+    /// then, so every slot of that key sealed earlier is stale.
+    Left(VectorId, u32, &'a Key),
 }
 
 /// A number the store keeps for the vector part.
@@ -104,6 +128,16 @@ pub(crate) enum VectorNumber {
     NextPartition(VectorId),
     /// How many pending records there are, over every column.
     Pending,
+}
+
+/// A vector cell that `write` asks the store to keep in one byte a number: where the cell is
+/// in its row, and the scale and codes the vector part made of it. The row's value at that
+/// place is each code times the scale, and that is what reading the row gives back. The store
+/// works nothing out from a vector's numbers and recognises nothing in them.
+pub(crate) struct Compact {
+    pub at: usize,
+    pub scale: f32,
+    pub codes: Vec<i8>,
 }
 
 /// A primary key or an index entry, encoded so that comparing the bytes compares the values.
@@ -139,6 +173,12 @@ impl Key {
     /// the key of no values.
     pub(crate) fn starts_with(&self, prefix: &Key) -> bool {
         self.0.starts_with(&prefix.0)
+    }
+
+    /// The values the key was made from, ascending columns only: what [`Key::from_values`]
+    /// was given. Bytes that are no such key are `None`.
+    pub(crate) fn values(&self) -> Option<Vec<Value>> {
+        keys::decode(&self.0)
     }
 
     /// The first key after every key that begins with this one, `None` when there is none.
@@ -303,6 +343,8 @@ type Staged<C> = BTreeMap<u32, BTreeMap<Key, C>>;
 struct StagedRow {
     /// The new values, or `None` for a removal.
     values: Option<Vec<Value>>,
+    /// The vector cells to write as a scale and codes.
+    compact: Vec<Compact>,
     /// What the transaction said when it first staged this key: it found no row there.
     new_key: bool,
 }
@@ -379,6 +421,10 @@ impl ChangeSet {
     /// Stages a row, new or replacing the row with this key. Large text, JSON and vector values
     /// are kept beside the row when it is written; the caller does not split them.
     ///
+    /// `compact` names the vector cells to keep in one byte a number, each with its scale and
+    /// codes: such a cell is written as the tag `0x88`, its count of numbers, the scale and one
+    /// signed byte a number, and every other vector as its numbers.
+    ///
     /// `new_key` says the transaction found no row at this key. The answer given the first
     /// time a key is staged is the one kept, and [`ChangeSet::rows_changed`] hands it back.
     pub(crate) fn put_row(
@@ -386,15 +432,16 @@ impl ChangeSet {
         table: TableId,
         key: Key,
         values: Vec<Value>,
+        compact: Vec<Compact>,
         new_key: bool,
     ) -> Result<()> {
-        self.stage_row(table, key, Some(values), new_key)
+        self.stage_row(table, key, Some(values), compact, new_key)
     }
 
     /// Stages the removal of a row and of the values kept beside it. A key first staged here
     /// is one a row was at.
     pub(crate) fn delete_row(&mut self, table: TableId, key: &Key) -> Result<()> {
-        self.stage_row(table, key.clone(), None, false)
+        self.stage_row(table, key.clone(), None, Vec::new(), false)
     }
 
     fn stage_row(
@@ -402,13 +449,20 @@ impl ChangeSet {
         table: TableId,
         key: Key,
         values: Option<Vec<Value>>,
+        compact: Vec<Compact>,
         new_key: bool,
     ) -> Result<()> {
         let held: u64 = values.iter().flatten().map(value_bytes).sum();
-        let bytes = self.counted(&key, held)?;
+        let codes: usize = compact.iter().map(|cell| cell.codes.len()).sum();
+        let bytes = self.counted(&key, held + codes as u64)?;
         let rows = self.rows.entry(table.0).or_default();
         let new_key = rows.get(&key).map_or(new_key, |before| before.new_key);
-        let before = rows.insert(key.clone(), StagedRow { values, new_key });
+        let staged = StagedRow {
+            values,
+            compact,
+            new_key,
+        };
+        let before = rows.insert(key.clone(), staged);
         self.calls.push((Undo::Row(table.0, key, before), bytes));
         Ok(())
     }

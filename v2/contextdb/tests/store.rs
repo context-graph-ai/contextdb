@@ -204,3 +204,29 @@ fn a_store_closed_here_opens_again_while_a_child_process_holds_a_copy_of_its_loc
     heir.end();
     support::assert_rows_are(&support::open(&folder), 1..=4);
 }
+
+#[test]
+fn a_grouping_is_there_after_close_and_reopen() {
+    let (folder, db) = support::built("grouping-after-reopen", 16, "AUTO_INDEX_AT 1000", 2000);
+    let query = support::gathered(99_000, 16);
+    let sql = support::by_mode(None, "INDEXED", 10);
+    // The partitions as inspection lists them, and an indexed search's rows and work.
+    let state = |db: &contextdb::Database| {
+        let result = support::answer(db, &sql, &query);
+        (
+            support::shown(db, "SHOW VECTOR_PARTITIONS"),
+            result.rows().to_vec(),
+            result.distance_evaluations(),
+            db.committed_watermark(),
+        )
+    };
+    let before = state(&db);
+    assert_eq!(support::field(&before.0[0], "lists"), &Value::Int64(45));
+    support::close(db);
+
+    let db = support::open(&folder);
+    assert!(state(&db) == before, "the grouping after reopen");
+    // Nothing is left to build: a cycle makes no commit.
+    assert_eq!(support::upkeep(&db), (1, 0));
+    assert!(state(&db) == before, "after one more cycle");
+}

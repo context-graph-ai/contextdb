@@ -18,11 +18,13 @@ pub enum Store {
     Write(Database),
 }
 
-const HELP: [&str; 6] = [
+const HELP: [&str; 8] = [
     "<statement>;        Run a SQL statement. It may span lines and ends at its `;`.",
     "BEGIN; ... COMMIT;  Run statements as one transaction; ROLLBACK; undoes them, except SET MEMORY_LIMIT. Needs --write.",
     ".tables   \\dt       List the tables.",
     ".schema <table>   \\d <table>   Show a table's declaration as SQL.",
+    ".explain <sql>      Show how a similarity search would be answered, without running it.",
+    "SHOW VECTOR_INDEXES; SHOW VECTOR_PARTITIONS;   Describe the VECTOR columns and their partitions.",
     ".help     \\?        Show this list.",
     ".quit     \\q        End the session.",
 ];
@@ -151,6 +153,15 @@ impl<'a> Shell<'a> {
                 Store::Write(db) => db.declaration(table),
             }
             .map(|declaration| self.output.schema(table, &declaration)),
+            (Some(".explain"), Some(_), _) => {
+                let sql = line[".explain".len()..].trim();
+                let sql = sql.strip_suffix(';').unwrap_or(sql);
+                match self.store {
+                    Store::Read(reader) => reader.explain(sql),
+                    Store::Write(db) => db.explain(sql),
+                }
+                .map(|lines| self.output.explain(&lines))
+            }
             (Some(".help" | "\\?"), None, _) => {
                 self.output.help(&HELP);
                 Ok(())
@@ -186,7 +197,17 @@ impl<'a> Shell<'a> {
                 Ok(())
             })
         } else {
-            self.execute(sql).map(|result| self.output.result(&result))
+            // The rows of the two inspection statements are too wide for a table.
+            let mut words = sql.split_whitespace().map(str::to_ascii_uppercase);
+            let inspection = words.next().as_deref() == Some("SHOW")
+                && words.next().is_some_and(|word| word.starts_with("VECTOR_"));
+            self.execute(sql).map(|result| {
+                if inspection {
+                    self.output.fields(&result);
+                } else {
+                    self.output.result(&result);
+                }
+            })
         };
         if let Err(error) = ran {
             self.refused = true;

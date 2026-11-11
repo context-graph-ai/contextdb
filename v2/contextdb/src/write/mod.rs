@@ -17,14 +17,14 @@ mod values;
 use std::collections::HashMap;
 use std::ops::Bound;
 
-use crate::memory::Budget;
+use crate::memory::{Budget, Reservation};
 use crate::query;
-use crate::schema::{Catalog, Table};
+use crate::schema::{Catalog, Quantization, Table};
 use crate::sql::Plan;
 use crate::sql::plan::{DeletePlan, InsertPlan, UpdatePlan};
-use crate::store::{Cell, ChangeSet, IndexId, Key, Read, View};
+use crate::store::{Cell, ChangeSet, Compact, IndexId, Key, Read, View};
 use crate::types::{ColumnDefault, Error, Result, SortDirection, Value};
-use crate::vector::Tally;
+use crate::vector::{Reduced, Tally};
 
 /// Applies one INSERT, UPDATE or DELETE to the change set and returns the number of rows: those
 /// an INSERT stored, or those the WHERE of an UPDATE or DELETE matched.
@@ -55,7 +55,7 @@ pub(crate) fn apply(
     now: i64,
 ) -> Result<u64> {
     match plan {
-        Plan::Insert(plan) => insert(plan, params, catalog, changes, partitions, now),
+        Plan::Insert(plan) => insert(plan, params, catalog, changes, partitions, budget, now),
         Plan::Update(plan) => update(plan, params, catalog, changes, partitions, budget, now),
         Plan::Delete(plan) => delete(plan, params, catalog, changes, partitions, budget, now),
         other => unreachable!("{other:?} writes no rows"),
@@ -155,10 +155,12 @@ fn insert(
     catalog: &Catalog,
     changes: &mut ChangeSet,
     partitions: &mut Tally,
+    budget: &Budget,
     now: i64,
 ) -> Result<u64> {
     let table = find(catalog, &plan.table)?;
     let rules = Rules::of(table)?;
+    let mut held = budget.reserve(0, "INSERT")?;
     let columns = &table.meta.columns;
     let named: Vec<usize> = if plan.columns.is_empty() {
         (0..columns.len()).collect()
@@ -194,7 +196,8 @@ fn insert(
         }
         let row = row.into_iter().enumerate();
         let row = row.map(|(at, value)| rules.settle(at, value));
-        rules.put(changes, partitions, None, row.collect::<Result<_>>()?)?;
+        let row = row.collect::<Result<_>>()?;
+        rules.put(changes, partitions, &mut held, None, row)?;
     }
     changes.add_count(table.id, plan.values.len() as i64)?;
     rules.settle_partitions(partitions)?;
@@ -216,7 +219,7 @@ fn update(
     let set: Vec<_> = set
         .map(|(name, value)| Ok((column(table, name)?, value)))
         .collect::<Result<_>>()?;
-    let (found, _held) = query::matching(
+    let (found, mut held) = query::matching(
         table,
         plan.where_clause.as_ref(),
         params,
@@ -233,7 +236,7 @@ fn update(
         // A row that already holds what it is set to is left alone: a statement that changes
         // nothing stages nothing.
         if row != *old {
-            rules.put(changes, partitions, Some((key, old)), row)?;
+            rules.put(changes, partitions, &mut held, Some((key, old)), row)?;
         }
     }
     rules.settle_partitions(partitions)?;
@@ -303,6 +306,8 @@ struct Rules<'a> {
     /// The table has a VECTOR column with a PARTITION_KEY: the rows a statement stages in it
     /// are noted in the transaction's tally of partitions.
     partitioned: bool,
+    /// Where the VECTOR columns that keep a vector in one byte a number are in a row.
+    reduced: Vec<usize>,
 }
 
 /// One index of a table as a write uses it.
@@ -338,10 +343,15 @@ impl<'a> Rules<'a> {
             })
         });
         let mut vectors = table.vectors.iter();
+        let reduced = vectors
+            .clone()
+            .filter(|vector| vector.quantization == Quantization::Sq8)
+            .map(|vector| column(table, &vector.column));
         Ok(Rules {
             table,
             key,
             indexes: indexes.collect::<Result<_>>()?,
+            reduced: reduced.collect::<Result<_>>()?,
             partitioned: vectors.any(|vector| !vector.partition_key.is_empty()),
         })
     }
@@ -395,13 +405,36 @@ impl<'a> Rules<'a> {
     /// `was` is the key and the values the row had, for an UPDATE: what the row keeps from
     /// before is its own and is not looked up, an entry that stays as it was is left alone, and
     /// a row whose key changed leaves its old key. The row is noted in `partitions` first.
+    ///
+    /// Before anything else, a vector in a column that keeps one byte a number is replaced by
+    /// its reduced form, whose scale and codes go to the store with the row. `held` is grown
+    /// by a byte a number for the codes and four for the numbers until the row is staged.
     fn put(
         &self,
         changes: &mut ChangeSet,
         partitions: &mut Tally,
+        held: &mut Reservation,
         was: Option<(&Key, &[Value])>,
-        row: Vec<Value>,
+        mut row: Vec<Value>,
     ) -> Result<()> {
+        let mut compact = Vec::new();
+        let mut grown = 0;
+        for &at in &self.reduced {
+            let Value::Vector(vector) = &row[at] else {
+                continue;
+            };
+            let bytes = 5 * vector.len() as u64;
+            held.grow(bytes)?;
+            grown += bytes;
+            if let Some(reduced) = Reduced::of(vector) {
+                row[at] = Value::Vector(reduced.numbers());
+                compact.push(Compact {
+                    at,
+                    scale: reduced.scale,
+                    codes: reduced.codes,
+                });
+            }
+        }
         self.note(partitions, changes, was.map(|(key, _)| key), Some(&row))?;
         // No directions: a row's key is encoded ascending.
         let key = Key::from_values(&pick(&self.key, &row), &[])?;
@@ -434,7 +467,9 @@ impl<'a> Rules<'a> {
         {
             changes.delete_row(self.table.id, old_key)?;
         }
-        changes.put_row(self.table.id, key, row, new_key)
+        changes.put_row(self.table.id, key, row, compact, new_key)?;
+        held.shrink(grown);
+        Ok(())
     }
 
     /// The columns of the primary key, as a refusal names them.

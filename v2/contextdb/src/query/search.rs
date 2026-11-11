@@ -3,6 +3,7 @@
 //! which rows may be seen, and works out each row's distance from its stored vector; the vector
 //! part finds the rows.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 
 use super::access::{Source, as_key};
@@ -13,7 +14,7 @@ use crate::schema::{Catalog, Table};
 use crate::sql::ast::{BinOp, ColumnRef};
 use crate::sql::{Expr, Plan};
 use crate::store::{Key, Read};
-use crate::types::{ColumnType, Error, Result, Value, VectorIndexRef, VectorSearchMode};
+use crate::types::{ColumnType, Error, Result, Value, VectorIndexRef};
 use crate::vector::{self, Nearest};
 
 /// The most key tuples a filter may name; past that the search reads every partition.
@@ -68,9 +69,6 @@ pub(super) fn run(
     let Some(vector) = table.vector(column) else {
         return Err(Error::UnknownVectorIndex { index });
     };
-    if mode.unwrap_or_else(|| vector.mode()) == VectorSearchMode::Indexed {
-        return Err(Error::VectorIndexedRouteUnavailable { index });
-    }
     let near = match eval(query, table, &[], params, now)? {
         Value::Vector(vector) => Some(vector),
         Value::Text(text) => vector_from_text(&text),
@@ -124,8 +122,9 @@ pub(super) fn run(
         key,
         params,
         now,
-    }
-    .keys(filter)?;
+        unbound: Cell::default(),
+    };
+    let (scope, on_rows) = (scope.keys(filter)?, scope.on_rows(filter)?);
     // A row the vector part asks about is read for the filter and its vector alone; a row of
     // the answer for what the select list reads, so a large value is loaded only then.
     let mut its_vector = vec![false; width];
@@ -141,9 +140,12 @@ pub(super) fn run(
     let nearest = Nearest {
         table: table.id,
         vector: vector.id,
+        column: vector,
+        mode: mode.unwrap_or_else(|| vector.mode()),
         scope: &scope,
         query: &near,
         k,
+        filtered: on_rows,
     };
     let mut distance_of = |key: &Key| -> Result<Option<f64>> {
         examined += 1;
@@ -157,7 +159,14 @@ pub(super) fn run(
         reservation.shrink(bytes);
         Ok(distance)
     };
-    let hits = vector::search(&nearest, read, &mut searching, &mut distance_of)?;
+    // `None` is a search under INDEXED of a partition whose grouping is behind its writes, or
+    // one whose filter on rows passes fewer rows than it asks for.
+    let Some(found) = vector::search(&nearest, read, &mut searching, &mut distance_of)? else {
+        return Err(Error::VectorIndexedRouteUnavailable { index });
+    };
+    // Every row the vector part asked about had its distance worked out or was turned away.
+    let asked_for = examined;
+    let hits = found.hits;
 
     let moved = returned.moved(list)?;
     let mut rows = Vec::new();
@@ -173,6 +182,7 @@ pub(super) fn run(
         rows,
         rows_affected: 0,
         rows_examined: examined,
+        distance_evaluations: found.evaluations + asked_for,
         _reservation: Some(reservation),
     }))
 }
@@ -182,21 +192,82 @@ pub(super) fn run(
 type Tuple = Vec<Option<Value>>;
 
 /// Reads a filter for the partitions it selects.
-struct Scope<'a> {
-    table: &'a Table,
+pub(super) struct Scope<'a> {
+    pub(super) table: &'a Table,
     /// Where each PARTITION_KEY column is in a row, in declared order.
-    key: Vec<usize>,
-    params: &'a HashMap<String, Value>,
-    now: i64,
+    pub(super) key: Vec<usize>,
+    pub(super) params: &'a HashMap<String, Value>,
+    pub(super) now: i64,
+    /// The `$name` beside a key column that nothing is bound to, once one was met; its column
+    /// is left open. A search refuses such a name before it asks; `explain` binds nothing,
+    /// lists every partition and names it.
+    pub(super) unbound: Cell<Option<String>>,
 }
 
 impl Scope<'_> {
+    /// True when `filter` does more than select partitions, so that some row of the
+    /// partitions [`Scope::keys`] selects may not pass it: a filter on rows. False with no
+    /// filter, and for a filter made only of the selections of key tuples `keys` understood.
+    /// It fills `Nearest::filtered`: a search with a filter on rows uses the index as any
+    /// other does, and only the refusal of INDEXED asks whether there is one.
+    pub(super) fn on_rows(&self, filter: Option<&Expr>) -> Result<bool> {
+        let Some(filter) = filter else {
+            return Ok(false);
+        };
+        // Each tuple selects whole partitions when the columns it fixes are the leading ones.
+        let leading = |tuple: &Tuple| {
+            let fixed = tuple.iter().take_while(|value| value.is_some()).count();
+            fixed > 0 && tuple[fixed..].iter().all(Option::is_none)
+        };
+        let tuples = self.said(filter)?;
+        let selects = tuples.len() <= MOST_TUPLES && tuples.iter().all(leading);
+        Ok(!selects || !self.only_selects(filter)?)
+    }
+
+    /// True when every part of `filter` is one [`Scope::said`] reads whole: `AND` of two
+    /// sides that fix different key columns, `OR`, and `=` or `IN` whose every pair fixes a
+    /// key column.
+    fn only_selects(&self, filter: &Expr) -> Result<bool> {
+        let whole = |columns: &Expr, values: &Expr| -> Result<bool> {
+            let (columns, values) = (sides(columns), sides(values));
+            let fixed = self.tuple(columns, values)?.iter().flatten().count();
+            Ok(fixed == columns.len() && fixed == values.len())
+        };
+        Ok(match filter {
+            Expr::BinaryOp { left, op, right } if matches!(op, BinOp::And | BinOp::Or) => {
+                let (one, other) = (self.said(left)?, self.said(right)?);
+                let fixes =
+                    |said: &[Tuple], at: usize| said.iter().any(|tuple| tuple[at].is_some());
+                let clash = (0..self.key.len()).any(|at| fixes(&one, at) && fixes(&other, at));
+                !(clash && *op == BinOp::And)
+                    && self.only_selects(left)?
+                    && self.only_selects(right)?
+            }
+            Expr::BinaryOp { left, op, right } if *op == BinOp::Eq => match **left {
+                Expr::Column(_) => whole(left, right)?,
+                _ => whole(right, left)?,
+            },
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                let mut every = !*negated;
+                for item in list {
+                    every &= whole(expr, item)?;
+                }
+                every
+            }
+            _ => false,
+        })
+    }
+
     /// The partitions to search: for each key tuple the filter names, the key of the leading
     /// key columns it fixes, which every partition with those values begins with. Empty for
     /// every partition: no filter, a tuple that fixes no leading column, or more than 4,096
     /// tuples. It may select too much and never too little: the whole filter is still applied
     /// to every row.
-    fn keys(&self, filter: Option<&Expr>) -> Result<Vec<Key>> {
+    pub(super) fn keys(&self, filter: Option<&Expr>) -> Result<Vec<Key>> {
         let (Some(filter), false) = (filter, self.key.is_empty()) else {
             return Ok(Vec::new());
         };
@@ -272,9 +343,17 @@ impl Scope<'_> {
                 continue;
             };
             let at = column_index(self.table, column)?;
-            if let Some(place) = self.key.iter().position(|key| *key == at) {
-                let value = eval(value, self.table, &[], self.params, self.now)?;
-                tuple[place] = as_key(self.table.meta.columns[at].column_type, value);
+            let Some(place) = self.key.iter().position(|key| *key == at) else {
+                continue;
+            };
+            match value {
+                Expr::Parameter(name) if !self.params.contains_key(name) => {
+                    self.unbound.set(Some(name.clone()));
+                }
+                value => {
+                    let value = eval(value, self.table, &[], self.params, self.now)?;
+                    tuple[place] = as_key(self.table.meta.columns[at].column_type, value);
+                }
             }
         }
         Ok(tuple)

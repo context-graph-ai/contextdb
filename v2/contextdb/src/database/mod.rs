@@ -1,8 +1,9 @@
 //! database: the handle a store is opened for writing with, its transactions, and the one
 //! commit function.
 //!
-//! It never has a second way to commit: a statement run on its own, a transaction and a change
-//! of the memory limit each build a change set and hand it to the same function.
+//! It never has a second way to commit: a statement run on its own, a transaction, a change of
+//! the memory limit and every step of a maintenance cycle each build a change set and hand it
+//! to the same function.
 
 #[cfg(test)]
 mod tests;
@@ -496,38 +497,99 @@ impl Database {
         locked(&self.must_be_open().newest).commit
     }
 
+    /// What a statement would do as of the newest commit, without running it, as text of one
+    /// `name: value` to a line. For a similarity search it names the mode asked for and the one
+    /// in force, and for each partition the filter selects how it is searched: every vector of
+    /// it, or the groups of vectors nearest the one searched for. Nothing is read but the
+    /// store's small records, and nothing changes. A transaction has no such call.
+    ///
+    /// # Errors
+    ///
+    /// Whatever refuses the statement before it reads a row, by its own kind;
+    /// [`crate::Error::StoreIo`] or [`crate::Error::StoreCorrupted`] when the store cannot be
+    /// read; [`crate::Error::DatabaseClosed`] on a handle that was closed.
+    pub fn explain(&self, sql: &str) -> Result<String> {
+        let plan = planned(sql)?;
+        let open = self.opened()?;
+        let (view, catalog) = open.newest()?;
+        let now = system::now_millis(&*open.clock);
+        query::explain(&plan, &catalog, &view, &open.budget, now)
+    }
+
     /// Runs one cycle of upkeep and returns what it did.
     ///
-    /// A cycle moves at most 4,096 vectors from the pending lists of VECTOR columns into blocks,
-    /// in one commit, and reports how many it moved and how many still wait. Searches give the
-    /// same rows before and after a cycle; they read fewer rows after it, because a vector in a
-    /// block is ruled in or out from its one-byte copy and a pending vector is read from its
-    /// row. A store with nothing pending is left as it is, and no commit is made.
+    /// A cycle first moves at most 4,096 vectors from the pending lists of VECTOR columns into
+    /// blocks, in one commit. Then every partition that has a grouping due or being built is
+    /// advanced by one step, each step in a commit of its own: a build begins, moves its centres
+    /// once over a sample of at most 64 vectors a group, gives the vectors of whole blocks their
+    /// groups in at most 4,194,304 comparisons, packs whole groups of at most 4,096 vectors
+    /// together into new blocks, measures at most 4,194,304 vectors or sketches against its
+    /// questions, or puts the new grouping in force. A step that goes past its bound does so
+    /// by one block, one group or one question. A store with nothing to do is left as it is,
+    /// and no commit is made.
     ///
-    /// Under a memory limit with no room for all of that, a cycle seals the partitions it has
-    /// room for, at least one, and the next cycle goes on from there.
+    /// Searches give the same rows before and after a cycle; they read fewer rows after it.
+    ///
+    /// Under a memory limit with no room to seal everything, a cycle seals the partitions it has
+    /// room for, at least one. A step of a build that has no room is not an error: the cycle
+    /// records the bytes the step needed, reports the partition as stalled, and goes on.
     ///
     /// Nothing in this version calls a cycle on its own: a host that searches a VECTOR column
-    /// calls this after it has written, and again while
-    /// `vector.maintenance_vectors_remaining` is not zero. Other calls on the handle wait for
-    /// the cycle's commit as they wait for any other commit; readers do not wait.
+    /// calls this after it has written, and again as [`crate::VectorMaintenanceReport`] says.
+    /// A step is worked out with no lock held, so other calls on the handle wait only for a
+    /// step's commit, as they wait for any other commit, and never for its arithmetic; readers
+    /// do not wait.
     ///
     /// # Errors
     ///
     /// [`crate::Error::MemoryBudgetExceeded`] when the memory limit has no room to seal the
     /// pending vectors of one partition: a call holds one block's bytes (256 KiB less 64) for its
     /// whole run, the keys of the pending vectors it collected (at most 4,096, each key's bytes
-    /// plus 24), the partition's record, and one row with its vector at a time;
-    /// [`crate::Error::StoreIo`] or
-    /// [`crate::Error::StoreCorrupted`] when the store cannot be read or written;
-    /// [`crate::Error::DatabaseClosed`] on a handle that was closed. In each case nothing was
-    /// sealed and every vector is still found by a search.
+    /// plus 24), the partition's record, and one row with its vector at a time; then nothing
+    /// was sealed. [`crate::Error::StoreIo`] or [`crate::Error::StoreCorrupted`] when the store
+    /// cannot be read or written; [`crate::Error::DatabaseClosed`] on a handle that was closed.
+    /// The commits made before the error stay, and every vector is still found by a search.
     pub fn run_maintenance_cycle(&self) -> Result<MaintenanceReport> {
         let open = self.opened()?;
-        let held = locked(&open.committing);
-        let mut staged = open.begin()?;
-        let report = upkeep::cycle(&mut staged.changes, &staged.catalog, &open.budget)?;
-        open.commit(&held, staged)?;
+        let mut report = {
+            let held = locked(&open.committing);
+            let mut staged = open.begin()?;
+            let report = upkeep::cycle(&mut staged.changes, &staged.catalog, &open.budget)?;
+            open.commit(&held, staged)?;
+            report
+        };
+        let (view, catalog) = open.newest()?;
+        let mut listed = open.budget.reserve(0, "maintenance")?;
+        for work in vector::waiting(&view, &catalog, &mut listed)? {
+            // Worked out over the newest commit with no lock held; staged under the commit
+            // lock, where the vector part checks that the build has not moved since.
+            let (view, catalog) = open.newest()?;
+            let step = vector::prepare(&work, &view, &catalog, &open.budget);
+            let held = locked(&open.committing);
+            let mut staged = open.begin()?;
+            let done = step.and_then(|step| match step {
+                Some(step) => vector::stage_step(step, &mut staged.changes),
+                None => Ok(0),
+            });
+            match done {
+                Ok(done) => report.vector.maintenance_vectors_done += done,
+                // A step that does not fit, worked out or staged, is recorded in a change set
+                // of its own and is no error of the cycle.
+                Err(Error::MemoryBudgetExceeded {
+                    requested_bytes, ..
+                }) => {
+                    staged = open.begin()?;
+                    vector::stage_refusal(&work, requested_bytes, &mut staged.changes)?;
+                }
+                Err(other) => return Err(other),
+            }
+            open.commit(&held, staged)?;
+        }
+        let (view, catalog) = open.newest()?;
+        let left = vector::remaining(&view, &catalog)?;
+        report.vector.maintenance_vectors_remaining += left.vectors;
+        report.vector.remaining_partitions = left.partitions;
+        report.vector.stalled_partitions = left.stalled;
         Ok(report)
     }
 

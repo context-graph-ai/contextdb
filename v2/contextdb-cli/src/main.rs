@@ -67,13 +67,14 @@ MEMORY:
   `none` and 9437184 bytes used, the 1M and the 8M page cache.
 
 JSON (--json), one document a line:
-  a SELECT or SHOW MEMORY_LIMIT   {"result":{"columns":[...],"rows":[{...}]}}
+  a SELECT or any SHOW statement  {"result":{"columns":[...],"rows":[{...}]}}
                                   a vector is an array of numbers, each at the full
                                   precision of the stored 32-bit value, so a number
                                   may print with more digits than were typed
   any other statement             {"rows_affected":N}
   .tables                         {"tables":{"items":[...]}}
   .schema <table>                 {"schema":{"table":...,"ddl":...}}
+  .explain <sql>                  {"explain":{"lines":[...]}}
   .help                           {"help":[...]}
   a refusal                       {"error":{"class":...,"message":...,"detail":{"kind":...}}}
                                   on the error stream; "detail" is left out when the

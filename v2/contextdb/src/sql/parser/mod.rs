@@ -76,6 +76,20 @@ pub(super) fn parse(text: &str) -> Result<Statement> {
         })),
         Rule::select_stmt => select(pair).map(Statement::Select),
         Rule::set_memory_limit => memory_limit(pair).map(Statement::SetMemoryLimit),
+        Rule::show_vector_indexes => Ok(Statement::ShowVectorIndexes),
+        Rule::show_vector_partitions => {
+            let mut names = idents(pair.clone()).into_iter();
+            let count = |rule, what| {
+                child(pair.clone(), rule)
+                    .map(|clause| number(&clause.into_inner().next().expect("a count"), what))
+                    .transpose()
+            };
+            Ok(Statement::ShowVectorPartitions {
+                column: names.next().zip(names.next()),
+                limit: count(Rule::limit_clause, "LIMIT")?,
+                offset: count(Rule::offset_clause, "OFFSET")?.unwrap_or(0),
+            })
+        }
         // The one statement left: SHOW MEMORY_LIMIT.
         _ => Ok(Statement::ShowMemoryLimit),
     }
@@ -290,6 +304,11 @@ fn where_clause(pair: Pair<'_>) -> Result<Option<Expr>> {
         .transpose()
 }
 
+/// The number of a clause of a VECTOR column, as written.
+fn signed(clause: Pair<'_>) -> Option<String> {
+    child(clause, Rule::signed).map(|number| number.as_str().to_owned())
+}
+
 /// AUTO, EXACT or INDEXED, after SEARCH_MODE and after USE VECTOR.
 fn search_mode(pair: &Pair<'_>) -> VectorSearchMode {
     match pair.as_str().to_ascii_uppercase().as_str() {
@@ -430,12 +449,28 @@ fn column_def(pair: Pair<'_>) -> Result<ColumnDef> {
             let dimension = parts.next().expect("a dimension");
             for clause in parts {
                 match clause.as_rule() {
-                    Rule::partition_key => vector.partition_key = idents(clause),
-                    Rule::partition_count => {
-                        vector.max_partitions = Some(clause.as_str().to_owned());
+                    Rule::quantization => {
+                        let text = clause.into_inner().next().expect("a quoted text");
+                        vector.quantization = Some(string(&text));
                     }
-                    // The one clause left: SEARCH_MODE.
-                    _ => vector.search_mode = Some(search_mode(&clause)),
+                    Rule::partition_key => vector.partition_key = idents(clause),
+                    Rule::max_partitions => vector.max_partitions = signed(clause),
+                    Rule::search_mode => vector.search_mode = Some(search_mode(&clause)),
+                    Rule::auto_index_at => vector.auto_index_at = signed(clause),
+                    // The one clause left: CONSOLIDATION, which is NONE when it has no member.
+                    _ => {
+                        let member = |rule| child(clause.clone(), rule).and_then(signed);
+                        let members = (
+                            member(Rule::change_percent),
+                            member(Rule::tombstone_percent),
+                        );
+                        vector.consolidation = Some(match members {
+                            (None, None) => ConsolidationClause::None,
+                            (change, tombstone) => {
+                                ConsolidationClause::Percent { change, tombstone }
+                            }
+                        });
+                    }
                 }
             }
             DataType::Vector(number(&dimension, "the VECTOR dimension")?)

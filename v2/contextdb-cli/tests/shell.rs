@@ -894,8 +894,8 @@ VALUES (1, 'a', [1.0, 0.0, 0.0]), (2, 'a', [0.0, 1.0, 0.0]), (3, 'b', [-1.0, 0.0
 }
 
 #[test]
-fn indexed_search_is_refused_by_name_through_the_program() {
-    let dir = folder("indexed-search-is-refused");
+fn an_indexed_search_runs_through_the_program() {
+    let dir = folder("an-indexed-search-runs");
     let store = dir.join("store");
     let made = shell(
         &dir,
@@ -905,7 +905,8 @@ fn indexed_search_is_refused_by_name_through_the_program() {
     );
     assert_eq!(made.code, Some(0), "{}", made.stderr);
 
-    // The same search asked for INDEXED and then for EXACT.
+    // The same search asked for INDEXED and then for EXACT: no maintenance cycle has grouped
+    // these rows, so INDEXED searches every one of them and both give the same table.
     let search = |mode: &str| {
         format!(
             "SELECT id FROM passages ORDER BY embedding <=> [1.0, 0.0, 0.0] USE VECTOR {mode} \
@@ -913,53 +914,257 @@ fn indexed_search_is_refused_by_name_through_the_program() {
         )
     };
     let input = format!("{}{}", search("INDEXED"), search("EXACT"));
-    let exact = "+----+\n| id |\n+----+\n| 2  |\n| 1  |\n+----+\n(2 rows)\n";
+    let table = "+----+\n| id |\n+----+\n| 2  |\n| 1  |\n+----+\n(2 rows)\n";
+    let document = json!({"result": {"columns": ["id"], "rows": [{"id": 2}, {"id": 1}]}});
 
-    // Reading or writing, this version keeps no index and says so.
+    // Reading or writing, for a person and for a program.
     for mode in [&[][..], &["--write"][..]] {
         let mut args = vec![arg(&store)];
         args.extend_from_slice(mode);
-
-        // For a person: one line on the error stream, the refusal's sentence naming the column,
-        // and a piped run that fails.
         let run = shell(&dir, &args, &input);
-        assert_eq!(run.code, Some(1), "{mode:?}: {}", run.stderr);
-        let lines: Vec<&str> = run.stderr.lines().collect();
-        assert_eq!(lines.len(), 1, "{mode:?}: {}", run.stderr);
-        assert!(
-            lines[0].starts_with("Error: ")
-                && lines[0].contains("passages.embedding")
-                && lines[0].contains("INDEXED"),
-            "{mode:?}: {}",
-            run.stderr
-        );
-        // INDEXED gave no rows under any name, and the statement after it still ran.
-        assert_eq!(run.stdout, exact, "{mode:?}");
+        assert_eq!(run.code, Some(0), "{mode:?}: {}", run.stderr);
+        assert_eq!(run.errors(), Vec::<&str>::new(), "{mode:?}");
+        assert_eq!(run.stdout, format!("{table}{table}"), "{mode:?}");
 
-        // For a program: the refusal's kind.
         args.push("--json");
         let run = shell(&dir, &args, &input);
-        assert_eq!(run.code, Some(1), "{mode:?}: {}", run.stderr);
-        let refusals = documents(&run.stderr);
-        assert_eq!(refusals.len(), 1, "{mode:?}: {}", run.stderr);
-        let error = &refusals[0]["error"];
-        assert_eq!(error["class"], "sql", "{mode:?}: {error}");
-        assert_eq!(
-            error["detail"]["kind"], "vector_indexed_route_unavailable",
-            "{mode:?}: {error}"
-        );
-        assert!(
-            error["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("passages.embedding")),
-            "{mode:?}: {error}"
-        );
+        assert_eq!(run.code, Some(0), "{mode:?}: {}", run.stderr);
         assert_eq!(
             documents(&run.stdout),
-            [json!({"result": {"columns": ["id"], "rows": [{"id": 2}, {"id": 1}]}})],
+            [document.clone(), document.clone()],
             "{mode:?}"
         );
     }
+}
+
+/// What the two tests below search and inspect: a column with a partition for each `kind`, two
+/// vectors in each, and no maintenance cycle run.
+const KINDS: &str = "\
+CREATE TABLE notes (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, v VECTOR(3) PARTITION_KEY (kind));
+INSERT INTO notes (id, kind, v)
+VALUES (1, 'a', [1.0, 0.0, 0.0]), (2, 'a', [0.0, 1.0, 0.0]), (3, 'b', [-1.0, 0.0, 0.0]),
+       (4, 'b', NULL), (5, 'b', [0.1, 0.2, 0.3]);
+";
+
+/// The fields of `SHOW VECTOR_INDEXES`, in the order they are printed.
+const INDEX_FIELDS: [&str; 31] = [
+    "table",
+    "column",
+    "dimension",
+    "quantization",
+    "vector_count",
+    "bytes",
+    "partition_key_columns",
+    "max_partitions",
+    "live_partitions",
+    "search_mode",
+    "declared_auto_index_at",
+    "effective_auto_index_at",
+    "declared_consolidation_mode",
+    "declared_consolidation_change_percent",
+    "declared_consolidation_tombstone_percent",
+    "effective_consolidation_mode",
+    "effective_consolidation_change_percent",
+    "effective_consolidation_tombstone_percent",
+    "pending_inserts",
+    "tombstones",
+    "durable_vector_bytes",
+    "durable_index_bytes",
+    "indexed_available",
+    "maintenance_state",
+    "maintenance_vectors_total",
+    "maintenance_vectors_done",
+    "maintenance_vectors_remaining",
+    "unavailable_partitions",
+    "stalled_partitions",
+    "broad_route",
+    "recovery_action",
+];
+
+/// The fields of `SHOW VECTOR_PARTITIONS`, in the order they are printed.
+const PARTITION_FIELDS: [&str; 18] = [
+    "table",
+    "column",
+    "partition_key",
+    "live_rows",
+    "pending_inserts",
+    "tombstones",
+    "durable_vector_bytes",
+    "durable_index_bytes",
+    "indexed_available",
+    "availability_reason",
+    "maintenance_state",
+    "maintenance_reason",
+    "maintenance_vectors_total",
+    "maintenance_vectors_done",
+    "maintenance_vectors_remaining",
+    "lists",
+    "probes",
+    "recovery_action",
+];
+
+#[test]
+fn vector_inspection_prints_one_field_to_a_line() {
+    let dir = folder("vector-inspection-prints");
+    let store = dir.join("store");
+    let more = "CREATE TABLE other (id INTEGER PRIMARY KEY, w VECTOR(2));\n";
+    let made = shell(&dir, &[arg(&store), "--write"], &format!("{KINDS}{more}"));
+    assert_eq!(made.code, Some(0), "{}", made.stderr);
+
+    // Each statement with the fields it prints and, for each row, the values of three of them.
+    let indexes = [["notes", "v", "3"], ["other", "w", "2"]];
+    let partitions = [
+        ["notes", "v", r#"{"kind":"a"}"#],
+        ["notes", "v", r#"{"kind":"b"}"#],
+        ["other", "w", "{}"],
+    ];
+    let cases = [
+        ("SHOW VECTOR_INDEXES;\n", &INDEX_FIELDS[..], &indexes[..]),
+        (
+            "SHOW VECTOR_PARTITIONS;\n",
+            &PARTITION_FIELDS[..],
+            &partitions[..],
+        ),
+    ];
+    for (statement, fields, rows) in cases {
+        // For a person: rows with an empty line between them, each `name: value` lines in the
+        // statement's order, and no line too long for a terminal.
+        let run = shell(&dir, &[arg(&store)], statement);
+        assert_eq!(run.code, Some(0), "{}", run.stderr);
+        assert!(
+            run.stdout.lines().all(|line| line.chars().count() <= 120),
+            "{}",
+            run.stdout
+        );
+        let printed: Vec<Vec<(&str, &str)>> = run
+            .stdout
+            .split("\n\n")
+            .map(|row| {
+                row.lines()
+                    .filter(|line| !line.starts_with('('))
+                    .map(|line| {
+                        line.split_once(": ")
+                            .unwrap_or_else(|| panic!("not `name: value`: {line:?}"))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|row| !row.is_empty())
+            .collect();
+        assert_eq!(printed.len(), rows.len(), "{}", run.stdout);
+        for (row, first) in printed.iter().zip(rows) {
+            let names: Vec<&str> = row.iter().map(|(name, _)| *name).collect();
+            assert_eq!(names, fields, "{}", run.stdout);
+            let values: Vec<&str> = row[..3].iter().map(|(_, value)| *value).collect();
+            assert_eq!(values, first, "{}", run.stdout);
+        }
+
+        // For a program: the usual result document, its columns the same names.
+        let run = shell(&dir, &[arg(&store), "--json"], statement);
+        assert_eq!(run.code, Some(0), "{}", run.stderr);
+        let results = documents(&run.stdout);
+        assert_eq!(results.len(), 1, "{}", run.stdout);
+        assert_eq!(results[0]["result"]["columns"], json!(fields));
+        let found = results[0]["result"]["rows"].as_array().unwrap();
+        assert_eq!(found.len(), rows.len(), "{}", run.stdout);
+        assert_eq!(found[0]["table"], "notes", "{}", run.stdout);
+    }
+}
+
+#[test]
+fn explain_prints_how_each_partition_is_searched() {
+    let dir = folder("explain-prints");
+    let store = dir.join("store");
+    let made = shell(&dir, &[arg(&store), "--write"], KINDS);
+    assert_eq!(made.code, Some(0), "{}", made.stderr);
+
+    // Four vectors in two partitions, far below the 100,000 from which AUTO uses a grouping,
+    // so the search asked for under AUTO is the exact one, and none grouped. A line ending in
+    // `*` is checked by its name alone: with no grouping the partition has no count of groups
+    // to print.
+    let lines = [
+        "requested_mode: AUTO",
+        "resolved_mode: EXACT",
+        "effective_auto_index_at: 100000",
+        "aggregate_allowed_vectors: 4",
+        r#"partition_key_columns: ["kind"]"#,
+        "partitions: 2",
+        r#"partition: {"kind":"a"}"#,
+        "  route: exact",
+        "  lists: *",
+        "  probes: *",
+        "  live_rows: 2",
+        "  outside_grouping: 2",
+        r#"partition: {"kind":"b"}"#,
+        "  route: exact",
+        "  lists: *",
+        "  probes: *",
+        "  live_rows: 2",
+        "  outside_grouping: 2",
+        "refusal: none",
+    ];
+    let same = |printed: &[&str]| {
+        printed.len() == lines.len()
+            && lines.iter().zip(printed).all(|(expected, line)| {
+                expected
+                    .strip_suffix('*')
+                    .map_or(expected == line, |name| line.starts_with(name))
+            })
+    };
+    let search = ".explain SELECT id FROM notes ORDER BY v <=> '[1,0,0]' LIMIT 3\n";
+
+    // The lines and nothing else: the search is not run, so no table of rows is printed.
+    let run = shell(&dir, &[arg(&store)], search);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert!(
+        same(&run.stdout.lines().collect::<Vec<_>>()),
+        "{}",
+        run.stdout
+    );
+
+    // Any other statement is refused in one line, and the session goes on to the next.
+    let other = ".explain SELECT id FROM notes ORDER BY id\n";
+    let next = "SELECT id FROM notes WHERE id = 5;\n";
+    let run = shell(&dir, &[arg(&store)], &format!("{other}{next}"));
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
+    let refusals: Vec<&str> = run.stderr.lines().collect();
+    assert_eq!(refusals.len(), 1, "{}", run.stderr);
+    assert!(
+        refusals[0].starts_with("Error: ")
+            && refusals[0].contains(
+                "explaining this statement is not supported in this version of the library"
+            ),
+        "{}",
+        run.stderr
+    );
+    assert_eq!(tables(&run.stdout), [[["id"], ["5"]]], "{}", run.stdout);
+
+    // For a program: one document that holds the same lines.
+    let run = shell(&dir, &[arg(&store), "--json"], search);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let results = documents(&run.stdout);
+    assert_eq!(results.len(), 1, "{}", run.stdout);
+    let printed: Vec<&str> = results[0]["explain"]["lines"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no explain.lines: {}", results[0]))
+        .iter()
+        .map(|line| line.as_str().unwrap())
+        .collect();
+    assert!(same(&printed), "{}", run.stdout);
+}
+
+#[test]
+fn help_lists_explain() {
+    let dir = folder("help-lists-explain");
+    let store = dir.join("store");
+    let made = shell(&dir, &[arg(&store), "--write"], CREATE_NOTES);
+    assert_eq!(made.code, Some(0), "{}", made.stderr);
+    let run = shell(&dir, &[arg(&store)], ".help\n");
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert!(
+        run.stdout.lines().any(|line| line.starts_with(".explain")),
+        "{}",
+        run.stdout
+    );
 }
 
 #[test]

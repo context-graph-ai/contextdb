@@ -1,6 +1,6 @@
 //! Printing a declaration back as SQL.
 
-use super::{RESERVED_PREFIXES, Table};
+use super::{Consolidation, Quantization, RESERVED_PREFIXES, Table};
 use crate::types::{ColumnDef, ColumnDefault, ColumnType, SortDirection, Value, VectorSearchMode};
 
 /// A table's declaration as SQL: the CREATE TABLE, then one CREATE INDEX for each index the
@@ -58,8 +58,12 @@ fn column(table: &Table, column: &ColumnDef) -> String {
         ColumnType::Vector(size) => text.push_str(&format!("VECTOR({size})")),
     }
     if let Some(vector) = table.vector(&column.name) {
+        if vector.quantization == Quantization::Sq8 {
+            text.push_str(" WITH (quantization = 'SQ8')");
+        }
         // The limit on partitions refuses writes, so it is printed for every column with a
-        // PARTITION_KEY, whether or not it was written. SEARCH_MODE is printed only when it was.
+        // PARTITION_KEY, whether or not it was written. The clauses after it are printed only
+        // when they were written.
         if let Some(limit) = vector.limit() {
             let key: Vec<String> = vector.partition_key.iter().map(|key| name(key)).collect();
             text.push_str(&format!(
@@ -73,6 +77,21 @@ fn column(table: &Table, column: &ColumnDef) -> String {
             Some(VectorSearchMode::Exact) => " SEARCH_MODE EXACT",
             Some(VectorSearchMode::Indexed) => " SEARCH_MODE INDEXED",
         });
+        if let Some(at) = vector.auto_index_at {
+            text.push_str(&format!(" AUTO_INDEX_AT {at}"));
+        }
+        match vector.consolidation {
+            None => {}
+            Some(Consolidation::None) => text.push_str(" CONSOLIDATION NONE"),
+            Some(Consolidation::Percent { change, tombstone }) => {
+                let members = [("CHANGE_PERCENT", change), ("TOMBSTONE_PERCENT", tombstone)];
+                let written = members.iter().filter_map(|(member, percent)| {
+                    percent.map(|percent| format!("{member} = {percent}"))
+                });
+                let written: Vec<String> = written.collect();
+                text.push_str(&format!(" CONSOLIDATION ({})", written.join(", ")));
+            }
+        }
     }
     if column.primary_key {
         text.push_str(" PRIMARY KEY");

@@ -1,14 +1,14 @@
 //! Checking a declaration: what CREATE TABLE and CREATE INDEX may say, and the table each gives.
 
-use super::{Catalog, RESERVED_PREFIXES, Table, VectorColumn};
-use crate::sql::ast::{self, DataType, Expr, Literal};
+use super::{Catalog, Consolidation, Quantization, RESERVED_PREFIXES, Table, VectorColumn};
+use crate::sql::ast::{self, ConsolidationClause, DataType, Expr, Literal};
 use crate::sql::not_supported;
 use crate::sql::plan::{CreateIndexPlan, CreateTablePlan};
 use crate::store::{IndexId, TableId, VectorId};
 use crate::types::{
     ColumnDef, ColumnDefault, ColumnType, Error, IndexDecl, Result, SortDirection, TableMeta,
     Value, VectorIndexRef, VectorPartitionDeclarationIssue as PartitionIssue,
-    VectorPolicyDeclarationIssue,
+    VectorPolicyDeclarationIssue as PolicyIssue,
 };
 
 fn invalid(reason: String) -> Error {
@@ -109,18 +109,63 @@ fn vector_column(
         table: table.to_owned(),
         column: declared.name.clone(),
     };
+    let policy = |issue| Error::InvalidVectorPolicyDeclaration {
+        index: index.clone(),
+        issue,
+    };
     if declared.data_type == DataType::Vector(0) {
-        let issue = VectorPolicyDeclarationIssue::DimensionsNotPositive;
-        return Err(Error::InvalidVectorPolicyDeclaration { index, issue });
+        return Err(policy(PolicyIssue::DimensionsNotPositive));
     }
-    let max_partitions = partitions(declared, columns)
-        .map_err(|issue| Error::InvalidVectorPartitionDeclaration { index, issue })?;
+    let max_partitions = partitions(declared, columns).map_err(|issue| {
+        Error::InvalidVectorPartitionDeclaration {
+            index: index.clone(),
+            issue,
+        }
+    })?;
+    let written = declared.vector.quantization.as_deref();
+    let quantization = match written.map(str::to_ascii_uppercase).as_deref() {
+        None | Some("F32") => Quantization::F32,
+        Some("SQ8") => Quantization::Sq8,
+        Some("SQ4") => return Err(not_supported("WITH (quantization = 'SQ4')")),
+        Some(_) => {
+            let member = "quantization";
+            return Err(policy(PolicyIssue::InvalidMember { member }));
+        }
+    };
+    let auto_index_at = match &declared.vector.auto_index_at {
+        None => None,
+        Some(written) => match written.parse::<u64>() {
+            Ok(at) if at > 0 => Some(at),
+            Err(_) if !written.starts_with('-') => {
+                return Err(policy(PolicyIssue::AutoIndexAtOutOfRange));
+            }
+            _ => return Err(policy(PolicyIssue::AutoIndexAtNotPositive)),
+        },
+    };
+    let percent = |written: &Option<String>| match written {
+        None => Ok(None),
+        Some(written) => match written.parse::<u8>() {
+            Ok(percent @ 1..=100) => Ok(Some(percent)),
+            _ => Err(policy(PolicyIssue::ConsolidationPercentOutOfRange)),
+        },
+    };
+    let consolidation = match &declared.vector.consolidation {
+        None => None,
+        Some(ConsolidationClause::None) => Some(Consolidation::None),
+        Some(ConsolidationClause::Percent { change, tombstone }) => Some(Consolidation::Percent {
+            change: percent(change)?,
+            tombstone: percent(tombstone)?,
+        }),
+    };
     Ok(VectorColumn {
         id,
         column: declared.name.clone(),
         partition_key: declared.vector.partition_key.clone(),
         max_partitions,
         search_mode: declared.vector.search_mode,
+        auto_index_at,
+        consolidation,
+        quantization,
     })
 }
 

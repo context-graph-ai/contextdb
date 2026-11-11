@@ -10,14 +10,15 @@ This is the first version of contextdb 2. What it has:
 
 - tables with typed columns, a primary key, `NOT NULL`, `UNIQUE` and `DEFAULT`, and indexes;
 - `INSERT`, `UPDATE`, `DELETE` and `SELECT` over one table;
-- vector search: the rows nearest a vector by cosine distance, each with its distance, exact,
-  over vectors that a column may keep in partitions;
+- vector search: the rows nearest a vector by cosine distance, each with its distance, over
+  vectors that a column may keep in partitions; exact on request, and through an index that
+  `run_maintenance_cycle` builds and brings up to date once a column holds many vectors;
 - transactions;
 - one process writing a store while any number of other processes read it;
 - a memory limit that holds.
 
-What it does not have yet: an index for vector search (every search is exact), relationships
-between rows, joins, grouping, and sync between machines. A statement that uses one of them is
+What it does not have yet: relationships between rows, joins, grouping, and sync between
+machines. A statement that uses one of them is
 refused and changes nothing.
 
 It is not on crates.io yet. Clone <https://github.com/context-graph-ai/contextdb> and use it from that checkout:
@@ -65,9 +66,9 @@ fn main() -> contextdb::Result<()> {
 ```
 
 It prints `buy oat milk: 0.006` and then `call the plumber: 1.000`. After writing vectors, a host
-calls `db.run_maintenance_cycle()?` until its report's `vector.maintenance_vectors_remaining` is
-0, because this version does not do it by itself; a search before that returns the same rows,
-slower ([Sealing](#vector-search) below). This page is also the crate's
+calls `db.run_maintenance_cycle()?` again and again, as the paragraph on upkeep under Vector search says, because
+this version does not do it by itself; a search before that still finds every vector, and reads
+more to do it. This page is also the crate's
 documentation, and the documentation tests compile this program as it is written here. Rust 1.89 or newer; Linux and macOS. Licence:
 Apache-2.0. It is developed in the open at <https://github.com/context-graph-ai/contextdb> by the context-graph-ai organisation.
 
@@ -76,8 +77,11 @@ Apache-2.0. It is developed in the open at <https://github.com/context-graph-ai/
 ```sql
 CREATE TABLE [IF NOT EXISTS] name (
   column type [PRIMARY KEY] [NOT NULL] [UNIQUE] [DEFAULT value],
-  column VECTOR(n) [PARTITION_KEY (column, ...) [MAX_PARTITIONS m]]  -- m is 256 when left out
-                   [SEARCH_MODE AUTO | EXACT | INDEXED],
+  column VECTOR(n) [WITH (quantization = 'F32' | 'SQ8')]             -- F32 when left out
+                   [PARTITION_KEY (column, ...) [MAX_PARTITIONS m]]  -- m is 256 when left out
+                   [SEARCH_MODE AUTO | EXACT | INDEXED]
+                   [AUTO_INDEX_AT a]                                 -- a is 100000 when left out
+                   [CONSOLIDATION NONE | CONSOLIDATION (CHANGE_PERCENT = c, TOMBSTONE_PERCENT = t)],
   ...,
   [UNIQUE (column, ...)]
 );
@@ -89,6 +93,8 @@ SELECT column, ... | * FROM table [WHERE condition] [ORDER BY column [ASC | DESC
 SELECT column, ... | * FROM table [WHERE condition]
   ORDER BY column <=> vector [USE VECTOR AUTO | EXACT | INDEXED] LIMIT k;
 SET MEMORY_LIMIT 512M;   SET MEMORY_LIMIT NONE;   SHOW MEMORY_LIMIT;
+SHOW VECTOR_INDEXES;
+SHOW VECTOR_PARTITIONS [FOR table.column] [LIMIT count [OFFSET start]];
 ```
 
 - Every table has exactly one `PRIMARY KEY` column. A default is a literal or `NOW()`.
@@ -102,12 +108,13 @@ SET MEMORY_LIMIT 512M;   SET MEMORY_LIMIT NONE;   SHOW MEMORY_LIMIT;
   match, and `AS` to name a column of the result.
 - `ORDER BY` puts NULL last ascending and first descending.
 - The second `SELECT` is a vector search; [Vector search](#vector-search) below says what it
-  returns.
+  returns. The clauses of a `VECTOR` column are described under Vector search (quantization, modes, upkeep),
+  and the two `SHOW` statements there too, under inspection.
 - `--` and `/* */` comments are read past.
 
 Not in this version, and refused: `JOIN`, `GROUP BY`, `DISTINCT`, `LIKE`, `BETWEEN`,
 `OFFSET`, `UNION`, subqueries, table aliases, `ALTER`, `DROP`, and a primary key over several
-columns. Most are refused by name; this is the sentence the refusal prints:
+columns; and the vector clauses `IVF`, `SEARCH (...)` and `WITH (quantization = 'SQ4')`. Most are refused by name; this is the sentence the refusal prints:
 
 ```text
 plan error: LIKE is not supported in this version of the library
@@ -124,7 +131,7 @@ plan error: LIKE is not supported in this version of the library
 | `UUID` | a UUID, written as quoted text | `Value::Uuid` |
 | `TIMESTAMP` | milliseconds since the first moment of 1970, UTC; written as ISO 8601 text (`'2026-01-01T00:00:01Z'`) or taken from `NOW()` | `Value::Timestamp` |
 | `JSON` | a JSON value, written as quoted text; the value is kept, not the text's spacing | `Value::Json` |
-| `VECTOR(n)` | a vector of exactly `n` finite numbers, each kept as an `f32`, written `[0.1, 0.2, 0.3]`; searched with `<=>` | `Value::Vector` |
+| `VECTOR(n)` | a vector of exactly `n` finite numbers, each kept as an `f32` (a column declared `SQ8` keeps a rounded vector, see the paragraph on quantization under Vector search), written `[0.1, 0.2, 0.3]`; searched with `<=>` | `Value::Vector` |
 
 A value must be of its column's type: text into an `INTEGER` column is refused, and so is NULL
 into a `NOT NULL` column, on `INSERT` and on `UPDATE` alike. A whole number is accepted into a
@@ -151,8 +158,10 @@ SELECT id, embedding <=> $q AS distance FROM notes ORDER BY distance LIMIT 10;
   the same as quoted text, `'[1, 0, 0]'`. It has the column's dimension and finite numbers.
 - `WHERE` is applied first: the answer is the `k` nearest of the rows that pass it. A row whose
   vector is NULL is in no answer. The distance to a vector of all zeros is 1.
-- Every search is exact: it returns the rows that comparing `$q` with every stored vector
-  returns.
+- How much of the column a search compares with `$q` is the search's mode: `EXACT` compares
+  every stored vector and returns the true nearest rows; `INDEXED` chooses among them through
+  the column's index; `AUTO`, the default, is `EXACT` until a column is large and then uses the
+  index (the paragraph on modes below).
 
 Only `<=>`, cosine, is here: pgvector's `<->` and `<#>` are a parse error. `<=>` has a value
 only for the rows of a search, so it is refused everywhere else: in `WHERE`,
@@ -160,13 +169,35 @@ in the select list of a statement that does not order by it, in an `INSERT`, `UP
 `DELETE`, with a vector other than the one the statement orders by, and in an `ORDER BY` that
 is `DESC`, has a second item or has no `LIMIT`; a search takes no `OFFSET` either.
 
-**Sealing.** Beside every stored vector the engine keeps a one-byte copy of each of its numbers
+**Upkeep.** Beside every stored vector the engine keeps a one-byte copy of each of its numbers
 and packs the copies of many vectors into a block, which a search screens quickly to rule most
 rows out without reading them. A vector that was just written is on the waiting list, the
-vectors not yet in a block, which a search compares one by one by reading their rows.
-`Database::run_maintenance_cycle` seals them, which is to move them from the list into blocks:
-one call seals at most 4,096 in one commit and returns how many it sealed and how many still
-wait; nothing in this version calls it on its own. A search returns the same rows with the same distances whether or not vectors are sealed; sealed,
+vectors not yet in a block, which a search compares one by one by reading their rows. Once a
+column is large enough (the paragraph on modes below) the engine also groups a partition's vectors:
+it finds the centres of groups of near vectors, files each vector under its nearest centre, and
+keeps a one-bit sketch of every vector, an eighth of the size of its one-byte copy. A grouping
+is made once and replaced whole; a vector written after it waits in blocks of its own, each
+with its sketches, until the partition is grouped again.
+
+`Database::run_maintenance_cycle` does this work in bounded steps, and nothing in this version
+calls it on its own. One call first seals: it moves at most 4,096 waiting vectors into blocks
+in one commit. Then it takes one step for each partition that has a grouping due or being
+built, each step in a commit of its own: begin, ten rounds that find the centres, file the
+vectors under them, pack the groups into blocks, measure (twice), and put the new grouping in
+force. A partition is grouped again when the vectors written, removed or changed since reach
+`CHANGE_PERCENT` of its grouping (20 when left out) or the removed or changed ones reach
+`TOMBSTONE_PERCENT` (10); `CONSOLIDATION NONE` never groups it again. The call returns a
+`MaintenanceReport`, and its `vector` field says what is left:
+`maintenance_vectors_done` and `maintenance_vectors_remaining` (vectors), `remaining_partitions`
+(partitions with a grouping due or being built) and `stalled_partitions` (those whose last step
+the memory limit refused; a further cycle does nothing for them until the limit is raised, and
+with no limit declared none stall). A host runs cycles while `remaining_partitions` is above
+`stalled_partitions` or `maintenance_vectors_remaining` is not zero, as the program in the paragraph on the index below does.
+
+A step is worked out with no lock held, so a write waits only for a step's commit and a reader
+not at all, and a search made between two cycles finds every vector: it sees the grouping in
+force when the statement began, whole, or the one before it, whole, never a mix. An exact
+search returns the same rows with the same distances whether or not vectors are sealed; sealed,
 it reads far fewer rows, and the result's `QueryResult::rows_examined` says how many it read.
 
 **Partitions.** `PARTITION_KEY (column, ...)` on a `VECTOR` column lays its vectors out by the
@@ -186,14 +217,257 @@ column and its limit; the statement changes nothing, and inside a transaction th
 goes on. A column with no `PARTITION_KEY` is one partition and has no limit.
 
 **Modes.** `SEARCH_MODE` on the column says how its searches run when a statement does not, and
-`USE VECTOR`, written after the `ORDER BY` item, says it for one statement. `AUTO`, which is
-the default, and `EXACT` both run the exact search. `INDEXED` asks for an index, and this
-version has none: a column may be declared with it, and a search under it is refused before
-anything is read, unless the statement itself says `USE VECTOR EXACT` or `AUTO`.
+`USE VECTOR`, written after the `ORDER BY` item, says it for one statement. The mode in force is
+the statement's, else the column's, else `AUTO`.
+
+- `EXACT` compares the search vector with every stored vector of every partition the statement
+  selects: the grouping's blocks, the blocks written since and the waiting list. It returns the
+  true nearest rows, and reads no centre and no sketch.
+- `INDEXED` searches the waiting vectors of each selected partition and, of the rest, only
+  the vectors the index chooses (the paragraph on the index below). A partition with no grouping,
+  or with a grouping of one group, has nothing to choose among, and is searched as `EXACT`
+  searches it. `INDEXED` is refused, before anything is read, when a selected partition's
+  writes are far ahead of upkeep (for a partition with no grouping or a grouping of one group,
+  the vectors outside its grouping number at least twice `AUTO_INDEX_AT`; for one with more
+  groups, at least twice what makes it due to be grouped again, which under
+  `CONSOLIDATION NONE` is never), and when a filter on rows leaves it nothing to choose among, as the
+  paragraph on filters below says.
+- `AUTO`, which is the default, adds up the vectors of the partitions the statement selects.
+  Below `AUTO_INDEX_AT` it is `EXACT`. From there on each selected partition that has a
+  grouping and is not far behind is searched as `INDEXED` searches it, and every other
+  partition as `EXACT` does. `AUTO` is never refused for a grouping.
+
+`AUTO_INDEX_AT` is 100,000 when not written. Until a column holds that many vectors in all its
+partitions together (or declares `SEARCH_MODE INDEXED`), no centre, sketch or mean is
+written, and `durable_index_bytes` is 0 unless removed or changed rows (10% by default) have
+given a partition a grouping of one group, which takes 28 bytes. In a column that has reached it, a partition is grouped once it
+holds a hundredth of it, 1,000 vectors when nothing is written, so a store of many middling
+partitions is indexed too; a partition of a few hundred vectors is not cut into groups. A
+declared `AUTO_INDEX_AT` of any size is served. A column that should never be grouped declares
+one it will not reach.
+
+**The index.** An indexed search of a partition that has groups compares the search vector with
+the centres of its groups and takes the groups whose centre is nearly as near as the nearest
+centre; then it estimates from the sketches of those groups' vectors, and of the vectors
+written since the grouping, which of them can be among the nearest; only those go on to the
+one-byte copy and then to the row. So every row in an indexed answer has its true distance,
+the answer is in the order of those distances, no row comes twice, and a search is never
+answered short: it returns `LIMIT` rows whenever the selected partitions hold that many rows
+the statement's filter passes. What a sketch can cost is a row that an exact search would have
+put among the nearest.
+
+An indexed search returns rows that an exact search would rank among its nearest, each with
+its true distance. How far from the nearest group it scans and how far it trusts a sketch
+are measured when the index is built, on questions made from the stored vectors: half are
+stored vectors themselves, half lie between two stored vectors, and a sketch counts as kept
+only if it would be kept both as a grouped row and as a row written after the build. That is
+a measure over those questions, not a promise for any one question: a question unlike both
+kinds, rows written after the build that are unlike the rows the build saw, and a `LIMIT`
+other than ten are not what the measure was taken on. `USE VECTOR EXACT` or `SEARCH_MODE EXACT`
+is exact.
+
+A search with a filter on rows uses the index too. The filter is asked of each row the search
+visits, and the search widens until it holds as many allowed rows as were asked for: a filter
+that passes most rows costs what the unfiltered search costs, and one that passes few costs
+more, up to the work of `EXACT`. `INDEXED` is refused by name only when a filter passes too few
+rows for the index to choose among, because being sure of the answer would mean asking the filter
+of the whole table under the index's name; `AUTO` does that work and returns every row there
+is.
 
 ```text
-no vector index ships in this version, so notes.embedding cannot be searched INDEXED; use EXACT or AUTO
+notes.embedding cannot be searched INDEXED for this statement now: its index is behind its writes, or the statement's filter leaves the index nothing to choose among; run a maintenance cycle, or use EXACT or AUTO
 ```
+
+`QueryResult::distance_evaluations` counts the work of a similarity search: the centres it
+compared with the search vector, the sketches it estimated, the one-byte copies it screened and
+the rows whose distance it worked out. It is an exact count, the same on every run over the
+same store, and 0 for any other statement. An indexed search usually counts far fewer than an
+exact one, and can count more when it leaves few groups out, because it estimates a sketch of
+every vector it keeps; each of those counts an eighth of the bytes. `Database::explain`, and
+`ReadSession::explain`, return what a similarity search would do, without running it. This
+program builds a store of 2,000 vectors, runs upkeep as above, and searches it both ways:
+
+```rust,no_run
+use contextdb::{params, Database};
+
+// A number from -1 to 1 for each seed, the same on every machine.
+fn spread(seed: u64) -> f32 {
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x ^= x >> 29;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 32;
+    (x % 2001) as f32 / 1000.0 - 1.0
+}
+
+// Eight numbers for each id: the topic's (fifty topics) and a little of the id's own.
+fn vector(id: u64) -> Vec<f32> {
+    (0..8u64)
+        .map(|j| spread((id % 50) * 8 + j + 1) + 0.15 * spread(id * 8 + j + 100_000))
+        .collect()
+}
+
+fn main() -> contextdb::Result<()> {
+    let db = Database::open("./notes-index")?;
+    db.execute(
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, embedding VECTOR(8) AUTO_INDEX_AT 1000)",
+        &params! {},
+    )?;
+    let tx = db.transaction()?;
+    for id in 0..2000u64 {
+        tx.execute(
+            "INSERT INTO notes (id, embedding) VALUES ($id, $embedding)",
+            &params! { "id" => id as i64, "embedding" => vector(id) },
+        )?;
+    }
+    tx.commit()?;
+
+    // Upkeep: seal the new vectors and group them, a bounded step at a time.
+    let mut cycles = 0;
+    loop {
+        let report = db.run_maintenance_cycle()?.vector;
+        cycles += 1;
+        if report.remaining_partitions <= report.stalled_partitions
+            && report.maintenance_vectors_remaining == 0
+        {
+            break;
+        }
+    }
+    println!("{cycles} cycles");
+
+    let mut ids = Vec::new();
+    for mode in ["EXACT", "INDEXED"] {
+        let sql = format!(
+            "SELECT id FROM notes ORDER BY embedding <=> $q USE VECTOR {mode} LIMIT 10"
+        );
+        let found = db.execute(&sql, &params! { "q" => vector(5000) })?;
+        println!("{mode}: {} distance evaluations", found.distance_evaluations());
+        ids.push(found.rows().to_vec());
+    }
+    println!("the same ten rows: {}", ids[0] == ids[1]);
+    println!("{}", db.explain("SELECT id FROM notes ORDER BY embedding <=> $q LIMIT 10")?);
+    db.close()
+}
+```
+
+It prints, for the first run (`./notes-index` must not exist):
+
+```text
+16 cycles
+EXACT: 2019 distance evaluations
+INDEXED: 225 distance evaluations
+the same ten rows: true
+requested_mode: AUTO
+resolved_mode: AUTO
+effective_auto_index_at: 1000
+aggregate_allowed_vectors: 2000
+partition_key_columns: []
+partitions: 1
+partition: {}
+  route: indexed
+  lists: 45
+  probes: 8
+  live_rows: 2000
+  outside_grouping: 0
+refusal: none
+```
+
+`lists` is the groups of the grouping in force and `probes` the most of them a search scanned
+for the questions its build made, `outside_grouping` the slots in blocks written since (stale ones
+included) plus the vectors still waiting, and `route` is `exact` or `indexed`; `refusal` is `none` or, for INDEXED over a partition that is
+behind its writes, the sentence the search would be refused with (the refusal for a filter is
+known only when the search runs). A statement that names a partition with a `$name` has nothing to select
+with, since `explain` binds nothing: it lists every partition of the column and says so,
+`partitions: every partition ($t is not bound)`. `explain` of a statement that is not a
+similarity search is refused as a later version's.
+
+**Quantization.** `WITH (quantization = 'SQ8')` on a column keeps each vector as one scale and
+one whole number from -127 to 127 for each of its numbers, so a vector of `n` numbers takes
+`n + 13` bytes in place of `4n + 9`: in the two stores of real passages under Numbers below a passage
+takes about 2.0 KB in place of 4.4 and 4.9, and the store 0.45 times the room. The cost is in the answers. The vector the row keeps is the rounded one, and it is the
+one a `SELECT` returns and every search, `EXACT` included, ranks by (`[0.1, 0.2, 0.3]` is
+read back as `[0.0992126, 0.2007874, 0.3]`); and on those stores, searched exactly, the ten nearest rows of an
+`SQ8` column differ from the full-precision column's on 12 to 21 questions in 100, by whether the
+search covers one, several or all of its partitions. It is an option a table chooses and never a default: a
+column keeps `F32` unless it says otherwise. `SQ4` is refused by name.
+
+**Inspection.** `SHOW VECTOR_INDEXES` returns one row for each `VECTOR` column of the store,
+in the order of table name and column, and `SHOW VECTOR_PARTITIONS` one row for each partition
+of the column after `FOR`, or of every `VECTOR` column, in the order of table, column and key
+tuple; `LIMIT` takes the first rows and `OFFSET`, only after `LIMIT`, skips some. Both read
+the vector part's small records and no block, no centre and no row, change nothing, and work in
+a writer, a transaction and a read session alike. The shell prints their rows one field to a
+line, with an empty line between rows. For the store above, `contextdb ./notes-index` prints
+these (the lines of `SHOW VECTOR_INDEXES` that tell the column's declaration, size and
+state, with `…` for the lines left out):
+
+```text
+table: notes
+column: embedding
+dimension: 8
+quantization: F32
+vector_count: 2000
+…
+search_mode: AUTO
+declared_auto_index_at: 1000
+effective_auto_index_at: 1000
+…
+durable_vector_bytes: 32000
+durable_index_bytes: 7856
+indexed_available: true
+maintenance_state: idle
+…
+recovery_action: none
+```
+
+and for `SHOW VECTOR_PARTITIONS`:
+
+```text
+table: notes
+column: embedding
+partition_key: {}
+live_rows: 2000
+pending_inserts: 0
+tombstones: 0
+durable_vector_bytes: 32000
+durable_index_bytes: 7856
+indexed_available: true
+availability_reason: none
+maintenance_state: idle
+maintenance_reason: none
+maintenance_vectors_total: 0
+maintenance_vectors_done: 0
+maintenance_vectors_remaining: 0
+lists: 45
+probes: 8
+recovery_action: none
+```
+
+`.explain <sql>` in the shell prints what `Database::explain` returns; `.explain SELECT id FROM notes
+ORDER BY embedding <=> $q LIMIT 10` prints:
+
+```text
+requested_mode: AUTO
+resolved_mode: AUTO
+effective_auto_index_at: 1000
+aggregate_allowed_vectors: 2000
+partition_key_columns: []
+partitions: 1
+partition: {}
+  route: indexed
+  lists: 45
+  probes: 8
+  live_rows: 2000
+  outside_grouping: 0
+refusal: none
+```
+
+Inspection tells the groups a partition has (`lists`) and the most groups a search scanned
+while the index was measured (`probes`); it does not print the measured distance or width. A
+column with no `PARTITION_KEY` has one row in `SHOW VECTOR_PARTITIONS`, with `partition_key`
+`{}`, and a partitioned column with no vector has none. A partition's `maintenance_state` is `idle`, `pending` (a grouping is due and not begun),
+`building` or `stalled`, and its `maintenance_reason` says why upkeep has work: `first_grouping`,
+`changes`, `tombstones`, `damaged` or `memory_limit`. For `pending` and `building` the
+`recovery_action` is `run a maintenance cycle`, and for `stalled` it is `raise the memory limit`.
 
 ## Binding values
 
@@ -350,7 +624,9 @@ contextdb ./notes --write    read and write it, creating it if it is missing
 
 A statement ends at `;`. `BEGIN;`, `COMMIT;` and `ROLLBACK;` run a transaction, which needs
 `--write`; `.tables` lists
-the tables, `.schema <table>` prints a table's declaration and `.help` lists the commands. With
+the tables, `.schema <table>` prints a table's declaration, `.explain <sql>` prints how a
+similarity search would be answered without running it (anything else it refuses like a statement
+of a later version), and `.help` lists the commands. With
 statements piped in there is no prompt, and a refusal does not stop what comes after it. A
 refused statement or command is one line on the error stream, `Error: ` and then the refusal's
 sentence, or the program's own sentence where one of its options is the way on; a line that
@@ -368,22 +644,56 @@ options, the exit statuses and the JSON forms.
 
 Measured at one commit by `v2/numbers.sh`, which prints them again on any machine: a release
 build on a 16-core AMD Ryzen 9 9955HX with 64 GB of memory and an NVMe drive, running Linux and
-nothing else.
+nothing else. Every search time is the 95th percentile of 100 questions asked one after the
+other by one thread, in a read session under a 1 GiB memory limit unless a row says 64 MiB, in
+an ordinary release build with no processor flag (the counting loop uses the processor's
+bit-count instruction, which this processor has). Recall is the share of an exact search's ten
+nearest rows that the search returned, averaged over the 100 questions, and the next number is
+how many of the 100 questions got all ten.
 
 | What | Measured |
 |---|---|
-| 20,000 rows of 1.6 KB, one commit per row: time to insert | 11.0 s |
+| 20,000 rows of 1.6 KB, one commit per row: time to insert | 11.1 s |
 | That store on disk (its rows repeat their text, which compresses far better than real text) | 2.4 MiB |
-| Open that store | 0.606 ms |
-| `SELECT COUNT(*)` over it | 0.025 ms, 0 rows read |
-| A million rows under a 64 MiB limit: time to load | 9.7 s |
-| Scan the million rows | 239.167 ms |
+| Open that store | 0.561 ms |
+| `SELECT COUNT(*)` over it | 0.030 ms, 0 rows read |
+| A million rows under a 64 MiB limit: time to load | 10.5 s |
+| Scan the million rows | 236.582 ms |
 | Most memory the engine had allocated during that load and scan | 16.4 MiB |
-| Most memory the process held, as the operating system reports it | 21.3 MiB |
-| First build of a program that uses the library | 6 s, 47 packages, a 3.0 MiB program |
-| From a fresh clone to a passing `cargo test` | 2.7 min |
-| Ten nearest of 20,000 vectors, sealed, through SQL: 95th percentile | 1.500 ms |
+| Most memory the process held, as the operating system reports it | 21.5 MiB |
+| First build of a program that uses the library | 8 s, 47 packages, a 3.2 MiB program |
+| From a fresh clone to a passing `cargo test` | 3.2 min |
+| Ten nearest of 20,000 vectors, sealed, through SQL, exact: 95th percentile | 1.548 ms |
 | That vector store on disk, and how many times the bytes it holds | 44.3 MiB, 1.50 times |
-| Lines of Rust and grammar in the library and the program | 10,809 |
-| Tests | 171 |
+| Lines of Rust and grammar in the library and the program | 15,440 |
+| Tests | 253 |
 | Lines that differ from redb 4.1.0 in the storage library under the engine, which is redb 4.1.0 with the changes listed in `v2/redb/README.md` | 626 |
+
+Searches for the ten nearest, indexed beside exact from the same run. Where a store is below
+`AUTO_INDEX_AT` nothing is grouped and an indexed search is the exact one.
+
+| Search | Indexed | Exact | Recall, questions with all ten |
+|---|---|---|---|
+| 10,000 generated vectors, one partition, 100 groups (`AUTO_INDEX_AT 1000`) | 0.541 ms | 1.185 ms | 0.9960, 96 of 100 |
+| 100,008 real passages, eight partitions, 884 groups: one partition | 0.682 ms | 1.411 ms | 1.0000, 100 of 100 |
+| the same: several partitions | 1.537 ms | 3.841 ms | 0.9990, 99 of 100 |
+| the same: all eight | 4.052 ms | 10.880 ms | 0.9990, 99 of 100 |
+| the same: all eight, under 64 MiB | 11.383 ms | not taken | 0.9990, 99 of 100 |
+| the same: all eight, a filter that passes 992 of the 100,008 rows | 32.411 ms | 38.453 ms | 1.0000, 100 of 100 |
+| the same, 9,996 more passages written after the build and sealed | 3.749 ms | 10.781 ms | 1.0000, 100 of 100 |
+| 1,000,000 generated vectors of 768 numbers around 300 hidden centres, one partition, 1,000 groups | 1.109 ms | 180.929 ms | 1.0000, 100 of 100 |
+| 1,000,000 generated camera sightings, one partition, 1,000 groups | 30.348 ms | 175.409 ms | 1.0000, 100 of 100 |
+| 11,588 real passages, eight partitions, below the size: one / several / all | 0.303 / 0.724 / 1.440 ms | 0.302 / 0.724 / 1.440 ms | 1.0000, 100 of 100 each |
+
+Getting a store to those groupings takes `run_maintenance_cycle` calls: 34 cycles and 1.8 s for
+the 10,000, 56 cycles and 26.9 s for the 100,008 passages, 1,150 cycles and 362.8 s for the
+million. The index takes 129, 125 and 101 bytes a vector there. Right after a build a store's
+file is 1.20, 1.13 and 1.31 times the size it had sealed, which is more than the index holds,
+because the pages the build freed stay in the file in this version; a store that is never
+grouped stays at 1.00 times (the 11,588 passages).
+
+With `WITH (quantization = 'SQ8')` the same two stores of real passages take 0.45 times the room
+(a passage 1,968 bytes in place of 4,411 in the 11,588, and 1,992 in place of 4,946 in the
+100,008). Searched exactly, the same ten rows come back as from the full-precision store on 88,
+84 and 79 questions of 100 in the 11,588 (one, several, all partitions) and on 86, 83 and 85 in
+the 100,008.

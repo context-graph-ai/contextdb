@@ -8,7 +8,7 @@
 // Each test program uses a part of this module; the rest would be reported as never used.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write};
@@ -702,25 +702,246 @@ pub fn text(value: &str) -> Value {
     Value::Text(value.to_owned())
 }
 
-/// Runs maintenance cycles until no vector waits to be sealed, and returns how many vectors
-/// the cycles sealed between them. Nothing else in the tests seals.
+/// Runs maintenance cycles until nothing is left for one to do, and returns how many vectors
+/// the cycles sealed and packed between them. Nothing else in the tests seals or groups.
 pub fn seal_all(db: &Database) -> u64 {
-    let mut sealed = 0;
-    loop {
-        let report = match db.run_maintenance_cycle() {
-            Ok(report) => report.vector,
-            Err(error) => panic!("a maintenance cycle was refused: {error:?}"),
-        };
-        sealed += report.maintenance_vectors_done;
-        if report.maintenance_vectors_remaining == 0 {
-            return sealed;
+    upkeep(db).1
+}
+
+/// One maintenance cycle, which must not be refused.
+pub fn cycle(db: &Database) -> contextdb::VectorMaintenanceReport {
+    match db.run_maintenance_cycle() {
+        Ok(report) => report.vector,
+        Err(error) => panic!("a maintenance cycle was refused: {error:?}"),
+    }
+}
+
+/// Runs maintenance cycles as a host does: while a vector is left, or a partition that is
+/// not stalled. Returns how many cycles it ran, the last included, and the vectors they
+/// reported done. A store that never comes to rest fails the test.
+pub fn upkeep(db: &Database) -> (u64, u64) {
+    let mut done = 0;
+    for ran in 1..=100_000_u64 {
+        let report = cycle(db);
+        done += report.maintenance_vectors_done;
+        if report.maintenance_vectors_remaining == 0
+            && report.remaining_partitions <= report.stalled_partitions
+        {
+            return (ran, done);
         }
-        assert!(
-            report.maintenance_vectors_done > 0,
-            "a cycle sealed nothing and left {} vectors waiting",
-            report.maintenance_vectors_remaining
+    }
+    panic!("100,000 maintenance cycles left work to do");
+}
+
+// ---- the index ----
+
+/// The vector of row `n` in a scatter around eight directions at right angles: direction
+/// `n % 8` has its numbers `2d` and `2d + 1` at one, and every number is moved by a twentieth
+/// of what [`vector`] gives. Rows of one direction lie close together and far from the rest.
+/// The dimension is 16 or more.
+pub fn gathered(n: i64, dimension: usize) -> Vec<f32> {
+    let direction = n.rem_euclid(8) as usize;
+    let moved = vector(n, dimension);
+    (0..dimension)
+        .map(|at| f32::from(u8::from(at / 2 == direction)) + 0.05 * moved[at])
+        .collect()
+}
+
+/// The vector of row `n` of `of` spread evenly round one circle that lies across every number
+/// of the dimension, each number moved by a hundredth of what [`vector`] gives: no direction
+/// gathers rows, and the rows nearest any of them are its neighbours on the circle.
+pub fn ringed(n: i64, of: i64, dimension: usize) -> Vec<f32> {
+    let turn = std::f64::consts::TAU * n as f64 / of as f64;
+    let moved = vector(n, dimension);
+    (0..dimension)
+        .map(|at| {
+            let phase = std::f64::consts::TAU * at as f64 / dimension as f64;
+            (turn - phase).cos() as f32 + 0.01 * moved[at]
+        })
+        .collect()
+}
+
+/// Inserts these rows of `docs` under one context in one commit, row `n` with `vector(n)`.
+pub fn load_docs(
+    db: &Database,
+    numbers: RangeInclusive<i64>,
+    ctx: &str,
+    vector: impl Fn(i64) -> Vec<f32>,
+) {
+    let tx = db.transaction().expect("begin");
+    for n in numbers {
+        if let Err(error) = insert_doc(&tx, n, ctx, Some(vector(n))) {
+            panic!("inserting row {n} of docs was refused: {error:?}");
+        }
+    }
+    tx.commit().expect("commit the rows of docs");
+}
+
+/// A store whose `docs` has these clauses after `VECTOR(dimension)` and rows 1 to `rows` of
+/// [`gathered`] under the context `a`, with every maintenance cycle run.
+pub fn built(name: &str, dimension: usize, clauses: &str, rows: i64) -> (PathBuf, Database) {
+    let folder = folder(name);
+    let db = open(&folder);
+    declare_docs(&db, dimension, clauses);
+    load_docs(&db, 1..=rows, "a", |n| gathered(n, dimension));
+    upkeep(&db);
+    (folder, db)
+}
+
+/// A search of `docs` for the `k` rows nearest `$q` under this mode: `EXACT`, `AUTO`,
+/// `INDEXED`, or nothing for the column's own.
+pub fn by_mode(filter: Option<&str>, mode: &str, k: usize) -> String {
+    let filter = filter.map_or_else(String::new, |filter| format!(" WHERE {filter}"));
+    let clause = if mode.is_empty() {
+        String::new()
+    } else {
+        format!("USE VECTOR {mode} ")
+    };
+    format!("SELECT id, v <=> $q AS distance FROM docs{filter} ORDER BY distance {clause}LIMIT {k}")
+}
+
+/// A search that must answer.
+pub fn answer(on: &impl Run, sql: &str, query: &[f32]) -> QueryResult {
+    match search(on, sql, query) {
+        Ok(result) => result,
+        Err(error) => panic!("{sql}\nwas refused: {error:?}"),
+    }
+}
+
+/// Asserts that an answer is one a search that may leave rows out can give: `count` rows,
+/// nearest first and none twice, each a row `passes` lets through, with the distance of the
+/// vector stored for it, to the bit. Returns the answer.
+pub fn assert_sound(
+    result: &QueryResult,
+    stored: &Stored,
+    passes: impl Fn(&[Value]) -> bool,
+    query: &[f32],
+    count: usize,
+    what: &str,
+) -> Vec<Near> {
+    let answer = found(result, what);
+    assert_eq!(answer.len(), count, "{what}: rows in the answer");
+    let rows: BTreeMap<i64, &Vec<Value>> = stored
+        .rows()
+        .iter()
+        .map(|row| match row[0] {
+            Value::Int64(id) => (id, row),
+            ref other => panic!("the key {other:?} is no INTEGER"),
+        })
+        .collect();
+    for near in &answer {
+        let Value::Int64(id) = near.key else {
+            panic!("{what}: the key {:?}", near.key)
+        };
+        let row = rows
+            .get(&id)
+            .unwrap_or_else(|| panic!("{what}: row {id} is not stored"));
+        assert!(passes(row), "{what}: row {id} does not pass the filter");
+        let Some(Value::Vector(vector)) = row.last() else {
+            panic!("{what}: row {id} has no vector")
+        };
+        assert_eq!(
+            near.distance.to_bits(),
+            distance(vector, query).to_bits(),
+            "{what}: the distance of row {id}"
         );
     }
+    for pair in answer.windows(2) {
+        let order = pair[0].distance.total_cmp(&pair[1].distance);
+        assert!(
+            order
+                .then_with(|| key_order(&pair[0].key, &pair[1].key))
+                .is_lt(),
+            "{what}: {:?} came before {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+    answer
+}
+
+/// How the refusal of an INDEXED search goes on after the column's name.
+pub const INDEXED_REFUSED: &str = " cannot be searched INDEXED for this statement now: its index \
+    is behind its writes, or the statement's filter leaves the index nothing to choose among; \
+    run a maintenance cycle, or use EXACT or AUTO";
+
+/// Asserts that a search of `docs.v` was refused as one that asked for the index, in the
+/// sentence that names both causes.
+pub fn assert_indexed_refused(outcome: contextdb::Result<QueryResult>, what: &str) {
+    match outcome {
+        Err(error @ Error::VectorIndexedRouteUnavailable { .. }) => {
+            assert_eq!(
+                error.to_string(),
+                format!("docs.v{INDEXED_REFUSED}"),
+                "{what}"
+            );
+        }
+        other => panic!("{what}: asked for the index and got {other:?}"),
+    }
+}
+
+/// One row of an inspection statement: each column's name with its value.
+pub type Shown = BTreeMap<String, Value>;
+
+/// The rows of `SHOW VECTOR_INDEXES` or `SHOW VECTOR_PARTITIONS`.
+pub fn shown(on: &impl Run, sql: &str) -> Vec<Shown> {
+    let result = run(on, sql);
+    let names = result.columns();
+    let named = |row: &Vec<Value>| names.iter().cloned().zip(row.iter().cloned()).collect();
+    result.rows().iter().map(named).collect()
+}
+
+/// One field of an inspection row.
+pub fn field<'a>(row: &'a Shown, name: &str) -> &'a Value {
+    row.get(name)
+        .unwrap_or_else(|| panic!("inspection has no field {name}: {row:?}"))
+}
+
+/// A field that is a whole number.
+pub fn whole(row: &Shown, name: &str) -> i64 {
+    match field(row, name) {
+        Value::Int64(number) => *number,
+        other => panic!("the field {name} is {other:?}, not a whole number"),
+    }
+}
+
+/// A field that is text.
+pub fn word(row: &Shown, name: &str) -> String {
+    match field(row, name) {
+        Value::Text(text) => text.clone(),
+        other => panic!("the field {name} is {other:?}, not text"),
+    }
+}
+
+/// A field that holds JSON, whether the engine hands it over as JSON or as its text.
+pub fn json(row: &Shown, name: &str) -> contextdb::serde_json::Value {
+    match field(row, name) {
+        Value::Json(value) => value.clone(),
+        Value::Text(text) => contextdb::serde_json::from_str(text)
+            .unwrap_or_else(|error| panic!("the field {name} is no JSON: {error}")),
+        other => panic!("the field {name} is {other:?}, not JSON"),
+    }
+}
+
+/// The one partition of a store whose `docs.v` has one.
+pub fn the_partition(on: &impl Run) -> Shown {
+    let mut rows = shown(on, "SHOW VECTOR_PARTITIONS FOR docs.v");
+    assert_eq!(rows.len(), 1, "partitions of docs.v");
+    rows.remove(0)
+}
+
+/// A storage door that adds up the bytes read from the data file.
+pub fn counting_bytes_read() -> (WrapStorage, Arc<AtomicU64>) {
+    let bytes = Arc::new(AtomicU64::new(0));
+    let door = storage({
+        let bytes = bytes.clone();
+        move |call| {
+            if let Call::Read(_, read) = call {
+                bytes.fetch_add(read.len() as u64, Ordering::SeqCst);
+            }
+        }
+    });
+    (door, bytes)
 }
 
 // ---- the storage door ----

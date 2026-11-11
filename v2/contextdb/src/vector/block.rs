@@ -1,5 +1,5 @@
 //! A block: the slots of as many vectors of one partition as fit in the block's bytes
-//! (328 at 768 numbers a vector), each with the key of its row.
+//! (328 at 768 numbers a vector with a UUID key), each with the key of its row.
 //!
 //! A block is `count` as four bytes, then `count` slots of one length, then `count` numbers of
 //! four bytes, each the end of a key within the bytes that follow, then the keys one after
@@ -76,6 +76,13 @@ impl BlockWriter {
         let at = self.slots.len();
         self.slots.resize(at + slot_len(self.dimension), 0);
         write_slot(vector, &mut self.slots[at..]);
+        self.keys.extend_from_slice(key.as_bytes());
+        self.ends.push(self.keys.len() as u32);
+    }
+
+    /// Adds a slot as it was written for another block, with the key of its row.
+    pub(super) fn push_slot(&mut self, key: &Key, slot: &[u8]) {
+        self.slots.extend_from_slice(slot);
         self.keys.extend_from_slice(key.as_bytes());
         self.ends.push(self.keys.len() as u32);
     }
