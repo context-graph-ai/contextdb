@@ -1,15 +1,16 @@
-//! Index choice: which rows of a table a statement has to read, and reading them.
+//! Index choice: which rows of a table a statement has to read, reading them, and working out
+//! the select list for a row that was read.
 
 use std::collections::HashMap;
 use std::ops::Bound;
 
-use super::expression::{column_index, eval};
+use super::expression::{column_index, eval, eval_found, most_bytes, reads};
 use super::{heap_bytes, row_overhead};
 use crate::memory::Reservation;
 use crate::schema::Table;
 use crate::sql::Expr;
 use crate::sql::ast::{BinOp, SortDirection as Asked};
-use crate::sql::plan::SortKey;
+use crate::sql::plan::{ProjectColumn, SortKey};
 use crate::store::{Cell, IndexId, Key, Read, Row};
 use crate::types::{ColumnType, Result, SortDirection, Value};
 
@@ -65,7 +66,7 @@ fn starting_after(key: Key) -> Bound<Key> {
 
 /// The value as a key of a column of this type holds it, when there is one such value: only
 /// then is looking the value up the same as comparing every row with it.
-fn as_key(column: ColumnType, value: Value) -> Option<Value> {
+pub(super) fn as_key(column: ColumnType, value: Value) -> Option<Value> {
     match (column, value) {
         (ColumnType::Integer, value @ Value::Int64(_))
         | (ColumnType::Real, value @ Value::Float64(_))
@@ -300,16 +301,9 @@ impl<'a> Source<'a> {
         let mut examined = 0;
         let mut offer = |key: Key, row: Row| {
             examined += 1;
-            let before = reservation.bytes();
             match self.values(row, reservation)? {
-                Some(values) => {
-                    let bytes = reservation.bytes() - before;
-                    each(key, values, bytes, reservation)
-                }
-                None => {
-                    reservation.shrink(reservation.bytes() - before);
-                    Ok(true)
-                }
+                Some((values, bytes)) => each(key, values, bytes, reservation),
+                None => Ok(true),
             }
         };
         let table = self.table.id;
@@ -341,9 +335,83 @@ impl<'a> Source<'a> {
         Ok(examined)
     }
 
-    /// The values of a stored row if it passes the filter, charged to `reservation`. A column
-    /// the statement does not read is left as NULL.
-    fn values(&self, row: Row, reservation: &mut Reservation) -> Result<Option<Vec<Value>>> {
+    /// The row with this key if it is there and passes the filter, as [`Source::walk`] hands a
+    /// row over: its values, and the bytes of `reservation` it holds.
+    pub(super) fn row(
+        &self,
+        key: &Key,
+        reservation: &mut Reservation,
+    ) -> Result<Option<(Vec<Value>, u64)>> {
+        match self.read.row(self.table.id, key)? {
+            Some(row) => self.values(row, reservation),
+            None => Ok(None),
+        }
+    }
+
+    /// For each item of a select list, the column whose value it moves out of a row: the column
+    /// it names, when no other item of the list reads that column. Any other item copies what
+    /// it reads. Empty for `SELECT *`, which hands the row over as it is.
+    pub(super) fn moved(&self, columns: Option<&[ProjectColumn]>) -> Result<Vec<Option<usize>>> {
+        let columns = columns.unwrap_or_default();
+        let mut readers = vec![0; self.table.meta.columns.len()];
+        for column in columns {
+            let mut read = vec![false; readers.len()];
+            reads(&column.expr, self.table, self.params, &mut read)?;
+            for (readers, read) in readers.iter_mut().zip(read) {
+                *readers += usize::from(read);
+            }
+        }
+        let alone = |column: &ProjectColumn| match &column.expr {
+            Expr::Column(named) => column_index(self.table, named).ok(),
+            _ => None,
+        };
+        let moved = columns.iter().map(alone);
+        Ok(moved.map(|at| at.filter(|at| readers[*at] == 1)).collect())
+    }
+
+    /// The select list worked out for one row this source handed over, or the row itself for
+    /// `SELECT *`. `moved` is [`Source::moved`] of the list, and `distance` is the row's distance
+    /// when a similarity search found it. The memory of the values is asked for before they
+    /// are made, and the row's bytes are given back once they are. A value that is moved is
+    /// held once: what it takes passes from the row to the result and is not asked for again.
+    pub(super) fn output(
+        &self,
+        columns: Option<&[ProjectColumn]>,
+        moved: &[Option<usize>],
+        mut row: Vec<Value>,
+        bytes: u64,
+        distance: Option<f64>,
+        reservation: &mut Reservation,
+    ) -> Result<Vec<Value>> {
+        let Some(columns) = columns else {
+            return Ok(row);
+        };
+        let most = columns
+            .iter()
+            .map(|column| most_bytes(&column.expr, self.table, &row, self.params));
+        let passed = moved.iter().flatten().map(|at| heap_bytes(&row[*at]));
+        let passed = passed.sum::<u64>().min(bytes);
+        reservation.grow(row_overhead(columns.len()) + most.sum::<u64>() - passed)?;
+        let values = columns
+            .iter()
+            .zip(moved)
+            .map(|(column, moved)| match moved {
+                Some(at) => Ok(std::mem::replace(&mut row[*at], Value::Null)),
+                None => {
+                    let (params, now) = (self.params, self.now);
+                    eval_found(&column.expr, self.table, &row, distance, params, now)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        reservation.shrink(bytes - passed);
+        Ok(values)
+    }
+
+    /// The values of a stored row if it passes the filter, and the bytes of `reservation` they
+    /// hold; a row that does not pass holds none. A column the statement does not read is left
+    /// as NULL.
+    fn values(&self, row: Row, reservation: &mut Reservation) -> Result<Option<(Vec<Value>, u64)>> {
+        let before = reservation.bytes();
         let mut cells = row.cells;
         reservation.grow(row_overhead(cells.len()))?;
         let mut values = vec![Value::Null; cells.len()];
@@ -351,10 +419,11 @@ impl<'a> Source<'a> {
         if let Some(filter) = self.filter
             && eval(filter, self.table, &values, self.params, self.now)? != Value::Bool(true)
         {
+            reservation.shrink(reservation.bytes() - before);
             return Ok(None);
         }
         self.take(&mut cells, &mut values, &self.rest, reservation)?;
-        Ok(Some(values))
+        Ok(Some((values, reservation.bytes() - before)))
     }
 
     /// Moves the marked cells into `values`, loading a value kept beside its row. The memory

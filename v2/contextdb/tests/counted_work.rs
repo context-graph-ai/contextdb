@@ -188,3 +188,87 @@ fn a_sort_the_index_already_gives_reads_only_the_limit() {
     );
     assert_eq!(sorted.rows_examined(), 1000);
 }
+
+#[test]
+fn a_negative_number_in_a_filter_narrows_the_work_as_a_positive_one_does() {
+    const DIMENSION: usize = 8;
+    const EACH: i64 = 50;
+    let folder = support::folder("negative-number-narrows");
+    let db = support::open(&folder);
+    // Two tables of two hundred rows, a quarter of them under each of the numbers -1, 0, 1
+    // and 2. In `marks` the number is the PARTITION_KEY of a VECTOR column, and no vector is
+    // sealed; in `plain` it is a column with an index.
+    support::run(
+        &db,
+        &format!(
+            "CREATE TABLE marks (id INTEGER PRIMARY KEY, kind INTEGER NOT NULL, \
+             v VECTOR({DIMENSION}) PARTITION_KEY (kind))"
+        ),
+    );
+    support::run(
+        &db,
+        "CREATE TABLE plain (id INTEGER PRIMARY KEY, k INTEGER NOT NULL)",
+    );
+    support::run(&db, "CREATE INDEX plain_k ON plain (k)");
+    let tx = db.transaction().expect("begin");
+    for n in 1..=4 * EACH {
+        let number = n % 4 - 1;
+        tx.execute(
+            "INSERT INTO marks (id, kind, v) VALUES ($id, $kind, $v)",
+            &params! { "id" => n, "kind" => number, "v" => support::vector(n, DIMENSION) },
+        )
+        .expect("insert a mark");
+        tx.execute(
+            "INSERT INTO plain (id, k) VALUES ($id, $k)",
+            &params! { "id" => n, "k" => number },
+        )
+        .expect("insert a plain row");
+    }
+    tx.commit().expect("commit");
+
+    // A search of one partition reads that partition's pending rows once and the rows it
+    // returns once more. Returns the rows it read.
+    let stored = support::stored(&db, "SELECT id, kind, v FROM marks");
+    let query = support::vector(99_000, DIMENSION);
+    let searched = |number: i64| -> u64 {
+        let wanted = stored.nearest(|row| row[1] == Value::Int64(number), &query, 10);
+        assert_eq!(wanted.len(), 10);
+        let filter = format!("kind = {number}");
+        let sql = support::nearest_sql("marks", "v", Some(&filter), 10);
+        let what = format!("the partition of kind {number}");
+        support::assert_nearest(&db, &sql, &query, &wanted, &what).rows_examined()
+    };
+    // A lookup through the index reads the rows it returns. Returns the rows it read.
+    let looked_up = |number: i64| -> u64 {
+        let found = support::run(
+            &db,
+            &format!("SELECT id FROM plain WHERE k = {number} ORDER BY id"),
+        );
+        let wanted: Vec<Vec<Value>> = (1..=4 * EACH)
+            .filter(|n| n % 4 - 1 == number)
+            .map(|n| vec![Value::Int64(n)])
+            .collect();
+        support::assert_same_rows(
+            found.rows(),
+            &wanted,
+            &format!("the rows with k = {number}"),
+        );
+        found.rows_examined()
+    };
+
+    // A number written without a sign narrows both, and so does zero.
+    let one_partition = EACH as u64 + 10;
+    for number in [0, 1, 2] {
+        assert_eq!(searched(number), one_partition, "WHERE kind = {number}");
+        assert_eq!(looked_up(number), EACH as u64, "WHERE k = {number}");
+    }
+    // A number written with a minus sign is the same kind of value and narrows the same.
+    assert_eq!(
+        (searched(-1), looked_up(-1)),
+        (one_partition, EACH as u64),
+        "the rows read for WHERE kind = -1 by a search of {} rows, and for WHERE k = -1 through \
+         the index of a table of {} rows",
+        4 * EACH,
+        4 * EACH
+    );
+}

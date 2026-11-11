@@ -1,6 +1,8 @@
 //! Kill and reopen: a writer killed at any storage call of a commit leaves the whole commit or
-//! none of it, and the store opens again with nothing to mend by hand. Damage in the file is
-//! refused as damage, by name.
+//! none of it, and the store opens again with nothing to mend by hand. That holds for a commit
+//! of rows with vectors and for the commit of a maintenance cycle that seals vectors: after
+//! either, every search finds exactly the vectors of the rows that are there. Damage in the
+//! file is refused as damage, by name.
 //!
 //! A kill lands at a point the child names. The child's storage door counts the writes and
 //! syncs of its data file; before call number `stop_at` it announces `stopped` and waits there,
@@ -274,11 +276,13 @@ fn a_commit_on_disk_is_reported_and_served_though_the_read_after_it_fails() {
             Ok(())
         }
     }));
+    // Under a memory limit of 32 MiB the store's page cache is 8 MiB: a quarter of the limit.
+    options.memory_limit = Some(32 << 20);
     let db = support::open_with(&folder, options).expect("open");
     support::declare(&db);
-    // A second table four times the size of the store's 8 MiB page cache, in rows small enough
-    // to be kept in the table's own pages. Reading all of it leaves the cache full of its
-    // pages, so the pages a commit writes afterwards have to be read back from the file.
+    // A second table four times the size of that 8 MiB page cache, in rows small enough to be
+    // kept in the table's own pages. Reading all of it leaves the cache full of its pages, so
+    // the pages a commit writes afterwards have to be read back from the file.
     support::run(
         &db,
         "CREATE TABLE padding (id INTEGER PRIMARY KEY, body TEXT)",
@@ -368,6 +372,213 @@ fn answers_with_rows_or_store_io(db: &Database, rows: i64, when: &str) {
         Err(Error::StoreIo { .. }) => {}
         Err(other) => panic!("a count {when} was refused as {other:?}"),
     }
+}
+
+// ---- vectors ----
+
+/// The numbers in a vector of the two tests below.
+const DIMENSION: usize = 16;
+
+/// A closed store with `docs`, its VECTOR column partitioned by context: rows 1 to 100 are in
+/// blocks and rows 101 to 300 on pending lists, half of each under `c0` and half under `c1`.
+fn store_with_vectors(name: &str) -> PathBuf {
+    let folder = support::folder(name);
+    let db = support::open(&folder);
+    support::declare_docs(&db, DIMENSION, "PARTITION_KEY (ctx)");
+    for numbers in [1..=100, 101..=300] {
+        let tx = db.transaction().expect("begin");
+        support::insert_docs(&tx, numbers, DIMENSION, |n| format!("c{}", n % 2));
+        tx.commit().expect("commit");
+        // The first hundred are sealed before the rest arrive.
+        if support::int(&db, "SELECT COUNT(*) FROM docs") == 100 {
+            assert_eq!(support::seal_all(&db), 100);
+        }
+    }
+    support::close(db);
+    folder
+}
+
+/// Asserts that every search of `docs` returns exactly what its rows call for: everything and
+/// each context, ten rows and more rows than there are, for three vectors. Returns the rows.
+fn searches_agree(db: &Database, state: &str) -> Vec<Vec<Value>> {
+    let stored = support::stored(db, "SELECT id, ctx, tag, v FROM docs ORDER BY id");
+    let queries = [
+        support::vector(98_001, DIMENSION),
+        support::vector(98_002, DIMENSION),
+        support::vector(150, DIMENSION),
+    ];
+    for query in &queries {
+        for ctx in [None, Some("c0"), Some("c1"), Some("new"), Some("newer")] {
+            let filter = ctx.map(|ctx| format!("ctx = '{ctx}'"));
+            for k in [10, 1000] {
+                let passes = |row: &[Value]| ctx.is_none_or(|ctx| row[1] == support::text(ctx));
+                let wanted = stored.nearest(passes, query, k);
+                let sql = support::nearest_sql("docs", "v", filter.as_deref(), k);
+                support::assert_nearest(db, &sql, query, &wanted, state);
+            }
+        }
+    }
+    stored.rows().to_vec()
+}
+
+#[test]
+fn a_kill_at_any_storage_call_of_a_seal_leaves_every_vector_found() {
+    if let Some(role) = support::role() {
+        return one_seal(role);
+    }
+    let test = "a_kill_at_any_storage_call_of_a_seal_leaves_every_vector_found";
+    // Run once to the end to learn which storage calls belong to the sealing commit.
+    let folder = store_with_vectors("kill-seal-count");
+    let rows = searches_agree(&support::open(&folder), "before the cycle");
+    assert_eq!(rows.len(), 300);
+    let lines = Child::start(test, "sealer stop_at=0", &folder).end();
+    let begins = support::last_number(&lines, "sealing").expect("the sealer announces it");
+    let calls = support::last_number(&lines, "calls").expect("the sealer announces its calls");
+    assert!(
+        lines.iter().any(|line| line == "sealed 200 0"),
+        "one cycle was to seal the 200 pending vectors: {lines:?}"
+    );
+    assert!(
+        calls > begins,
+        "a cycle that sealed 200 vectors made no write and no sync"
+    );
+
+    for k in begins + 1..=calls {
+        let folder = store_with_vectors(&format!("kill-seal-at-{k}"));
+        let mut sealer = Child::start(test, &format!("sealer stop_at={k}"), &folder);
+        let before = sealer.until("stopped");
+        sealer.kill();
+        let returned = before.iter().any(|line| line.starts_with("sealed "));
+
+        // The store opens with nothing to mend, every row is there, and every search finds
+        // exactly the vectors of those rows, whether the seal's commit is there or not.
+        let db = support::open(&folder);
+        let state = format!("killed at storage call {k} of a seal");
+        assert!(
+            searches_agree(&db, &state) == rows,
+            "{state}: the rows of docs"
+        );
+        // The next cycles finish the sealing: all 200 vectors when the killed commit is not
+        // there, none when it is. A cycle that had returned is there.
+        let sealed = support::seal_all(&db);
+        assert!(
+            sealed == 0 || sealed == 200 && !returned,
+            "{state}: the next cycles sealed {sealed} vectors; the killed cycle had {}returned",
+            if returned { "" } else { "not " }
+        );
+        let report = db.run_maintenance_cycle().expect("one more cycle").vector;
+        assert_eq!(
+            (
+                report.maintenance_vectors_done,
+                report.maintenance_vectors_remaining
+            ),
+            (0, 0),
+            "{state}: a cycle after the sealing was finished"
+        );
+        assert!(
+            searches_agree(&db, &state) == rows,
+            "{state}: the rows after sealing"
+        );
+    }
+}
+
+/// Runs one maintenance cycle. Announces `sealing <n>` with the storage calls made so far when
+/// the cycle is about to begin, `sealed <done> <remaining>` when it has returned, and
+/// `calls <total>` once the store is closed.
+fn one_seal(role: support::Role) {
+    let (storage, calls) = stopping_before_call(role.number("stop_at"));
+    let mut options = DatabaseOpenOptions::default();
+    options.storage = Some(storage);
+    let db = support::open_with(&role.folder, options).expect("open");
+    support::say(format!("sealing {}", calls.load(Ordering::SeqCst)));
+    let report = db.run_maintenance_cycle().expect("a cycle").vector;
+    support::say(format!(
+        "sealed {} {}",
+        report.maintenance_vectors_done, report.maintenance_vectors_remaining
+    ));
+    support::close(db);
+    support::say(format!("calls {}", calls.load(Ordering::SeqCst)));
+}
+
+#[test]
+fn a_kill_inside_a_commit_of_vectors_keeps_rows_and_vectors_together() {
+    if let Some(role) = support::role() {
+        return one_commit_of_vectors(role);
+    }
+    let test = "a_kill_inside_a_commit_of_vectors_keeps_rows_and_vectors_together";
+    // The rows before the commit, from a store nothing was done to, and the rows after it,
+    // from a run of the commit to its end, which also tells which storage calls are its own.
+    let untouched = store_with_vectors("kill-vectors-before");
+    let before = searches_agree(&support::open(&untouched), "before the commit");
+    let folder = store_with_vectors("kill-vectors-count");
+    let lines = Child::start(test, "writer stop_at=0", &folder).end();
+    let begins = support::last_number(&lines, "committing").expect("the writer announces it");
+    let calls = support::last_number(&lines, "calls").expect("the writer announces its calls");
+    assert!(
+        calls > begins,
+        "a commit of sixty vectors made no write and no sync"
+    );
+    let after = searches_agree(&support::open(&folder), "after the commit");
+    assert_eq!((before.len(), after.len()), (300, 358));
+
+    for k in begins + 1..=calls {
+        let folder = store_with_vectors(&format!("kill-vectors-at-{k}"));
+        let mut writer = Child::start(test, &format!("writer stop_at={k}"), &folder);
+        let told = writer.until("stopped");
+        writer.kill();
+        let returned = told.iter().any(|line| line == "committed");
+
+        // The rows are those of before the commit or those of after it, and the searches
+        // answer from the vectors of exactly those rows: never rows of one and vectors of the
+        // other. A commit that had returned is there.
+        let db = support::open(&folder);
+        let state = format!("killed at storage call {k} of a commit of vectors");
+        let rows = searches_agree(&db, &state);
+        assert!(
+            rows == after || rows == before && !returned,
+            "{state}: {} rows are there, of neither state or of the wrong one; the commit had \
+             {}returned",
+            rows.len(),
+            if returned { "" } else { "not " }
+        );
+        // The store goes on from there: what waits is sealed, and the answers stay.
+        support::seal_all(&db);
+        assert!(
+            searches_agree(&db, &state) == rows,
+            "{state}: the rows after sealing"
+        );
+    }
+}
+
+/// In one transaction adds rows 301 to 360, a third of them under a context that has rows and
+/// the rest under two that have none; changes the vector of a sealed row and of a pending row;
+/// deletes one of each; and moves a sealed row to one of the new contexts. Announces
+/// `committing <n>` with the storage calls made so far when the commit is about to begin,
+/// `committed` when it has returned, and `calls <total>` once the store is closed.
+fn one_commit_of_vectors(role: support::Role) {
+    let (storage, calls) = stopping_before_call(role.number("stop_at"));
+    let mut options = DatabaseOpenOptions::default();
+    options.storage = Some(storage);
+    let db = support::open_with(&role.folder, options).expect("open");
+    let tx = db.transaction().expect("begin");
+    support::insert_docs(&tx, 301..=360, DIMENSION, |n| {
+        ["c0", "new", "newer"][(n % 3) as usize].to_owned()
+    });
+    for id in [5_i64, 150] {
+        tx.execute(
+            "UPDATE docs SET v = $v WHERE id = $id",
+            &params! { "id" => id, "v" => support::vector(98_100 + id, DIMENSION) },
+        )
+        .expect("change a vector");
+    }
+    support::run(&tx, "DELETE FROM docs WHERE id = 6");
+    support::run(&tx, "DELETE FROM docs WHERE id = 151");
+    support::run(&tx, "UPDATE docs SET ctx = 'new' WHERE id = 7");
+    support::say(format!("committing {}", calls.load(Ordering::SeqCst)));
+    tx.commit().expect("commit");
+    support::say("committed");
+    support::close(db);
+    support::say(format!("calls {}", calls.load(Ordering::SeqCst)));
 }
 
 // ---- shared by the tests of this file ----

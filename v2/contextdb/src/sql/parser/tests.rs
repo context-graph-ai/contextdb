@@ -1,8 +1,10 @@
 use super::parse;
-use crate::sql::ast::{DataType, Expr, Literal, Statement};
+use crate::sql::ast::{
+    BinOp, ColumnRef, DataType, Expr, Literal, Select, Statement, VectorClauses,
+};
 use crate::sql::plan;
 use crate::sql::plan::{Effect, PhysicalPlan};
-use crate::types::Error;
+use crate::types::{Error, SortDirection, VectorSearchMode};
 
 fn refusal(sql: &str) -> String {
     match parse(sql) {
@@ -217,8 +219,6 @@ fn what_a_later_version_reads_is_refused_by_its_name() {
             "SELECT a FROM GRAPH_TABLE(g MATCH (a)-[e]->(b))",
             "GRAPH_TABLE",
         ),
-        ("SELECT id FROM t ORDER BY v <=> $q LIMIT 3", "<=>"),
-        ("SELECT id FROM t WHERE a NOT IN (1, 2)", "NOT IN"),
         ("SELECT id FROM t WHERE a LIKE 'x%'", "LIKE"),
         ("UPDATE t SET a = 1 WHERE b BETWEEN 1 AND 2", "BETWEEN"),
         (
@@ -260,5 +260,314 @@ fn what_a_later_version_reads_is_refused_by_its_name() {
     planned("SELECT state, history FROM t WHERE immutable ORDER BY state");
     // What is neither read nor named is a syntax error.
     assert!(refusal("SELECT a FROM t x").contains("unexpected 'x'"));
-    assert!(refusal("SELECT (a, b) FROM t").contains("unexpected ','"));
+    // A row value is read wherever an expression is. In a select list it is refused by name
+    // when the statement is planned.
+    let read = parse("SELECT (a, b) FROM t")
+        .unwrap_or_else(|error| panic!("a row value in a select list was not read: {error:?}"));
+    match plan(&read) {
+        Err(Error::PlanError(text)) => {
+            assert!(text.to_lowercase().contains("row value"), "{text}");
+        }
+        other => panic!("a row value in a select list was planned as {other:?}"),
+    }
+}
+
+fn select(sql: &str) -> Select {
+    match parse(sql) {
+        Ok(Statement::Select(select)) => select,
+        other => panic!("{sql}\nwas not read as a SELECT: {other:?}"),
+    }
+}
+
+/// True for `<column> <=> $<parameter>`.
+fn is_distance(expr: &Expr, column: &str, parameter: &str) -> bool {
+    let Expr::Distance { left, right } = expr else {
+        return false;
+    };
+    let of_column = matches!(
+        &**left,
+        Expr::Column(ColumnRef { table: None, column: name }) if name == column
+    );
+    of_column && matches!(&**right, Expr::Parameter(name) if name == parameter)
+}
+
+#[test]
+fn a_distance_is_read_as_an_expression() {
+    // In a select item under a name, with the search ordered by that name.
+    let read = select("SELECT id, v <=> $q AS distance FROM t ORDER BY distance LIMIT 3");
+    assert!(is_distance(&read.columns[1].expr, "v", "q"));
+    assert_eq!(read.columns[1].alias.as_deref(), Some("distance"));
+    assert!(matches!(
+        &read.order_by[..],
+        [item] if item.direction == SortDirection::Asc
+            && matches!(
+                &item.expr,
+                Expr::Column(ColumnRef { table: None, column }) if column == "distance"
+            )
+    ));
+    assert_eq!((read.limit, read.use_vector), (Some(3), None));
+
+    // Under no name, and as the ORDER BY item itself, with ASC written or not.
+    for order in ["v <=> $q", "v <=> $q ASC", "v<=>$q asc"] {
+        let read = select(&format!(
+            "SELECT id, v <=> $q FROM t ORDER BY {order} LIMIT 3"
+        ));
+        assert!(is_distance(&read.columns[1].expr, "v", "q"), "{order}");
+        assert_eq!(read.columns[1].alias, None, "{order}");
+        assert!(
+            matches!(
+                &read.order_by[..],
+                [item] if item.direction == SortDirection::Asc && is_distance(&item.expr, "v", "q")
+            ),
+            "{order}"
+        );
+    }
+
+    // Inside another expression: one minus the distance.
+    let read = select("SELECT id, 1 - (v <=> $q) AS similarity FROM t ORDER BY v <=> $q LIMIT 3");
+    assert!(matches!(
+        &read.columns[1].expr,
+        Expr::FunctionCall { name, args }
+            if name == "__sub"
+                && matches!(&args[..], [Expr::Literal(Literal::Integer(1)), distance]
+                    if is_distance(distance, "v", "q"))
+    ));
+    assert_eq!(read.columns[1].alias.as_deref(), Some("similarity"));
+
+    // The vector on the right is a literal, its quoted text or a bound name.
+    let read = select("SELECT id FROM t ORDER BY v <=> [1.0, 0.0] LIMIT 3");
+    assert!(matches!(
+        &read.order_by[0].expr,
+        Expr::Distance { right, .. }
+            if matches!(&**right, Expr::Literal(Literal::Vector(vector)) if vector == &[1.0, 0.0])
+    ));
+    let read = select("SELECT id FROM t ORDER BY v <=> '[1,0]' LIMIT 3");
+    assert!(matches!(
+        &read.order_by[0].expr,
+        Expr::Distance { right, .. }
+            if matches!(&**right, Expr::Literal(Literal::Text(text)) if text == "[1,0]")
+    ));
+}
+
+#[test]
+fn a_distance_binds_tighter_than_a_comparison_and_looser_than_a_sum() {
+    let item = |sql: &str| {
+        let read = select(&format!("SELECT {sql} FROM t"));
+        format!("{:?}", read.columns[0].expr)
+    };
+    assert_eq!(item("v <=> $q < 0.5"), item("(v <=> $q) < 0.5"));
+    assert_eq!(item("0.5 >= v <=> $q"), item("0.5 >= (v <=> $q)"));
+    assert_eq!(item("v <=> $q + $r"), item("v <=> ($q + $r)"));
+    assert_eq!(item("a + b <=> $q - $r"), item("(a + b) <=> ($q - $r)"));
+    assert_eq!(item("1 - v <=> $q"), item("(1 - v) <=> $q"));
+    assert_eq!(
+        item("v <=> $q < w <=> $q AND NOT v <=> $q = 1"),
+        item("((v <=> $q) < (w <=> $q)) AND (NOT ((v <=> $q) = 1))")
+    );
+    // The first of them is a comparison of a distance, and the third a distance to a sum.
+    let read = select("SELECT v <=> $q < 0.5, v <=> $q + $r FROM t");
+    assert!(matches!(
+        &read.columns[0].expr,
+        Expr::BinaryOp { left, op: BinOp::Lt, .. } if is_distance(left, "v", "q")
+    ));
+    assert!(matches!(
+        &read.columns[1].expr,
+        Expr::Distance { right, .. }
+            if matches!(&**right, Expr::FunctionCall { name, .. } if name == "__add")
+    ));
+}
+
+#[test]
+fn a_search_is_planned_as_one_step_with_its_limit() {
+    // Under a projection when the statement names its columns: the search holds the column,
+    // the vector, the limit, the filter and the mode, and no limit wraps it.
+    let planned_search = planned(
+        "SELECT id, v <=> $q AS distance FROM t WHERE a = 1 ORDER BY distance USE VECTOR EXACT \
+         LIMIT 3",
+    );
+    assert_eq!(planned_search.effect(), Effect::Reads);
+    let (input, columns) = match planned_search {
+        PhysicalPlan::Project { input, columns } => (input, columns),
+        other => panic!("a search with a select list is not under a projection: {other:?}"),
+    };
+    assert!(is_distance(&columns[1].expr, "v", "q"));
+    assert_eq!(columns[1].alias.as_deref(), Some("distance"));
+    assert!(matches!(
+        &*input,
+        PhysicalPlan::VectorSearch {
+            table,
+            column,
+            query: Expr::Parameter(query),
+            k: 3,
+            filter: Some(_),
+            mode: Some(VectorSearchMode::Exact),
+        } if table == "t" && column == "v" && query == "q"
+    ));
+    // `SELECT *` is the search itself, and with no USE VECTOR the mode is left to the column.
+    for order in ["v <=> $q", "v <=> $q ASC"] {
+        let sql = format!("SELECT * FROM t ORDER BY {order} LIMIT 10");
+        assert!(
+            matches!(
+                planned(&sql),
+                PhysicalPlan::VectorSearch {
+                    k: 10,
+                    filter: None,
+                    mode: None,
+                    ..
+                }
+            ),
+            "{sql}"
+        );
+    }
+    for (mode, read) in [
+        ("AUTO", VectorSearchMode::Auto),
+        ("exact", VectorSearchMode::Exact),
+        ("Indexed", VectorSearchMode::Indexed),
+    ] {
+        let sql = format!("SELECT * FROM t ORDER BY v <=> $q USE VECTOR {mode} LIMIT 1");
+        assert_eq!(select(&sql).use_vector, Some(read), "{sql}");
+        assert!(
+            matches!(
+                planned(&sql),
+                PhysicalPlan::VectorSearch { mode: Some(found), .. } if found == read
+            ),
+            "{sql}"
+        );
+    }
+    // What is refused without looking at any table, when the statement is read or planned.
+    let refused = |sql: &str| match parse(sql) {
+        Ok(statement) => plan(&statement).expect_err(sql),
+        Err(error) => error,
+    };
+    // A search with no LIMIT has no kind of its own: it is refused as every statement of a
+    // later version is.
+    match refused("SELECT id FROM t ORDER BY v <=> $q") {
+        Error::PlanError(text) => assert_eq!(
+            text,
+            "a vector search without LIMIT is not supported in this version of the library"
+        ),
+        other => panic!("a search with no LIMIT was refused as {other:?}"),
+    }
+    assert!(matches!(
+        refused("SELECT id FROM t ORDER BY id USE VECTOR EXACT LIMIT 3"),
+        Error::UseVectorRequiresVectorOrder
+    ));
+    for sql in [
+        "SELECT id FROM t ORDER BY v <=> $q DESC LIMIT 3",
+        "SELECT id FROM t ORDER BY v <=> $q, id LIMIT 3",
+        "SELECT id FROM t ORDER BY $q <=> v LIMIT 3",
+        "SELECT id FROM t WHERE v <=> $q < 0.5",
+        "SELECT id, v <=> $q AS distance FROM t",
+        "SELECT id, v <=> $q AS distance FROM t ORDER BY id LIMIT 3",
+    ] {
+        match refused(sql) {
+            Error::PlanError(text) => assert!(text.contains("<=>"), "{sql}: {text}"),
+            other => panic!("{sql}\nwas refused as {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_row_value_and_any_right_side_of_a_distance_are_read_and_refused_when_planned() {
+    // Each is read by the parser, and refused by the planner in a sentence that names it.
+    // The refusal of ROW_VECTOR(...) names the function and the `<=>` it stands beside.
+    let names: [(&str, &[&str]); 4] = [
+        ("SELECT id FROM t WHERE (a, b) = (1, 2)", &["row value"]),
+        (
+            "SELECT id FROM t WHERE (a, b) IN ((1, 2, 3))",
+            &["row value"],
+        ),
+        ("SELECT id FROM t ORDER BY v <=> w LIMIT 3", &["<=>"]),
+        (
+            "SELECT id FROM t ORDER BY v <=> ROW_VECTOR('t', 'v', 1) LIMIT 3",
+            &["<=>", "row_vector"],
+        ),
+    ];
+    for (sql, names) in names {
+        let read = parse(sql).unwrap_or_else(|error| panic!("{sql}\nwas not read: {error:?}"));
+        match plan(&read) {
+            Err(Error::PlanError(text)) => {
+                for name in names {
+                    assert!(text.to_lowercase().contains(name), "{sql}: {text}");
+                }
+            }
+            other => panic!("{sql}\nwas planned as {other:?}"),
+        }
+    }
+    // The two statements that describe an index and its partitions are a later version's.
+    for (sql, name) in [
+        ("SHOW VECTOR_INDEXES", "VECTOR_INDEXES"),
+        ("show vector_partitions docs", "VECTOR_PARTITIONS"),
+    ] {
+        match parse(sql) {
+            Err(Error::PlanError(text)) => assert!(
+                text.to_uppercase().contains(name)
+                    && text.ends_with("is not supported in this version of the library"),
+                "{sql}: {text}"
+            ),
+            other => panic!("{sql}\nwas not refused by name: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn the_clauses_of_a_vector_column_and_in_lists_are_read() {
+    let Statement::CreateTable(table) = parse(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, ctx TEXT NOT NULL, kind INT NOT NULL, \
+         plain VECTOR(3), v VECTOR(4) PARTITION_KEY (ctx, kind) MAX_PARTITIONS 8 \
+         SEARCH_MODE EXACT NOT NULL, w VECTOR(2) partition_key (ctx) max_partitions -1, \
+         x VECTOR(2) SEARCH_MODE indexed)",
+    )
+    .unwrap() else {
+        panic!("not a CREATE TABLE");
+    };
+    let clauses: Vec<&VectorClauses> = table.columns.iter().map(|column| &column.vector).collect();
+    let keyed = |key: &[&str], max: Option<&str>, mode: Option<VectorSearchMode>| VectorClauses {
+        partition_key: key.iter().map(|column| (*column).to_owned()).collect(),
+        max_partitions: max.map(str::to_owned),
+        search_mode: mode,
+    };
+    let none = VectorClauses::default();
+    assert_eq!(
+        clauses,
+        [
+            &none,
+            &none,
+            &none,
+            &none,
+            &keyed(&["ctx", "kind"], Some("8"), Some(VectorSearchMode::Exact)),
+            // The number is kept as it was written: it is `schema` that judges it.
+            &keyed(&["ctx"], Some("-1"), None),
+            &keyed(&[], None, Some(VectorSearchMode::Indexed)),
+        ]
+    );
+    assert_eq!(table.columns[4].data_type, DataType::Vector(4));
+    assert!(!table.columns[4].nullable && table.columns[3].nullable);
+
+    // IN and NOT IN over a list, and over a list of row values.
+    let filter = |sql: &str| {
+        let read = select(&format!("SELECT id FROM t WHERE {sql}"));
+        read.where_clause.expect("a WHERE")
+    };
+    assert!(matches!(
+        filter("a IN (1, 2, $p)"),
+        Expr::InList { expr, list, negated: false }
+            if matches!(&*expr, Expr::Column(_)) && list.len() == 3
+    ));
+    assert!(matches!(
+        filter("a not in ('x')"),
+        Expr::InList { list, negated: true, .. } if list.len() == 1
+    ));
+    assert!(matches!(
+        filter("(a, b) IN ((1, 'x'), (2, 'y'))"),
+        Expr::InList { expr, list, negated: false }
+            if matches!(&*expr, Expr::Row(row) if row.len() == 2)
+                && list.len() == 2
+                && list.iter().all(|item| matches!(item, Expr::Row(row) if row.len() == 2))
+    ));
+    // A list is an operand of AND and OR like any comparison.
+    assert!(matches!(
+        filter("a IN (1, 2) AND NOT b IN (3) OR c = 4"),
+        Expr::BinaryOp { op: BinOp::Or, .. }
+    ));
 }

@@ -728,7 +728,14 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
         required_size > self.mem.get_page_size() && self.pairs.len() > 1
     }
 
-    pub(super) fn build_split<'txn>(self) -> Result<(PageMut<'txn>, &'a [u8], PageMut<'txn>)> {
+    // Divides the pairs between two pages where half their bytes are. When `appended` is set,
+    // the last pair was added after every pair the leaf already held: the first page then keeps
+    // all of those and the second starts with the new pair, so that a tree written in key order
+    // is left with full leaves instead of half-empty ones.
+    pub(super) fn build_split<'txn>(
+        self,
+        appended: bool,
+    ) -> Result<(PageMut<'txn>, &'a [u8], PageMut<'txn>)> {
         let total_size = self.total_key_bytes + self.total_value_bytes;
         let mut division = 0;
         let mut first_split_key_bytes = 0;
@@ -737,7 +744,7 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
             first_split_key_bytes += key.len();
             first_split_value_bytes += value.len();
             division += 1;
-            if first_split_key_bytes + first_split_value_bytes >= total_size / 2 {
+            if !appended && first_split_key_bytes + first_split_value_bytes >= total_size / 2 {
                 break;
             }
         }

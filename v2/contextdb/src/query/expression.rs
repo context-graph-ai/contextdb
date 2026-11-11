@@ -15,6 +15,9 @@ use crate::types::{Error, Result, Uuid, Value};
 /// one time in milliseconds, which `NOW()` answers with. A comparison with NULL, and one between
 /// values of types that do not compare, is unknown: it gives NULL, and a filter keeps a row
 /// only for TRUE.
+///
+/// A distance, `column <=> vector`, has no value here: only a similarity search gives a row one
+/// ([`eval_found`]), so it is refused by name.
 pub(crate) fn eval(
     expr: &Expr,
     table: &Table,
@@ -22,7 +25,20 @@ pub(crate) fn eval(
     params: &HashMap<String, Value>,
     now: i64,
 ) -> Result<Value> {
-    let value = |expr: &Expr| eval(expr, table, row, params, now);
+    eval_found(expr, table, row, None, params, now)
+}
+
+/// [`eval`] for a row a similarity search found. `distance` is the distance the search worked
+/// out for the row, and every `<=>` in the expression is that number as it is.
+pub(super) fn eval_found(
+    expr: &Expr,
+    table: &Table,
+    row: &[Value],
+    distance: Option<f64>,
+    params: &HashMap<String, Value>,
+    now: i64,
+) -> Result<Value> {
+    let value = |expr: &Expr| eval_found(expr, table, row, distance, params, now);
     Ok(match expr {
         Expr::Column(column) => {
             let at = column_index(table, column)?;
@@ -92,7 +108,68 @@ pub(crate) fn eval(
             }
             _ => return Err(refused(name)),
         },
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            // TRUE when an item equals the left side, else unknown when any equality was.
+            let left = side(expr, value)?;
+            let mut found = Some(false);
+            for item in list {
+                let item = side(item, value)?;
+                if item.len() != left.len() {
+                    return Err(Error::PlanError(
+                        "a row value beside IN needs as many values as its partner".to_owned(),
+                    ));
+                }
+                match rows_equal(&left, &item) {
+                    Some(true) => {
+                        found = Some(true);
+                        break;
+                    }
+                    Some(false) => {}
+                    None => found = None,
+                }
+            }
+            found.map_or(Value::Null, |found| Value::Bool(found != *negated))
+        }
+        Expr::Row(_) => {
+            return Err(Error::PlanError(
+                "a row value, (a, b), stands only on either side of IN".to_owned(),
+            ));
+        }
+        Expr::Distance { .. } => Value::Float64(distance.ok_or_else(|| {
+            Error::PlanError(
+                "<=> has a value only for the rows of a similarity search, SELECT ... ORDER BY \
+                 column <=> vector LIMIT k, and in that statement's select list"
+                    .to_owned(),
+            )
+        })?),
     })
+}
+
+/// The values of one side of IN: those of a row value, or the one value of anything else.
+fn side(expr: &Expr, value: impl Fn(&Expr) -> Result<Value>) -> Result<Vec<Value>> {
+    match expr {
+        Expr::Row(items) => items.iter().map(value).collect(),
+        one => Ok(vec![value(one)?]),
+    }
+}
+
+/// Whether two row values of one length are equal, as standard SQL has it: FALSE as soon as one
+/// pair of columns is definitely different, whatever a NULL beside it holds; TRUE when every
+/// pair is equal; otherwise unknown. One value is a row of one column.
+fn rows_equal(left: &[Value], right: &[Value]) -> Option<bool> {
+    let mut equal = Some(true);
+    for (left, right) in left.iter().zip(right) {
+        match compare(left, right) {
+            Some(Ordering::Equal) => {}
+            Some(_) => return Some(false),
+            None => equal = None,
+        }
+    }
+    equal
 }
 
 /// The most memory the value of an expression can take outside its own cell. It is known
@@ -123,8 +200,10 @@ pub(super) fn most_bytes(
 /// Marks in `read` each column the expression reads.
 ///
 /// Refuses, before any row is read, what [`eval`] would refuse at the first row: a column the
-/// table does not have, a `$name` nothing is bound to, and a form this version does not work
-/// out. A statement is therefore refused or not whatever rows its table holds.
+/// table does not have, a `$name` nothing is bound to, and a function this version does not
+/// work out. A statement is therefore refused or not whatever rows its table holds. A distance
+/// and a row value are walked and not judged: the planner refuses the ones a SELECT cannot
+/// hold, and [`eval`] any other when it meets it.
 pub(super) fn reads(
     expr: &Expr,
     table: &Table,
@@ -152,6 +231,22 @@ pub(super) fn reads(
             }
             for arg in args {
                 reads(arg, table, params, read)?;
+            }
+        }
+        // The search gives a row's distance: the column on the left is looked up, not read.
+        Expr::Distance { left, right } => {
+            reads(left, table, params, &mut read.to_vec())?;
+            reads(right, table, params, read)?;
+        }
+        Expr::Row(items) => {
+            for item in items {
+                reads(item, table, params, read)?;
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            reads(expr, table, params, read)?;
+            for item in list {
+                reads(item, table, params, read)?;
             }
         }
     }

@@ -19,6 +19,8 @@ use crate::sql::{self, Effect, Plan};
 use crate::store::{ChangeSet, Read, Store, View, WrapStorage};
 use crate::system::{self, Clock};
 use crate::types::{Error, Result, TxId, Value};
+use crate::upkeep::{self, MaintenanceReport};
+use crate::vector::{self, Tally};
 use crate::write;
 
 /// What a host may say when it opens a store for writing.
@@ -42,8 +44,11 @@ pub struct DatabaseOpenOptions {
     /// ever declared. A limit given here holds until the store is closed and leaves what the
     /// store remembers as it is.
     ///
-    /// Every open sets 9 MiB aside out of the limit, 8 MiB of it for the store's page cache. A
-    /// smaller limit is refused with [`crate::Error::MemoryBudgetExceeded`] and opens no store.
+    /// Every open sets aside, out of the limit, 1 MiB and the store's page cache. The cache is
+    /// a quarter of the limit in force and never less than 8 MiB, which is also its size when
+    /// no limit is in force; it is chosen when the store is opened and keeps its size until the
+    /// store is closed. A limit below 9 MiB is refused with
+    /// [`crate::Error::MemoryBudgetExceeded`] and opens no store.
     ///
     /// A [`crate::ReadSession`] never takes the limit the store remembers: `None` in its own
     /// options means no limit at all, so a reader that needs a ceiling is given one there.
@@ -108,6 +113,9 @@ struct Staged {
     catalog: Arc<Catalog>,
     /// The declarations it ran, in order, for a commit that has to run them again.
     declared: Vec<Plan>,
+    /// The vector partitions its statements have made and emptied, for the limit a statement
+    /// is refused by. The commit function does not read it: it counts again.
+    partitions: Tally,
 }
 
 fn planned(sql: &str) -> Result<Plan> {
@@ -146,6 +154,7 @@ impl Open {
             changes: ChangeSet::new(view, &self.budget)?,
             catalog,
             declared: Vec::new(),
+            partitions: Tally::new(&self.budget)?,
         })
     }
 
@@ -174,8 +183,17 @@ impl Open {
                     return Err(Error::MixedSchemaAndRowWrite);
                 }
                 let (catalog, changes) = (&staged.catalog, &mut staged.changes);
-                write::apply(plan, params, catalog, changes, &self.budget, now)
-                    .map(QueryResult::affected)
+                let partitions = &mut staged.partitions;
+                write::apply(
+                    plan,
+                    params,
+                    catalog,
+                    changes,
+                    partitions,
+                    &self.budget,
+                    now,
+                )
+                .map(QueryResult::affected)
             }
             Effect::Reads => {
                 if let Plan::ShowMemoryLimit = plan {
@@ -211,12 +229,14 @@ impl Open {
     /// its declarations again over the newest moment, because a table's and an index's number
     /// are counted on from the catalog and a new index is filled from the rows that are there;
     /// a refusal of that second run is the commit's refusal. One that wrote rows is laid over
-    /// the newest moment and `write` checks its rows against it.
+    /// the newest moment and `write` checks its rows against it. Then the vector part stages
+    /// what the rows mean for it, so a row and its place in a search commit together.
     fn commit(&self, _held: &MutexGuard<'_, ()>, staged: Staged) -> Result<()> {
         let Staged {
             mut changes,
             mut catalog,
             declared,
+            partitions: _,
         } = staged;
         let (view, tables) = self.newest()?;
         if changes.commit() != view.commit() {
@@ -243,6 +263,7 @@ impl Open {
         if changes.is_empty() {
             return Ok(());
         }
+        vector::stage(&mut changes, &catalog, &self.budget)?;
         let commit = self.store.commit(changes)?;
         // The commit is on disk whatever the read after it says. When that read fails no view
         // is kept and the next call reads again, so none answers from before this commit.
@@ -259,6 +280,9 @@ impl Open {
     /// hold in this open and is committed for the store to remember, or neither happens.
     fn set_memory_limit(&self, limit: Option<u64>) -> Result<()> {
         let held = locked(&self.committing);
+        // Refused here, before anything changes, when the page cache of this open and what is
+        // in use do not fit under the limit.
+        self.store.count_cache_under(limit)?;
         let mut staged = self.begin()?;
         staged.changes.put_memory_limit(limit)?;
         let before = self.budget.limit();
@@ -389,13 +413,18 @@ impl Database {
     /// Declares the memory limit in bytes, or no limit for `None`.
     ///
     /// The limit takes hold at once and is committed, so the store remembers it for every
-    /// later open whose options name no limit, exactly as `SET MEMORY_LIMIT` does.
+    /// later open whose options name no limit, exactly as `SET MEMORY_LIMIT` does. The page
+    /// cache keeps the size this open gave it; the next open sizes it from the limit.
     ///
     /// # Errors
     ///
-    /// [`crate::Error::MemoryBudgetExceeded`] when the limit is below what is in use now, which
-    /// is never less than the 9 MiB every open sets aside. [`crate::Error::StoreIo`] when the
-    /// commit cannot be written. In both cases the limit stays what it was.
+    /// [`crate::Error::MemoryBudgetExceeded`] when the limit is below the smallest this open
+    /// can take: 1 MiB, its page cache, and what open transactions and results not yet dropped
+    /// hold. That is never less than 9 MiB, and is 9 MiB plus what is held for a store opened
+    /// with no limit in force. The refusal names it; a limit below the cache of a store opened
+    /// under a larger limit is given as [`DatabaseOpenOptions::memory_limit`] when the store is
+    /// opened. [`crate::Error::StoreIo`] when the commit cannot be written. In both cases the
+    /// limit stays what it was.
     /// [`crate::Error::DatabaseClosed`] on a handle that was closed.
     pub fn set_memory_limit(&self, limit: Option<usize>) -> Result<()> {
         self.opened()?
@@ -467,6 +496,41 @@ impl Database {
         locked(&self.must_be_open().newest).commit
     }
 
+    /// Runs one cycle of upkeep and returns what it did.
+    ///
+    /// A cycle moves at most 4,096 vectors from the pending lists of VECTOR columns into blocks,
+    /// in one commit, and reports how many it moved and how many still wait. Searches give the
+    /// same rows before and after a cycle; they read fewer rows after it, because a vector in a
+    /// block is ruled in or out from its one-byte copy and a pending vector is read from its
+    /// row. A store with nothing pending is left as it is, and no commit is made.
+    ///
+    /// Under a memory limit with no room for all of that, a cycle seals the partitions it has
+    /// room for, at least one, and the next cycle goes on from there.
+    ///
+    /// Nothing in this version calls a cycle on its own: a host that searches a VECTOR column
+    /// calls this after it has written, and again while
+    /// `vector.maintenance_vectors_remaining` is not zero. Other calls on the handle wait for
+    /// the cycle's commit as they wait for any other commit; readers do not wait.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::MemoryBudgetExceeded`] when the memory limit has no room to seal the
+    /// pending vectors of one partition: a call holds one block's bytes (256 KiB less 64) for its
+    /// whole run, the keys of the pending vectors it collected (at most 4,096, each key's bytes
+    /// plus 24), the partition's record, and one row with its vector at a time;
+    /// [`crate::Error::StoreIo`] or
+    /// [`crate::Error::StoreCorrupted`] when the store cannot be read or written;
+    /// [`crate::Error::DatabaseClosed`] on a handle that was closed. In each case nothing was
+    /// sealed and every vector is still found by a search.
+    pub fn run_maintenance_cycle(&self) -> Result<MaintenanceReport> {
+        let open = self.opened()?;
+        let held = locked(&open.committing);
+        let mut staged = open.begin()?;
+        let report = upkeep::cycle(&mut staged.changes, &staged.catalog, &open.budget)?;
+        open.commit(&held, staged)?;
+        Ok(report)
+    }
+
     /// Lets go of the store, so that the next writer can open it. Every commit that returned is
     /// already on disk, and closing writes nothing. While a call is still running on another
     /// thread, the store is let go when that call returns. Closing a handle that was closed
@@ -514,6 +578,7 @@ impl Transaction<'_> {
         let result = open.run(&plan, params, staged);
         if result.is_err() {
             staged.changes.rewind(mark);
+            staged.partitions.forget();
         }
         result
     }

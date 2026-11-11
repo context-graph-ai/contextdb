@@ -6,6 +6,11 @@
 //! holds it, shared, for the moment it takes to find the newest commit and leave a file naming
 //! it; the writer holds it, alone, while it looks through those files. So the writer never
 //! sees a reader between its choice of a commit and the file that says so.
+//!
+//! Such a lock belongs to the open file, and a child process has a copy of every file its
+//! parent had open when it was started, until it replaces itself with its program. So every
+//! lock is let go by unlocking the file before it is closed: a copy a child still has then
+//! holds nothing.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read as _, Write as _};
@@ -83,9 +88,18 @@ impl StorageBackend for Plain {
     }
 }
 
+/// A file this process holds locked. Dropping it unlocks the file and then closes it.
+pub(super) struct Locked(File);
+
+impl Drop for Locked {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// Takes the folder's `lock` for this process and writes the process id into it. When another
 /// process holds it, answers at once with the id that process wrote.
-pub(super) fn take_lock(folder: &Path) -> io::Result<Result<File, u32>> {
+pub(super) fn take_lock(folder: &Path) -> io::Result<Result<Locked, u32>> {
     let mut lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -94,8 +108,10 @@ pub(super) fn take_lock(folder: &Path) -> io::Result<Result<File, u32>> {
         .open(folder.join("lock"))?;
     match lock.try_lock() {
         Ok(()) => {
-            lock.set_len(0)?;
-            lock.write_all(std::process::id().to_string().as_bytes())?;
+            let mut lock = Locked(lock);
+            lock.0.set_len(0)?;
+            lock.0
+                .write_all(std::process::id().to_string().as_bytes())?;
             Ok(Ok(lock))
         }
         Err(TryLockError::WouldBlock) => {
@@ -112,7 +128,7 @@ pub(super) fn take_lock(folder: &Path) -> io::Result<Result<File, u32>> {
 pub(super) struct Hold {
     pub(super) commit: u64,
     path: PathBuf,
-    _locked: File,
+    _locked: Locked,
 }
 
 impl Hold {
@@ -126,9 +142,10 @@ impl Hold {
             NEXT.fetch_add(1, Ordering::Relaxed)
         );
         let path = readers.join(name);
-        let mut file = File::create(&path)?;
+        let file = File::create(&path)?;
         file.lock()?;
-        file.write_all(commit.to_string().as_bytes())?;
+        let mut file = Locked(file);
+        file.0.write_all(commit.to_string().as_bytes())?;
         Ok(Hold {
             commit,
             path,
@@ -164,7 +181,10 @@ fn look_through(readers: &Path) -> io::Result<Option<u64>> {
         };
         match file.try_lock() {
             // Nobody holds it: its reader is gone, and may have removed it already.
-            Ok(()) => drop(fs::remove_file(&path)),
+            Ok(()) => {
+                let _ = fs::remove_file(&path);
+                file.unlock()?;
+            }
             Err(TryLockError::WouldBlock) => {
                 let mut named = String::new();
                 file.read_to_string(&mut named)?;

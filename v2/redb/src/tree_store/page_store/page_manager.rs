@@ -1194,24 +1194,34 @@ impl TransactionalMemory {
             2u64.pow(required_order_allocation.into()) * u64::from(state.header.page_size());
         let max_region_size = u64::from(state.header.layout().full_region_layout().num_pages())
             * u64::from(state.header.page_size());
+        // The file grows in small steps, so that it stays close to the size of what it holds:
+        // by a sixteenth of its usable bytes once they pass 1 MiB, and never by less than twice
+        // the allocation that needs the room. A smaller file doubles.
+        let usable = layout.usable_bytes();
+        let step = max(
+            if usable < (1 << 20) {
+                usable
+            } else {
+                usable / 16
+            },
+            required_growth * 2,
+        );
         let next_desired_size = if layout.num_full_regions() > 0 {
             if let Some(trailing) = layout.trailing_region_layout() {
-                if 2 * required_growth < max_region_size - trailing.usable_bytes() {
-                    // Fill out the trailing region
-                    layout.usable_bytes() + (max_region_size - trailing.usable_bytes())
+                let room = max_region_size - trailing.usable_bytes();
+                if 2 * required_growth < room {
+                    // Grow the trailing region, at most until it is full
+                    usable + min(step, room)
                 } else {
-                    // Fill out trailing & Grow by 1 region
-                    layout.usable_bytes() + 2 * max_region_size - trailing.usable_bytes()
+                    // Fill out trailing & start the next region
+                    usable + room + min(step, max_region_size)
                 }
             } else {
-                // Grow by 1 region
-                layout.usable_bytes() + max_region_size
+                // Start the next region
+                usable + min(step, max_region_size)
             }
         } else {
-            max(
-                layout.usable_bytes() * 2,
-                layout.usable_bytes() + required_growth * 2,
-            )
+            usable + step
         };
         let new_layout = DatabaseLayout::calculate(
             next_desired_size,

@@ -8,10 +8,11 @@
 //! every page it reads. Where a byte says which of several kinds follows, the last kind is read
 //! for any byte the earlier ones do not claim.
 
-use super::Table;
-use crate::store::{IndexId, TableId};
+use super::{Table, VectorColumn};
+use crate::store::{IndexId, TableId, VectorId};
 use crate::types::{
     ColumnDef, ColumnDefault, ColumnType, IndexDecl, SortDirection, TableMeta, Value,
+    VectorSearchMode,
 };
 
 /// The schema record of a table.
@@ -77,6 +78,23 @@ pub(super) fn encode(table: &Table) -> Vec<u8> {
             out.push(u8::from(*direction == SortDirection::Desc));
         }
     }
+    number(&mut out, table.vectors.len());
+    for vector in &table.vectors {
+        number(&mut out, vector.id.0 as usize);
+        text(&mut out, &vector.column);
+        number(&mut out, vector.partition_key.len());
+        for column in &vector.partition_key {
+            text(&mut out, column);
+        }
+        // A declared MAX_PARTITIONS is never zero, so zero says that none was declared.
+        number(&mut out, vector.max_partitions.unwrap_or(0) as usize);
+        out.push(match vector.search_mode {
+            None => 0,
+            Some(VectorSearchMode::Auto) => 1,
+            Some(VectorSearchMode::Exact) => 2,
+            Some(VectorSearchMode::Indexed) => 3,
+        });
+    }
     out
 }
 
@@ -133,6 +151,18 @@ pub(super) fn decode(record: &[u8]) -> Table {
         });
         IndexDecl { name, columns }
     });
+    let vectors = read.list(|read| VectorColumn {
+        id: VectorId(read.number() as u32),
+        column: read.text(),
+        partition_key: read.list(Reader::text),
+        max_partitions: Some(read.number() as u32).filter(|limit| *limit != 0),
+        search_mode: match read.byte() {
+            0 => None,
+            1 => Some(VectorSearchMode::Auto),
+            2 => Some(VectorSearchMode::Exact),
+            _ => Some(VectorSearchMode::Indexed),
+        },
+    });
     Table {
         id,
         name,
@@ -142,6 +172,7 @@ pub(super) fn decode(record: &[u8]) -> Table {
             indexes,
         },
         index_ids,
+        vectors,
     }
 }
 

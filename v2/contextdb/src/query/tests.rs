@@ -19,6 +19,7 @@ fn worked_out(expr: &Expr) -> Value {
             indexes: Vec::new(),
         },
         index_ids: Vec::new(),
+        vectors: Vec::new(),
     };
     eval(expr, &table, &[], &HashMap::new(), 0).expect("an expression of literals")
 }

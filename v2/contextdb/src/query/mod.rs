@@ -1,11 +1,13 @@
 //! query: answers a SELECT from one table: which rows to read and through which index, the
-//! filter, the select list, COUNT, SUM, MIN and MAX, ORDER BY and LIMIT. It holds the one
-//! expression evaluator, and counts exactly the rows it reads.
+//! filter, the select list, COUNT, SUM, MIN and MAX, ORDER BY and LIMIT, and a similarity
+//! search, whose rows the vector part finds. It holds the one expression evaluator, and counts
+//! exactly the rows it reads.
 //!
 //! It never changes anything.
 
 mod access;
 mod expression;
+mod search;
 #[cfg(test)]
 mod tests;
 
@@ -14,6 +16,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 pub(crate) use expression::eval;
+pub(crate) use search::vector_from_text;
 
 use crate::memory::{Budget, Reservation};
 use crate::schema::{Catalog, Table};
@@ -129,6 +132,9 @@ pub(crate) fn memory_limit_shown(budget: &Budget, opened_under: Option<u64>) -> 
 /// table is answered from the kept count. Loads a value kept beside its row only when a selected
 /// or filtered column needs it. The result, and any sort or grouping on the way to it, grows
 /// through reservations on `budget` and refuses with `MemoryBudgetExceeded` before it grows.
+///
+/// A similarity search, `ORDER BY column <=> vector LIMIT k`, is answered by the vector part
+/// from the rows this part lets it see, and returns the nearest rows first.
 pub(crate) fn run(
     plan: &Plan,
     params: &HashMap<String, Value>,
@@ -137,6 +143,9 @@ pub(crate) fn run(
     budget: &Budget,
     now: i64,
 ) -> Result<QueryResult> {
+    if let Some(found) = search::run(plan, params, catalog, read, budget, now)? {
+        return Ok(found);
+    }
     let select = Select::of(plan)?;
     let table = catalog
         .table(select.table)
@@ -152,12 +161,8 @@ pub(crate) fn run(
         reads(&key.expr, table, params, &mut wanted)?;
     }
     let mut aggregates = Vec::new();
-    let columns = match select.columns {
-        None => {
-            wanted.fill(true);
-            let declared = table.meta.columns.iter();
-            declared.map(|column| column.name.clone()).collect()
-        }
+    match select.columns {
+        None => wanted.fill(true),
         Some(columns) => {
             for column in columns {
                 let Some(aggregate) = Aggregate::of(&column.expr)? else {
@@ -173,19 +178,9 @@ pub(crate) fn run(
             if !aggregates.is_empty() && aggregates.len() < columns.len() {
                 return Err(unsupported("a column beside an aggregate (GROUP BY)"));
             }
-            columns
-                .iter()
-                .map(|column| match (&column.alias, &column.expr) {
-                    (Some(alias), _) => alias.clone(),
-                    (None, Expr::Column(column)) => column.column.clone(),
-                    (None, Expr::FunctionCall { name, .. }) if !aggregates.is_empty() => {
-                        name.clone()
-                    }
-                    (None, _) => "expr".to_owned(),
-                })
-                .collect()
         }
-    };
+    }
+    let columns = names(table, select.columns, !aggregates.is_empty());
 
     let source = Source::new(table, select.filter, params, now, read, filtered, &wanted);
     let limit = select.limit.map_or(usize::MAX, |limit| {
@@ -217,24 +212,11 @@ pub(crate) fn run(
             rows.push(aggregates.into_iter().map(Aggregate::answer).collect());
         }
     } else if limit > 0 {
-        // The select list worked out for one row. The memory of its values is asked for before
-        // they are made, and the row's bytes are given back once they are.
-        let output =
-            |row: Vec<Value>, bytes: u64, reservation: &mut Reservation| -> Result<Vec<Value>> {
-                let Some(columns) = select.columns else {
-                    return Ok(row);
-                };
-                let most = columns
-                    .iter()
-                    .map(|column| most_bytes(&column.expr, table, &row, params));
-                reservation.grow(row_overhead(columns.len()) + most.sum::<u64>())?;
-                let values = columns
-                    .iter()
-                    .map(|column| eval(&column.expr, table, &row, params, now))
-                    .collect::<Result<Vec<_>>>()?;
-                reservation.shrink(bytes);
-                Ok(values)
-            };
+        // The select list worked out for one row.
+        let moved = source.moved(select.columns)?;
+        let output = |row: Vec<Value>, bytes: u64, reservation: &mut Reservation| {
+            source.output(select.columns, &moved, row, bytes, None, reservation)
+        };
         let (path, in_order) = source.choose(select.order)?;
         if in_order {
             examined = source.walk(&path, &mut reservation, |_, row, bytes, reservation| {
@@ -328,6 +310,25 @@ pub(crate) fn matching(
         Ok(true)
     })?;
     Ok((found, reservation))
+}
+
+/// What a result calls its columns: the table's own names for `SELECT *` (`None`), otherwise
+/// each item's `AS` name, a bare column's name, an aggregate's name, and `expr` for any other
+/// expression.
+fn names(table: &Table, columns: Option<&[ProjectColumn]>, aggregates: bool) -> Vec<String> {
+    let Some(columns) = columns else {
+        let declared = table.meta.columns.iter();
+        return declared.map(|column| column.name.clone()).collect();
+    };
+    columns
+        .iter()
+        .map(|column| match (&column.alias, &column.expr) {
+            (Some(alias), _) => alias.clone(),
+            (None, Expr::Column(column)) => column.column.clone(),
+            (None, Expr::FunctionCall { name, .. }) if aggregates => name.clone(),
+            (None, _) => "expr".to_owned(),
+        })
+        .collect()
 }
 
 /// One planned SELECT, as the planner nests it: LIMIT over the select list over ORDER BY over

@@ -26,9 +26,10 @@ pub struct ReadSessionOptions {
     /// The most memory, in bytes, the session may use for its page cache and for the results
     /// it has returned and that are still alive. `None`, the default, is no ceiling: a reader
     /// does not take the limit the store remembers for its writer, so a reader that needs a
-    /// cap sets it here. Every open sets aside 8 MiB for the page cache and 1 MiB for the
-    /// small fixed needs of a statement, so a limit under 9 MiB is refused at open with
-    /// [`crate::Error::MemoryBudgetExceeded`].
+    /// cap sets it here. Every open sets aside its page cache and 1 MiB for the small fixed
+    /// needs of a statement. The page cache is a quarter of the limit and never less than
+    /// 8 MiB, so a limit under 9 MiB is refused at open with
+    /// [`crate::Error::MemoryBudgetExceeded`]; with no limit the page cache is 8 MiB.
     pub memory_limit: Option<usize>,
     /// Where the session gets the time that `NOW()` in a statement answers with. `None`, the
     /// default, is the machine's clock.
@@ -85,7 +86,7 @@ impl ReadSession {
     /// # Errors
     ///
     /// Those of [`ReadSession::open`], and [`crate::Error::MemoryBudgetExceeded`] when
-    /// [`ReadSessionOptions::memory_limit`] is under the 9 MiB every open sets aside.
+    /// [`ReadSessionOptions::memory_limit`] is under 9 MiB, the least an open sets aside.
     pub fn open_with_options(
         path: impl AsRef<Path>,
         options: ReadSessionOptions,

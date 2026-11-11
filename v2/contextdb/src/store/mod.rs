@@ -1,8 +1,9 @@
 //! store: the folder and the data file; how each kind of record is keyed; views of one moment;
 //! reader files and locks.
 //!
-//! It never interprets SQL or a table's rules: it keeps rows, index entries, counts and schema
-//! records under the keys it is given and hands them back exactly as they were written.
+//! It never interprets SQL or a table's rules: it keeps rows, index entries, counts, schema
+//! records and the vector part's records under the keys it is given and hands them back exactly
+//! as they were written.
 //!
 //! Two of the things the parts meet at are defined here: [`Read`], the view to read from, and
 //! [`ChangeSet`], the change set to write with.
@@ -28,12 +29,16 @@ use redb::{ReadTransaction, ReadableDatabase};
 use crate::memory::{Budget, Reservation};
 use crate::types::{Error, Result, SortDirection, TxId, Value};
 use disk::{Moment, Stored};
-use folder::{DataFile, Hold};
+use folder::{DataFile, Hold, Locked};
 use keys::Span;
 
-/// The size of the page cache of one open store, in bytes. It is reserved from the budget when
-/// the store is opened and does not change.
-const CACHE_BYTES: u64 = 8 << 20;
+/// The size of the page cache of a store opened under this memory limit, in bytes: a quarter
+/// of the limit and never less than 8 MiB, which is also its size when there is no limit. It is
+/// reserved from the budget when the store is opened and does not change until the store is
+/// closed, because the storage library fixes its cache when the data file is opened.
+fn cache_under(limit: Option<u64>) -> u64 {
+    (limit.unwrap_or(0) / 4).max(8 << 20)
+}
 
 /// What a refusal names when the memory limit cannot hold the page cache.
 const CACHE_NEEDED: &str = "page cache needed to open the store";
@@ -43,11 +48,14 @@ const CACHE_NEEDED: &str = "page cache needed to open the store";
 ///
 /// It is given in [`crate::DatabaseOpenOptions::storage`] or
 /// [`crate::ReadSessionOptions::storage`]; with none given the file is read and written as it
-/// is. The library opens and locks the data file itself, calls the function once for each open
-/// with the open file, and from then on reads and writes the file only through the
-/// [`StorageBackend`] the function returned. A session opened for reading hands over a file
-/// opened for reading only. A host wraps the file to keep the bytes somewhere else or to change
-/// them on the way; a test wraps it to count the calls, to fail one or to stop at one.
+/// is. The library opens and locks the data file itself, calls the function with the open file
+/// each time it has opened it, and from then on reads and writes the file only through the
+/// [`StorageBackend`] the function returned. That is once for each open, and twice for a writer
+/// that names no memory limit over a store that remembers one: the data file is opened to
+/// read the limit, and again with the page cache the limit calls for when that is another
+/// size. A session opened for reading hands over a file opened for reading only. A host wraps
+/// the file to keep the bytes somewhere else or to change them on the way; a test wraps it to
+/// count the calls, to fail one or to stop at one.
 ///
 /// An error returned by the function, or by a call of what it returned, is reported as
 /// [`crate::Error::StoreIo`]. The two exceptions are the kinds `UnexpectedEof` and
@@ -63,6 +71,40 @@ pub(crate) struct TableId(pub u32);
 /// An index's number inside one store, given by `schema` like a [`TableId`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct IndexId(pub u32);
+
+/// A VECTOR column's number inside one store, given by `schema` like a [`TableId`]. Every record
+/// the vector part keeps for the column begins with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct VectorId(pub u32);
+
+/// A record the vector part keeps. `store` decides the bytes of its key and where it is held;
+/// the value is the vector part's own and comes back exactly as it was put.
+///
+/// Records of one kind are in the order of their fields, left to right: every record of one
+/// column is one run of keys, and inside it every pending row or block of one partition is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VectorRecord<'a> {
+    /// What the column keeps about one partition, under the partition's key tuple: the values
+    /// of the PARTITION_KEY columns encoded as [`Key::from_values`] encodes them, ascending. A
+    /// column with no PARTITION_KEY has one partition, under the key of no values.
+    Partition(VectorId, &'a Key),
+    /// A row whose vector is in no block yet: the partition's number, then the row's key. Its
+    /// value is empty.
+    Pending(VectorId, u32, &'a Key),
+    /// One block of a partition: the partition's number, then the block's.
+    Block(VectorId, u32, u32),
+}
+
+/// A number the store keeps for the vector part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VectorNumber {
+    /// How many partitions a column has.
+    Partitions(VectorId),
+    /// The number the column's next new partition takes. It only ever rises.
+    NextPartition(VectorId),
+    /// How many pending records there are, over every column.
+    Pending,
+}
 
 /// A primary key or an index entry, encoded so that comparing the bytes compares the values.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -81,6 +123,22 @@ impl Key {
     /// that every full key with those values begins with, and no other key begins with them.
     pub(crate) fn from_values(values: &[Value], directions: &[SortDirection]) -> Result<Key> {
         keys::encode(values, directions).map(Key)
+    }
+
+    /// The bytes of the key, for a part that keeps keys inside a record of its own.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// The key that [`Key::as_bytes`] gave these bytes for.
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Key {
+        Key(bytes.to_vec())
+    }
+
+    /// True when this key begins with every value of `prefix`, in order. Every key begins with
+    /// the key of no values.
+    pub(crate) fn starts_with(&self, prefix: &Key) -> bool {
+        self.0.starts_with(&prefix.0)
     }
 
     /// The first key after every key that begins with this one, `None` when there is none.
@@ -107,10 +165,13 @@ pub(crate) enum Cell {
     Beside(Beside),
 }
 
-/// Where a large value is kept and how many bytes loading it takes.
+/// Where a large value is kept and how many bytes are stored for it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Beside {
+    /// The bytes of the value's stored record. A large text or JSON value may be stored
+    /// compressed, so this can be less than the bytes the loaded value takes.
     bytes: u64,
+    /// The place of the first slice of the record; the others are under the places after it.
     place: u64,
 }
 
@@ -153,10 +214,46 @@ pub(crate) trait Read {
     /// How many rows the table holds at this moment. One small record, never a scan.
     fn count(&self, table: TableId) -> Result<u64>;
 
-    /// Loads a value kept beside its row. Grows `reservation` by the bytes the value takes
-    /// first and refuses with `MemoryBudgetExceeded` before reading anything if that does not
-    /// fit.
+    /// Loads a value kept beside its row. Grows `reservation` by the bytes stored for the
+    /// value first and refuses with `MemoryBudgetExceeded` before reading anything if that does
+    /// not fit. A value that is stored compressed can be refused a second time, after its
+    /// stored bytes are read and before any byte of the value exists: the reservation is then
+    /// grown by the bytes the value really takes.
+    ///
+    /// After a load the reservation holds the bytes the value takes, however it was stored;
+    /// while a JSON or vector value is made it holds them twice. A load that fails gives back
+    /// all it grew. A stored length the stored bytes do not support is `StoreCorrupted`.
     fn load(&self, beside: &Beside, reservation: &mut Reservation) -> Result<Value>;
+
+    /// Calls `each` with the key of every row of the table that this reader has staged over
+    /// its committed moment, in key order, until `each` answers false: the rows a transaction
+    /// has written or removed and not yet committed. A [`View`] has none.
+    fn staged(&self, table: TableId, each: &mut dyn FnMut(&Key) -> Result<bool>) -> Result<()>;
+
+    /// Calls `each` with the vector part's records of the kind of `from`, in key order, from
+    /// `from` itself or the first record after it, until `each` answers false or the kind has
+    /// no more records. Records of other columns follow those of `from`'s column, so the
+    /// caller stops where its own run ends.
+    ///
+    /// The value is lent, not copied: a block is handed over in place from the page cache, and
+    /// costs one read of the file when it is not there. A partition's key tuple compares with
+    /// `from` as a whole key, so the tuple of no values starts at a column's first partition.
+    ///
+    /// Vector records are staged only inside the commit function and by upkeep, after the last
+    /// read of their change set. A [`ChangeSet`] therefore answers from its committed moment.
+    fn vectors(
+        &self,
+        from: VectorRecord<'_>,
+        each: &mut dyn FnMut(VectorRecord<'_>, &[u8]) -> Result<bool>,
+    ) -> Result<()>;
+
+    /// One of the numbers kept for the vector part; zero when it was never put.
+    fn vector_number(&self, number: VectorNumber) -> Result<u64>;
+
+    /// The refusal of a record that its own bytes, or the records it goes with, do not
+    /// support: `StoreCorrupted`, naming the store's folder, with this reason. A part that
+    /// keeps records of its own tells the damage it finds in them with this.
+    fn damaged(&self, reason: &str) -> Error;
 }
 
 /// One committed moment of a store.
@@ -189,6 +286,11 @@ pub(crate) struct ChangeSet {
     schema: BTreeMap<String, Vec<u8>>,
     /// The memory limit the store is to remember, when one was staged: `Some(None)` for none.
     memory_limit: Option<Option<u64>>,
+    /// Staged records of the vector part by their stored key: the value, or `None` for a
+    /// removal.
+    vectors: BTreeMap<Key, Option<Vec<u8>>>,
+    /// Staged numbers of the vector part by their place among the store's numbers.
+    vector_numbers: BTreeMap<u64, u64>,
     /// Every staging call of a statement in order, each with what it put aside and the bytes it
     /// was counted as, so that the calls after a mark can be undone.
     calls: Vec<(Undo, u64)>,
@@ -212,6 +314,8 @@ enum Undo {
     Entry(u32, Key, Option<Option<usize>>),
     Count(u32, i64),
     Schema(String, Option<Vec<u8>>),
+    Vector(Key, Option<Option<Vec<u8>>>),
+    VectorNumber(u64, Option<u64>),
 }
 
 /// What one staging call is counted as beside its key and its values: its place in the map
@@ -228,6 +332,8 @@ impl ChangeSet {
             counts: BTreeMap::new(),
             schema: BTreeMap::new(),
             memory_limit: None,
+            vectors: BTreeMap::new(),
+            vector_numbers: BTreeMap::new(),
             calls: Vec::new(),
             reserved: budget.reserve(0, "transaction")?,
         })
@@ -255,13 +361,16 @@ impl ChangeSet {
     pub(crate) fn rewind(&mut self, mark: usize) {
         for (undo, bytes) in self.calls.drain(mark..).rev() {
             match undo {
-                Undo::Row(table, key, before) => put_back(&mut self.rows, table, key, before),
+                Undo::Row(table, key, before) => {
+                    put_back(self.rows.entry(table).or_default(), key, before);
+                }
                 Undo::Entry(index, joined, before) => {
-                    put_back(&mut self.index, index, joined, before);
+                    put_back(self.index.entry(index).or_default(), joined, before);
                 }
                 Undo::Count(table, delta) => *self.counts.entry(table).or_default() -= delta,
-                Undo::Schema(name, Some(before)) => drop(self.schema.insert(name, before)),
-                Undo::Schema(name, None) => drop(self.schema.remove(&name)),
+                Undo::Schema(name, before) => put_back(&mut self.schema, name, before),
+                Undo::Vector(key, before) => put_back(&mut self.vectors, key, before),
+                Undo::VectorNumber(at, before) => put_back(&mut self.vector_numbers, at, before),
             }
             self.reserved.shrink(bytes);
         }
@@ -349,6 +458,38 @@ impl ChangeSet {
         Ok(())
     }
 
+    /// Stages a record of the vector part, new or in place of the record with that key. The
+    /// value's bytes are charged to the change set's reservation until it is committed or
+    /// dropped.
+    pub(crate) fn put_vector(&mut self, record: VectorRecord<'_>, value: Vec<u8>) -> Result<()> {
+        self.stage_vector(record, Some(value))
+    }
+
+    /// Stages the removal of a record of the vector part. Removing a record that is not there
+    /// changes nothing.
+    pub(crate) fn delete_vector(&mut self, record: VectorRecord<'_>) -> Result<()> {
+        self.stage_vector(record, None)
+    }
+
+    fn stage_vector(&mut self, record: VectorRecord<'_>, value: Option<Vec<u8>>) -> Result<()> {
+        let key = Key(keys::vector(record));
+        let held = value.as_ref().map_or(0, Vec::len);
+        let bytes = self.counted(&key, held as u64)?;
+        let before = self.vectors.insert(key.clone(), value);
+        self.calls.push((Undo::Vector(key, before), bytes));
+        Ok(())
+    }
+
+    /// Stages one of the numbers kept for the vector part.
+    pub(crate) fn put_vector_number(&mut self, number: VectorNumber, value: u64) -> Result<()> {
+        self.reserved.grow(STAGED_BYTES)?;
+        let at = disk::vector_number_at(number);
+        let before = self.vector_numbers.insert(at, value);
+        self.calls
+            .push((Undo::VectorNumber(at, before), STAGED_BYTES));
+        Ok(())
+    }
+
     /// Counts one staging call against the budget before anything is kept: its key twice, once
     /// in the map and once in the list of calls, and what its values hold. Returns the bytes.
     fn counted(&mut self, key: &Key, held: u64) -> Result<u64> {
@@ -374,8 +515,7 @@ impl ChangeSet {
 }
 
 /// Puts a staged record back as it was before one staging call.
-fn put_back<C>(staged: &mut Staged<C>, id: u32, key: Key, before: Option<C>) {
-    let records = staged.entry(id).or_default();
+fn put_back<K: Ord, C>(records: &mut BTreeMap<K, C>, key: K, before: Option<C>) {
     match before {
         Some(before) => drop(records.insert(key, before)),
         None => drop(records.remove(&key)),
@@ -496,12 +636,39 @@ impl Read for ChangeSet {
     fn load(&self, beside: &Beside, reservation: &mut Reservation) -> Result<Value> {
         self.base.load(beside, reservation)
     }
+
+    fn staged(&self, table: TableId, each: &mut dyn FnMut(&Key) -> Result<bool>) -> Result<()> {
+        for key in self.rows.get(&table.0).into_iter().flat_map(BTreeMap::keys) {
+            if !each(key)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn vectors(
+        &self,
+        from: VectorRecord<'_>,
+        each: &mut dyn FnMut(VectorRecord<'_>, &[u8]) -> Result<bool>,
+    ) -> Result<()> {
+        self.base.vectors(from, each)
+    }
+
+    fn vector_number(&self, number: VectorNumber) -> Result<u64> {
+        self.base.vector_number(number)
+    }
+
+    fn damaged(&self, reason: &str) -> Error {
+        self.base.damaged(reason)
+    }
 }
 
 /// One open store folder, held either for writing or for reading.
 pub(crate) struct Store {
     held: HeldFor,
     folder: Arc<Path>,
+    /// The budget the page cache is reserved from.
+    budget: Budget,
     _cache: Reservation,
 }
 
@@ -510,7 +677,7 @@ pub(crate) struct Store {
 enum HeldFor {
     Writing {
         data: redb::Database,
-        _lock: File,
+        _lock: Locked,
     },
     Reading {
         data: redb::ReadOnlyDatabase,
@@ -556,10 +723,17 @@ impl Fixing {
 
 impl HeldFor {
     /// Takes the folder for writing, or answers with the id of the process that holds it.
+    /// With the folder comes the size of the page cache its data file was opened with.
+    ///
+    /// `limit` is the memory limit of the open's budget, and the cache is the one it calls
+    /// for. With none, the limit in force is the one the store remembers, which only the open
+    /// data file tells: the file is opened with the cache of no limit and, when the remembered
+    /// limit calls for another size, let go and opened again with that size.
     fn writing(
         folder: &Path,
         storage: Option<&WrapStorage>,
-    ) -> Stored<std::result::Result<HeldFor, u32>> {
+        limit: Option<u64>,
+    ) -> Stored<std::result::Result<(HeldFor, u64), u32>> {
         fs::create_dir_all(folder)?;
         let lock = match folder::take_lock(folder)? {
             Ok(lock) => lock,
@@ -567,9 +741,26 @@ impl HeldFor {
         };
         let readers = folder.join("readers");
         fs::create_dir_all(&readers)?;
-        let gate = File::open(&readers)?;
         // Removes what readers that are gone left behind.
-        folder::oldest_held(&readers, &gate)?;
+        folder::oldest_held(&readers, &File::open(&readers)?)?;
+        let mut cache = cache_under(limit);
+        let mut data = HeldFor::data(folder, storage, cache)?;
+        disk::prepare(&data)?;
+        if limit.is_none() {
+            let remembered = cache_under(disk::remembered_limit(&data)?);
+            if remembered != cache {
+                drop(data);
+                cache = remembered;
+                data = HeldFor::data(folder, storage, cache)?;
+            }
+        }
+        Ok(Ok((HeldFor::Writing { data, _lock: lock }, cache)))
+    }
+
+    /// Opens the data file of a folder held for writing, with a page cache of `cache` bytes.
+    fn data(folder: &Path, storage: Option<&WrapStorage>, cache: u64) -> Stored<redb::Database> {
+        let readers = folder.join("readers");
+        let gate = File::open(&readers)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -577,25 +768,29 @@ impl HeldFor {
             .truncate(false)
             .open(folder.join("data"))?;
         let data = redb::Builder::new()
-            .set_cache_size(CACHE_BYTES as usize)
+            .set_cache_size(cache as usize)
             // When the files cannot be looked through, every commit counts as held.
             .set_held_commits_callback(move || {
                 folder::oldest_held(&readers, &gate).unwrap_or(Some(0))
             })
             .create_with_backend(DataFile::over(file, storage)?)?;
-        disk::prepare(&data)?;
-        Ok(Ok(HeldFor::Writing { data, _lock: lock }))
+        Ok(data)
     }
 
-    /// Opens the folder for reading, or answers `None` when it has no data file.
-    fn reading(folder: &Path, storage: Option<&WrapStorage>) -> Stored<Option<HeldFor>> {
+    /// Opens the folder for reading with a page cache of `cache` bytes, or answers `None` when
+    /// it has no data file.
+    fn reading(
+        folder: &Path,
+        storage: Option<&WrapStorage>,
+        cache: u64,
+    ) -> Stored<Option<HeldFor>> {
         let file = match File::open(folder.join("data")) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
         let data = redb::Builder::new()
-            .set_cache_size(CACHE_BYTES as usize)
+            .set_cache_size(cache as usize)
             .open_read_only_with_backend(DataFile::over(file, storage)?)?;
         let readers = folder.join("readers");
         let fixing = Mutex::new(Fixing {
@@ -612,21 +807,33 @@ impl Store {
     ///
     /// Takes the folder's `lock` for the life of the value and refuses at once with
     /// `DatabaseLocked`, naming the holder, when another process has it. Clears what a killed
-    /// reader or writer left behind. Reserves the page cache from `budget`. Costs a few
-    /// milliseconds whatever the store's size: nothing is loaded.
+    /// reader or writer left behind. Costs a few milliseconds whatever the store's size:
+    /// nothing is loaded.
+    ///
+    /// Reserves the page cache from `budget`: the cache the budget's limit calls for, and with
+    /// no limit there the cache that the limit the store remembers calls for. The caller sets
+    /// the remembered limit on the budget afterwards, and the cache fits under it.
     pub(crate) fn open_for_writing(
         folder: &Path,
         budget: &Budget,
         storage: Option<&WrapStorage>,
     ) -> Result<Store> {
-        let cache = budget.reserve(CACHE_BYTES, CACHE_NEEDED)?;
-        let held = HeldFor::writing(folder, storage);
+        let limit = budget.limit();
+        let mut cache = budget.reserve(cache_under(limit), CACHE_NEEDED)?;
+        let held = HeldFor::writing(folder, storage, limit);
         match held.map_err(|error| disk::failed(folder, "open", error))? {
-            Ok(held) => Ok(Store {
-                held,
-                folder: folder.into(),
-                _cache: cache,
-            }),
+            Ok((held, opened_with)) => {
+                // Another size is opened only with no limit in force, so nothing refuses this.
+                if opened_with != cache.bytes() {
+                    cache = budget.reserve(opened_with, CACHE_NEEDED)?;
+                }
+                Ok(Store {
+                    held,
+                    folder: folder.into(),
+                    budget: budget.clone(),
+                    _cache: cache,
+                })
+            }
             Err(holder_pid) => Err(Error::DatabaseLocked {
                 holder_pid,
                 path: folder.to_path_buf(),
@@ -636,13 +843,16 @@ impl Store {
 
     /// Opens the folder for reading. Never creates anything: refuses with `StoreMissing` when
     /// there is no store. Works whether or not a writer is running, and never makes a writer
-    /// fail; a view holds one up only for the instant it has the short lock.
+    /// fail; a view holds one up only for the instant it has the short lock. Reserves the page
+    /// cache that the budget's limit calls for: a reader does not take the limit the store
+    /// remembers.
     pub(crate) fn open_for_reading(
         folder: &Path,
         budget: &Budget,
         storage: Option<&WrapStorage>,
     ) -> Result<Store> {
-        let held = HeldFor::reading(folder, storage)
+        let cache = cache_under(budget.limit());
+        let held = HeldFor::reading(folder, storage, cache)
             .map_err(|error| disk::failed(folder, "open", error))?;
         let Some(held) = held else {
             return Err(Error::StoreMissing {
@@ -652,8 +862,39 @@ impl Store {
         Ok(Store {
             held,
             folder: folder.into(),
-            _cache: budget.reserve(CACHE_BYTES, CACHE_NEEDED)?,
+            budget: budget.clone(),
+            _cache: budget.reserve(cache, CACHE_NEEDED)?,
         })
+    }
+
+    /// Checks a memory limit that is about to take hold against the page cache of this open.
+    ///
+    /// The cache keeps the size it was opened with until the store is closed, and the budget
+    /// counts all of it. A declared limit must hold, so the smallest limit this open can take
+    /// is what the budget counts now: 1 MiB, the cache, and what open transactions and live
+    /// results hold. A limit below that is refused with `MemoryBudgetExceeded`, operation
+    /// `set_limit`, and nothing changes: the refusal names the smallest limit as the bytes
+    /// needed and says to open the store with the limit as an open option. A limit at or above
+    /// it, or none, is accepted: once `database` has set it on the budget it holds at once,
+    /// the store remembers it, and it sizes the cache at the next open. `database` calls this
+    /// on the one path of `SET MEMORY_LIMIT`, before anything changes.
+    pub(crate) fn count_cache_under(&self, limit: Option<u64>) -> Result<()> {
+        let smallest = self.budget.used();
+        match limit {
+            Some(limit) if limit < smallest => Err(Error::MemoryBudgetExceeded {
+                subsystem: "store",
+                operation: "set_limit",
+                requested_bytes: smallest,
+                available_bytes: limit,
+                budget_limit_bytes: limit,
+                hint: "the bytes needed are the smallest limit this session can take, because \
+                       its page cache keeps the size it was opened with; for a lower limit, \
+                       open the store with the limit as an open option, which sizes the \
+                       page cache from the limit, and declare the limit in that session for \
+                       the store to remember it",
+            }),
+            _ => Ok(()),
+        }
     }
 
     /// The newest committed moment.
@@ -682,16 +923,18 @@ impl Store {
 
     /// Writes a change set as one commit and waits for the disk.
     ///
-    /// Rows, the values kept beside them, index entries, counts, schema records and the list of
-    /// changed keys go in one storage transaction: after a kill either all of it is there or
-    /// none. The caller holds the commit lock and has laid the change set over the newest
+    /// Rows, the values kept beside them, index entries, counts, schema records, the vector
+    /// part's records and numbers and the list of changed keys go in one storage transaction:
+    /// after a kill either all of it is there or none. A large text or JSON value is compressed
+    /// on its way in, in a buffer counted against the change set's reservation while it is
+    /// used. The caller holds the commit lock and has laid the change set over the newest
     /// moment; one over an older moment is refused with `StoreIo` and writes nothing. Returns
     /// the commit's number. Only a store opened for writing is given a change set to commit.
-    pub(crate) fn commit(&self, changes: ChangeSet) -> Result<TxId> {
+    pub(crate) fn commit(&self, mut changes: ChangeSet) -> Result<TxId> {
         let HeldFor::Writing { data, .. } = &self.held else {
             unreachable!("a store opened for reading is given nothing to commit")
         };
-        match disk::write(data, &changes) {
+        match disk::write(data, &mut changes) {
             Ok(commit) => Ok(TxId(commit)),
             Err(error) => Err(disk::failed(&self.folder, "commit", error)),
         }

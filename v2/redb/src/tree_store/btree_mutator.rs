@@ -417,7 +417,8 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                         old_value: existing_value,
                     }
                 } else {
-                    let (new_page1, split_key, new_page2) = builder.build_split()?;
+                    let appended = !found && accessor.num_pairs() == position;
+                    let (new_page1, split_key, new_page2) = builder.build_split(appended)?;
                     let split_key = split_key.to_vec();
                     let page_number = page.get_page_number();
                     let existing_value = if found {
@@ -899,7 +900,8 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                                 .push_all_except(&partial_child_accessor, Some(deleted_pair));
                         }
                         if child_builder.should_split() {
-                            let (new_page1, split_key, new_page2) = child_builder.build_split()?;
+                            let (new_page1, split_key, new_page2) =
+                                child_builder.build_split(false)?;
                             builder.push_key(split_key);
                             builder.push_child(new_page1.get_page_number(), DEFERRED);
                             builder.push_child(new_page2.get_page_number(), DEFERRED);

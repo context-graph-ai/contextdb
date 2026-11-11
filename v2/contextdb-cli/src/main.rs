@@ -51,16 +51,26 @@ EXIT STATUS:
   2  the command line was refused; nothing was opened
 
 MEMORY:
-  --memory-limit is this session's ceiling, in bytes or with K, M or G. Without it a
-  --write session has the limit the store remembers and a read session has none.
-  The store keeps 8M for its page cache and 1M is set aside before that, so the
-  smallest limit that opens a store is 9M.
+  --memory-limit is this session's ceiling, in bytes or with K, M or G; the store does
+  not remember it. Without it a --write session has the limit the store remembers and
+  a read session has none.
+  A session sets aside 1M and its page cache, sized when it starts: a quarter of its
+  limit and never less than 8M, which is also its size with no limit. So the smallest
+  limit that opens a store is 9M.
   `SET MEMORY_LIMIT 512M;` (or NONE) declares the limit the store remembers; it needs
   --write, and inside a transaction it still takes effect at once and ROLLBACK does not
-  undo it. `SHOW MEMORY_LIMIT;` reports this session's limit and what is in use.
+  undo it. The smallest limit a session takes is 1M plus its page cache plus what it
+  holds, which is 9M in a session started with no limit; a limit below it is refused.
+  To go below the page cache of a session started under a larger limit, start with the
+  smaller one, `--memory-limit 64M`, and then run `SET MEMORY_LIMIT 64M;`.
+  `SHOW MEMORY_LIMIT;` reports this session's limit and what is in use: with no limit,
+  `none` and 9437184 bytes used, the 1M and the 8M page cache.
 
 JSON (--json), one document a line:
   a SELECT or SHOW MEMORY_LIMIT   {"result":{"columns":[...],"rows":[{...}]}}
+                                  a vector is an array of numbers, each at the full
+                                  precision of the stored 32-bit value, so a number
+                                  may print with more digits than were typed
   any other statement             {"rows_affected":N}
   .tables                         {"tables":{"items":[...]}}
   .schema <table>                 {"schema":{"table":...,"ddl":...}}

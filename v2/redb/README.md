@@ -30,6 +30,17 @@ Checking pages when they are read:
   pages they read into the page cache, so the cache only holds pages that were checked or that
   were written through the same handle.
 
+Keeping a file close to the size of what it holds:
+
+- A leaf written in key order is left full. When a leaf must split because a pair was inserted
+  after its last pair, the first leaf keeps every pair that was there and the second starts with
+  the new pair; upstream divides every leaf where half its bytes are, which leaves a table that
+  is written in key order with half-empty leaves. Every other split is still in half.
+- The file grows in small steps. Once its usable bytes pass 1 MiB the file grows by a sixteenth
+  of them, and never by less than twice the allocation that needed the room; upstream doubles
+  the file while it has one region and adds a whole region at a time after that. A file under
+  1 MiB still doubles, and a region is still filled before the next one is started.
+
 Everything below is upstream's README.
 
 # redb

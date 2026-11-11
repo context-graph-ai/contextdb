@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use super::{Catalog, Table, check, record, render};
-use crate::sql::ast::{self, DataType, Expr, Literal, UnaryOp};
+use crate::sql::ast::{self, DataType, Expr, Literal};
 use crate::sql::plan::{CreateIndexPlan, CreateTablePlan};
 use crate::store::{IndexId, TableId};
 use crate::types::{
@@ -85,6 +85,7 @@ fn notes() -> Table {
             ],
         },
         index_ids: [7, 8, 9, 12, 15].map(IndexId).to_vec(),
+        vectors: Vec::new(),
     }
 }
 
@@ -121,32 +122,49 @@ CREATE INDEX by_body ON notes (body);
     );
 }
 
+/// The DEFAULT of a column as the parser hands it over, for this text after the word.
+fn written_default(text: &str) -> Expr {
+    let statement = format!("CREATE TABLE t (c INTEGER DEFAULT {text})");
+    let parsed = match crate::sql::parse(&statement) {
+        Ok(ast::Statement::CreateTable(create)) => create,
+        other => panic!("{statement}\nwas read as {other:?}"),
+    };
+    let [column] = parsed.columns.as_slice() else {
+        panic!(
+            "{statement}\nwas read with {} columns",
+            parsed.columns.len()
+        );
+    };
+    column
+        .default
+        .clone()
+        .unwrap_or_else(|| panic!("{statement}\nwas read with no default"))
+}
+
 #[test]
 fn a_default_is_kept_in_the_type_the_author_wrote() {
-    let literal = Expr::Literal;
-    let minus = |literal| Expr::UnaryOp {
-        op: UnaryOp::Neg,
-        operand: Box::new(Expr::Literal(literal)),
-    };
-    let now = Expr::FunctionCall {
-        name: "now".to_owned(),
-        args: Vec::new(),
-    };
-    for (expr, value) in [
-        (literal(Literal::Null), Value::Null),
-        (literal(Literal::Bool(true)), Value::Bool(true)),
-        (literal(Literal::Integer(3)), Value::Int64(3)),
-        (literal(Literal::Real(0.0)), Value::Float64(0.0)),
-        (literal(Literal::Text("it's".to_owned())), "it's".into()),
-        (minus(Literal::Integer(1)), Value::Int64(-1)),
-        (minus(Literal::Real(2.5)), Value::Float64(-2.5)),
+    for (text, value) in [
+        ("NULL", Value::Null),
+        ("TRUE", Value::Bool(true)),
+        ("3", Value::Int64(3)),
+        ("0.0", Value::Float64(0.0)),
+        ("'it''s'", "it's".into()),
+        ("-1", Value::Int64(-1)),
+        ("-2.5", Value::Float64(-2.5)),
     ] {
-        assert_eq!(check::default(&expr), Some(ColumnDefault::Literal(value)));
+        assert_eq!(
+            check::default(&written_default(text)),
+            Some(ColumnDefault::Literal(value)),
+            "DEFAULT {text}"
+        );
     }
-    assert_eq!(check::default(&now), Some(ColumnDefault::Now));
+    assert_eq!(
+        check::default(&written_default("NOW()")),
+        Some(ColumnDefault::Now)
+    );
     // Anything that is not a literal or NOW() is no default this version keeps.
-    assert_eq!(check::default(&Expr::Parameter("p".to_owned())), None);
-    assert_eq!(check::default(&minus(Literal::Text("x".to_owned()))), None);
+    assert_eq!(check::default(&written_default("$p")), None);
+    assert_eq!(check::default(&written_default("-'x'")), None);
 }
 
 /// A column as the parser hands over one that wrote no clause.
@@ -158,6 +176,7 @@ fn declared(name: &str, data_type: DataType) -> ast::ColumnDef {
         primary_key: false,
         unique: false,
         default: None,
+        vector: ast::VectorClauses::default(),
     }
 }
 

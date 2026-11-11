@@ -3,13 +3,23 @@
 //!
 //! This test has a file of its own because its program counts every allocation. The count is
 //! taken in a child, so that it is the count of one store and nothing else.
+//!
+//! The same count holds a refused read to its word: a value stored compressed whose real size
+//! does not fit the reader's limit is refused before its bytes exist. And it holds a sealing
+//! cycle to what it reserves: under a limit with exactly the room the cycle's reservations
+//! come to, the cycle completes and the process stays within the limit. The cycle is measured
+//! with the page cache already full: the limit has room for the whole cache, and a cache that
+//! is half empty would hide whatever the cycle held without reserving it.
 
 mod support;
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use contextdb::{DatabaseOpenOptions, params};
+use contextdb::{
+    Database, DatabaseOpenOptions, Error, ReadSession, ReadSessionOptions, Value, params,
+};
 
 const LIMIT: usize = 64 << 20;
 const ROWS: i64 = 1_000_000;
@@ -156,6 +166,287 @@ fn load_and_scan(role: support::Role) {
     ALLOCATED.peak.store(loaded, Ordering::Relaxed);
     support::close(db);
 
+    support::say(format!("before {before}"));
+    support::say(format!("peak {}", ALLOCATED.peak.load(Ordering::Relaxed)));
+}
+
+/// The value of the test below: 1 MiB of one sentence repeated, the largest the store
+/// compresses. And the reader's limit: the 9 MiB an open sets aside and 64 KiB, which is room
+/// for the value's stored record, a little over 4 KiB, and a sixteenth of what the value
+/// itself takes. The arithmetic is that of `a_compressed_value_too_large_for_the_limit_is_refused`
+/// in `large_values.rs`, which holds the refusal itself.
+const VALUE: usize = 1 << 20;
+const VALUE_LIMIT: usize = (9 << 20) + (64 << 10);
+
+#[test]
+fn a_refused_compressed_value_is_never_produced() {
+    if let Some(role) = support::role() {
+        return refused_select(&role);
+    }
+    let folder = support::folder("refused-value-never-produced");
+    let db = support::open(&folder);
+    support::run(
+        &db,
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+    );
+    let large = support::large_text(support::Kind::Repeating, 1, VALUE);
+    for (id, body) in [(1_i64, large.as_str()), (2, "small")] {
+        db.execute(
+            "INSERT INTO notes (id, body) VALUES ($id, $body)",
+            &params! { "id" => id, "body" => body },
+        )
+        .unwrap_or_else(|error| panic!("note {id} was refused: {error:?}"));
+    }
+    support::close(db);
+    // The value is stored compressed: the file is too short to hold it as it is.
+    let length = fs::metadata(folder.join("data"))
+        .expect("the store's data file")
+        .len();
+    assert!(
+        length < VALUE as u64,
+        "the data file is {length} bytes long: a repeating text of {VALUE} bytes was stored as \
+         it is, and this test would show nothing about a compressed value"
+    );
+
+    let lines = support::Child::start(
+        "a_refused_compressed_value_is_never_produced",
+        "reader",
+        &folder,
+    )
+    .end();
+    assert_eq!(
+        support::last_number(&lines, "refused"),
+        Some(1),
+        "the reader's select of the large value was not refused by its limit"
+    );
+    // The value's bytes never existed: from just before the select to just after its refusal
+    // the most the process had allocated rose by less than the value is long. A read that
+    // produced the value and then counted it would have taken all of its bytes at once.
+    let rise = support::last_number(&lines, "rise").expect("the reader announces it");
+    assert!(
+        rise < VALUE as u64,
+        "while a value of {VALUE} bytes was refused, the process allocated {rise} bytes more \
+         than it had before the select"
+    );
+}
+
+/// Opens the store for reading under the limit and reads the small row and the count, so that
+/// whatever a session sets up with its first statements is there. Then selects the large
+/// value, which must be refused by the memory limit, and announces `refused 1` and
+/// `rise <bytes>`: how far the most this process ever had allocated rose above what it had
+/// allocated just before the select.
+fn refused_select(role: &support::Role) {
+    let mut options = ReadSessionOptions::default();
+    options.memory_limit = Some(VALUE_LIMIT);
+    let reader = ReadSession::open_with_options(&role.folder, options)
+        .expect("open the store for reading under the limit");
+    assert_eq!(support::int(&reader, "SELECT COUNT(*) FROM notes"), 2);
+    assert_eq!(
+        support::rows(&reader, "SELECT body FROM notes WHERE id = 2"),
+        [[support::text("small")]]
+    );
+
+    let before = ALLOCATED.now.load(Ordering::Relaxed);
+    ALLOCATED.peak.store(before, Ordering::Relaxed);
+    let outcome = reader.execute("SELECT body FROM notes WHERE id = 1", &params! {});
+    let peak = ALLOCATED.peak.load(Ordering::Relaxed);
+    match outcome {
+        Err(Error::MemoryBudgetExceeded { .. }) => support::say("refused 1"),
+        Err(other) => panic!("the select of the large value was refused as {other:?}"),
+        Ok(result) => panic!(
+            "the select of the large value was answered with {} rows",
+            result.rows().len()
+        ),
+    }
+    support::say(format!("rise {}", peak - before));
+}
+
+// ---- a full cache ----
+
+/// Rows of a table beside the one a test measures, each with a text of 900 bytes that does not
+/// shrink: 18 MiB, more than twice the 8 MiB cache of a store whose limit is under 32 MiB.
+const FILLER_ROWS: i64 = 20_000;
+const FILLER_TEXT: usize = 900;
+
+/// Writes the filler rows, in a table of their own and one commit.
+fn write_the_filler(db: &Database) {
+    support::run(
+        db,
+        "CREATE TABLE filler (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+    );
+    let tx = db.transaction().expect("begin");
+    for id in 1..=FILLER_ROWS {
+        let body = support::large_text(support::Kind::Scattered, id, FILLER_TEXT);
+        tx.execute(
+            "INSERT INTO filler (id, body) VALUES ($id, $body)",
+            &params! { "id" => id, "body" => body },
+        )
+        .unwrap_or_else(|error| panic!("filler row {id} was refused: {error:?}"));
+    }
+    tx.commit().expect("commit the filler rows");
+}
+
+/// Reads every filler row's text, so that the cache is full before what is measured begins and
+/// nothing is measured with the room an empty cache leaves.
+fn fill_the_cache(db: &Database) {
+    assert_eq!(
+        support::int(db, "SELECT COUNT(body) FROM filler"),
+        FILLER_ROWS
+    );
+}
+
+// ---- one sealing cycle with exactly the room it reserves ----
+
+/// The numbers in a vector of the sealing test, and its rows: as many as one cycle seals, in
+/// one partition, with keys of nine bytes. Their slots fill most of one block.
+const SEALED_DIMENSION: usize = 40;
+const SEALED: usize = 4096;
+const KEY: usize = 9;
+
+/// The bytes of the block one cycle writes for them: its count, and for each vector a slot of
+/// eight bytes and one byte a number, the end of its key, and its key.
+const BLOCK: usize = 4 + SEALED * (8 + SEALED_DIMENSION + 4 + KEY);
+const _: () = assert!(BLOCK == 249_860 && BLOCK <= 262_080);
+
+/// What the cycle's working memory comes to: the keys of the pending records it collected,
+/// each its bytes and 24; one block being built, 262,080 bytes, taken once; the partition
+/// record it adds to, the bytes of its key tuple, here none, and 64; and one row with its
+/// vector, a row of two values as a statement counts it and the vector's numbers once more.
+const WORKING: usize = SEALED * (KEY + 24)
+    + 262_080
+    + 64
+    + (size_of::<Vec<Value>>() + 2 * size_of::<Value>() + 2 * 4 * SEALED_DIMENSION);
+
+/// What the records the cycle stages come to, each its value, 128 bytes and twice its key: the
+/// block, whole, under a key of 13 bytes; the removal of each pending record, whose key is nine
+/// bytes and the row's key; the partition's entry of 16 bytes under a key of 5; and the
+/// store's count of pending records, 128.
+const STAGED: usize =
+    (BLOCK + 128 + 2 * 13) + SEALED * (128 + 2 * (9 + KEY)) + (16 + 128 + 2 * 5) + 128;
+
+/// A limit that is exactly enough for that one partition: the 9 MiB an open sets aside, and
+/// every reservation of one cycle, each once.
+const SEALING_LIMIT: usize = (9 << 20) + WORKING + STAGED;
+
+#[test]
+fn a_sealing_cycle_with_exactly_the_room_it_reserves_completes_within_the_limit() {
+    if let Some(role) = support::role() {
+        return one_cycle_under_the_limit(&role);
+    }
+    let folder = support::folder("sealing-exact-room");
+    let db = support::open(&folder);
+    write_the_filler(&db);
+    support::run(
+        &db,
+        &format!("CREATE TABLE points (id INTEGER PRIMARY KEY, v VECTOR({SEALED_DIMENSION}))"),
+    );
+    let tx = db.transaction().expect("begin");
+    for id in 1..=SEALED as i64 {
+        tx.execute(
+            "INSERT INTO points (id, v) VALUES ($id, $v)",
+            &params! { "id" => id, "v" => support::vector(id, SEALED_DIMENSION) },
+        )
+        .unwrap_or_else(|error| panic!("point {id} was refused: {error:?}"));
+    }
+    tx.commit().expect("commit the points");
+    support::close(db);
+
+    let lines = support::Child::start(
+        "a_sealing_cycle_with_exactly_the_room_it_reserves_completes_within_the_limit",
+        "sealer",
+        &folder,
+    )
+    .end();
+    // The open set 9 MiB aside, so what the limit left the cycle is exactly its reservations.
+    assert_eq!(
+        support::last_number(&lines, "set_aside"),
+        Some(9 << 20),
+        "set aside by an open under {SEALING_LIMIT} bytes"
+    );
+    let refused: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.starts_with("refused "))
+        .collect();
+    assert!(
+        refused.is_empty(),
+        "with {} bytes for its working memory and {} for the records it stages, {} in all, a \
+         cycle over one partition of {SEALED} pending vectors was {}",
+        WORKING,
+        STAGED,
+        WORKING + STAGED,
+        refused[0]
+    );
+    assert_eq!(
+        (
+            support::last_number(&lines, "done"),
+            support::last_number(&lines, "remaining")
+        ),
+        (Some(SEALED as u64), Some(0)),
+        "what the cycle sealed and left waiting"
+    );
+    assert_eq!(
+        support::last_number(&lines, "used_after"),
+        Some(9 << 20),
+        "memory in use after the cycle"
+    );
+    // What the process really took for the store, from before the open to the end, the
+    // cycle's commit included, is within the limit. The cycle began with the cache full.
+    let before = support::last_number(&lines, "before").expect("the sealer announces it");
+    let peak = support::last_number(&lines, "peak").expect("the sealer announces it");
+    let cached = support::last_number(&lines, "cached").expect("the sealer announces it");
+    assert!(
+        peak <= before + SEALING_LIMIT as u64,
+        "with {before} bytes allocated before the store was opened, the process reached {peak}: \
+         {} bytes on the store's account under a limit of {SEALING_LIMIT}, {} past it, in a \
+         cycle over {SEALED} pending vectors, begun with {cached} bytes allocated for a full \
+         cache",
+        peak - before,
+        peak - before - SEALING_LIMIT as u64
+    );
+
+    // The cycle's commit is there: every vector is in a block, and the nearest are found.
+    let db = support::open(&folder);
+    let stored = support::stored(&db, "SELECT id, v FROM points");
+    let query = support::vector(94_500, SEALED_DIMENSION);
+    let wanted = stored.nearest(|_| true, &query, 10);
+    let sql = support::nearest_sql("points", "v", None, 10);
+    let result = support::assert_nearest(&db, &sql, &query, &wanted, "after the cycle");
+    assert!(
+        result.rows_examined() < SEALED as u64,
+        "a search of {SEALED} sealed vectors read {} rows",
+        result.rows_examined()
+    );
+}
+
+/// Opens the store under [`SEALING_LIMIT`], reads every filler row, and runs one maintenance
+/// cycle. Announces `set_aside <bytes>`, what the open counts; `cached <bytes>`, what this
+/// process had allocated more than before the open once the filler rows were read; then
+/// `done <vectors>` and `remaining <vectors>`, or `refused <the refusal>`; `used_after <bytes>`;
+/// and, once the store is closed,
+/// `before <bytes>`, what this process had allocated when it opened the store, and
+/// `peak <bytes>`, the most it had allocated at any time after that.
+fn one_cycle_under_the_limit(role: &support::Role) {
+    let before = ALLOCATED.now.load(Ordering::Relaxed);
+    ALLOCATED.peak.store(before, Ordering::Relaxed);
+    let mut options = DatabaseOpenOptions::default();
+    options.memory_limit = Some(SEALING_LIMIT);
+    let db = support::open_with(&role.folder, options).expect("open the store under the limit");
+    support::say(format!("set_aside {}", db.memory_used()));
+    fill_the_cache(&db);
+    let cached = ALLOCATED.now.load(Ordering::Relaxed);
+    support::say(format!("cached {}", cached.saturating_sub(before)));
+    match db.run_maintenance_cycle() {
+        Ok(report) => {
+            support::say(format!("done {}", report.vector.maintenance_vectors_done));
+            support::say(format!(
+                "remaining {}",
+                report.vector.maintenance_vectors_remaining
+            ));
+        }
+        Err(error) => support::say(format!("refused {error:?}")),
+    }
+    support::say(format!("used_after {}", db.memory_used()));
+    support::close(db);
     support::say(format!("before {before}"));
     support::say(format!("peak {}", ALLOCATED.peak.load(Ordering::Relaxed)));
 }

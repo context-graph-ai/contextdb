@@ -214,6 +214,49 @@ pub enum Error {
         budget_limit_bytes: u64,
         hint: &'static str,
     },
+    /// A vector written into a VECTOR column, or the vector of a search, holds a number that
+    /// is not finite. `position` counts its numbers from zero. Returned by the INSERT or UPDATE
+    /// that wrote it, or by the SELECT that searched with it.
+    InvalidVectorValue {
+        index: VectorIndexRef,
+        position: usize,
+    },
+    /// The vector of a search has a different length from the dimension its VECTOR column
+    /// declares. `expected` is the declared dimension, `actual` the length given.
+    VectorIndexDimensionMismatch {
+        index: VectorIndexRef,
+        expected: usize,
+        actual: usize,
+    },
+    /// The column on the left of `<=>` is not a VECTOR column.
+    UnknownVectorIndex { index: VectorIndexRef },
+    /// A `PARTITION_KEY` or `MAX_PARTITIONS` clause that cannot stand; `issue` says why.
+    /// Returned by `CREATE TABLE`, which then declares nothing.
+    InvalidVectorPartitionDeclaration {
+        index: VectorIndexRef,
+        issue: VectorPartitionDeclarationIssue,
+    },
+    /// A VECTOR column whose declaration cannot stand; `issue` says why. Returned by
+    /// `CREATE TABLE`, which then declares nothing.
+    InvalidVectorPolicyDeclaration {
+        index: VectorIndexRef,
+        issue: VectorPolicyDeclarationIssue,
+    },
+    /// A write would have given the column more partitions than its `MAX_PARTITIONS` allows:
+    /// a row with a vector arrived under partition key values no row with a vector has yet.
+    /// Returned by the INSERT or UPDATE that brought the row, which then changes nothing and
+    /// leaves its transaction usable. Returned by a commit only when another transaction made
+    /// a partition while this one was open; nothing of that commit is written.
+    VectorPartitionLimitExceeded {
+        index: VectorIndexRef,
+        max_partitions: u32,
+    },
+    /// A search asked for `INDEXED`, with `USE VECTOR INDEXED` or through the column's
+    /// `SEARCH_MODE INDEXED`, and this version keeps no index. It never answers such a search
+    /// with an exact scan under the indexed name; `EXACT` and `AUTO` answer.
+    VectorIndexedRouteUnavailable { index: VectorIndexRef },
+    /// `USE VECTOR` was written in a SELECT that does not order by `<=>`.
+    UseVectorRequiresVectorOrder,
 }
 
 impl fmt::Display for Error {
@@ -313,6 +356,44 @@ impl fmt::Display for Error {
                 "memory limit reached during {operation}: {requested_bytes} bytes were needed and \
                  {available_bytes} bytes of the {budget_limit_bytes}-byte limit were free. {hint}"
             ),
+            Error::InvalidVectorValue { index, position } => write!(
+                f,
+                "vector {index} contains a non-finite component at position {position}"
+            ),
+            Error::VectorIndexDimensionMismatch {
+                index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "vector index dimension mismatch on {index}: expected {expected}, got {actual}"
+            ),
+            Error::UnknownVectorIndex { index } => write!(f, "unknown vector index {index}"),
+            Error::InvalidVectorPartitionDeclaration { index, issue } => {
+                write!(
+                    f,
+                    "invalid vector partition declaration on {index}: {issue}"
+                )
+            }
+            Error::InvalidVectorPolicyDeclaration { index, issue } => {
+                write!(f, "invalid vector policy declaration on {index}: {issue}")
+            }
+            Error::VectorPartitionLimitExceeded {
+                index,
+                max_partitions,
+            } => write!(
+                f,
+                "vector partition limit reached on {index}: MAX_PARTITIONS is {max_partitions}; \
+                 use fewer partition-key values, or declare the table with a larger MAX_PARTITIONS"
+            ),
+            Error::VectorIndexedRouteUnavailable { index } => write!(
+                f,
+                "no vector index ships in this version, so {index} cannot be searched INDEXED; \
+                 use EXACT or AUTO"
+            ),
+            Error::UseVectorRequiresVectorOrder => {
+                f.write_str("USE VECTOR requires ORDER BY embedding <=> $param in the same query")
+            }
         }
     }
 }
@@ -341,6 +422,94 @@ pub enum ColumnType {
     Vector(usize),
     /// `TIMESTAMP`.
     Timestamp,
+}
+
+/// A VECTOR column as a refusal names it: its table, then its own name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorIndexRef {
+    pub table: String,
+    pub column: String,
+}
+
+impl fmt::Display for VectorIndexRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}", self.table, self.column)
+    }
+}
+
+/// Why a `PARTITION_KEY` or `MAX_PARTITIONS` clause was refused. None of these carries a value
+/// a statement bound, so printing one never echoes data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VectorPartitionDeclarationIssue {
+    /// A column of the key is not a column of the table.
+    UnknownPartitionKeyColumn,
+    /// A column of the key may hold NULL.
+    NullablePartitionKeyColumn,
+    /// A column of the key is REAL, JSON or VECTOR.
+    UnsupportedPartitionKeyColumnType,
+    /// The key names a column twice.
+    DuplicatePartitionKeyColumn,
+    /// The key names the VECTOR column it belongs to.
+    VectorColumnInPartitionKey,
+    /// `MAX_PARTITIONS` was written on a column with no `PARTITION_KEY`.
+    MaxPartitionsWithoutPartitionKey,
+    /// `MAX_PARTITIONS` is zero or negative.
+    MaxPartitionsNotPositive,
+    /// `MAX_PARTITIONS` is larger than the engine keeps.
+    MaxPartitionsOutOfRange,
+}
+
+impl fmt::Display for VectorPartitionDeclarationIssue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::UnknownPartitionKeyColumn => {
+                "PARTITION_KEY references a column that does not exist in the same table"
+            }
+            Self::NullablePartitionKeyColumn => "every PARTITION_KEY column must be NOT NULL",
+            Self::UnsupportedPartitionKeyColumnType => {
+                "PARTITION_KEY columns must use UUID, TEXT, INTEGER, BOOLEAN or TIMESTAMP"
+            }
+            Self::DuplicatePartitionKeyColumn => "a PARTITION_KEY column may appear only once",
+            Self::VectorColumnInPartitionKey => {
+                "PARTITION_KEY may not contain the vector column itself"
+            }
+            Self::MaxPartitionsWithoutPartitionKey => "MAX_PARTITIONS requires PARTITION_KEY",
+            Self::MaxPartitionsNotPositive => "MAX_PARTITIONS must be a positive integer",
+            Self::MaxPartitionsOutOfRange => {
+                "MAX_PARTITIONS is outside the persisted numeric range"
+            }
+        })
+    }
+}
+
+/// Why a VECTOR column's declaration was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VectorPolicyDeclarationIssue {
+    /// `VECTOR(0)`.
+    DimensionsNotPositive,
+}
+
+impl fmt::Display for VectorPolicyDeclarationIssue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::DimensionsNotPositive => "vector dimensions must be at least 1",
+        })
+    }
+}
+
+/// How a similarity search is answered: what `SEARCH_MODE` declares for a column and what
+/// `USE VECTOR` asks for in one statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VectorSearchMode {
+    /// The engine chooses. This version has no index, so it answers exactly.
+    #[default]
+    Auto,
+    /// Every allowed vector is compared: the true nearest rows.
+    Exact,
+    /// Only through an index; refused when there is none.
+    Indexed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

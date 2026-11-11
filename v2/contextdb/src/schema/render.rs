@@ -1,14 +1,18 @@
 //! Printing a declaration back as SQL.
 
 use super::{RESERVED_PREFIXES, Table};
-use crate::types::{ColumnDef, ColumnDefault, ColumnType, SortDirection, Value};
+use crate::types::{ColumnDef, ColumnDefault, ColumnType, SortDirection, Value, VectorSearchMode};
 
 /// A table's declaration as SQL: the CREATE TABLE, then one CREATE INDEX for each index the
 /// author made, every statement ended by `;` and a new line. A clause left at its default is
 /// not printed, and neither are the indexes the engine keeps behind a key or a UNIQUE rule.
 pub(super) fn declaration(table: &Table) -> String {
     let meta = &table.meta;
-    let mut lines: Vec<String> = meta.columns.iter().map(column).collect();
+    let mut lines: Vec<String> = meta
+        .columns
+        .iter()
+        .map(|declared| column(table, declared))
+        .collect();
     for rule in &meta.unique_constraints {
         let columns: Vec<String> = rule.iter().map(|column| name(column)).collect();
         lines.push(format!("UNIQUE ({})", columns.join(", ")));
@@ -40,7 +44,7 @@ pub(super) fn declaration(table: &Table) -> String {
 }
 
 /// One column's line: its name, its type, and the clauses it was given.
-fn column(column: &ColumnDef) -> String {
+fn column(table: &Table, column: &ColumnDef) -> String {
     let mut text = name(&column.name);
     text.push(' ');
     match column.column_type {
@@ -52,6 +56,23 @@ fn column(column: &ColumnDef) -> String {
         ColumnType::Uuid => text.push_str("UUID"),
         ColumnType::Timestamp => text.push_str("TIMESTAMP"),
         ColumnType::Vector(size) => text.push_str(&format!("VECTOR({size})")),
+    }
+    if let Some(vector) = table.vector(&column.name) {
+        // The limit on partitions refuses writes, so it is printed for every column with a
+        // PARTITION_KEY, whether or not it was written. SEARCH_MODE is printed only when it was.
+        if let Some(limit) = vector.limit() {
+            let key: Vec<String> = vector.partition_key.iter().map(|key| name(key)).collect();
+            text.push_str(&format!(
+                " PARTITION_KEY ({}) MAX_PARTITIONS {limit}",
+                key.join(", ")
+            ));
+        }
+        text.push_str(match vector.search_mode {
+            None => "",
+            Some(VectorSearchMode::Auto) => " SEARCH_MODE AUTO",
+            Some(VectorSearchMode::Exact) => " SEARCH_MODE EXACT",
+            Some(VectorSearchMode::Indexed) => " SEARCH_MODE INDEXED",
+        });
     }
     if column.primary_key {
         text.push_str(" PRIMARY KEY");

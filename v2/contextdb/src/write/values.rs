@@ -3,13 +3,15 @@
 
 use std::ops::Range;
 
-use crate::types::{ColumnDef, ColumnType, Error, Result, Uuid, Value};
+use crate::query::vector_from_text;
+use crate::types::{ColumnDef, ColumnType, Error, Result, Uuid, Value, VectorIndexRef};
 
 /// Brings a value to its column's type, or refuses it with `ColumnTypeMismatch`.
 ///
 /// NULL fits every type here; whether the column takes it is the NOT NULL rule's business. The
 /// only conversions are quoted text into a UUID, TIMESTAMP, JSON or VECTOR column and an INTEGER
-/// into a REAL column.
+/// into a REAL column. A vector of the column's length with a number that is not finite is
+/// refused with `InvalidVectorValue`, however it was written: no search could measure it.
 pub(super) fn typed(table: &str, column: &ColumnDef, value: Value) -> Result<Value> {
     let converted = match (column.column_type, &value) {
         (_, Value::Null)
@@ -21,7 +23,7 @@ pub(super) fn typed(table: &str, column: &ColumnDef, value: Value) -> Result<Val
         | (ColumnType::Uuid, Value::Uuid(_))
         | (ColumnType::Timestamp, Value::Timestamp(_)) => return Ok(value),
         (ColumnType::Vector(length), Value::Vector(vector)) if vector.len() == length => {
-            return Ok(value);
+            return finite(table, column, value);
         }
         (ColumnType::Real, Value::Int64(whole)) => Some(Value::Float64(*whole as f64)),
         (ColumnType::Uuid, Value::Text(text)) => Uuid::parse_str(text).ok().map(Value::Uuid),
@@ -32,12 +34,29 @@ pub(super) fn typed(table: &str, column: &ColumnDef, value: Value) -> Result<Val
             .map(Value::Vector),
         _ => None,
     };
-    converted.ok_or_else(|| Error::ColumnTypeMismatch {
+    let converted = converted.ok_or_else(|| Error::ColumnTypeMismatch {
         table: table.to_owned(),
         column: column.name.clone(),
         expected: format!("{:?}", column.column_type).to_uppercase(),
         actual: kind(&value),
-    })
+    })?;
+    finite(table, column, converted)
+}
+
+/// The value itself, unless it is a vector that holds a number that is not finite.
+fn finite(table: &str, column: &ColumnDef, value: Value) -> Result<Value> {
+    if let Value::Vector(vector) = &value
+        && let Some(position) = vector.iter().position(|number| !number.is_finite())
+    {
+        return Err(Error::InvalidVectorValue {
+            index: VectorIndexRef {
+                table: table.to_owned(),
+                column: column.name.clone(),
+            },
+            position,
+        });
+    }
+    Ok(value)
 }
 
 /// What a refusal calls the value it was given. A vector says how long it is, since its length
@@ -131,13 +150,4 @@ fn digits(text: &str, positions: Range<usize>) -> Option<i64> {
     } else {
         None
     }
-}
-
-/// Reads the text spelling of a vector, `[0.1, 0.2, 0.3]`.
-fn vector_from_text(text: &str) -> Option<Vec<f32>> {
-    let inside = text.trim().strip_prefix('[')?.strip_suffix(']')?;
-    inside
-        .split(',')
-        .map(|number| number.trim().parse().ok())
-        .collect()
 }

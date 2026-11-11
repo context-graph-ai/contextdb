@@ -94,6 +94,49 @@ fn listing(folder: &Path) -> Vec<String> {
     names
 }
 
+/// The tables a run printed for a person, in order: each is its header and then its rows, cell
+/// by cell. A result with no rows prints no table and is an empty list here.
+fn tables(stdout: &str) -> Vec<Vec<Vec<String>>> {
+    let mut tables = Vec::new();
+    let mut table = Vec::new();
+    for line in stdout.lines() {
+        let cells = line
+            .strip_prefix('|')
+            .and_then(|rest| rest.strip_suffix('|'));
+        if let Some(cells) = cells {
+            let cells = cells.split('|').map(|cell| cell.trim().to_owned());
+            table.push(cells.collect());
+        } else if line.starts_with('(') {
+            tables.push(std::mem::take(&mut table));
+        }
+    }
+    tables
+}
+
+/// The rows of a printed search whose columns are `id` and `distance`: each row's key and its
+/// distance as a number, however the program writes a whole REAL.
+fn nearest(table: &[Vec<String>]) -> Vec<(i64, f64)> {
+    assert_eq!(table[0], ["id", "distance"], "{table:?}");
+    table[1..]
+        .iter()
+        .map(|row| (row[0].parse().unwrap(), row[1].parse().unwrap()))
+        .collect()
+}
+
+/// A vector in a JSON document: an array of numbers.
+fn numbers(vector: &Json) -> Vec<f32> {
+    vector
+        .as_array()
+        .unwrap_or_else(|| panic!("not a JSON array: {vector}"))
+        .iter()
+        .map(|number| {
+            number
+                .as_f64()
+                .unwrap_or_else(|| panic!("not a number: {number}")) as f32
+        })
+        .collect()
+}
+
 const CREATE_NOTES: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);\n";
 const SELECT_NOTES: &str = "SELECT id, body FROM notes ORDER BY id;\n";
 
@@ -636,6 +679,20 @@ fn the_memory_limit_option_is_the_sessions_ceiling() {
         documents(&run.stdout)[0]["result"]["rows"][0]["limit"].clone()
     };
     assert_eq!(limit(&[arg(&store), "--write", "--json"]), json!("none"));
+    // With no limit a session counts 9 MiB as used before any statement: 1 MiB and a page
+    // cache of 8 MiB. A read shell with no limit counts the same.
+    for args in [
+        &[arg(&store), "--write", "--json"][..],
+        &[arg(&store), "--json"],
+    ] {
+        let run = shell(&dir, args, "SHOW MEMORY_LIMIT;\n");
+        assert_eq!(run.code, Some(0), "{}", run.stderr);
+        assert_eq!(
+            documents(&run.stdout)[0]["result"]["rows"][0]["used"],
+            json!(9_437_184_u64),
+            "used with no limit"
+        );
+    }
     for (size, bytes) in [
         ("65536K", 67_108_864_u64),
         ("64M", 67_108_864),
@@ -729,4 +786,228 @@ fn the_memory_limit_option_is_the_sessions_ceiling() {
             "{mode:?}"
         );
     }
+}
+
+#[test]
+fn a_similarity_search_runs_through_the_program() {
+    let dir = folder("a-similarity-search-runs");
+    let store = dir.join("store");
+    // From [1, 0, 0] row 1 is at distance 0, row 5 between 0 and 1, row 2 at 1 and row 3 at 2.
+    // Row 4 has no vector.
+    let declare = "\
+CREATE TABLE t (
+  id INTEGER PRIMARY KEY,
+  kind TEXT NOT NULL,
+  v VECTOR(3) PARTITION_KEY (kind) SEARCH_MODE EXACT
+);
+INSERT INTO t (id, kind, v)
+VALUES (1, 'a', [1.0, 0.0, 0.0]), (2, 'a', [0.0, 1.0, 0.0]), (3, 'b', [-1.0, 0.0, 0.0]),
+       (4, 'b', NULL), (5, 'b', [0.1, 0.2, 0.3]);
+";
+    let search =
+        "SELECT id, v <=> [1.0, 0.0, 0.0] AS distance FROM t ORDER BY distance LIMIT 10;\n";
+    let rows = "SELECT id, v FROM t ORDER BY id;\n";
+
+    // Declared, written and searched in one piped write session.
+    let run = shell(
+        &dir,
+        &[arg(&store), "--write"],
+        &format!("{declare}{search}{rows}"),
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.errors(), Vec::<&str>::new());
+    let printed = tables(&run.stdout);
+    assert_eq!(printed.len(), 2, "{}", run.stdout);
+
+    // The rows that have a vector, nearest first, each with its distance under the name the
+    // statement gave it.
+    let found = nearest(&printed[0]);
+    let ids: Vec<i64> = found.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, [1, 5, 2, 3], "{}", run.stdout);
+    assert_eq!(
+        (found[0].1, found[2].1, found[3].1),
+        (0.0, 1.0, 2.0),
+        "{}",
+        run.stdout
+    );
+    assert!(0.0 < found[1].1 && found[1].1 < 1.0, "{}", run.stdout);
+
+    // A vector prints as its numbers in brackets, and no vector as NULL.
+    assert_eq!(printed[1][0], ["id", "v"], "{}", run.stdout);
+    assert_eq!(printed[1][1], ["1", "[1.0, 0.0, 0.0]"], "{}", run.stdout);
+    assert_eq!(printed[1][4], ["4", "NULL"], "{}", run.stdout);
+    assert_eq!(printed[1][5], ["5", "[0.1, 0.2, 0.3]"], "{}", run.stdout);
+
+    // For a program the distance is a number, a vector an array of numbers and no vector null.
+    let run = shell(&dir, &[arg(&store), "--json"], &format!("{search}{rows}"));
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let results = documents(&run.stdout);
+    assert_eq!(results.len(), 2, "{}", run.stdout);
+    assert_eq!(results[0]["result"]["columns"], json!(["id", "distance"]));
+    let found = results[0]["result"]["rows"].as_array().unwrap();
+    let ids: Vec<i64> = found
+        .iter()
+        .map(|row| row["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, [1, 5, 2, 3], "{}", run.stdout);
+    for row in found {
+        assert!(row["distance"].is_number(), "{row}");
+    }
+    let distance = |row: usize| found[row]["distance"].as_f64().unwrap();
+    assert_eq!(
+        (distance(0), distance(2), distance(3)),
+        (0.0, 1.0, 2.0),
+        "{}",
+        run.stdout
+    );
+    assert!(0.0 < distance(1) && distance(1) < 1.0, "{}", run.stdout);
+    assert_eq!(results[1]["result"]["columns"], json!(["id", "v"]));
+    let stored = results[1]["result"]["rows"].as_array().unwrap();
+    assert_eq!(stored.len(), 5, "{}", run.stdout);
+    assert_eq!(numbers(&stored[0]["v"]), [1.0, 0.0, 0.0]);
+    assert!(stored[3]["v"].is_null(), "{}", stored[3]);
+    assert_eq!(numbers(&stored[4]["v"]), [0.1, 0.2, 0.3]);
+
+    // `.schema` prints the VECTOR column with its clauses in the order they are declared in,
+    // and with the limit of 256 partitions that a key declared without one has.
+    let schema = shell(&dir, &[arg(&store)], ".schema t\n");
+    assert_eq!(schema.code, Some(0), "{}", schema.stderr);
+    let words = schema
+        .stdout
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        words.contains("v VECTOR(3) PARTITION_KEY (kind) MAX_PARTITIONS 256 SEARCH_MODE EXACT"),
+        "{}",
+        schema.stdout
+    );
+
+    // What it printed declares the same table again in another store.
+    let copy = dir.join("copy");
+    let made = shell(&dir, &[arg(&copy), "--write"], &schema.stdout);
+    assert_eq!(made.code, Some(0), "{}", made.stderr);
+    assert_eq!(
+        shell(&dir, &[arg(&copy)], ".schema t\n").stdout,
+        schema.stdout
+    );
+}
+
+#[test]
+fn indexed_search_is_refused_by_name_through_the_program() {
+    let dir = folder("indexed-search-is-refused");
+    let store = dir.join("store");
+    let made = shell(
+        &dir,
+        &[arg(&store), "--write"],
+        "CREATE TABLE passages (id INTEGER PRIMARY KEY, embedding VECTOR(3));\n\
+         INSERT INTO passages (id, embedding) VALUES (1, [0.0, 1.0, 0.0]), (2, [1.0, 0.0, 0.0]);\n",
+    );
+    assert_eq!(made.code, Some(0), "{}", made.stderr);
+
+    // The same search asked for INDEXED and then for EXACT.
+    let search = |mode: &str| {
+        format!(
+            "SELECT id FROM passages ORDER BY embedding <=> [1.0, 0.0, 0.0] USE VECTOR {mode} \
+             LIMIT 2;\n"
+        )
+    };
+    let input = format!("{}{}", search("INDEXED"), search("EXACT"));
+    let exact = "+----+\n| id |\n+----+\n| 2  |\n| 1  |\n+----+\n(2 rows)\n";
+
+    // Reading or writing, this version keeps no index and says so.
+    for mode in [&[][..], &["--write"][..]] {
+        let mut args = vec![arg(&store)];
+        args.extend_from_slice(mode);
+
+        // For a person: one line on the error stream, the refusal's sentence naming the column,
+        // and a piped run that fails.
+        let run = shell(&dir, &args, &input);
+        assert_eq!(run.code, Some(1), "{mode:?}: {}", run.stderr);
+        let lines: Vec<&str> = run.stderr.lines().collect();
+        assert_eq!(lines.len(), 1, "{mode:?}: {}", run.stderr);
+        assert!(
+            lines[0].starts_with("Error: ")
+                && lines[0].contains("passages.embedding")
+                && lines[0].contains("INDEXED"),
+            "{mode:?}: {}",
+            run.stderr
+        );
+        // INDEXED gave no rows under any name, and the statement after it still ran.
+        assert_eq!(run.stdout, exact, "{mode:?}");
+
+        // For a program: the refusal's kind.
+        args.push("--json");
+        let run = shell(&dir, &args, &input);
+        assert_eq!(run.code, Some(1), "{mode:?}: {}", run.stderr);
+        let refusals = documents(&run.stderr);
+        assert_eq!(refusals.len(), 1, "{mode:?}: {}", run.stderr);
+        let error = &refusals[0]["error"];
+        assert_eq!(error["class"], "sql", "{mode:?}: {error}");
+        assert_eq!(
+            error["detail"]["kind"], "vector_indexed_route_unavailable",
+            "{mode:?}: {error}"
+        );
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("passages.embedding")),
+            "{mode:?}: {error}"
+        );
+        assert_eq!(
+            documents(&run.stdout),
+            [json!({"result": {"columns": ["id"], "rows": [{"id": 2}, {"id": 1}]}})],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn a_read_shell_searches_while_a_writer_holds_the_store() {
+    let dir = folder("a-read-shell-searches-while-a-writer-holds");
+    let store = dir.join("store");
+
+    // This test is the writer, and holds the store until the end. From [1, 0, 0] row 1 is at
+    // distance 1 and row 2 at 2.
+    let writer = Database::open(&store).unwrap();
+    for sql in [
+        "CREATE TABLE passages (id INTEGER PRIMARY KEY, embedding VECTOR(3))",
+        "INSERT INTO passages (id, embedding) VALUES (1, [0.0, 1.0, 0.0]), (2, [-1.0, 0.0, 0.0])",
+    ] {
+        writer.execute(sql, &params! {}).unwrap();
+    }
+    let search = "SELECT id, embedding <=> [1.0, 0.0, 0.0] AS distance FROM passages \
+                  ORDER BY distance LIMIT 2;\n";
+
+    // The store really is held: a second writer is refused, naming this process.
+    let second = shell(&dir, &[arg(&store), "--write"], search);
+    assert_eq!(second.code, Some(1), "{}", second.stderr);
+    assert!(
+        second.stderr.contains(&std::process::id().to_string()),
+        "{}",
+        second.stderr
+    );
+
+    // A read shell needs nothing from the writer: it searches and gets the rows.
+    let run = shell(&dir, &[arg(&store)], search);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let printed = tables(&run.stdout);
+    assert_eq!(printed.len(), 1, "{}", run.stdout);
+    assert_eq!(nearest(&printed[0]), [(1, 1.0), (2, 2.0)], "{}", run.stdout);
+
+    // The writer was not held up by it, and the next read shell searches its next commit, in
+    // which row 3 is the nearest.
+    writer
+        .execute(
+            "INSERT INTO passages (id, embedding) VALUES (3, [1.0, 0.0, 0.0])",
+            &params! {},
+        )
+        .unwrap();
+    let run = shell(&dir, &[arg(&store)], search);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let printed = tables(&run.stdout);
+    assert_eq!(printed.len(), 1, "{}", run.stdout);
+    assert_eq!(nearest(&printed[0]), [(3, 0.0), (1, 1.0)], "{}", run.stdout);
+
+    writer.close().unwrap();
 }

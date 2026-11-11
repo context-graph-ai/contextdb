@@ -20,28 +20,32 @@ stmt = _{
 // first words alone and the rest of the text is left unread, so that the statement is refused by
 // that name and not as a syntax error. `later` stands only where nothing this version reads can
 // begin with one of these words: after a whole statement or clause, and after an expression,
-// where IN, LIKE, BETWEEN and the distance operator `<=>` would follow. DISTINCT and GRAPH_TABLE
-// stand where a name could, so they are looked for first.
+// where LIKE and BETWEEN would follow. DISTINCT and GRAPH_TABLE stand where a name could, so
+// they are looked for first.
 later = { later_name ~ ANY* }
 later_name = @{
-    "<=>"
-    | (
-        ^"ALTER" | ^"DROP" | ^"WITH" | ^"BEGIN" | ^"COMMIT" | ^"ROLLBACK" | ^"PURGE" | ^"DISCARD"
+    (
+        ^"SHOW" ~ SPACE+ ~ (^"VECTOR_INDEXES" | ^"VECTOR_PARTITIONS")
+        | ^"ALTER" | ^"DROP" | ^"WITH" | ^"BEGIN" | ^"COMMIT" | ^"ROLLBACK" | ^"PURGE" | ^"DISCARD"
         | ^"DECLARE" | ^"DISTINCT" | ^"GRAPH_TABLE"
         | ((^"LEFT" | ^"INNER" | ^"CROSS") ~ SPACE+)? ~ ^"JOIN"
         | ^"GROUP" ~ SPACE+ ~ ^"BY" | ^"HAVING" | ^"UNION" | ^"OFFSET"
-        | ^"USE" ~ SPACE+ ~ (^"VECTOR" | ^"RANK")
+        | ^"USE" ~ SPACE+ ~ ^"RANK"
         | ^"ON" ~ SPACE+ ~ ^"CONFLICT"
-        | (^"NOT" ~ SPACE+)? ~ (^"IN" | ^"LIKE" | ^"BETWEEN")
+        | (^"NOT" ~ SPACE+)? ~ (^"LIKE" | ^"BETWEEN")
         | ^"FOREIGN" ~ SPACE+ ~ ^"KEY" | ^"REFERENCES" | ^"EXPIRES" | ^"IMMUTABLE"
         | ^"RANK_POLICY" | ^"CONTEXT_ID" | ^"SCOPE_LABEL_READ" | ^"SCOPE_LABEL" | ^"ACL"
-        | ^"PARTITION_KEY" | ^"MAX_PARTITIONS" | ^"SEARCH_MODE" | ^"AUTO_INDEX_AT" | ^"SEARCH"
-        | ^"IVF" | ^"CONSOLIDATION"
+        | ^"AUTO_INDEX_AT" | ^"SEARCH" | ^"IVF" | ^"CONSOLIDATION"
         | ^"RETAIN" | ^"HISTORY" | ^"SYNC" | ^"STATE_MACHINE" | ^"STATE" ~ SPACE+ ~ ^"MACHINE"
         | ^"DAG" | ^"PROPAGATE" | ^"DELIVERY" ~ SPACE+ ~ ^"MANIFEST"
         | ^"EDGE" ~ SPACE+ ~ ^"DISCARD" | ^"MAINTAIN" ~ SPACE+ ~ ^"COUNT"
     ) ~ !ident_char
 }
+// Two forms of a later version that begin with words this version reads, so each is known by
+// where it stands: a SELECT as the list of IN, and the options after the mode of USE VECTOR.
+// Like `later`, each leaves the rest of the text unread.
+subquery = @{ ^"SELECT" ~ !ident_char }
+vector_options = { "(" }
 
 set_memory_limit = { ^"SET" ~ ^"MEMORY_LIMIT" ~ "="? ~ ("'" ~ memory_limit_value ~ "'" | memory_limit_value) }
 show_memory_limit = { ^"SHOW" ~ ^"MEMORY_LIMIT" }
@@ -55,7 +59,8 @@ select_stmt = {
         | select_list ~ ^"FROM"
           ~ (
               &(^"GRAPH_TABLE" ~ "(") ~ later
-              | identifier ~ where_clause? ~ order_by_clause? ~ limit_clause? ~ later?
+              | identifier ~ where_clause? ~ order_by_clause? ~ use_vector_clause? ~ limit_clause?
+                ~ later?
           )
     )
 }
@@ -66,6 +71,8 @@ where_clause = { ^"WHERE" ~ expr }
 order_by_clause = { ^"ORDER" ~ ^"BY" ~ order_item ~ ("," ~ order_item)* }
 order_item = { expr ~ sort_dir? }
 sort_dir = { ^"ASC" | ^"DESC" }
+use_vector_clause = { ^"USE" ~ ^"VECTOR" ~ search_mode ~ (vector_options ~ ANY*)? }
+search_mode = @{ (^"AUTO" | ^"EXACT" | ^"INDEXED") ~ !ident_char }
 limit_clause = { ^"LIMIT" ~ integer }
 
 create_table_stmt = {
@@ -83,7 +90,13 @@ data_type = {
     | ^"UUID" | ^"TEXT" | ^"INTEGER" | ^"INT" | ^"REAL" | ^"FLOAT" | ^"BOOLEAN" | ^"BOOL"
     | ^"TIMESTAMP" | ^"JSON"
 }
-vector_type = { ^"VECTOR" ~ "(" ~ integer ~ ")" }
+vector_type = {
+    ^"VECTOR" ~ "(" ~ integer ~ ")"
+    ~ partition_key? ~ (^"MAX_PARTITIONS" ~ partition_count)? ~ (^"SEARCH_MODE" ~ search_mode)?
+}
+partition_key = { ^"PARTITION_KEY" ~ "(" ~ identifier ~ ("," ~ identifier)* ~ ")" }
+// Read with its sign, so that `schema` refuses zero and a negative number by their kind.
+partition_count = @{ "-"? ~ ASCII_DIGIT+ }
 column_constraint = _{ not_null | nullable_marker | primary_key | unique | default_clause }
 not_null = { ^"NOT" ~ ^"NULL" }
 nullable_marker = { ^"NULL" }
@@ -112,16 +125,20 @@ update_stmt = { ^"UPDATE" ~ identifier ~ ^"SET" ~ assignment ~ ("," ~ assignment
 // One level of rule here is one level of the parser's recursion for every parenthesis, so the
 // boolean operators share one flat rule and the arithmetic operators another, and the builder
 // applies their precedence: NOT, then AND, then OR; `*` and `/` before `+` and `-`.
-expr = { not_op* ~ additive_expr ~ comparison_suffix? ~ (bool_op ~ not_op* ~ additive_expr ~ comparison_suffix?)* }
+expr = { not_op* ~ distance_expr ~ comparison_suffix? ~ (bool_op ~ not_op* ~ distance_expr ~ comparison_suffix?)* }
 bool_op = _{ and_op | or_op }
 or_op = @{ ^"OR" ~ !ident_char }
 and_op = @{ ^"AND" ~ !ident_char }
 not_op = @{ ^"NOT" ~ !ident_char }
 
-comparison_suffix = _{ is_null_suffix | cmp_suffix | later }
-cmp_suffix = { cmp_op ~ additive_expr }
+comparison_suffix = _{ is_null_suffix | in_suffix | cmp_suffix | later }
+cmp_suffix = { cmp_op ~ distance_expr }
 cmp_op = { "=" | "!=" | "<>" | "<=" | ">=" | "<" | ">" }
 is_null_suffix = { ^"IS" ~ not_op? ~ ^"NULL" }
+in_suffix = { not_op? ~ ^"IN" ~ "(" ~ (subquery ~ ANY* | expr ~ ("," ~ expr)* ~ ")") }
+
+// The distance operator binds tighter than a comparison and looser than `+` and `-`.
+distance_expr = { additive_expr ~ ("<=>" ~ additive_expr)? }
 
 additive_expr = { unary_minus* ~ primary_expr ~ (math_op ~ unary_minus* ~ primary_expr)* }
 math_op = { "+" | "-" | "*" | "/" }
@@ -137,8 +154,12 @@ primary_expr = _{
     | string
     | vector_lit
     | column_ref
-    | "(" ~ expr ~ ")"
+    | parenthesized
 }
+// One expression in parentheses is that expression; two or more are a row value. One rule reads
+// both: a rule that read the first expression, failed and read it again would double the work
+// at every level of nesting.
+parenthesized = { "(" ~ expr ~ ("," ~ expr)* ~ ")" }
 vector_lit = { "[" ~ vector_component ~ ("," ~ vector_component)* ~ "]" }
 vector_component = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
 function_call = { identifier ~ "(" ~ (star | (expr ~ ("," ~ expr)*))? ~ ")" }
