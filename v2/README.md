@@ -27,8 +27,12 @@ cargo +1.89 check --manifest-path v2/Cargo.toml --workspace --locked
 ```
 
 The last line checks the oldest Rust the packages declare (`rustup toolchain install 1.89`
-first). The workflow also fails when the library and the program together pass 150,000 lines or
-the tests pass 1,000; the two lines that count them are in the workflow file.
+first). The workflow also states the size of the library and the program, rounded up to 500
+lines, and the number of tests, rounded up to 10, and fails when either is passed or is no
+longer within that distance: a change that grows or shrinks the code past a boundary edits
+the number in the workflow file, in the same change. It also refuses a shipped file longer
+than 1,500 lines, a test-only name in shipped code, an ignored test and an `allow` attribute
+beyond the four `AGENTS.md` names. `AGENTS.md` says how a change is made so that these hold.
 
 ## One test
 

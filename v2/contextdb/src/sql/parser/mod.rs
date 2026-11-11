@@ -13,6 +13,7 @@ use pest::Parser;
 use pest::error::{InputLocation, LineColLocation};
 
 use super::ast::*;
+use super::not_supported;
 use crate::types::{Error, Result};
 
 #[derive(pest_derive::Parser)]
@@ -29,16 +30,17 @@ pub(super) fn parse(text: &str) -> Result<Statement> {
     check_source_nesting(text)?;
     let read =
         SqlParser::parse(Rule::statement, text).map_err(|error| syntax_error(text, &error))?;
-    if let Some(later) = read
-        .clone()
-        .flatten()
-        .find(|part| part.as_rule() == Rule::later_name)
-    {
-        let words: Vec<&str> = later.as_str().split_whitespace().collect();
-        return Err(Error::PlanError(format!(
-            "{} is not supported in this version of the library",
-            words.join(" ").to_ascii_uppercase()
-        )));
+    for part in read.clone().flatten() {
+        let later = match part.as_rule() {
+            Rule::later_name => {
+                let words: Vec<&str> = part.as_str().split_whitespace().collect();
+                words.join(" ").to_ascii_uppercase()
+            }
+            Rule::subquery => "IN (SELECT ...)".to_owned(),
+            Rule::vector_options => "USE VECTOR with options".to_owned(),
+            _ => continue,
+        };
+        return Err(not_supported(&later));
     }
     let pair = read
         .flatten()
@@ -288,6 +290,15 @@ fn where_clause(pair: Pair<'_>) -> Result<Option<Expr>> {
         .transpose()
 }
 
+/// AUTO, EXACT or INDEXED, after SEARCH_MODE and after USE VECTOR.
+fn search_mode(pair: &Pair<'_>) -> VectorSearchMode {
+    match pair.as_str().to_ascii_uppercase().as_str() {
+        "AUTO" => VectorSearchMode::Auto,
+        "EXACT" => VectorSearchMode::Exact,
+        _ => VectorSearchMode::Indexed,
+    }
+}
+
 /// ASC when nothing is written.
 fn direction(written: Option<Pair<'_>>) -> SortDirection {
     match written {
@@ -302,6 +313,7 @@ fn select(pair: Pair<'_>) -> Result<Select> {
         table: first_ident(pair.clone()),
         where_clause: where_clause(pair.clone())?,
         order_by: Vec::new(),
+        use_vector: None,
         limit: None,
     };
     for part in pair.into_inner() {
@@ -331,6 +343,10 @@ fn select(pair: Pair<'_>) -> Result<Select> {
                         direction: direction(parts.next()),
                     });
                 }
+            }
+            Rule::use_vector_clause => {
+                let mode = part.into_inner().next().expect("a mode");
+                select.use_vector = Some(search_mode(&mode));
             }
             Rule::limit_clause => {
                 let count = part.into_inner().next().expect("a count");
@@ -407,11 +423,23 @@ fn column_def(pair: Pair<'_>) -> Result<ColumnDef> {
     let name = ident(&parts.next().expect("a column name"));
     let type_pair = parts.next().expect("a column type");
     let type_name = type_pair.as_str().to_ascii_uppercase();
+    let mut vector = VectorClauses::default();
     let data_type = match (type_pair.into_inner().next(), type_name.as_str()) {
-        (Some(vector), _) => DataType::Vector(number(
-            &vector.into_inner().next().expect("a dimension"),
-            "the VECTOR dimension",
-        )?),
+        (Some(declared), _) => {
+            let mut parts = declared.into_inner();
+            let dimension = parts.next().expect("a dimension");
+            for clause in parts {
+                match clause.as_rule() {
+                    Rule::partition_key => vector.partition_key = idents(clause),
+                    Rule::partition_count => {
+                        vector.max_partitions = Some(clause.as_str().to_owned());
+                    }
+                    // The one clause left: SEARCH_MODE.
+                    _ => vector.search_mode = Some(search_mode(&clause)),
+                }
+            }
+            DataType::Vector(number(&dimension, "the VECTOR dimension")?)
+        }
         (None, "UUID") => DataType::Uuid,
         (None, "TEXT") => DataType::Text,
         (None, "INTEGER" | "INT") => DataType::Integer,
@@ -427,6 +455,7 @@ fn column_def(pair: Pair<'_>) -> Result<ColumnDef> {
         primary_key: false,
         unique: false,
         default: None,
+        vector,
     };
     // A constraint written twice is refused.
     let once = |written: bool, clause: &str| match written {

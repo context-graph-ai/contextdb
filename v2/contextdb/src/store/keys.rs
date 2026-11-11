@@ -11,7 +11,7 @@
 
 use std::ops::Bound;
 
-use super::Key;
+use super::{Key, VectorId, VectorRecord};
 use crate::types::{Error, Result, SortDirection, Value};
 
 /// No value's form begins with this byte, turned or not, so a key followed by it sorts after
@@ -110,4 +110,51 @@ pub(super) fn span(from: Bound<&Key>, to: Bound<&Key>) -> Span {
 /// A key as the data file holds it: the number of its table or index, then the key.
 pub(super) fn stored(id: u32, key: &[u8]) -> Vec<u8> {
     [&id.to_be_bytes(), key].concat()
+}
+
+/// The first byte of the stored key of a block of the vector part. Blocks are kept in a table
+/// of their own.
+pub(super) const BLOCK: u8 = 0;
+const PARTITION: u8 = 1;
+const PENDING: u8 = 2;
+
+/// A record of the vector part as the data file keys it: one byte for its kind, the column,
+/// and then the rest of its fields in order, every number most significant byte first. So the
+/// records of one kind are one run of keys in the order of their fields: the columns follow
+/// each other by number, and within a column a partition's pending rows or blocks are one run.
+pub(super) fn vector(record: VectorRecord<'_>) -> Vec<u8> {
+    let number = u32::to_be_bytes;
+    match record {
+        VectorRecord::Block(column, partition, block) => {
+            let numbers = [number(column.0), number(partition), number(block)];
+            [&[BLOCK][..], numbers.as_flattened()].concat()
+        }
+        VectorRecord::Partition(column, tuple) => {
+            [&[PARTITION][..], &number(column.0), &tuple.0].concat()
+        }
+        VectorRecord::Pending(column, partition, row) => {
+            let numbers = [number(column.0), number(partition)];
+            [&[PENDING][..], numbers.as_flattened(), &row.0].concat()
+        }
+    }
+}
+
+/// The record a stored key of the vector part stands for. A key tuple or a row key is read
+/// into `key`, which the record then borrows.
+pub(super) fn vector_of<'a>(stored: &[u8], key: &'a mut Key) -> Option<VectorRecord<'a>> {
+    let number = |at: usize| Some(u32::from_be_bytes(*stored.get(at..)?.first_chunk()?));
+    let column = VectorId(number(1)?);
+    key.0.clear();
+    Some(match stored[0] {
+        BLOCK => VectorRecord::Block(column, number(5)?, number(9)?),
+        PARTITION => {
+            key.0.extend_from_slice(&stored[5..]);
+            VectorRecord::Partition(column, key)
+        }
+        _ => {
+            let partition = number(5)?;
+            key.0.extend_from_slice(&stored[9..]);
+            VectorRecord::Pending(column, partition, key)
+        }
+    })
 }

@@ -1,9 +1,9 @@
 //! Expressions. The grammar reads the boolean operators as one flat run and the arithmetic
 //! operators as another; the functions here apply their precedence.
 //!
-//! `expr`, `comparison_expr`, `additive_expr` and `primary_expr` call each other once for every
-//! level of nesting, to the limit, on the caller's stack. So each is kept small: what is not on
-//! that path is in a function of its own, and a list is gathered with a loop.
+//! `expr`, `comparison_expr`, `distance_expr`, `additive_expr` and `primary_expr` call each other
+//! once for every level of nesting, to the limit, on the caller's stack. So each is kept small:
+//! what is not on that path is in a function of its own, and a list is gathered with a loop.
 
 use super::{MAX_EXPR_NESTING, Pair, Rule, depth_error, has, ident, number, string};
 use crate::sql::ast::*;
@@ -58,6 +58,12 @@ fn depth_of(expr: &Expr) -> usize {
         Expr::UnaryOp { operand, .. } => depth_of(operand),
         Expr::FunctionCall { args, .. } => args.iter().map(depth_of).max().unwrap_or(0),
         Expr::IsNull { expr, .. } => depth_of(expr),
+        Expr::Distance { left, right } => depth_of(left).max(depth_of(right)),
+        Expr::Row(items) => items.iter().map(depth_of).max().unwrap_or(0),
+        Expr::InList { expr, list, .. } => {
+            let items = list.iter().map(depth_of).max().unwrap_or(0);
+            depth_of(expr).max(items)
+        }
         Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) => return 0,
     };
     below + 1
@@ -91,7 +97,7 @@ fn not(operand: Expr) -> Expr {
 
 /// One comparison: its left side and what the grammar read after it, if anything.
 fn comparison_expr(left: Pair<'_>, suffix: Option<Pair<'_>>) -> Result<Expr> {
-    let left = Box::new(additive_expr(left)?);
+    let left = Box::new(distance_expr(left)?);
     let Some(suffix) = suffix else {
         return Ok(*left);
     };
@@ -99,6 +105,13 @@ fn comparison_expr(left: Pair<'_>, suffix: Option<Pair<'_>>) -> Result<Expr> {
         return Ok(Expr::IsNull {
             expr: left,
             negated: has(&suffix, Rule::not_op),
+        });
+    }
+    if suffix.as_rule() == Rule::in_suffix {
+        return Ok(Expr::InList {
+            expr: left,
+            negated: has(&suffix, Rule::not_op),
+            list: exprs(suffix)?,
         });
     }
     let mut parts = suffix.into_inner();
@@ -113,7 +126,20 @@ fn comparison_expr(left: Pair<'_>, suffix: Option<Pair<'_>>) -> Result<Expr> {
     Ok(Expr::BinaryOp {
         left,
         op,
-        right: Box::new(additive_expr(parts.next().expect("an operand"))?),
+        right: Box::new(distance_expr(parts.next().expect("an operand"))?),
+    })
+}
+
+/// `sum [<=> sum]`: a sum alone, or the distance between two.
+fn distance_expr(pair: Pair<'_>) -> Result<Expr> {
+    let mut sides = pair.into_inner();
+    let left = additive_expr(sides.next().expect("an operand"))?;
+    let Some(right) = sides.next() else {
+        return Ok(left);
+    };
+    Ok(Expr::Distance {
+        left: Box::new(left),
+        right: Box::new(additive_expr(right)?),
     })
 }
 
@@ -163,10 +189,7 @@ fn additive_expr(pair: Pair<'_>) -> Result<Expr> {
             _ => {
                 let mut operand = primary_expr(part)?;
                 for _ in 0..std::mem::take(&mut minuses) {
-                    operand = Expr::UnaryOp {
-                        op: UnaryOp::Neg,
-                        operand: Box::new(operand),
-                    };
+                    operand = negated(operand);
                 }
                 product = Some(match product.take() {
                     Some((left, times_or_over)) => (arithmetic(times_or_over, left, operand)?, ""),
@@ -182,6 +205,19 @@ fn additive_expr(pair: Pair<'_>) -> Result<Expr> {
     }
 }
 
+/// `-operand`. A number written with a minus sign is that number: a literal, as a number
+/// written without a sign is, so whatever reads a literal reads it.
+fn negated(operand: Expr) -> Expr {
+    match operand {
+        Expr::Literal(Literal::Integer(whole)) => Expr::Literal(Literal::Integer(-whole)),
+        Expr::Literal(Literal::Real(real)) => Expr::Literal(Literal::Real(-real)),
+        operand => Expr::UnaryOp {
+            op: UnaryOp::Neg,
+            operand: Box::new(operand),
+        },
+    }
+}
+
 /// The `*` of `SELECT *` and of `COUNT(*)`: a column of that name.
 pub(super) fn star() -> Expr {
     Expr::Column(ColumnRef {
@@ -192,8 +228,14 @@ pub(super) fn star() -> Expr {
 
 fn primary_expr(primary: Pair<'_>) -> Result<Expr> {
     match primary.as_rule() {
-        // A parenthesised expression.
-        Rule::expr => expr(primary),
+        // One expression in parentheses is that expression; two or more are a row value.
+        Rule::parenthesized => {
+            let mut items = exprs(primary)?;
+            Ok(match items.len() {
+                1 => items.swap_remove(0),
+                _ => Expr::Row(items),
+            })
+        }
         Rule::function_call => function_call(primary),
         Rule::column_ref => Ok(column_ref(primary)),
         _ => literal(&primary),

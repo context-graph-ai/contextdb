@@ -9,6 +9,7 @@ repository = "https://github.com/context-graph-ai/contextdb"
 readme = "README.md"
 
 [dependencies]
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
 pest = "2.8.6"
 pest_derive = "2.8.6"
 redb = { package = "contextdb-redb", version = "4.1.0", path = "../redb" }

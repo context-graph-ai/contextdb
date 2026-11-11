@@ -9,6 +9,8 @@ mod sql;
 mod store;
 mod system;
 mod types;
+mod upkeep;
+mod vector;
 mod write;
 
 pub use database::{Database, DatabaseOpenOptions, Transaction};
@@ -16,7 +18,11 @@ pub use query::QueryResult;
 pub use read::{ReadSession, ReadSessionOptions};
 pub use store::{StorageBackend, WrapStorage};
 pub use system::Clock;
-pub use types::{ColumnType, Error, Result, TxId, Uuid, Value};
+pub use types::{
+    ColumnType, Error, Result, TxId, Uuid, Value, VectorIndexRef, VectorPartitionDeclarationIssue,
+    VectorPolicyDeclarationIssue,
+};
+pub use upkeep::{MaintenanceReport, VectorMaintenanceReport};
 
 /// The JSON package whose `Value` a [`Value::Json`] holds, so a host needs no copy of its own.
 pub use serde_json;

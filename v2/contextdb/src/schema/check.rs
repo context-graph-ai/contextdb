@@ -1,19 +1,15 @@
 //! Checking a declaration: what CREATE TABLE and CREATE INDEX may say, and the table each gives.
 
-use super::{Catalog, RESERVED_PREFIXES, Table};
-use crate::sql::ast::{self, DataType, Expr, Literal, UnaryOp};
+use super::{Catalog, RESERVED_PREFIXES, Table, VectorColumn};
+use crate::sql::ast::{self, DataType, Expr, Literal};
+use crate::sql::not_supported;
 use crate::sql::plan::{CreateIndexPlan, CreateTablePlan};
-use crate::store::{IndexId, TableId};
+use crate::store::{IndexId, TableId, VectorId};
 use crate::types::{
-    ColumnDef, ColumnDefault, ColumnType, Error, IndexDecl, Result, SortDirection, TableMeta, Value,
+    ColumnDef, ColumnDefault, ColumnType, Error, IndexDecl, Result, SortDirection, TableMeta,
+    Value, VectorIndexRef, VectorPartitionDeclarationIssue as PartitionIssue,
+    VectorPolicyDeclarationIssue,
 };
-
-/// The refusal of a statement or clause that arrives with a later version.
-pub(super) fn not_supported(clause: &str) -> Error {
-    Error::PlanError(format!(
-        "{clause} is not supported in this version of the library"
-    ))
-}
 
 fn invalid(reason: String) -> Error {
     Error::SchemaInvalid { reason }
@@ -76,6 +72,17 @@ pub(super) fn new_table(create: &CreateTablePlan, catalog: &Catalog) -> Result<T
         meta.indexes.push(index);
     }
 
+    // Each VECTOR column is numbered on from the highest number in the catalog, as indexes are.
+    let numbered = catalog.tables.values().flat_map(|other| &other.vectors);
+    let next_vector = numbered.map(|vector| vector.id.0 + 1).max().unwrap_or(0);
+    let mut vectors = Vec::new();
+    for declared in &create.columns {
+        if matches!(declared.data_type, DataType::Vector(_)) {
+            let id = VectorId(next_vector + vectors.len() as u32);
+            vectors.push(vector_column(table, declared, &meta.columns, id)?);
+        }
+    }
+
     let id = catalog.tables.values().map(|other| other.id.0 + 1).max();
     let index_ids = (next_index_id(catalog)..)
         .take(meta.indexes.len())
@@ -86,7 +93,76 @@ pub(super) fn new_table(create: &CreateTablePlan, catalog: &Catalog) -> Result<T
         name: table.clone(),
         meta,
         index_ids,
+        vectors,
     })
+}
+
+/// What the table keeps about the VECTOR column `declared`, or the refusal of a clause of it
+/// that cannot stand. `columns` is every column of the table.
+fn vector_column(
+    table: &str,
+    declared: &ast::ColumnDef,
+    columns: &[ColumnDef],
+    id: VectorId,
+) -> Result<VectorColumn> {
+    let index = VectorIndexRef {
+        table: table.to_owned(),
+        column: declared.name.clone(),
+    };
+    if declared.data_type == DataType::Vector(0) {
+        let issue = VectorPolicyDeclarationIssue::DimensionsNotPositive;
+        return Err(Error::InvalidVectorPolicyDeclaration { index, issue });
+    }
+    let max_partitions = partitions(declared, columns)
+        .map_err(|issue| Error::InvalidVectorPartitionDeclaration { index, issue })?;
+    Ok(VectorColumn {
+        id,
+        column: declared.name.clone(),
+        partition_key: declared.vector.partition_key.clone(),
+        max_partitions,
+        search_mode: declared.vector.search_mode,
+    })
+}
+
+/// Checks the PARTITION_KEY and the MAX_PARTITIONS of a VECTOR column and gives the limit it
+/// declares, `None` when it declares none.
+fn partitions(
+    declared: &ast::ColumnDef,
+    columns: &[ColumnDef],
+) -> std::result::Result<Option<u32>, PartitionIssue> {
+    let key = &declared.vector.partition_key;
+    for (at, name) in key.iter().enumerate() {
+        let column = columns.iter().find(|column| column.name == *name);
+        let issue = match column {
+            _ if key[..at].contains(name) => PartitionIssue::DuplicatePartitionKeyColumn,
+            _ if *name == declared.name => PartitionIssue::VectorColumnInPartitionKey,
+            None => PartitionIssue::UnknownPartitionKeyColumn,
+            // Two values of a key column are one partition or they are not: a REAL has two
+            // zeros and a NaN, and JSON and VECTOR values have no order to be keyed by.
+            Some(ColumnDef {
+                column_type: ColumnType::Real | ColumnType::Json | ColumnType::Vector(_),
+                ..
+            }) => PartitionIssue::UnsupportedPartitionKeyColumnType,
+            // The primary key column holds no NULL, written NOT NULL or not.
+            Some(column) if column.nullable && !column.primary_key => {
+                PartitionIssue::NullablePartitionKeyColumn
+            }
+            Some(_) => continue,
+        };
+        return Err(issue);
+    }
+    let Some(written) = &declared.vector.max_partitions else {
+        return Ok(None);
+    };
+    if key.is_empty() {
+        return Err(PartitionIssue::MaxPartitionsWithoutPartitionKey);
+    }
+    match written.parse::<u32>() {
+        Ok(limit) if limit > 0 => Ok(Some(limit)),
+        Ok(_) => Err(PartitionIssue::MaxPartitionsNotPositive),
+        Err(_) if written.starts_with('-') => Err(PartitionIssue::MaxPartitionsNotPositive),
+        Err(_) => Err(PartitionIssue::MaxPartitionsOutOfRange),
+    }
 }
 
 /// The table a CREATE INDEX names, with the new index as its last.
@@ -206,14 +282,6 @@ pub(super) fn default(expr: &Expr) -> Option<ColumnDefault> {
         Expr::Literal(Literal::Integer(whole)) => Value::Int64(*whole),
         Expr::Literal(Literal::Real(real)) => Value::Float64(*real),
         Expr::Literal(Literal::Text(words)) => Value::Text(words.clone()),
-        Expr::UnaryOp {
-            op: UnaryOp::Neg,
-            operand,
-        } => match **operand {
-            Expr::Literal(Literal::Integer(whole)) => Value::Int64(-whole),
-            Expr::Literal(Literal::Real(real)) => Value::Float64(-real),
-            _ => return None,
-        },
         _ => return None,
     };
     Some(ColumnDefault::Literal(value))

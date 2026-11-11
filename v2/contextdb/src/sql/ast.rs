@@ -1,6 +1,6 @@
 //! A statement as it was written: what `parse` returns and `plan` reads.
 
-pub use crate::types::SortDirection;
+pub use crate::types::{SortDirection, VectorSearchMode};
 
 #[derive(Debug, Clone)]
 pub enum Statement {
@@ -26,7 +26,11 @@ pub struct Select {
     pub columns: Vec<SelectColumn>,
     pub table: String,
     pub where_clause: Option<Expr>,
+    /// The ORDER BY items. A similarity search has one, a distance ([`Expr::Distance`]) or the
+    /// name the select list gives one.
     pub order_by: Vec<OrderByItem>,
+    /// `USE VECTOR AUTO | EXACT | INDEXED`, when it was written.
+    pub use_vector: Option<VectorSearchMode>,
     pub limit: Option<u64>,
 }
 
@@ -64,6 +68,26 @@ pub enum Expr {
     },
     IsNull {
         expr: Box<Expr>,
+        negated: bool,
+    },
+    /// `left <=> right`: the cosine distance between a VECTOR column and a vector, a REAL that
+    /// is lower for a closer row. It binds tighter than a comparison and looser than `+` and
+    /// `-`, as in Postgres. This version works it out for the rows of a similarity search: the
+    /// planner reads it as the one ORDER BY key of a SELECT with LIMIT and, written the same
+    /// way, inside that statement's select list; anywhere else it is refused by name.
+    Distance {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    /// A row value, `(a, b)`: two or more expressions in parentheses. It is read wherever an
+    /// expression is, and has a meaning only on either side of `IN`: the planner refuses it
+    /// anywhere else.
+    Row(Vec<Expr>),
+    /// `expr [NOT] IN (item, ...)`. Beside a row value every item is a row value of the same
+    /// length: the planner refuses any other list.
+    InList {
+        expr: Box<Expr>,
+        list: Vec<Expr>,
         negated: bool,
     },
 }
@@ -140,6 +164,21 @@ pub struct ColumnDef {
     pub primary_key: bool,
     pub unique: bool,
     pub default: Option<Expr>,
+    /// The clauses after `VECTOR(n)`. Left as it starts on a column of any other type.
+    pub vector: VectorClauses,
+}
+
+/// The clauses a VECTOR column may carry, as they were written.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VectorClauses {
+    /// The columns of `PARTITION_KEY (...)`, in the order written; empty when it was not.
+    pub partition_key: Vec<String>,
+    /// The number after `MAX_PARTITIONS`, kept as written: `schema` judges it, so that zero, a
+    /// negative number and one too large are refused by their own kind and not as a syntax
+    /// error.
+    pub max_partitions: Option<String>,
+    /// `SEARCH_MODE AUTO | EXACT | INDEXED`, when it was written.
+    pub search_mode: Option<VectorSearchMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

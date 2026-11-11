@@ -368,3 +368,116 @@ fn a_page_with_a_wrong_checksum_is_refused_when_read() {
         Ok(_) => panic!("a damaged page was answered with a wrong value"),
     }
 }
+
+/// The table of the two tests below: the slices of large values, each under its place.
+const SLICES: TableDefinition<u64, &[u8]> = TableDefinition::new("slices");
+
+/// The 243 bytes kept under `place`.
+fn slice(place: u64) -> Vec<u8> {
+    format!("slice {place:08} ")
+        .into_bytes()
+        .into_iter()
+        .cycle()
+        .take(243)
+        .collect()
+}
+
+/// Writes the slices of these places in this order, 500 to a commit.
+fn commit_slices(db: &Database, places: &[u64]) {
+    for batch in places.chunks(500) {
+        let write = db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(SLICES).unwrap();
+            for place in batch {
+                table.insert(*place, slice(*place).as_slice()).unwrap();
+            }
+        }
+        write.commit().unwrap();
+    }
+}
+
+/// Asserts that the table holds exactly the slices of the places below `count`, each whole.
+fn assert_slices_are(db: &Database, count: u64) {
+    let read = db.begin_read().unwrap();
+    let table = read.open_table(SLICES).unwrap();
+    let mut next = 0;
+    for entry in table.iter().unwrap() {
+        let (place, value) = entry.unwrap();
+        assert_eq!(
+            place.value(),
+            next,
+            "the places come in order, none missing"
+        );
+        assert!(
+            value.value() == slice(next).as_slice(),
+            "the slice at {next}"
+        );
+        next += 1;
+    }
+    assert_eq!(next, count, "slices read back");
+}
+
+#[test]
+fn a_table_written_in_key_order_has_full_leaves() {
+    let path = folder("a-table-written-in-key-order").join("data");
+    let db = writer(&path);
+    let in_order: Vec<u64> = (0..16_000).collect();
+    commit_slices(&db, &in_order);
+
+    // A leaf is 4 bytes and, for each slice, 8 of key, 4 of length and 243 of value: sixteen
+    // slices take 4,084 of a page's 4,096 bytes. Written in key order, every leaf is left
+    // full, so 16,000 slices are in exactly 1,000 leaves.
+    let write = db.begin_write().unwrap();
+    let stats = write.stats().unwrap();
+    write.abort().unwrap();
+    assert_eq!(stats.page_size(), 4096);
+    assert_eq!(
+        stats.leaf_pages(),
+        1000,
+        "leaf pages of 16,000 slices in key order"
+    );
+    assert_slices_are(&db, 16_000);
+
+    // A table written in an order far from key order still reads back every slice. 7,919 and
+    // 16,000 share no factor, so the places below are every place once.
+    let path = folder("a-table-written-in-scattered-key-order").join("data");
+    let db = writer(&path);
+    let scattered: Vec<u64> = (0..16_000_u64).map(|n| n * 7919 % 16_000).collect();
+    commit_slices(&db, &scattered);
+    assert_slices_are(&db, 16_000);
+    drop(db);
+    assert_slices_are(&writer(&path), 16_000);
+}
+
+#[test]
+fn a_file_is_at_most_a_sixteenth_longer_than_its_pages() {
+    let path = folder("a-file-is-at-most-a-sixteenth-longer").join("data");
+    let db = writer(&path);
+    let in_order: Vec<u64> = (0..40_000).collect();
+    commit_slices(&db, &in_order);
+
+    let write = db.begin_write().unwrap();
+    let stats = write.stats().unwrap();
+    write.abort().unwrap();
+    let pages = stats.allocated_pages() * stats.page_size() as u64;
+    assert!(
+        pages > 40_000 * 243,
+        "40,000 slices of 243 bytes are in {pages} bytes of pages"
+    );
+    // Seventeen sixteenths of the pages, and 64 KiB.
+    let most = pages * 17 / 16 + (64 << 10);
+    let length = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        length <= most,
+        "after the last commit the file is {length} bytes long; its pages are {pages} bytes, \
+         and it may be {most}"
+    );
+    drop(db);
+    let length = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        length <= most,
+        "after the database was dropped the file is {length} bytes long; its pages are \
+         {pages} bytes, and it may be {most}"
+    );
+    assert_slices_are(&writer(&path), 40_000);
+}

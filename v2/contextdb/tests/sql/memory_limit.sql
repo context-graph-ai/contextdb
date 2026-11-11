@@ -6,6 +6,13 @@ SHOW MEMORY_LIMIT;
 limit | used | available | startup_ceiling | ceiling_refresh_failures
 none | * | * | * | *
 
+# A store opened with no limit takes 64 MiB as its first limit.
+SET MEMORY_LIMIT 64M;
+SHOW MEMORY_LIMIT;
+----
+limit | used | available | startup_ceiling | ceiling_refresh_failures
+67108864 | * | * | * | *
+
 SET MEMORY_LIMIT 512M;
 SHOW MEMORY_LIMIT;
 ----

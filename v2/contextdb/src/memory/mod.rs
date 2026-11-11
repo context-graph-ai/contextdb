@@ -28,9 +28,10 @@ const NO_CEILING: u64 = u64::MAX;
 /// names one. With no limit there is no ceiling, and what is reserved is still counted.
 ///
 /// Three kinds of memory are counted against it: small fixed things, covered by an allowance
-/// of 1 MiB set aside in [`Budget::new`]; the page cache of 8 MiB, reserved once when the store
-/// is opened; and everything that grows with data, which must hold a [`Reservation`]. A limit
-/// below those 9 MiB therefore cannot open any store: the open is refused with
+/// of 1 MiB set aside in [`Budget::new`]; the page cache, reserved once when the store is
+/// opened; and everything that grows with data, which must hold a [`Reservation`]. The page
+/// cache is a quarter of the limit and never less than 8 MiB, which is also its size with no
+/// limit. A limit below 9 MiB therefore cannot open any store: the open is refused with
 /// `MemoryBudgetExceeded`.
 #[derive(Clone)]
 pub(crate) struct Budget {

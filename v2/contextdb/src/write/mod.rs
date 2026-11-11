@@ -24,6 +24,7 @@ use crate::sql::Plan;
 use crate::sql::plan::{DeletePlan, InsertPlan, UpdatePlan};
 use crate::store::{Cell, ChangeSet, IndexId, Key, Read, View};
 use crate::types::{ColumnDefault, Error, Result, SortDirection, Value};
+use crate::vector::Tally;
 
 /// Applies one INSERT, UPDATE or DELETE to the change set and returns the number of rows: those
 /// an INSERT stored, or those the WHERE of an UPDATE or DELETE matched.
@@ -36,6 +37,11 @@ use crate::types::{ColumnDefault, Error, Result, SortDirection, Value};
 /// a mark on the change set before the call and rewinds to it on refusal. `now` is the
 /// statement's time in milliseconds: what `DEFAULT NOW()` stores and `NOW()` answers.
 ///
+/// `partitions` is the transaction's tally of vector partitions. Every row staged in a table
+/// that has a VECTOR column with a PARTITION_KEY is noted in it, and the statement's last act
+/// is to settle it: a statement that would give a column one partition too many is refused
+/// there, like any other refusal of this function.
+///
 /// # Panics
 ///
 /// When the plan is not an INSERT, UPDATE or DELETE.
@@ -44,13 +50,14 @@ pub(crate) fn apply(
     params: &HashMap<String, Value>,
     catalog: &Catalog,
     changes: &mut ChangeSet,
+    partitions: &mut Tally,
     budget: &Budget,
     now: i64,
 ) -> Result<u64> {
     match plan {
-        Plan::Insert(plan) => insert(plan, params, catalog, changes, now),
-        Plan::Update(plan) => update(plan, params, catalog, changes, budget, now),
-        Plan::Delete(plan) => delete(plan, params, catalog, changes, budget, now),
+        Plan::Insert(plan) => insert(plan, params, catalog, changes, partitions, now),
+        Plan::Update(plan) => update(plan, params, catalog, changes, partitions, budget, now),
+        Plan::Delete(plan) => delete(plan, params, catalog, changes, partitions, budget, now),
         other => unreachable!("{other:?} writes no rows"),
     }
 }
@@ -147,6 +154,7 @@ fn insert(
     params: &HashMap<String, Value>,
     catalog: &Catalog,
     changes: &mut ChangeSet,
+    partitions: &mut Tally,
     now: i64,
 ) -> Result<u64> {
     let table = find(catalog, &plan.table)?;
@@ -186,9 +194,10 @@ fn insert(
         }
         let row = row.into_iter().enumerate();
         let row = row.map(|(at, value)| rules.settle(at, value));
-        rules.put(changes, None, row.collect::<Result<_>>()?)?;
+        rules.put(changes, partitions, None, row.collect::<Result<_>>()?)?;
     }
     changes.add_count(table.id, plan.values.len() as i64)?;
+    rules.settle_partitions(partitions)?;
     Ok(plan.values.len() as u64)
 }
 
@@ -197,6 +206,7 @@ fn update(
     params: &HashMap<String, Value>,
     catalog: &Catalog,
     changes: &mut ChangeSet,
+    partitions: &mut Tally,
     budget: &Budget,
     now: i64,
 ) -> Result<u64> {
@@ -223,9 +233,10 @@ fn update(
         // A row that already holds what it is set to is left alone: a statement that changes
         // nothing stages nothing.
         if row != *old {
-            rules.put(changes, Some((key, old)), row)?;
+            rules.put(changes, partitions, Some((key, old)), row)?;
         }
     }
+    rules.settle_partitions(partitions)?;
     Ok(found.len() as u64)
 }
 
@@ -234,6 +245,7 @@ fn delete(
     params: &HashMap<String, Value>,
     catalog: &Catalog,
     changes: &mut ChangeSet,
+    partitions: &mut Tally,
     budget: &Budget,
     now: i64,
 ) -> Result<u64> {
@@ -248,6 +260,7 @@ fn delete(
         now,
     )?;
     for (key, row) in &found {
+        rules.note(partitions, changes, Some(key), None)?;
         for index in &rules.indexes {
             changes.delete_index(index.id, &index.entry(row)?, key)?;
         }
@@ -257,6 +270,7 @@ fn delete(
     if !found.is_empty() {
         changes.add_count(table.id, -(found.len() as i64))?;
     }
+    rules.settle_partitions(partitions)?;
     Ok(found.len() as u64)
 }
 
@@ -286,6 +300,9 @@ struct Rules<'a> {
     /// behind the primary key (`__pk_...`) is left out: it holds none, a row is kept under its
     /// key.
     indexes: Vec<Index>,
+    /// The table has a VECTOR column with a PARTITION_KEY: the rows a statement stages in it
+    /// are noted in the transaction's tally of partitions.
+    partitioned: bool,
 }
 
 /// One index of a table as a write uses it.
@@ -320,11 +337,42 @@ impl<'a> Rules<'a> {
                     .then(|| names.join(", ")),
             })
         });
+        let mut vectors = table.vectors.iter();
         Ok(Rules {
             table,
             key,
             indexes: indexes.collect::<Result<_>>()?,
+            partitioned: vectors.any(|vector| !vector.partition_key.is_empty()),
         })
+    }
+
+    /// Notes in the tally a row the statement is about to stage: `was` is the key the
+    /// transaction has had the row under until now, `None` for a new row, and `after` the
+    /// values it is staged with, `None` for a removal.
+    fn note(
+        &self,
+        partitions: &mut Tally,
+        changes: &ChangeSet,
+        was: Option<&Key>,
+        after: Option<&[Value]>,
+    ) -> Result<()> {
+        if !self.partitioned {
+            return Ok(());
+        }
+        let before = match was {
+            Some(key) => changes.row(self.table.id, key)?,
+            None => None,
+        };
+        partitions.note(self.table, before.as_ref(), after, changes)
+    }
+
+    /// The last act of a statement, once every row is staged and every other rule has passed:
+    /// refuses a statement that gave a column one partition too many.
+    fn settle_partitions(&self, partitions: &mut Tally) -> Result<()> {
+        if self.partitioned {
+            partitions.settle(self.table)?;
+        }
+        Ok(())
     }
 
     /// Brings a value written into a column to the column's type, and refuses NULL where the
@@ -346,13 +394,15 @@ impl<'a> Rules<'a> {
     ///
     /// `was` is the key and the values the row had, for an UPDATE: what the row keeps from
     /// before is its own and is not looked up, an entry that stays as it was is left alone, and
-    /// a row whose key changed leaves its old key.
+    /// a row whose key changed leaves its old key. The row is noted in `partitions` first.
     fn put(
         &self,
         changes: &mut ChangeSet,
+        partitions: &mut Tally,
         was: Option<(&Key, &[Value])>,
         row: Vec<Value>,
     ) -> Result<()> {
+        self.note(partitions, changes, was.map(|(key, _)| key), Some(&row))?;
         // No directions: a row's key is encoded ascending.
         let key = Key::from_values(&pick(&self.key, &row), &[])?;
         // A new row, or a row whose key changed: the transaction must find no row at this key.

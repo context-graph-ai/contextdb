@@ -17,6 +17,11 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # The size of the shipped code, rounded up to 500 lines, and the number of tests, rounded up
+  # to 10. A change that crosses either number edits it here, in the same change, where its
+  # reader sees that the code grew or shrank. Neither ever passes 150,000 lines or 1,000 tests.
+  SHIPPED_LINES: 11000
+  TESTS: 180
 
 jobs:
   lint:
@@ -26,8 +31,21 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: cargo fmt --manifest-path v2/Cargo.toml --all --check
       - run: cargo clippy --manifest-path v2/Cargo.toml --workspace --all-targets --locked -- -D warnings
-      - name: Shipped lines stay under 150,000
-        run: test "$(find v2/contextdb/src v2/contextdb-cli/src \( -name '*.rs' -o -name '*.pest' \) ! -name tests.rs -exec cat {} + | wc -l)" -le 150000
+      - name: Shipped lines are at most the stated number and within 500 of it
+        run: |
+          lines=$(find v2/contextdb/src v2/contextdb-cli/src \( -name '*.rs' -o -name '*.pest' \) ! -name tests.rs -exec cat {} + | wc -l)
+          echo "$lines shipped lines; the stated number is $SHIPPED_LINES"
+          test "$SHIPPED_LINES" -le 150000
+          test "$lines" -le "$SHIPPED_LINES"
+          test "$lines" -gt "$((SHIPPED_LINES - 500))"
+      - name: No shipped file is longer than 1,500 lines
+        run: test -z "$(find v2/contextdb/src v2/contextdb-cli/src -name '*.rs' ! -name tests.rs -exec wc -l {} + | awk '$2 != "total" && $1 > 1500')"
+      - name: No test-only name in shipped code
+        run: test -z "$(grep -rnE --include='*.rs' --exclude=tests.rs '_for_test|test[-_]seam|feature *= *"test' v2/contextdb/src v2/contextdb-cli/src)"
+      - name: No ignored test
+        run: test -z "$(grep -rn --include='*.rs' '#\[ignore' v2/contextdb v2/contextdb-cli)"
+      - name: Only the four allow attributes that v2/AGENTS.md names, and no expect attribute
+        run: test "$(grep -rnE --include='*.rs' '#!?\[ *(allow|expect) *\(' v2/contextdb v2/contextdb-cli | wc -l)" -eq 4
 
   test:
     strategy:
@@ -45,9 +63,15 @@ jobs:
       - run: cargo test --manifest-path v2/Cargo.toml --workspace --locked --doc
       - name: The storage library's own tests
         run: cargo test --manifest-path v2/redb/Cargo.toml --locked --lib --tests
-      # A test is one the runner lists, or one script file.
-      - name: Tests stay under 1,000
-        run: test "$(( $(cargo nextest list --manifest-path v2/Cargo.toml --workspace --locked -T oneline | wc -l) + $(find v2/contextdb/tests/sql -name '*.sql' | wc -l) ))" -le 1000
+      # A test is one the runner lists, or one script file. Counted on Linux, where every test runs.
+      - name: Tests are at most the stated number and within 10 of it
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          tests=$(( $(cargo nextest list --manifest-path v2/Cargo.toml --workspace --locked -T oneline | wc -l) + $(find v2/contextdb/tests/sql -name '*.sql' | wc -l) ))
+          echo "$tests tests; the stated number is $TESTS"
+          test "$TESTS" -le 1000
+          test "$tests" -le "$TESTS"
+          test "$tests" -gt "$((TESTS - 10))"
 
   minimum-rust:
     runs-on: ubuntu-latest
