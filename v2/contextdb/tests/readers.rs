@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use contextdb::{DatabaseOpenOptions, ReadSession, ReadSessionOptions, Value};
+use contextdb::{DatabaseOpenOptions, Error, ReadSession, ReadSessionOptions, Value, params};
 
 use support::{Call, Child};
 
@@ -219,6 +219,21 @@ fn a_killed_reader_leaves_one_file_that_the_next_open_clears() {
         support::listing(&readers).is_empty(),
         "a reader that ended left its file behind"
     );
+
+    // With `readers` replaced by a plain file a reader cannot make its file: it is refused as a
+    // failure of the storage, and no row comes from it.
+    std::fs::remove_dir(&readers).expect("the empty readers folder");
+    std::fs::write(&readers, b"not a folder").expect("a plain file where readers was");
+    let outcome = ReadSession::open_with_options(&folder, ReadSessionOptions::default())
+        .and_then(|session| session.execute(support::SCAN, &params! {}));
+    match outcome {
+        Err(Error::StoreIo { .. }) => {}
+        Err(other) => panic!("a reader beside a plain file named readers was refused as {other:?}"),
+        Ok(result) => panic!(
+            "a reader beside a plain file named readers returned {} rows",
+            result.rows().len()
+        ),
+    }
 }
 
 #[test]

@@ -1,8 +1,8 @@
 //! Checking a declaration: what CREATE TABLE and CREATE INDEX may say, and the table each gives.
 
-use super::{Catalog, Consolidation, Quantization, RESERVED_PREFIXES, Table, VectorColumn};
-use crate::sql::ast::{self, ConsolidationClause, DataType, Expr, Literal};
-use crate::sql::not_supported;
+use super::{Catalog, Consolidation, Quantization, RESERVED_PREFIXES, Table, VectorColumn, rules};
+use crate::sql::ast::{self, ConsolidationClause, Expr, Literal};
+use crate::sql::not_carried;
 use crate::sql::plan::{CreateIndexPlan, CreateTablePlan};
 use crate::store::{IndexId, TableId, VectorId};
 use crate::types::{
@@ -11,7 +11,7 @@ use crate::types::{
     VectorPolicyDeclarationIssue as PolicyIssue,
 };
 
-fn invalid(reason: String) -> Error {
+pub(super) fn invalid(reason: String) -> Error {
     Error::SchemaInvalid { reason }
 }
 
@@ -28,62 +28,69 @@ pub(super) fn new_table(create: &CreateTablePlan, catalog: &Catalog) -> Result<T
         }
         columns.push(column(table, declared)?);
     }
-    match columns.iter().filter(|column| column.primary_key).count() {
-        0 => return Err(not_supported("a table without a PRIMARY KEY")),
-        1 => {}
-        _ => {
-            return Err(invalid(format!(
-                "table '{table}' declares more than one PRIMARY KEY"
-            )));
-        }
+    // One key to a table: written with one column, or as an element of the table.
+    let key = columns.iter().filter(|column| column.primary_key);
+    let mut key: Vec<String> = key.map(|column| column.name.clone()).collect();
+    if key.len() + usize::from(!create.primary_key.is_empty()) > 1 {
+        return Err(invalid(format!(
+            "table '{table}' declares more than one PRIMARY KEY: write one, over one column or \
+             several"
+        )));
+    }
+    key.extend(create.primary_key.iter().cloned());
+    for column in columns
+        .iter_mut()
+        .filter(|column| key.contains(&column.name))
+    {
+        column.primary_key = true;
     }
 
+    let options = &create.options;
     let mut meta = TableMeta {
         columns,
         unique_constraints: create.unique_constraints.clone(),
         indexes: Vec::new(),
+        immutable: options.immutable,
+        state_machine: options.state_machine.clone(),
+        dag: options.dag.clone(),
+        retain: options.retain.clone(),
+        history: options.history,
+        sync: options.sync,
+        conflict: options.conflict,
+        kept_counts: options.kept_counts.clone(),
     };
     // The index behind the key, then behind each UNIQUE column, then behind each UNIQUE rule.
     // The key's index already keeps the key column unique.
     let one = |column: &ColumnDef| vec![column.name.clone()];
-    let key = meta.columns.iter().filter(|column| column.primary_key);
     let unique = meta.columns.iter();
     let unique = unique.filter(|column| column.unique && !column.primary_key);
     let rules = create.unique_constraints.iter().cloned();
-    let behind = key
-        .map(|column| ("__pk_", one(column)))
+    let behind: Vec<(&str, Vec<String>)> = (!key.is_empty())
+        .then(|| ("__pk_", key.clone()))
+        .into_iter()
         .chain(unique.map(|column| ("__unique_", one(column))))
-        .chain(rules.map(|rule| ("__unique_", rule)));
+        .chain(rules.map(|rule| ("__unique_", rule)))
+        .collect();
     for (prefix, rule) in behind {
-        // Two rules can spell one name (`a_b`, and `a` with `b`); the later one takes a number.
-        let plain = format!("{prefix}{}", rule.join("_"));
-        let mut name = plain.clone();
-        let mut copy = 1;
-        while meta.indexes.iter().any(|other| other.name == name) {
-            copy += 1;
-            name = format!("{plain}_{copy}");
-        }
-        let columns = rule.into_iter().map(|column| (column, SortDirection::Asc));
-        let index = IndexDecl {
-            name,
-            columns: columns.collect(),
-        };
-        check_columns(table, &meta, &index, true)?;
-        meta.indexes.push(index);
+        let name = format!("{prefix}{}", rule.join("_"));
+        engine_index(table, &mut meta, name, rule, true)?;
     }
+    let rules = rules::of(create, &mut meta, catalog)?;
+    let position = |name: &String| meta.columns.iter().position(|column| column.name == *name);
+    let key: Vec<usize> = key.iter().filter_map(position).collect();
 
     // Each VECTOR column is numbered on from the highest number in the catalog, as indexes are.
-    let numbered = catalog.tables.values().flat_map(|other| &other.vectors);
+    let numbered = catalog.numbered().flat_map(|other| &other.vectors);
     let next_vector = numbered.map(|vector| vector.id.0 + 1).max().unwrap_or(0);
     let mut vectors = Vec::new();
     for declared in &create.columns {
-        if matches!(declared.data_type, DataType::Vector(_)) {
+        if matches!(declared.data_type, ColumnType::Vector(_)) {
             let id = VectorId(next_vector + vectors.len() as u32);
             vectors.push(vector_column(table, declared, &meta.columns, id)?);
         }
     }
 
-    let id = catalog.tables.values().map(|other| other.id.0 + 1).max();
+    let id = catalog.numbered().map(|other| other.id.0 + 1).max();
     let index_ids = (next_index_id(catalog)..)
         .take(meta.indexes.len())
         .map(IndexId)
@@ -91,10 +98,43 @@ pub(super) fn new_table(create: &CreateTablePlan, catalog: &Catalog) -> Result<T
     Ok(Table {
         id: TableId(id.unwrap_or(0)),
         name: table.clone(),
-        meta,
         index_ids,
         vectors,
+        key,
+        key_is_element: !create.primary_key.is_empty(),
+        missing: vec![Value::Null; meta.columns.len()],
+        meta,
+        rules,
+        shapes: Vec::new().into(),
     })
+}
+
+/// Gives the table an index the engine makes for itself, under `plain` or, when a rule before
+/// it spelt the same name (`a_b`, and `a` with `b`), under that name and a number.
+pub(super) fn engine_index(
+    table: &str,
+    meta: &mut TableMeta,
+    plain: String,
+    columns: Vec<String>,
+    rule: bool,
+) -> Result<()> {
+    let mut name = plain.clone();
+    let mut copy = 1;
+    while meta.indexes.iter().any(|other| other.name == name) {
+        copy += 1;
+        name = format!("{plain}_{copy}");
+    }
+    let columns = columns
+        .into_iter()
+        .map(|column| (column, SortDirection::Asc));
+    let index = IndexDecl {
+        name,
+        columns: columns.collect(),
+        json_path: Vec::new(),
+    };
+    check_columns(table, meta, &index, rule)?;
+    meta.indexes.push(index);
+    Ok(())
 }
 
 /// What the table keeps about the VECTOR column `declared`, or the refusal of a clause of it
@@ -113,7 +153,7 @@ fn vector_column(
         index: index.clone(),
         issue,
     };
-    if declared.data_type == DataType::Vector(0) {
+    if declared.data_type == ColumnType::Vector(0) {
         return Err(policy(PolicyIssue::DimensionsNotPositive));
     }
     let max_partitions = partitions(declared, columns).map_err(|issue| {
@@ -126,7 +166,11 @@ fn vector_column(
     let quantization = match written.map(str::to_ascii_uppercase).as_deref() {
         None | Some("F32") => Quantization::F32,
         Some("SQ8") => Quantization::Sq8,
-        Some("SQ4") => return Err(not_supported("WITH (quantization = 'SQ4')")),
+        Some("SQ4") => {
+            let instead = "write 'SQ8' to store one byte a component, or leave the clause out to \
+                           store each vector as given";
+            return Err(not_carried("WITH (quantization = 'SQ4')", instead));
+        }
         Some(_) => {
             let member = "quantization";
             return Err(policy(PolicyIssue::InvalidMember { member }));
@@ -229,6 +273,7 @@ pub(super) fn with_index(create: &CreateIndexPlan, catalog: &Catalog) -> Result<
     let index = IndexDecl {
         name: create.name.clone(),
         columns: create.columns.clone(),
+        json_path: create.json_path.clone(),
     };
     check_columns(&table.name, &table.meta, &index, false)?;
     if table
@@ -244,31 +289,42 @@ pub(super) fn with_index(create: &CreateIndexPlan, catalog: &Catalog) -> Result<
     }
     table.meta.indexes.push(index);
     table.index_ids.push(IndexId(next_index_id(catalog)));
+    // A table that keeps a count for every beginning of every index keeps the new index's.
+    table.rules.counts = rules::counts(&table.name, &table.meta, &table.rules.counts, catalog)?;
     Ok(table)
 }
 
-/// One past the highest index number in use. Nothing in this version removes an index or a
-/// table, so counting on from the highest never gives a number twice.
+/// One past the highest index number in use.
 fn next_index_id(catalog: &Catalog) -> u32 {
-    let ids = catalog.tables.values().flat_map(|table| &table.index_ids);
+    let ids = catalog.numbered().flat_map(|table| &table.index_ids);
     ids.map(|id| id.0 + 1).max().unwrap_or(0)
 }
 
 /// Refuses an index over a column the table does not have or whose type it cannot be over.
 /// `rule` says the index is the one behind a key or a UNIQUE rule.
 fn check_columns(table: &str, meta: &TableMeta, index: &IndexDecl, rule: bool) -> Result<()> {
+    if index.columns.len() > 32 {
+        return Err(invalid(format!(
+            "table '{table}': '{}' names {} columns, and a key, a UNIQUE rule or an index names \
+             at most 32; name fewer",
+            index.name,
+            index.columns.len()
+        )));
+    }
     for (name, _) in &index.columns {
         let column = meta.columns.iter().find(|column| column.name == *name);
         let column = column.ok_or_else(|| Error::ColumnNotFound {
             table: table.to_owned(),
             column: name.clone(),
         })?;
-        // JSON and VECTOR have no order to keep an index by. A REAL has one, and is still no
-        // identity for a key or a UNIQUE rule: it has two zeros and a NaN.
+        // JSON and VECTOR have no order to keep an index by; a path into a JSON column has,
+        // and only a JSON column has a path. A REAL has an order, and is still no identity for
+        // a key or a UNIQUE rule: it has two zeros and a NaN.
         let refused = match column.column_type {
-            ColumnType::Json | ColumnType::Vector(_) => true,
+            ColumnType::Json => index.json_path.is_empty(),
+            ColumnType::Vector(_) => true,
             ColumnType::Real => rule,
-            _ => false,
+            _ => !index.json_path.is_empty(),
         };
         if refused {
             return Err(Error::ColumnNotIndexable {
@@ -283,16 +339,6 @@ fn check_columns(table: &str, meta: &TableMeta, index: &IndexDecl, rule: bool) -
 
 /// One column as the catalog keeps it.
 fn column(table: &str, declared: &ast::ColumnDef) -> Result<ColumnDef> {
-    let column_type = match declared.data_type {
-        DataType::Integer => ColumnType::Integer,
-        DataType::Real => ColumnType::Real,
-        DataType::Text => ColumnType::Text,
-        DataType::Boolean => ColumnType::Boolean,
-        DataType::Uuid => ColumnType::Uuid,
-        DataType::Timestamp => ColumnType::Timestamp,
-        DataType::Json => ColumnType::Json,
-        DataType::Vector(size) => ColumnType::Vector(size as usize),
-    };
     let default = match &declared.default {
         Some(expr) => Some(default(expr).ok_or_else(|| {
             invalid(format!(
@@ -303,14 +349,19 @@ fn column(table: &str, declared: &ast::ColumnDef) -> Result<ColumnDef> {
         })?),
         None => None,
     };
-    Ok(ColumnDef {
+    let column = ColumnDef {
         name: declared.name.clone(),
-        column_type,
+        column_type: declared.data_type,
         nullable: declared.nullable,
         primary_key: declared.primary_key,
         unique: declared.unique,
         default,
-    })
+    };
+    // A default that a row could not hold in the column is refused here, not at the first row.
+    if let Some(ColumnDefault::Literal(value)) = &column.default {
+        crate::types::typed(table, &column, value.clone())?;
+    }
+    Ok(column)
 }
 
 /// A DEFAULT as the catalog keeps it, in the type the author wrote. `None` for anything but

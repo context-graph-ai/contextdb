@@ -155,7 +155,7 @@ fn of_two_transactions_inserting_one_key_exactly_one_commits() {
         .commit()
         .expect("the first of two transactions commits");
     match second.commit() {
-        Err(Error::UniqueViolation { table, column }) => {
+        Err(Error::UniqueViolation { table, column, .. }) => {
             assert_eq!((table.as_str(), column.as_str()), ("people", "id"));
         }
         other => panic!("the second transaction to take key 1 got {other:?}"),
@@ -176,7 +176,7 @@ fn of_two_transactions_inserting_one_key_exactly_one_commits() {
         .commit()
         .expect("the first of two transactions commits");
     match second.commit() {
-        Err(Error::UniqueViolation { table, column }) => {
+        Err(Error::UniqueViolation { table, column, .. }) => {
             assert_eq!((table.as_str(), column.as_str()), ("people", "email"));
         }
         other => panic!("the second transaction to take the email got {other:?}"),
@@ -201,6 +201,39 @@ fn of_two_transactions_inserting_one_key_exactly_one_commits() {
         .commit()
         .expect("a transaction that conflicts with nothing commits");
 
+    // A table with no primary key has no key for rows to collide on: both commit, as in
+    // Postgres, and both rows are there.
+    support::run(&db, "CREATE TABLE notes (body TEXT)");
+    let first = db.transaction().expect("begin");
+    let second = db.transaction().expect("begin");
+    support::run(&first, "INSERT INTO notes (body) VALUES ('one')");
+    support::run(&second, "INSERT INTO notes (body) VALUES ('two')");
+    first
+        .commit()
+        .expect("the first insert into a table with no key");
+    second
+        .commit()
+        .unwrap_or_else(|error| panic!("the second insert into a table with no key: {error:?}"));
+    assert_eq!(
+        support::rows(&db, "SELECT body FROM notes ORDER BY body"),
+        [
+            [Value::Text("one".to_owned())],
+            [Value::Text("two".to_owned())]
+        ]
+    );
+
+    // A transaction that inserts a key and deletes it again leaves the key empty, but another
+    // handle took the key meanwhile: its commit is refused as a conflict, and the other handle's
+    // row stands among the winners below.
+    let tx = db.transaction().expect("begin");
+    support::run(&tx, "INSERT INTO people VALUES (6, 'six@example.org')");
+    support::run(&tx, "DELETE FROM people WHERE id = 6");
+    support::run(&db, "INSERT INTO people VALUES (6, 'six@example.org')");
+    match tx.commit() {
+        Err(Error::ConditionalUpdateConflict { count }) => assert_eq!(count, 1),
+        other => panic!("a transaction whose key was taken meanwhile: {other:?}"),
+    }
+
     // The stored rows are exactly the winners'.
     let text = |s: &str| Value::Text(s.to_owned());
     assert_eq!(
@@ -210,6 +243,7 @@ fn of_two_transactions_inserting_one_key_exactly_one_commits() {
             [Value::Int64(2), text("shared@example.org")],
             [Value::Int64(4), text("four@example.org")],
             [Value::Int64(5), text("five@example.org")],
+            [Value::Int64(6), text("six@example.org")],
         ]
     );
 }
@@ -372,7 +406,7 @@ fn a_refused_statement_changes_nothing_and_leaves_the_transaction_usable() {
     for taken in [1, 2] {
         let sql = format!("INSERT INTO t (id, name, tag) VALUES ({taken}, 'again', 0)");
         match support::refusal(&tx, &sql) {
-            Error::UniqueViolation { table, column } => {
+            Error::UniqueViolation { table, column, .. } => {
                 assert_eq!((table.as_str(), column.as_str()), ("t", "id"));
             }
             other => panic!("a taken key was refused as {other:?}"),
@@ -464,6 +498,32 @@ fn a_transaction_that_declares_a_table_may_not_also_write_rows() {
     assert!(matches!(
         support::refusal(&db, "SELECT * FROM late"),
         Error::TableNotFound(_)
+    ));
+
+    // The same for a change and a drop of the table: after a row, each is refused and the row
+    // commits with the table as it was; before a row, the drop of the column commits.
+    let tx = db.transaction().expect("begin");
+    support::insert(&tx, 3..=3);
+    for sql in ["ALTER TABLE t DROP COLUMN tag CASCADE", "DROP TABLE t"] {
+        let refusal = support::refusal(&tx, sql);
+        assert!(
+            matches!(refusal, Error::MixedSchemaAndRowWrite),
+            "{sql}\nafter a row was refused as {refusal:?}"
+        );
+    }
+    tx.commit().expect("commit the row");
+    support::assert_rows_are(&db, 1..=3);
+    let tx = db.transaction().expect("begin");
+    support::run(&tx, "ALTER TABLE t DROP COLUMN tag CASCADE");
+    let refusal = support::refusal(&tx, "UPDATE t SET name = 'x' WHERE id = 1");
+    assert!(
+        matches!(refusal, Error::MixedSchemaAndRowWrite),
+        "a row change after a dropped column was refused as {refusal:?}"
+    );
+    tx.commit().expect("commit the drop");
+    assert!(matches!(
+        support::refusal(&db, "SELECT tag FROM t"),
+        Error::ColumnNotFound { .. }
     ));
 }
 

@@ -4,9 +4,10 @@
 
 mod support;
 
+use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 
-use contextdb::{DatabaseOpenOptions, Error, ReadSession, Value, VectorIndexRef};
+use contextdb::{ContextId, DatabaseOpenOptions, Error, ReadSession, Uuid, Value, VectorIndexRef};
 
 use support::{Run, Shown};
 
@@ -354,6 +355,31 @@ fn explain_names_how_each_partition_is_searched() {
     };
     assert!(lines.iter().any(unbound), "{explained}");
     assert_eq!(routes(&lines).len(), 2);
+
+    // A handle narrowed to Context 1 is told nothing of the partitions of other Contexts: no
+    // partition line, no count, no id of Context 2; the unnarrowed handle's text is unchanged.
+    support::run(
+        &db,
+        "CREATE TABLE scoped (id INTEGER PRIMARY KEY, context_id UUID NOT NULL CONTEXT_ID, \
+         v VECTOR(2) PARTITION_KEY (context_id))",
+    );
+    let (one, two) = (Uuid::from_u128(0x00C0_0001), Uuid::from_u128(0x00C0_0002));
+    for (id, context) in [(1, one), (2, two)] {
+        let sql = format!("INSERT INTO scoped VALUES ({id}, '{context}', [1.0, 0.0])");
+        support::run(&db, &sql);
+    }
+    let sql = "SELECT id, v <=> [1.0, 0.0] AS distance FROM scoped ORDER BY distance LIMIT 10";
+    let whole = db.explain(sql).expect("explain");
+    assert!(whole.contains(&two.to_string()), "{whole}");
+    let narrowed = db.scoped_with_contexts(BTreeSet::from([ContextId::new(one)]));
+    let seen = narrowed.explain(sql).expect("a narrowed handle explains");
+    assert!(
+        !seen.contains("partition:")
+            && !seen.contains("partitions:")
+            && !seen.contains(&two.to_string()),
+        "a handle narrowed to Context 1 was told of other partitions:\n{seen}"
+    );
+    assert_eq!(db.explain(sql).expect("explain"), whole);
 
     // Any other statement is a later version's to explain.
     match db.explain("SELECT id FROM docs") {

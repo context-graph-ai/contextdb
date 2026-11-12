@@ -1125,12 +1125,16 @@ fn a_distance_on_a_column_of_another_table_is_a_column_that_is_not_found() {
     let mut wrong = Vec::new();
     for qualifier in ["other", "nowhere"] {
         // What any column written under that name is refused as: not found, naming the
-        // statement's table and the column.
+        // qualifier as written and the column.
         let plain = format!("SELECT {qualifier}.v FROM docs LIMIT 3");
         let not_found = refused_at_every_door(&db, &reader, &plain, &query);
         match &not_found {
             Error::ColumnNotFound { table, column } => {
-                assert_eq!((table.as_str(), column.as_str()), ("docs", "v"), "{plain}");
+                assert_eq!(
+                    (table.as_str(), column.as_str()),
+                    (qualifier, "v"),
+                    "{plain}"
+                );
             }
             other => panic!("{plain}\nwas refused as {other:?}"),
         }
@@ -1437,24 +1441,36 @@ fn the_index_clauses_are_refused_by_kind() {
             other => panic!("{sql}\nwas refused as {other:?}"),
         }
     }
-    // What a later version reads is refused by its name.
-    for (declared, name) in [
+    // What no version reads is refused by its name, and the sentence says what to write instead.
+    let tuning = |name: &str| {
+        format!(
+            "{name} (...) is not part of this library: the index sizes its own groups and measures \
+             how far a search scans; for the true nearest rows write USE VECTOR EXACT or \
+             SEARCH_MODE EXACT, and to move the size from which AUTO uses the index write \
+             AUTO_INDEX_AT"
+        )
+    };
+    for (declared, sentence) in [
         (
             "VECTOR(4) WITH (quantization = 'SQ4')",
-            "WITH (quantization = 'SQ4')",
+            "WITH (quantization = 'SQ4') is not part of this library: write 'SQ8' to store one \
+             byte a component, or leave the clause out to store each vector as given"
+                .to_owned(),
         ),
-        ("VECTOR(4) IVF (LISTS = 4, PROBES = 2)", "IVF"),
         (
-            "VECTOR(4) SEARCH (TARGET_ACCURACY = 0.9, EXPECTED_VECTORS = 100)",
-            "SEARCH",
+            "VECTOR(4) IVF (LISTS = 16, PROBES = 4, REFINE_FACTOR = 2)",
+            tuning("IVF"),
+        ),
+        (
+            "VECTOR(4) SEARCH (TARGET_ACCURACY = 0.95, EXPECTED_VECTORS = 1000000)",
+            tuning("SEARCH"),
         ),
     ] {
         let sql = with_vector(declared);
-        let sentence = support::refusal(&db, &sql).to_string();
-        assert!(
-            sentence.ends_with(&format!("{name} {LATER_VERSION}")),
-            "{sql}\nwas refused in the sentence: {sentence}"
-        );
+        match support::refusal(&db, &sql) {
+            Error::PlanError(text) => assert_eq!(text, sentence, "{sql}"),
+            other => panic!("{sql}\nwas not refused by name: {other:?}"),
+        }
     }
     // A CONSOLIDATION list that is empty, names a member twice or names another member, and
     // a clause out of its place, are syntax errors.

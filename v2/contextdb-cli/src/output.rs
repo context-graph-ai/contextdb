@@ -1,5 +1,8 @@
 //! Everything the shell prints: results on the output, refusals on the error stream, each as
-//! text for a person or, under `--json`, as one JSON document a line.
+//! text for a person or, under `--json`, as one JSON document a line. A result that cannot be
+//! written is handed back to the shell as the failure it is.
+
+use std::io::{Result, Write, stdout};
 
 use contextdb::serde_json::{Map, Value as Json, json};
 use contextdb::{Error, QueryResult, Value};
@@ -12,9 +15,9 @@ pub struct Output {
 
 impl Output {
     /// The result of one statement: the rows of a SELECT, or how many rows a write changed.
-    pub fn result(self, result: &QueryResult) {
+    pub fn result(self, result: &QueryResult) -> Result<()> {
         if result.columns().is_empty() {
-            self.rows_affected(result.rows_affected());
+            self.rows_affected(result.rows_affected())
         } else if self.json {
             // A row is written key by key so that its keys come in the order of `columns`.
             let mut rows = String::new();
@@ -31,81 +34,81 @@ impl Output {
                 }
                 rows.push('}');
             }
-            println!(
+            writeln!(
+                stdout(),
                 "{{\"result\":{{\"columns\":{},\"rows\":[{rows}]}}}}",
                 json!(result.columns())
-            );
+            )
         } else {
-            print!("{}", table(result.columns(), result.rows()));
+            write!(stdout(), "{}", table(result.columns(), result.rows()))
         }
     }
 
     /// The rows of an inspection statement: one `name: value` to a line, with an empty line
     /// between rows.
-    pub fn fields(self, result: &QueryResult) {
+    pub fn fields(self, result: &QueryResult) -> Result<()> {
         if self.json {
             return self.result(result);
         }
         for (at, row) in result.rows().iter().enumerate() {
             if at > 0 {
-                println!();
+                writeln!(stdout())?;
             }
             for (name, value) in result.columns().iter().zip(row) {
-                println!("{name}: {}", text(value));
+                writeln!(stdout(), "{name}: {}", text(value))?;
             }
         }
+        Ok(())
     }
 
     /// What `.explain` answers: its lines.
-    pub fn explain(self, lines: &str) {
+    pub fn explain(self, lines: &str) -> Result<()> {
         if self.json {
             let lines: Vec<&str> = lines.lines().collect();
-            println!("{}", json!({ "explain": { "lines": lines } }));
+            writeln!(stdout(), "{}", json!({ "explain": { "lines": lines } }))
         } else {
-            println!("{lines}");
+            writeln!(stdout(), "{lines}")
         }
     }
 
     /// A statement that returns no rows succeeded and changed this many.
-    pub fn rows_affected(self, rows: u64) {
+    pub fn rows_affected(self, rows: u64) -> Result<()> {
         if self.json {
-            println!("{}", json!({ "rows_affected": rows }));
+            writeln!(stdout(), "{}", json!({ "rows_affected": rows }))
         } else {
-            println!("ok (rows_affected={rows})");
+            writeln!(stdout(), "ok (rows_affected={rows})")
         }
     }
 
     /// What `.tables` answers: the table names, one a line.
-    pub fn tables(self, names: &[String]) {
+    pub fn tables(self, names: &[String]) -> Result<()> {
         if self.json {
-            println!("{}", json!({ "tables": { "items": names } }));
+            writeln!(stdout(), "{}", json!({ "tables": { "items": names } }))
         } else {
-            for name in names {
-                println!("{name}");
-            }
+            names
+                .iter()
+                .try_for_each(|name| writeln!(stdout(), "{name}"))
         }
     }
 
     /// What `.schema` answers: the table's declaration as SQL.
-    pub fn schema(self, table: &str, declaration: &str) {
+    pub fn schema(self, table: &str, declaration: &str) -> Result<()> {
         if self.json {
-            println!(
-                "{}",
-                json!({ "schema": { "table": table, "ddl": declaration } })
-            );
+            let schema = json!({ "schema": { "table": table, "ddl": declaration } });
+            writeln!(stdout(), "{schema}")
         } else {
-            println!("{}", declaration.trim_end());
+            writeln!(stdout(), "{}", declaration.trim_end())
         }
     }
 
     /// What `.help` answers.
-    pub fn help(self, lines: &[&str]) {
+    pub fn help(self, lines: &[&str]) -> Result<()> {
         if self.json {
-            println!("{}", json!({ "help": lines }));
+            writeln!(stdout(), "{}", json!({ "help": lines }))
         } else {
-            for line in lines {
-                println!("{line}");
-            }
+            lines
+                .iter()
+                .try_for_each(|line| writeln!(stdout(), "{line}"))
         }
     }
 
@@ -157,16 +160,24 @@ impl Output {
         self.refused(class, &message, Some(detail));
     }
 
+    /// A warning: the statement still answers and the run goes on, as in Postgres.
+    pub fn warning(self, message: &str) {
+        eprintln!("warning: {message}");
+    }
+
     /// A refusal of the shell's own: `class` is `usage` for a command line or a shell command
     /// it cannot act on, `sql` for a statement.
     pub fn refusal(self, class: &str, message: &str) {
         self.refused(class, message, None);
     }
 
-    /// A line that starts like a shell command and is not one. For a person it is a plain line
-    /// with no `Error:` before it.
-    pub fn unknown_command(self, line: &str) {
-        let message = format!("Unknown command: {line}. Type \\? for help.");
+    /// A line that starts like a shell command and is not one, or a command used wrongly, with
+    /// its `usage`. For a person it is a plain line with no `Error:` before it.
+    pub fn unknown_command(self, line: &str, usage: Option<&str>) {
+        let message = match usage {
+            Some(usage) => format!("Usage: {usage}"),
+            None => format!("Unknown command: {line}. Type \\? for help."),
+        };
         if self.json {
             self.refused("usage", &message, None);
         } else {

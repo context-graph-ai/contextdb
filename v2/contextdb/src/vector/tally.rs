@@ -6,8 +6,8 @@ use std::collections::btree_map::Entry;
 
 use super::directory;
 use crate::memory::{Budget, Reservation};
-use crate::schema::{Table, VectorColumn};
-use crate::store::{Cell, Key, Read, Row, VectorId, VectorNumber};
+use crate::schema::{Catalog, Table, VectorColumn};
+use crate::store::{Cell, Key, Read, Row, StagedValues, VectorId, VectorNumber};
 use crate::types::{Error, Result, Value};
 
 /// What the rows a transaction has staged mean for the partition count of each VECTOR column
@@ -85,7 +85,7 @@ impl Tally {
         &mut self,
         table: &Table,
         before: Option<&Row>,
-        after: Option<&[Value]>,
+        after: Option<StagedValues<'_>>,
         read: &dyn Read,
     ) -> Result<()> {
         for column in &table.vectors {
@@ -138,20 +138,18 @@ impl Tally {
         Ok(())
     }
 
-    /// The last act of a statement that wrote rows. Refuses with
-    /// `VectorPartitionLimitExceeded` when the statement put a vector under a key tuple that
-    /// had none and the column would then have more partitions than its limit, and forgets
-    /// what the statement noted; otherwise keeps it.
-    pub(crate) fn settle(&mut self, table: &Table) -> Result<()> {
-        for column in &table.vectors {
-            let mut notes = self.noted.iter();
-            let began = notes.any(|note| note.place.0 == column.id && note.began);
+    /// The last act of a statement that wrote rows, after the rows that follow it. Refuses
+    /// with `VectorPartitionLimitExceeded` when the statement put a vector under a key tuple
+    /// that had none and the column, found in `catalog`, would then have more partitions than
+    /// its limit; what the statement noted is then forgotten by `database`, as for any
+    /// refusal. Otherwise keeps it.
+    pub(crate) fn settle(&mut self, catalog: &Catalog) -> Result<()> {
+        let began = self.noted.iter().filter(|note| note.began);
+        for (table, column) in began.filter_map(|note| catalog.vector(note.place.0)) {
             let partitions = self.partitions.get(&column.id).copied().unwrap_or(0);
             if let Some(limit) = column.limit()
-                && began
                 && partitions > u64::from(limit)
             {
-                self.forget();
                 return Err(Error::VectorPartitionLimitExceeded {
                     index: table.vector_ref(column),
                     max_partitions: limit,
@@ -188,8 +186,10 @@ pub(super) fn position(table: &Table, name: &str) -> usize {
 
 /// The key tuple a row's vector was under in a VECTOR column, and the one it is under now.
 ///
-/// `before` is the row as it was and `after` its values as they are staged; `None` is no row.
-/// A row that is not there, and a row whose vector is NULL, has its vector under no tuple.
+/// `before` is the row as it was and `after` its values as they are staged, with the large
+/// cells it left where they are; `None` is no row. A row that is not there, a row whose vector
+/// is NULL, and a row in a state its table declares `EXCLUDE VECTOR` has its vector under no
+/// tuple.
 /// The tuple is the values of the PARTITION_KEY columns as [`Key::from_values`] encodes them,
 /// ascending; a column with no PARTITION_KEY has the one tuple of no values. A key column
 /// kept beside its row is loaded from `read` through `held`, which is given back what the
@@ -198,18 +198,26 @@ pub(super) fn tuples(
     table: &Table,
     column: &VectorColumn,
     before: Option<&Row>,
-    after: Option<&[Value]>,
+    after: Option<StagedValues<'_>>,
     read: &dyn Read,
     held: &mut Reservation,
 ) -> Result<(Option<Key>, Option<Key>)> {
     let vector = position(table, &column.column);
+    let machine = table.meta.state_machine.as_ref();
+    let state = machine.map(|machine| position(table, &machine.column));
+    let excluded = |value: &Value| matches!(value, Value::Text(state) if table.rules.exclude_vector_states.contains(state));
     let keys = column.partition_key.iter();
     let keys: Vec<usize> = keys.map(|name| position(table, name)).collect();
     let tuple = |values: Result<Vec<Value>>| Key::from_values(&values?, &[]).map(Some);
     let was = match before {
-        Some(row) if !matches!(row.cells[vector], Cell::Here(Value::Null)) => {
+        Some(row)
+            if !matches!(*table.cell(row, vector), Cell::Here(Value::Null))
+                && !state.is_some_and(
+                    |at| matches!(&*table.cell(row, at), Cell::Here(value) if excluded(value)),
+                ) =>
+        {
             let taken = held.bytes();
-            let values = keys.iter().map(|&at| match &row.cells[at] {
+            let values = keys.iter().map(|&at| match &*table.cell(row, at) {
                 Cell::Here(value) => Ok(value.clone()),
                 Cell::Beside(beside) => read.load(beside, held),
             });
@@ -220,7 +228,10 @@ pub(super) fn tuples(
         _ => None,
     };
     let is = match after {
-        Some(values) if values[vector] != Value::Null => {
+        Some((values, left))
+            if (values[vector] != Value::Null || left.iter().any(|(at, _)| *at == vector))
+                && !state.is_some_and(|at| excluded(&values[at])) =>
+        {
             tuple(Ok(keys.iter().map(|&at| values[at].clone()).collect()))?
         }
         _ => None,

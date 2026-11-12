@@ -219,18 +219,23 @@ fn moves(changes: &ChangeSet, catalog: &Catalog, held: &mut Reservation) -> Resu
             continue;
         }
         let staged = changes.rows_changed();
-        for (_, key, after, _) in staged.filter(|staged| staged.0 == table.id) {
+        for (_, key, staged, _) in staged.filter(|staged| staged.0 == table.id) {
             let before = base.row(table.id, key)?;
             for column in &table.vectors {
-                let (leaves, enters) = tuples(table, column, before.as_ref(), after, base, held)?;
+                let (leaves, enters) = tuples(table, column, before.as_ref(), staged, base, held)?;
                 if leaves == enters {
-                    // The row has a vector under one tuple before and after, or none.
-                    let (Some(row), Some(values), true) = (&before, after, leaves.is_some()) else {
+                    // The row has a vector under one tuple before and after, or none. A vector
+                    // the row left where it is has not changed.
+                    let at = position(table, &column.column);
+                    let kept =
+                        staged.is_some_and(|(_, left)| left.iter().any(|(slot, _)| *slot == at));
+                    let (Some(row), Some((values, _)), true, false) =
+                        (&before, staged, leaves.is_some(), kept)
+                    else {
                         continue;
                     };
-                    let at = position(table, &column.column);
                     let taken = held.bytes();
-                    let same = match &row.cells[at] {
+                    let same = match &*table.cell(row, at) {
                         Cell::Here(vector) => *vector == values[at],
                         Cell::Beside(beside) => base.load(beside, held)? == values[at],
                     };

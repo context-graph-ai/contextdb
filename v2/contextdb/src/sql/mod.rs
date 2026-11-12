@@ -23,6 +23,13 @@ pub(crate) fn parse(text: &str) -> Result<Statement> {
     parser::parse(text)
 }
 
+/// Reads the formula of a rank policy: numbers and `{column}`s joined by `+` and `*`, in
+/// parentheses or in `coalesce(<formula>, <number>)`, as the tree any expression is. Refuses
+/// with `ParseError`.
+pub(crate) fn formula(text: &str) -> Result<Expr> {
+    parser::formula(text)
+}
+
 /// Plans a parsed statement. Refuses with `PlanError`. Looks at no table and no data.
 pub(crate) fn plan(statement: &Statement) -> Result<Plan> {
     planner::plan(statement)
@@ -34,4 +41,10 @@ pub(crate) fn not_supported(what: &str) -> Error {
     Error::PlanError(format!(
         "{what} is not supported in this version of the library"
     ))
+}
+
+/// The refusal of a form of the earlier engine that no version of the library reads, by its
+/// name, with what to write in its place.
+pub(crate) fn not_carried(what: &str, instead: &str) -> Error {
+    Error::PlanError(format!("{what} is not part of this library: {instead}"))
 }

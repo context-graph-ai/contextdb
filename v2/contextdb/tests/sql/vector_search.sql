@@ -175,3 +175,85 @@ id | distance
 4 | 0.0
 1 | 1.0
 2 | 1.0
+
+# A table may leave the rows in some states out of every search: `PROPAGATE ON STATE x EXCLUDE
+# VECTOR`. Such a row stays a row, and a plain SELECT still returns it; a similarity search does
+# not. A row moved into an excluded state by an UPDATE, or by propagation from the row it
+# references, is out of the next search, EXACT or INDEXED, and out of what SHOW counts; moved
+# back to a state the table does not exclude, it is found again. From [1, 0] the order is 1, 2,
+# 5, 3, 4: the rows left out are the nearest, so a search that cut its list before leaving
+# them out would come back short.
+CREATE TABLE sources (id INTEGER PRIMARY KEY, status TEXT NOT NULL)
+STATE MACHINE (status: active -> [archived]);
+CREATE TABLE claims (
+  id INTEGER PRIMARY KEY,
+  status TEXT NOT NULL,
+  source_id INTEGER REFERENCES sources(id) ON STATE archived PROPAGATE SET superseded,
+  v VECTOR(2)
+) STATE MACHINE (status: active -> [invalidated, superseded], invalidated -> [active], superseded -> [active])
+  PROPAGATE ON STATE invalidated EXCLUDE VECTOR
+  PROPAGATE ON STATE superseded EXCLUDE VECTOR;
+INSERT INTO sources (id, status) VALUES (1, 'active'), (2, 'active');
+INSERT INTO claims (id, status, source_id, v)
+VALUES (3, 'active', 2, [0.0, 1.0]),
+       (1, 'active', 1, [1.0, 0.0]),
+       (4, 'active', 2, [-1.0, 0.0]),
+       (2, 'active', 1, [0.9, 0.1]),
+       (5, 'active', 2, [0.5, 0.5]);
+
+SELECT id FROM claims ORDER BY v <=> [1.0, 0.0] LIMIT 10;
+----
+id
+1
+2
+5
+3
+4
+
+# Row 3 by an UPDATE; rows 1 and 2 by propagation, as source 1 is archived.
+UPDATE claims SET status = 'invalidated' WHERE id = 3;
+----
+rows affected: 1
+
+UPDATE sources SET status = 'archived' WHERE id = 1;
+----
+rows affected: 1
+
+SELECT id FROM claims ORDER BY v <=> [1.0, 0.0] LIMIT 10;
+----
+id
+5
+4
+
+SELECT id FROM claims ORDER BY v <=> [1.0, 0.0] USE VECTOR INDEXED LIMIT 2;
+----
+id
+5
+4
+
+SELECT id, status FROM claims ORDER BY id;
+----
+id | status
+1 | superseded
+2 | superseded
+3 | invalidated
+4 | active
+5 | active
+
+SHOW VECTOR_PARTITIONS FOR claims.v;
+----
+table | column | partition_key | live_rows | pending_inserts | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | availability_reason | maintenance_state | maintenance_reason | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | lists | probes | recovery_action
+claims | v | {} | 2 | 2 | 0 | 0 | 0 | true | none | idle | none | 0 | 0 | 0 | NULL | NULL | none
+
+UPDATE claims SET status = 'active' WHERE id IN (1, 2, 3);
+----
+rows affected: 3
+
+SELECT id FROM claims ORDER BY v <=> [1.0, 0.0] LIMIT 10;
+----
+id
+1
+2
+5
+3
+4

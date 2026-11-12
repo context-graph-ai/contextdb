@@ -15,7 +15,7 @@ mod support;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use contextdb::{
     Database, DatabaseOpenOptions, Error, ReadSession, ReadSessionOptions, Value, params,
@@ -24,6 +24,11 @@ use contextdb::{
 const LIMIT: usize = 64 << 20;
 const ROWS: i64 = 1_000_000;
 const ROWS_IN_A_COMMIT: i64 = 10_000;
+
+/// The most pages one UPDATE of one small column may write: the pages from the root to the row
+/// and to its two index entries, the commit's own records, and room beside them.
+const UPDATE_PAGES: u64 = 32;
+const PAGE: u64 = 4096;
 
 /// The system allocator, counting the bytes allocated now and the most there have been.
 struct Counting {
@@ -109,6 +114,25 @@ fn a_million_rows_load_and_scan_under_64_mib() {
          {} bytes on the store's account under a limit of {LIMIT}",
         peak - before
     );
+
+    // A commit writes what it changed, not what the store holds: the hundredth commit of
+    // 10,000 new rows writes about what the first did, whatever the tree has grown to.
+    let first =
+        support::last_number(&lines, "first_commit_bytes").expect("the loader announces it");
+    let last = support::last_number(&lines, "last_commit_bytes").expect("the loader announces it");
+    assert!(
+        last <= 2 * first,
+        "the first commit of {ROWS_IN_A_COMMIT} rows wrote {first} bytes and the hundredth wrote \
+         {last}: a commit's writes grow with the size of the store"
+    );
+    // One UPDATE of one small column of one row, in a store of a million rows, changes the
+    // pages on the way to that row and to its index entry, and nothing else.
+    let update = support::last_number(&lines, "update_bytes").expect("the loader announces it");
+    assert!(
+        update <= UPDATE_PAGES * PAGE,
+        "one UPDATE of one column of one row in a store of {ROWS} rows wrote {update} bytes, more \
+         than {UPDATE_PAGES} pages of {PAGE} bytes"
+    );
 }
 
 /// Opens the store with the limit, loads the rows, scans them, and announces `before <bytes>`,
@@ -122,13 +146,31 @@ fn load_and_scan(role: support::Role) {
     ALLOCATED.peak.store(before, Ordering::Relaxed);
     let mut options = DatabaseOpenOptions::default();
     options.memory_limit = Some(LIMIT);
+    // The bytes written to the data file, counted by the storage door.
+    let written = std::sync::Arc::new(AtomicU64::new(0));
+    options.storage = Some(support::storage({
+        let written = written.clone();
+        move |call| {
+            if let support::Call::Write(_, bytes) = call {
+                written.fetch_add(bytes.len() as u64, Ordering::SeqCst);
+            }
+        }
+    }));
     let db = support::open_with(&role.folder, options).expect("open the store under the limit");
 
     for first in (1..=ROWS).step_by(ROWS_IN_A_COMMIT as usize) {
+        written.store(0, Ordering::SeqCst);
         let tx = db.transaction().expect("begin");
         support::insert(&tx, first..first + ROWS_IN_A_COMMIT);
         tx.commit()
             .expect("commit ten thousand rows under the limit");
+        let bytes = written.load(Ordering::SeqCst);
+        if first == 1 {
+            support::say(format!("first_commit_bytes {bytes}"));
+        }
+        if first + ROWS_IN_A_COMMIT > ROWS {
+            support::say(format!("last_commit_bytes {bytes}"));
+        }
         support::say(format!("committed {}", first + ROWS_IN_A_COMMIT - 1));
     }
 
@@ -147,6 +189,11 @@ fn load_and_scan(role: support::Role) {
         .expect("read the last page");
     let wanted: Vec<_> = (ROWS - 99..=ROWS).map(support::row).collect();
     support::assert_same_rows(last_page.rows(), &wanted, "the last hundred rows");
+
+    // One UPDATE of one small column of one row, and the bytes it writes.
+    written.store(0, Ordering::SeqCst);
+    support::run(&db, "UPDATE t SET tag = 7 WHERE id = 500000");
+    support::say(format!("update_bytes {}", written.load(Ordering::SeqCst)));
 
     // Memory the host takes for itself is not the store's: with twice the limit allocated
     // beside it, the store counts what it counted and still answers under its limit.
@@ -178,10 +225,17 @@ fn load_and_scan(role: support::Role) {
 const VALUE: usize = 1 << 20;
 const VALUE_LIMIT: usize = (9 << 20) + (64 << 10);
 
+/// The JSON cases of the test below: the same 1 MiB as text, in the shape that shrinks most
+/// (an array of small objects), whose tree in memory is some twenty times its text. The limit
+/// leaves 4 MiB beyond the open's 9 MiB: room for the text, none for the tree.
+const JSON_ROOM: usize = 4 << 20;
+const JSON_LIMIT: usize = (9 << 20) + JSON_ROOM;
+
 #[test]
 fn a_refused_compressed_value_is_never_produced() {
     if let Some(role) = support::role() {
-        return refused_select(&role);
+        refused_select(&role);
+        return refused_json(&role);
     }
     let folder = support::folder("refused-value-never-produced");
     let db = support::open(&folder);
@@ -189,6 +243,15 @@ fn a_refused_compressed_value_is_never_produced() {
         &db,
         "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
     );
+    support::run(
+        &db,
+        "CREATE TABLE records (id INTEGER PRIMARY KEY, meta JSON NOT NULL)",
+    );
+    db.execute(
+        "INSERT INTO records (id, meta) VALUES ($id, $meta)",
+        &params! { "id" => 1_i64, "meta" => Value::Json(support::large_json(true, 1, VALUE)) },
+    )
+    .expect("store the JSON value");
     let large = support::large_text(support::Kind::Repeating, 1, VALUE);
     for (id, body) in [(1_i64, large.as_str()), (2, "small")] {
         db.execute(
@@ -228,6 +291,43 @@ fn a_refused_compressed_value_is_never_produced() {
         "while a value of {VALUE} bytes was refused, the process allocated {rise} bytes more \
          than it had before the select"
     );
+
+    // A JSON value is counted as the tree it becomes, not as its text: a tree of some twenty
+    // times the text, under a limit with room for the text only, is refused by name when it is
+    // selected and when the same text is written, and is made in neither case.
+    for (prefix, what) in [("select_", "selected"), ("write_", "written")] {
+        assert_eq!(
+            support::last_number(&lines, &format!("{prefix}refused")),
+            Some(1),
+            "a JSON value of {VALUE} bytes of text whose tree is far larger than the \
+             {JSON_ROOM} bytes of room its limit leaves was not refused when {what}: the limit \
+             counts the tree, not the text"
+        );
+        let rise = support::last_number(&lines, &format!("{prefix}rise")).expect("announced");
+        assert!(
+            rise < JSON_ROOM as u64,
+            "while a JSON value was refused when {what}, the process allocated {rise} bytes more \
+             than it had before: the tree was made though the limit left {JSON_ROOM} bytes"
+        );
+    }
+}
+
+/// Runs one statement and announces `<prefix>refused 1` when the memory limit refused it (0 when
+/// it was answered) and `<prefix>rise <bytes>`: how far the most this process ever had allocated
+/// rose above what it had allocated just before the statement. Any other outcome fails.
+fn measured<T>(prefix: &str, statement: impl FnOnce() -> contextdb::Result<T>) -> bool {
+    let before = ALLOCATED.now.load(Ordering::Relaxed);
+    ALLOCATED.peak.store(before, Ordering::Relaxed);
+    let outcome = statement();
+    let peak = ALLOCATED.peak.load(Ordering::Relaxed);
+    let refused = match outcome {
+        Err(Error::MemoryBudgetExceeded { .. }) => true,
+        Err(other) => panic!("the statement was refused as {other:?}"),
+        Ok(_) => false,
+    };
+    support::say(format!("{prefix}refused {}", u8::from(refused)));
+    support::say(format!("{prefix}rise {}", peak - before));
+    refused
 }
 
 /// Opens the store for reading under the limit and reads the small row and the count, so that
@@ -246,19 +346,42 @@ fn refused_select(role: &support::Role) {
         [[support::text("small")]]
     );
 
-    let before = ALLOCATED.now.load(Ordering::Relaxed);
-    ALLOCATED.peak.store(before, Ordering::Relaxed);
-    let outcome = reader.execute("SELECT body FROM notes WHERE id = 1", &params! {});
-    let peak = ALLOCATED.peak.load(Ordering::Relaxed);
-    match outcome {
-        Err(Error::MemoryBudgetExceeded { .. }) => support::say("refused 1"),
-        Err(other) => panic!("the select of the large value was refused as {other:?}"),
-        Ok(result) => panic!(
-            "the select of the large value was answered with {} rows",
-            result.rows().len()
-        ),
-    }
-    support::say(format!("rise {}", peak - before));
+    measured("", || {
+        reader.execute("SELECT body FROM notes WHERE id = 1", &params! {})
+    });
+}
+
+/// Selects the JSON value under [`JSON_LIMIT`] from a reader, then writes the text of a second
+/// value of the same shape from a writer under the same limit, and announces each as
+/// [`measured`] does, with the prefixes `select_` and `write_`. A refused write left no row.
+fn refused_json(role: &support::Role) {
+    let mut options = ReadSessionOptions::default();
+    options.memory_limit = Some(JSON_LIMIT);
+    let reader = ReadSession::open_with_options(&role.folder, options)
+        .expect("open the store for reading under the limit");
+    assert_eq!(support::int(&reader, "SELECT COUNT(*) FROM records"), 1);
+    measured("select_", || {
+        reader.execute("SELECT meta FROM records WHERE id = 1", &params! {})
+    });
+    drop(reader);
+
+    let mut options = DatabaseOpenOptions::default();
+    options.memory_limit = Some(JSON_LIMIT);
+    let db = support::open_with(&role.folder, options).expect("open the store under the limit");
+    let text = contextdb::serde_json::to_string(&support::large_json(true, 2, VALUE))
+        .expect("JSON writes as text");
+    measured("write_", || {
+        db.execute(
+            "INSERT INTO records (id, meta) VALUES ($id, $meta)",
+            &params! { "id" => 2_i64, "meta" => text },
+        )
+    });
+    assert_eq!(
+        support::int(&db, "SELECT COUNT(*) FROM records"),
+        1,
+        "the refused write left a row"
+    );
+    support::close(db);
 }
 
 // ---- a full cache ----
@@ -481,9 +604,19 @@ fn an_indexed_search_and_a_build_stay_under_the_limit() {
     assert!(refused.is_empty(), "under {BUILD_LIMIT} bytes: {refused:?}");
     let told = |key: &str| support::last_number(&lines, key);
     assert_eq!(
-        (told("stalled"), told("lists"), told("rows")),
-        (Some(0), Some(45), Some(10)),
-        "the build's stalled partitions and groups, and the rows of the indexed search"
+        (
+            told("stalled"),
+            told("lists"),
+            told("rows"),
+            told("exact_rows")
+        ),
+        (Some(0), Some(45), Some(10), Some(10)),
+        "the build's stalled partitions and groups, and the rows of the indexed and of the \
+         exact search"
+    );
+    assert!(
+        lines.iter().any(|line| line == "committed 200"),
+        "the commit of vectors under the limit was not taken: {lines:?}"
     );
     // What the process took for the store, from before the open to the end, every step of
     // the build and the search included, is within the limit. Each began with the cache full.
@@ -507,6 +640,20 @@ fn a_build_under_the_limit(role: &support::Role) {
     let mut options = DatabaseOpenOptions::default();
     options.memory_limit = Some(BUILD_LIMIT);
     let db = support::open_with(&role.folder, options).expect("open the store under the limit");
+    // One commit of vectors under the limit: 200 rows take a nearby vector of the same
+    // direction, so the column keeps its 2,000 vectors and the build below is the same.
+    fill_the_cache(&db);
+    let tx = db.transaction().expect("begin");
+    for id in 1..=200_i64 {
+        let values = params! { "id" => id, "v" => support::gathered(id + 8, 64) };
+        if let Err(error) = tx.execute("UPDATE docs SET v = $v WHERE id = $id", &values) {
+            support::say(format!("refused {error:?}"));
+        }
+    }
+    match tx.commit() {
+        Ok(_) => support::say("committed 200"),
+        Err(error) => support::say(format!("refused {error:?}")),
+    }
     for _ in 0..100 {
         fill_the_cache(&db);
         match db.run_maintenance_cycle() {
@@ -532,6 +679,11 @@ fn a_build_under_the_limit(role: &support::Role) {
     let query = support::gathered(93_000, 64);
     match support::search(&db, &support::by_mode(None, "INDEXED", 10), &query) {
         Ok(result) => support::say(format!("rows {}", result.rows().len())),
+        Err(error) => support::say(format!("refused {error:?}")),
+    }
+    fill_the_cache(&db);
+    match support::search(&db, &support::by_mode(None, "EXACT", 10), &query) {
+        Ok(result) => support::say(format!("exact_rows {}", result.rows().len())),
         Err(error) => support::say(format!("refused {error:?}")),
     }
     support::close(db);

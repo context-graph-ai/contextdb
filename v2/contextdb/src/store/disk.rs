@@ -1,15 +1,15 @@
 //! What the data file holds, how one committed moment of it is read, and how a commit is
 //! written into it.
 //!
-//! Seven tables of the storage library hold everything. Rows and index entries are keyed by
+//! Eight tables of the storage library hold everything. Rows and index entries are keyed by
 //! the number of their table or index and then their key, so one table's rows are one run of
 //! keys. A large value is cut into slices of 243 bytes, each under a place number of its own:
 //! the slices of one value are under consecutive places, and its row says how many bytes there
 //! are and which place is the first. The vector part's blocks have a table to themselves, and
-//! its partition entries and pending entries share another. The last table holds the few
-//! numbers the store keeps: the newest commit, the commit that last changed the schema, the
-//! next free place, the declared memory limit, each table's row count, and the vector part's
-//! three numbers.
+//! its partition entries and pending entries share another. Kept counts have one. The last
+//! table holds the few numbers the store keeps: the newest commit, the commit that last
+//! changed the schema, the next free place, the declared memory limit, each table's row count,
+//! and the vector part's three numbers.
 
 use std::io::{self, ErrorKind};
 use std::ops::{Bound, Range};
@@ -20,9 +20,12 @@ use redb::{ReadOnlyTable, ReadTransaction, ReadableDatabase, ReadableTable, Tabl
 
 use super::folder::Hold;
 use super::keys::{self, Span, stored};
-use super::{Beside, Cell, ChangeSet, EntryIter, IndexId, Key, Read, Row, RowIter, TableId, View};
+use super::{
+    Beside, ChangeSet, CountId, EntryIter, IndexId, Joined, KeptIter, Key, Read, Row, RowIter,
+    TableId, View,
+};
 use super::{VectorNumber, VectorRecord};
-use super::{record, split};
+use super::{counts, drop, record, split};
 use crate::memory::Reservation;
 use crate::types::{Error, Result, TxId, Value};
 
@@ -31,10 +34,14 @@ pub(super) type Stored<T> = std::result::Result<T, redb::Error>;
 
 /// Rows: table number and key, to the row as `record` writes it.
 const ROWS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("rows");
-/// Index entries: index number, entry and row key, to the length of the entry.
+/// Index entries: index number, entry and row key, to the length of the entry in four bytes
+/// and, for an entry that holds a cut value, the place its first one's kept bytes end in four
+/// more.
 const INDEX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("index");
 /// Large values: place, to one slice of the record `record` stores for the value.
 const BESIDE: TableDefinition<u64, &[u8]> = TableDefinition::new("beside");
+/// Kept counts: count number and the group's key, to the count in eight bytes.
+const COUNTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("counts");
 /// Schema records by name, as `schema` wrote them.
 const SCHEMA: TableDefinition<&str, &[u8]> = TableDefinition::new("schema");
 /// The numbers the store keeps.
@@ -60,7 +67,7 @@ const NEXT_PLACE: u64 = 2;
 const MEMORY_LIMIT: u64 = 3;
 
 /// Where a table's row count is kept among the numbers.
-fn count_of(table: u32) -> u64 {
+pub(super) fn count_of(table: u32) -> u64 {
     (1 << 32) | u64::from(table)
 }
 
@@ -77,6 +84,17 @@ pub(super) fn vector_number_at(number: VectorNumber) -> u64 {
 /// find them.
 fn places(kept: &Beside) -> Range<u64> {
     kept.place..kept.place + kept.bytes.div_ceil(SLICE as u64)
+}
+
+/// Removes the slices of a large value.
+pub(super) fn remove_slices(
+    beside: &mut redb::Table<'_, u64, &'static [u8]>,
+    kept: &Beside,
+) -> Stored<()> {
+    for place in places(kept) {
+        beside.remove(place)?;
+    }
+    Ok(())
 }
 
 /// Tells a failure of the storage library or of a file as the engine tells it: as damage when
@@ -112,7 +130,7 @@ pub(super) fn failed(
 }
 
 /// What a record that is not one the store wrote is told as: a failed check.
-fn unsound() -> redb::Error {
+pub(super) fn unsound() -> redb::Error {
     redb::Error::Corrupted("a stored record is not one the store wrote".to_owned())
 }
 
@@ -141,6 +159,7 @@ pub(super) fn prepare(data: &redb::Database) -> Stored<()> {
     write.open_table(ROWS)?;
     write.open_table(INDEX)?;
     write.open_table(BESIDE)?;
+    write.open_table(COUNTS)?;
     write.open_table(SCHEMA)?;
     write.open_table(NUMBERS)?;
     write.open_table(BLOCKS)?;
@@ -149,11 +168,12 @@ pub(super) fn prepare(data: &redb::Database) -> Stored<()> {
     Ok(())
 }
 
-/// One committed moment: the seven tables as one read of the storage library shows them.
+/// One committed moment: the eight tables as one read of the storage library shows them.
 pub(super) struct Moment {
     rows: ReadOnlyTable<&'static [u8], &'static [u8]>,
     index: ReadOnlyTable<&'static [u8], &'static [u8]>,
     beside: ReadOnlyTable<u64, &'static [u8]>,
+    counts: ReadOnlyTable<&'static [u8], &'static [u8]>,
     schema: ReadOnlyTable<&'static str, &'static [u8]>,
     numbers: ReadOnlyTable<u64, u64>,
     blocks: ReadOnlyTable<&'static [u8], &'static [u8]>,
@@ -175,6 +195,7 @@ impl Moment {
             rows: read.open_table(ROWS)?,
             index: read.open_table(INDEX)?,
             beside: read.open_table(BESIDE)?,
+            counts: read.open_table(COUNTS)?,
             schema: read.open_table(SCHEMA)?,
             blocks: read.open_table(BLOCKS)?,
             vectors: read.open_table(VECTORS)?,
@@ -189,7 +210,13 @@ impl Moment {
         read.map_err(|error| failed(&self.folder, "read", error))
     }
 
-    /// The records of one table or index inside a span, in key order, each read with `read`.
+    /// One of the numbers the store keeps; zero when it was never put.
+    pub(super) fn number(&self, at: u64) -> Result<u64> {
+        self.told(number(&self.numbers, at))
+    }
+
+    /// The records of one table, index or count inside a span, in key order, each read with
+    /// `read` from its key and its value.
     fn scan<T, F>(
         &self,
         table: &ReadOnlyTable<&'static [u8], &'static [u8]>,
@@ -198,7 +225,7 @@ impl Moment {
         read: F,
     ) -> Result<impl Iterator<Item = Result<(Key, T)>> + use<T, F>>
     where
-        F: Fn(&[u8]) -> Option<T>,
+        F: Fn(&[u8], &[u8]) -> Option<T>,
     {
         let folder = self.folder.clone();
         let range = table
@@ -206,8 +233,10 @@ impl Moment {
             .map_err(|error| failed(&folder, "read", error))?;
         Ok(range.map(move |entry| {
             let (key, record) = entry.map_err(|error| failed(&folder, "read", error))?;
-            let read = read(record.value()).ok_or_else(|| failed(&folder, "read", unsound()))?;
-            Ok((Key(key.value()[4..].to_vec()), read))
+            let key = &key.value()[4..];
+            let read = read(key, record.value());
+            let read = read.ok_or_else(|| failed(&folder, "read", unsound()))?;
+            Ok((Key(key.to_vec()), read))
         }))
     }
 
@@ -217,7 +246,7 @@ impl Moment {
         table: u32,
         span: &Span,
     ) -> Result<impl Iterator<Item = Result<(Key, Row)>> + use<>> {
-        self.scan(&self.rows, table, span, |row| {
+        self.scan(&self.rows, table, span, |_, row| {
             Some(Row {
                 cells: record::decode_row(row),
             })
@@ -225,15 +254,34 @@ impl Moment {
     }
 
     /// The entries of an index inside a span, each still joined to the key of its row, with
-    /// the length of the entry.
+    /// the length of the entry and the place its first cut value's kept bytes end. A record
+    /// of another size than four or eight bytes, an entry longer than its key and a place past
+    /// the entry are damage.
     pub(super) fn joined(
         &self,
         index: u32,
         span: &Span,
-    ) -> Result<impl Iterator<Item = Result<(Key, usize)>> + use<>> {
-        self.scan(&self.index, index, span, |length| {
-            Some(u32::from_le_bytes(*length.first_chunk()?) as usize)
+    ) -> Result<impl Iterator<Item = Result<(Key, Joined)>> + use<>> {
+        self.scan(&self.index, index, span, |joined, record| {
+            let number =
+                |at: usize| Some(u32::from_le_bytes(*record.get(at..)?.first_chunk()?) as usize);
+            let length = number(0)?;
+            let cut = match record.len() {
+                4 => None,
+                8 => Some(number(4)?),
+                _ => return None,
+            };
+            (length <= joined.len() && cut.is_none_or(|cut| cut <= length)).then_some((length, cut))
         })
+    }
+
+    /// The records of a kept count inside a span. One that is not eight bytes is damage.
+    pub(super) fn kept(
+        &self,
+        count: u32,
+        span: &Span,
+    ) -> Result<impl Iterator<Item = Result<(Key, u64)>> + use<>> {
+        self.scan(&self.counts, count, span, |_, record| counts::read(record))
     }
 
     /// Every schema record, in the order of their names.
@@ -296,9 +344,13 @@ impl Read for View {
         Ok(Box::new(joined.map(split)))
     }
 
+    fn kept(&self, count: CountId, from: Bound<&Key>, to: Bound<&Key>) -> Result<KeptIter<'_>> {
+        let kept = self.moment.kept(count.0, &keys::span(from, to))?;
+        Ok(Box::new(kept))
+    }
+
     fn count(&self, table: TableId) -> Result<u64> {
-        self.moment
-            .told(number(&self.moment.numbers, count_of(table.0)))
+        self.moment.number(count_of(table.0))
     }
 
     fn load(&self, beside: &Beside, reservation: &mut Reservation) -> Result<Value> {
@@ -343,8 +395,7 @@ impl Read for View {
     }
 
     fn vector_number(&self, number: VectorNumber) -> Result<u64> {
-        let at = vector_number_at(number);
-        self.moment.told(self::number(&self.moment.numbers, at))
+        self.moment.number(vector_number_at(number))
     }
 
     fn damaged(&self, reason: &str) -> Error {
@@ -392,11 +443,13 @@ pub(super) fn write(data: &redb::Database, changes: &mut ChangeSet) -> Stored<u6
             ))
             .into());
         }
-        commit = newest + 1;
+        // The transaction's own number, unless a commit has taken it or a higher one.
+        commit = changes.number.0.max(newest + 1);
         numbers.insert(COMMIT, commit)?;
 
         let mut rows = write.open_table(ROWS)?;
         let mut beside = write.open_table(BESIDE)?;
+        let mut index = write.open_table(INDEX)?;
         let first_free = number(&numbers, NEXT_PLACE)?;
         let mut free = first_free;
         for (table, staged) in &changes.rows {
@@ -405,7 +458,8 @@ pub(super) fn write(data: &redb::Database, changes: &mut ChangeSet) -> Stored<u6
                 // The row that was there, when there was one, still has its large values.
                 let before = match &row.values {
                     Some(values) => {
-                        let row =
+                        let left = &row.left;
+                        let mut row =
                             record::encode_row(values, &row.compact, |large| -> Stored<u64> {
                                 // The compressor's buffer is counted until the value is written.
                                 let room = record::compress(large, &mut changes.reserved);
@@ -417,20 +471,21 @@ pub(super) fn write(data: &redb::Database, changes: &mut ChangeSet) -> Stored<u6
                                 changes.reserved.shrink(room);
                                 Ok(first)
                             })?;
-                        let before = rows.insert(key.as_slice(), row.as_slice())?;
-                        before.map(|row| record::decode_row(row.value()))
+                        record::leave(&mut row, left);
+                        rows.insert(key.as_slice(), row.as_slice())?
                     }
-                    None => {
-                        let before = rows.remove(key.as_slice())?;
-                        before.map(|row| record::decode_row(row.value()))
-                    }
+                    None => rows.remove(key.as_slice())?,
                 };
-                for cell in before.into_iter().flatten() {
-                    if let Cell::Beside(kept) = cell {
-                        for place in places(&kept) {
-                            beside.remove(place)?;
-                        }
-                    }
+                let before: Vec<Beside> = before
+                    .iter()
+                    .flat_map(|row| record::besides(row.value()))
+                    .collect();
+                // A value the new row left where it is stays; the others go with the old row.
+                for kept in before
+                    .iter()
+                    .filter(|kept| row.left.iter().all(|left| left.1 != **kept))
+                {
+                    remove_slices(&mut beside, kept)?;
                 }
             }
         }
@@ -438,14 +493,18 @@ pub(super) fn write(data: &redb::Database, changes: &mut ChangeSet) -> Stored<u6
             numbers.insert(NEXT_PLACE, free)?;
         }
 
-        let mut index = write.open_table(INDEX)?;
         for (id, staged) in &changes.index {
             for (joined, entry) in staged {
                 let key = stored(*id, &joined.0);
                 match entry {
-                    Some(length) => {
-                        let length = u32::try_from(*length).expect("an index entry is short");
-                        index.insert(key.as_slice(), length.to_le_bytes().as_slice())?;
+                    Some((length, cut)) => {
+                        let number = |number: usize| {
+                            let number = u32::try_from(number).expect("an index entry is short");
+                            number.to_le_bytes()
+                        };
+                        let record = [number(*length), number(cut.unwrap_or(0))];
+                        let record = &record.as_flattened()[..if cut.is_some() { 8 } else { 4 }];
+                        index.insert(key.as_slice(), record)?;
                     }
                     None => drop(index.remove(key.as_slice())?),
                 }
@@ -457,9 +516,27 @@ pub(super) fn write(data: &redb::Database, changes: &mut ChangeSet) -> Stored<u6
             numbers.insert(count_of(*table), count)?;
         }
 
+        counts::write(&changes.kept, &mut write.open_table(COUNTS)?)?;
+
+        // Last, so that a drop takes with it what the transaction staged under its number.
+        let mut blocks = write.open_table(BLOCKS)?;
+        let mut vectors = write.open_table(VECTORS)?;
+        drop::write(
+            &changes.dropped,
+            &mut rows,
+            &mut beside,
+            &mut index,
+            &mut write.open_table(COUNTS)?,
+            &mut numbers,
+            [&mut blocks, &mut vectors],
+        )?;
+
         let mut schema = write.open_table(SCHEMA)?;
         for (name, record) in &changes.schema {
-            schema.insert(name.as_str(), record.as_slice())?;
+            match record {
+                Some(record) => drop(schema.insert(name.as_str(), record.as_slice())?),
+                None => drop(schema.remove(name.as_str())?),
+            }
         }
         if !changes.schema.is_empty() {
             numbers.insert(SCHEMA_COMMIT, commit)?;
@@ -471,8 +548,6 @@ pub(super) fn write(data: &redb::Database, changes: &mut ChangeSet) -> Stored<u6
             None => {}
         }
 
-        let mut blocks = write.open_table(BLOCKS)?;
-        let mut vectors = write.open_table(VECTORS)?;
         for (key, value) in &changes.vectors {
             let table = if keys::with_blocks(key.0[0]) {
                 &mut blocks
@@ -484,7 +559,7 @@ pub(super) fn write(data: &redb::Database, changes: &mut ChangeSet) -> Stored<u6
                 None => drop(table.remove(key.0.as_slice())?),
             }
         }
-        for (at, number) in &changes.vector_numbers {
+        for (at, number) in &changes.numbers {
             numbers.insert(*at, *number)?;
         }
     }

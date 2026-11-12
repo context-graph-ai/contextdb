@@ -9,27 +9,38 @@
 //! A table's indexes come in one order: the index behind the primary key (`__pk_<column>`),
 //! the index behind each UNIQUE column in column order (`__unique_<column>`; the key column has
 //! its key's index and no other), the index behind each UNIQUE rule of the table in declared
-//! order (`__unique_<column>_<column>...`), then the indexes of CREATE INDEX in the order they
-//! were made.
+//! order (`__unique_<column>_<column>...`), the index that serves the child side of each
+//! reference no earlier index leads with (`__fk_<column>...`), the two indexes of a table of
+//! edges (`__graph_edge_...`), then the indexes of CREATE INDEX in the order they were made.
 
+mod alter;
 mod check;
 mod record;
 mod render;
+mod rules;
 #[cfg(test)]
 mod tests;
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
+pub(crate) use self::alter::Declared;
+pub(crate) use self::rules::{Reference, Rules};
+use crate::query::Scope;
 use crate::sql::Plan;
-use crate::store::{ChangeSet, IndexId, Read, TableId, VectorId, View};
-use crate::types::{ColumnType, Error, Result, TableMeta, VectorIndexRef, VectorSearchMode};
+use crate::store::{Cell, ChangeSet, EntryShape, IndexId, Read, Row, TableId, VectorId, View};
+use crate::types::{
+    ColumnType, Error, IndexDecl, Result, TableMeta, Value, VectorIndexRef, VectorSearchMode,
+};
 
 /// What the name of an index the engine makes for itself begins with. An index of CREATE INDEX
 /// may not take one of these.
-const RESERVED_PREFIXES: [&str; 3] = ["__pk_", "__unique_", "__fk_"];
+const RESERVED_PREFIXES: [&str; 4] = ["__pk_", "__unique_", "__fk_", "__graph_"];
 
-/// One declared table as the other parts use it.
-#[derive(Debug, Clone)]
+/// One declared table as the other parts use it. The rules a host reads are in `meta`; what
+/// `schema` works out from the declaration beyond them is in `rules`.
+#[derive(Clone)]
 pub(crate) struct Table {
     pub id: TableId,
     pub name: String,
@@ -38,6 +49,15 @@ pub(crate) struct Table {
     pub index_ids: Vec<IndexId>,
     /// One entry per VECTOR column, in column order.
     pub vectors: Vec<VectorColumn>,
+    /// The primary key's columns in declared order; empty for a table that declares no key.
+    pub key: Vec<usize>,
+    /// The key was written as an element of the table, `PRIMARY KEY (...)`, not on its column.
+    pub key_is_element: bool,
+    /// For each column, what a row with no cell for it reads as.
+    pub missing: Vec<Value>,
+    pub rules: Rules,
+    /// How the entries of each index are made, in the order of `meta.indexes`.
+    shapes: Arc<[EntryShape]>,
 }
 
 /// How many partitions a VECTOR column with a PARTITION_KEY may have when its declaration
@@ -141,6 +161,45 @@ impl VectorColumn {
 }
 
 impl Table {
+    /// The table's columns as an expression reaches them: under the table's name, in row order.
+    pub(crate) fn scope(&self) -> Scope<'_> {
+        Scope::of(&self.name, &self.meta.columns)
+    }
+
+    /// The cell a stored row holds for a column. A row written before the column was added has
+    /// none, and reads as the table says such a row does.
+    pub(crate) fn cell<'a>(&self, row: &'a Row, column: usize) -> Cow<'a, Cell> {
+        match row.cells.get(column) {
+            Some(cell) => Cow::Borrowed(cell),
+            None => Cow::Owned(Cell::Here(self.missing[column].clone())),
+        }
+    }
+
+    /// How the entries of the index at this place in `meta.indexes` are made.
+    pub(crate) fn entry_shape(&self, index: usize) -> &EntryShape {
+        &self.shapes[index]
+    }
+
+    /// The table with the shape of each of its indexes, made once here: every table of a
+    /// catalog has been through this.
+    fn shaped(mut self) -> Table {
+        let shape = |index: &IndexDecl| {
+            let columns = index.columns.iter();
+            let directions: Vec<_> = columns.clone().map(|(_, direction)| *direction).collect();
+            let of = |name: &String| self.meta.columns.iter().find(|c| c.name == *name);
+            let types: Vec<ColumnType> = match index.json_path.is_empty() {
+                true => columns
+                    .filter_map(|(name, _)| Some(of(name)?.column_type))
+                    .collect(),
+                // An index over a JSON path is one TEXT column to its entries.
+                false => vec![ColumnType::Text],
+            };
+            EntryShape::new(&types, &directions)
+        };
+        self.shapes = self.meta.indexes.iter().map(shape).collect();
+        self
+    }
+
     /// What the table keeps about the VECTOR column of this name, `None` when it has no such
     /// column or the column is of another type.
     pub(crate) fn vector(&self, column: &str) -> Option<&VectorColumn> {
@@ -169,6 +228,10 @@ impl Table {
 /// Every table declared in a store at one moment.
 pub(crate) struct Catalog {
     tables: BTreeMap<String, Table>,
+    /// The tables a transaction has altered or dropped, as they were before. What they held a
+    /// number for may still be in the store under it until the commit, so no declaration of
+    /// the same transaction is given one of their numbers.
+    left: Vec<Table>,
 }
 
 impl Catalog {
@@ -177,7 +240,7 @@ impl Catalog {
     pub(crate) fn load(view: &View) -> Result<Catalog> {
         let mut tables = BTreeMap::new();
         for bytes in view.schema_records()? {
-            let table = record::decode(&bytes);
+            let table = record::decode(&bytes, view)?;
             // No declaration names, as a VECTOR column, a column that is not one of its table.
             let is_vector = |vector: &VectorColumn| {
                 let column = table.meta.columns.iter().find(|c| c.name == vector.column);
@@ -186,14 +249,22 @@ impl Catalog {
             if !table.vectors.iter().all(is_vector) {
                 return Err(view.damaged("a schema record's VECTOR column is not one"));
             }
-            tables.insert(table.name.clone(), table);
+            tables.insert(table.name.clone(), table.shaped());
         }
-        Ok(Catalog { tables })
+        let left = Vec::new();
+        Ok(Catalog { tables, left })
     }
 
     /// A table by name, as SQL names it.
     pub(crate) fn table(&self, name: &str) -> Option<&Table> {
         self.tables.get(name)
+    }
+
+    /// Every table that holds numbers: those declared, and those a transaction has altered or
+    /// dropped, as they were. A new table, index, kept count or VECTOR column is numbered one
+    /// past the highest of these.
+    fn numbered(&self) -> impl Iterator<Item = &Table> {
+        self.tables.values().chain(&self.left)
     }
 
     /// Every table, in name order.
@@ -214,15 +285,24 @@ impl Catalog {
 ///
 /// Checks the declaration against the catalog, stages its schema record and returns the
 /// catalog as it will be once the change set commits. Stages no row and no index entry; after
-/// a CREATE INDEX on a table that has rows, `database` asks `write` to fill the index.
-pub(crate) fn declare(plan: &Plan, catalog: &Catalog, changes: &mut ChangeSet) -> Result<Catalog> {
-    let mut tables = catalog.tables.clone();
+/// a CREATE INDEX on a table that has rows, `database` asks `write` to fill the index. `now`
+/// is the time of the statement, which a row written before an added column reads where the
+/// column's default is `NOW()`.
+pub(crate) fn declare(
+    plan: &Plan,
+    catalog: &Catalog,
+    changes: &mut ChangeSet,
+    now: i64,
+) -> Result<Declared> {
+    let (mut tables, left) = (catalog.tables.clone(), catalog.left.clone());
     let table = match plan {
         Plan::CreateTable(create) if !tables.contains_key(&create.name) => {
             check::new_table(create, catalog)?
         }
         // A taken name is settled before the rest of the declaration is looked at.
-        Plan::CreateTable(create) if create.if_not_exists => return Ok(Catalog { tables }),
+        Plan::CreateTable(create) if create.if_not_exists => {
+            return Ok(Catalog { tables, left }.into());
+        }
         Plan::CreateTable(create) => {
             return Err(Error::SchemaInvalid {
                 reason: format!(
@@ -233,11 +313,18 @@ pub(crate) fn declare(plan: &Plan, catalog: &Catalog, changes: &mut ChangeSet) -
             });
         }
         Plan::CreateIndex(create) => check::with_index(create, catalog)?,
-        _ => return Err(crate::sql::not_supported("this declaration")),
+        _ => return alter::declare(plan, catalog, changes, now),
     };
+    // The counts a CREATE INDEX made on its table hold no record yet.
+    let old = catalog.table(&table.name);
+    let before = |id| old.is_some_and(|old| old.rules.counts.iter().any(|count| count.id == id));
+    let made = table.rules.counts.iter().map(|count| count.id);
+    let counts = made.filter(|id| !before(*id)).collect();
     changes.put_schema(&table.name, record::encode(&table))?;
-    tables.insert(table.name.clone(), table);
-    Ok(Catalog { tables })
+    tables.insert(table.name.clone(), table.shaped());
+    let mut declared = Declared::from(Catalog { tables, left });
+    declared.counts = counts;
+    Ok(declared)
 }
 
 /// The declaration as `.schema` prints it: text that, run again, declares the same table.

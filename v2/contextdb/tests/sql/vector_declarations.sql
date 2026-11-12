@@ -87,8 +87,9 @@ SELECT id FROM docs;
 ----
 error: TableNotFound
 
-# The name was free all along. ALTER is a later version's too: refused, each leaves the column
-# as it was declared, with room for one partition and searched INDEXED, which answers.
+# The name was free all along. The column is declared with room for one partition and searched
+# INDEXED; ALTER changes each: searched EXACT, an ordinary search answers, and with the limit
+# raised a second partition is accepted.
 CREATE TABLE docs (
   id INTEGER PRIMARY KEY,
   tenant TEXT NOT NULL,
@@ -96,16 +97,16 @@ CREATE TABLE docs (
 );
 ALTER TABLE docs ALTER COLUMN v SET SEARCH_MODE EXACT;
 ----
-error: PlanError
+rows affected: 0
 
 ALTER TABLE docs ALTER COLUMN v SET MAX_PARTITIONS 512;
 ----
-error: PlanError
+rows affected: 0
 
 INSERT INTO docs (id, tenant, v) VALUES (1, 'north', [1.0, 0.0, 0.0]);
 INSERT INTO docs (id, tenant, v) VALUES (2, 'south', [0.0, 1.0, 0.0]);
 ----
-error: VectorPartitionLimitExceeded
+rows affected: 1
 
 SELECT id FROM docs ORDER BY v <=> [1.0, 0.0, 0.0] LIMIT 1;
 ----

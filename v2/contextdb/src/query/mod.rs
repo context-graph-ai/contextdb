@@ -5,32 +5,37 @@
 //!
 //! It never changes anything.
 
-mod access;
+mod bind;
+mod counts;
 mod expression;
+mod for_write;
 mod inspect;
 mod search;
+mod table;
 #[cfg(test)]
 mod tests;
+mod visible;
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 
-pub(crate) use expression::eval;
+pub(crate) use expression::{EvalContext, Scope, eval, reads};
+pub(crate) use for_write::{Asked, rows_for_write};
 pub(crate) use inspect::explain;
-pub(crate) use search::vector_from_text;
+pub(crate) use visible::{Reader, Visible};
 
 use crate::memory::{Budget, Reservation};
 use crate::schema::{Catalog, Table};
 use crate::sql::ast::SortDirection;
 use crate::sql::plan::{ProjectColumn, SortKey};
 use crate::sql::{Expr, Plan};
-use crate::store::{Key, Read};
+use crate::store::Read;
 use crate::types::{ColumnType, Error, Result, Value};
-use access::Source;
 use expression::{
-    Arithmetic, arithmetic, column_index, compare, most_bytes, reads, sort_order, unsupported,
+    Arithmetic, arithmetic, column_index, compare, most_bytes, sort_order, unsupported,
 };
+use table::Source;
 
 /// What a statement returned: the column names and rows of a SELECT, or the number of rows a
 /// write affected. Its rows stay counted against the memory limit until it is dropped.
@@ -143,12 +148,14 @@ pub(crate) fn memory_limit_shown(budget: &Budget, opened_under: Option<u64>) -> 
     QueryResult::from_rows(columns.map(str::to_owned).to_vec(), vec![row])
 }
 
-/// Answers one planned SELECT from one reader.
+/// Answers one planned SELECT from one store, for one reader.
 ///
-/// Picks an index when the plan's filter can use one and scans otherwise; `COUNT(*)` of a whole
-/// table is answered from the kept count. Loads a value kept beside its row only when a selected
-/// or filtered column needs it. The result, and any sort or grouping on the way to it, grows
-/// through reservations on `budget` and refuses with `MemoryBudgetExceeded` before it grows.
+/// Every row comes from the table source, which picks an index when the plan's filter can use
+/// one and scans otherwise, and hands on only the rows `reader` may see. A `COUNT(*)` is
+/// answered with no row read when a kept number or the entries of one index range give it.
+/// Loads a value kept beside its row only when a selected or filtered column needs it. The
+/// result, and any sort or grouping on the way to it, grows through reservations on `budget`
+/// and refuses with `MemoryBudgetExceeded` before it grows.
 ///
 /// A similarity search, `ORDER BY column <=> vector LIMIT k`, is answered by the vector part
 /// from the rows this part lets it see, and returns the nearest rows first.
@@ -157,10 +164,11 @@ pub(crate) fn run(
     params: &HashMap<String, Value>,
     catalog: &Catalog,
     read: &dyn Read,
+    reader: &Reader,
     budget: &Budget,
     now: i64,
 ) -> Result<QueryResult> {
-    if let Some(found) = search::run(plan, params, catalog, read, budget, now)? {
+    if let Some(found) = search::run(plan, params, catalog, read, reader, budget, now)? {
         return Ok(found);
     }
     if let Some(shown) = inspect::show(plan, catalog, read, budget)? {
@@ -202,25 +210,36 @@ pub(crate) fn run(
     }
     let columns = names(table, select.columns, !aggregates.is_empty());
 
-    let source = Source::new(table, select.filter, params, now, read, filtered, &wanted);
+    // What the reader's filter holds is given back with the statement.
+    let mut seeing = budget.reserve(0, "query")?;
+    let visible = Visible::new(table, catalog, reader, &mut seeing)?;
+    let source =
+        Source::new(table, select.filter, params, now, read, visible).reading(filtered, &wanted);
     let limit = select.limit.map_or(usize::MAX, |limit| {
         usize::try_from(limit).unwrap_or(usize::MAX)
     });
     let mut reservation = budget.reserve(0, "query")?;
     let mut rows = Vec::new();
     let mut examined = 0;
+    let scope = table.scope();
 
     if !aggregates.is_empty() {
-        if select.filter.is_none() && aggregates.iter().all(|aggregate| aggregate.of.is_none()) {
-            let count = read.count(table.id)? as i64;
+        let counted = match aggregates.iter().all(|aggregate| aggregate.of.is_none()) {
+            true => {
+                let ctx = EvalContext::new(params, now);
+                counts::count_without_rows(table, select.filter, reader, &ctx, read)?
+            }
+            false => None,
+        };
+        if let Some(count) = counted {
             for aggregate in &mut aggregates {
-                aggregate.seen = count;
+                aggregate.seen = count as i64;
             }
         } else {
-            let (path, _) = source.choose(&[])?;
+            let path = source.choose(&[], &[])?;
             examined = source.walk(&path, &mut reservation, |_, row, bytes, reservation| {
                 for aggregate in &mut aggregates {
-                    aggregate.add(table, &row, params, now, reservation)?;
+                    aggregate.add(&scope, &row, params, now, reservation)?;
                 }
                 reservation.shrink(bytes);
                 Ok(true)
@@ -237,8 +256,8 @@ pub(crate) fn run(
         let output = |row: Vec<Value>, bytes: u64, reservation: &mut Reservation| {
             source.output(select.columns, &moved, row, bytes, None, reservation)
         };
-        let (path, in_order) = source.choose(select.order)?;
-        if in_order {
+        let path = source.choose(select.order, &[])?;
+        if path.in_order {
             examined = source.walk(&path, &mut reservation, |_, row, bytes, reservation| {
                 rows.push(output(row, bytes, reservation)?);
                 Ok(rows.len() < limit)
@@ -250,13 +269,13 @@ pub(crate) fn run(
                 let order = select.order;
                 let most = order
                     .iter()
-                    .map(|key| most_bytes(&key.expr, table, &row, params));
+                    .map(|key| most_bytes(&key.expr, &scope, &row, params));
                 let held = row_overhead(order.len()) + most.sum::<u64>();
                 reservation.grow(held + size_of::<Sorting>() as u64)?;
                 key_bytes += held + size_of::<Sorting>() as u64;
                 let keys = order
                     .iter()
-                    .map(|key| eval(&key.expr, table, &row, params, now))
+                    .map(|key| eval(&key.expr, &scope, &row, &EvalContext::new(params, now)))
                     .collect::<Result<Vec<_>>>()?;
                 sorting.push(Sorting { keys, row, bytes });
                 Ok(true)
@@ -288,49 +307,6 @@ pub(crate) fn run(
         distance_evaluations: 0,
         _reservation: Some(reservation),
     })
-}
-
-/// The rows [`matching`] found, each with its key.
-pub(crate) type Matched = Vec<(Key, Vec<Value>)>;
-
-/// The rows of one table that pass a filter, with their keys: what an UPDATE or DELETE acts on.
-/// Uses the same index choice and the same evaluator as [`run`]. The rows and their keys stay
-/// counted against the memory limit for as long as the caller holds the reservation that comes
-/// with them.
-pub(crate) fn matching(
-    table: &Table,
-    filter: Option<&Expr>,
-    params: &HashMap<String, Value>,
-    read: &dyn Read,
-    budget: &Budget,
-    now: i64,
-) -> Result<(Matched, Reservation)> {
-    let width = table.meta.columns.len();
-    let mut filtered = vec![false; width];
-    if let Some(filter) = filter {
-        reads(filter, table, params, &mut filtered)?;
-    }
-    let source = Source::new(
-        table,
-        filter,
-        params,
-        now,
-        read,
-        filtered,
-        &vec![true; width],
-    );
-    let (path, _) = source.choose(&[])?;
-    let mut reservation = budget.reserve(0, "query")?;
-    let mut found = Vec::new();
-    let key_columns = source.key_columns();
-    source.walk(&path, &mut reservation, |key, row, _, reservation| {
-        // A key is its row's key values once more, and is asked for as what they take.
-        let values = key_columns.iter().map(|at| heap_bytes(&row[*at]));
-        reservation.grow(row_overhead(key_columns.len()) + values.sum::<u64>())?;
-        found.push((key, row));
-        Ok(true)
-    })?;
-    Ok((found, reservation))
 }
 
 /// What a result calls its columns: the table's own names for `SELECT *` (`None`), otherwise
@@ -481,16 +457,16 @@ impl<'a> Aggregate<'a> {
     /// is kept as the least or the greatest so far.
     fn add(
         &mut self,
-        table: &Table,
+        scope: &Scope,
         row: &[Value],
         params: &HashMap<String, Value>,
         now: i64,
         reservation: &mut Reservation,
     ) -> Result<()> {
         if let Some(of) = self.of {
-            let most = most_bytes(of, table, row, params);
+            let most = most_bytes(of, scope, row, params);
             reservation.grow(most)?;
-            let value = eval(of, table, row, params, now)?;
+            let value = eval(of, scope, row, &EvalContext::new(params, now))?;
             if value == Value::Null {
                 reservation.shrink(most);
                 return Ok(());
@@ -530,31 +506,4 @@ impl<'a> Aggregate<'a> {
 /// The memory a row of this many values takes before any text, JSON or vector in it.
 fn row_overhead(values: usize) -> u64 {
     (size_of::<Vec<Value>>() + values * size_of::<Value>()) as u64
-}
-
-/// The memory a value takes outside its own cell.
-fn heap_bytes(value: &Value) -> u64 {
-    fn json(value: &serde_json::Value) -> u64 {
-        let cell = size_of::<serde_json::Value>();
-        match value {
-            serde_json::Value::String(text) => text.len() as u64,
-            serde_json::Value::Array(items) => {
-                let items = items.iter();
-                items.map(|item| cell as u64 + json(item)).sum()
-            }
-            serde_json::Value::Object(members) => {
-                let members = members.iter();
-                members
-                    .map(|(name, member)| (name.len() + cell) as u64 + json(member))
-                    .sum()
-            }
-            _ => 0,
-        }
-    }
-    match value {
-        Value::Text(text) => text.len() as u64,
-        Value::Vector(vector) => size_of_val(vector.as_slice()) as u64,
-        Value::Json(value) => json(value),
-        _ => 0,
-    }
 }

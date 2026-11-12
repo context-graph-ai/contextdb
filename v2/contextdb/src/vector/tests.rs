@@ -22,7 +22,7 @@ use super::train::{Mean, Round, first_centres, groups_for, nearest, product, sam
 use crate::Database;
 use crate::memory::Budget;
 use crate::schema::Catalog;
-use crate::store::{ChangeSet, Key, Read, Store, TableId, VectorId, VectorRecord, View};
+use crate::store::{Cell, ChangeSet, Key, Read, Store, TableId, VectorId, VectorRecord, View};
 use crate::types::{Error, Value};
 
 /// A fixed scatter of numbers: a xorshift that starts from a seed.
@@ -261,7 +261,7 @@ fn a_pending_record_of_a_row_with_no_vector_is_reported_as_damage() {
         let table = catalog.table("docs").expect("the table").id;
         let mut changes = ChangeSet::new(view, &budget).expect("a change set");
         let key = Key::from_values(&[Value::Int64(damaged)], &[]).expect("a key");
-        let row = vec![Value::Int64(damaged), Value::Null];
+        let row = vec![Cell::Here(Value::Int64(damaged)), Cell::Here(Value::Null)];
         changes
             .put_row(table, key, row, Vec::new(), false)
             .expect("stage");
@@ -321,17 +321,16 @@ fn a_vector_entry_named(test: &str, named: u8) -> Misnamed {
     let mut records = view.schema_records().expect("the schema records");
     let mut record = records.pop().expect("the record of the one table");
     assert!(records.is_empty(), "one table has one schema record");
-    // A schema record ends with its VECTOR entries, and the one entry here ends with its
-    // column's name, a text of one byte, and then nine bytes: no PARTITION_KEY column, no
-    // MAX_PARTITIONS, no SEARCH_MODE.
-    // The VECTOR entry is the last thing in the record, and in it the column's name follows
-    // the length of the name: the last place the record holds that length and `v`.
-    let entry = [1, 0, 0, 0, b'v'];
-    let at = record
-        .windows(entry.len())
-        .rposition(|window| window == entry)
-        .expect("the VECTOR entry of the column v");
-    let name = at + entry.len() - 1;
+    // The one VECTOR entry of the record holds its column's name, a text of one byte, and then
+    // six bytes: a list of no PARTITION_KEY columns, no MAX_PARTITIONS, no SEARCH_MODE. The
+    // column `v` is named once more in the record, among the table's columns, and there its
+    // type follows the name, which is no zero byte.
+    let entry = [1, 0, 0, 0, b'v', 0, 0, 0, 0, 0, 0];
+    let found: Vec<usize> = (0..record.len())
+        .filter(|at| record[*at..].starts_with(&entry))
+        .collect();
+    assert_eq!(found.len(), 1, "the record's one VECTOR entry for `v`");
+    let name = found[0] + 4;
     record[name] = named;
     let mut changes = ChangeSet::new(view, &budget).expect("a change set");
     changes.put_schema("docs", record).expect("stage");
@@ -357,7 +356,9 @@ fn a_write_is_reported_as_damage(test: &str, named: u8, what: &str) {
     let mut changes = ChangeSet::new(view.clone(), &budget).expect("a change set");
     let key = Key::from_values(&[Value::Int64(4)], &[]).expect("a key");
     let numbers = Value::Vector(vec![0.0, 0.0, 0.0, 1.0]);
-    let row = vec![Value::Int64(4), Value::Int64(40), numbers];
+    let row = [Value::Int64(4), Value::Int64(40), numbers]
+        .map(Cell::Here)
+        .to_vec();
     changes
         .put_row(table, key, row, Vec::new(), true)
         .expect("stage");

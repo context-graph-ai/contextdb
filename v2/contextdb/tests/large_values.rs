@@ -639,8 +639,15 @@ fn a_damaged_length_of_a_compressed_value_is_reported_as_damage() {
     insert_note(&db, 1, &body);
     support::close(db);
 
-    // A length no store holds, one byte more than the value has, and one byte less.
-    for wrong in [1_u64 << 40, LEN as u64 + 1, LEN as u64 - 1] {
+    // A length no store holds, one byte more than the value has, one byte less, half of it, none.
+    for wrong in [
+        u64::MAX,
+        1_u64 << 40,
+        LEN as u64 + 1,
+        LEN as u64 - 1,
+        LEN as u64 / 2,
+        0,
+    ] {
         // A storage door that, in every read, puts the wrong length after that 0x84.
         let changed = Arc::new(AtomicU64::new(0));
         let mut options = ReadSessionOptions::default();

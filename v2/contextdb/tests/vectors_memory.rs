@@ -448,7 +448,41 @@ fn a_limit_below_the_sessions_cache_is_refused_and_one_above_it_is_taken() {
         // Under the 1 GiB the store remembers the cache is 256 MiB, and 64 MiB is refused.
         refused_below_the_cache(set(&db, 64), 64 * MIB, 257 * MIB);
         assert_eq!(db.memory_limit(), Some(1024 * MIB));
+        support::close(db);
     }
+
+    // An open under 1 MiB, for writing and for reading, is refused by the ordinary memory
+    // refusal with the bytes it needed and the limit; it leaves the store as it was.
+    let folder = support::folder("open-below-1-mib");
+    support::close(support::open(&folder));
+    let (mut write, mut read) = (
+        DatabaseOpenOptions::default(),
+        ReadSessionOptions::default(),
+    );
+    (write.memory_limit, read.memory_limit) = (Some(MIB), Some(MIB));
+    let refusals = [
+        ("writing", support::open_with(&folder, write).err()),
+        (
+            "reading",
+            ReadSession::open_with_options(&folder, read).err(),
+        ),
+    ];
+    for (how, refusal) in refusals {
+        let Some(Error::MemoryBudgetExceeded {
+            requested_bytes,
+            budget_limit_bytes,
+            ..
+        }) = refusal
+        else {
+            panic!("an open for {how} under 1 MiB was not a memory refusal: {refusal:?}");
+        };
+        assert!(
+            budget_limit_bytes == MIB as u64 && requested_bytes > MIB as u64,
+            "an open for {how}: the refusal names the limit ({budget_limit_bytes}) and the \
+             bytes the session needs ({requested_bytes}), which are more than the limit"
+        );
+    }
+    support::close(support::open(&folder));
 }
 
 #[test]

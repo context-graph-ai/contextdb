@@ -127,6 +127,42 @@ passages passages_measurements "${PASSAGES:-}" sq8
 passages passages_large_measurements "${PASSAGES_LARGE:-}" sq8,tail
 passages passages_larger_measurements "${PASSAGES_LARGER:-}" tail
 
+# Context Graph's declarations and statements (the head of contextdb/examples/queries.rs):
+# its declarations; the second dump in its passages table; the anchors of every session file
+# of the SESSIONS folder's `files`; and two generated cases.
+queries() {
+  example queries -- "$@" "$scratch/queries" || echo "queries_${1}_measurements unavailable -"
+  rm -rf -- "$scratch/queries"
+}
+queries declarations
+queries dag
+queries grants
+if [ -n "${PASSAGES_LARGE:-}" ]; then
+  queries declared "${PASSAGES_LARGE%%:*}" "${PASSAGES_LARGE#*:}"
+else
+  echo "declared_measurements unavailable -"
+fi
+if [ -n "${SESSIONS:-}" ]; then
+  queries anchors "${SESSIONS%%:*}/files"
+else
+  echo "anchors_measurements unavailable -"
+fi
+
+# The Context Graph branch, CG_BRANCH=<checkout>, checked against this tree's library: the
+# compiler's errors, and the call sites still fenced for each later step.
+if [ -n "${CG_BRANCH:-}" ]; then
+  mkdir -p "$scratch/cg"
+  tar -C "$CG_BRANCH" --exclude=./target -cf - . | tar -xf - -C "$scratch/cg"
+  sed -i "s#path = \"[^\"]*/v2/contextdb\"#path = \"$PWD/v2/contextdb\"#" "$scratch/cg/Cargo.toml"
+  cargo check --manifest-path "$scratch/cg/Cargo.toml" --workspace --all-targets --keep-going > "$scratch/cg.log" 2>&1
+  echo "cg_branch_errors $(grep -E '^error(\[|:)' "$scratch/cg.log" | grep -cv 'could not compile') errors"
+  for step in 3 5 6 7 8; do
+    echo "cg_branch_fenced_step$step $(grep -r -o "cfg(lean_step$step)" "$scratch/cg/crates" | wc -l) sites"
+  done
+else
+  echo "cg_branch_measurements unavailable -"
+fi
+
 # From a fresh clone to a green `cargo test`: nothing built before.
 start=$SECONDS
 if CARGO_TARGET_DIR="$scratch/fresh" cargo test --manifest-path v2/Cargo.toml --workspace --locked > "$scratch/fresh.log" 2>&1; then
