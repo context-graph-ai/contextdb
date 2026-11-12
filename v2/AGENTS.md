@@ -152,7 +152,7 @@ Every path in this guide is written from `v2/`.
 - A test asserts states, values, error kinds and counts, never a duration, and waits only on something a process announces.
 - Its data is fixed, and each test has its own store folder (`support::folder` in `contextdb/tests/support/mod.rs`).
 - Nothing is retried (`.config/nextest.toml` sets `retries = 0`) and no test is ignored.
-- The check holds every test but slow work. Slow work is listed in the `nightly` profile of `.config/nextest.toml` and runs in `Check nightly`. A test that nears its limit on a hosted runner does less work or, when the size is the promise, moves there.
+- The check holds every test but slow work. Slow work is listed in the `nightly` profile of `.config/nextest.toml` and runs once a night in the check's scheduled run. A test that nears its limit on a hosted runner does less work or, when the size is the promise, moves there.
 
 Two lint settings hold this up:
 
