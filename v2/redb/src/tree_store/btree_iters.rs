@@ -1,6 +1,6 @@
 use crate::Result;
+use crate::tree_store::btree_base::{AccessGuard, BranchAccessor, LeafAccessor};
 use crate::tree_store::btree_base::{BRANCH, LEAF};
-use crate::tree_store::btree_base::{BranchAccessor, LeafAccessor};
 use crate::tree_store::btree_iters::RangeIterState::{Internal, Leaf};
 use crate::tree_store::btree_mutator::MutateHelper;
 use crate::tree_store::page_store::{Page, PageHint, PageImpl, TransactionalMemory};
@@ -128,7 +128,7 @@ impl RangeIterState {
         }
     }
 
-    fn get_entry<K: Key, V: Value>(&self) -> Option<EntryGuard<K, V>> {
+    fn get_entry<K: Key + 'static, V: Value>(&self) -> Option<EntryGuard<K, V>> {
         match self {
             Leaf {
                 page,
@@ -137,9 +137,9 @@ impl RangeIterState {
                 entry,
                 ..
             } => {
-                let (key, value) =
-                    LeafAccessor::new(page.memory(), *fixed_key_size, *fixed_value_size)
-                        .entry_ranges(*entry)?;
+                let accessor = LeafAccessor::new(page.memory(), *fixed_key_size, *fixed_value_size);
+                let (_, value) = accessor.entry_ranges(*entry)?;
+                let key = accessor.key_guard(page, *entry);
                 Some(EntryGuard::new(page.clone(), key, value))
             }
             Internal { .. } => None,
@@ -147,39 +147,37 @@ impl RangeIterState {
     }
 }
 
-pub(crate) struct EntryGuard<K: Key, V: Value> {
+pub(crate) struct EntryGuard<K: Key + 'static, V: Value> {
     page: PageImpl,
-    key_range: Range<usize>,
+    key: AccessGuard<'static, K>,
     value_range: Range<usize>,
-    _key_type: PhantomData<K>,
     _value_type: PhantomData<V>,
 }
 
 impl<K: Key, V: Value> EntryGuard<K, V> {
-    fn new(page: PageImpl, key_range: Range<usize>, value_range: Range<usize>) -> Self {
+    fn new(page: PageImpl, key: AccessGuard<'static, K>, value_range: Range<usize>) -> Self {
         Self {
             page,
-            key_range,
+            key,
             value_range,
-            _key_type: Default::default(),
             _value_type: Default::default(),
         }
     }
 
     pub(crate) fn key_data(&self) -> Vec<u8> {
-        self.page.memory()[self.key_range.clone()].to_vec()
+        K::as_bytes(&self.key.value()).as_ref().to_vec()
     }
 
     pub(crate) fn key(&self) -> K::SelfType<'_> {
-        K::from_bytes(&self.page.memory()[self.key_range.clone()])
+        self.key.value()
     }
 
     pub(crate) fn value(&self) -> V::SelfType<'_> {
         V::from_bytes(&self.page.memory()[self.value_range.clone()])
     }
 
-    pub(crate) fn into_raw(self) -> (PageImpl, Range<usize>, Range<usize>) {
-        (self.page, self.key_range, self.value_range)
+    pub(crate) fn into_raw(self) -> (PageImpl, AccessGuard<'static, K>, Range<usize>) {
+        (self.page, self.key, self.value_range)
     }
 }
 
@@ -528,6 +526,34 @@ impl<K: Key, V: Value> Iterator for BtreeRangeIter<K, V> {
     type Item = Result<EntryGuard<K, V>>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let step = self.step()?;
+        Some(step.map(|()| self.left.as_ref().unwrap().get_entry().unwrap()))
+    }
+}
+
+impl<K: Key, V: Value> BtreeRangeIter<K, V> {
+    // The next pair as borrowed bytes. Past the first pair of a page that shares, its key is
+    // rebuilt in `lent`, whose shared bytes stay while the walk is on that page.
+    pub(crate) fn next_lent<'s>(
+        &'s mut self,
+        lent: &'s mut Vec<u8>,
+    ) -> Result<Option<(&'s [u8], &'s [u8])>> {
+        let Some(Leaf { page, entry, .. }) = self.step().transpose()?.and(self.left.as_ref())
+        else {
+            return Ok(None);
+        };
+        let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
+        let ((key, value), shared) = (accessor.entry_ranges(*entry).unwrap(), accessor.prefix());
+        if *entry == 0 || shared.is_empty() {
+            return Ok(Some((&page.memory()[key], &page.memory()[value])));
+        }
+        lent.truncate(usize::from(lent.starts_with(shared)) * shared.len());
+        lent.extend_from_slice(&shared[lent.len()..]);
+        lent.extend_from_slice(&page.memory()[key]);
+        Ok(Some((lent, &page.memory()[value])))
+    }
+
+    fn step(&mut self) -> Option<Result<()>> {
         if let (
             Some(Leaf {
                 page: left_page,
@@ -589,8 +615,8 @@ impl<K: Key, V: Value> Iterator for BtreeRangeIter<K, V> {
             }
 
             self.include_left = false;
-            if self.left.as_ref().unwrap().get_entry::<K, V>().is_some() {
-                return self.left.as_ref().map(|s| s.get_entry().unwrap()).map(Ok);
+            if let Some(Leaf { .. }) = self.left {
+                return Some(Ok(()));
             }
         }
     }
@@ -676,8 +702,8 @@ impl<K: Key, V: Value> DoubleEndedIterator for BtreeRangeIter<K, V> {
             }
 
             self.include_right = false;
-            if self.right.as_ref().unwrap().get_entry::<K, V>().is_some() {
-                return self.right.as_ref().map(|s| s.get_entry().unwrap()).map(Ok);
+            if let Some(entry) = self.right.as_ref().unwrap().get_entry() {
+                return Some(Ok(entry));
             }
         }
     }

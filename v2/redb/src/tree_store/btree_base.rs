@@ -361,14 +361,15 @@ impl<'a, V: Value + 'static> AccessGuardMut<'a, V> {
                 accessor.num_pairs(),
                 self.key_width,
                 V::fixed_width(),
+                !accessor.prefix().is_empty(),
             );
 
             for i in 0..accessor.num_pairs() {
                 let entry = accessor.entry(i).unwrap();
                 if i == self.entry_index {
-                    builder.push(entry.key(), value_bytes.as_ref());
+                    builder.push(entry.key_parts(), value_bytes.as_ref());
                 } else {
-                    builder.push(entry.key(), entry.value());
+                    builder.push(entry.key_parts(), entry.value());
                 }
             }
 
@@ -443,19 +444,26 @@ impl<V: Value + 'static> Drop for AccessGuardMutInPlace<'_, V> {
 
 // Provides a simple zero-copy way to access entries
 pub struct EntryAccessor<'a> {
+    prefix: &'a [u8],
     key: &'a [u8],
     value: &'a [u8],
 }
 
 impl<'a> EntryAccessor<'a> {
-    fn new(key: &'a [u8], value: &'a [u8]) -> Self {
-        EntryAccessor { key, value }
+    fn new(prefix: &'a [u8], key: &'a [u8], value: &'a [u8]) -> Self {
+        EntryAccessor { prefix, key, value }
     }
 }
 
 impl<'a: 'b, 'b> EntryAccessor<'a> {
     pub(crate) fn key(&'b self) -> &'a [u8] {
+        assert!(self.prefix.is_empty());
         self.key
+    }
+
+    // The whole key: what its page keeps once (nothing for the first pair), then the rest
+    pub(crate) fn key_parts(&'b self) -> [&'a [u8]; 2] {
+        [self.prefix, self.key]
     }
 
     pub(crate) fn value(&'b self) -> &'a [u8] {
@@ -490,7 +498,7 @@ impl<'a> LeafAccessor<'a> {
     pub(super) fn print_node<K: Key, V: Value>(&self, include_value: bool) {
         let mut i = 0;
         while let Some(entry) = self.entry(i) {
-            eprint!(" key_{i}={:?}", K::from_bytes(entry.key()));
+            eprint!(" key_{i}={:?}", K::from_bytes(&entry.key_parts().concat()));
             if include_value {
                 eprint!(" value_{i}={:?}", V::from_bytes(entry.value()));
             }
@@ -499,6 +507,14 @@ impl<'a> LeafAccessor<'a> {
     }
 
     pub(crate) fn position<K: Key>(&self, query: &[u8]) -> (usize, bool) {
+        // A query not beginning with what the page keeps once is below or above every key
+        let prefix = self.prefix();
+        match query[..query.len().min(prefix.len())].cmp(prefix) {
+            Ordering::Less => return (0, false),
+            Ordering::Greater => return (self.num_pairs(), false),
+            Ordering::Equal => {}
+        }
+        let query = &query[prefix.len()..];
         // inclusive
         let mut min_entry = 0;
         // inclusive. Start past end, since it might be positioned beyond the end of the leaf
@@ -506,6 +522,7 @@ impl<'a> LeafAccessor<'a> {
         while min_entry < max_entry {
             let mid = min_entry.midpoint(max_entry);
             let key = self.key_unchecked(mid);
+            let key = if mid == 0 { &key[prefix.len()..] } else { key };
             match K::compare(query, key) {
                 Ordering::Less => {
                     max_entry = mid;
@@ -643,10 +660,28 @@ impl<'a> LeafAccessor<'a> {
         &self.page[self.key_start(n).unwrap()..self.key_end(n).unwrap()]
     }
 
+    // A leaf keeps once the bytes all its keys begin with, as many as its second byte says: its
+    // first key is whole, later keys are kept without them
+    pub(crate) fn prefix(&self) -> &'a [u8] {
+        let start = self.key_section_start();
+        &self.page[start..(start + usize::from(self.page[1]))]
+    }
+
     pub(crate) fn entry(&self, n: usize) -> Option<EntryAccessor<'a>> {
         let key = &self.page[self.key_start(n)?..self.key_end(n)?];
         let value = &self.page[self.value_start(n)?..self.value_end(n)?];
-        Some(EntryAccessor::new(key, value))
+        let prefix = if n == 0 { &[] } else { self.prefix() };
+        Some(EntryAccessor::new(prefix, key, value))
+    }
+
+    // A pair's whole key: a range of the page, or owned bytes when the page keeps part of it once
+    pub(crate) fn key_guard<K: Key>(&self, page: &PageImpl, n: usize) -> AccessGuard<'static, K> {
+        let (range, _) = self.entry_ranges(n).unwrap();
+        if n == 0 || self.page[1] == 0 {
+            AccessGuard::with_page(page.clone(), range)
+        } else {
+            AccessGuard::with_owned_value([self.prefix(), &self.page[range]].concat())
+        }
     }
 
     pub(crate) fn entry_ranges(&self, n: usize) -> Option<(Range<usize>, Range<usize>)> {
@@ -660,10 +695,22 @@ impl<'a> LeafAccessor<'a> {
     }
 }
 
+// A key in two pieces: the bytes kept once by the page it was read from, then the rest
+type Parts<'a> = [&'a [u8]; 2];
+
+fn bytes<'a>(key: &Parts<'a>) -> impl Iterator<Item = &'a u8> {
+    key[0].iter().chain(key[1])
+}
+
+fn common(a: &Parts, b: &Parts) -> usize {
+    bytes(a).zip(bytes(b)).take_while(|(x, y)| x == y).count()
+}
+
 pub(super) struct LeafBuilder<'a, 'b> {
-    pairs: Vec<(&'a [u8], &'a [u8])>,
+    pairs: Vec<(Parts<'a>, &'a [u8])>,
     fixed_key_size: Option<usize>,
     fixed_value_size: Option<usize>,
+    bytewise: bool,
     total_key_bytes: usize,
     total_value_bytes: usize,
     mem: &'b TransactionalMemory,
@@ -686,11 +733,14 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
         capacity: usize,
         fixed_key_size: Option<usize>,
         fixed_value_size: Option<usize>,
+        bytewise: bool,
     ) -> Self {
         Self {
             pairs: Vec::with_capacity(capacity),
             fixed_key_size,
             fixed_value_size,
+            // A tree of unit values (a multimap's value tree, copied inline as it is) shares none
+            bytewise: bytewise && fixed_value_size != Some(0),
             total_key_bytes: 0,
             total_value_bytes: 0,
             mem,
@@ -698,8 +748,8 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
         }
     }
 
-    pub(super) fn push(&mut self, key: &'a [u8], value: &'a [u8]) {
-        self.total_key_bytes += key.len();
+    pub(super) fn push(&mut self, key: Parts<'a>, value: &'a [u8]) {
+        self.total_key_bytes += key[0].len() + key[1].len();
         self.total_value_bytes += value.len();
         self.pairs.push((key, value));
     }
@@ -716,82 +766,96 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
                 continue;
             }
             let entry = accessor.entry(i).unwrap();
-            self.push(entry.key(), entry.value());
+            self.push(entry.key_parts(), entry.value());
         }
     }
 
-    pub(super) fn should_split(&self) -> bool {
-        let required_size = self.required_bytes(
-            self.pairs.len(),
-            self.total_key_bytes + self.total_value_bytes,
-        );
-        required_size > self.mem.get_page_size() && self.pairs.len() > 1
+    // What a page of `pairs` keeps once (what its first and last key share, at most 255 bytes,
+    // for `bytewise` keys), and the bytes its keys and its values then take
+    fn measure(&self, pairs: &[(Parts<'a>, &'a [u8])]) -> (usize, usize, usize) {
+        let shared =
+            common(&pairs[0].0, &pairs[pairs.len() - 1].0).min(255 * usize::from(self.bytewise));
+        let keys: usize = pairs.iter().map(|([a, b], _)| a.len() + b.len()).sum();
+        let values: usize = pairs.iter().map(|(_, value)| value.len()).sum();
+        (shared, keys - shared * (pairs.len() - 1), values)
     }
 
-    // Divides the pairs between two pages where half their bytes are. When `appended` is set,
-    // the last pair was added after every pair the leaf already held: the first page then keeps
-    // all of those and the second starts with the new pair, so that a tree written in key order
-    // is left with full leaves instead of half-empty ones.
+    // The pages a page of `pairs` is given: one, or a power of two when they take more
+    fn pages(&self, pairs: &[(Parts<'a>, &'a [u8])]) -> usize {
+        let (_, keys, values) = self.measure(pairs);
+        let bytes = self.required_bytes(pairs.len(), keys + values);
+        bytes.div_ceil(self.mem.get_page_size()).next_power_of_two()
+    }
+
+    pub(super) fn should_split(&self) -> bool {
+        self.pages(&self.pairs) > 1 && self.pairs.len() > 1
+    }
+
+    // Cuts at the first place in a short list that leaves both sides within one page, else the
+    // place whose sides take the fewest pages. A pair new at `at` (`fresh`) that ends a run
+    // (nothing after it, or sharing 4 more bytes with the pair before than after) lists after it,
+    // before it, half; another insert or an update half, after, before; a join half, then the
+    // place nearest half, towards `at` where the leaves met, that leaves both sides within a page,
+    // then `at`. The separator is the shortest beginning of the right key above the left key.
     pub(super) fn build_split<'txn>(
-        self,
-        appended: bool,
-    ) -> Result<(PageMut<'txn>, &'a [u8], PageMut<'txn>)> {
+        mut self,
+        at: usize,
+        fresh: Option<bool>,
+    ) -> Result<(PageMut<'txn>, Vec<u8>, PageMut<'txn>)> {
         let total_size = self.total_key_bytes + self.total_value_bytes;
         let mut division = 0;
         let mut first_split_key_bytes = 0;
         let mut first_split_value_bytes = 0;
-        for (key, value) in self.pairs.iter().take(self.pairs.len() - 1) {
-            first_split_key_bytes += key.len();
+        for ([a, b], value) in self.pairs.iter().take(self.pairs.len() - 1) {
+            first_split_key_bytes += a.len() + b.len();
             first_split_value_bytes += value.len();
             division += 1;
-            if !appended && first_split_key_bytes + first_split_value_bytes >= total_size / 2 {
+            if first_split_key_bytes + first_split_value_bytes >= total_size / 2 {
                 break;
             }
         }
 
-        let required_size =
-            self.required_bytes(division, first_split_key_bytes + first_split_value_bytes);
-        let mut allocated_pages = self.allocated_pages.lock().unwrap();
-        let mut page1 = self.mem.allocate(required_size, &mut allocated_pages)?;
-        let mut builder = RawLeafBuilder::new(
-            page1.memory_mut(),
-            division,
-            self.fixed_key_size,
-            self.fixed_value_size,
-            first_split_key_bytes,
-        );
-        for (key, value) in self.pairs.iter().take(division) {
-            builder.append(key, value);
+        let (pairs, last, half) = (&self.pairs, self.pairs.len() - 1, division);
+        let run_end = fresh == Some(true)
+            && (at == last
+                || (self.bytewise
+                    && at > 0
+                    && common(&pairs[at - 1].0, &pairs[at].0)
+                        >= common(&pairs[at].0, &pairs[at + 1].0) + 4));
+        let fits = |place: usize| self.pages(&pairs[..place]) + self.pages(&pairs[place..]) == 2;
+        let (mut near, mut over) = (at, half);
+        while fresh.is_none() && near.abs_diff(over) > 1 {
+            let mid = near.midpoint(over);
+            if fits(mid) { near = mid } else { over = mid }
         }
-        drop(builder);
+        let places = match fresh {
+            Some(_) if run_end => [at + 1, at, half],
+            Some(_) => [half, at + 1, at],
+            None => [half, near, at],
+        };
+        let division = places
+            .into_iter()
+            .filter(|place| (1..=last).contains(place))
+            .min_by_key(|&place| self.pages(&pairs[..place]) + self.pages(&pairs[place..]))
+            .unwrap();
+        let (left, right) = (&pairs[division - 1].0, &pairs[division].0);
+        let same = common(left, right);
+        let separator = if self.bytewise && bytes(right).count() > same + 1 {
+            bytes(right).take(same + 1).copied().collect()
+        } else {
+            left.concat()
+        };
 
-        let required_size = self.required_bytes(
-            self.pairs.len() - division,
-            self.total_key_bytes + self.total_value_bytes
-                - first_split_key_bytes
-                - first_split_value_bytes,
-        );
-        let mut page2 = self.mem.allocate(required_size, &mut allocated_pages)?;
-        let mut builder = RawLeafBuilder::new(
-            page2.memory_mut(),
-            self.pairs.len() - division,
-            self.fixed_key_size,
-            self.fixed_value_size,
-            self.total_key_bytes - first_split_key_bytes,
-        );
-        for (key, value) in &self.pairs[division..] {
-            builder.append(key, value);
-        }
-        drop(builder);
-
-        Ok((page1, self.pairs[division - 1].0, page2))
+        let second = Self {
+            pairs: self.pairs.split_off(division),
+            ..self
+        };
+        Ok((self.build()?, separator, second.build()?))
     }
 
     pub(super) fn build<'txn>(self) -> Result<PageMut<'txn>> {
-        let required_size = self.required_bytes(
-            self.pairs.len(),
-            self.total_key_bytes + self.total_value_bytes,
-        );
+        let (shared, key_bytes, value_bytes) = self.measure(&self.pairs);
+        let required_size = self.required_bytes(self.pairs.len(), key_bytes + value_bytes);
         let mut allocated_pages = self.allocated_pages.lock().unwrap();
         let mut page = self.mem.allocate(required_size, &mut allocated_pages)?;
         let mut builder = RawLeafBuilder::new(
@@ -799,12 +863,18 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
             self.pairs.len(),
             self.fixed_key_size,
             self.fixed_value_size,
-            self.total_key_bytes,
+            key_bytes,
         );
-        for (key, value) in self.pairs {
-            builder.append(key, value);
+        for (i, ([a, b], value)) in self.pairs.iter().enumerate() {
+            let skip = if i == 0 { 0 } else { shared };
+            builder.append_parts(
+                &a[skip.min(a.len())..],
+                &b[skip.saturating_sub(a.len())..],
+                value,
+            );
         }
         drop(builder);
+        page.memory_mut()[1] = u8::try_from(shared).unwrap();
         Ok(page)
     }
 }
@@ -813,7 +883,7 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
 // and rewriting all fields if any dynamically sized fields are written
 // Layout is:
 // 1 byte: type
-// 1 byte: reserved (padding to 32bits aligned)
+// 1 byte: how many leading bytes all keys share, kept once in the first key
 // 2 bytes: num_entries (number of pairs)
 // (optional) repeating (num_entries times):
 // 4 bytes: key_end
@@ -861,6 +931,7 @@ impl<'a> RawLeafBuilder<'a> {
         key_bytes: usize,
     ) -> Self {
         page[0] = LEAF;
+        page[1] = 0;
         page[2..4].copy_from_slice(&u16::try_from(num_pairs).unwrap().to_le_bytes());
         #[cfg(debug_assertions)]
         {
@@ -926,8 +997,13 @@ impl<'a> RawLeafBuilder<'a> {
     }
 
     pub(crate) fn append(&mut self, key: &[u8], value: &[u8]) {
+        self.append_parts(&[], key, value);
+    }
+
+    // Appends a pair whose key is the bytes of `head` then those of `key`
+    fn append_parts(&mut self, head: &[u8], key: &[u8], value: &[u8]) {
         if let Some(key_width) = self.fixed_key_size {
-            assert_eq!(key_width, key.len());
+            assert_eq!(key_width, head.len() + key.len());
         }
         if let Some(value_width) = self.fixed_value_size {
             assert_eq!(value_width, value.len());
@@ -942,6 +1018,8 @@ impl<'a> RawLeafBuilder<'a> {
         } else {
             self.value_end(self.pairs_written - 1)
         };
+        self.page[key_offset..(key_offset + head.len())].copy_from_slice(head);
+        let key_offset = key_offset + head.len();
 
         let n = self.pairs_written;
         if self.fixed_key_size.is_none() {
@@ -1104,7 +1182,9 @@ impl<'b> LeafMutator<'b> {
         let num_pairs = accessor.num_pairs();
         let last_key_end = accessor.key_end(accessor.num_pairs() - 1).unwrap();
         let last_value_end = accessor.value_end(accessor.num_pairs() - 1).unwrap();
-        let shift_key_start = accessor.key_start(i).unwrap_or(last_key_end);
+        // A first pair begins after the bytes the page keeps once, which stay where they are
+        let shift_key_start = accessor.key_start(i).unwrap_or(last_key_end)
+            + usize::from(i == 0) * accessor.prefix().len();
         let shift_value_start = accessor.value_start(i).unwrap_or(last_value_end);
 
         // Update all the pointers
@@ -1193,7 +1273,8 @@ impl<'b> LeafMutator<'b> {
         let num_pairs = accessor.num_pairs();
         assert!(i < num_pairs);
         assert!(num_pairs > 1);
-        let key_start = accessor.key_start(i).unwrap();
+        let key_start =
+            accessor.key_start(i).unwrap() + usize::from(i == 0) * accessor.prefix().len();
         let key_end = accessor.key_end(i).unwrap();
         let value_start = accessor.value_start(i).unwrap();
         let value_end = accessor.value_end(i).unwrap();

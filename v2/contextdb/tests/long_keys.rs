@@ -805,3 +805,44 @@ fn two_hundred_rows_of_50_000_byte_indexed_values_make_a_store_smaller_than_twic
         "the store is {stored} bytes for {values} bytes of values: an index entry holds a whole value"
     );
 }
+
+#[test]
+fn a_store_with_twelve_indexes_stays_under_twice_its_bytes_and_under_its_recorded_size() {
+    const RECORDED: u64 = 6_422_528; // today's size, rounded up to the next 64 KiB
+    let folder = support::folder("many-indexes-store-size");
+    let db = support::open(&folder);
+    support::run(
+        &db,
+        "CREATE TABLE events (id INTEGER PRIMARY KEY, host TEXT NOT NULL, path TEXT NOT NULL, \
+         kind TEXT NOT NULL, seq INTEGER NOT NULL, at INTEGER NOT NULL, note TEXT NOT NULL)",
+    );
+    let indexes = "host;path;kind;host,path;host,kind;path,kind;kind,host;host,path,kind;\
+                   path,host;kind,path;host,kind,path;path,host,kind";
+    for (n, columns) in indexes.split(';').enumerate() {
+        support::run(&db, &format!("CREATE INDEX i{n} ON events ({columns})"));
+    }
+    let (mut put_in, tx) = (0_u64, db.transaction().expect("begin"));
+    for id in 0..4_000_i64 {
+        let (seq, at, note) = (id * 3, 1_700_000_000 + id * 61, support::letters(id, 800));
+        let (host, kind) = (
+            format!("host-{}.build.cluster.example.internal.corp", id % 7),
+            ["created", "changed", "removed", "moved", "read"][id as usize % 5],
+        );
+        let path = format!("/srv/data/projects/{}/releases/{}", id % 13, id % 101);
+        put_in += (8 + host.len() + path.len() + kind.len() + 8 + 8 + note.len()) as u64;
+        let sql = "INSERT INTO events VALUES ($id, $host, $path, $kind, $seq, $at, $note)";
+        let row = params! { "id" => id, "host" => host, "path" => path, "kind" => kind, "seq" => seq, "at" => at, "note" => note };
+        tx.execute(sql, &row).expect("insert");
+    }
+    tx.commit().expect("commit the events");
+    support::close(db);
+    let stored = fs::metadata(folder.join("data")).expect("data file").len();
+    assert!(
+        stored <= 2 * put_in,
+        "the store is {stored} bytes for {put_in} bytes put in, over twice: a store with many indexes got larger than the promise allows; find the change that made index pages bigger and undo it"
+    );
+    assert!(
+        stored <= RECORDED,
+        "the store is {stored} bytes, over the recorded {RECORDED}: the store grew; a larger store needs the owner's word, not a larger number"
+    );
+}

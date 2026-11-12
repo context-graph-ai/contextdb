@@ -36,9 +36,9 @@ impl ChangeSet {
     }
 }
 
-/// Removes what a commit drops, in the order it was staged.
+/// Removes what `changes` drops, in the order it was staged; it counts a row's packing too.
 pub(super) fn write(
-    dropped: &[Dropped],
+    changes: &mut ChangeSet,
     rows: &mut Table<'_, &'static [u8], &'static [u8]>,
     beside: &mut Table<'_, u64, &'static [u8]>,
     index: &mut Table<'_, &'static [u8], &'static [u8]>,
@@ -46,13 +46,13 @@ pub(super) fn write(
     numbers: &mut Table<'_, u64, u64>,
     [blocks, vectors]: [&mut Table<'_, &'static [u8], &'static [u8]>; 2],
 ) -> Stored<()> {
-    for dropped in dropped {
+    for dropped in &changes.dropped {
         match *dropped {
             Dropped::Rows(table) => {
                 let (from, end) = all(table.0);
                 let all = from.as_slice()..end.as_slice();
                 for row in rows.extract_from_if::<&[u8], _>(all, |_, _| true)? {
-                    for kept in record::besides(row?.1.value()) {
+                    for kept in record::besides(&record::plain(row?.1.value())?) {
                         disk::remove_slices(beside, &kept)?;
                     }
                 }
@@ -76,12 +76,14 @@ pub(super) fn write(
                         let (key, row) = next?;
                         (
                             key.value().to_vec(),
-                            record::without_cell(row.value(), slot),
+                            record::without_cell(&record::plain(row.value())?, slot),
                         )
                     };
                     drop(after);
-                    if let Some((without, kept)) = without {
+                    if let Some((mut without, kept)) = without {
+                        let room = record::pack(&mut without, &mut changes.reserved);
                         rows.insert(key.as_slice(), without.as_slice())?;
+                        changes.reserved.shrink(room);
                         if let Some(kept) = kept {
                             disk::remove_slices(beside, &kept)?;
                         }

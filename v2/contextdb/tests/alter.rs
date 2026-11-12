@@ -6,7 +6,7 @@
 mod support;
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -393,42 +393,35 @@ fn a_dropped_columns_bytes_leave_the_store() {
 
 #[test]
 fn a_dropped_table_leaves_no_record() {
-    // As above, with a table dropped where a column was: one table filled, then a second one.
-    let store = |test: &str, drop: bool| -> (PathBuf, u64) {
-        let folder = support::folder(test);
-        let db = support::open(&folder);
-        let declare = |table: &str| {
-            let columns = "id INTEGER PRIMARY KEY, body TEXT, tag TEXT, v VECTOR(2)";
-            support::run(&db, &format!("CREATE TABLE {table} ({columns})"));
-            support::run(&db, &format!("CREATE INDEX by_tag ON {table} (tag, id)"));
-        };
-        declare("one");
-        fill(&db, "one", "body", true, 0);
-        support::run(
-            &db,
-            "UPDATE one SET tag = 'old', v = [1.0, 0.0] WHERE id <= 50",
-        );
-        if drop {
-            let dropped = support::run(&db, "DROP TABLE one");
-            assert_eq!(dropped.rows_affected(), 0);
-            assert!(db.table_names().is_empty());
-        }
-        declare("two");
-        fill(&db, "two", "body", true, ROWS);
-        support::close(db);
-        let length = data_file(&folder);
-        (folder, length)
+    // A table is filled and dropped, then a second one is filled with as many bytes. The
+    // dropped table's room is free for reuse, so the second fill does not grow the data file.
+    let folder = support::folder("dropped-table");
+    let db = support::open(&folder);
+    let declare = |table: &str| {
+        let columns = "id INTEGER PRIMARY KEY, body TEXT, tag TEXT, v VECTOR(2)";
+        support::run(&db, &format!("CREATE TABLE {table} ({columns})"));
+        support::run(&db, &format!("CREATE INDEX by_tag ON {table} (tag, id)"));
     };
-    let (_, kept) = store("dropped-table-kept", false);
-    let (folder, dropped) = store("dropped-table-dropped", true);
-    assert!(
-        kept >= 2 * PUT_IN,
-        "the store that dropped nothing is {kept} bytes long"
+    declare("one");
+    fill(&db, "one", "body", true, 0);
+    support::run(
+        &db,
+        "UPDATE one SET tag = 'old', v = [1.0, 0.0] WHERE id <= 50",
     );
+    let held = data_file(&folder);
+    assert!(held >= PUT_IN, "the filled store is {held} bytes long");
+    let dropped = support::run(&db, "DROP TABLE one");
+    assert_eq!(dropped.rows_affected(), 0);
+    assert!(db.table_names().is_empty());
+    let after_drop = data_file(&folder);
+    declare("two");
+    fill(&db, "two", "body", true, ROWS);
+    support::close(db);
+    let refilled = data_file(&folder);
     assert!(
-        dropped + PUT_IN / 2 <= kept,
-        "after DROP TABLE of {PUT_IN} bytes the data file is {dropped} bytes long, and the \
-         same store with the table kept is {kept}: the dropped table's bytes are still held"
+        refilled <= after_drop,
+        "after DROP TABLE of {PUT_IN} bytes the data file is {after_drop} bytes long, and \
+         writing {PUT_IN} bytes again made it {refilled}: the dropped table's room is not reused"
     );
 
     // Nothing answers for the dropped table: not the writer, not a reader, not after close
@@ -1096,63 +1089,54 @@ fn a_vector_column_far_larger_than_the_memory_limit_is_dropped_under_it() {
     const HELD: u64 = VECTORS as u64 * DIMENSION as u64 * 4;
     const KIB: usize = 1 << 10;
     const MIB: usize = 1 << 20;
-    // Two stores take the same writes: 10,000 vectors of 64 numbers, 2,560,000 bytes of them,
-    // in four partitions, all sealed, and then two tables of large text, 6,400,000 bytes.
-    // One of them drops the vector column in between, under a memory limit.
-    let store = |test: &str, drop: bool| -> u64 {
-        let folder = support::folder(test);
-        let db = support::open(&folder);
-        support::declare_docs(&db, DIMENSION, "PARTITION_KEY (ctx)");
-        for first in (1..=VECTORS).step_by(1000) {
-            let tx = db.transaction().expect("begin");
-            support::insert_docs(&tx, first..first + 1000, DIMENSION, |n| {
-                format!("p{}", n % 4)
-            });
-            tx.commit().expect("commit a thousand vectors");
+    // 10,000 vectors of 64 numbers, 2,560,000 bytes of them, in four partitions, all sealed, are
+    // dropped under a memory limit. Their room is free for reuse, so as many bytes of large text
+    // written afterwards (3,200,000, more than were dropped) do not grow the data file.
+    let folder = support::folder("drop-vector-column");
+    let db = support::open(&folder);
+    support::declare_docs(&db, DIMENSION, "PARTITION_KEY (ctx)");
+    for first in (1..=VECTORS).step_by(1000) {
+        let tx = db.transaction().expect("begin");
+        support::insert_docs(&tx, first..first + 1000, DIMENSION, |n| {
+            format!("p{}", n % 4)
+        });
+        tx.commit().expect("commit a thousand vectors");
+    }
+    assert_eq!(support::seal_all(&db), VECTORS as u64);
+    support::close(db);
+    let held = data_file(&folder);
+    // 9 MiB is what a store needs to open at all. The 192 KiB above it are less than
+    // a tenth of the vectors, which is 256,000 bytes.
+    let mut options = DatabaseOpenOptions::default();
+    options.memory_limit = Some(9 * MIB + 192 * KIB);
+    let db = support::open_with(&folder, options).expect("open under the limit");
+    let sql = "ALTER TABLE docs DROP COLUMN v";
+    if let Err(error) = db.execute(sql, &params! {}) {
+        panic!("{sql}\nof {VECTORS} vectors was refused under the limit: {error:?}");
+    }
+    // The column is gone, its rows are not, and a search on it is refused by name.
+    assert!(!says(&printed(&db, "docs"), "v VECTOR"));
+    let sql = support::nearest_sql("docs", "v", None, 10);
+    match support::search(&db, &sql, &support::vector(1, DIMENSION)) {
+        Err(Error::ColumnNotFound { table, column }) => {
+            assert_eq!((table.as_str(), column.as_str()), ("docs", "v"));
         }
-        assert_eq!(support::seal_all(&db), VECTORS as u64);
-        support::close(db);
-        if drop {
-            // 9 MiB is what a store needs to open at all. The 192 KiB above it are less than
-            // a tenth of the vectors, which is 256,000 bytes.
-            let mut options = DatabaseOpenOptions::default();
-            options.memory_limit = Some(9 * MIB + 192 * KIB);
-            let db = support::open_with(&folder, options).expect("open under the limit");
-            let sql = "ALTER TABLE docs DROP COLUMN v";
-            if let Err(error) = db.execute(sql, &params! {}) {
-                panic!("{sql}\nof {VECTORS} vectors was refused under the limit: {error:?}");
-            }
-            // The column is gone, its rows are not, and a search on it is refused by name.
-            assert!(!says(&printed(&db, "docs"), "v VECTOR"));
-            let sql = support::nearest_sql("docs", "v", None, 10);
-            match support::search(&db, &sql, &support::vector(1, DIMENSION)) {
-                Err(Error::ColumnNotFound { table, column }) => {
-                    assert_eq!((table.as_str(), column.as_str()), ("docs", "v"));
-                }
-                other => panic!("a search on the dropped column answered {other:?}"),
-            }
-            support::close(db);
-        }
-        let db = support::open(&folder);
-        assert_eq!(support::int(&db, "SELECT COUNT(*) FROM docs"), VECTORS);
-        for (table, seed) in [("n0", 0), ("n1", ROWS)] {
-            support::run(
-                &db,
-                &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, body TEXT)"),
-            );
-            fill(&db, table, "body", true, seed);
-        }
-        support::close(db);
-        data_file(&folder)
-    };
-    let kept = store("drop-vector-column-kept", false);
-    let dropped = store("drop-vector-column-dropped", true);
-    // The store that dropped the column has let its vectors, blocks and waiting entries go,
-    // so the text written afterwards took their room.
+        other => panic!("a search on the dropped column answered {other:?}"),
+    }
+    support::close(db);
+    let after_drop = data_file(&folder);
+    let db = support::open(&folder);
+    assert_eq!(support::int(&db, "SELECT COUNT(*) FROM docs"), VECTORS);
+    support::run(&db, "CREATE TABLE n0 (id INTEGER PRIMARY KEY, body TEXT)");
+    fill(&db, "n0", "body", true, 0);
+    support::close(db);
+    let refilled = data_file(&folder);
     assert!(
-        dropped + HELD / 2 <= kept,
-        "after DROP COLUMN of {HELD} bytes of vectors the data file is {dropped} bytes long, \
-         and the same store with the column kept is {kept}: the column's bytes are still held"
+        refilled <= after_drop,
+        "after DROP COLUMN of {HELD} bytes of vectors the data file is {after_drop} bytes long \
+         (it was {held} before), and writing {} bytes again made it {refilled}: the column's \
+         room is not reused",
+        PUT_IN
     );
 }
 

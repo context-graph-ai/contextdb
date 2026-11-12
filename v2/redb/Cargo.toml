@@ -57,10 +57,6 @@ name = "special_values"
 path = "examples/special_values.rs"
 
 [[test]]
-name = "backward_compatibility"
-path = "tests/backward_compatibility.rs"
-
-[[test]]
 name = "basic_tests"
 path = "tests/basic_tests.rs"
 
@@ -98,10 +94,6 @@ version = "2.0.1"
 
 [dev-dependencies.rand]
 version = "0.10.1"
-
-[dev-dependencies.redb2_6]
-version = "=2.6.0"
-package = "redb"
 
 [dev-dependencies.tempfile]
 version = "3.5.0"

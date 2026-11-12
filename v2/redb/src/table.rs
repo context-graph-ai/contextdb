@@ -598,8 +598,7 @@ impl<
     fn next(&mut self) -> Option<Self::Item> {
         let entry = self.inner.next()?;
         Some(entry.map(|entry| {
-            let (page, key_range, value_range) = entry.into_raw();
-            let key = AccessGuard::with_page(page.clone(), key_range);
+            let (page, key, value_range) = entry.into_raw();
             let value = AccessGuard::with_page(page, value_range);
             (key, value)
         }))
@@ -615,8 +614,7 @@ impl<
     fn next_back(&mut self) -> Option<Self::Item> {
         let entry = self.inner.next_back()?;
         Some(entry.map(|entry| {
-            let (page, key_range, value_range) = entry.into_raw();
-            let key = AccessGuard::with_page(page.clone(), key_range);
+            let (page, key, value_range) = entry.into_raw();
             let value = AccessGuard::with_page(page, value_range);
             (key, value)
         }))
@@ -626,6 +624,7 @@ impl<
 #[derive(Clone)]
 pub struct Range<'a, K: Key + 'static, V: Value + 'static> {
     inner: BtreeRangeIter<K, V>,
+    lent: Vec<u8>,
     _transaction_guard: Arc<TransactionGuard>,
     // This lifetime is here so that `&` can be held on `Table` preventing concurrent mutation
     _lifetime: PhantomData<&'a ()>,
@@ -635,9 +634,16 @@ impl<K: Key + 'static, V: Value + 'static> Range<'_, K, V> {
     pub(super) fn new(inner: BtreeRangeIter<K, V>, guard: Arc<TransactionGuard>) -> Self {
         Self {
             inner,
+            lent: Vec::new(),
             _transaction_guard: guard,
             _lifetime: Default::default(),
         }
+    }
+
+    /// The next pair as borrowed bytes, lent until the walk moves on, with no key copied to the heap
+    pub fn next_lent(&mut self) -> Result<Option<(K::SelfType<'_>, V::SelfType<'_>)>> {
+        let pair = self.inner.next_lent(&mut self.lent)?;
+        Ok(pair.map(|(key, value)| (K::from_bytes(key), V::from_bytes(value))))
     }
 }
 
@@ -647,8 +653,7 @@ impl<'a, K: Key + 'static, V: Value + 'static> Iterator for Range<'a, K, V> {
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(|x| {
             x.map(|entry| {
-                let (page, key_range, value_range) = entry.into_raw();
-                let key = AccessGuard::with_page(page.clone(), key_range);
+                let (page, key, value_range) = entry.into_raw();
                 let value = AccessGuard::with_page(page, value_range);
                 (key, value)
             })
@@ -660,8 +665,7 @@ impl<K: Key + 'static, V: Value + 'static> DoubleEndedIterator for Range<'_, K, 
     fn next_back(&mut self) -> Option<Self::Item> {
         self.inner.next_back().map(|x| {
             x.map(|entry| {
-                let (page, key_range, value_range) = entry.into_raw();
-                let key = AccessGuard::with_page(page.clone(), key_range);
+                let (page, key, value_range) = entry.into_raw();
                 let value = AccessGuard::with_page(page, value_range);
                 (key, value)
             })

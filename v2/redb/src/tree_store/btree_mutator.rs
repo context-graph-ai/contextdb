@@ -12,6 +12,7 @@ use crate::tree_store::{
 };
 use crate::types::{Key, Value};
 use crate::{AccessGuard, Result};
+use std::cell::OnceCell;
 use std::cmp::{max, min};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
@@ -143,6 +144,7 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                         accessor.num_pairs() - 1,
                         K::fixed_width(),
                         V::fixed_width(),
+                        K::compares_as_bytes(),
                     );
                     builder.push_all_except(&accessor, Some(deleted_pair));
                     let page = builder.build()?;
@@ -238,8 +240,9 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                 1,
                 K::fixed_width(),
                 V::fixed_width(),
+                K::compares_as_bytes(),
             );
-            builder.push(key_bytes, value_bytes);
+            builder.push([&[], key_bytes], value_bytes);
             let page = builder.build()?;
 
             let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
@@ -276,8 +279,9 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                         1,
                         K::fixed_width(),
                         V::fixed_width(),
+                        K::compares_as_bytes(),
                     );
-                    builder.push(key, value);
+                    builder.push([&[], key], value);
                     let new_page = builder.build()?;
                     let new_page_number = new_page.get_page_number();
                     let new_page_accessor =
@@ -308,7 +312,8 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                     };
                 }
 
-                // Fast-path for uncommitted pages, that can be modified in-place
+                // Fast-path for uncommitted pages, that can be modified in-place, keeping the prefix
+                let stored_key = key.strip_prefix(accessor.prefix());
                 let has_inplace_space = || -> bool {
                     if found {
                         LeafMutator::sufficient_replace_inplace_space(
@@ -324,13 +329,14 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                             position,
                             K::fixed_width(),
                             V::fixed_width(),
-                            key,
+                            stored_key.unwrap(),
                             value,
                         )
                     }
                 };
                 if self.mem.uncommitted(page.get_page_number())
                     && self.modify_uncommitted
+                    && (found || stored_key.is_some())
                     && has_inplace_space()
                 {
                     let page_number = page.get_page_number();
@@ -347,7 +353,7 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                     if found {
                         mutator.replace(position, value);
                     } else {
-                        mutator.insert(position, key, value);
+                        mutator.insert(position, stored_key.unwrap(), value);
                     }
                     let new_page_accessor =
                         LeafAccessor::new(page_mut.memory(), K::fixed_width(), V::fixed_width());
@@ -368,18 +374,19 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                     accessor.num_pairs() + 1,
                     K::fixed_width(),
                     V::fixed_width(),
+                    K::compares_as_bytes(),
                 );
                 for i in 0..accessor.num_pairs() {
                     if i == position {
-                        builder.push(key, value);
+                        builder.push([&[], key], value);
                     }
                     if !found || i != position {
                         let entry = accessor.entry(i).unwrap();
-                        builder.push(entry.key(), entry.value());
+                        builder.push(entry.key_parts(), entry.value());
                     }
                 }
                 if accessor.num_pairs() == position {
-                    builder.push(key, value);
+                    builder.push([&[], key], value);
                 }
                 if !builder.should_split() {
                     let new_page = builder.build()?;
@@ -417,9 +424,8 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                         old_value: existing_value,
                     }
                 } else {
-                    let appended = !found && accessor.num_pairs() == position;
-                    let (new_page1, split_key, new_page2) = builder.build_split(appended)?;
-                    let split_key = split_key.to_vec();
+                    let (new_page1, split_key, new_page2) =
+                        builder.build_split(position, Some(!found))?;
                     let page_number = page.get_page_number();
                     let existing_value = if found {
                         let (start, end) = accessor.value_range(position).unwrap();
@@ -653,8 +659,10 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
         if !found {
             return Ok((Subtree(page.get_page_number(), checksum), None));
         }
+        // Counted with every key whole: the shared bytes again for each pair left kept without them
         let new_kv_bytes = accessor.length_of_pairs(0, accessor.num_pairs())
-            - accessor.length_of_pairs(position, position + 1);
+            - accessor.length_of_pairs(position, position + 1)
+            + accessor.prefix().len() * (accessor.num_pairs() - 1 - usize::from(position > 0));
         let new_required_bytes = RawLeafBuilder::required_bytes(
             accessor.num_pairs() - 1,
             new_kv_bytes,
@@ -702,13 +710,14 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                 accessor.num_pairs() - 1,
                 K::fixed_width(),
                 V::fixed_width(),
+                K::compares_as_bytes(),
             );
             for i in 0..accessor.num_pairs() {
                 if i == position {
                     continue;
                 }
                 let entry = accessor.entry(i).unwrap();
-                builder.push(entry.key(), entry.value());
+                builder.push(entry.key_parts(), entry.value());
             }
             let new_page = builder.build()?;
             Subtree(new_page.get_page_number(), DEFERRED)
@@ -859,6 +868,7 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                         partial_child_accessor.num_pairs() - 1,
                         K::fixed_width(),
                         V::fixed_width(),
+                        K::compares_as_bytes(),
                     );
                     child_builder.push_all_except(&partial_child_accessor, Some(deleted_pair));
                     let new_page = child_builder.build()?;
@@ -875,6 +885,7 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                     return Ok((result, found));
                 }
 
+                let signpost = OnceCell::new();
                 for i in 0..accessor.count_children() {
                     if i == child_index {
                         continue;
@@ -889,6 +900,7 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                                 + merge_with_accessor.num_pairs(),
                             K::fixed_width(),
                             V::fixed_width(),
+                            K::compares_as_bytes(),
                         );
                         if child_index < merge_with {
                             child_builder
@@ -900,9 +912,14 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                                 .push_all_except(&partial_child_accessor, Some(deleted_pair));
                         }
                         if child_builder.should_split() {
+                            let met = if child_index < merge_with {
+                                partial_child_accessor.num_pairs() - 1
+                            } else {
+                                merge_with_accessor.num_pairs()
+                            };
                             let (new_page1, split_key, new_page2) =
-                                child_builder.build_split(false)?;
-                            builder.push_key(split_key);
+                                child_builder.build_split(met, None)?;
+                            builder.push_key(signpost.get_or_init(|| split_key));
                             builder.push_child(new_page1.get_page_number(), DEFERRED);
                             builder.push_child(new_page2.get_page_number(), DEFERRED);
                         } else {
