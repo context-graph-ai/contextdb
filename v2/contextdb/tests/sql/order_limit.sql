@@ -120,3 +120,18 @@ id | points
 5 | 20
 1 | 30
 2 | NULL
+
+# With no ORDER BY, a read through an index comes in the index's order: its values, then the
+# row's key, whatever order the rows were written in.
+CREATE TABLE unordered (id INTEGER PRIMARY KEY, grp INTEGER NOT NULL);
+CREATE INDEX unordered_by_grp ON unordered (grp);
+INSERT INTO unordered (id, grp) VALUES (9, 2), (3, 1), (7, 2), (1, 1), (5, 2), (4, 1);
+SELECT id, grp FROM unordered WHERE grp >= 1;
+----
+id | grp
+1 | 1
+3 | 1
+4 | 1
+5 | 2
+7 | 2
+9 | 2

@@ -5,8 +5,12 @@ block_comment = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
 
 statement = { SOI ~ stmt ~ ";"? ~ EOI }
 stmt = _{
-    create_table_stmt
+    stored_procedure
+    | create_table_stmt
     | create_index_stmt
+    | alter_table_stmt
+    | drop_table_stmt
+    | drop_index_stmt
     | insert_stmt
     | delete_stmt
     | update_stmt
@@ -18,28 +22,22 @@ stmt = _{
     | later
 }
 
-// A statement or clause that a later version of the library reads. It is recognised by its
-// first words alone and the rest of the text is left unread, so that the statement is refused by
-// that name and not as a syntax error. `later` stands only where nothing this version reads can
-// begin with one of these words: after a whole statement or clause, and after an expression,
-// where LIKE and BETWEEN would follow. DISTINCT and GRAPH_TABLE stand where a name could, so
-// they are looked for first.
+// A statement or clause that a later version of the library reads, or that no version reads
+// (IVF and SEARCH). It is recognised by its first words alone and the rest of the text is left
+// unread, so that the statement is refused by that name and not as a syntax error. `later`
+// stands only where nothing this version reads can begin with one of these words: after a whole
+// statement or clause, and after an expression, where LIKE and BETWEEN would follow. DISTINCT and
+// GRAPH_TABLE stand where a name could, so they are looked for first.
 later = { later_name ~ ANY* }
 later_name = @{
     (
-        ^"ALTER" | ^"DROP" | ^"WITH" | ^"BEGIN" | ^"COMMIT" | ^"ROLLBACK" | ^"PURGE" | ^"DISCARD"
+        ^"DROP" ~ SPACE+ ~ (^"TRIGGER" | ^"ROUTE" | ^"SCHEDULE") | ^"WITH" | ^"BEGIN" | ^"COMMIT" | ^"ROLLBACK" | ^"PURGE" | ^"DISCARD"
         | ^"DECLARE" | ^"DISTINCT" | ^"GRAPH_TABLE"
         | ((^"LEFT" | ^"INNER" | ^"CROSS") ~ SPACE+)? ~ ^"JOIN"
         | ^"GROUP" ~ SPACE+ ~ ^"BY" | ^"HAVING" | ^"UNION" | ^"OFFSET"
         | ^"USE" ~ SPACE+ ~ ^"RANK"
-        | ^"ON" ~ SPACE+ ~ ^"CONFLICT"
         | (^"NOT" ~ SPACE+)? ~ (^"LIKE" | ^"BETWEEN")
-        | ^"FOREIGN" ~ SPACE+ ~ ^"KEY" | ^"REFERENCES" | ^"EXPIRES" | ^"IMMUTABLE"
-        | ^"RANK_POLICY" | ^"CONTEXT_ID" | ^"SCOPE_LABEL_READ" | ^"SCOPE_LABEL" | ^"ACL"
-        | ^"SEARCH" | ^"IVF"
-        | ^"RETAIN" | ^"HISTORY" | ^"SYNC" | ^"STATE_MACHINE" | ^"STATE" ~ SPACE+ ~ ^"MACHINE"
-        | ^"DAG" | ^"PROPAGATE" | ^"DELIVERY" ~ SPACE+ ~ ^"MANIFEST"
-        | ^"EDGE" ~ SPACE+ ~ ^"DISCARD" | ^"MAINTAIN" ~ SPACE+ ~ ^"COUNT"
+        | ^"EXPIRES" | ^"SEARCH" | ^"IVF"
     ) ~ !ident_char
 }
 // Two forms of a later version that begin with words this version reads, so each is known by
@@ -87,16 +85,22 @@ create_table_stmt = {
     ^"CREATE" ~ ^"TABLE" ~ if_not_exists? ~ identifier
     ~ "(" ~ table_element ~ ("," ~ table_element)*
     // A later clause may follow a column, stand as an element of its own, or follow the list.
-    ~ (")" ~ later? | ","? ~ later)
+    ~ (")" ~ table_option* ~ later? | ","? ~ later)
 }
+// The program stored in a database that no version reads: it is refused by its own kind.
+stored_procedure = { ^"CREATE" ~ stored_word ~ ANY* }
+stored_word = @{ (^"PROCEDURE" | ^"FUNCTION") ~ !ident_char }
 if_not_exists = { ^"IF" ~ ^"NOT" ~ ^"EXISTS" }
-table_element = _{ column_def | unique_table_constraint }
+table_element = _{ column_def | unique_table_constraint | primary_key_columns | foreign_key }
 unique_table_constraint = { ^"UNIQUE" ~ "(" ~ identifier ~ ("," ~ identifier)* ~ ")" }
+primary_key_columns = { ^"PRIMARY" ~ ^"KEY" ~ columns }
+foreign_key = { ^"FOREIGN" ~ ^"KEY" ~ columns ~ ^"REFERENCES" ~ identifier ~ columns }
+columns = { "(" ~ identifier ~ ("," ~ identifier)* ~ ")" }
 column_def = { identifier ~ data_type ~ column_constraint* }
 data_type = {
     vector_type
     | ^"UUID" | ^"TEXT" | ^"INTEGER" | ^"INT" | ^"REAL" | ^"FLOAT" | ^"BOOLEAN" | ^"BOOL"
-    | ^"TIMESTAMP" | ^"JSON"
+    | ^"TIMESTAMP" | ^"TXID" | ^"JSON"
 }
 vector_type = {
     ^"VECTOR" ~ "(" ~ integer ~ ")"
@@ -122,24 +126,117 @@ change_percent = { ^"CHANGE_PERCENT" ~ "=" ~ signed }
 tombstone_percent = { ^"TOMBSTONE_PERCENT" ~ "=" ~ signed }
 // Read with its sign, so that `schema` refuses zero and a negative number by their kind.
 signed = @{ "-"? ~ ASCII_DIGIT+ }
-column_constraint = _{ not_null | nullable_marker | primary_key | unique | default_clause }
+column_constraint = _{
+    not_null | nullable_marker | primary_key | unique | default_clause
+    | references | immutable | context_id | scope_labels | acl | rank_policy
+}
 not_null = { ^"NOT" ~ ^"NULL" }
 nullable_marker = { ^"NULL" }
 primary_key = { ^"PRIMARY" ~ ^"KEY" }
 unique = { ^"UNIQUE" }
 default_clause = { ^"DEFAULT" ~ expr }
+references = { ^"REFERENCES" ~ identifier ~ "(" ~ identifier ~ ")" ~ propagation? }
+propagation = {
+    ^"ON" ~ ^"STATE" ~ as_written ~ ^"PROPAGATE" ~ ^"SET" ~ as_written ~ max_depth? ~ abort_on_failure?
+}
+max_depth = { ^"MAX" ~ ^"DEPTH" ~ integer }
+abort_on_failure = { ^"ABORT" ~ ^"ON" ~ ^"FAILURE" }
+// A state or an edge type, which is a value that rows hold, and the name of a function: none
+// of them is folded to lower case as the name of a table, a column or an index is.
+as_written = { quoted_ident | ident }
+immutable = { ^"IMMUTABLE" }
+context_id = { ^"CONTEXT_ID" }
+scope_labels = { ^"SCOPE_LABEL_READ" ~ labels ~ ^"WRITE" ~ labels | ^"SCOPE_LABEL" ~ labels }
+labels = { "(" ~ string ~ ("," ~ string)* ~ ")" }
+acl = { ^"ACL" ~ ^"REFERENCES" ~ identifier ~ "(" ~ identifier ~ ")" }
+rank_policy = {
+    ^"RANK_POLICY" ~ "(" ~ ^"JOIN" ~ identifier ~ ^"ON" ~ identifier
+    ~ "," ~ ^"FORMULA" ~ string ~ "," ~ ^"SORT_KEY" ~ identifier ~ ")"
+}
+
+table_option = _{
+    immutable | state_machine | dag | propagate_edge | exclude_vector | retain | history
+    | sync_conflict | sync | maintain_count | delivery_manifest | edge_discard
+}
+state_machine = {
+    (^"STATE_MACHINE" | ^"STATE" ~ ^"MACHINE")
+    ~ "(" ~ identifier ~ ":" ~ transition ~ ("," ~ transition)* ~ ")"
+}
+transition = { as_written ~ "->" ~ ("[" ~ as_written ~ ("," ~ as_written)* ~ "]" | as_written) }
+dag = { ^"DAG" ~ "(" ~ string ~ ("," ~ string)* ~ ")" }
+propagate_edge = {
+    ^"PROPAGATE" ~ ^"ON" ~ ^"EDGE" ~ as_written ~ edge_direction
+    ~ ^"STATE" ~ as_written ~ ^"SET" ~ as_written ~ max_depth? ~ abort_on_failure?
+}
+edge_direction = { ^"INCOMING" | ^"OUTGOING" | ^"BOTH" }
+exclude_vector = { ^"PROPAGATE" ~ ^"ON" ~ ^"STATE" ~ as_written ~ ^"EXCLUDE" ~ ^"VECTOR" }
+retain = { ^"RETAIN" ~ integer ~ retain_unit ~ sync_safe? }
+retain_unit = { ^"SECONDS" | ^"MINUTES" | ^"HOURS" | ^"DAYS" }
+// RETAIN names no direction. One written here is read so that the refusal can name the clause
+// to write instead.
+sync_safe = { ^"SYNC" ~ ^"SAFE" ~ nested_direction? }
+nested_direction = { ^"PUSH" ~ ^"ONLY" | ^"TWO" ~ ^"WAY" }
+history = { ^"HISTORY" ~ history_kept }
+history_kept = { ^"ALL" | ^"CURRENT" ~ ^"ONLY" }
+sync = { ^"SYNC" ~ sync_direction }
+sync_direction = { ^"OFF" | ^"PUSH" ~ ^"ONLY" | ^"PULL" ~ ^"ONLY" | ^"TWO" ~ ^"WAY" }
+sync_conflict = { ^"SYNC" ~ ^"CONFLICT" ~ ^"KEEP" ~ conflict_kept }
+conflict_kept = { ^"FIRST" | ^"LATEST" }
+// DEFAULT takes a declared list away, so a new table is refused for it by the builder.
+maintain_count = { ^"MAINTAIN" ~ ^"COUNT" ~ (count_word | count_list ~ ("," ~ count_list)*) }
+count_word = { ^"ALL" ~ ^"PREFIXES" | ^"NONE" | ^"DEFAULT" }
+count_list = { "(" ~ indexed_column ~ ("," ~ indexed_column)* ~ ")" }
+delivery_manifest = { ^"DELIVERY" ~ ^"MANIFEST" ~ ^"OVER" ~ identifier ~ ("," ~ identifier)* }
+edge_discard = { ^"EDGE" ~ ^"DISCARD" ~ discard_when }
+discard_when = { ^"NEVER" | ^"AFTER" ~ ^"OUTCOME" | ^"ALWAYS" }
 
 create_index_stmt = {
     ^"CREATE" ~ ^"INDEX" ~ identifier ~ ^"ON" ~ identifier
-    ~ "(" ~ indexed_column ~ ("," ~ indexed_column)* ~ ")"
+    ~ "(" ~ (json_path | indexed_column ~ ("," ~ indexed_column)*) ~ ")"
 }
+// A path into a JSON column, written as an expression in its own parentheses.
+json_path = { "(" ~ identifier ~ ("->" ~ string)+ ~ ")" }
 indexed_column = { identifier ~ sort_dir? }
+
+alter_table_stmt = { ^"ALTER" ~ ^"TABLE" ~ identifier ~ alter_action }
+alter_action = _{
+    add_column | drop_retain | drop_column | rename_column | alter_column
+    | ^"SET" ~ (retain | history | sync_conflict | sync | maintain_count)
+}
+// The clauses of a later version may follow the column, as in CREATE TABLE.
+add_column = { ^"ADD" ~ column_word? ~ column_def ~ later? }
+drop_retain = { ^"DROP" ~ retain_word }
+drop_column = { ^"DROP" ~ column_word? ~ identifier ~ drop_behaviour? }
+drop_behaviour = { ^"RESTRICT" | ^"CASCADE" }
+rename_column = { ^"RENAME" ~ column_word ~ identifier ~ ^"TO" ~ identifier }
+// The clauses of a VECTOR column that may change, DEFAULT taking one back to what a column that
+// does not write it has; the SET of any other is a later version's.
+alter_column = {
+    ^"ALTER" ~ column_word ~ identifier ~ ^"SET"
+    ~ (
+        ^"MAX_PARTITIONS" ~ signed | ^"SEARCH_MODE" ~ search_mode | auto_index_at | consolidation
+        | auto_index_default | consolidation_default | later
+    )
+}
+auto_index_default = { ^"AUTO_INDEX_AT" ~ ^"DEFAULT" }
+consolidation_default = { ^"CONSOLIDATION" ~ ^"DEFAULT" }
+// Whole words, so that a column whose name begins with one is still a column.
+column_word = @{ ^"COLUMN" ~ !ident_char }
+retain_word = @{ ^"RETAIN" ~ !ident_char }
+
+drop_table_stmt = { ^"DROP" ~ ^"TABLE" ~ if_exists? ~ identifier }
+drop_index_stmt = { ^"DROP" ~ ^"INDEX" ~ if_exists? ~ identifier ~ on_table }
+on_table = { ^"ON" ~ identifier }
+if_exists = { ^"IF" ~ ^"EXISTS" }
 
 insert_stmt = {
     ^"INSERT" ~ ^"INTO" ~ identifier
     ~ ("(" ~ identifier ~ ("," ~ identifier)* ~ ")")?
     ~ ^"VALUES" ~ values_row ~ ("," ~ values_row)*
-    ~ later?
+    ~ on_conflict? ~ later?
+}
+on_conflict = {
+    ^"ON" ~ ^"CONFLICT" ~ columns ~ ^"DO" ~ ^"UPDATE" ~ ^"SET" ~ assignment ~ ("," ~ assignment)*
 }
 values_row = { "(" ~ expr ~ ("," ~ expr)* ~ ")" }
 assignment = { identifier ~ "=" ~ expr }
@@ -187,8 +284,17 @@ primary_expr = _{
 parenthesized = { "(" ~ expr ~ ("," ~ expr)* ~ ")" }
 vector_lit = { "[" ~ vector_component ~ ("," ~ vector_component)* ~ "]" }
 vector_component = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
-function_call = { identifier ~ "(" ~ (star | (expr ~ ("," ~ expr)*))? ~ ")" }
+function_call = { as_written ~ "(" ~ (star | (expr ~ ("," ~ expr)*))? ~ ")" }
 column_ref = { identifier ~ ("." ~ identifier)? }
+
+// A rank formula, which no statement reads: numbers and `{column}`s joined by `+` and `*`, in
+// parentheses or in `coalesce(<formula>, <number>)`.
+formula = { SOI ~ formula_sum ~ EOI }
+formula_sum = { formula_operand ~ (formula_op ~ formula_operand)* }
+formula_op = { "+" | "*" }
+formula_operand = _{ coalesce | float | integer | braced | "(" ~ formula_sum ~ ")" }
+coalesce = { ^"coalesce" ~ "(" ~ formula_sum ~ "," ~ (float | integer) ~ ")" }
+braced = { "{" ~ identifier ~ "}" }
 
 parameter = @{ "$" ~ ident }
 null_lit = { ^"NULL" }

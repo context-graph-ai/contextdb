@@ -6,15 +6,16 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 
-use super::access::{Source, as_key};
-use super::expression::{column_index, eval, reads};
-use super::{QueryResult, names};
+use super::expression::{EvalContext, column_index, eval, reads};
+use super::table::{Source, as_key};
+use super::visible::Visible;
+use super::{QueryResult, Reader, names};
 use crate::memory::Budget;
 use crate::schema::{Catalog, Table};
 use crate::sql::ast::{BinOp, ColumnRef};
 use crate::sql::{Expr, Plan};
 use crate::store::{Key, Read};
-use crate::types::{ColumnType, Error, Result, Value, VectorIndexRef};
+use crate::types::{ColumnType, Error, Result, Value, VectorIndexRef, vector_from_text};
 use crate::vector::{self, Nearest};
 
 /// The most key tuples a filter may name; past that the search reads every partition.
@@ -35,6 +36,7 @@ pub(super) fn run(
     params: &HashMap<String, Value>,
     catalog: &Catalog,
     read: &dyn Read,
+    reader: &Reader,
     budget: &Budget,
     now: i64,
 ) -> Result<Option<QueryResult>> {
@@ -69,7 +71,7 @@ pub(super) fn run(
     let Some(vector) = table.vector(column) else {
         return Err(Error::UnknownVectorIndex { index });
     };
-    let near = match eval(query, table, &[], params, now)? {
+    let near = match eval(query, &table.scope(), &[], &EvalContext::new(params, now))? {
         Value::Vector(vector) => Some(vector),
         Value::Text(text) => vector_from_text(&text),
         _ => None,
@@ -129,8 +131,15 @@ pub(super) fn run(
     // the answer for what the select list reads, so a large value is loaded only then.
     let mut its_vector = vec![false; width];
     its_vector[at] = true;
-    let asked = Source::new(table, filter, params, now, read, filtered, &its_vector);
-    let returned = Source::new(table, None, params, now, read, vec![false; width], &wanted);
+    // Each is read through the reader's filter, and what a filter holds is given back with
+    // the statement.
+    let (mut seeing, mut showing) = (budget.reserve(0, "query")?, budget.reserve(0, "query")?);
+    let visible = Visible::new(table, catalog, reader, &mut seeing)?;
+    let asked =
+        Source::new(table, filter, params, now, read, visible).reading(filtered, &its_vector);
+    let visible = Visible::new(table, catalog, reader, &mut showing)?;
+    let returned =
+        Source::new(table, None, params, now, read, visible).reading(vec![false; width], &wanted);
     // What the vector part holds is given back once the rows are built; the rows stay counted
     // with the result.
     let mut searching = budget.reserve(0, "query")?;
@@ -351,7 +360,8 @@ impl Scope<'_> {
                     self.unbound.set(Some(name.clone()));
                 }
                 value => {
-                    let value = eval(value, self.table, &[], self.params, self.now)?;
+                    let ctx = EvalContext::new(self.params, self.now);
+                    let value = eval(value, &self.table.scope(), &[], &ctx)?;
                     tuple[place] = as_key(self.table.meta.columns[at].column_type, value);
                 }
             }
@@ -366,14 +376,4 @@ fn sides(expr: &Expr) -> &[Expr] {
         Expr::Row(items) => items,
         one => std::slice::from_ref(one),
     }
-}
-
-/// Reads the text spelling of a vector, `[0.1, 0.2, 0.3]`: the one reader of it, for a value
-/// written into a VECTOR column and for the vector of a search.
-pub(crate) fn vector_from_text(text: &str) -> Option<Vec<f32>> {
-    let inside = text.trim().strip_prefix('[')?.strip_suffix(']')?;
-    inside
-        .split(',')
-        .map(|number| number.trim().parse().ok())
-        .collect()
 }

@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 use serde_json::json;
 
-use super::QueryResult;
 use super::search::Scope;
+use super::{QueryResult, Reader};
 use crate::memory::Budget;
 use crate::schema::{Catalog, Consolidation, Quantization, Table, VectorColumn};
 use crate::sql::{Plan, not_supported};
@@ -311,6 +311,7 @@ pub(crate) fn explain(
     plan: &Plan,
     catalog: &Catalog,
     read: &dyn Read,
+    reader: &Reader,
     budget: &Budget,
     now: i64,
 ) -> Result<String> {
@@ -349,6 +350,16 @@ pub(crate) fn explain(
         now,
         unbound: Cell::default(),
     };
+    // A narrowed handle is told what the statement and the declaration say: no partition
+    // record is read for it, as one names its Context's values and counts its vectors.
+    if !reader.is_admin() {
+        let lines = [
+            format!("requested_mode: {}", mode_name(mode)),
+            format!("effective_auto_index_at: {}", vector.index_at()),
+            format!("partition_key_columns: {}", key_columns(vector)),
+        ];
+        return Ok(lines.join("\n"));
+    }
     let mut keys = scope.keys(filter.as_ref())?;
     let every = scope.unbound.take();
     if every.is_some() {

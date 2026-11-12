@@ -1,8 +1,10 @@
 //! Kill and reopen: a writer killed at any storage call of a commit leaves the whole commit or
 //! none of it, and the store opens again with nothing to mend by hand. That holds for a commit
 //! of rows with vectors and for the commit of a maintenance cycle that seals vectors: after
-//! either, every search finds exactly the vectors of the rows that are there. Damage in the
-//! file is refused as damage, by name.
+//! either, every search finds exactly the vectors of the rows that are there. It holds for a
+//! commit of rows that reference each other, are counted by a kept count and are indexed by
+//! values too long for an index entry: the rows, the counts and the entries are there together
+//! or not at all. Damage in the file is refused as damage, by name.
 //!
 //! A kill lands at a point the child names. The child's storage door counts the writes and
 //! syncs of its data file; before call number `stop_at` it announces `stopped` and waits there,
@@ -256,29 +258,37 @@ fn a_commit_on_disk_is_reported_and_served_though_the_read_after_it_fails() {
     let syncs = Arc::new(AtomicU64::new(0));
     let fail_after = Arc::new(AtomicU64::new(0));
     let failed = Arc::new(AtomicU64::new(0));
-    let mut options = DatabaseOpenOptions::default();
-    options.storage = Some(support::failing_storage({
-        let (syncs, fail_after, failed) = (syncs.clone(), fail_after.clone(), failed.clone());
-        move |call| {
-            match call {
-                Call::Sync => {
-                    syncs.fetch_add(1, Ordering::SeqCst);
-                }
-                Call::Read(..) => {
-                    let after = fail_after.load(Ordering::SeqCst);
-                    if after > 0 && syncs.load(Ordering::SeqCst) >= after {
-                        failed.fetch_add(1, Ordering::SeqCst);
-                        return Err(io::Error::other("a read this test makes fail"));
+    // When set, every read fails, whatever the syncs: reads that fail before a commit is on disk.
+    let fail_now = Arc::new(AtomicBool::new(false));
+    let options = || {
+        let mut options = DatabaseOpenOptions::default();
+        options.storage = Some(support::failing_storage({
+            let (syncs, fail_after, failed) = (syncs.clone(), fail_after.clone(), failed.clone());
+            let fail_now = fail_now.clone();
+            move |call| {
+                match call {
+                    Call::Sync => {
+                        syncs.fetch_add(1, Ordering::SeqCst);
                     }
+                    Call::Read(..) => {
+                        let after = fail_after.load(Ordering::SeqCst);
+                        if fail_now.load(Ordering::SeqCst)
+                            || (after > 0 && syncs.load(Ordering::SeqCst) >= after)
+                        {
+                            failed.fetch_add(1, Ordering::SeqCst);
+                            return Err(io::Error::other("a read this test makes fail"));
+                        }
+                    }
+                    Call::Write(..) => {}
                 }
-                Call::Write(..) => {}
+                Ok(())
             }
-            Ok(())
-        }
-    }));
-    // Under a memory limit of 32 MiB the store's page cache is 8 MiB: a quarter of the limit.
-    options.memory_limit = Some(32 << 20);
-    let db = support::open_with(&folder, options).expect("open");
+        }));
+        // Under a memory limit of 32 MiB the store's page cache is 8 MiB: a quarter of the limit.
+        options.memory_limit = Some(32 << 20);
+        options
+    };
+    let db = support::open_with(&folder, options()).expect("open");
     support::declare(&db);
     // A second table four times the size of that 8 MiB page cache, in rows small enough to be
     // kept in the table's own pages. Reading all of it leaves the cache full of its pages, so
@@ -353,6 +363,64 @@ fn a_commit_on_disk_is_reported_and_served_though_the_read_after_it_fails() {
 
     // Closed and opened again with nothing failing, the store holds every commit that returned.
     let _ = db.close();
+    support::assert_rows_are(&support::open(&folder), 1..=rows);
+
+    // A read that fails inside a statement, and inside a commit before it reaches the disk, is
+    // a failure of the storage and never damage; the handle that met it says so until it is
+    // opened again, nothing aborts, and a commit that was refused left no row. Each is made on a
+    // handle just opened, whose cache is empty, so that it has to read the file.
+    fail_after.store(0, Ordering::SeqCst);
+    let db = support::open_with(&folder, options()).expect("open again");
+    fail_now.store(true, Ordering::SeqCst);
+    let failed_before = failed.load(Ordering::SeqCst);
+    match db.run("SELECT COUNT(name) FROM t", &params! {}) {
+        Err(Error::StoreIo { .. }) => {}
+        other => panic!("a statement whose read failed got {other:?}, not a storage failure"),
+    }
+    assert!(
+        failed.load(Ordering::SeqCst) > failed_before,
+        "the statement made no read that failed"
+    );
+    fail_now.store(false, Ordering::SeqCst);
+    let _ = db.close();
+    let db = support::open_with(&folder, options()).expect("open again");
+    fail_now.store(true, Ordering::SeqCst);
+    let failed_before = failed.load(Ordering::SeqCst);
+    let [id, name, tag] =
+        <[Value; 3]>::try_from(support::row(rows + 1)).expect("a row has three columns");
+    let refused = db.execute(
+        "INSERT INTO t (id, name, tag) VALUES ($id, $name, $tag)",
+        &params! { "id" => id, "name" => name, "tag" => tag },
+    );
+    let read_failed = failed.load(Ordering::SeqCst) > failed_before;
+    fail_now.store(false, Ordering::SeqCst);
+    match refused {
+        Err(Error::StoreIo { .. }) => {}
+        Ok(_) if !read_failed => panic!("the commit made no read that failed: nothing was shown"),
+        other => panic!("a commit whose read failed got {other:?}, not a storage failure"),
+    }
+    let _ = db.close();
+    support::assert_rows_are(&support::open(&folder), 1..=rows);
+
+    // An open, for writing and for reading, while every read fails is a failure of the storage.
+    let failing = || {
+        support::failing_storage(|call| match call {
+            Call::Read(..) => Err(io::Error::other("a read this test makes fail")),
+            _ => Ok(()),
+        })
+    };
+    let mut writing = DatabaseOpenOptions::default();
+    writing.storage = Some(failing());
+    match support::open_with(&folder, writing) {
+        Err(Error::StoreIo { .. }) => {}
+        other => panic!("an open for writing while reads fail got {:?}", other.err()),
+    }
+    let mut reading = ReadSessionOptions::default();
+    reading.storage = Some(failing());
+    match ReadSession::open_with_options(&folder, reading) {
+        Err(Error::StoreIo { .. }) => {}
+        other => panic!("an open for reading while reads fail got {:?}", other.err()),
+    }
     support::assert_rows_are(&support::open(&folder), 1..=rows);
 }
 
@@ -582,6 +650,206 @@ fn one_commit_of_vectors(role: support::Role) {
 }
 
 // ---- shared by the tests of this file ----
+
+// ---- a commit of rows that a table's rules tie together ----
+
+/// The body of a child: 3,400 bytes, of which the first 3,000 are the same for every child, so
+/// that in the index over `body` the children differ only past what an entry keeps of a value.
+fn body(n: i64) -> String {
+    format!("{}{}", "m".repeat(3000), support::letters(n, 400))
+}
+
+/// The children before the commit of the test below and after it, as (id, parent, body).
+fn children(committed: bool) -> Vec<(i64, i64, String)> {
+    match committed {
+        false => (1..=6).map(|n| (n, n % 2 + 1, body(n))).collect(),
+        true => {
+            let mut children: Vec<_> = (3..=6).map(|n| (n, n % 2 + 1, body(n))).collect();
+            children[0].2 = body(103);
+            children[1].1 = 3;
+            children.extend((7..=18).map(|n| (n, n % 3 + 1, body(n))));
+            children
+        }
+    }
+}
+
+/// A closed store with two parents and six children. A child references its parent, the table
+/// keeps a count of the children of each parent, and `body` is indexed.
+fn store_with_children(name: &str) -> PathBuf {
+    let folder = support::folder(name);
+    let db = support::open(&folder);
+    for sql in [
+        "CREATE TABLE parents (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE children (id INTEGER PRIMARY KEY, \
+         parent_id INTEGER NOT NULL REFERENCES parents(id), body TEXT NOT NULL)",
+        "CREATE INDEX children_parent ON children (parent_id)",
+        "CREATE INDEX children_body ON children (body)",
+        "ALTER TABLE children SET MAINTAIN COUNT (parent_id)",
+        "INSERT INTO parents (id) VALUES (1), (2)",
+    ] {
+        support::run(&db, sql);
+    }
+    let tx = db.transaction().expect("begin");
+    for child in children(false) {
+        insert_child(&tx, child).expect("insert a child");
+    }
+    tx.commit().expect("commit");
+    support::close(db);
+    folder
+}
+
+fn insert_child(
+    on: &impl Run,
+    (id, parent, body): (i64, i64, String),
+) -> contextdb::Result<contextdb::QueryResult> {
+    on.run(
+        "INSERT INTO children (id, parent_id, body) VALUES ($id, $parent, $body)",
+        &params! { "id" => id, "parent" => parent, "body" => body },
+    )
+}
+
+/// Asserts that the store holds exactly these children and that everything kept beside the rows
+/// says the same as the rows: the parent of every child is there, the kept count of each parent
+/// is the number of its children and reads no row, and every child is found by its body through
+/// the index, alone and in the order of the bodies.
+fn assert_children_are(db: &Database, wanted: &[(i64, i64, String)], when: &str) {
+    let rows: Vec<Vec<Value>> = wanted
+        .iter()
+        .map(|(id, parent, body)| {
+            vec![
+                Value::Int64(*id),
+                Value::Int64(*parent),
+                support::text(body),
+            ]
+        })
+        .collect();
+    let found = support::rows(db, "SELECT id, parent_id, body FROM children ORDER BY id");
+    support::assert_same_rows(&found, &rows, &format!("{when}: the children"));
+
+    let parents = support::rows(db, "SELECT id FROM parents ORDER BY id");
+    for parent in 1..=3_i64 {
+        let children = wanted.iter().filter(|child| child.1 == parent).count();
+        assert!(
+            children == 0 || parents.contains(&vec![Value::Int64(parent)]),
+            "{when}: parent {parent} is gone and {children} children name it"
+        );
+        let count = support::run(
+            db,
+            &format!("SELECT COUNT(*) FROM children WHERE parent_id = {parent}"),
+        );
+        assert_eq!(
+            count.rows(),
+            [[Value::Int64(children as i64)]],
+            "{when}: the kept count of parent {parent}"
+        );
+        assert_eq!(count.rows_examined(), 0, "{when}: rows read by the count");
+    }
+    for (id, _, body) in wanted {
+        let by_body = db
+            .execute(
+                "SELECT id FROM children WHERE body = $body",
+                &params! { "body" => body.as_str() },
+            )
+            .expect("look a child up by its body");
+        assert_eq!(
+            by_body.rows(),
+            [[Value::Int64(*id)]],
+            "{when}: child {id} by its body"
+        );
+    }
+    let mut by_body: Vec<&(i64, i64, String)> = wanted.iter().collect();
+    by_body.sort_by(|a, b| a.2.cmp(&b.2));
+    let in_order: Vec<[Value; 1]> = by_body
+        .iter()
+        .map(|child| [Value::Int64(child.0)])
+        .collect();
+    let found = support::rows(db, "SELECT id FROM children ORDER BY body");
+    support::assert_same_rows(&found, &in_order, &format!("{when}: the children by body"));
+}
+
+#[test]
+fn a_kill_inside_a_commit_keeps_references_counts_and_long_entries_with_their_rows() {
+    if let Some(role) = support::role() {
+        return one_commit_of_children(role);
+    }
+    let test = "a_kill_inside_a_commit_keeps_references_counts_and_long_entries_with_their_rows";
+    // Run once to the end to learn which storage calls belong to the commit.
+    let folder = store_with_children("kill-children-count");
+    let lines = Child::start(test, "writer stop_at=0", &folder).end();
+    let begins = support::last_number(&lines, "committing").expect("the writer announces it");
+    let calls = support::last_number(&lines, "calls").expect("the writer announces its calls");
+    assert!(calls > begins, "the commit made no write and no sync");
+    assert_children_are(
+        &support::open(&folder),
+        &children(true),
+        "after the whole commit",
+    );
+
+    for k in begins + 1..=calls {
+        let folder = store_with_children(&format!("kill-children-at-{k}"));
+        let mut writer = Child::start(test, &format!("writer stop_at={k}"), &folder);
+        let before = writer.until("stopped");
+        writer.kill();
+        let returned = before.iter().any(|line| line == "committed");
+
+        // The store holds what it held before the commit, or everything the commit brought.
+        let db = support::open(&folder);
+        let when = format!("killed at storage call {k}");
+        let committed = match support::int(&db, "SELECT COUNT(*) FROM children") {
+            6 if !returned => false,
+            16 => true,
+            rows => panic!(
+                "{when}: {rows} children are there; the commit had {}returned",
+                if returned { "" } else { "not " }
+            ),
+        };
+        assert_children_are(&db, &children(committed), &when);
+        let parents = support::int(&db, "SELECT COUNT(*) FROM parents");
+        assert_eq!(
+            parents,
+            if committed { 3 } else { 2 },
+            "{when}: the parents"
+        );
+
+        // The store goes on from that state, and its rules with it.
+        let mut wanted = children(committed);
+        wanted.push((50, 1, body(50)));
+        insert_child(&db, (50, 1, body(50))).expect("insert a child after reopening");
+        assert_children_are(&db, &wanted, &format!("{when}, and one more child"));
+        assert!(matches!(
+            insert_child(&db, (51, 404, body(51))),
+            Err(Error::ForeignKeyViolation { .. })
+        ));
+    }
+}
+
+/// In one transaction adds a parent and twelve children, removes two children, gives one another
+/// body and one another parent. Announces `committing <n>` with the storage calls made so far
+/// when the commit is about to begin, `committed` when it has returned, and `calls <total>` once
+/// the store is closed.
+fn one_commit_of_children(role: support::Role) {
+    let (storage, calls) = stopping_before_call(role.number("stop_at"));
+    let mut options = DatabaseOpenOptions::default();
+    options.storage = Some(storage);
+    let db = support::open_with(&role.folder, options).expect("open");
+    let tx = db.transaction().expect("begin");
+    support::run(&tx, "INSERT INTO parents (id) VALUES (3)");
+    for child in children(true).split_off(4) {
+        insert_child(&tx, child).expect("insert a child");
+    }
+    support::run(&tx, "DELETE FROM children WHERE id <= 2");
+    tx.execute(
+        "UPDATE children SET body = $body WHERE id = 3",
+        &params! { "body" => body(103) },
+    )
+    .expect("change a body");
+    support::run(&tx, "UPDATE children SET parent_id = 3 WHERE id = 4");
+    support::say(format!("committing {}", calls.load(Ordering::SeqCst)));
+    tx.commit().expect("commit");
+    support::say("committed");
+    support::close(db);
+    support::say(format!("calls {}", calls.load(Ordering::SeqCst)));
+}
 
 /// A closed store with the table declared and rows 1 to `rows` committed.
 fn store_with_rows(name: &str, rows: i64) -> PathBuf {

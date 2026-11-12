@@ -5,7 +5,12 @@
 
 mod support;
 
-use contextdb::{Database, Error, ReadSession, ReadSessionOptions, Value, VectorIndexRef, params};
+use std::sync::atomic::Ordering;
+
+use contextdb::{
+    Database, DatabaseOpenOptions, Error, ReadSession, ReadSessionOptions, Value, VectorIndexRef,
+    params,
+};
 
 use support::{Child, Near, Run};
 
@@ -456,6 +461,24 @@ fn vector_partition_limit_counts_and_refuses() {
         [[Value::Int64(30)], [Value::Int64(32)]]
     );
 
+    // A statement refused after it opened a tuple puts the count back, whatever refused it:
+    // with b emptied, a two-row INSERT opens c and then breaks the key on its second row, and
+    // b is still the tuple there is room for.
+    let tx = db.transaction().expect("begin");
+    support::run(&tx, "DELETE FROM docs WHERE ctx = 'b'");
+    let broken = tx
+        .execute(
+            "INSERT INTO docs (id, ctx, tag, v) VALUES (90, 'c', 0, $v), (1, 'a', 0, $v)",
+            &params! { "v" => support::vector(90, 8) },
+        )
+        .expect_err("the second row repeats a key");
+    assert!(
+        !matches!(broken, Error::VectorPartitionLimitExceeded { .. }),
+        "the second row breaks the key, not the limit: {broken:?}"
+    );
+    insert_one(&tx, 91, "b").expect("b once the refused statement left its count");
+    tx.rollback();
+
     // In one transaction at the limit: deleting a partition's last vector and then inserting
     // under a new tuple succeeds, and inserting under the emptied tuple after that is refused.
     let tx = db.transaction().expect("begin");
@@ -563,6 +586,57 @@ fn vector_partition_limit_counts_and_refuses() {
     );
     assert_eq!(work(&db), read_before);
     assert!(state_of(&db).2 == sealed.2);
+
+    // The storage reads of one INSERT under an existing partition, from a cold cache, are the
+    // same with 8 partitions and with 512, within the depth of the file's tree: the insert
+    // finds its partition by its key and does not visit the others. The key tuples are long, so
+    // that 512 of them cannot sit in the one or two pages that 8 do.
+    let reads_of_one_insert = |partitions: i64| -> u64 {
+        let folder = support::folder(&format!("insert-reads-{partitions}-partitions"));
+        let db = support::open(&folder);
+        support::run(
+            &db,
+            "CREATE TABLE long_keys (id INTEGER PRIMARY KEY, ctx TEXT NOT NULL, \
+             v VECTOR(4) PARTITION_KEY (ctx) MAX_PARTITIONS 4096)",
+        );
+        let insert = "INSERT INTO long_keys (id, ctx, v) VALUES ($id, $ctx, $v)";
+        let tx = db.transaction().expect("begin");
+        for n in 1..=partitions {
+            let ctx = format!("{n:0>200}");
+            tx.execute(
+                insert,
+                &params! { "id" => n, "ctx" => ctx, "v" => support::vector(n, 4) },
+            )
+            .unwrap_or_else(|error| panic!("partition {n} was refused: {error:?}"));
+        }
+        tx.commit().expect("commit the partitions");
+        support::close(db);
+
+        let (storage, bytes) = support::counting_bytes_read();
+        let mut options = DatabaseOpenOptions::default();
+        options.storage = Some(storage);
+        let db = support::open_with(&folder, options).expect("open with a counting door");
+        let opened = bytes.load(Ordering::SeqCst);
+        db.execute(
+            insert,
+            &params! {
+                "id" => partitions + 1,
+                "ctx" => format!("{:0>200}", 1),
+                "v" => support::vector(partitions + 1, 4),
+            },
+        )
+        .expect("a row under an existing partition");
+        bytes.load(Ordering::SeqCst) - opened
+    };
+    // The promise: the bytes read for one insert at 512 partitions are at most four times
+    // those at 8: a walk of the partition list reads 64 times as much, a lookup through a few
+    // trees that each grow a level reads a few more pages.
+    let (few, most) = (reads_of_one_insert(8), reads_of_one_insert(512));
+    assert!(
+        most <= few * 4,
+        "one insert read {few} bytes of the file with 8 partitions and {most} with 512: its \
+         reads grow with the number of partitions as a walk of the partition list does"
+    );
 }
 
 /// Rows in each of the two partitions of the next test.

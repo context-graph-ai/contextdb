@@ -1,11 +1,21 @@
 //! The planned statement: what `schema`, `write` and `query` each take.
 
-use super::ast::{ColumnDef, Expr, SetMemoryLimitValue, SortDirection, VectorSearchMode};
+/// A declaration or a write is planned as it was written: `schema` and `write` judge every
+/// clause of it.
+pub use super::ast::{
+    AlterTable as AlterTablePlan, CreateIndex as CreateIndexPlan, CreateTable as CreateTablePlan,
+    Delete as DeletePlan, DropIndex as DropIndexPlan, DropTable as DropTablePlan,
+    Insert as InsertPlan, Update as UpdatePlan,
+};
+use super::ast::{Expr, SetMemoryLimitValue, SortDirection, VectorSearchMode};
 
 #[derive(Debug, Clone)]
 pub enum PhysicalPlan {
     CreateTable(CreateTablePlan),
     CreateIndex(CreateIndexPlan),
+    AlterTable(AlterTablePlan),
+    DropTable(DropTablePlan),
+    DropIndex(DropIndexPlan),
     Insert(InsertPlan),
     Delete(DeletePlan),
     Update(UpdatePlan),
@@ -60,7 +70,7 @@ pub enum PhysicalPlan {
 /// What a planned statement does to the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Effect {
-    /// Declares a table or an index.
+    /// Declares, changes or drops a table or an index.
     Declares,
     /// Adds, changes or removes rows.
     WritesRows,
@@ -76,7 +86,11 @@ impl PhysicalPlan {
     /// one place every part asks.
     pub(crate) fn effect(&self) -> Effect {
         match self {
-            PhysicalPlan::CreateTable(_) | PhysicalPlan::CreateIndex(_) => Effect::Declares,
+            PhysicalPlan::CreateTable(_)
+            | PhysicalPlan::CreateIndex(_)
+            | PhysicalPlan::AlterTable(_)
+            | PhysicalPlan::DropTable(_)
+            | PhysicalPlan::DropIndex(_) => Effect::Declares,
             PhysicalPlan::Insert(_) | PhysicalPlan::Delete(_) | PhysicalPlan::Update(_) => {
                 Effect::WritesRows
             }
@@ -94,42 +108,22 @@ impl PhysicalPlan {
             | PhysicalPlan::ShowVectorPartitions { .. } => Effect::Reads,
         }
     }
-}
 
-#[derive(Debug, Clone)]
-pub struct CreateTablePlan {
-    pub name: String,
-    pub columns: Vec<ColumnDef>,
-    pub unique_constraints: Vec<Vec<String>>,
-    /// `IF NOT EXISTS` was written: a table of this name that is already there is left as it is.
-    pub if_not_exists: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct CreateIndexPlan {
-    pub name: String,
-    pub table: String,
-    pub columns: Vec<(String, SortDirection)>,
-}
-
-#[derive(Debug, Clone)]
-pub struct InsertPlan {
-    pub table: String,
-    pub columns: Vec<String>,
-    pub values: Vec<Vec<Expr>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct DeletePlan {
-    pub table: String,
-    pub where_clause: Option<Expr>,
-}
-
-#[derive(Debug, Clone)]
-pub struct UpdatePlan {
-    pub table: String,
-    pub assignments: Vec<(String, Expr)>,
-    pub where_clause: Option<Expr>,
+    /// The statement's name when only a handle that declared no narrowing may run it: what it
+    /// declares, sets or reads holds for every Context, label and principal at once.
+    pub(crate) fn admin_only(&self) -> Option<&'static str> {
+        Some(match self {
+            PhysicalPlan::CreateTable(_) => "CREATE TABLE",
+            PhysicalPlan::CreateIndex(_) => "CREATE INDEX",
+            PhysicalPlan::AlterTable(_) => "ALTER TABLE",
+            PhysicalPlan::DropTable(_) => "DROP TABLE",
+            PhysicalPlan::DropIndex(_) => "DROP INDEX",
+            PhysicalPlan::SetMemoryLimit(_) => "SET MEMORY_LIMIT",
+            PhysicalPlan::ShowVectorIndexes => "SHOW VECTOR_INDEXES",
+            PhysicalPlan::ShowVectorPartitions { .. } => "SHOW VECTOR_PARTITIONS",
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]

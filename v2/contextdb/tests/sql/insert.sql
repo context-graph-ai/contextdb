@@ -59,3 +59,13 @@ id
 3
 4
 5
+
+# A column named twice as a target is refused, as Postgres refuses it, and nothing is written.
+INSERT INTO items (id, name, name) VALUES (7, 'seven', 'again');
+----
+error: PlanError
+
+SELECT COUNT(*) FROM items WHERE id = 7;
+----
+COUNT
+0

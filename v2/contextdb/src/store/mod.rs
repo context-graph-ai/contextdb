@@ -8,7 +8,9 @@
 //! Two of the things the parts meet at are defined here: [`Read`], the view to read from, and
 //! [`ChangeSet`], the change set to write with.
 
+mod counts;
 mod disk;
+mod drop;
 mod folder;
 mod keys;
 mod record;
@@ -27,10 +29,12 @@ pub use redb::StorageBackend;
 use redb::{ReadTransaction, ReadableDatabase};
 
 use crate::memory::{Budget, Reservation};
-use crate::types::{Error, Result, SortDirection, TxId, Value};
+use crate::types::{Error, Result, SortDirection, TxId, Value, heap_bytes};
 use disk::{Moment, Stored};
+pub(crate) use drop::Dropped;
 use folder::{DataFile, Hold, Locked};
 use keys::Span;
+pub(crate) use keys::{Entry, EntryShape, KEY_LIMIT};
 
 /// The size of the page cache of a store opened under this memory limit, in bytes: a quarter
 /// of the limit and never less than 8 MiB, which is also its size when there is no limit. It is
@@ -71,6 +75,10 @@ pub(crate) struct TableId(pub u32);
 /// An index's number inside one store, given by `schema` like a [`TableId`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct IndexId(pub u32);
+
+/// The number of a kept count, given by `schema` like an index's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct CountId(pub u32);
 
 /// A VECTOR column's number inside one store, given by `schema` like a [`TableId`]. Every record
 /// the vector part keeps for the column begins with it.
@@ -156,7 +164,7 @@ impl Key {
     /// The key of the leading columns of an index, made with their directions, is the bytes
     /// that every full key with those values begins with, and no other key begins with them.
     pub(crate) fn from_values(values: &[Value], directions: &[SortDirection]) -> Result<Key> {
-        keys::encode(values, directions).map(Key)
+        Ok(Key(keys::encode(values, directions, usize::MAX)?.0))
     }
 
     /// The bytes of the key, for a part that keeps keys inside a record of its own.
@@ -218,13 +226,22 @@ pub(crate) struct Beside {
 /// Rows in key order.
 pub(crate) type RowIter<'a> = Box<dyn Iterator<Item = Result<(Key, Row)>> + 'a>;
 
-/// Index entries in entry order, each with the key of the row it points at.
-pub(crate) type EntryIter<'a> = Box<dyn Iterator<Item = Result<(Key, Key)>> + 'a>;
+/// Index entries in entry order, each with the key of the row it points at and the place its
+/// first cut value's kept bytes end, when it holds one.
+pub(crate) type EntryIter<'a> = Box<dyn Iterator<Item = Result<(Key, Key, Option<usize>)>> + 'a>;
 
-/// The rows a change set has staged: table, key, the new values or `None` for a delete, and
-/// whether the transaction found no row at the key when it first staged it.
+/// The records of a kept count in key order, each with its count.
+pub(crate) type KeptIter<'a> = Box<dyn Iterator<Item = Result<(Key, u64)>> + 'a>;
+
+/// The rows a change set has staged: table, key, the new row or `None` for a delete, and
+/// whether the transaction found no row at the key when it first staged it. A row is its
+/// values, with NULL for each large value it left where it is, and those cells with their
+/// places in the row.
 pub(crate) type StagedRows<'a> =
-    Box<dyn Iterator<Item = (TableId, &'a Key, Option<&'a [Value]>, bool)> + 'a>;
+    Box<dyn Iterator<Item = (TableId, &'a Key, Option<StagedValues<'a>>, bool)> + 'a>;
+
+/// A staged row's values, and the large cells it left where they are.
+pub(crate) type StagedValues<'a> = (&'a [Value], &'a [(usize, Beside)]);
 
 /// The view to read rows from. `query` and `write` read a store only through this.
 ///
@@ -250,6 +267,9 @@ pub(crate) trait Read {
     /// key. A bound applies to the entry alone, so an entry equal to an included bound is in
     /// range whatever row it points at.
     fn index(&self, index: IndexId, from: Bound<&Key>, to: Bound<&Key>) -> Result<EntryIter<'_>>;
+
+    /// The records of a kept count between two keys, in key order.
+    fn kept(&self, count: CountId, from: Bound<&Key>, to: Bound<&Key>) -> Result<KeptIter<'_>>;
 
     /// How many rows the table holds at this moment. One small record, never a scan.
     fn count(&self, table: TableId) -> Result<u64>;
@@ -318,31 +338,56 @@ pub(crate) struct ChangeSet {
     /// Staged rows by table and key.
     rows: Staged<StagedRow>,
     /// Staged index entries by index, each entry joined to the key of its row: the length of
-    /// the entry, or `None` for a removal.
-    index: Staged<Option<usize>>,
+    /// the entry and where its first cut value's kept bytes end, or `None` for a removal.
+    index: Staged<Option<Joined>>,
     /// The change to each table's kept row count.
     counts: BTreeMap<u32, i64>,
-    /// Staged schema records by name.
-    schema: BTreeMap<String, Vec<u8>>,
+    /// The change to each record of a kept count, by count and key.
+    kept: Staged<i64>,
+    /// Staged schema records by name: the record, or `None` for a removal.
+    schema: BTreeMap<String, Option<Vec<u8>>>,
+    /// What is to be dropped whole, in the order it was staged.
+    dropped: Vec<Dropped>,
+    /// The row guards, in the order they were staged.
+    guards: Vec<RowGuard>,
+    /// The number the transaction took when it began; zero when it took none.
+    number: TxId,
     /// The memory limit the store is to remember, when one was staged: `Some(None)` for none.
     memory_limit: Option<Option<u64>>,
     /// Staged records of the vector part by their stored key: the value, or `None` for a
     /// removal.
     vectors: BTreeMap<Key, Option<Vec<u8>>>,
-    /// Staged numbers of the vector part by their place among the store's numbers.
-    vector_numbers: BTreeMap<u64, u64>,
+    /// Staged numbers of the vector part, by their place among the store's numbers.
+    numbers: BTreeMap<u64, u64>,
+    /// How many rows of tables that declare no primary key the change set has made.
+    made: u64,
     /// Every staging call of a statement in order, each with what it put aside and the bytes it
     /// was counted as, so that the calls after a mark can be undone.
     calls: Vec<(Undo, u64)>,
     reserved: Reservation,
 }
 
-/// Staged records of several tables or indexes, by number and then by key.
+/// Staged records of several tables, indexes or counts, by number and then by key.
 type Staged<C> = BTreeMap<u32, BTreeMap<Key, C>>;
+
+/// The length of an index entry inside the key that joins it to its row, and where the
+/// entry's first cut value's kept bytes end, when it holds one.
+type Joined = (usize, Option<usize>);
+
+/// The values a row must still hold when its transaction is committed: the row's table and
+/// key, and each guarded cell by its position.
+pub(crate) struct RowGuard {
+    pub table: TableId,
+    pub key: Key,
+    pub columns: Vec<(usize, Value)>,
+}
 
 struct StagedRow {
     /// The new values, or `None` for a removal.
     values: Option<Vec<Value>>,
+    /// The large values that stay where they are, each by its cell's position; NULL stands at
+    /// that position in `values`.
+    left: Vec<(usize, Beside)>,
     /// The vector cells to write as a scale and codes.
     compact: Vec<Compact>,
     /// What the transaction said when it first staged this key: it found no row there.
@@ -353,11 +398,13 @@ struct StagedRow {
 /// `None` when nothing was.
 enum Undo {
     Row(u32, Key, Option<StagedRow>),
-    Entry(u32, Key, Option<Option<usize>>),
+    Entry(u32, Key, Option<Option<Joined>>),
     Count(u32, i64),
-    Schema(String, Option<Vec<u8>>),
+    Kept(u32, Key, i64),
+    Schema(String, Option<Option<Vec<u8>>>),
     Vector(Key, Option<Option<Vec<u8>>>),
-    VectorNumber(u64, Option<u64>),
+    Number(u64, Option<u64>),
+    Dropped,
 }
 
 /// What one staging call is counted as beside its key and its values: its place in the map
@@ -372,10 +419,15 @@ impl ChangeSet {
             rows: BTreeMap::new(),
             index: BTreeMap::new(),
             counts: BTreeMap::new(),
+            kept: BTreeMap::new(),
             schema: BTreeMap::new(),
+            dropped: Vec::new(),
+            guards: Vec::new(),
+            number: TxId(0),
             memory_limit: None,
             vectors: BTreeMap::new(),
-            vector_numbers: BTreeMap::new(),
+            numbers: BTreeMap::new(),
+            made: 0,
             calls: Vec::new(),
             reserved: budget.reserve(0, "transaction")?,
         })
@@ -410,16 +462,22 @@ impl ChangeSet {
                     put_back(self.index.entry(index).or_default(), joined, before);
                 }
                 Undo::Count(table, delta) => *self.counts.entry(table).or_default() -= delta,
+                Undo::Kept(count, key, delta) => {
+                    *self.kept.entry(count).or_default().entry(key).or_default() -= delta;
+                }
                 Undo::Schema(name, before) => put_back(&mut self.schema, name, before),
                 Undo::Vector(key, before) => put_back(&mut self.vectors, key, before),
-                Undo::VectorNumber(at, before) => put_back(&mut self.vector_numbers, at, before),
+                Undo::Number(at, before) => put_back(&mut self.numbers, at, before),
+                Undo::Dropped => drop(self.dropped.pop()),
             }
             self.reserved.shrink(bytes);
         }
     }
 
     /// Stages a row, new or replacing the row with this key. Large text, JSON and vector values
-    /// are kept beside the row when it is written; the caller does not split them.
+    /// are kept beside the row when it is written; the caller does not split them. A
+    /// [`Cell::Beside`] is a value this row holds already, handed back as it was read: it is
+    /// written as the same place and none of its bytes is read or written.
     ///
     /// `compact` names the vector cells to keep in one byte a number, each with its scale and
     /// codes: such a cell is written as the tag `0x88`, its count of numbers, the scale and one
@@ -431,17 +489,29 @@ impl ChangeSet {
         &mut self,
         table: TableId,
         key: Key,
-        values: Vec<Value>,
+        cells: Vec<Cell>,
         compact: Vec<Compact>,
         new_key: bool,
     ) -> Result<()> {
-        self.stage_row(table, key, Some(values), compact, new_key)
+        let mut left = Vec::new();
+        let values = cells
+            .into_iter()
+            .enumerate()
+            .map(|(slot, cell)| match cell {
+                Cell::Here(value) => value,
+                Cell::Beside(kept) => {
+                    left.push((slot, kept));
+                    Value::Null
+                }
+            });
+        let values = Some(values.collect());
+        self.stage_row(table, key, values, left, compact, new_key)
     }
 
     /// Stages the removal of a row and of the values kept beside it. A key first staged here
     /// is one a row was at.
     pub(crate) fn delete_row(&mut self, table: TableId, key: &Key) -> Result<()> {
-        self.stage_row(table, key.clone(), None, Vec::new(), false)
+        self.stage_row(table, key.clone(), None, Vec::new(), Vec::new(), false)
     }
 
     fn stage_row(
@@ -449,28 +519,30 @@ impl ChangeSet {
         table: TableId,
         key: Key,
         values: Option<Vec<Value>>,
+        left: Vec<(usize, Beside)>,
         compact: Vec<Compact>,
         new_key: bool,
     ) -> Result<()> {
-        let held: u64 = values.iter().flatten().map(value_bytes).sum();
+        let held: u64 = values.iter().flatten().map(held).sum();
         let codes: usize = compact.iter().map(|cell| cell.codes.len()).sum();
         let bytes = self.counted(&key, held + codes as u64)?;
         let rows = self.rows.entry(table.0).or_default();
         let new_key = rows.get(&key).map_or(new_key, |before| before.new_key);
-        let staged = StagedRow {
+        let row = StagedRow {
             values,
+            left,
             compact,
             new_key,
         };
-        let before = rows.insert(key.clone(), staged);
+        let before = rows.insert(key.clone(), row);
         self.calls.push((Undo::Row(table.0, key, before), bytes));
         Ok(())
     }
 
     /// Stages an index entry pointing at a row.
-    pub(crate) fn put_index(&mut self, index: IndexId, entry: Key, row: Key) -> Result<()> {
-        let length = entry.0.len();
-        self.stage_entry(index, Key([entry.0, row.0].concat()), Some(length))
+    pub(crate) fn put_index(&mut self, index: IndexId, entry: Entry, row: Key) -> Result<()> {
+        let joined = (entry.key.0.len(), entry.cut);
+        self.stage_entry(index, Key([entry.key.0, row.0].concat()), Some(joined))
     }
 
     /// Stages the removal of an index entry.
@@ -478,7 +550,7 @@ impl ChangeSet {
         self.stage_entry(index, Key([entry.0.as_slice(), &row.0].concat()), None)
     }
 
-    fn stage_entry(&mut self, index: IndexId, joined: Key, entry: Option<usize>) -> Result<()> {
+    fn stage_entry(&mut self, index: IndexId, joined: Key, entry: Option<Joined>) -> Result<()> {
         let bytes = self.counted(&joined, 0)?;
         let entries = self.index.entry(index.0).or_default();
         let before = entries.insert(joined.clone(), entry);
@@ -497,12 +569,73 @@ impl ChangeSet {
 
     /// Stages a schema record under a name, new or in place of the record with that name.
     pub(crate) fn put_schema(&mut self, name: &str, record: Vec<u8>) -> Result<()> {
-        let bytes = STAGED_BYTES + 2 * name.len() as u64 + record.len() as u64;
+        self.stage_schema(name, Some(record))
+    }
+
+    /// Stages the removal of the schema record under a name.
+    pub(crate) fn delete_schema(&mut self, name: &str) -> Result<()> {
+        self.stage_schema(name, None)
+    }
+
+    fn stage_schema(&mut self, name: &str, record: Option<Vec<u8>>) -> Result<()> {
+        let held = record.as_ref().map_or(0, Vec::len);
+        let bytes = STAGED_BYTES + 2 * name.len() as u64 + held as u64;
         self.reserved.grow(bytes)?;
         let before = self.schema.insert(name.to_owned(), record);
         self.calls
             .push((Undo::Schema(name.to_owned(), before), bytes));
         Ok(())
+    }
+
+    /// How many rows of tables that declare no primary key this change set has made, the one
+    /// just made among them: with the transaction's number, the key such a row is kept under.
+    pub(crate) fn next_row_number(&mut self) -> u64 {
+        self.made += 1;
+        self.made
+    }
+
+    /// Stages a row guard: the values the cells at these positions of a row, as this
+    /// transaction shows it, must still hold when the transaction is committed. Each position
+    /// is turned into the cell's position in the stored row, undoing, last first, the drops of
+    /// cells this transaction has staged for the table before the guard. It writes nothing,
+    /// so it is no staging call and no rewind takes it back; [`ChangeSet::guards`] hands it to
+    /// the rule check at commit.
+    pub(crate) fn guard_row(
+        &mut self,
+        table: TableId,
+        key: Key,
+        mut columns: Vec<(usize, Value)>,
+    ) -> Result<()> {
+        for (at, _) in &mut columns {
+            for dropped in self.dropped.iter().rev() {
+                if let Dropped::Cell(of, slot) = *dropped
+                    && of == table
+                    && slot <= *at
+                {
+                    *at += 1;
+                }
+            }
+        }
+        let held = columns.iter().map(|(_, value)| held(value)).sum();
+        self.counted(&key, held)?;
+        self.guards.push(RowGuard {
+            table,
+            key,
+            columns,
+        });
+        Ok(())
+    }
+
+    /// Every staged row guard, for the rule check at commit.
+    pub(crate) fn guards(&self) -> &[RowGuard] {
+        &self.guards
+    }
+
+    /// Records the number the transaction took when it began. Its commit is written under
+    /// that number when no commit has taken it or a higher one since, and under the next
+    /// number after the newest commit otherwise.
+    pub(crate) fn set_number(&mut self, number: TxId) {
+        self.number = number;
     }
 
     /// Stages the memory limit the store is to remember from this commit on, in bytes, or
@@ -538,9 +671,8 @@ impl ChangeSet {
     pub(crate) fn put_vector_number(&mut self, number: VectorNumber, value: u64) -> Result<()> {
         self.reserved.grow(STAGED_BYTES)?;
         let at = disk::vector_number_at(number);
-        let before = self.vector_numbers.insert(at, value);
-        self.calls
-            .push((Undo::VectorNumber(at, before), STAGED_BYTES));
+        let before = self.numbers.insert(at, value);
+        self.calls.push((Undo::Number(at, before), STAGED_BYTES));
         Ok(())
     }
 
@@ -552,19 +684,36 @@ impl ChangeSet {
         Ok(bytes)
     }
 
-    /// Every staged row, for the rule check at commit.
+    /// Every staged row, for the rule check at commit. A large value the row left where it is
+    /// was not read: it is NULL among the values and its cell is handed over beside them.
     pub(crate) fn rows_changed(&self) -> StagedRows<'_> {
         Box::new(self.rows.iter().flat_map(|(table, staged)| {
-            staged
-                .iter()
-                .map(|(key, row)| (TableId(*table), key, row.values.as_deref(), row.new_key))
+            staged.iter().map(|(key, row)| {
+                let staged = row.values.as_deref().map(|values| (values, &*row.left));
+                (TableId(*table), key, staged, row.new_key)
+            })
         }))
     }
 
-    /// True when nothing is staged. The commit function asks before it commits, so that a
-    /// transaction that changed nothing writes nothing and spends no commit number.
+    /// True when nothing is staged to be written; a row guard writes nothing. The commit
+    /// function asks before it commits, so that a transaction that changed nothing writes
+    /// nothing and spends no commit number.
     pub(crate) fn is_empty(&self) -> bool {
         self.calls.is_empty() && self.memory_limit.is_none()
+    }
+
+    /// A stored row of `table` as it is once the cells this change set drops are gone, so that
+    /// a row is read by the same places inside the transaction as after its commit.
+    fn shaped(&self, table: TableId, mut row: Row) -> Row {
+        for dropped in &self.dropped {
+            if let Dropped::Cell(of, slot) = *dropped
+                && of == table
+                && slot < row.cells.len()
+            {
+                row.cells.remove(slot);
+            }
+        }
+        row
     }
 }
 
@@ -576,28 +725,9 @@ fn put_back<K: Ord, C>(records: &mut BTreeMap<K, C>, key: K, before: Option<C>) 
     }
 }
 
-/// What a value is counted as while a transaction holds it.
-fn value_bytes(value: &Value) -> u64 {
-    let grown = match value {
-        Value::Text(text) => text.len() as u64,
-        Value::Vector(numbers) => 4 * numbers.len() as u64,
-        Value::Json(json) => json_bytes(json),
-        _ => 0,
-    };
-    size_of::<Value>() as u64 + grown
-}
-
-fn json_bytes(json: &serde_json::Value) -> u64 {
-    let grown = match json {
-        serde_json::Value::String(text) => text.len() as u64,
-        serde_json::Value::Array(items) => items.iter().map(json_bytes).sum(),
-        serde_json::Value::Object(members) => members
-            .iter()
-            .map(|(name, member)| name.len() as u64 + json_bytes(member))
-            .sum(),
-        _ => 0,
-    };
-    size_of::<serde_json::Value>() as u64 + grown
+/// What a value is counted as while a transaction holds it: its cell and what it takes outside.
+fn held(value: &Value) -> u64 {
+    size_of::<Value>() as u64 + heap_bytes(value)
 }
 
 /// The staged records of one table or index inside a span, in key order.
@@ -641,18 +771,27 @@ fn overlay<'a, T: 'a>(
     }))
 }
 
-/// A staged row as a read returns it. Its values are in memory already, so none is beside.
-fn shown(values: &[Value]) -> Row {
-    Row {
-        cells: values.iter().cloned().map(Cell::Here).collect(),
+/// A staged row as a read returns it, `None` for a removal. Its values are in memory already,
+/// so none is beside but those it left where they are.
+fn shown(row: &StagedRow) -> Option<Row> {
+    let mut cells: Vec<Cell> = row
+        .values
+        .iter()
+        .flatten()
+        .cloned()
+        .map(Cell::Here)
+        .collect();
+    for (slot, kept) in &row.left {
+        cells[*slot] = Cell::Beside(kept.clone());
     }
+    row.values.is_some().then_some(Row { cells })
 }
 
 /// Parts an index entry from the key of its row.
-fn split(joined: Result<(Key, usize)>) -> Result<(Key, Key)> {
-    let (Key(mut entry), length) = joined?;
+fn split(joined: Result<(Key, Joined)>) -> Result<(Key, Key, Option<usize>)> {
+    let (Key(mut entry), (length, cut)) = joined?;
     let row = entry.split_off(length);
-    Ok((Key(entry), Key(row)))
+    Ok((Key(entry), Key(row), cut))
 }
 
 impl Read for ChangeSet {
@@ -662,8 +801,11 @@ impl Read for ChangeSet {
 
     fn row(&self, table: TableId, key: &Key) -> Result<Option<Row>> {
         match self.rows.get(&table.0).and_then(|staged| staged.get(key)) {
-            Some(staged) => Ok(staged.values.as_deref().map(shown)),
-            None => self.base.row(table, key),
+            Some(staged) => Ok(shown(staged)),
+            None => Ok(self
+                .base
+                .row(table, key)?
+                .map(|row| self.shaped(table, row))),
         }
     }
 
@@ -671,7 +813,12 @@ impl Read for ChangeSet {
         let span = keys::span(from, to);
         let stored = self.base.moment.rows(table.0, &span)?;
         let staged = staged_in(&self.rows, table.0, span);
-        let staged = staged.map(|(key, row)| (key, row.values.as_deref().map(shown)));
+        let staged = staged.map(|(key, row)| (key, shown(row)));
+        // A stored row is reshaped only while this change set drops something.
+        if self.dropped.is_empty() {
+            return Ok(overlay(stored, staged));
+        }
+        let stored = stored.map(move |row| row.map(|(key, row)| (key, self.shaped(table, row))));
         Ok(overlay(stored, staged))
     }
 
@@ -680,6 +827,10 @@ impl Read for ChangeSet {
         let stored = self.base.moment.joined(index.0, &span)?;
         let staged = staged_in(&self.index, index.0, span).map(|(joined, entry)| (joined, *entry));
         Ok(Box::new(overlay(stored, staged).map(split)))
+    }
+
+    fn kept(&self, count: CountId, from: Bound<&Key>, to: Bound<&Key>) -> Result<KeptIter<'_>> {
+        counts::kept(self, count, &keys::span(from, to))
     }
 
     fn count(&self, table: TableId) -> Result<u64> {
@@ -977,11 +1128,14 @@ impl Store {
 
     /// Writes a change set as one commit and waits for the disk.
     ///
-    /// Rows, the values kept beside them, index entries, counts, schema records, the vector
+    /// Whatever is dropped whole goes after the staged records, and takes with it those staged
+    /// under its number: every row of a table with its large values, every entry of an index,
+    /// or one cell of every row of a table, a storage page or a row at a time. Rows, the values kept beside them, index entries, counts, schema records, the vector
     /// part's records and numbers and the list of changed keys go in one storage transaction:
     /// after a kill either all of it is there or none. A large text or JSON value is compressed
     /// on its way in, in a buffer counted against the change set's reservation while it is
-    /// used. The caller holds the commit lock and has laid the change set over the newest
+    /// used. The commit takes the number the change set's transaction took, or the next after
+    /// the newest commit when that is higher. The caller holds the commit lock and has laid the change set over the newest
     /// moment; one over an older moment is refused with `StoreIo` and writes nothing. Returns
     /// the commit's number. Only a store opened for writing is given a change set to commit.
     pub(crate) fn commit(&self, mut changes: ChangeSet) -> Result<TxId> {

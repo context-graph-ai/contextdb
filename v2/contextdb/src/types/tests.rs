@@ -20,9 +20,10 @@ fn a_unique_refusal_names_the_table_and_every_column_of_the_rule() {
     let refusal = Error::UniqueViolation {
         table: "t".to_owned(),
         column: "a, b, c".to_owned(),
+        key: "1, x, 1".to_owned(),
     };
     assert_eq!(
         refusal.to_string(),
-        "unique constraint violation: t (a, b, c)"
+        "unique constraint violation: t (a, b, c) = (1, x, 1)"
     );
 }

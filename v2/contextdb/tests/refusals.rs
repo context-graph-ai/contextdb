@@ -19,7 +19,7 @@ fn a_unique_refusal_names_the_table_and_every_column_of_the_rule() {
     support::run(&db, "INSERT INTO t (id, a, b, c) VALUES (2, 1, 'x', 2)");
 
     match support::refusal(&db, "INSERT INTO t (id, a, b, c) VALUES (3, 1, 'x', 1)") {
-        Error::UniqueViolation { table, column } => {
+        Error::UniqueViolation { table, column, .. } => {
             assert_eq!((table.as_str(), column.as_str()), ("t", "a, b, c"));
         }
         other => panic!("a duplicate under UNIQUE (a, b, c) was refused as {other:?}"),

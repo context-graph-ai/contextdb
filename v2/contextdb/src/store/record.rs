@@ -176,14 +176,81 @@ pub(super) fn decode_row(mut row: &[u8]) -> Vec<Cell> {
     cells
 }
 
+/// Steps over the first cell of a stored row without making its value, and answers with the
+/// large value the cell keeps beside the row, when it keeps one.
+fn skip_cell(row: &mut &[u8]) -> Option<Beside> {
+    let width = match take(row, 1)[0] {
+        NULL => 0,
+        BOOL => 1,
+        UUID => 16,
+        TEXT | JSON | VECTOR => u64::from_le_bytes(take_array(row)) as usize,
+        REDUCED => u64::from_le_bytes(take_array(row)) as usize + 4,
+        BESIDE => {
+            return Some(Beside {
+                bytes: u64::from_le_bytes(take_array(row)),
+                place: u64::from_le_bytes(take_array(row)),
+            });
+        }
+        _ => 8,
+    };
+    take(row, width);
+    None
+}
+
+/// The bytes of a stored row from its cell at `slot` on: none for a row with no cell there,
+/// which was written before the column was added.
+fn from_cell(mut row: &[u8], slot: usize) -> &[u8] {
+    for _ in 0..slot {
+        if !row.is_empty() {
+            skip_cell(&mut row);
+        }
+    }
+    row
+}
+
+/// The large values a stored row keeps beside it. None of the row's values is made.
+pub(super) fn besides(mut row: &[u8]) -> impl Iterator<Item = Beside> {
+    std::iter::from_fn(move || {
+        while !row.is_empty() {
+            if let Some(kept) = skip_cell(&mut row) {
+                return Some(kept);
+            }
+        }
+        None
+    })
+}
+
+/// A stored row without its cell at `slot`, and the large value that cell kept beside the row.
+/// `None` for a row with no cell there.
+pub(super) fn without_cell(row: &[u8], slot: usize) -> Option<(Vec<u8>, Option<Beside>)> {
+    let mut rest = from_cell(row, slot);
+    let start = row.len() - rest.len();
+    if rest.is_empty() {
+        return None;
+    }
+    let kept = skip_cell(&mut rest);
+    Some(([&row[..start], rest].concat(), kept))
+}
+
+/// Says again, in a row just written, where each large value that was left where it is is
+/// kept. `left` names them by cell, and NULL was written in the cell of each.
+pub(super) fn leave(row: &mut Vec<u8>, left: &[(usize, Beside)]) {
+    for (slot, kept) in left {
+        let at = row.len() - from_cell(row, *slot).len();
+        let place = [kept.bytes.to_le_bytes(), kept.place.to_le_bytes()];
+        row.splice(at..=at, [&[BESIDE][..], place.as_flattened()].concat());
+    }
+}
+
 /// Makes a large value from its stored record, in either form. `reservation` already holds
 /// the record's bytes, and holds the bytes of the value's plain record when the value is made.
 ///
 /// A compressed record is decoded first. The reservation is grown by the bytes of the plain
 /// record before one of them exists, so a value that does not fit under the memory limit is
 /// refused and never produced; the stored bytes are given back once it is decoded. A text
-/// keeps the plain record's buffer as its own. While a JSON or vector value is made, the
-/// record and the value both exist, and the reservation holds the bytes twice for that moment.
+/// keeps the plain record's buffer as its own. A JSON tree is counted, before it is made, as
+/// the most its text can make. While a vector is made, the record and the vector both exist,
+/// and the reservation holds the bytes twice for that moment.
 ///
 /// The inner error is the reason a record's own bytes do not support the length it gives:
 /// the store is damaged. Nothing is allocated from such a length.
@@ -233,14 +300,16 @@ pub(super) fn load(
         let text = String::from_utf8(stored).map(Value::Text);
         return Ok(text.map_err(|_| "a large text is not text"));
     }
+    if stored[0] == JSON {
+        // The tree is counted at the most its text can make before it is made, and is held
+        // by the reservation as long as the value is.
+        reservation.grow(types::json_bytes(&stored[FRONT..]))?;
+        let json = serde_json::from_slice(&stored[FRONT..]).map(Value::Json);
+        return Ok(json.map_err(|_| "a large JSON value is not JSON"));
+    }
     let twice = stored.len() as u64;
     reservation.grow(twice)?;
-    let json = &stored[FRONT..];
-    let value = match stored[0] {
-        JSON => serde_json::from_slice(json).ok().map(Value::Json),
-        VECTOR => Some(decode_value(&stored)),
-        _ => None,
-    };
+    let value = (stored[0] == VECTOR).then(|| decode_value(&stored));
     reservation.shrink(twice);
     Ok(value.ok_or("a large value is not text, JSON or a vector"))
 }

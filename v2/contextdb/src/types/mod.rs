@@ -3,6 +3,7 @@
 //! It never holds behaviour: nothing here reads a store, checks a rule or decides an answer.
 
 use std::fmt;
+use std::ops::Range;
 use std::path::PathBuf;
 
 pub use uuid::Uuid;
@@ -43,7 +44,7 @@ pub enum Value {
     /// A vector of `f32`. Its length must equal the dimension its `VECTOR(n)` column declares;
     /// any other length is refused with [`Error::ColumnTypeMismatch`].
     Vector(Vec<f32>),
-    /// The position of a commit, as [`TxId`]. No column type of this version stores one.
+    /// The position of a commit, as [`TxId`]: what a `TXID` column holds.
     TxId(TxId),
 }
 
@@ -95,6 +96,69 @@ impl From<Vec<f32>> for Value {
     }
 }
 
+/// Values as a refusal shows them, joined by a comma and a space; a text longer than 64 bytes
+/// is cut there, at a whole character, and followed by `...` and its length in bytes.
+pub(crate) fn shown(values: &[Value]) -> String {
+    let each = values.iter().map(|value| match value {
+        Value::Text(text) if text.len() > 64 => {
+            let cut = (0..=64).rfind(|&at| text.is_char_boundary(at)).unwrap_or(0);
+            format!("{}... ({} bytes)", &text[..cut], text.len())
+        }
+        Value::Text(text) => text.clone(),
+        Value::Int64(number) | Value::Timestamp(number) => number.to_string(),
+        Value::Uuid(uuid) => uuid.to_string(),
+        other => format!("{other:?}"),
+    });
+    each.collect::<Vec<_>>().join(", ")
+}
+
+/// The memory a value takes outside its own cell.
+pub(crate) fn heap_bytes(value: &Value) -> u64 {
+    fn json(value: &serde_json::Value) -> u64 {
+        let cell = size_of::<serde_json::Value>();
+        match value {
+            serde_json::Value::String(text) => text.len() as u64,
+            serde_json::Value::Array(items) => {
+                let items = items.iter();
+                items.map(|item| cell as u64 + json(item)).sum()
+            }
+            serde_json::Value::Object(members) => {
+                let members = members.iter();
+                members
+                    .map(|(name, member)| (name.len() + cell) as u64 + json(member))
+                    .sum()
+            }
+            _ => 0,
+        }
+    }
+    match value {
+        Value::Text(text) => text.len() as u64,
+        Value::Vector(vector) => size_of_val(vector.as_slice()) as u64,
+        Value::Json(value) => json(value),
+        _ => 0,
+    }
+}
+
+/// The most memory the JSON tree made from this text takes, worked out from the text alone,
+/// so that it is counted before the tree is made. Outside strings, an object takes a table
+/// node of its own and a share of the nodes its members fill, and every member and array
+/// item takes a cell with the room its array may grow into; every string is its own bytes.
+pub(crate) fn json_bytes(text: &[u8]) -> u64 {
+    let (mut bytes, mut quoted, mut escaped) = (text.len() as u64, false, false);
+    for &byte in text {
+        match byte {
+            _ if escaped => escaped = false,
+            b'\\' if quoted => escaped = true,
+            b'"' => quoted = !quoted,
+            _ if quoted => {}
+            b'{' => bytes += 768,
+            b'[' | b',' | b':' => bytes += 128,
+            _ => {}
+        }
+    }
+    bytes
+}
+
 /// Every refusal and failure of this library, by kind.
 ///
 /// A caller matches on the kind; the sentence a person reads comes from `Display`. A statement
@@ -114,8 +178,9 @@ pub enum Error {
     /// The statement names a table that is not declared. Carries the bare table name. Returned
     /// by every `execute` and by `declaration`.
     TableNotFound(String),
-    /// The statement or a declaration names a column its table does not have. Returned by
-    /// every `execute`.
+    /// The statement or a declaration names a column its table does not have. For a name
+    /// written with a qualifier that is no table or alias of the statement, `table` is the
+    /// qualifier as written. Returned by every `execute`.
     ColumnNotFound { table: String, column: String },
     /// An INSERT or UPDATE wrote a value that is not of its column's type. The only
     /// conversions are quoted text into a UUID, TIMESTAMP, JSON or VECTOR column and an INTEGER
@@ -132,12 +197,16 @@ pub enum Error {
     ColumnNotNullable { table: String, column: String },
     /// A row with this primary key, or with these values under a UNIQUE rule, is already
     /// there. `column` names every column of the rule in declared order, joined by a comma and
-    /// a space.
+    /// a space; `key` is the values the refused row has in them, as text.
     ///
     /// Returned by the INSERT or UPDATE when the other row is already visible to it. Returned
     /// by `Transaction::commit` when another commit took the key or the values while the
     /// transaction was open; then nothing of the transaction was committed.
-    UniqueViolation { table: String, column: String },
+    UniqueViolation {
+        table: String,
+        column: String,
+        key: String,
+    },
     /// A declaration that cannot stand. `reason` is a sentence for a person, not a table name:
     /// a `CREATE TABLE` of a name that is taken, a column declared twice, a second PRIMARY KEY,
     /// a DEFAULT that is not a constant or `NOW()`. Returned by the `execute` that declares.
@@ -171,9 +240,10 @@ pub enum Error {
     /// Declarations and row writes commit in separate transactions.
     MixedSchemaAndRowWrite,
     /// `Transaction::commit` found that another commit had changed rows this transaction
-    /// updated or deleted since the transaction read them. `count` is the number of such rows.
-    /// Nothing of the transaction was committed; run the whole transaction again. Only a
-    /// transaction that was open across another commit can meet this.
+    /// updated or deleted since the transaction read them, or rows it asked to stay as they
+    /// were until it committed. `count` is the number of such rows. Nothing of the transaction
+    /// was committed; run the whole transaction again. Only a transaction that was open across
+    /// another commit can meet this.
     ConditionalUpdateConflict { count: u64 },
     /// A call was made on a `Database` after its `close`.
     DatabaseClosed,
@@ -259,6 +329,88 @@ pub enum Error {
     VectorIndexedRouteUnavailable { index: VectorIndexRef },
     /// `USE VECTOR` was written in a SELECT that does not order by `<=>`.
     UseVectorRequiresVectorOrder,
+    /// An UPDATE, a DELETE or an `ON CONFLICT DO UPDATE` named a table declared `IMMUTABLE`.
+    ImmutableTable { table: String },
+    /// A statement would change a column declared `IMMUTABLE`: an UPDATE that assigns it, or
+    /// an ALTER that drops or renames it.
+    ImmutableColumn { table: String, column: String },
+    /// An UPDATE would move a row's state to one its table's `STATE MACHINE` does not list
+    /// after the state the row is in.
+    InvalidStateTransition {
+        table: String,
+        column: String,
+        from: String,
+        to: String,
+    },
+    /// A commit would leave a reference without its parent row. `still_referenced` says the
+    /// parent row was removed or re-keyed while a row of `table` points at it; otherwise a
+    /// row of `table` names a parent that is not there. `columns` are the referencing columns,
+    /// joined by a comma and a space, and `key` the values they hold, as text.
+    ForeignKeyViolation {
+        table: String,
+        columns: String,
+        parent: String,
+        still_referenced: bool,
+        key: String,
+    },
+    /// An edge of a type its table lists under `DAG` would close a cycle.
+    CycleDetected { table: String, edge_type: String },
+    /// A propagation declared `ABORT ON FAILURE` met a row it could not move.
+    PropagationAborted { table: String, reason: String },
+    /// A write would store a row key, a partition-key tuple or the values of a kept count
+    /// longer than the engine keeps: values that identify a row or a group and are kept whole.
+    /// `key` is `primary key`, the VECTOR column's name or the count's list as declared. A
+    /// value of any length may be indexed: an index is never the reason for this refusal.
+    KeyTooLong {
+        table: String,
+        key: String,
+        bytes: u64,
+        limit: u64,
+    },
+    /// `DROP INDEX` named an index its table does not have, without `IF EXISTS`.
+    IndexNotFound { table: String, index: String },
+    /// `DROP COLUMN` without `CASCADE` named a column that `index` is over.
+    ColumnInIndex {
+        table: String,
+        column: String,
+        index: String,
+    },
+    /// An ALTER would drop or rename a column of a VECTOR column's `PARTITION_KEY`.
+    /// `index` is the VECTOR column.
+    VectorPartitionKeyInUse {
+        table: String,
+        column: String,
+        index: String,
+    },
+    /// A DROP or an ALTER named a table, a column or an index that the rank policy `policy`
+    /// reads.
+    DropBlockedByRankPolicy {
+        table: String,
+        column: String,
+        policy: String,
+    },
+    /// A `RANK_POLICY` whose declaration cannot stand; `reason` says why.
+    RankPolicyInvalid {
+        index: VectorIndexRef,
+        reason: String,
+    },
+    /// A handle narrowed to some Contexts named, by its key, a row of another Context, or
+    /// wrote a row outside them.
+    ContextScopeViolation { table: String },
+    /// A handle narrowed by scope labels named, by its key, a row its labels do not allow, or
+    /// wrote one.
+    ScopeLabelViolation { table: String },
+    /// A handle's principal holds no grant for the row it named by its key.
+    AclDenied { table: String },
+    /// A table with an `ACL REFERENCES` column was read through a narrowed handle that names
+    /// no principal able to hold grants.
+    PrincipalRequired { table: String },
+    /// A narrowed handle ran a statement only the handle that declared no narrowing may run.
+    AdminRequired { statement: String },
+    /// `CREATE PROCEDURE` or `CREATE FUNCTION`.
+    StoredProcNotSupported,
+    /// A statement wrote a `TXID` value above its own transaction's number.
+    TxIdOutOfRange { value: u64, max: u64 },
 }
 
 impl fmt::Display for Error {
@@ -282,8 +434,11 @@ impl fmt::Display for Error {
             Error::ColumnNotNullable { table, column } => {
                 write!(f, "column {table}.{column} is NOT NULL")
             }
-            Error::UniqueViolation { table, column } => {
-                write!(f, "unique constraint violation: {table} ({column})")
+            Error::UniqueViolation { table, column, key } => {
+                write!(
+                    f,
+                    "unique constraint violation: {table} ({column}) = ({key})"
+                )
             }
             Error::SchemaInvalid { reason } => write!(f, "schema invalid: {reason}"),
             Error::ColumnNotIndexable {
@@ -397,6 +552,117 @@ impl fmt::Display for Error {
             Error::UseVectorRequiresVectorOrder => {
                 f.write_str("USE VECTOR requires ORDER BY embedding <=> $param in the same query")
             }
+            Error::ImmutableTable { table } => write!(
+                f,
+                "table {table} is IMMUTABLE: its rows are inserted once and never updated or \
+                 deleted"
+            ),
+            Error::ImmutableColumn { table, column } => write!(
+                f,
+                "column {table}.{column} is IMMUTABLE: it is set when the row is inserted and \
+                 never changed"
+            ),
+            Error::InvalidStateTransition {
+                table: t,
+                column: c,
+                from,
+                to,
+            } => {
+                write!(f, "invalid state transition of {t}.{c}: {from} -> {to}")
+            }
+            Error::ForeignKeyViolation {
+                table,
+                columns,
+                parent,
+                still_referenced,
+                key,
+            } => match still_referenced {
+                true => write!(
+                    f,
+                    "foreign key violation: {parent} is still referenced by {table} ({columns}) \
+                     = ({key})"
+                ),
+                false => write!(
+                    f,
+                    "foreign key violation: {table} ({columns}) = ({key}) has no row in {parent}"
+                ),
+            },
+            Error::CycleDetected { table, edge_type } => write!(
+                f,
+                "cycle detected: this {edge_type} edge of {table} would close a cycle"
+            ),
+            Error::PropagationAborted { table, reason } => {
+                write!(f, "propagation aborted on {table}: {reason}")
+            }
+            Error::KeyTooLong {
+                table,
+                key,
+                bytes,
+                limit,
+            } => write!(
+                f,
+                "key too long: the {key} of {table} takes {bytes} bytes and the limit is \
+                 {limit}; these values identify a row or a group and are kept whole, so use a \
+                 shorter one"
+            ),
+            Error::IndexNotFound { table, index } => write!(f, "index not found: {table}.{index}"),
+            Error::ColumnInIndex {
+                table,
+                column,
+                index,
+            } => write!(
+                f,
+                "column {table}.{column} is used by the index {index}; drop the index first, or \
+                 write CASCADE"
+            ),
+            Error::VectorPartitionKeyInUse {
+                table,
+                column,
+                index,
+            } => write!(
+                f,
+                "column {table}.{column} is in the PARTITION_KEY of {table}.{index}; to change \
+                 the key, declare a new table with the key you want and copy the rows"
+            ),
+            Error::DropBlockedByRankPolicy {
+                table,
+                column,
+                policy,
+            } => write!(f, "{table}.{column} is read by the rank policy {policy}"),
+            Error::RankPolicyInvalid { index, reason } => {
+                write!(f, "invalid rank policy on {index}: {reason}")
+            }
+            Error::ContextScopeViolation { table } => write!(
+                f,
+                "context scope violation: this row of {table} is outside the Contexts this \
+                 handle was given"
+            ),
+            Error::ScopeLabelViolation { table } => write!(
+                f,
+                "scope label violation: this row of {table} is outside the labels this handle \
+                 was given"
+            ),
+            Error::AclDenied { table } => write!(
+                f,
+                "access denied: this handle's principal holds no grant for this row of {table}"
+            ),
+            Error::PrincipalRequired { table } => write!(
+                f,
+                "table {table} is access-controlled: read it through a handle that names a \
+                 principal"
+            ),
+            Error::AdminRequired { statement } => write!(
+                f,
+                "{statement} reaches every Context, label and principal: run it through the \
+                 handle that declared no narrowing"
+            ),
+            Error::StoredProcNotSupported => {
+                f.write_str("stored procedures and functions are not supported")
+            }
+            Error::TxIdOutOfRange { value, max } => write!(
+                f,
+                "TXID {value} is above this transaction's own number, {max}"
+            ),
         }
     }
 }
@@ -405,6 +671,163 @@ impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests;
+
+/// Reads an ISO 8601 moment with its offset (`2026-01-01T02:00:00+02:00`,
+/// `1970-01-01T00:00:00.250Z`) as milliseconds since the first moment of 1970, UTC. Digits past
+/// the millisecond are dropped. `None` when the text is not such a moment.
+pub(crate) fn timestamp_millis(text: &str) -> Option<i64> {
+    let (year, month, day) = (
+        digits(text, 0..4)?,
+        digits(text, 5..7)?,
+        digits(text, 8..10)?,
+    );
+    let (hour, minute, second) = (
+        digits(text, 11..13)?,
+        digits(text, 14..16)?,
+        digits(text, 17..19)?,
+    );
+    let marks = text.as_bytes();
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days = match month {
+        2 => 28 + i64::from(leap),
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if [marks[4], marks[7], marks[13], marks[16]] != *b"--::"
+        || !matches!(marks[10], b'T' | b't')
+        || !(1..=12).contains(&month)
+        || !(1..=month_days).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+
+    let mut rest = &text[19..];
+    let mut millis = 0;
+    if let Some(fraction) = rest.strip_prefix('.') {
+        let end = fraction
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(fraction.len());
+        if end == 0 {
+            return None;
+        }
+        millis = format!("{:0<3}", &fraction[..end.min(3)]).parse().ok()?;
+        rest = &fraction[end..];
+    }
+    let offset_minutes = match rest.as_bytes() {
+        b"Z" | b"z" => 0,
+        [sign @ (b'+' | b'-'), _, _, b':', _, _] => {
+            let minutes = digits(rest, 1..3)? * 60 + digits(rest, 4..6)?;
+            if *sign == b'-' { -minutes } else { minutes }
+        }
+        _ => return None,
+    };
+
+    // Days since 1970 of a date in the Gregorian calendar, counting years from March so that
+    // the leap day is the last day of its year.
+    let (year, month) = if month > 2 {
+        (year, month - 3)
+    } else {
+        (year - 1, month + 9)
+    };
+    let leap_days = year.div_euclid(4) - year.div_euclid(100) + year.div_euclid(400);
+    let days = year * 365 + leap_days + (153 * month + 2) / 5 + day - 719_469;
+    Some(((days * 24 + hour) * 60 + minute - offset_minutes) * 60_000 + second * 1_000 + millis)
+}
+
+/// The number written in these positions of the text, when every one of them is a digit.
+fn digits(text: &str, positions: Range<usize>) -> Option<i64> {
+    let part = text.get(positions)?;
+    if part.bytes().all(|byte| byte.is_ascii_digit()) {
+        part.parse().ok()
+    } else {
+        None
+    }
+}
+
+/// Reads the text spelling of a vector, `[0.1, 0.2, 0.3]`: the one reader of it, for a value
+/// written into a VECTOR column and for the vector of a search.
+pub(crate) fn vector_from_text(text: &str) -> Option<Vec<f32>> {
+    let inside = text.trim().strip_prefix('[')?.strip_suffix(']')?;
+    inside
+        .split(',')
+        .map(|number| number.trim().parse().ok())
+        .collect()
+}
+
+/// Brings a value to its column's type, or refuses it with `ColumnTypeMismatch`.
+///
+/// NULL fits every type here; whether the column takes it is the NOT NULL rule's business. The
+/// only conversions are quoted text into a UUID, TIMESTAMP, JSON or VECTOR column and an INTEGER
+/// into a REAL column. A vector of the column's length with a number that is not finite is
+/// refused with `InvalidVectorValue`, however it was written: no search could measure it.
+pub(crate) fn typed(table: &str, column: &ColumnDef, value: Value) -> Result<Value> {
+    let converted = match (column.column_type, &value) {
+        (_, Value::Null)
+        | (ColumnType::Integer, Value::Int64(_))
+        | (ColumnType::Real, Value::Float64(_))
+        | (ColumnType::Text, Value::Text(_))
+        | (ColumnType::Boolean, Value::Bool(_))
+        | (ColumnType::Json, Value::Json(_))
+        | (ColumnType::Uuid, Value::Uuid(_))
+        | (ColumnType::Timestamp, Value::Timestamp(_))
+        | (ColumnType::TxId, Value::TxId(_)) => return Ok(value),
+        (ColumnType::Vector(length), Value::Vector(vector)) if vector.len() == length => {
+            return finite(table, column, value);
+        }
+        (ColumnType::Real, Value::Int64(whole)) => Some(Value::Float64(*whole as f64)),
+        (ColumnType::Uuid, Value::Text(text)) => Uuid::parse_str(text).ok().map(Value::Uuid),
+        (ColumnType::Timestamp, Value::Text(text)) => timestamp_millis(text).map(Value::Timestamp),
+        (ColumnType::Json, Value::Text(text)) => serde_json::from_str(text).ok().map(Value::Json),
+        (ColumnType::Vector(length), Value::Text(text)) => vector_from_text(text)
+            .filter(|vector| vector.len() == length)
+            .map(Value::Vector),
+        _ => None,
+    };
+    let converted = converted.ok_or_else(|| Error::ColumnTypeMismatch {
+        table: table.to_owned(),
+        column: column.name.clone(),
+        expected: column.column_type.to_string(),
+        actual: kind(&value),
+    })?;
+    finite(table, column, converted)
+}
+
+/// The value itself, unless it is a vector that holds a number that is not finite.
+fn finite(table: &str, column: &ColumnDef, value: Value) -> Result<Value> {
+    if let Value::Vector(vector) = &value
+        && let Some(position) = vector.iter().position(|number| !number.is_finite())
+    {
+        return Err(Error::InvalidVectorValue {
+            index: VectorIndexRef {
+                table: table.to_owned(),
+                column: column.name.clone(),
+            },
+            position,
+        });
+    }
+    Ok(value)
+}
+
+/// What a refusal calls the value it was given. A vector says how long it is, since its length
+/// is what a VECTOR column refuses it for.
+fn kind(value: &Value) -> String {
+    match value {
+        Value::Null => "Null",
+        Value::Bool(_) => "Bool",
+        Value::Int64(_) => "Int64",
+        Value::Float64(_) => "Float64",
+        Value::Text(_) => "Text",
+        Value::Uuid(_) => "Uuid",
+        Value::Timestamp(_) => "Timestamp",
+        Value::Json(_) => "Json",
+        Value::Vector(vector) => return format!("Vector({})", vector.len()),
+        Value::TxId(_) => "TxId",
+    }
+    .to_owned()
+}
 
 /// The declared type of a column, with the names SQL gives it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -425,6 +848,25 @@ pub enum ColumnType {
     Vector(usize),
     /// `TIMESTAMP`.
     Timestamp,
+    /// `TXID`: the number of a transaction, as [`TxId`].
+    TxId,
+}
+
+/// The type as SQL names it.
+impl fmt::Display for ColumnType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            ColumnType::Integer => "INTEGER",
+            ColumnType::Real => "REAL",
+            ColumnType::Text => "TEXT",
+            ColumnType::Boolean => "BOOLEAN",
+            ColumnType::Json => "JSON",
+            ColumnType::Uuid => "UUID",
+            ColumnType::Vector(size) => return write!(f, "VECTOR({size})"),
+            ColumnType::Timestamp => "TIMESTAMP",
+            ColumnType::TxId => "TXID",
+        })
+    }
 }
 
 /// A VECTOR column as a refusal names it: its table, then its own name.
@@ -569,13 +1011,114 @@ pub struct ColumnDef {
 pub struct IndexDecl {
     pub name: String,
     pub columns: Vec<(String, SortDirection)>,
+    /// The keys of `(column -> 'key' -> ...)` when the index is over a path into its one JSON
+    /// column; empty for an index over columns.
+    pub json_path: Vec<String>,
 }
 
-/// A table as it was declared.
+/// A table as it was declared, as far as this value has fields for: references, `PROPAGATE`,
+/// `EXCLUDE VECTOR`, rank policies, the clauses of a VECTOR column, `DELIVERY MANIFEST`,
+/// `EDGE DISCARD` and the rules of who may see a row are not in it; `Database::declaration`
+/// returns them.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct TableMeta {
     pub columns: Vec<ColumnDef>,
     pub unique_constraints: Vec<Vec<String>>,
     pub indexes: Vec<IndexDecl>,
+    /// The table was declared `IMMUTABLE`.
+    pub immutable: bool,
+    /// Each of these is `None`, or empty, when the table's declaration does not write it.
+    pub state_machine: Option<StateMachine>,
+    /// The edge types of `DAG(...)`.
+    pub dag: Vec<String>,
+    pub retain: Option<Retain>,
+    pub history: Option<History>,
+    pub sync: Option<SyncDirection>,
+    pub conflict: Option<ConflictPolicy>,
+    pub kept_counts: Option<KeptCounts>,
+}
+
+/// `STATE MACHINE (column: state -> [next, ...], ...)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateMachine {
+    pub column: String,
+    pub transitions: Vec<(String, Vec<String>)>,
+}
+
+/// `RETAIN count unit [SYNC SAFE]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Retain {
+    pub count: u64,
+    pub unit: RetainUnit,
+    pub sync_safe: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetainUnit {
+    Seconds,
+    Minutes,
+    Hours,
+    Days,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum History {
+    All,
+    CurrentOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncDirection {
+    Off,
+    PushOnly,
+    PullOnly,
+    TwoWay,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictPolicy {
+    KeepFirst,
+    KeepLatest,
+}
+
+/// `MAINTAIN COUNT NONE`, `ALL PREFIXES`, or the column lists written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeptCounts {
+    None,
+    AllPrefixes,
+    Lists(Vec<Vec<(String, SortDirection)>>),
+}
+
+/// The Context a row belongs to, as its `CONTEXT_ID` column holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ContextId(pub Uuid);
+
+impl ContextId {
+    /// The Context with this id.
+    pub fn new(uuid: Uuid) -> ContextId {
+        ContextId(uuid)
+    }
+}
+
+/// One label of a table's `SCOPE_LABEL` column.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ScopeLabel(pub String);
+
+impl ScopeLabel {
+    /// The label with this name.
+    pub fn new(label: impl Into<String>) -> ScopeLabel {
+        ScopeLabel(label.into())
+    }
+}
+
+/// Who a handle acts for, as a table's access-control grants name them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Principal {
+    /// The system itself.
+    System,
+    /// An agent, by name.
+    Agent(String),
+    /// A person, by name.
+    Human(String),
 }

@@ -3,46 +3,108 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use super::heap_bytes;
+use super::bind::bind;
 use crate::schema::Table;
 use crate::sql::Expr;
 use crate::sql::ast::{BinOp, ColumnRef, Literal, UnaryOp};
-use crate::types::{Error, Result, Uuid, Value};
+use crate::types::{
+    ColumnDef, ColumnType, Error, Result, Uuid, Value, heap_bytes, timestamp_millis,
+};
+
+#[cfg(test)]
+mod tests;
+
+/// The columns an expression has in reach: for each table of the statement, in the order their
+/// values stand in a row, the name that qualifies its columns and the columns themselves.
+#[derive(Default)]
+pub(crate) struct Scope<'a> {
+    relations: Vec<(&'a str, &'a [ColumnDef])>,
+}
+
+impl<'a> Scope<'a> {
+    /// The scope of one table's columns.
+    pub(crate) fn of(qualifier: &'a str, columns: &'a [ColumnDef]) -> Self {
+        Scope {
+            relations: vec![(qualifier, columns)],
+        }
+    }
+
+    /// Where a column sits in a row, and its type. A name no table in reach has is
+    /// `ColumnNotFound`, and so is a name qualified with anything but one of the tables: that
+    /// refusal names the qualifier as it was written.
+    pub(super) fn find(&self, column: &ColumnRef) -> Result<(usize, ColumnType)> {
+        let mut before = 0;
+        for (qualifier, columns) in &self.relations {
+            let named = |declared: &ColumnDef| declared.name == column.column;
+            if column
+                .table
+                .as_deref()
+                .is_none_or(|table| table == *qualifier)
+                && let Some(at) = columns.iter().position(named)
+            {
+                return Ok((before + at, columns[at].column_type));
+            }
+            before += columns.len();
+        }
+        Err(self.missing(column))
+    }
+
+    /// The refusal of a column that is not in reach, under the qualifier it was written with or
+    /// else the first table.
+    fn missing(&self, column: &ColumnRef) -> Error {
+        let first = self.relations.first().map(|(qualifier, _)| *qualifier);
+        Error::ColumnNotFound {
+            table: column
+                .table
+                .as_deref()
+                .or(first)
+                .unwrap_or_default()
+                .to_owned(),
+            column: column.column.clone(),
+        }
+    }
+}
+
+/// What an expression is worked out with beside its row: the values the statement bound, the
+/// statement's one time in milliseconds, which `NOW()` answers with, and the row's distance
+/// when a similarity search found it.
+pub(crate) struct EvalContext<'a> {
+    params: &'a HashMap<String, Value>,
+    now: i64,
+    distance: Option<f64>,
+}
+
+impl<'a> EvalContext<'a> {
+    pub(crate) fn new(params: &'a HashMap<String, Value>, now: i64) -> Self {
+        EvalContext {
+            params,
+            now,
+            distance: None,
+        }
+    }
+
+    /// The context for a row a similarity search found at this distance: every `<=>` in an
+    /// expression is that number as it is.
+    pub(super) fn found(self, distance: Option<f64>) -> Self {
+        EvalContext { distance, ..self }
+    }
+}
 
 /// Works out one expression against one row. The only expression evaluator in the library.
 ///
-/// `row` holds one value per column of `table`, in declared order, and `now` is the statement's
-/// one time in milliseconds, which `NOW()` answers with. A comparison with NULL, and one between
-/// values of types that do not compare, is unknown: it gives NULL, and a filter keeps a row
+/// `row` holds one value per column of `scope`, in its order. A comparison with NULL, and one
+/// between values that do not compare, is unknown: it gives NULL, and a filter keeps a row
 /// only for TRUE.
 ///
-/// A distance, `column <=> vector`, has no value here: only a similarity search gives a row one
-/// ([`eval_found`]), so it is refused by name.
-pub(crate) fn eval(
-    expr: &Expr,
-    table: &Table,
-    row: &[Value],
-    params: &HashMap<String, Value>,
-    now: i64,
-) -> Result<Value> {
-    eval_found(expr, table, row, None, params, now)
-}
-
-/// [`eval`] for a row a similarity search found. `distance` is the distance the search worked
-/// out for the row, and every `<=>` in the expression is that number as it is.
-pub(super) fn eval_found(
-    expr: &Expr,
-    table: &Table,
-    row: &[Value],
-    distance: Option<f64>,
-    params: &HashMap<String, Value>,
-    now: i64,
-) -> Result<Value> {
-    let value = |expr: &Expr| eval_found(expr, table, row, distance, params, now);
+/// A distance, `column <=> vector`, has no value of its own here: only a similarity search
+/// gives a row one, through the context, so without one it is refused by name.
+pub(crate) fn eval(expr: &Expr, scope: &Scope, row: &[Value], ctx: &EvalContext) -> Result<Value> {
+    let value = |expr: &Expr| eval(expr, scope, row, ctx);
     Ok(match expr {
         Expr::Column(column) => {
-            let at = column_index(table, column)?;
-            row.get(at).cloned().ok_or_else(|| missing(table, column))?
+            let (at, _) = scope.find(column)?;
+            let value = row.get(at).cloned();
+            value.ok_or_else(|| scope.missing(column))?
         }
         Expr::Literal(literal) => match literal {
             Literal::Null => Value::Null,
@@ -52,7 +114,7 @@ pub(super) fn eval_found(
             Literal::Text(value) => Value::Text(value.clone()),
             Literal::Vector(value) => Value::Vector(value.clone()),
         },
-        Expr::Parameter(name) => params.get(name).cloned().ok_or_else(|| unbound(name))?,
+        Expr::Parameter(name) => ctx.params.get(name).cloned().ok_or_else(|| unbound(name))?,
         Expr::BinaryOp { left, op, right } => {
             let holds: fn(Ordering) -> bool = match op {
                 BinOp::And | BinOp::Or => {
@@ -96,7 +158,7 @@ pub(super) fn eval_found(
             (Some(Scalar::Arithmetic(op)), [left, right]) => {
                 arithmetic(op, &value(left)?, &value(right)?)?
             }
-            (Some(Scalar::Now), []) => Value::Timestamp(now),
+            (Some(Scalar::Now), []) => Value::Timestamp(ctx.now),
             (Some(Scalar::Coalesce), args) => {
                 for arg in args {
                     let first = value(arg)?;
@@ -139,7 +201,7 @@ pub(super) fn eval_found(
                 "a row value, (a, b), stands only on either side of IN".to_owned(),
             ));
         }
-        Expr::Distance { .. } => Value::Float64(distance.ok_or_else(|| {
+        Expr::Distance { .. } => Value::Float64(ctx.distance.ok_or_else(|| {
             Error::PlanError(
                 "<=> has a value only for the rows of a similarity search, SELECT ... ORDER BY \
                  column <=> vector LIMIT k, and in that statement's select list"
@@ -176,20 +238,20 @@ fn rows_equal(left: &[Value], right: &[Value]) -> Option<bool> {
 /// before the expression is worked out, so the memory is asked for before the value is made.
 pub(super) fn most_bytes(
     expr: &Expr,
-    table: &Table,
+    scope: &Scope,
     row: &[Value],
     params: &HashMap<String, Value>,
 ) -> u64 {
     match expr {
         Expr::Column(column) => {
-            let at = column_index(table, column).ok();
-            at.and_then(|at| row.get(at)).map_or(0, heap_bytes)
+            let at = scope.find(column).ok();
+            at.and_then(|(at, _)| row.get(at)).map_or(0, heap_bytes)
         }
         Expr::Literal(Literal::Text(text)) => text.len() as u64,
         Expr::Literal(Literal::Vector(vector)) => size_of_val(vector.as_slice()) as u64,
         Expr::Parameter(name) => params.get(name).map_or(0, heap_bytes),
         Expr::FunctionCall { name, args } if matches!(scalar(name), Some(Scalar::Coalesce)) => {
-            let each = args.iter().map(|arg| most_bytes(arg, table, row, params));
+            let each = args.iter().map(|arg| most_bytes(arg, scope, row, params));
             each.max().unwrap_or(0)
         }
         // Everything else gives a number, a truth, a time or NULL.
@@ -197,82 +259,50 @@ pub(super) fn most_bytes(
     }
 }
 
-/// Marks in `read` each column the expression reads.
-///
-/// Refuses, before any row is read, what [`eval`] would refuse at the first row: a column the
-/// table does not have, a `$name` nothing is bound to, and a function this version does not
-/// work out. A statement is therefore refused or not whatever rows its table holds. A distance
-/// and a row value are walked and not judged: the planner refuses the ones a SELECT cannot
-/// hold, and [`eval`] any other when it meets it.
-pub(super) fn reads(
+/// Binds the expression against the table, then marks in `read` each column it reads. The
+/// column on the left of a distance is not marked: the search gives a row's distance.
+pub(crate) fn reads(
     expr: &Expr,
     table: &Table,
     params: &HashMap<String, Value>,
     read: &mut [bool],
 ) -> Result<()> {
-    match expr {
-        Expr::Column(column) => read[column_index(table, column)?] = true,
-        Expr::Literal(_) => {}
-        Expr::Parameter(name) => {
-            if !params.contains_key(name) {
-                return Err(unbound(name));
-            }
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            reads(left, table, params, read)?;
-            reads(right, table, params, read)?;
-        }
-        Expr::UnaryOp { operand, .. } | Expr::IsNull { expr: operand, .. } => {
-            reads(operand, table, params, read)?;
-        }
-        Expr::FunctionCall { name, args } => {
-            if scalar(name).is_none() {
-                return Err(refused(name));
-            }
-            for arg in args {
-                reads(arg, table, params, read)?;
-            }
-        }
-        // The search gives a row's distance: the column on the left is looked up, not read.
-        Expr::Distance { left, right } => {
-            reads(left, table, params, &mut read.to_vec())?;
-            reads(right, table, params, read)?;
-        }
-        Expr::Row(items) => {
-            for item in items {
-                reads(item, table, params, read)?;
-            }
-        }
-        Expr::InList { expr, list, .. } => {
-            reads(expr, table, params, read)?;
-            for item in list {
-                reads(item, table, params, read)?;
-            }
-        }
-    }
+    let scope = table.scope();
+    bind(expr, &scope, params)?;
+    mark(expr, &scope, read);
     Ok(())
 }
 
-/// Where a column sits in a row of its table. A name the table does not have, and a name
-/// qualified with anything but the table's own name, is `ColumnNotFound`.
-pub(super) fn column_index(table: &Table, column: &ColumnRef) -> Result<usize> {
-    let in_scope = column.table.as_ref().is_none_or(|name| *name == table.name);
-    table
-        .meta
-        .columns
-        .iter()
-        .position(|declared| in_scope && declared.name == column.column)
-        .ok_or_else(|| missing(table, column))
-}
-
-fn missing(table: &Table, column: &ColumnRef) -> Error {
-    Error::ColumnNotFound {
-        table: table.name.clone(),
-        column: column.column.clone(),
+fn mark(expr: &Expr, scope: &Scope, read: &mut [bool]) {
+    let mut all = |items: &[Expr]| items.iter().for_each(|item| mark(item, scope, read));
+    match expr {
+        Expr::Column(column) => {
+            if let Ok((at, _)) = scope.find(column) {
+                read[at] = true;
+            }
+        }
+        Expr::Literal(_) | Expr::Parameter(_) => {}
+        Expr::BinaryOp { left, right, .. } => {
+            mark(left, scope, read);
+            mark(right, scope, read);
+        }
+        Expr::UnaryOp { operand, .. }
+        | Expr::IsNull { expr: operand, .. }
+        | Expr::Distance { right: operand, .. } => mark(operand, scope, read),
+        Expr::FunctionCall { args: items, .. } | Expr::Row(items) => all(items),
+        Expr::InList { expr, list, .. } => {
+            all(list);
+            mark(expr, scope, read);
+        }
     }
 }
 
-fn unbound(name: &str) -> Error {
+/// Where a column sits in a row of its table.
+pub(super) fn column_index(table: &Table, column: &ColumnRef) -> Result<usize> {
+    Ok(table.scope().find(column)?.0)
+}
+
+pub(super) fn unbound(name: &str) -> Error {
     Error::PlanError(format!("no value is bound to ${name}"))
 }
 
@@ -288,7 +318,7 @@ pub(super) fn unsupported(what: &str) -> Error {
 }
 
 /// The refusal of a call [`eval`] does not work out.
-fn refused(name: &str) -> Error {
+pub(super) fn refused(name: &str) -> Error {
     unsupported(&format!("the function {name}"))
 }
 
@@ -379,7 +409,7 @@ fn truth(value: &Value) -> Option<bool> {
 ///
 /// A REAL has one rule for `=`, ORDER BY and the bytes of a key: the two zeros are one value,
 /// and every NaN is one value, equal to itself and above positive infinity. A whole number
-/// compares with a REAL as a REAL, and a UUID with the text that spells one.
+/// compares with a REAL as a REAL, and a UUID or a TIMESTAMP with the text that spells one.
 pub(super) fn compare(left: &Value, right: &Value) -> Option<Ordering> {
     let reals = |left: f64, right: f64| {
         let unordered = || left.is_nan().cmp(&right.is_nan());
@@ -397,6 +427,8 @@ pub(super) fn compare(left: &Value, right: &Value) -> Option<Ordering> {
         (Value::Uuid(left), Value::Uuid(right)) => left.cmp(right),
         (Value::Uuid(left), Value::Text(right)) => left.cmp(&right.parse().ok()?),
         (Value::Text(left), Value::Uuid(right)) => left.parse::<Uuid>().ok()?.cmp(right),
+        (Value::Timestamp(left), Value::Text(right)) => left.cmp(&timestamp_millis(right)?),
+        (Value::Text(left), Value::Timestamp(right)) => timestamp_millis(left)?.cmp(right),
         _ => return None,
     })
 }

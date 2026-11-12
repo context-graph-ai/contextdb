@@ -5,6 +5,7 @@
 //! the memory limit and every step of a maintenance cycle each build a change set and hand it
 //! to the same function.
 
+mod scoped;
 #[cfg(test)]
 mod tests;
 
@@ -16,10 +17,11 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use crate::memory::Budget;
 use crate::query::{self, QueryResult};
 use crate::schema::{self, Catalog};
-use crate::sql::{self, Effect, Plan};
-use crate::store::{ChangeSet, Read, Store, View, WrapStorage};
+use crate::sql::ast::{BinOp, ColumnRef};
+use crate::sql::{self, Effect, Expr, Plan};
+use crate::store::{Cell, ChangeSet, Read, Store, View, WrapStorage};
 use crate::system::{self, Clock};
-use crate::types::{Error, Result, TxId, Value};
+use crate::types::{Error, Result, TableMeta, TxId, Value};
 use crate::upkeep::{self, MaintenanceReport};
 use crate::vector::{self, Tally};
 use crate::write;
@@ -77,6 +79,8 @@ pub struct DatabaseOpenOptions {
 pub struct Database {
     /// The open store, `None` once [`Database::close`] has let go of it.
     open: Mutex<Option<Arc<Open>>>,
+    /// Who asks through this handle: every statement of it reads and writes as this reader.
+    reader: query::Reader,
 }
 
 /// One store held for writing. A call holds it for as long as the call runs, so the folder is
@@ -92,6 +96,8 @@ struct Open {
     /// What every statement and every transaction begins from. Held to copy it, to replace it
     /// and to read it again after a read that failed, never while a commit goes to the disk.
     newest: Mutex<Newest>,
+    /// The highest number a transaction was given or a commit carries.
+    numbered: Mutex<u64>,
     /// The last field, so that the view above is dropped before the folder is let go.
     store: Store,
 }
@@ -112,15 +118,24 @@ struct Staged {
     /// The tables as the transaction sees them: those of the moment it began at and those it
     /// has declared since.
     catalog: Arc<Catalog>,
-    /// The declarations it ran, in order, for a commit that has to run them again.
-    declared: Vec<Plan>,
+    /// The declarations it ran, in order, each with the time it read, for a commit that has
+    /// to run them again.
+    declared: Vec<(Plan, i64)>,
     /// The vector partitions its statements have made and emptied, for the limit a statement
     /// is refused by. The commit function does not read it: it counts again.
     partitions: Tally,
+    /// The transaction's number; zero for one that runs no statement of a host.
+    number: TxId,
 }
 
 fn planned(sql: &str) -> Result<Plan> {
     sql::plan(&sql::parse(sql)?)
+}
+
+/// Refuses `statement`, by its name, to a handle that declared a narrowing.
+fn admin(reader: &query::Reader, statement: Option<&str>) -> Result<()> {
+    let statement = statement.filter(|_| !reader.is_admin()).map(str::to_owned);
+    statement.map_or(Ok(()), |statement| Err(Error::AdminRequired { statement }))
 }
 
 /// Takes a lock. None of this part's locks is held across a step that can leave what the lock
@@ -156,7 +171,15 @@ impl Open {
             catalog,
             declared: Vec::new(),
             partitions: Tally::new(&self.budget)?,
+            number: TxId(0),
         })
+    }
+
+    /// The next transaction's number: one past every number given out and every commit.
+    fn number(&self) -> TxId {
+        let mut last = locked(&self.numbered);
+        *last += 1;
+        TxId(*last)
     }
 
     /// Runs one planned statement inside a transaction. A refusal may leave part of the
@@ -166,18 +189,26 @@ impl Open {
         plan: &Plan,
         params: &HashMap<String, Value>,
         staged: &mut Staged,
+        reader: &query::Reader,
     ) -> Result<QueryResult> {
         // One time for the whole statement.
         let now = system::now_millis(&*self.clock);
+        admin(reader, plan.admin_only())?;
         match plan.effect() {
             Effect::Declares => {
                 if staged.declared.is_empty() && !staged.changes.is_empty() {
                     return Err(Error::MixedSchemaAndRowWrite);
                 }
-                let catalog = self.declare(plan, &staged.catalog, &mut staged.changes)?;
+                let (catalog, dropped) =
+                    self.declare(plan, &staged.catalog, &mut staged.changes, now)?;
                 staged.catalog = Arc::new(catalog);
-                staged.declared.push(plan.clone());
-                Ok(QueryResult::affected(0))
+                staged.declared.push((plan.clone(), now));
+                if dropped.is_empty() {
+                    return Ok(QueryResult::affected(0));
+                }
+                let dropped = dropped.into_iter().map(|index| vec![Value::Text(index)]);
+                let columns = vec!["dropped_indexes".to_owned()];
+                Ok(QueryResult::from_rows(columns, dropped.collect()))
             }
             Effect::WritesRows => {
                 if !staged.declared.is_empty() {
@@ -185,23 +216,22 @@ impl Open {
                 }
                 let (catalog, changes) = (&staged.catalog, &mut staged.changes);
                 let partitions = &mut staged.partitions;
-                write::apply(
-                    plan,
+                let given = write::Given {
                     params,
                     catalog,
-                    changes,
-                    partitions,
-                    &self.budget,
+                    budget: &self.budget,
+                    reader,
                     now,
-                )
-                .map(QueryResult::affected)
+                    number: staged.number,
+                };
+                write::apply(plan, &given, changes, partitions).map(QueryResult::affected)
             }
             Effect::Reads => {
                 if let Plan::ShowMemoryLimit = plan {
                     return Ok(query::memory_limit_shown(&self.budget, self.started_under));
                 }
                 let (catalog, changes) = (&staged.catalog, &staged.changes);
-                query::run(plan, params, catalog, changes, &self.budget, now)
+                query::run(plan, params, catalog, changes, reader, &self.budget, now)
             }
             // A setting is not part of the transaction: it takes hold at once, in a commit of
             // its own, and a rollback does not undo it.
@@ -211,16 +241,32 @@ impl Open {
         }
     }
 
-    /// Stages one declaration and, for a new index, its entries for the rows already there.
-    fn declare(&self, plan: &Plan, catalog: &Catalog, changes: &mut ChangeSet) -> Result<Catalog> {
-        let declared = schema::declare(plan, catalog, changes)?;
+    /// Stages one declaration, with the entries of each index and the records of each kept
+    /// count it makes for the rows already there. Returns the tables as they will be, and the
+    /// names of the indexes a `DROP COLUMN ... CASCADE` dropped.
+    fn declare(
+        &self,
+        plan: &Plan,
+        catalog: &Catalog,
+        changes: &mut ChangeSet,
+        now: i64,
+    ) -> Result<(Catalog, Vec<String>)> {
+        let declared = schema::declare(plan, catalog, changes, now)?;
+        let catalog = declared.catalog;
+        write::fill_kept_count(&declared.counts, &catalog, changes, &self.budget)?;
+        let mut made = declared.indexes;
         if let Plan::CreateIndex(create) = plan
-            && let Some(table) = declared.table(&create.table)
-            && let Some(&index) = table.index_ids.last()
+            && let Some(table) = catalog.table(&create.table)
         {
-            write::fill_index(table, index, changes, &self.budget)?;
+            made.extend(table.index_ids.last());
         }
-        Ok(declared)
+        for index in made {
+            let of = |table: &&schema::Table| table.index_ids.contains(&index);
+            if let Some(table) = catalog.tables().into_iter().find(of) {
+                write::fill_index(table, index, &catalog, changes, &self.budget)?;
+            }
+        }
+        Ok((catalog, declared.dropped))
     }
 
     /// The one commit function: everything that changes the store is written here, one commit
@@ -230,42 +276,56 @@ impl Open {
     /// its declarations again over the newest moment, because a table's and an index's number
     /// are counted on from the catalog and a new index is filled from the rows that are there;
     /// a refusal of that second run is the commit's refusal. One that wrote rows is laid over
-    /// the newest moment and `write` checks its rows against it. Then the vector part stages
-    /// what the rows mean for it, so a row and its place in a search commit together.
+    /// the newest moment and `write` checks its rows against it. Every row guard it took is
+    /// checked there too, whatever else it staged. Then the vector part stages
+    /// what the rows mean for it, so a row and its place in a search commit together. The
+    /// commit carries the transaction's number, or the next after the newest commit when that
+    /// is higher.
     fn commit(&self, _held: &MutexGuard<'_, ()>, staged: Staged) -> Result<()> {
         let Staged {
             mut changes,
             mut catalog,
             declared,
             partitions: _,
+            number,
         } = staged;
         let (view, tables) = self.newest()?;
+        let mut overtaken = None;
         if changes.commit() != view.commit() {
+            // What the declarations staged is taken back, to be staged again below. A rewind
+            // leaves the row guards.
             if !declared.is_empty() {
-                changes = ChangeSet::new(view, &self.budget)?;
-                catalog = tables;
-                for plan in &declared {
-                    catalog = Arc::new(self.declare(plan, &catalog, &mut changes)?);
-                }
-            } else if !changes.is_empty() {
-                let before = changes.rebase(view);
-                // The rows were staged with the index entries of the tables as they were
-                // declared then; an index declared since would be left without them.
-                if before.schema_commit()? != changes.base().schema_commit()? {
-                    return Err(Error::SchemaInvalid {
-                        reason: "a table or an index was declared while this transaction was \
-                                 open, so nothing of it was committed; run it again"
-                            .to_owned(),
-                    });
-                }
-                write::check_at_commit(&changes, &catalog, &before)?;
+                changes.rewind(0);
             }
+            let before = changes.rebase(view);
+            // The rows were staged with the index entries of the tables as they were declared
+            // then, and a guard holds the cells of its row as they lay then; an index or a
+            // column declared since would leave either wrong.
+            if !(changes.is_empty() && changes.guards().is_empty())
+                && before.schema_commit()? != changes.base().schema_commit()?
+            {
+                return Err(Error::SchemaInvalid {
+                    reason: "a table or an index was declared while this transaction was \
+                             open, so nothing of it was committed; run it again"
+                        .to_owned(),
+                });
+            }
+            catalog = tables;
+            for (plan, now) in &declared {
+                catalog = Arc::new(self.declare(plan, &catalog, &mut changes, *now)?.0);
+            }
+            overtaken = Some(before);
         }
+        write::check_at_commit(&changes, &catalog, overtaken.as_ref(), &self.budget)?;
         if changes.is_empty() {
             return Ok(());
         }
         vector::stage(&mut changes, &catalog, &self.budget)?;
+        changes.set_number(number);
         let commit = self.store.commit(changes)?;
+        let mut last = locked(&self.numbered);
+        *last = (*last).max(commit.0);
+        drop(last);
         // The commit is on disk whatever the read after it says. When that read fails no view
         // is kept and the next call reads again, so none answers from before this commit.
         let view = self.store.view().ok();
@@ -338,6 +398,7 @@ impl Database {
             view: Some(view),
         };
         let open = Open {
+            numbered: Mutex::new(newest.commit.0),
             started_under: budget.limit(),
             budget,
             clock: options.clock.unwrap_or_else(system::machine_clock),
@@ -347,6 +408,7 @@ impl Database {
         };
         Ok(Database {
             open: Mutex::new(Some(Arc::new(open))),
+            reader: query::Reader::admin(),
         })
     }
 
@@ -359,6 +421,23 @@ impl Database {
     /// refuse. On a closed handle they panic with the refusal's sentence.
     fn must_be_open(&self) -> Arc<Open> {
         self.opened().unwrap_or_else(|closed| panic!("{closed}"))
+    }
+
+    /// A table as it was declared, as of the newest commit: its columns, its UNIQUE rules, its
+    /// indexes and the options `TableMeta` has fields for. A primary key column is not nullable, however the key was written.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::TableNotFound`] when the store has no table of this name, and
+    /// [`crate::Error::DatabaseClosed`] on a handle that was closed.
+    pub fn table_meta(&self, name: &str) -> Result<TableMeta> {
+        let open = self.opened()?;
+        let newest = locked(&open.newest);
+        let found = newest.catalog.table(name).map(|table| table.meta.clone());
+        let mut meta = found.ok_or_else(|| Error::TableNotFound(name.to_owned()))?;
+        let key = meta.columns.iter_mut().filter(|column| column.primary_key);
+        key.for_each(|column| column.nullable = false);
+        Ok(meta)
     }
 
     /// Runs one SQL statement in a transaction of its own and returns its result.
@@ -387,12 +466,13 @@ impl Database {
             // Taken before the statement reads anything, so no other commit can overtake it.
             let held = locked(&open.committing);
             let mut staged = open.begin()?;
-            let result = open.run(&plan, params, &mut staged)?;
+            staged.number = open.number();
+            let result = open.run(&plan, params, &mut staged, &self.reader)?;
             open.commit(&held, staged)?;
             Ok(result)
         } else {
             // A statement that stages nothing has nothing to commit.
-            open.run(&plan, params, &mut open.begin()?)
+            open.run(&plan, params, &mut open.begin()?, &self.reader)
         }
     }
 
@@ -405,8 +485,11 @@ impl Database {
     /// [`crate::Error::StoreIo`] or [`crate::Error::StoreCorrupted`] when the store cannot be
     /// read.
     pub fn transaction(&self) -> Result<Transaction<'_>> {
+        let open = self.opened()?;
+        let mut staged = open.begin()?;
+        staged.number = open.number();
         Ok(Transaction {
-            staged: RefCell::new(self.opened()?.begin()?),
+            staged: RefCell::new(staged),
             db: self,
         })
     }
@@ -427,7 +510,9 @@ impl Database {
     /// opened. [`crate::Error::StoreIo`] when the commit cannot be written. In both cases the
     /// limit stays what it was.
     /// [`crate::Error::DatabaseClosed`] on a handle that was closed.
+    /// [`crate::Error::AdminRequired`] on a narrowed handle, as `SET MEMORY_LIMIT` is.
     pub fn set_memory_limit(&self, limit: Option<usize>) -> Result<()> {
+        admin(&self.reader, Some("SET MEMORY_LIMIT"))?;
         self.opened()?
             .set_memory_limit(limit.map(|limit| limit as u64))
     }
@@ -468,7 +553,7 @@ impl Database {
 
     /// A table's declaration as SQL text, as of the newest commit: the `CREATE TABLE` statement
     /// that would declare the table as it stands, with every clause left at its default not
-    /// written, then one `CREATE INDEX` statement for each index that was made with one. Each
+    /// written (except `MAX_PARTITIONS`, which is printed for every column with a `PARTITION_KEY`), then one `CREATE INDEX` statement for each index that was made with one. Each
     /// statement ends with `;` and a new line.
     ///
     /// # Errors
@@ -483,9 +568,10 @@ impl Database {
         found.ok_or_else(|| Error::TableNotFound(table.to_owned()))
     }
 
-    /// The position of the newest commit on disk: 0 for a store nothing was ever committed to,
-    /// and one more for every commit since. A transaction that commits nothing does not move
-    /// it, and no position is ever reported for work that did not commit.
+    /// The number of the newest commit on disk: 0 for a store nothing was ever committed to,
+    /// and higher with every commit since, by one or by more: a commit carries its
+    /// transaction's number ([`Transaction::id`]). A transaction that commits nothing does not
+    /// move it, and no number is ever reported for work that did not commit.
     ///
     /// The position is for comparing two moments of one store. No call of this library takes
     /// one.
@@ -513,7 +599,7 @@ impl Database {
         let open = self.opened()?;
         let (view, catalog) = open.newest()?;
         let now = system::now_millis(&*open.clock);
-        query::explain(&plan, &catalog, &view, &open.budget, now)
+        query::explain(&plan, &catalog, &view, &self.reader, &open.budget, now)
     }
 
     /// Runs one cycle of upkeep and returns what it did.
@@ -637,7 +723,7 @@ impl Transaction<'_> {
         let open = self.db.opened()?;
         let staged = &mut *self.staged.borrow_mut();
         let mark = staged.changes.mark();
-        let result = open.run(&plan, params, staged);
+        let result = open.run(&plan, params, staged, &self.db.reader);
         if result.is_err() {
             staged.changes.rewind(mark);
             staged.partitions.forget();
@@ -655,7 +741,8 @@ impl Transaction<'_> {
     /// - [`crate::Error::UniqueViolation`] when the other commit took a key, or a value of a
     ///   unique column, that this transaction inserted;
     /// - [`crate::Error::ConditionalUpdateConflict`] when the other commit changed or deleted a
-    ///   row that this transaction changed or deleted;
+    ///   row that this transaction changed or deleted, or a row it guarded no longer holds the
+    ///   guarded values ([`Transaction::guard_row_conditions`]);
     /// - [`crate::Error::SchemaInvalid`] when a table or an index was declared meanwhile and
     ///   this transaction wrote rows;
     /// - for a transaction that declared tables or indexes, whatever would refuse its
@@ -670,6 +757,80 @@ impl Transaction<'_> {
         let open = self.db.opened()?;
         let held = locked(&open.committing);
         open.commit(&held, self.staged.into_inner())
+    }
+
+    /// The transaction's number, taken when it began: above every commit there was then and
+    /// above the number of every transaction begun before it. It is the highest value a `TXID`
+    /// column takes from this transaction; a higher one is refused with
+    /// [`crate::Error::TxIdOutOfRange`]. The commit carries this number, or the next after the
+    /// newest commit when another commit has taken this number or a higher one meanwhile.
+    pub fn id(&self) -> TxId {
+        self.staged.borrow().number
+    }
+
+    /// Answers whether the row that `key_column = key_value` names is shown to the handle and
+    /// holds every `(column, value)` of `predicates` now, and if so asks the commit to stand
+    /// only if the row still holds them then: otherwise the commit is refused with
+    /// [`crate::Error::ConditionalUpdateConflict`]. Of several rows with that value it is the
+    /// first one found. The guard writes nothing, so a guarded row is not a changed row.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::TableNotFound`] and [`crate::Error::ColumnNotFound`] for a name that is
+    /// not declared, and whatever refuses a read of the table through this handle.
+    pub fn guard_row_conditions(
+        &self,
+        table: &str,
+        key_column: &str,
+        key_value: &Value,
+        predicates: &[(String, Value)],
+    ) -> Result<bool> {
+        let open = self.db.opened()?;
+        let staged = &mut *self.staged.borrow_mut();
+        let catalog = staged.catalog.clone();
+        let missing = || Error::TableNotFound(table.to_owned());
+        let found = catalog.table(table).ok_or_else(missing)?;
+        let columns = &found.meta.columns;
+        let mut needed = vec![false; columns.len()];
+        let mut held = Vec::new();
+        for (name, value) in predicates {
+            let at = columns.iter().position(|column| column.name == *name);
+            let at = at.ok_or_else(|| Error::ColumnNotFound {
+                table: table.to_owned(),
+                column: name.clone(),
+            })?;
+            needed[at] = true;
+            held.push((at, value.clone()));
+        }
+        let filter = Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef {
+                table: None,
+                column: key_column.to_owned(),
+            })),
+            op: BinOp::Eq,
+            right: Box::new(Expr::Parameter("key".to_owned())),
+        };
+        let asked = query::Asked {
+            table: found,
+            filter: Some(&filter),
+            assigned: &[],
+            needed: &needed,
+            reader: &self.db.reader,
+            params: &HashMap::from([("key".to_owned(), key_value.clone())]),
+            now: 0,
+        };
+        let rows = query::rows_for_write(&asked, None, &catalog, &staged.changes, &open.budget)?;
+        let Some((key, cells)) = rows.and_then(|(rows, _)| rows.into_iter().next()) else {
+            return Ok(false);
+        };
+        if held
+            .iter()
+            .any(|(at, value)| !matches!(&cells[*at], Cell::Here(holds) if holds == value))
+        {
+            return Ok(false);
+        }
+        staged.changes.guard_row(found.id, key, held)?;
+        Ok(true)
     }
 
     /// Rolls back now. What the transaction staged is held in memory only, so this drops it,

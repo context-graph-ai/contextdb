@@ -2,7 +2,7 @@
 //! prints what it gave.
 
 use std::collections::HashMap;
-use std::io::{BufRead, IsTerminal};
+use std::io::{self, BufRead, IsTerminal};
 use std::ops::ControlFlow;
 
 use contextdb::{Database, Error, QueryResult, ReadSession, Result, Transaction};
@@ -57,15 +57,24 @@ pub fn run(store: &Store, output: Output) -> bool {
         shell.at_a_terminal();
         return true;
     }
-    for line in std::io::stdin().lock().lines() {
-        let Ok(line) = line else { break };
+    for (at, line) in std::io::stdin().lock().lines().enumerate() {
+        // What follows a line that cannot be read may rest on it: nothing after it runs, and
+        // a transaction left open is not committed.
+        let Ok(line) = line else {
+            let message = format!(
+                "line {} of the input is not text, so the run ends there",
+                at + 1
+            );
+            shell.output.refusal("io", &message);
+            return false;
+        };
         if shell.line(&line).is_break() {
             return !shell.refused;
         }
     }
     // Piped input ends its last statement without a `;`.
     let rest = std::mem::take(&mut shell.pending);
-    shell.statement(&rest);
+    let _ = shell.statement(&rest);
     !shell.refused
 }
 
@@ -127,7 +136,9 @@ impl<'a> Shell<'a> {
             match scan(&self.pending) {
                 Scan::Ends(end) => {
                     let statement: String = self.pending.drain(..end).collect();
-                    self.statement(&statement);
+                    if self.statement(&statement).is_break() {
+                        return ControlFlow::Break(());
+                    }
                 }
                 Scan::Open => break,
                 Scan::Blank => {
@@ -162,30 +173,28 @@ impl<'a> Shell<'a> {
                 }
                 .map(|lines| self.output.explain(&lines))
             }
-            (Some(".help" | "\\?"), None, _) => {
-                self.output.help(&HELP);
-                Ok(())
-            }
+            (Some(".help" | "\\?"), None, _) => Ok(self.output.help(&HELP)),
             (Some(".quit" | ".exit" | "\\q"), None, _) => return ControlFlow::Break(()),
             _ => {
                 self.refused = true;
-                self.output.unknown_command(line);
-                Ok(())
+                let first = line.split_whitespace().next().unwrap_or_default();
+                let usage = HELP
+                    .into_iter()
+                    .find(|h| h.split_whitespace().any(|w| w == first));
+                self.output.unknown_command(line, usage);
+                Ok(Ok(()))
             }
         };
-        if let Err(error) = answered {
-            self.refused = true;
-            self.output.error(&error);
-        }
-        ControlFlow::Continue(())
+        self.answered(answered)
     }
 
-    /// Runs one statement and prints its result or its refusal.
-    fn statement(&mut self, text: &str) {
+    /// Runs one statement and prints its result or its refusal. Breaks when the result
+    /// cannot be written.
+    fn statement(&mut self, text: &str) -> ControlFlow<()> {
         let sql = text.trim();
         let sql = sql.strip_suffix(';').unwrap_or(sql).trim_end();
         if sql.is_empty() {
-            return;
+            return ControlFlow::Continue(());
         }
         let ran = if sql.eq_ignore_ascii_case("BEGIN") {
             self.begin()
@@ -201,18 +210,33 @@ impl<'a> Shell<'a> {
             let mut words = sql.split_whitespace().map(str::to_ascii_uppercase);
             let inspection = words.next().as_deref() == Some("SHOW")
                 && words.next().is_some_and(|word| word.starts_with("VECTOR_"));
-            self.execute(sql).map(|result| {
-                if inspection {
-                    self.output.fields(&result);
-                } else {
-                    self.output.result(&result);
-                }
+            self.execute(sql).map(|result| match inspection {
+                true => self.output.fields(&result),
+                false => self.output.result(&result),
             })
         };
-        if let Err(error) = ran {
-            self.refused = true;
-            self.output.error(&error);
+        self.answered(ran)
+    }
+
+    /// Prints a refusal, or ends the session when the answer could not be written: as `.quit`
+    /// does when nobody reads the output any more, and as a refusal for any other failure.
+    fn answered(&mut self, answered: Result<io::Result<()>>) -> ControlFlow<()> {
+        match answered {
+            Ok(Ok(())) => {}
+            Err(error) => {
+                self.refused = true;
+                self.output.error(&error);
+            }
+            Ok(Err(error)) => {
+                if error.kind() != io::ErrorKind::BrokenPipe {
+                    self.refused = true;
+                    let message = format!("the output cannot be written: {error}");
+                    self.output.refusal("io", &message);
+                }
+                return ControlFlow::Break(());
+            }
         }
+        ControlFlow::Continue(())
     }
 
     fn execute(&self, sql: &str) -> Result<QueryResult> {
@@ -224,28 +248,30 @@ impl<'a> Shell<'a> {
         }
     }
 
-    /// `BEGIN`. With a transaction open already it changes nothing and answers the same.
-    fn begin(&mut self) -> Result<()> {
+    /// `BEGIN`. With a transaction open already it changes nothing, warns, and answers the same.
+    fn begin(&mut self) -> Result<io::Result<()>> {
         let Store::Write(db) = self.store else {
             return Err(Error::ReadOnlySession);
         };
-        if self.transaction.is_none() {
-            self.transaction = Some(db.transaction()?);
+        match self.transaction {
+            None => self.transaction = Some(db.transaction()?),
+            Some(_) => self
+                .output
+                .warning("there is already a transaction in progress"),
         }
-        self.output.rows_affected(0);
-        Ok(())
+        Ok(self.output.rows_affected(0))
     }
 
-    /// `COMMIT` or `ROLLBACK`. With no transaction open it changes nothing and answers the
-    /// same.
-    fn end(&mut self, how: impl FnOnce(Transaction<'a>) -> Result<()>) -> Result<()> {
+    /// `COMMIT` or `ROLLBACK`. With no transaction open it changes nothing, warns, and answers
+    /// the same.
+    fn end(&mut self, how: impl FnOnce(Transaction<'a>) -> Result<()>) -> Result<io::Result<()>> {
         if let Store::Read(_) = self.store {
             return Err(Error::ReadOnlySession);
         }
-        if let Some(transaction) = self.transaction.take() {
-            how(transaction)?;
+        match self.transaction.take() {
+            Some(transaction) => how(transaction)?,
+            None => self.output.warning("there is no transaction in progress"),
         }
-        self.output.rows_affected(0);
-        Ok(())
+        Ok(self.output.rows_affected(0))
     }
 }

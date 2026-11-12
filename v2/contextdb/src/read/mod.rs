@@ -130,7 +130,8 @@ impl ReadSession {
         }
         let now = system::now_millis(&*self.clock);
         let (view, catalog) = self.newest()?;
-        query::run(&plan, params, &catalog, &view, &self.budget, now)
+        let reader = query::Reader::admin();
+        query::run(&plan, params, &catalog, &view, &reader, &self.budget, now)
     }
 
     /// What a statement would do, without running it: as [`crate::Database::explain`], for
@@ -143,7 +144,8 @@ impl ReadSession {
         let plan = sql::plan(&sql::parse(sql)?)?;
         let now = system::now_millis(&*self.clock);
         let (view, catalog) = self.newest()?;
-        query::explain(&plan, &catalog, &view, &self.budget, now)
+        let admin = query::Reader::admin();
+        query::explain(&plan, &catalog, &view, &admin, &self.budget, now)
     }
 
     /// The names of the store's tables as of the newest commit, in name order. A store with no

@@ -199,9 +199,8 @@ fn comments_are_skipped_and_kept_inside_quoted_text() {
 #[test]
 fn what_a_later_version_reads_is_refused_by_its_name() {
     for (sql, name) in [
-        ("ALTER TABLE t ADD COLUMN c TEXT", "ALTER"),
-        ("drop table t", "DROP"),
         ("BEGIN", "BEGIN"),
+        ("purge FROM t WHERE id = 1", "PURGE"),
         (
             "WITH recent AS (SELECT a FROM t) SELECT a FROM recent",
             "WITH",
@@ -223,24 +222,8 @@ fn what_a_later_version_reads_is_refused_by_its_name() {
         ("SELECT id FROM t WHERE a LIKE 'x%'", "LIKE"),
         ("UPDATE t SET a = 1 WHERE b BETWEEN 1 AND 2", "BETWEEN"),
         (
-            "INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = 2",
-            "ON CONFLICT",
-        ),
-        (
-            "CREATE TABLE t (id UUID PRIMARY KEY) RETAIN 7 DAYS",
-            "RETAIN",
-        ),
-        (
-            "CREATE TABLE t (id UUID PRIMARY KEY) SYNC PUSH ONLY",
-            "SYNC",
-        ),
-        (
-            "CREATE TABLE t (id UUID PRIMARY KEY, o UUID REFERENCES p(id))",
-            "REFERENCES",
-        ),
-        (
-            "CREATE TABLE t (a INT, b INT, FOREIGN KEY (a, b) REFERENCES o (a, b))",
-            "FOREIGN KEY",
+            "CREATE TABLE t (id UUID PRIMARY KEY, until TIMESTAMP EXPIRES)",
+            "EXPIRES",
         ),
     ] {
         match parse(sql) {
@@ -554,6 +537,39 @@ fn the_clauses_of_a_vector_column_and_in_lists_are_read() {
         filter("a IN (1, 2) AND NOT b IN (3) OR c = 4"),
         Expr::BinaryOp { op: BinOp::Or, .. }
     ));
+}
+
+#[test]
+fn ten_thousand_operands_of_and_and_or_are_read_in_the_order_written() {
+    /// The numbers the comparisons of a tree of ANDs and ORs hold, from left to right.
+    fn numbers(expr: &Expr, found: &mut Vec<i64>) {
+        match expr {
+            Expr::BinaryOp {
+                left,
+                op: BinOp::And | BinOp::Or,
+                right,
+            } => {
+                numbers(left, found);
+                numbers(right, found);
+            }
+            Expr::BinaryOp { right, .. } => match &**right {
+                Expr::Literal(Literal::Integer(number)) => found.push(*number),
+                other => panic!("a comparison with {other:?}"),
+            },
+            other => panic!("an operand that is no comparison: {other:?}"),
+        }
+    }
+    for operator in ["AND", "OR"] {
+        let operands: Vec<String> = (0..10_000).map(|n| format!("a = {n}")).collect();
+        let sql = format!(
+            "SELECT id FROM t WHERE {}",
+            operands.join(&format!(" {operator} "))
+        );
+        let filter = select(&sql).where_clause.expect("a WHERE");
+        let mut found = Vec::new();
+        numbers(&filter, &mut found);
+        assert!(found.iter().copied().eq(0..10_000), "{operator}");
+    }
 }
 
 #[test]

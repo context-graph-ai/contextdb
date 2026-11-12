@@ -8,18 +8,27 @@ commit together, and one `SELECT` filters rows and orders them by distance.
 
 This is the first version of contextdb 2. What it has:
 
-- tables with typed columns, a primary key, `NOT NULL`, `UNIQUE` and `DEFAULT`, and indexes;
-- `INSERT`, `UPDATE`, `DELETE` and `SELECT` over one table;
+- tables with typed columns, a primary key of one column, of several or of none, `NOT NULL`,
+  `UNIQUE`, `DEFAULT`, references between tables, and indexes;
+- rules a table declares and every write obeys: rows that are never changed, the states a column
+  may move through, edges that may not close a cycle, rows that follow a change of another row;
+- who may see and write a row: Contexts, scope labels and principals;
+- `ALTER TABLE`, `DROP TABLE` and `DROP INDEX`;
+- `INSERT` (also `ON CONFLICT ... DO UPDATE`), `UPDATE`, `DELETE` and `SELECT` over one table;
 - vector search: the rows nearest a vector by cosine distance, each with its distance, over
   vectors that a column may keep in partitions; exact on request, and through an index that
   `run_maintenance_cycle` builds and brings up to date once a column holds many vectors;
-- transactions;
+- transactions, whose conflicts are decided when they commit;
 - one process writing a store while any number of other processes read it;
 - a memory limit that holds.
 
-What it does not have yet: relationships between rows, joins, grouping, and sync between
-machines. A statement that uses one of them is
-refused and changes nothing.
+What it does not have yet: joins, grouping, graph patterns, ranked search (`USE RANK`) and sync
+between machines; the statements that use them are listed under Statements, and each is refused
+and changes nothing. Some clauses are accepted, kept and printed back by `.schema`, and nothing
+acts on them yet: `RETAIN` (no row expires), `HISTORY`, `SYNC`, `SYNC CONFLICT`,
+`DELIVERY MANIFEST`, `EDGE DISCARD` and `RANK_POLICY` (which only keeps `ALTER` from dropping or
+renaming a column it reads); so is an index on a JSON field, `CREATE INDEX name ON table ((column -> 'key'))`:
+writes to its table are accepted and pass over it, and no query reads it. `table_meta` reports `RETAIN`, `HISTORY`, `SYNC` and `SYNC CONFLICT`.
 
 It is not on crates.io yet. Clone <https://github.com/context-graph-ai/contextdb> and use it from that checkout:
 
@@ -65,28 +74,65 @@ fn main() -> contextdb::Result<()> {
 }
 ```
 
-It prints `buy oat milk: 0.006` and then `call the plumber: 1.000`. After writing vectors, a host
-calls `db.run_maintenance_cycle()?` again and again, as the paragraph on upkeep under Vector search says, because
-this version does not do it by itself; a search before that still finds every vector, and reads
-more to do it. This page is also the crate's
-documentation, and the documentation tests compile this program as it is written here. Rust 1.89 or newer; Linux and macOS. Licence:
-Apache-2.0. It is developed in the open at <https://github.com/context-graph-ai/contextdb> by the context-graph-ai organisation.
+It prints `buy oat milk: 0.006` and then `call the plumber: 1.000`. Call `db.close()?` when you
+are done, as the later programs do: it lets the store go at once, and every later call on the
+handle returns `DatabaseClosed`. After writing vectors, a host calls `db.run_maintenance_cycle()?`
+again and again (see Upkeep under Vector search), because this version does not do it by itself;
+a search before that still finds every vector, and reads more to do it. This page is also the
+crate's documentation, and the documentation tests compile this program as it is written here.
+Rust 1.89 or newer; Linux and macOS. Licence: Apache-2.0. It is developed in the open at
+<https://github.com/context-graph-ai/contextdb> by the context-graph-ai organisation.
 
 ## Statements
 
 ```sql
 CREATE TABLE [IF NOT EXISTS] name (
-  column type [PRIMARY KEY] [NOT NULL] [UNIQUE] [DEFAULT value],
+  column type [PRIMARY KEY] [NOT NULL] [UNIQUE] [DEFAULT value] [IMMUTABLE]
+         [REFERENCES table (column)
+            [ON STATE state PROPAGATE SET state [MAX DEPTH n] [ABORT ON FAILURE]]]
+         [CONTEXT_ID]
+         [SCOPE_LABEL ('label', ...) | SCOPE_LABEL_READ ('label', ...) WRITE ('label', ...)]
+         [ACL REFERENCES table (column)]
+         [RANK_POLICY (JOIN table ON column, FORMULA 'formula', SORT_KEY key)],
   column VECTOR(n) [WITH (quantization = 'F32' | 'SQ8')]             -- F32 when left out
                    [PARTITION_KEY (column, ...) [MAX_PARTITIONS m]]  -- m is 256 when left out
                    [SEARCH_MODE AUTO | EXACT | INDEXED]
                    [AUTO_INDEX_AT a]                                 -- a is 100000 when left out
                    [CONSOLIDATION NONE | CONSOLIDATION (CHANGE_PERCENT = c, TOMBSTONE_PERCENT = t)],
   ...,
-  [UNIQUE (column, ...)]
-);
+  [PRIMARY KEY (column, ...)],
+  [UNIQUE (column, ...)],
+  [FOREIGN KEY (column, ...) REFERENCES table (column, ...)]
+)
+  [IMMUTABLE]
+  [STATE MACHINE (column: state -> [state, ...], state -> state, ...)]
+  [DAG ('edge_type', ...)]
+  [PROPAGATE ON EDGE edge_type INCOMING | OUTGOING | BOTH STATE state SET state
+     [MAX DEPTH n] [ABORT ON FAILURE]]
+  [PROPAGATE ON STATE state EXCLUDE VECTOR]
+  [RETAIN n SECONDS | MINUTES | HOURS | DAYS]
+  [HISTORY ALL | CURRENT ONLY]
+  [SYNC OFF | PUSH ONLY | PULL ONLY | TWO WAY]
+  [SYNC CONFLICT KEEP FIRST | KEEP LATEST]
+  [MAINTAIN COUNT (column, ...) [, (column, ...)] | ALL PREFIXES | NONE]
+  [DELIVERY MANIFEST OVER table, ...]
+  [EDGE DISCARD NEVER | AFTER OUTCOME | ALWAYS];
 CREATE INDEX name ON table (column [ASC | DESC], ...);
-INSERT INTO table (column, ...) VALUES (value, ...), (value, ...);
+CREATE INDEX name ON table ((column -> 'key'));
+ALTER TABLE table ADD [COLUMN] column type ...;
+ALTER TABLE table DROP [COLUMN] column [RESTRICT | CASCADE];
+ALTER TABLE table RENAME COLUMN column TO column;
+ALTER TABLE table SET RETAIN ... | SET HISTORY ... | SET SYNC ... | SET SYNC CONFLICT ...
+                      | SET MAINTAIN COUNT ...;
+ALTER TABLE table DROP RETAIN;
+ALTER TABLE table ALTER COLUMN column SET MAX_PARTITIONS m | SET SEARCH_MODE mode
+  | SET AUTO_INDEX_AT a | SET AUTO_INDEX_AT DEFAULT
+  | SET CONSOLIDATION NONE | SET CONSOLIDATION (CHANGE_PERCENT = c, TOMBSTONE_PERCENT = t)
+  | SET CONSOLIDATION DEFAULT;
+DROP TABLE [IF EXISTS] table;
+DROP INDEX [IF EXISTS] name ON table;
+INSERT INTO table (column, ...) VALUES (value, ...), (value, ...)
+  [ON CONFLICT (column, ...) DO UPDATE SET column = value, ...];
 UPDATE table SET column = value, ... [WHERE condition];
 DELETE FROM table [WHERE condition];
 SELECT column, ... | * FROM table [WHERE condition] [ORDER BY column [ASC | DESC], ...] [LIMIT n];
@@ -97,7 +143,8 @@ SHOW VECTOR_INDEXES;
 SHOW VECTOR_PARTITIONS [FOR table.column] [LIMIT count [OFFSET start]];
 ```
 
-- Every table has exactly one `PRIMARY KEY` column. A default is a literal or `NOW()`.
+- A default is a literal or `NOW()`. A table, column or index name written without quotes is
+  folded to lower case, as in Postgres; a state or an edge type is a value and is kept as written.
 - A condition or a value is built from column names, literals, `$name` values,
   `=  !=  <>  <  <=  >  >=`, `AND`, `OR`, `NOT`, `IS NULL`, `IS NOT NULL`, `+  -  *  /`,
   parentheses and `NOW()`. A comparison with NULL is not true, as in standard SQL.
@@ -107,14 +154,18 @@ SHOW VECTOR_PARTITIONS [FOR table.column] [LIMIT count [OFFSET start]];
 - `SELECT` also takes `COUNT(*)`, `COUNT(column)`, `SUM`, `MIN` and `MAX` over the rows that
   match, and `AS` to name a column of the result.
 - `ORDER BY` puts NULL last ascending and first descending.
-- The second `SELECT` is a vector search; [Vector search](#vector-search) below says what it
-  returns. The clauses of a `VECTOR` column are described under Vector search (quantization, modes, upkeep),
-  and the two `SHOW` statements there too, under inspection.
+- The second `SELECT` is a vector search, and the clauses of a `VECTOR` column and the two
+  `SHOW` statements are described under [Vector search](#vector-search).
 - `--` and `/* */` comments are read past.
+- The library has one way to run a transaction, `Database::transaction`; its `execute` refuses
+  `BEGIN`, `COMMIT` and `ROLLBACK` by name, which are words of the `contextdb` program.
 
-Not in this version, and refused: `JOIN`, `GROUP BY`, `DISTINCT`, `LIKE`, `BETWEEN`,
-`OFFSET`, `UNION`, subqueries, table aliases, `ALTER`, `DROP`, and a primary key over several
-columns; and the vector clauses `IVF`, `SEARCH (...)` and `WITH (quantization = 'SQ4')`. Most are refused by name; this is the sentence the refusal prints:
+Not in this version, and refused: `JOIN`, `GROUP BY`, `HAVING`, `DISTINCT`, `LIKE`, `BETWEEN`,
+`OFFSET`, `UNION`, `WITH`, subqueries, `INSERT ... SELECT`, graph patterns, `USE RANK`,
+`DROP TRIGGER`, `CREATE PROCEDURE` and `CREATE FUNCTION`, table aliases, `CREATE UNIQUE INDEX`
+(write `UNIQUE` on the column or in the table); and the vector clauses `IVF (...)`, `SEARCH (...)` and
+`WITH (quantization = 'SQ4')`, which no version reads; the refusal of each says what to write instead.
+Most are refused by name; this is the sentence the refusal prints:
 
 ```text
 plan error: LIKE is not supported in this version of the library
@@ -130,12 +181,467 @@ plan error: LIKE is not supported in this version of the library
 | `BOOLEAN`, `BOOL` | `TRUE` or `FALSE` | `Value::Bool` |
 | `UUID` | a UUID, written as quoted text | `Value::Uuid` |
 | `TIMESTAMP` | milliseconds since the first moment of 1970, UTC; written as ISO 8601 text (`'2026-01-01T00:00:01Z'`) or taken from `NOW()` | `Value::Timestamp` |
+| `TXID` | the number of a transaction (see Transactions); written only as a bound `Value::TxId` | `Value::TxId` |
 | `JSON` | a JSON value, written as quoted text; the value is kept, not the text's spacing | `Value::Json` |
 | `VECTOR(n)` | a vector of exactly `n` finite numbers, each kept as an `f32` (a column declared `SQ8` keeps a rounded vector, see the paragraph on quantization under Vector search), written `[0.1, 0.2, 0.3]`; searched with `<=>` | `Value::Vector` |
 
 A value must be of its column's type: text into an `INTEGER` column is refused, and so is NULL
 into a `NOT NULL` column, on `INSERT` and on `UPDATE` alike. A whole number is accepted into a
 `REAL` column.
+
+## Declaring a table and its rules
+
+A table declares what its rows must obey, and every write is checked against it, whoever makes
+the write. The shell prints each statement's answer; these statements declare two tables, one
+following the other:
+
+```sql
+CREATE TABLE docs (
+  id INTEGER PRIMARY KEY,
+  title TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'live'
+) STATE MACHINE (status: live -> [stale, gone], stale -> [live, gone]);
+
+CREATE TABLE chunks (
+  id INTEGER PRIMARY KEY,
+  doc_id INTEGER REFERENCES docs(id) ON STATE stale PROPAGATE SET stale,
+  status TEXT NOT NULL DEFAULT 'live'
+) STATE MACHINE (status: live -> [stale], stale -> [live]);
+```
+
+- **Keys.** `PRIMARY KEY` is written on one column or as a table element over several, and
+  `UNIQUE` the same. A table may declare no primary key: it keeps its rows under a hidden key,
+  made of the number of the transaction that wrote the row and a count within it, which is not a
+  column and which no statement can name. A key, a `UNIQUE` rule or an index has a limit on the
+  columns it may name, and a row key a limit on its length; a declaration or a write past
+  either is refused (`SchemaInvalid`, `KeyTooLong`). An index entry is never refused for a long
+  value: it keeps the first 256 bytes of a long text and a digest of the whole, and a read checks the
+  row, so no answer changes.
+- **References.** `REFERENCES parent(column)` on a column, or `FOREIGN KEY (a, b) REFERENCES
+  parent(x, y)` over several. The parent's columns must be its primary key or a `UNIQUE` rule, in
+  that order, and of the child's types. A reference with a NULL in it is not checked.
+  There is no `ON DELETE`, `ON UPDATE` or `CHECK`; what a change in a parent does to its children
+  is `PROPAGATE`.
+- **`IMMUTABLE`** on a table: rows are inserted once and never updated or deleted. On a column:
+  it is set when the row is inserted and never changed.
+- **`STATE MACHINE (column: from -> [to, ...])`**: an `UPDATE` may move the column only along a
+  listed arrow. A state with no list is a state a row cannot leave. A new row may start in any
+  state.
+- **`DAG ('edge_type', ...)`** is for a table of edges, one with `source_id UUID`,
+  `target_id UUID` and `edge_type TEXT`: an edge of a listed type that would close a cycle is
+  refused, by the statement that writes it and again at commit.
+- **`PROPAGATE`**: when a row enters a state, the rows that reference it (`ON STATE s PROPAGATE
+  SET t` on the reference), or the rows at the other end of its edges (`PROPAGATE ON EDGE`), are
+  moved to another state in the same statement, along their own state machines. A table that
+  declares `PROPAGATE ON EDGE` also needs `id UUID`. `MAX DEPTH n` bounds how many steps a change is
+  followed from the row the statement changed (edges for `PROPAGATE ON EDGE`, references for `ON
+  STATE`), 10 when not written; `ABORT ON FAILURE` refuses the whole statement when a row cannot move, where otherwise that row
+  stays.
+- **`PROPAGATE ON STATE s EXCLUDE VECTOR`** keeps the vector of a row in state `s` out of every
+  search and every count of `SHOW VECTOR_*`. It is refused on a table with no state machine, and
+  naming a state the machine does not have.
+
+Run in the shell, the rules answer as they are broken (`chunks` row 12 names a document that is
+not there; `docs` row 1 is moved to `stale`, and its chunks follow):
+
+```text
+contextdb> INSERT INTO docs (id, title) VALUES (1, 'plan');
+ok (rows_affected=1)
+contextdb> INSERT INTO chunks (id, doc_id) VALUES (10, 1), (11, 1);
+ok (rows_affected=2)
+contextdb> INSERT INTO chunks (id, doc_id) VALUES (12, 99);
+Error: foreign key violation: chunks (doc_id) = (99) has no row in docs
+contextdb> UPDATE docs SET status = 'stale' WHERE id = 1;
+ok (rows_affected=1)
+contextdb> SELECT id, status FROM chunks ORDER BY id;
++----+--------+
+| id | status |
++----+--------+
+| 10 | stale  |
+| 11 | stale  |
++----+--------+
+(2 rows)
+contextdb> UPDATE docs SET status = 'gone' WHERE id = 1;
+ok (rows_affected=1)
+contextdb> UPDATE docs SET status = 'live' WHERE id = 1;
+Error: invalid state transition of docs.status: gone -> live
+contextdb> DELETE FROM docs WHERE id = 1;
+Error: foreign key violation: docs is still referenced by chunks (doc_id) = (1)
+```
+
+**If you know Postgres.** A reference is checked when the transaction commits, not when the
+statement ends, as if every one were `DEFERRABLE INITIALLY DEFERRED`; in the shell, where a
+statement is its own transaction, the two come to the same. A primary key is judged when the
+statement ends, as the SQL standard says: an `UPDATE` that swaps two keys or shifts a run of
+them succeeds, where Postgres decides by the order it visits the rows unless the key is
+declared `DEFERRABLE`; two rows left under one key are still refused, by that key. An index
+name that begins `__pk_`,
+`__unique_`, `__fk_` or `__graph_` is the engine's, and is refused for an index of yours
+(`ReservedIndexName`).
+
+## Writing rows
+
+`INSERT`, `UPDATE` and `DELETE` check, before they change anything: the type of each value, `NOT
+NULL`, the key, every `UNIQUE` rule, and the rules of the table above. A statement that breaks one
+is refused, names the table, the column or rule and the value, and changes nothing. In a transaction it
+leaves the transaction usable.
+
+```text
+contextdb> INSERT INTO people (id, name) VALUES (2, 'ada');
+Error: unique constraint violation: people (name) = (ada)
+contextdb> INSERT INTO people (id, name, born) VALUES (3, 'bob', 'x');
+Error: column type mismatch: people.born expected INTEGER, got Text
+contextdb> INSERT INTO people (id) VALUES (4);
+Error: column people.name is NOT NULL
+contextdb> INSERT INTO people (id, name, name) VALUES (5, 'c', 'd');
+Error: plan error: name is named twice as a column people is written in
+```
+
+`INSERT ... ON CONFLICT (columns) DO UPDATE SET ...` takes the columns of the key or of a
+`UNIQUE` rule, and updates the row that is in the way; it is subject to every rule an `UPDATE` is
+(`IMMUTABLE` and a state machine included). `DO NOTHING`, `EXCLUDED` and `RETURNING` are not
+there.
+
+A refusal that depends only on the declaration (the table is not there, the table is
+`IMMUTABLE`) comes before one that depends on the rows. Each refusal is its own kind of
+`contextdb::Error`, listed on the type.
+
+**If you know Postgres.** A table with no primary key keeps its rows under the hidden key, so
+the same row written twice is two rows, and a refusal about a row cannot name a key.
+
+## Transactions
+
+`db.execute` is a transaction of one statement: when it returns, the change is on disk.
+`db.transaction()` begins a longer one. Its statements see what it has written and nobody else
+does until `commit` returns; dropping it, or `rollback`, discards it. A statement of it is
+refused at once for a type, `NOT NULL`, a key too long, a taken key or `UNIQUE` value,
+`IMMUTABLE`, the state machine, a cycle and a partition limit, and the transaction goes on; a
+reference, a guarded row and a clash with another commit are refused by `commit`, which
+writes nothing and ends the transaction.
+
+Two open transactions that take the same key, the same `UNIQUE` value, or change the same row do
+not wait for each other: the first to commit wins, and the other's `commit` is refused. The
+refusal is the kind the clash is: `UniqueViolation` for a key or a `UNIQUE` value,
+`ConditionalUpdateConflict` for a row changed meanwhile. This program runs the clashes:
+
+```rust,no_run
+use contextdb::{params, Database, Value};
+
+fn main() -> contextdb::Result<()> {
+    let db = Database::open("./accounts")?;
+    db.execute(
+        "CREATE TABLE accounts (id INTEGER PRIMARY KEY, owner TEXT NOT NULL UNIQUE)",
+        &params! {},
+    )?;
+
+    // Two transactions begin together and both take key 1.
+    let first = db.transaction()?;
+    let second = db.transaction()?;
+    first.execute("INSERT INTO accounts VALUES (1, 'ana')", &params! {})?;
+    second.execute("INSERT INTO accounts VALUES (1, 'bo')", &params! {})?;
+    first.commit()?;
+    match second.commit() {
+        Ok(_) => println!("second committed"),
+        Err(error) => println!("second: {error}"),
+    }
+
+    // One that takes a key and gives it up again, while another handle takes it.
+    let tx = db.transaction()?;
+    tx.execute("INSERT INTO accounts VALUES (2, 'cy')", &params! {})?;
+    tx.execute("DELETE FROM accounts WHERE id = 2", &params! {})?;
+    db.execute("INSERT INTO accounts VALUES (2, 'cy')", &params! {})?;
+    match tx.commit() {
+        Ok(_) => println!("third committed"),
+        Err(error) => println!("third: {error}"),
+    }
+
+    // A transaction that declares a table writes no rows.
+    let tx = db.transaction()?;
+    tx.execute("CREATE TABLE extra (id INTEGER PRIMARY KEY)", &params! {})?;
+    match tx.execute("INSERT INTO accounts VALUES (3, 'di')", &params! {}) {
+        Ok(_) => println!("wrote"),
+        Err(error) => println!("declaring: {error}"),
+    }
+    tx.rollback();
+
+    // A guard: this commit stands only while account 1 is still owned by ana.
+    db.execute("CREATE TABLE stamped (id INTEGER PRIMARY KEY, at TXID)", &params! {})?;
+    let tx = db.transaction()?;
+    let held = tx.guard_row_conditions(
+        "accounts",
+        "id",
+        &Value::Int64(1),
+        &[("owner".to_owned(), Value::Text("ana".to_owned()))],
+    )?;
+    // A TXID column takes the transaction's own number.
+    tx.execute(
+        "INSERT INTO stamped VALUES (1, $at)",
+        &params! { "at" => Value::TxId(tx.id()) },
+    )?;
+    println!("guard holds now: {held}");
+    db.execute("UPDATE accounts SET owner = 'ana2' WHERE id = 1", &params! {})?;
+    match tx.commit() {
+        Ok(_) => println!("fourth committed"),
+        Err(error) => println!("fourth: {error}"),
+    }
+
+    let found = db.execute("SELECT id, owner FROM accounts ORDER BY id", &params! {})?;
+    println!("{} rows", found.rows().len());
+    db.close()
+}
+```
+
+It prints (`./accounts` must not exist):
+
+```text
+second: unique constraint violation: accounts (id) = (1)
+third: conditional update conflict: 1 staged update(s) no longer matched at commit
+declaring: a transaction either declares tables or writes rows: commit this one and run the statement in the next
+guard holds now: true
+fourth: conditional update conflict: 1 staged update(s) no longer matched at commit
+2 rows
+```
+
+- A transaction either declares (`CREATE`, `ALTER`, `DROP`) or writes rows, not both: the
+  statement that would mix them is refused (`MixedSchemaAndRowWrite`), in either order, and the
+  transaction goes on. Its declarations commit together and take hold when it commits.
+- `Transaction::id()` is the transaction's number, taken when it begins and above every commit
+  there is. A `TXID` column holds such a number, bound as `Value::TxId`; SQL has no `TXID`
+  literal, and a number above the transaction's own is refused (`TxIdOutOfRange`). The commit
+  carries the transaction's number, or the next after the newest commit when another commit
+  overtook it.
+- `Transaction::guard_row_conditions(table, key_column, &key, &[(column, value)])` answers
+  whether the row `key_column = key` is visible to the handle and holds every value now, and if
+  so makes the commit stand only while it still does. A guard writes nothing.
+- `SET MEMORY_LIMIT` is not part of a transaction: run inside one, it takes effect and the store
+  remembers it at once, and a rollback does not undo it.
+
+**If you know Postgres.** The second of two transactions that clash does not wait for a lock; it
+is refused when it commits, and then it has lost everything it wrote, also when it inserted a key
+and deleted it again while another commit took the key. A transaction that declares a table
+cannot also write rows.
+
+## Who may see and write a row
+
+A handle made with `Database::scoped_with_constraints(contexts, scope_labels, principal)` (or
+`scoped_with_contexts(contexts)`) shares the open store and sees, and may write, only the rows
+those three allow; `None` declares nothing for that rule; labels are built with
+`ScopeLabel::new("a")`. A handle with no narrowing (`Database::open`, or
+`scoped_with_constraints(None, None, None)`) sees every row and is the only one that may run
+`CREATE`, `ALTER`, `DROP`, `SET MEMORY_LIMIT` and the two `SHOW VECTOR_*` statements;
+`set_memory_limit` is refused as `SET MEMORY_LIMIT` is; `run_maintenance_cycle` does not look at
+the narrowing. A handle made from a
+narrowed handle keeps the Contexts and labels both name and the principal the first had, and a
+transaction begun on a narrowed handle is narrowed the same way.
+
+A table opts in by declaring a column:
+
+- `CONTEXT_ID` on a `UUID` column: a row belongs to the Context it holds, and a handle narrowed
+  to Contexts reads and writes only rows of those.
+- `SCOPE_LABEL ('a', 'b')` on a `TEXT` column: a row written must carry one of the listed labels
+  and a label the handle holds; it hides no row. `SCOPE_LABEL_READ ('a') WRITE ('a', 'b')` hides
+  rows as well: a handle that holds labels reads the rows whose label is on the read list and
+  one it holds, and a row with no label is hidden from it; it writes under the write list.
+- `ACL REFERENCES grants(acl_id)` on a `UUID` column: a row is shown to a principal that holds a
+  grant for its `acl_id`. A grant is a row of the table `grants`, with `principal_kind` (`Agent`
+  or `Human`), `principal_id` and `acl_id`; the grant row has to be visible to the handle too. A
+  narrowed handle that names no principal, or `Principal::System`, is refused such a table
+  (`PrincipalRequired`).
+
+What a narrowed handle gets:
+
+- A list read (a scan, a range, a count) leaves hidden rows out, and says nothing of them.
+- A `SELECT` that names one hidden row whole, by its primary key or a `UNIQUE` rule, is refused
+  by the rule that hid it: `ContextScopeViolation`, `ScopeLabelViolation`, `AclDenied`, or
+  `PrincipalRequired` for a table that wants a principal and got none. That tells "not yours"
+  from "not there", which is an empty answer; the sentence never carries a value or a number of
+  the hidden row.
+- An `UPDATE` or `DELETE` changes no row the handle cannot see, and says it changed none; an
+  `INSERT` or `UPDATE` that would put a row outside the handle's Contexts, labels or grants is
+  refused by the same kinds, and so is a statement whose `PROPAGATE` would move a row the handle
+  may not write.
+- The statements named above as the unnarrowed handle's reach every Context at once and are
+  refused with `AdminRequired`, naming the statement.
+  `explain` prints the declaration lines of a search and no record of a partition.
+
+```rust,no_run
+use std::collections::BTreeSet;
+
+use contextdb::{params, ContextId, Database, Principal, Uuid};
+
+fn main() -> contextdb::Result<()> {
+    let db = Database::open("./reports")?;
+    db.execute(
+        "CREATE TABLE grants (id INTEGER PRIMARY KEY, principal_kind TEXT, principal_id TEXT,
+                              acl_id UUID)",
+        &params! {},
+    )?;
+    db.execute(
+        "CREATE TABLE reports (id INTEGER PRIMARY KEY, context_id UUID CONTEXT_ID,
+                               acl_id UUID ACL REFERENCES grants(acl_id), body TEXT)",
+        &params! {},
+    )?;
+    let (mine, theirs, key) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    db.execute(
+        "INSERT INTO grants VALUES (1, 'Agent', 'reader', $key)",
+        &params! { "key" => key },
+    )?;
+    for (id, context) in [(1_i64, mine), (2, theirs)] {
+        db.execute(
+            "INSERT INTO reports VALUES ($id, $context, $key, 'text')",
+            &params! { "id" => id, "context" => context, "key" => key },
+        )?;
+    }
+
+    let contexts = BTreeSet::from([ContextId::new(mine)]);
+    let agent = db.scoped_with_constraints(
+        Some(contexts),
+        None,
+        Some(Principal::Agent("reader".to_owned())),
+    );
+    let list = agent.execute("SELECT id FROM reports", &params! {})?;
+    println!("a list read: {} row", list.rows().len());
+    for sql in ["SELECT body FROM reports WHERE id = 2", "DELETE FROM reports WHERE id = 2"] {
+        match agent.execute(sql, &params! {}) {
+            Ok(result) => println!("{} rows changed", result.rows_affected()),
+            Err(error) => println!("{error}"),
+        }
+    }
+    if let Err(error) = agent.execute(
+        "INSERT INTO reports VALUES (3, $other, $key, 'text')",
+        &params! { "other" => theirs, "key" => key },
+    ) {
+        println!("{error}");
+    }
+    if let Err(error) = agent.execute("DROP TABLE reports", &params! {}) {
+        println!("{error}");
+    }
+    let nobody = db.scoped_with_contexts(BTreeSet::from([ContextId::new(mine)]));
+    if let Err(error) = nobody.execute("SELECT id FROM reports", &params! {}) {
+        println!("{error}");
+    }
+    db.close()
+}
+```
+
+It prints (`./reports` must not exist):
+
+```text
+a list read: 1 row
+context scope violation: this row of reports is outside the Contexts this handle was given
+0 rows changed
+context scope violation: this row of reports is outside the Contexts this handle was given
+DROP TABLE reaches every Context, label and principal: run it through the handle that declared no narrowing
+table reports is access-controlled: read it through a handle that names a principal
+```
+
+**If you know Postgres.** This is not row-level security, which leaves a hidden row out of every
+read, a `SELECT` by key included.
+
+## Changing a table
+
+```text
+contextdb> ALTER TABLE docs ADD COLUMN owner TEXT DEFAULT 'nobody';
+ok (rows_affected=0)
+contextdb> SELECT id, owner FROM docs;
++----+--------+
+| id | owner  |
++----+--------+
+| 1  | nobody |
++----+--------+
+(1 row)
+contextdb> ALTER TABLE docs RENAME COLUMN title TO heading;
+ok (rows_affected=0)
+contextdb> ALTER TABLE docs RENAME COLUMN id TO ident;
+Error: schema invalid: column 'docs.id' is in the PRIMARY KEY, which stays as the table declared it, so it is neither dropped nor renamed
+contextdb> CREATE INDEX docs_by_heading ON docs (heading);
+ok (rows_affected=0)
+contextdb> ALTER TABLE docs DROP COLUMN heading;
+Error: column docs.heading is used by the index docs_by_heading; drop the index first, or write CASCADE
+contextdb> ALTER TABLE docs DROP COLUMN heading CASCADE;
++-----------------+
+| dropped_indexes |
++-----------------+
+| docs_by_heading |
++-----------------+
+(1 row)
+contextdb> DROP TABLE docs;
+Error: schema invalid: table 'docs' is referenced by table 'chunks', so it was not dropped; drop that table first
+```
+
+- `ADD COLUMN` writes no row again: a row written before it reads the column's `DEFAULT` (NULL
+  without one). A `NOT NULL` column added to a table that has rows needs a `DEFAULT`.
+- `DROP COLUMN` is `RESTRICT` unless `CASCADE` is written: a column an index names is refused,
+  and `CASCADE` drops those indexes and reports them. The column's bytes leave the store at the
+  commit.
+- A column is neither dropped nor renamed while the table is declared by it: a column of the
+  primary key, an `IMMUTABLE` column, a vector column's `PARTITION_KEY`, the three columns of a
+  table of edges that has a `DAG`, or a column a rank policy reads. `CASCADE` does not lift that.
+- `RENAME COLUMN` carries the column's indexes and its vectors with it.
+- `SET RETAIN`, `SET HISTORY`, `SET SYNC`, `SET SYNC CONFLICT` and `SET MAINTAIN COUNT` replace
+  that clause; `DROP RETAIN` takes `RETAIN` off. No statement removes a `HISTORY` clause: `SET
+  HISTORY ALL` is the way back. A new set of counts is installed whole or not at all.
+- `ALTER COLUMN v SET MAX_PARTITIONS m`, `SET SEARCH_MODE mode`, `SET AUTO_INDEX_AT a` and
+  `SET CONSOLIDATION ...` change a `VECTOR` column; `DEFAULT` after `AUTO_INDEX_AT` or
+  `CONSOLIDATION` puts back the default.
+- `DROP TABLE` refuses a table another table references, and `DROP INDEX name ON table` names
+  the table, because two tables may use one index name. `IF EXISTS` makes a missing table or
+  index a no-op.
+
+**If you know Postgres.** A key column can be neither renamed nor dropped, and `DROP COLUMN`
+refuses where Postgres drops an index silently.
+
+## Reading a table's rules back
+
+`Database::declaration(table)` returns the declaration as text, the same text `.schema` prints, and
+declaring that text again declares the same table. `Database::table_meta(table)` returns it as a
+value: `columns` (each with its name, type, `nullable`, `primary_key`, `unique` and default), `unique_constraints`,
+`indexes`, `immutable`, `state_machine`, `dag`, `retain`, `history`, `sync`, `conflict` and
+`kept_counts`. The type is `#[non_exhaustive]`. It carries only those; references, `PROPAGATE`,
+`EXCLUDE VECTOR`, rank policies, `VECTOR` column clauses, `DELIVERY MANIFEST`, `EDGE DISCARD` and
+the rules of who may see a row are in the text `declaration` returns.
+
+```rust,no_run
+use contextdb::{params, Database};
+
+fn main() -> contextdb::Result<()> {
+    let db = Database::open("./docs")?;
+    db.execute(
+        "CREATE TABLE docs (a INTEGER, b TEXT, PRIMARY KEY (a, b), note TEXT)
+         RETAIN 30 DAYS SYNC OFF",
+        &params! {},
+    )?;
+    let meta = db.table_meta("docs")?;
+    for column in &meta.columns {
+        println!("{}: nullable {}", column.name, column.nullable);
+    }
+    println!("retain: {:?}", meta.retain);
+    println!("sync: {:?}", meta.sync);
+    println!("state machine: {:?}", meta.state_machine);
+    println!("{}", db.declaration("docs")?);
+    db.close()
+}
+```
+
+It prints (`./docs` must not exist):
+
+```text
+a: nullable false
+b: nullable false
+note: nullable true
+retain: Some(Retain { count: 30, unit: Days, sync_safe: false })
+sync: Some(Off)
+state machine: None
+CREATE TABLE docs (
+  a INTEGER,
+  b TEXT,
+  note TEXT,
+  PRIMARY KEY (a, b)
+) RETAIN 30 DAYS SYNC OFF;
+```
+
+`table_meta` reports every column of the primary key as not nullable, however the key was
+written.
 
 ## Vector search
 
@@ -388,7 +894,7 @@ one a `SELECT` returns and every search, `EXACT` included, ranks by (`[0.1, 0.2,
 read back as `[0.0992126, 0.2007874, 0.3]`); and on those stores, searched exactly, the ten nearest rows of an
 `SQ8` column differ from the full-precision column's on 12 to 21 questions in 100, by whether the
 search covers one, several or all of its partitions. It is an option a table chooses and never a default: a
-column keeps `F32` unless it says otherwise. `SQ4` is refused by name.
+column keeps `F32` unless it says otherwise. `SQ4` is refused by name, and the refusal says to write `'SQ8'` or leave the clause out.
 
 **Inspection.** `SHOW VECTOR_INDEXES` returns one row for each `VECTOR` column of the store,
 in the order of table name and column, and `SHOW VECTOR_PARTITIONS` one row for each partition
@@ -442,24 +948,7 @@ probes: 8
 recovery_action: none
 ```
 
-`.explain <sql>` in the shell prints what `Database::explain` returns; `.explain SELECT id FROM notes
-ORDER BY embedding <=> $q LIMIT 10` prints:
-
-```text
-requested_mode: AUTO
-resolved_mode: AUTO
-effective_auto_index_at: 1000
-aggregate_allowed_vectors: 2000
-partition_key_columns: []
-partitions: 1
-partition: {}
-  route: indexed
-  lists: 45
-  probes: 8
-  live_rows: 2000
-  outside_grouping: 0
-refusal: none
-```
+`.explain <sql>` in the shell prints what `Database::explain` returns, the text shown above.
 
 Inspection tells the groups a partition has (`lists`) and the most groups a search scanned
 while the index was measured (`probes`); it does not print the measured distance or width. A
@@ -483,28 +972,16 @@ any other value is written as a `Value`, for example `Value::Timestamp(1_767_225
 Every call that can fail returns `contextdb::Result` with one `contextdb::Error`, except
 `Database::memory_limit`, `memory_used`, `table_names` and `committed_watermark`, which return
 a plain value and panic on a handle that was closed. A program
-matches on the kind (`Error::UniqueViolation { table, column }`, `Error::ColumnNotNullable`,
+matches on the kind (`Error::UniqueViolation { table, column, key }`, `Error::ColumnNotNullable`,
 `Error::TableNotFound`, `Error::DatabaseLocked`, `Error::MemoryBudgetExceeded`, and the rest
 listed on the `Error` type); a person reads the sentence it prints:
 
 ```text
-unique constraint violation: notes (id)
+unique constraint violation: notes (id) = (5b1f0a9e-3c47-4d2a-9e51-8f0c6a2d7b14)
 column notes.body is NOT NULL
 column not found: notes.nothing
 parse error: syntax error at line 1, column 1: unexpected 'SELEC'
 ```
-
-A refused statement changes nothing. Inside a transaction it leaves the transaction usable.
-
-## Transactions
-
-`db.execute` is a transaction of one statement: when it returns, the change is on disk.
-`db.transaction()` begins a longer one. Its statements see what it has written and nobody else
-does until `commit` returns; dropping it, or `rollback`, discards it. A transaction either
-declares tables and indexes or writes rows, not both. When two open transactions insert the same
-key, or change the same row, the first to commit wins and the other's `commit` is refused.
-`SET MEMORY_LIMIT` is not part of a transaction: run inside one, it takes effect and the store
-remembers it at once, and a rollback does not undo it.
 
 ## One writer, many readers
 
@@ -623,7 +1100,8 @@ contextdb ./notes --write    read and write it, creating it if it is missing
 ```
 
 A statement ends at `;`. `BEGIN;`, `COMMIT;` and `ROLLBACK;` run a transaction, which needs
-`--write`; `.tables` lists
+`--write`; a `BEGIN` inside a transaction, and a `COMMIT` or `ROLLBACK` outside one, change nothing,
+answer `ok` and print a `warning:` line on the error stream; `.tables` lists
 the tables, `.schema <table>` prints a table's declaration, `.explain <sql>` prints how a
 similarity search would be answered without running it (anything else it refuses like a statement
 of a later version), and `.help` lists the commands. With
@@ -632,7 +1110,10 @@ refused statement or command is one line on the error stream, `Error: ` and then
 sentence, or the program's own sentence where one of its options is the way on; a line that
 starts like a command and is not one is answered with `Unknown command:`. The rest still run. A
 piped run exits 1 if any statement or command was refused, an unknown command and `.schema` of
-a table that is not there included, and 0 otherwise. However the input arrives, the exit status is 1 when the
+a table that is not there included, and 0 otherwise. A piped run that meets a line that is not
+text ends there with `Error: line 4 of the input is not text, so the run ends there` (the line's
+number), exit status 1, and a transaction it had open is not committed. An output pipe closed
+by the reader is not an error: the program stops and exits 0. However the input arrives, the exit status is 1 when the
 store could not be opened or closed, and 2 when the command line itself is refused. `--json`
 prints one JSON document per statement or command and each refusal as a JSON document on the
 error stream. A vector in a result is a JSON array of numbers, each written at the full
@@ -653,20 +1134,21 @@ how many of the 100 questions got all ten.
 
 | What | Measured |
 |---|---|
-| 20,000 rows of 1.6 KB, one commit per row: time to insert | 11.1 s |
+| 20,000 rows of 1.6 KB, one commit per row: time to insert | 11.3 s |
 | That store on disk (its rows repeat their text, which compresses far better than real text) | 2.4 MiB |
-| Open that store | 0.561 ms |
-| `SELECT COUNT(*)` over it | 0.030 ms, 0 rows read |
-| A million rows under a 64 MiB limit: time to load | 10.5 s |
-| Scan the million rows | 236.582 ms |
+| Open that store | 0.558 ms |
+| `SELECT COUNT(*)` over it | 0.032 ms, 0 rows read |
+| A million rows under a 64 MiB limit: time to load | 10.7 s |
+| Scan the million rows | 255.040 ms |
 | Most memory the engine had allocated during that load and scan | 16.4 MiB |
-| Most memory the process held, as the operating system reports it | 21.5 MiB |
-| First build of a program that uses the library | 8 s, 47 packages, a 3.2 MiB program |
-| From a fresh clone to a passing `cargo test` | 3.2 min |
-| Ten nearest of 20,000 vectors, sealed, through SQL, exact: 95th percentile | 1.548 ms |
+| Most memory the process held, as the operating system reports it | 22.3 MiB |
+| First build of a program that uses the library | 11 s, 47 packages, a 4.1 MiB program |
+| From a fresh clone to a passing `cargo test` | 4.0 min |
+| Ten nearest of 20,000 vectors, sealed, through SQL, exact: 95th percentile | 1.505 ms |
 | That vector store on disk, and how many times the bytes it holds | 44.3 MiB, 1.50 times |
-| Lines of Rust and grammar in the library and the program | 15,440 |
-| Tests | 253 |
+| Lines of Rust and grammar in the library and the program | 20,742 |
+| Tests | 371 |
+| 173 session files of real coding sessions (150,756 rows): the megabytes put in, and that store on disk | 344.9 MiB in, 227.9 MiB on disk, 0.66 times |
 | Lines that differ from redb 4.1.0 in the storage library under the engine, which is redb 4.1.0 with the changes listed in `v2/redb/README.md` | 626 |
 
 Searches for the ten nearest, indexed beside exact from the same run. Where a store is below
@@ -674,26 +1156,26 @@ Searches for the ten nearest, indexed beside exact from the same run. Where a st
 
 | Search | Indexed | Exact | Recall, questions with all ten |
 |---|---|---|---|
-| 10,000 generated vectors, one partition, 100 groups (`AUTO_INDEX_AT 1000`) | 0.541 ms | 1.185 ms | 0.9960, 96 of 100 |
-| 100,008 real passages, eight partitions, 884 groups: one partition | 0.682 ms | 1.411 ms | 1.0000, 100 of 100 |
-| the same: several partitions | 1.537 ms | 3.841 ms | 0.9990, 99 of 100 |
-| the same: all eight | 4.052 ms | 10.880 ms | 0.9990, 99 of 100 |
-| the same: all eight, under 64 MiB | 11.383 ms | not taken | 0.9990, 99 of 100 |
-| the same: all eight, a filter that passes 992 of the 100,008 rows | 32.411 ms | 38.453 ms | 1.0000, 100 of 100 |
-| the same, 9,996 more passages written after the build and sealed | 3.749 ms | 10.781 ms | 1.0000, 100 of 100 |
-| 1,000,000 generated vectors of 768 numbers around 300 hidden centres, one partition, 1,000 groups | 1.109 ms | 180.929 ms | 1.0000, 100 of 100 |
-| 1,000,000 generated camera sightings, one partition, 1,000 groups | 30.348 ms | 175.409 ms | 1.0000, 100 of 100 |
-| 11,588 real passages, eight partitions, below the size: one / several / all | 0.303 / 0.724 / 1.440 ms | 0.302 / 0.724 / 1.440 ms | 1.0000, 100 of 100 each |
+| 10,000 generated vectors, one partition, 100 groups (`AUTO_INDEX_AT 1000`) | 0.544 ms | 1.194 ms | 0.9960, 96 of 100 |
+| 100,008 real passages, eight partitions, 884 groups: one partition | 0.696 ms | 1.407 ms | 1.0000, 100 of 100 |
+| the same: several partitions | 1.568 ms | 3.829 ms | 0.9990, 99 of 100 |
+| the same: all eight | 4.115 ms | 10.904 ms | 0.9990, 99 of 100 |
+| the same: all eight, under 64 MiB | 10.975 ms | not taken | 0.9990, 99 of 100 |
+| the same: all eight, a filter that passes 992 of the 100,008 rows | 32.761 ms | 38.290 ms | 1.0000, 100 of 100 |
+| the same, 9,996 more passages written after the build and sealed | 3.797 ms | 10.874 ms | 1.0000, 100 of 100 |
+| 1,000,000 generated vectors of 768 numbers around 300 hidden centres, one partition, 1,000 groups | 1.122 ms | 180.378 ms | 1.0000, 100 of 100 |
+| 1,000,000 generated camera sightings, one partition, 1,000 groups | 33.734 ms | 183.724 ms | 1.0000, 100 of 100 |
+| 11,588 real passages, eight partitions, below the size: one / several / all | 0.309 / 0.727 / 1.447 ms | 0.305 / 0.727 / 1.447 ms | 1.0000, 100 of 100 each |
 
-Getting a store to those groupings takes `run_maintenance_cycle` calls: 34 cycles and 1.8 s for
-the 10,000, 56 cycles and 26.9 s for the 100,008 passages, 1,150 cycles and 362.8 s for the
+Getting a store to those groupings takes `run_maintenance_cycle` calls: 34 cycles and 1.5 s for
+the 10,000, 56 cycles and 19.3 s for the 100,008 passages, 1,150 cycles and 365.8 s for the
 million. The index takes 129, 125 and 101 bytes a vector there. Right after a build a store's
 file is 1.20, 1.13 and 1.31 times the size it had sealed, which is more than the index holds,
 because the pages the build freed stay in the file in this version; a store that is never
 grouped stays at 1.00 times (the 11,588 passages).
 
 With `WITH (quantization = 'SQ8')` the same two stores of real passages take 0.45 times the room
-(a passage 1,968 bytes in place of 4,411 in the 11,588, and 1,992 in place of 4,946 in the
+(a passage 1,968 bytes in place of 4,411 in the 11,588, and 1,989 in place of 4,946 in the
 100,008). Searched exactly, the same ten rows come back as from the full-precision store on 88,
 84 and 79 questions of 100 in the 11,588 (one, several, all partitions) and on 86, 83 and 85 in
 the 100,008.

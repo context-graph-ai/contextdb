@@ -163,8 +163,8 @@ fn arithmetic(op: &str, left: Expr, right: Expr) -> Result<Expr> {
 }
 
 /// `[-] primary {+ | - | * | / [-] primary}`, read left to right with `*` and `/` binding
-/// tighter.
-fn additive_expr(pair: Pair<'_>) -> Result<Expr> {
+/// tighter; a rank formula's sum the same way.
+pub(super) fn additive_expr(pair: Pair<'_>) -> Result<Expr> {
     // `sum` is everything before the last `+` or `-`, with that operator; `product` is the run
     // of `*` and `/` being read, with the operator that waits for its right side.
     let mut sum: Option<(Expr, &str)> = None;
@@ -173,7 +173,7 @@ fn additive_expr(pair: Pair<'_>) -> Result<Expr> {
     for part in pair.into_inner() {
         match part.as_rule() {
             Rule::unary_minus => minuses += 1,
-            Rule::math_op => {
+            Rule::math_op | Rule::formula_op => {
                 let (operand, _) = product.take().expect("an operand before an operator");
                 let op = part.as_str();
                 if op == "*" || op == "/" {
@@ -237,7 +237,14 @@ fn primary_expr(primary: Pair<'_>) -> Result<Expr> {
             })
         }
         Rule::function_call => function_call(primary),
-        Rule::column_ref => Ok(column_ref(primary)),
+        Rule::column_ref | Rule::braced => Ok(column_ref(primary)),
+        // The parts of a rank formula.
+        Rule::formula_sum => additive_expr(primary),
+        Rule::coalesce => {
+            let (name, parts) = ("coalesce".to_owned(), primary.into_inner());
+            let args = parts.map(primary_expr).collect::<Result<_>>()?;
+            Ok(Expr::FunctionCall { name, args })
+        }
         _ => literal(&primary),
     }
 }

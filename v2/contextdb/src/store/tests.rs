@@ -1,22 +1,25 @@
 //! Checks of the pure parts of the store: the order keys take as bytes, the span a pair of
-//! bounds stands for, and a row written and read back. And the store's own check of a
-//! compressed value's recorded length: the storage library checks every page it reads, so a
-//! length changed on its way from the file never reaches that check, and the tests of damage
-//! here write the wrong bytes into the data file as a commit of the storage library: a wrong
-//! length, a large value with a slice missing, and a block that decodes to the recorded length
-//! of bytes that are no value of its kind.
+//! bounds stands for, and a row written and read back. And the store's own checks of stored
+//! bytes that disagree with themselves: the storage library checks every page it reads, so these
+//! tests write the wrong bytes into the data file as a commit of the storage library, which no
+//! public call can: a large value with a slice missing, a block that decodes to the recorded
+//! length of bytes that are no value of its kind, a reduced vector of another length, a kept
+//! count, and an index entry with the place its first long value is cut at. And the one rule by
+//! which an index entry is made: never longer than the limit, in the order of its values, and
+//! the same bytes every time.
 
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
 use lz4_flex::block::{compress_into, get_maximum_output_size};
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 
 use super::{
-    Cell, ChangeSet, Compact, Key, Read, Store, TableId, VectorId, VectorRecord, keys, record,
+    Cell, ChangeSet, Compact, CountId, EntryShape, IndexId, KEY_LIMIT, Key, Read, Store, TableId,
+    VectorId, VectorRecord, keys, record,
 };
 use crate::memory::Budget;
-use crate::types::{Error, SortDirection, TxId, Uuid, Value};
+use crate::types::{ColumnType, Error, Result, SortDirection, TxId, Uuid, Value};
 
 fn key(values: &[Value]) -> Key {
     Key::from_values(values, &[]).expect("these values can be part of a key")
@@ -177,146 +180,6 @@ fn a_row_reads_back_as_written_with_its_large_values_beside_it() {
 /// The storage library's table of large values, as `disk` declares it: place to slice.
 const BESIDE: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("beside");
 
-#[test]
-fn a_compressed_value_whose_recorded_length_is_wrong_is_damage_and_takes_no_memory() {
-    const MIB: u64 = 1 << 20;
-    // 16 KiB of one sentence, which the store keeps compressed in a block of about a hundredth
-    // of that.
-    const LEN: u64 = 16 << 10;
-    let folder =
-        std::env::temp_dir().join(format!("contextdb-wrong-length-{}", std::process::id()));
-    if folder.exists() {
-        std::fs::remove_dir_all(&folder).expect("clear the folder an earlier run left");
-    }
-    let sentence = "A store keeps what it is given and hands it back as it was. ";
-    let body: String = sentence.chars().cycle().take(LEN as usize).collect();
-    let (table, row_key) = (TableId(1), key(&[Value::Int64(1)]));
-
-    // One row whose text goes beside it, written under no limit so that it is compressed.
-    let budget = Budget::new(None).expect("a budget");
-    let store = Store::open_for_writing(&folder, &budget, None).expect("open a fresh store");
-    let mut changes = ChangeSet::new(store.view().expect("a view"), &budget).expect("begin");
-    let row = vec![Value::Int64(1), text(&body)];
-    changes
-        .put_row(table, row_key.clone(), row, Vec::new(), true)
-        .expect("stage");
-    store.commit(changes).expect("commit");
-    drop(store);
-
-    // Opens the store under a limit that leaves `room` bytes once it is open, and loads the
-    // text. Returns what the load gave, where the value is kept, the bytes the statement
-    // holds after the load, and whether what the budget counts is back where it was once
-    // the statement has let go.
-    let load = |room: u64| {
-        let budget = Budget::new(Some(9 * MIB + room)).expect("a budget");
-        let store = Store::open_for_writing(&folder, &budget, None).expect("open the store");
-        let view = store.view().expect("a view");
-        let row = view.row(table, &row_key).expect("read the row");
-        let Some(Cell::Beside(beside)) = row.expect("the row is there").cells.pop() else {
-            panic!("a text of {LEN} bytes was kept in its row");
-        };
-        let before = budget.used();
-        let mut reservation = budget.reserve(0, "query").expect("a reservation");
-        let loaded = view.load(&beside, &mut reservation);
-        let held = reservation.bytes();
-        drop(reservation);
-        (loaded, beside, held, budget.used() == before)
-    };
-    let (loaded, beside, held, given_back) = load(MIB);
-    assert!(loaded.expect("load the value") == text(&body));
-    assert_eq!(held, 9 + LEN, "held for the loaded value");
-    assert!(given_back, "counted once the value is let go");
-    // The compressed record: nine bytes, then one block.
-    let block = beside.bytes - 9;
-    assert!(
-        beside.bytes < LEN / 50,
-        "{} bytes are stored for a repeating text of {LEN}: it is not compressed",
-        beside.bytes
-    );
-    // The room every load below is given: what reading the value takes at its most, the
-    // stored record and the value's own record together, one byte and a little more. No
-    // block decodes to more than 255 times its own bytes, and that much does not fit.
-    let room = beside.bytes + 9 + LEN + 1 + 64;
-    assert!(LEN <= 255 * block && 9 + 255 * block > room);
-
-    // Writes this length where the record keeps its own, as a commit of the storage library,
-    // which then hands the slice over as a page that passes its check.
-    let record_length = |wrong: u64| {
-        let data = redb::Database::open(folder.join("data")).expect("open the data file");
-        let write = data.begin_write().expect("begin");
-        {
-            let mut slices = write.open_table(BESIDE).expect("the large values");
-            let first = slices.get(beside.place).expect("read the first slice");
-            let mut first = first.expect("the first slice is there").value().to_vec();
-            assert_eq!(first[0], 0x84, "the first byte of a compressed text");
-            first[1..9].copy_from_slice(&wrong.to_le_bytes());
-            slices
-                .insert(beside.place, first.as_slice())
-                .expect("write the first slice");
-        }
-        write.commit().expect("commit");
-    };
-    // The outcome of a load that must make no value: the reason of the store's damage, which
-    // names the folder and the large value, or `None` for the memory limit's refusal. Either
-    // way the statement holds nothing afterwards and nothing stays counted.
-    let damage = |wrong: u64| -> Option<String> {
-        record_length(wrong);
-        let (loaded, _, held, given_back) = load(room);
-        assert_eq!(held, 0, "held after a recorded length of {wrong}");
-        assert!(given_back, "counted after a recorded length of {wrong}");
-        match loaded {
-            Err(Error::StoreCorrupted { path, reason }) => {
-                assert_eq!(path, folder, "a recorded length of {wrong}");
-                assert!(reason.contains("large value"), "{wrong}: {reason}");
-                Some(reason)
-            }
-            Err(Error::MemoryBudgetExceeded { operation, .. }) => {
-                assert_eq!(operation, "query", "a recorded length of {wrong}");
-                None
-            }
-            other => panic!("a recorded length of {wrong} gave {other:?}"),
-        }
-    };
-
-    // The value reads under that room as it is.
-    let (loaded, _, held, _) = load(room);
-    assert!(loaded.expect("load the value under the room") == text(&body));
-    assert_eq!(held, 9 + LEN);
-
-    // A length the block cannot decode to, from one more than 255 times its bytes to the
-    // largest number there is, is damage before any memory is asked for. The limit has room
-    // for none of them: a length that was asked for would be the limit's refusal, and one
-    // that was taken without asking would end the test.
-    for wrong in [255 * block + 1, 1 << 40, 1 << 62, u64::MAX - 8, u64::MAX] {
-        assert!(
-            damage(wrong).is_some(),
-            "memory was asked for a recorded length of {wrong}"
-        );
-    }
-    // The most a wrong length can ask for is 255 times the block, and it is asked for before
-    // it is taken: with no room for it, it is the limit's refusal, as for any value that
-    // does not fit.
-    assert!(
-        damage(255 * block).is_none(),
-        "no memory was asked for a recorded length of 255 times the block"
-    );
-    // A length there is room for, and that the block does not decode to, is damage once the
-    // block is decoded: one byte more than the value has, one byte less, half of it, none.
-    for wrong in [LEN + 1, LEN - 1, LEN / 2, 0] {
-        assert!(
-            damage(wrong).is_some(),
-            "a recorded length of {wrong} was refused for want of room"
-        );
-    }
-
-    // With its own length back, the value is as it was written.
-    record_length(LEN);
-    let (loaded, _, held, _) = load(room);
-    assert!(loaded.expect("load the value") == text(&body));
-    assert_eq!(held, 9 + LEN);
-    std::fs::remove_dir_all(&folder).expect("remove the test's folder");
-}
-
 /// The bytes of one slice of a large value, as `disk` cuts them.
 const SLICE: u64 = 243;
 
@@ -341,7 +204,7 @@ fn store_one_row(folder: &Path, value: Value) {
     let budget = Budget::new(None).expect("a budget");
     let store = Store::open_for_writing(folder, &budget, None).expect("open a fresh store");
     let mut changes = ChangeSet::new(store.view().expect("a view"), &budget).expect("begin");
-    let row = vec![Value::Int64(1), value];
+    let row = vec![Cell::Here(Value::Int64(1)), Cell::Here(value)];
     changes
         .put_row(table, row_key, row, Vec::new(), true)
         .expect("stage");
@@ -502,6 +365,483 @@ fn a_compressed_json_that_decodes_to_bytes_that_are_not_json_is_damage() {
     a_block_of_other_bytes_is_damage("not-json", &json, wrong.as_bytes());
 }
 
+// ---- the kept count and the index entry, as records ----
+
+/// The storage library's tables of kept counts and of index entries, as `disk` declares them.
+const COUNTS: redb::TableDefinition<&[u8], &[u8]> = redb::TableDefinition::new("counts");
+const INDEX: redb::TableDefinition<&[u8], &[u8]> = redb::TableDefinition::new("index");
+
+/// Every record of a kept count, in key order, or the refusal of the read.
+fn kept(read: &dyn Read, count: CountId) -> Result<Vec<(Key, u64)>> {
+    read.kept(count, Bound::Unbounded, Bound::Unbounded)
+        .and_then(|counts| counts.collect())
+}
+
+/// Every entry of an index, in entry order, each with its row key and the place its first long
+/// value is cut at, or the refusal of the read.
+fn entries(read: &dyn Read, index: IndexId) -> Result<Vec<(Key, Key, Option<usize>)>> {
+    read.index(index, Bound::Unbounded, Bound::Unbounded)
+        .and_then(|entries| entries.collect())
+}
+
+/// Opens the store in this folder under no memory limit and runs `read` on its newest moment.
+fn on_the_newest_moment<T>(folder: &Path, read: impl FnOnce(&dyn Read) -> T) -> T {
+    let budget = Budget::new(None).expect("a budget");
+    let store = Store::open_for_writing(folder, &budget, None).expect("open the store");
+    let view = store.view().expect("a view");
+    read(&view)
+}
+
+/// Stages with `stage` on the store's newest moment and commits.
+fn commit_staged(folder: &Path, stage: impl FnOnce(&mut ChangeSet)) {
+    let budget = Budget::new(None).expect("a budget");
+    let store = Store::open_for_writing(folder, &budget, None).expect("open the store");
+    let mut changes = ChangeSet::new(store.view().expect("a view"), &budget).expect("begin");
+    stage(&mut changes);
+    store.commit(changes).expect("commit");
+}
+
+/// Asserts that a read was refused as damage of the store in this folder.
+fn assert_damage<T: std::fmt::Debug>(read: Result<T>, folder: &Path, what: &str) {
+    match read {
+        Err(Error::StoreCorrupted { path, .. }) => assert_eq!(path, folder, "{what}"),
+        other => panic!("{what} was read as {other:?}"),
+    }
+}
+
+/// Every record of one of the storage library's tables, as (key, value).
+fn records(folder: &Path, table: redb::TableDefinition<&[u8], &[u8]>) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let data = redb::Database::open(folder.join("data")).expect("open the data file");
+    let read = data.begin_read().expect("begin");
+    let table = read.open_table(table).expect("the table");
+    table
+        .iter()
+        .expect("read the table")
+        .map(|record| {
+            let (key, value) = record.expect("read a record");
+            (key.value().to_vec(), value.value().to_vec())
+        })
+        .collect()
+}
+
+/// Writes `value` under `key` in one of the storage library's tables, as a commit of that
+/// library, which then hands the record over as a page that passes its check.
+fn write_record(
+    folder: &Path,
+    table: redb::TableDefinition<&[u8], &[u8]>,
+    key: &[u8],
+    value: &[u8],
+) {
+    let data = redb::Database::open(folder.join("data")).expect("open the data file");
+    let write = data.begin_write().expect("begin");
+    write
+        .open_table(table)
+        .expect("the table")
+        .insert(key, value)
+        .expect("write the record");
+    write.commit().expect("commit");
+}
+
+#[test]
+fn a_kept_count_that_reaches_zero_leaves_no_record() {
+    // No public call tells a zero record from none: the count reads 0 either way.
+    let folder = fresh_folder("kept-count-zero");
+    let (count, group) = (CountId(3), key(&[Value::Int64(1)]));
+    commit_staged(&folder, |changes| {
+        changes.add_kept(count, group.clone(), 2).expect("stage");
+    });
+    assert_eq!(records(&folder, COUNTS).len(), 1);
+    commit_staged(&folder, |changes| {
+        changes.add_kept(count, group.clone(), -2).expect("stage");
+    });
+    assert!(
+        records(&folder, COUNTS).is_empty(),
+        "a count taken down to zero keeps no record"
+    );
+    std::fs::remove_dir_all(&folder).expect("remove the test's folder");
+}
+
+#[test]
+fn a_kept_count_whose_record_is_not_eight_bytes_is_damage() {
+    let folder = fresh_folder("kept-count-damaged");
+    let count = CountId(1);
+    let group = key(&[text("group")]);
+    commit_staged(&folder, |changes| {
+        changes.add_kept(count, group.clone(), 7).expect("stage");
+    });
+    let [(stored_key, stored_value)] = records(&folder, COUNTS)
+        .try_into()
+        .expect("one count was written, so one record is there");
+    assert_eq!(stored_value.len(), 8, "a kept count is eight bytes");
+
+    for wrong in [
+        &stored_value[..7],
+        &[stored_value.as_slice(), &[0]].concat(),
+        &[],
+    ] {
+        write_record(&folder, COUNTS, &stored_key, wrong);
+        let read = on_the_newest_moment(&folder, |view| kept(view, count));
+        assert_damage(
+            read,
+            &folder,
+            &format!("a kept count of {} bytes", wrong.len()),
+        );
+    }
+    // With its own bytes back, the count is what was written.
+    write_record(&folder, COUNTS, &stored_key, &stored_value);
+    let read = on_the_newest_moment(&folder, |view| kept(view, count));
+    assert_eq!(read.expect("read the count"), [(group, 7)]);
+    std::fs::remove_dir_all(&folder).expect("remove the test's folder");
+}
+
+/// The most bytes a TEXT column takes in an index entry (the engine's `ENTRY_TEXT`, which tests
+/// cannot name). Every shape below leaves each of its TEXT columns at least this much.
+const TEXT_ROOM: usize = 256;
+
+/// The longest text an entry keeps whole: of its room a cut text gives 19 to its tag, its mark
+/// and its digest, and a longer one is kept as this many bytes and those.
+const WHOLE: usize = TEXT_ROOM - 19;
+
+/// An index over an INTEGER and a TEXT column, both ascending.
+fn integer_and_text() -> EntryShape {
+    let directions = [SortDirection::Asc, SortDirection::Asc];
+    EntryShape::new(&[ColumnType::Integer, ColumnType::Text], &directions)
+}
+
+/// Commits two entries of index 2: one whose text is short, for row 1, and one whose text is
+/// cut, for row 2. Returns what reading the index must give back.
+fn store_two_entries(folder: &Path) -> Vec<(Key, Key, Option<usize>)> {
+    let shape = integer_and_text();
+    let values = [
+        [Value::Int64(1), text("short")],
+        [Value::Int64(1), text(&"x".repeat(5000))],
+    ];
+    let rows = [key(&[Value::Int64(1)]), key(&[Value::Int64(2)])];
+    let entry = |at: usize| shape.entry(&values[at]).expect("an entry");
+    assert_eq!(entry(0).cut, None, "a short text is kept whole");
+    // Nine bytes of the INTEGER, the text's tag, and the bytes kept of the text.
+    let cut = Some(9 + 1 + WHOLE);
+    assert_eq!(entry(1).cut, cut, "where the long text is cut");
+    let wanted = vec![
+        (entry(0).key, rows[0].clone(), None),
+        (entry(1).key, rows[1].clone(), cut),
+    ];
+    commit_staged(folder, |changes| {
+        for (at, row) in rows.iter().enumerate() {
+            changes
+                .put_index(IndexId(2), entry(at), row.clone())
+                .expect("stage");
+        }
+        // A change set reads the entries it has staged, each with its place.
+        assert_eq!(entries(changes, IndexId(2)).expect("read"), wanted);
+    });
+    wanted
+}
+
+#[test]
+fn an_index_record_whose_value_does_not_fit_its_key_is_damage() {
+    let folder = fresh_folder("index-entry-damaged");
+    let wanted = store_two_entries(&folder);
+    let stored = records(&folder, INDEX);
+    // The whole entry records its length in four bytes; the cut one records its place as well.
+    let lengths: Vec<usize> = stored.iter().map(|(_, value)| value.len()).collect();
+    assert_eq!(lengths, [4, 8]);
+
+    for (stored_key, stored_value) in &stored {
+        let mut wrongs = vec![
+            stored_value[..3].to_vec(),
+            [stored_value.as_slice(), &[0]].concat(),
+            Vec::new(),
+            [stored_value.as_slice(), &[0; 8]].concat(),
+        ];
+        if stored_value.len() == 8 {
+            // A place past the end of the entry, whichever way its four bytes are read.
+            wrongs.push([&stored_value[..4], &[0xFF; 4][..]].concat());
+        }
+        for wrong in wrongs {
+            write_record(&folder, INDEX, stored_key, &wrong);
+            let read = on_the_newest_moment(&folder, |view| entries(view, IndexId(2)));
+            let what = format!(
+                "an index record of {} bytes where {} were written",
+                wrong.len(),
+                stored_value.len()
+            );
+            assert_damage(read, &folder, &what);
+        }
+        write_record(&folder, INDEX, stored_key, stored_value);
+    }
+    // With their own bytes back, the entries are what was written.
+    let read = on_the_newest_moment(&folder, |view| entries(view, IndexId(2)));
+    assert_eq!(read.expect("read the entries"), wanted);
+    std::fs::remove_dir_all(&folder).expect("remove the test's folder");
+}
+
+// ---- how an index entry is made ----
+
+/// The 128-bit FNV-1a digest of a text, most significant byte first.
+fn digest(text: &str) -> [u8; 16] {
+    let mut digest: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    for byte in text.bytes() {
+        digest ^= u128::from(byte);
+        digest = digest.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b);
+    }
+    digest.to_be_bytes()
+}
+
+/// The bytes of the entry these values make.
+fn entry_bytes(shape: &EntryShape, values: &[Value]) -> Vec<u8> {
+    let entry = shape.entry(values).expect("an entry");
+    entry.key.as_bytes().to_vec()
+}
+
+#[test]
+fn an_entry_is_never_longer_than_the_limit_and_is_the_same_bytes_every_time() {
+    use ColumnType::{Boolean, Integer, Text, Timestamp, Uuid as UuidType};
+    use SortDirection::{Asc, Desc};
+    assert_eq!(KEY_LIMIT, 2704);
+    // Texts that an entry keeps whole and texts it must cut, for any share of an entry a TEXT
+    // column can have: short ones, zero bytes (each is two bytes in an entry), characters of
+    // several bytes, and lengths on both sides of every place a text is cut at below.
+    let mut texts = vec![
+        String::new(),
+        "a".to_owned(),
+        "a\0b".to_owned(),
+        "\0".repeat(3000),
+        format!("{}\0{}", "z".repeat(60), "z".repeat(5000)),
+        "\u{65e5}\u{672c}".repeat(1000),
+        scattered(60_000),
+    ];
+    for len in [
+        64,
+        65,
+        66,
+        WHOLE - 1,
+        WHOLE,
+        WHOLE + 1,
+        TEXT_ROOM,
+        KEY_LIMIT,
+    ] {
+        texts.push("x".repeat(len));
+    }
+    let other = |column_type: ColumnType| match column_type {
+        Integer => Value::Int64(-7),
+        Boolean => Value::Bool(true),
+        Timestamp => Value::Timestamp(1),
+        _ => Value::Uuid(Uuid::from_u128(7)),
+    };
+    let shapes: Vec<(Vec<ColumnType>, Vec<SortDirection>)> = vec![
+        (vec![Text], vec![Asc]),
+        (vec![Text], vec![Desc]),
+        (vec![Text, Text], vec![Asc, Desc]),
+        (vec![UuidType, Text, Text, Text], vec![Asc; 4]),
+        (
+            vec![Integer, Text, Timestamp, Text, Boolean],
+            vec![Desc, Asc, Asc, Desc, Asc],
+        ),
+        (
+            vec![UuidType, UuidType, Text, UuidType, Text, Text],
+            vec![Asc; 6],
+        ),
+        (vec![Text; 32], vec![Asc; 32]),
+    ];
+    for (types, directions) in shapes {
+        let shape = EntryShape::new(&types, &directions);
+        // Every text in every TEXT column at once, the same text in each, then each text
+        // beside the one after it, then NULL in every column.
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        for at in 0..texts.len() {
+            let mut next = at;
+            let mut row = Vec::new();
+            let mut same = Vec::new();
+            for column_type in &types {
+                if *column_type == Text {
+                    row.push(text(&texts[next % texts.len()]));
+                    same.push(text(&texts[at]));
+                    next += 1;
+                } else {
+                    row.push(other(*column_type));
+                    same.push(other(*column_type));
+                }
+            }
+            rows.extend([row, same]);
+        }
+        rows.push(vec![Value::Null; types.len()]);
+        for row in rows {
+            let entry = shape.entry(&row).expect("an entry");
+            let bytes = entry.key.as_bytes();
+            assert!(
+                bytes.len() <= KEY_LIMIT,
+                "an entry of {} bytes over {types:?}",
+                bytes.len()
+            );
+            // The same values give the same bytes and the same place.
+            let again = shape.entry(&row).expect("an entry");
+            assert!(
+                bytes == again.key.as_bytes(),
+                "two entries of one row differ"
+            );
+            assert_eq!(entry.cut, again.cut);
+            let longest = row
+                .iter()
+                .any(|value| matches!(value, Value::Text(text) if text.len() > WHOLE));
+            assert!(
+                !longest || entry.cut.is_some(),
+                "a text longer than any share of an entry was kept whole over {types:?}"
+            );
+            // Given only its leading values, the entry begins every entry with those values.
+            for leading in 0..row.len() {
+                let begins = entry_bytes(&shape, &row[..leading]);
+                assert!(
+                    bytes.starts_with(&begins),
+                    "{leading} leading values of {types:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn an_entry_keeps_a_text_whole_up_to_its_share_and_cuts_a_longer_one_to_its_digest() {
+    // One TEXT column has the room of an entry: a text of `WHOLE` bytes is kept whole, as a key
+    // keeps it, and one byte more is cut to `WHOLE` bytes, the mark and the digest of the whole
+    // text.
+    let shape = EntryShape::new(&[ColumnType::Text], &[SortDirection::Asc]);
+    let whole = "w".repeat(WHOLE);
+    let entry = shape.entry(&[text(&whole)]).expect("an entry");
+    assert_eq!(entry.cut, None);
+    assert!(
+        entry.key == key(&[text(&whole)]),
+        "a whole text is not as a key keeps it"
+    );
+
+    let long = format!("{whole}w");
+    let entry = shape.entry(&[text(&long)]).expect("an entry");
+    let bytes = entry.key.as_bytes();
+    let kept = 1 + WHOLE;
+    assert_eq!((bytes.len(), entry.cut), (TEXT_ROOM, Some(kept)));
+    assert!(bytes[..kept] == key(&[text(&whole)]).as_bytes()[..kept]);
+    assert_eq!(bytes[kept..kept + 2], [0, 1], "the mark of a cut text");
+    assert_eq!(
+        bytes[kept + 2..],
+        digest(&long),
+        "the digest of the whole text"
+    );
+    // A descending column turns every bit of the same form.
+    let descending = EntryShape::new(&[ColumnType::Text], &[SortDirection::Desc]);
+    let turned: Vec<u8> = bytes.iter().map(|byte| !byte).collect();
+    assert!(entry_bytes(&descending, &[text(&long)]) == turned);
+
+    // A zero byte is two bytes in an entry, and a cut never falls between the two.
+    let zeros = "\0".repeat(3000);
+    let entry = shape.entry(&[text(&zeros)]).expect("an entry");
+    let cut = entry.cut.expect("3,000 zero bytes are cut");
+    assert_eq!(
+        cut,
+        1 + WHOLE / 2 * 2,
+        "whole zero bytes are kept, two bytes each"
+    );
+    assert_eq!(entry.key.as_bytes().len(), cut + 2 + 16);
+    assert_eq!(entry.key.as_bytes()[cut + 2..], digest(&zeros));
+
+    // Three TEXT columns after a UUID each have `TEXT_ROOM` too, so a text of `WHOLE` bytes is
+    // whole and one byte more is cut. Two texts of 60,000 bytes after a short one make an entry
+    // of two full rooms after the short one, and the place it records is that of the first cut
+    // text.
+    let types = [
+        ColumnType::Uuid,
+        ColumnType::Text,
+        ColumnType::Text,
+        ColumnType::Text,
+    ];
+    let shape = EntryShape::new(&types, &[SortDirection::Asc; 4]);
+    let row = |value: &str| {
+        let id = Value::Uuid(Uuid::from_u128(7));
+        [id, text("command"), text(value), text(value)]
+    };
+    assert_eq!(
+        shape.entry(&row(&"v".repeat(WHOLE))).expect("an entry").cut,
+        None
+    );
+    let entry = shape.entry(&row(&"v".repeat(WHOLE + 1))).expect("an entry");
+    assert_eq!(entry.cut, Some(17 + 10 + 1 + WHOLE));
+    let entry = shape.entry(&row(&scattered(60_000))).expect("an entry");
+    assert_eq!(
+        (entry.key.as_bytes().len(), entry.cut),
+        (17 + 10 + 2 * TEXT_ROOM, Some(17 + 10 + 1 + WHOLE))
+    );
+}
+
+#[test]
+fn entries_are_in_the_order_of_their_values_whole_or_cut() {
+    // Rising texts, whole and cut: no two of the cut ones begin with the same kept bytes.
+    let rising = [
+        Value::Text(String::new()),
+        text("a"),
+        text("a\0"),
+        text("a\0b"),
+        text("ab"),
+        text("b"),
+        text(&"b".repeat(WHOLE)),
+        text(&"b".repeat(5000)),
+        text("c"),
+        text(&"c".repeat(2001)),
+        text(&format!("{}{}", "c".repeat(2500), "a".repeat(3000))),
+        text(&format!("{}{}", "c".repeat(2000), "d".repeat(3000))),
+        text("d"),
+        Value::Null,
+    ];
+    let ascending = EntryShape::new(&[ColumnType::Text], &[SortDirection::Asc]);
+    let descending = EntryShape::new(&[ColumnType::Text], &[SortDirection::Desc]);
+    let up: Vec<Vec<u8>> = rising
+        .iter()
+        .map(|value| entry_bytes(&ascending, std::slice::from_ref(value)))
+        .collect();
+    assert!(
+        up.windows(2).all(|pair| pair[0] < pair[1]),
+        "entries of rising values do not rise"
+    );
+    let down: Vec<Vec<u8>> = rising
+        .iter()
+        .map(|value| entry_bytes(&descending, std::slice::from_ref(value)))
+        .collect();
+    assert!(
+        down.windows(2).all(|pair| pair[0] > pair[1]),
+        "entries of rising values in a descending column do not fall"
+    );
+    // The column after a cut text decides only between rows whose text is the same text.
+    let two = EntryShape::new(
+        &[ColumnType::Text, ColumnType::Integer],
+        &[SortDirection::Asc, SortDirection::Asc],
+    );
+    let long = "b".repeat(5000);
+    let longer = format!("{long}b");
+    let pair = |value: &str, number: i64| entry_bytes(&two, &[text(value), Value::Int64(number)]);
+    assert!(pair(&long, 1) < pair(&long, 2));
+    assert!(pair("b", 9) < pair(&long, 0) && pair(&long, 9) < pair("c", 0));
+    assert!(pair(&long, 1) != pair(&longer, 1));
+
+    // Texts that begin with the same kept bytes differ by their digests alone, and follow each
+    // other in the order of those.
+    let alike: Vec<String> = (0..6)
+        .map(|n| format!("{}{}", "m".repeat(3000), scattered(100 + n)))
+        .collect();
+    let mut by_entry: Vec<&String> = alike.iter().collect();
+    by_entry.sort_by_key(|value| entry_bytes(&ascending, &[text(value)]));
+    let mut by_digest: Vec<&String> = alike.iter().collect();
+    by_digest.sort_by_key(|value| digest(value));
+    assert!(
+        by_entry == by_digest,
+        "a run of cut entries is not in digest order"
+    );
+    let first = ascending.entry(&[text(&alike[0])]).expect("an entry");
+    let cut = first.cut.expect("a text of more than 3,000 bytes is cut");
+    for value in &alike {
+        let entry = ascending.entry(&[text(value)]).expect("an entry");
+        assert_eq!(entry.cut, Some(cut));
+        assert!(entry.key.as_bytes()[..cut] == first.key.as_bytes()[..cut]);
+    }
+}
+
 #[test]
 fn a_key_gives_its_values_back() {
     let lists = [
@@ -555,69 +895,26 @@ fn reduced(count: usize) -> (Vec<f32>, f32, Vec<i8>) {
     (numbers, scale, codes)
 }
 
-/// Writes a store of rows 1 to `rows`, each the number and then one vector of `count` reduced
-/// numbers, handed to the store with its scale and codes when `compact`. Returns the bytes of
-/// the data file once the store is closed.
-fn store_vectors(folder: &Path, rows: i64, count: usize, compact: bool) -> u64 {
+/// Writes a store of one row, the number 1 and then a vector of `count` reduced numbers, handed
+/// to the store with its scale and codes.
+fn store_reduced_vector(folder: &Path, count: usize) {
     let (numbers, scale, codes) = reduced(count);
     let budget = Budget::new(None).expect("a budget");
     let store = Store::open_for_writing(folder, &budget, None).expect("open a fresh store");
     let mut changes = ChangeSet::new(store.view().expect("a view"), &budget).expect("begin");
-    for id in 1..=rows {
-        let row = vec![Value::Int64(id), Value::Vector(numbers.clone())];
-        let kept = if compact {
-            vec![Compact {
-                at: 1,
-                scale,
-                codes: codes.clone(),
-            }]
-        } else {
-            Vec::new()
-        };
-        changes
-            .put_row(TableId(1), key(&[Value::Int64(id)]), row, kept, true)
-            .expect("stage");
-    }
+    let row = vec![
+        Cell::Here(Value::Int64(1)),
+        Cell::Here(Value::Vector(numbers)),
+    ];
+    let kept = vec![Compact {
+        at: 1,
+        scale,
+        codes,
+    }];
+    changes
+        .put_row(TableId(1), key(&[Value::Int64(1)]), row, kept, true)
+        .expect("stage");
     store.commit(changes).expect("commit");
-    drop(store);
-    std::fs::metadata(folder.join("data"))
-        .expect("the data file")
-        .len()
-}
-
-#[test]
-fn a_reduced_vector_reads_back_number_for_number_in_a_quarter_of_the_room() {
-    let folder = fresh_folder("reduced-vector");
-    // 4,000 rows, so that both files are well past the size a data file starts at.
-    let compact = store_vectors(&folder, 4000, 768, true);
-    // 781 bytes stay in the row, and read back as exactly the numbers that were put.
-    let (numbers, ..) = reduced(768);
-    let budget = Budget::new(None).expect("a budget");
-    let store = Store::open_for_writing(&folder, &budget, None).expect("open the store");
-    let view = store.view().expect("a view");
-    for id in [1, 250, 500] {
-        let row = view.row(TableId(1), &key(&[Value::Int64(id)]));
-        let row = row.expect("read the row").expect("the row is there");
-        match &row.cells[1] {
-            Cell::Here(Value::Vector(read)) => {
-                let bits = |numbers: &[f32]| -> Vec<u32> {
-                    numbers.iter().map(|number| number.to_bits()).collect()
-                };
-                assert_eq!(bits(read), bits(&numbers), "row {id}");
-            }
-            other => panic!("the vector of row {id} was read as {other:?}"),
-        }
-    }
-    drop((view, store));
-    let plain_folder = fresh_folder("reduced-vector-plain");
-    let plain = store_vectors(&plain_folder, 4000, 768, false);
-    assert!(
-        3 * compact < plain,
-        "4,000 vectors of 768 numbers take {compact} bytes of file reduced and {plain} as written"
-    );
-    for folder in [folder, plain_folder] {
-        std::fs::remove_dir_all(&folder).expect("remove the test's folder");
-    }
 }
 
 #[test]
@@ -625,7 +922,7 @@ fn a_reduced_record_of_another_length_is_damage() {
     // 2,000 reduced numbers are a record of 2,013 bytes, kept beside the row.
     const COUNT: usize = 2000;
     let folder = fresh_folder("reduced-length");
-    store_vectors(&folder, 1, COUNT, true);
+    store_reduced_vector(&folder, COUNT);
     let (loaded, beside, _, _) = load_the_value(&folder);
     assert!(loaded.expect("load the value as it was written") == Value::Vector(reduced(COUNT).0));
     assert_eq!(
@@ -688,4 +985,88 @@ fn the_records_of_a_grouping_keep_their_keys_apart() {
     // number's.
     let sketch = |under, block| keys::vector(Sketch(column, under, block));
     assert!(sketch(6, 0) < sketch(6, 1) && sketch(6, 1) < sketch(7, 0));
+}
+
+#[test]
+fn a_recorded_length_of_255_times_the_block_is_the_limits_refusal_and_one_more_is_damage() {
+    // No public call writes a wrong recorded length. The most a block can decode to is 255
+    // times its bytes: that much is asked of the memory limit before it is taken, and one byte
+    // more is damage before any memory is asked for.
+    const LEN: usize = 16 << 10;
+    let folder = fresh_folder("recorded-length-bound");
+    store_one_row(
+        &folder,
+        text(&"A store keeps what it is given. ".repeat(LEN / 32)),
+    );
+    let (_, beside, _, _) = load_the_value(&folder);
+    let block = beside.bytes - 9;
+    // Room for the stored record and a value of LEN bytes, and for no more than that.
+    let room = beside.bytes + 9 + LEN as u64 + 1 + 64;
+    assert!(
+        9 + 255 * block > room,
+        "255 times the block does not fit the room"
+    );
+    // A length one more or one less than the bytes the block decodes to is damage as well,
+    // though the page checksum holds: only the check of the decoded length can tell.
+    let cases = [
+        (255 * block, false),
+        (255 * block + 1, true),
+        (LEN as u64 + 1, true),
+        (LEN as u64 - 1, true),
+    ];
+    for (wrong, damaged) in cases {
+        record_length(&folder, beside.place, wrong);
+        let (table, row_key) = the_row();
+        let budget = Budget::new(Some((9 << 20) + room)).expect("a budget");
+        let store = Store::open_for_writing(&folder, &budget, None).expect("open the store");
+        let view = store.view().expect("a view");
+        let row = view.row(table, &row_key).expect("read").expect("the row");
+        let Some(Cell::Beside(at)) = row.cells.into_iter().last() else {
+            panic!("the text was kept beside its row");
+        };
+        let before = budget.used();
+        let mut reservation = budget.reserve(0, "query").expect("a reservation");
+        let loaded = view.load(&at, &mut reservation);
+        assert_eq!(reservation.bytes(), 0, "held after a length of {wrong}");
+        drop(reservation);
+        assert_eq!(budget.used(), before, "counted after a length of {wrong}");
+        match loaded {
+            Err(Error::StoreCorrupted { path, .. }) if damaged => assert_eq!(path, folder),
+            Err(Error::MemoryBudgetExceeded { operation, .. }) if !damaged => {
+                assert_eq!(operation, "query");
+            }
+            other => panic!("a recorded length of {wrong} gave {other:?}"),
+        }
+    }
+    std::fs::remove_dir_all(&folder).expect("remove the test's folder");
+
+    // A plain record whose recorded length is one more or one less than its bytes is damage.
+    let letters = scattered(2000);
+    for wrong in [2001_u64, 1999] {
+        let folder = fresh_folder("recorded-length-plain");
+        store_one_row(&folder, text(&letters));
+        let (_, beside, _, _) = load_the_value(&folder);
+        assert_eq!(beside.bytes, 9 + 2000, "the value is stored plain");
+        record_length(&folder, beside.place, wrong);
+        loading_is_damage(
+            &folder,
+            &format!("a plain record that gives the length {wrong}"),
+        );
+        std::fs::remove_dir_all(&folder).expect("remove the test's folder");
+    }
+}
+
+/// Puts `wrong` as the recorded length in the first slice of the large value at `place`, as a
+/// commit of the storage library, so the page checksum is right for it.
+fn record_length(folder: &Path, place: u64, wrong: u64) {
+    let data = redb::Database::open(folder.join("data")).expect("open the data file");
+    let write = data.begin_write().expect("begin");
+    {
+        let mut kept = write.open_table(BESIDE).expect("the large values");
+        let first = kept.get(place).expect("read the first slice");
+        let mut first = first.expect("the first slice is there").value().to_vec();
+        first[1..9].copy_from_slice(&wrong.to_le_bytes());
+        kept.insert(place, first.as_slice()).expect("write");
+    }
+    write.commit().expect("commit");
 }

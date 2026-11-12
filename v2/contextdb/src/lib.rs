@@ -19,8 +19,8 @@ pub use read::{ReadSession, ReadSessionOptions};
 pub use store::{StorageBackend, WrapStorage};
 pub use system::Clock;
 pub use types::{
-    ColumnType, Error, Result, TxId, Uuid, Value, VectorIndexRef, VectorPartitionDeclarationIssue,
-    VectorPolicyDeclarationIssue,
+    ColumnType, ContextId, Error, Principal, Result, ScopeLabel, TableMeta, TxId, Uuid, Value,
+    VectorIndexRef, VectorPartitionDeclarationIssue, VectorPolicyDeclarationIssue,
 };
 pub use upkeep::{MaintenanceReport, VectorMaintenanceReport};
 

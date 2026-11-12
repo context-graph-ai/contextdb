@@ -2,7 +2,8 @@
 
 use serde_json::json;
 
-use super::values::{timestamp_millis, typed};
+use super::typed;
+use crate::types::timestamp_millis;
 use crate::types::{ColumnDef, ColumnType, Error, Uuid, Value};
 
 #[test]

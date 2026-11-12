@@ -63,3 +63,44 @@ rows affected: 2
 SELECT id FROM tasks ORDER BY id;
 ----
 id
+
+# A column named twice in the SET list is refused, as Postgres refuses it, whatever it matches.
+INSERT INTO tasks (id, title) VALUES (1, 'again');
+UPDATE tasks SET title = 'first', title = 'second' WHERE id = 1;
+----
+error: PlanError
+
+# An UPDATE that swaps two keys: each key is taken while the statement runs and free when it
+# ends, so each row is left under the other's key and is found by it.
+CREATE TABLE swapped (k INTEGER PRIMARY KEY, v TEXT NOT NULL);
+INSERT INTO swapped (k, v) VALUES (1, 'one'), (2, 'two'), (3, 'three');
+UPDATE swapped SET k = 3 - k WHERE k IN (1, 2);
+----
+rows affected: 2
+
+SELECT k, v FROM swapped ORDER BY k;
+----
+k | v
+1 | two
+2 | one
+3 | three
+
+SELECT v FROM swapped WHERE k = 1;
+----
+v
+two
+
+# A row moved to a key is not met again at that key: every row of a shift is changed once,
+# although the key it moved to still passes the WHERE.
+CREATE TABLE shifted (k INTEGER PRIMARY KEY, v TEXT NOT NULL);
+INSERT INTO shifted (k, v) VALUES (98, 'one'), (99, 'two'), (100, 'three');
+UPDATE shifted SET k = k + 1 WHERE k >= 1 AND k <= 100;
+----
+rows affected: 3
+
+SELECT k, v FROM shifted ORDER BY k;
+----
+k | v
+99 | one
+100 | two
+101 | three

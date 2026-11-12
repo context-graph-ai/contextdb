@@ -12,7 +12,7 @@
 use std::ops::Bound;
 
 use super::{Key, VectorId, VectorRecord};
-use crate::types::{Error, Result, SortDirection, TxId, Uuid, Value};
+use crate::types::{ColumnType, Error, Result, SortDirection, TxId, Uuid, Value};
 
 /// No value's form begins with this byte, turned or not, so a key followed by it sorts after
 /// every key that begins with that key and before every other key above it.
@@ -21,9 +21,18 @@ const PAST: u8 = 0xFF;
 /// The bytes from the first, which a span includes, to the second, which it does not.
 pub(super) type Span = (Vec<u8>, Vec<u8>);
 
-/// The form [`Key::from_values`] gives.
-pub(super) fn encode(values: &[Value], directions: &[SortDirection]) -> Result<Vec<u8>> {
+/// The form [`Key::from_values`] gives, where `room` is `usize::MAX`: every value whole.
+///
+/// A text whose form is longer than `room` bytes is cut to exactly `room`: its leading bytes,
+/// the mark and the digest of the whole text. The second answer is where in the key the kept
+/// bytes of the first cut text end.
+pub(super) fn encode(
+    values: &[Value],
+    directions: &[SortDirection],
+    room: usize,
+) -> Result<(Vec<u8>, Option<usize>)> {
     let mut key = Vec::new();
+    let mut first_cut = None;
     for (column, value) in values.iter().enumerate() {
         let at = key.len();
         match value {
@@ -34,14 +43,28 @@ pub(super) fn encode(values: &[Value], directions: &[SortDirection]) -> Result<V
             Value::Text(text) => {
                 key.push(4);
                 // A zero byte inside the text is followed by 0xFF, and two zero bytes end it:
-                // a text sorts before every longer text it begins.
+                // a text sorts before every longer text it begins. The mark of a cut text
+                // sorts after that end and before any further byte.
+                let end = at.saturating_add(room - CUT_BYTES);
+                let mut cut = None;
                 for byte in text.bytes() {
+                    if key.len() + 1 + usize::from(byte == 0) > end {
+                        cut = Some(key.len());
+                        break;
+                    }
                     key.push(byte);
                     if byte == 0 {
                         key.push(0xFF);
                     }
                 }
-                key.extend([0, 0]);
+                match cut {
+                    None => key.extend([0, 0]),
+                    Some(_) => {
+                        key.extend([0, 1]);
+                        key.extend(digest(text));
+                    }
+                }
+                first_cut = first_cut.or(cut);
             }
             Value::Uuid(id) => put(&mut key, 5, id.as_bytes()),
             Value::Timestamp(millis) => put(&mut key, 6, &signed(*millis)),
@@ -56,7 +79,21 @@ pub(super) fn encode(values: &[Value], directions: &[SortDirection]) -> Result<V
             key[at..].iter_mut().for_each(|byte| *byte = !*byte);
         }
     }
-    Ok(key)
+    Ok((key, first_cut))
+}
+
+/// The bytes the form of a cut text ends with: its mark and its digest.
+const CUT_BYTES: usize = 2 + 16;
+
+/// The FNV-1a 128-bit digest of a text, most significant byte first. It is written out here
+/// because a stored digest must be the same bytes in every build.
+fn digest(text: &str) -> [u8; 16] {
+    let mut digest: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    for byte in text.bytes() {
+        digest ^= u128::from(byte);
+        digest = digest.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b);
+    }
+    digest.to_be_bytes()
 }
 
 fn put(key: &mut Vec<u8>, tag: u8, bytes: &[u8]) {
@@ -116,7 +153,7 @@ pub(super) fn stored(id: u32, key: &[u8]) -> Vec<u8> {
 /// of their own.
 pub(super) const BLOCK: u8 = 0;
 const PARTITION: u8 = 1;
-const PENDING: u8 = 2;
+pub(super) const PENDING: u8 = 2;
 const GROUPING: u8 = 3;
 /// The first byte of the stored key of a record of centres, which is kept with the blocks.
 pub(super) const CENTRES: u8 = 4;
@@ -125,7 +162,7 @@ const ASSIGNED: u8 = 6;
 /// The first byte of the stored key of a record of sketches, which is kept with the blocks.
 pub(super) const SKETCH: u8 = 7;
 const MEAN: u8 = 8;
-const LEFT: u8 = 9;
+pub(super) const LEFT: u8 = 9;
 
 /// True for the kinds of record that are kept in the table of blocks.
 pub(super) fn with_blocks(kind: u8) -> bool {
@@ -211,6 +248,58 @@ pub(super) fn vector_of<'a>(stored: &[u8], key: &'a mut Key) -> Option<VectorRec
         }
         _ => return None,
     })
+}
+
+/// The most bytes a row key, a partition-key tuple, a kept count's values or an index entry
+/// takes.
+pub(crate) const KEY_LIMIT: usize = 2704;
+
+/// The most bytes a TEXT value takes in an index entry. A longer one is cut and given a digest;
+/// the row is read again wherever the entry cannot decide, so this sets the index's size and
+/// how many rows an order over texts that begin alike reads together, never an answer.
+const ENTRY_TEXT: usize = 256;
+
+/// How the entries of one index are made: its columns' directions, and the room each of its
+/// TEXT columns has. The columns of fixed size take what they take, and the TEXT columns share
+/// the rest of [`KEY_LIMIT`] equally, each at most [`ENTRY_TEXT`], so no entry is longer than the
+/// limit.
+pub(crate) struct EntryShape {
+    directions: Vec<SortDirection>,
+    room: usize,
+}
+
+/// One index entry, and where its first cut value's kept bytes end when it holds one.
+pub(crate) struct Entry {
+    pub key: Key,
+    pub cut: Option<usize>,
+}
+
+impl EntryShape {
+    /// The shape of the entries of an index over columns of these types and directions.
+    pub(crate) fn new(types: &[ColumnType], directions: &[SortDirection]) -> EntryShape {
+        let texts = types.iter().filter(|column| **column == ColumnType::Text);
+        let fixed = types.iter().map(|column| match column {
+            ColumnType::Text => 0,
+            ColumnType::Uuid => 17,
+            ColumnType::Boolean => 2,
+            _ => 9,
+        });
+        EntryShape {
+            directions: directions.to_vec(),
+            room: ((KEY_LIMIT - fixed.sum::<usize>()) / texts.count().max(1)).min(ENTRY_TEXT),
+        }
+    }
+
+    /// The entry of a row's values in the index's columns; given only leading values, the bytes
+    /// every entry with those values begins with. This is the only place an entry is made.
+    ///
+    /// A text that fits its column's room is whole, as [`Key::from_values`] writes it. A longer
+    /// one is cut, so entries are in the order of their values except that long texts with
+    /// the same kept bytes follow each other in the order of their digests.
+    pub(crate) fn entry(&self, values: &[Value]) -> Result<Entry> {
+        let (key, cut) = encode(values, &self.directions, self.room)?;
+        Ok(Entry { key: Key(key), cut })
+    }
 }
 
 /// The values a key of ascending columns was made from; `None` for bytes that are no such key.

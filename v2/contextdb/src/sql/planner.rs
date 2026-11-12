@@ -15,41 +15,27 @@ const SORTABLE_FUNCTIONS: [&str; 6] = ["__add", "__sub", "__mul", "__div", "coal
 
 pub(super) fn plan(statement: &Statement) -> Result<PhysicalPlan> {
     Ok(match statement {
-        Statement::CreateTable(table) => PhysicalPlan::CreateTable(CreateTablePlan {
-            name: table.name.clone(),
-            columns: table.columns.clone(),
-            unique_constraints: table.unique_constraints.clone(),
-            if_not_exists: table.if_not_exists,
-        }),
-        Statement::CreateIndex(index) => PhysicalPlan::CreateIndex(CreateIndexPlan {
-            name: index.name.clone(),
-            table: index.table.clone(),
-            columns: index.columns.clone(),
-        }),
+        Statement::CreateTable(table) => PhysicalPlan::CreateTable(table.clone()),
+        Statement::CreateIndex(index) => PhysicalPlan::CreateIndex(index.clone()),
+        Statement::AlterTable(alter) => PhysicalPlan::AlterTable(alter.clone()),
+        Statement::DropTable(drop) => PhysicalPlan::DropTable(drop.clone()),
+        Statement::DropIndex(drop) => PhysicalPlan::DropIndex(drop.clone()),
         Statement::Insert(insert) => {
             insert.values.iter().flatten().try_for_each(rows_stand)?;
-            PhysicalPlan::Insert(InsertPlan {
-                table: insert.table.clone(),
-                columns: insert.columns.clone(),
-                values: insert.values.clone(),
-            })
+            let conflict = insert.on_conflict.iter();
+            let mut set = conflict.flat_map(|conflict| conflict.assignments.iter());
+            set.try_for_each(|(_, value)| in_a_write(value))?;
+            PhysicalPlan::Insert(insert.clone())
         }
         Statement::Delete(delete) => {
             delete.where_clause.iter().try_for_each(in_a_write)?;
-            PhysicalPlan::Delete(DeletePlan {
-                table: delete.table.clone(),
-                where_clause: delete.where_clause.clone(),
-            })
+            PhysicalPlan::Delete(delete.clone())
         }
         Statement::Update(update) => {
             let values = update.assignments.iter().map(|(_, value)| value);
             let mut written = values.chain(&update.where_clause);
             written.try_for_each(in_a_write)?;
-            PhysicalPlan::Update(UpdatePlan {
-                table: update.table.clone(),
-                assignments: update.assignments.clone(),
-                where_clause: update.where_clause.clone(),
-            })
+            PhysicalPlan::Update(update.clone())
         }
         Statement::Select(select) => plan_select(select)?,
         Statement::SetMemoryLimit(limit) => PhysicalPlan::SetMemoryLimit(limit.clone()),
