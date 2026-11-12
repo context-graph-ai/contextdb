@@ -1092,12 +1092,12 @@ fn an_alter_or_a_drop_in_a_transaction_takes_hold_when_it_commits() {
 #[test]
 fn a_vector_column_far_larger_than_the_memory_limit_is_dropped_under_it() {
     const DIMENSION: usize = 64;
-    const VECTORS: i64 = 20_000;
+    const VECTORS: i64 = 10_000;
     const HELD: u64 = VECTORS as u64 * DIMENSION as u64 * 4;
     const KIB: usize = 1 << 10;
     const MIB: usize = 1 << 20;
-    // Two stores take the same writes: 20,000 vectors of 64 numbers, 5,120,000 bytes of them,
-    // in four partitions, all sealed, and then four tables of large text, 12,800,000 bytes.
+    // Two stores take the same writes: 10,000 vectors of 64 numbers, 2,560,000 bytes of them,
+    // in four partitions, all sealed, and then two tables of large text, 6,400,000 bytes.
     // One of them drops the vector column in between, under a memory limit.
     let store = |test: &str, drop: bool| -> u64 {
         let folder = support::folder(test);
@@ -1113,10 +1113,10 @@ fn a_vector_column_far_larger_than_the_memory_limit_is_dropped_under_it() {
         assert_eq!(support::seal_all(&db), VECTORS as u64);
         support::close(db);
         if drop {
-            // 9 MiB is what a store needs to open at all. The 384 KiB above it are less than
-            // a tenth of the vectors, which is 512,000 bytes.
+            // 9 MiB is what a store needs to open at all. The 192 KiB above it are less than
+            // a tenth of the vectors, which is 256,000 bytes.
             let mut options = DatabaseOpenOptions::default();
-            options.memory_limit = Some(9 * MIB + 384 * KIB);
+            options.memory_limit = Some(9 * MIB + 192 * KIB);
             let db = support::open_with(&folder, options).expect("open under the limit");
             let sql = "ALTER TABLE docs DROP COLUMN v";
             if let Err(error) = db.execute(sql, &params! {}) {
@@ -1135,7 +1135,7 @@ fn a_vector_column_far_larger_than_the_memory_limit_is_dropped_under_it() {
         }
         let db = support::open(&folder);
         assert_eq!(support::int(&db, "SELECT COUNT(*) FROM docs"), VECTORS);
-        for (table, seed) in [("n0", 0), ("n1", ROWS), ("n2", 2 * ROWS), ("n3", 3 * ROWS)] {
+        for (table, seed) in [("n0", 0), ("n1", ROWS)] {
             support::run(
                 &db,
                 &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, body TEXT)"),

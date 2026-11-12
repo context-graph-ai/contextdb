@@ -29,6 +29,10 @@ pub(super) struct DataFile(Box<dyn StorageBackend>);
 
 impl DataFile {
     pub(super) fn over(file: File, storage: Option<&WrapStorage>) -> io::Result<DataFile> {
+        // What a folder reads as differs between systems, so nothing is asked of one.
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other("the store's data file is not a file"));
+        }
         Ok(DataFile(match storage {
             Some(wrap) => wrap(file)?,
             None => Box::new(Plain(file)),

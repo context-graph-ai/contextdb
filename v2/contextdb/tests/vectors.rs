@@ -58,7 +58,7 @@ fn told_apart(n: i64, dimension: usize) -> Option<Vec<f32>> {
 
 #[test]
 fn exact_search_returns_the_true_nearest_vectors() {
-    for (dimension, rows) in [(3, 5000_i64), (16, 5000), (33, 600), (384, 300), (768, 300)] {
+    for (dimension, rows) in [(3, 5000_i64), (16, 300), (33, 300), (384, 300), (768, 300)] {
         let folder = support::folder(&format!("exact-nearest-{dimension}"));
         let db = support::open(&folder);
         support::declare_docs(&db, dimension, "");

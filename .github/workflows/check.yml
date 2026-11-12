@@ -68,7 +68,7 @@ jobs:
       - name: Tests are at most the stated number and within 10 of it
         if: matrix.os == 'ubuntu-latest'
         run: |
-          tests=$(( $(cargo nextest list --manifest-path v2/Cargo.toml --workspace --locked -T oneline | wc -l) + $(find v2/contextdb/tests/sql -name '*.sql' | wc -l) ))
+          tests=$(( $(cargo nextest list --manifest-path v2/Cargo.toml --workspace --locked --ignore-default-filter -T oneline | wc -l) + $(find v2/contextdb/tests/sql -name '*.sql' | wc -l) ))
           echo "$tests tests; the stated number is $TESTS"
           test "$TESTS" -le 1000
           test "$tests" -le "$TESTS"

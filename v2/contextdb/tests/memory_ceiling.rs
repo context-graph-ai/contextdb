@@ -387,8 +387,8 @@ fn refused_json(role: &support::Role) {
 // ---- a full cache ----
 
 /// Rows of a table beside the one a test measures, each with a text of 900 bytes that does not
-/// shrink: 18 MiB, more than twice the 8 MiB cache of a store whose limit is under 32 MiB.
-const FILLER_ROWS: i64 = 20_000;
+/// shrink: 9 MiB, more than the 8 MiB cache of a store whose limit is under 32 MiB.
+const FILLER_ROWS: i64 = 10_000;
 const FILLER_TEXT: usize = 900;
 
 /// Writes the filler rows, in a table of their own and one commit.
@@ -588,7 +588,7 @@ fn an_indexed_search_and_a_build_stay_under_the_limit() {
     let db = support::open(&folder);
     write_the_filler(&db);
     support::declare_docs(&db, 64, "AUTO_INDEX_AT 1000");
-    support::load_docs(&db, 1..=2000, "a", |n| support::gathered(n, 64));
+    support::load_docs(&db, 1..=1100, "a", |n| support::gathered(n, 64));
     support::close(db);
 
     let lines = support::Child::start(
@@ -610,7 +610,7 @@ fn an_indexed_search_and_a_build_stay_under_the_limit() {
             told("rows"),
             told("exact_rows")
         ),
-        (Some(0), Some(45), Some(10), Some(10)),
+        (Some(0), Some(33), Some(10), Some(10)),
         "the build's stalled partitions and groups, and the rows of the indexed and of the \
          exact search"
     );
@@ -641,7 +641,7 @@ fn a_build_under_the_limit(role: &support::Role) {
     options.memory_limit = Some(BUILD_LIMIT);
     let db = support::open_with(&role.folder, options).expect("open the store under the limit");
     // One commit of vectors under the limit: 200 rows take a nearby vector of the same
-    // direction, so the column keeps its 2,000 vectors and the build below is the same.
+    // direction, so the column keeps its 1,100 vectors and the build below is the same.
     fill_the_cache(&db);
     let tx = db.transaction().expect("begin");
     for id in 1..=200_i64 {

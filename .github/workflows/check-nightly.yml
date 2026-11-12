@@ -1,0 +1,26 @@
+name: Check nightly
+
+# Slow work: the tests the `nightly` profile of v2/.config/nextest.toml lists. The pull-request
+# check stays fast because these run here, once a night, instead.
+on:
+  schedule:
+    - cron: '30 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+        with:
+          tool: cargo-nextest@0.9.138
+      - run: cargo nextest run --manifest-path v2/Cargo.toml --workspace --locked --profile nightly

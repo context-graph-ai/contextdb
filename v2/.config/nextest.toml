@@ -1,9 +1,14 @@
 # A test that runs past its limit is stopped and fails by name. Nothing is retried.
+# The pull-request check (the default profile) runs every test except the million-row load,
+# which is slow work and runs every night in the `nightly` profile.
 [profile.default]
 retries = 0
 slow-timeout = { period = "30s", terminate-after = 2 }
+default-filter = 'not test(=a_million_rows_load_and_scan_under_64_mib)'
 
-# The million-row load is the one test that needs longer.
-[[profile.default.overrides]]
-filter = 'test(a_million_rows_load_and_scan_under_64_mib)'
-slow-timeout = { period = "120s", terminate-after = 5 }
+# The nightly profile runs only the million-row load. Its limit is a hang detector, well clear
+# of the slowest hosted run seen (428 seconds).
+[profile.nightly]
+retries = 0
+default-filter = 'test(=a_million_rows_load_and_scan_under_64_mib)'
+slow-timeout = { period = "300s", terminate-after = 6 }

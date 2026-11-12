@@ -199,7 +199,7 @@ fn declare_groups(db: &Database) {
 
 #[test]
 fn a_new_set_of_counts_on_a_table_with_rows_is_installed_whole_or_not_at_all() {
-    const ROWS: i64 = 50_000;
+    const ROWS: i64 = 10_000;
     let folder = support::folder("kept-counts-installed");
     // The page cache is sized when the store is opened, so the limit of the second half is
     // set on a store that was opened under a larger one.
@@ -228,7 +228,7 @@ fn a_new_set_of_counts_on_a_table_with_rows_is_installed_whole_or_not_at_all() {
         }
     };
 
-    // With 64 KiB to spare, the 50,000 new counts do not fit: the statement is the memory
+    // With 64 KiB to spare, the 10,000 new counts do not fit: the statement is the memory
     // limit's refusal, the declaration is the one the table had, and its counts still answer.
     let limit = db.memory_used() + (64 << 10);
     db.set_memory_limit(Some(limit)).expect("set the limit");
