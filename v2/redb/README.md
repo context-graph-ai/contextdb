@@ -1,8 +1,9 @@
 # contextdb-redb
 
 redb 4.1.0 with changes for contextdb. Upstream version: [redb](https://github.com/cberner/redb)
-4.1.0, as published on crates.io. The library is still named `redb`, the file format is
-unchanged, and upstream's own tests pass unchanged.
+4.1.0, as published on crates.io. The library is still named `redb`. Its leaves are written
+differently (below), so it opens only files that it wrote itself: upstream's tests of opening
+files written by redb 2.6 are removed, and every other upstream test passes unchanged.
 
 This version changes the following and nothing else. Each change is written so that it can be
 proposed upstream.
@@ -32,10 +33,25 @@ Checking pages when they are read:
 
 Keeping a file close to the size of what it holds:
 
-- A leaf written in key order is left full. When a leaf must split because a pair was inserted
-  after its last pair, the first leaf keeps every pair that was there and the second starts with
-  the new pair; upstream divides every leaf where half its bytes are, which leaves a table that
-  is written in key order with half-empty leaves. Every other split is still in half.
+- A key type answers one new question, `Key::compares_as_bytes`: whether it orders keys exactly
+  as their bytes. Only `&[u8]` answers yes.
+- A leaf of such keys keeps once the leading bytes that all its keys share (at most 255): its
+  second header byte, which upstream leaves unwritten, holds their count; its first key is kept
+  whole and every later key without them. A tree whose values are the unit type, such as the
+  value sets of a multimap table or a table used as a set of keys, shares nothing and is written
+  as upstream writes it. An edit in place leaves the shared bytes where they are, also for a
+  leaf's first pair: a key that no longer begins with them rebuilds the leaf instead.
+- A leaf that must split is cut at the first of a few places that leaves both halves within one
+  page, else at the one that takes the fewest pages: after a pair that ends a run of inserted
+  keys (so a table written in key order has full leaves), before it, or where half the bytes
+  are. A leaf is joined with a neighbour when what is left, keys counted whole, is under a third
+  of a page; two leaves joined try half, then the place nearest half towards where they met
+  that leaves both within a page, then where they met. The key that a branch
+  keeps between two leaves of byte keys is the shortest beginning of the right leaf's first key
+  that is above the left leaf's last key; upstream keeps the left leaf's whole last key.
+- `Range::next_lent` is new: it answers the next pair borrowed until the walk moves on, with no
+  key copied to the heap. A key of a leaf that shares bytes is rebuilt in one buffer the range
+  owns, whose shared bytes stay while the walk is on that leaf.
 - The file grows in small steps. Once its usable bytes pass 1 MiB the file grows by a sixteenth
   of them, and never by less than twice the allocation that needed the room; upstream doubles
   the file while it has one region and adds a whole region at a time after that. A file under

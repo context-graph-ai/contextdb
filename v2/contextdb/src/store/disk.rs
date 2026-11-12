@@ -228,15 +228,18 @@ impl Moment {
         F: Fn(&[u8], &[u8]) -> Option<T>,
     {
         let folder = self.folder.clone();
-        let range = table
+        let mut range = table
             .range::<&[u8]>(stored(id, start).as_slice()..stored(id, end).as_slice())
             .map_err(|error| failed(&folder, "read", error))?;
-        Ok(range.map(move |entry| {
-            let (key, record) = entry.map_err(|error| failed(&folder, "read", error))?;
-            let key = &key.value()[4..];
-            let read = read(key, record.value());
-            let read = read.ok_or_else(|| failed(&folder, "read", unsound()))?;
-            Ok((Key(key.to_vec()), read))
+        Ok(std::iter::from_fn(move || {
+            let entry = range
+                .next_lent()
+                .map_err(|error| failed(&folder, "read", error));
+            Some(entry.transpose()?.and_then(|(key, record)| {
+                let read = read(&key[4..], record);
+                let read = read.ok_or_else(|| failed(&folder, "read", unsound()))?;
+                Ok((Key(key[4..].to_vec()), read))
+            }))
         }))
     }
 
@@ -248,7 +251,7 @@ impl Moment {
     ) -> Result<impl Iterator<Item = Result<(Key, Row)>> + use<>> {
         self.scan(&self.rows, table, span, |_, row| {
             Some(Row {
-                cells: record::decode_row(row),
+                cells: record::decode_row(&record::plain(row).ok()?),
             })
         })
     }
@@ -295,9 +298,8 @@ impl Moment {
 
     fn row(&self, table: u32, key: &Key) -> Stored<Option<Row>> {
         let row = self.rows.get(stored(table, &key.0).as_slice())?;
-        Ok(row.map(|row| Row {
-            cells: record::decode_row(row.value()),
-        }))
+        let row = row.map(|row| record::plain(row.value()).map(|row| record::decode_row(&row)));
+        Ok(row.transpose()?.map(|cells| Row { cells }))
     }
 
     /// Tells of a record that is not what was stored: damage, told as a failed check of the
@@ -382,12 +384,13 @@ impl Read for View {
             &moment.vectors
         };
         let records = table.range::<&[u8]>(start.as_slice()..end.as_slice());
+        let mut records = records.map_err(|error| failed(&moment.folder, "read", error))?;
         let mut key = Key(Vec::new());
-        for record in records.map_err(|error| failed(&moment.folder, "read", error))? {
-            let (stored, value) = record.map_err(|error| failed(&moment.folder, "read", error))?;
-            // The value is the bytes of the storage library's own page, lent for the call.
-            let record = keys::vector_of(stored.value(), &mut key).ok_or_else(unsound);
-            if !each(moment.told(record)?, value.value())? {
+        // The key and the value are lent by the storage library until the walk moves on.
+        let read = |error| failed(&moment.folder, "read", error);
+        while let Some((stored, value)) = records.next_lent().map_err(read)? {
+            let record = keys::vector_of(stored, &mut key).ok_or_else(unsound);
+            if !each(moment.told(record)?, value)? {
                 break;
             }
         }
@@ -472,14 +475,15 @@ pub(super) fn write(data: &redb::Database, changes: &mut ChangeSet) -> Stored<u6
                                 Ok(first)
                             })?;
                         record::leave(&mut row, left);
-                        rows.insert(key.as_slice(), row.as_slice())?
+                        let room = record::pack(&mut row, &mut changes.reserved);
+                        let before = rows.insert(key.as_slice(), row.as_slice())?;
+                        changes.reserved.shrink(room);
+                        before
                     }
                     None => rows.remove(key.as_slice())?,
                 };
-                let before: Vec<Beside> = before
-                    .iter()
-                    .flat_map(|row| record::besides(row.value()))
-                    .collect();
+                let old = Option::transpose(before.as_ref().map(|row| record::plain(row.value())))?;
+                let before: Vec<Beside> = old.iter().flat_map(|row| record::besides(row)).collect();
                 // A value the new row left where it is stays; the others go with the old row.
                 for kept in before
                     .iter()
@@ -522,7 +526,7 @@ pub(super) fn write(data: &redb::Database, changes: &mut ChangeSet) -> Stored<u6
         let mut blocks = write.open_table(BLOCKS)?;
         let mut vectors = write.open_table(VECTORS)?;
         drop::write(
-            &changes.dropped,
+            changes,
             &mut rows,
             &mut beside,
             &mut index,

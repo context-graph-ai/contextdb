@@ -9,8 +9,10 @@
 //! which. The plain form is the record itself. The compressed form is the tag with its top bit
 //! set, the same eight bytes of length, and one LZ4 block that decodes to exactly that many
 //! bytes and runs to the end. A text or JSON value of at most 1 MiB is stored compressed when
-//! that saves an eighth of its bytes; a longer one and a vector are always stored plain, and a
-//! value that stays in its row is never touched. Either form reads back as the same value.
+//! that saves an eighth of its bytes; a longer one and a vector are always stored plain. Either
+//! form reads back as the same value. A value that stays in its row is compressed only with it:
+//! a row's record of 256 bytes or more is stored, when that saves an eighth, as the byte `0xFF`
+//! (which begins no cell), its length as a `u32` and one LZ4 block.
 //!
 //! A vector cell that comes with a scale and codes is written in a third form, in its row or
 //! beside it: the tag `0x88`, the count of its numbers as a `u64`, the scale as an `f32` and
@@ -18,6 +20,7 @@
 
 use lz4_flex::block::{compress_into, decompress_into, get_maximum_output_size};
 
+use super::disk::{Stored, unsound};
 use super::{Beside, Cell, Compact};
 use crate::memory::Reservation;
 use crate::types::{self, TxId, Uuid, Value};
@@ -49,6 +52,8 @@ const TXID: u8 = 9;
 const BESIDE: u8 = 10;
 /// A vector as a scale and one signed byte a number.
 const REDUCED: u8 = 0x88;
+/// The first byte of a row's record that is stored as one block.
+const PACKED: u8 = 0xFF;
 
 /// The tag, the count and the scale in front of the codes of such a vector.
 const REDUCED_FRONT: u64 = 13;
@@ -95,31 +100,42 @@ pub(super) fn encode_row<E>(
 
 /// Puts the compressed form of a large value's plain record in its place, when the value is
 /// one that is compressed and that saves an eighth of its bytes.
-///
-/// The compressor works in a buffer of 20 bytes more than 1.1 times the value. `reservation`
-/// is grown by that first, and the bytes it was grown by are returned for the caller to give
-/// back once the record is written. When the budget has no room for the buffer the record
-/// stays plain: compression never refuses a commit.
 pub(super) fn compress(record: &mut Vec<u8>, reservation: &mut Reservation) -> u64 {
-    let len = record.len() - FRONT;
+    if matches!(record[0], VECTOR | REDUCED) {
+        return 0;
+    }
+    let front = [&[record[0] | COMPRESSED][..], &record[1..FRONT]].concat();
+    squeeze(record, FRONT, &front, reservation)
+}
+
+/// Puts a row's record of 256 bytes or more in its stored form, when that saves an eighth.
+pub(super) fn pack(row: &mut Vec<u8>, reservation: &mut Reservation) -> u64 {
+    if row.len() < 256 {
+        return 0;
+    }
+    let front = [&[PACKED][..], &(row.len() as u32).to_le_bytes()].concat();
+    squeeze(row, 0, &front, reservation)
+}
+
+/// Puts `front` and one LZ4 block of the record's bytes from `from` on in its place, when they
+/// are at most 1 MiB and that saves an eighth of them. The compressor's buffer (1.1 times them
+/// and 20 bytes) is asked of `reservation` first and returned, to give back once the record is
+/// written; without room for it the record stays plain: compression never refuses a commit.
+fn squeeze(record: &mut Vec<u8>, from: usize, front: &[u8], reservation: &mut Reservation) -> u64 {
+    let len = record.len() - from;
     let room = get_maximum_output_size(len);
-    if matches!(record[0], VECTOR | REDUCED)
-        || len > COMPRESS_TO
-        || reservation.grow(room as u64).is_err()
-    {
+    if len > COMPRESS_TO || reservation.grow(room as u64).is_err() {
         return 0;
     }
     let mut block = vec![0; room];
-    // A buffer of that size holds whatever the value compresses to, so nothing fails here.
-    if let Ok(size) = compress_into(&record[FRONT..], &mut block)
-        && size <= len - len / 8
+    // A buffer of that size holds whatever the bytes compress to, so nothing fails here.
+    if let Ok(size) = compress_into(&record[from..], &mut block)
+        && front.len() + size <= record.len() - len / 8
     {
-        // The block moves up to let the tag and the length in before it. They fit: the block
-        // is no longer than the value, and the buffer is at least 20 bytes longer.
-        block.copy_within(..size, FRONT);
-        block[..FRONT].copy_from_slice(&record[..FRONT]);
-        block[0] |= COMPRESSED;
-        block.truncate(FRONT + size);
+        // The block moves up to let the front in; the buffer is 11 bytes longer than both.
+        block.copy_within(..size, front.len());
+        block[..front.len()].copy_from_slice(front);
+        block.truncate(front.len() + size);
         *record = block;
     }
     room as u64
@@ -158,8 +174,18 @@ fn put_long(out: &mut Vec<u8>, tag: u8, bytes: &[u8]) {
     out.extend(bytes);
 }
 
-/// Reads a row back. The bytes are a row this module wrote: the storage library checks every
-/// page it reads, so nothing else reaches here.
+/// A stored row's record as it was written, the one way a stored row is read; a block that does
+/// not decode to its length is damage. Like a plain row, it is not counted against the limit.
+pub(super) fn plain(row: &[u8]) -> Stored<std::borrow::Cow<'_, [u8]>> {
+    let Some(([PACKED, len @ ..], block)) = row.split_first_chunk::<5>() else {
+        return Ok(row.into());
+    };
+    let plain = unpack(&[], block, u32::from_le_bytes(*len).into(), |_| Ok(()));
+    Ok(plain.ok().flatten().ok_or_else(unsound)?.into())
+}
+
+/// Reads a row back from its plain record. The bytes are a row this module wrote: the storage
+/// library checks every page it reads, and `plain` every block, so nothing else reaches here.
 pub(super) fn decode_row(mut row: &[u8]) -> Vec<Cell> {
     let mut cells = Vec::new();
     while !row.is_empty() {
@@ -208,7 +234,7 @@ fn from_cell(mut row: &[u8], slot: usize) -> &[u8] {
     row
 }
 
-/// The large values a stored row keeps beside it. None of the row's values is made.
+/// The large values a row's plain record keeps beside it. None of the row's values is made.
 pub(super) fn besides(mut row: &[u8]) -> impl Iterator<Item = Beside> {
     std::iter::from_fn(move || {
         while !row.is_empty() {
@@ -220,8 +246,8 @@ pub(super) fn besides(mut row: &[u8]) -> impl Iterator<Item = Beside> {
     })
 }
 
-/// A stored row without its cell at `slot`, and the large value that cell kept beside the row.
-/// `None` for a row with no cell there.
+/// A row's plain record without its cell at `slot`, and the large value that cell kept beside
+/// the row. `None` for a row with no cell there.
 pub(super) fn without_cell(row: &[u8], slot: usize) -> Option<(Vec<u8>, Option<Beside>)> {
     let mut rest = from_cell(row, slot);
     let start = row.len() - rest.len();
@@ -274,20 +300,13 @@ pub(super) fn load(
     }
     if front[0] & COMPRESSED != 0 {
         let len = u64::from_le_bytes(take_array(&mut &front[1..]));
-        // No LZ4 block decodes to more than 255 times its own bytes.
-        if len > 255 * (stored.len() - FRONT) as u64 {
+        let grow = |bytes| reservation.grow(bytes);
+        let Some(mut plain) = unpack(front, &stored[FRONT..], len, grow)? else {
             return Ok(Err(
-                "a compressed large value gives a length its bytes cannot decode to",
+                "a compressed large value does not decode to the length it gives",
             ));
-        }
-        reservation.grow(FRONT as u64 + len)?;
-        let mut plain = vec![0; FRONT + len as usize];
-        plain[..FRONT].copy_from_slice(front);
+        };
         plain[0] &= !COMPRESSED;
-        let decoded = decompress_into(&stored[FRONT..], &mut plain[FRONT..]);
-        if decoded.ok() != Some(len as usize) {
-            return Ok(Err("a compressed large value decodes to another length"));
-        }
         reservation.shrink(stored.len() as u64);
         stored = plain;
     }
@@ -312,6 +331,24 @@ pub(super) fn load(
     let value = (stored[0] == VECTOR).then(|| decode_value(&stored));
     reservation.shrink(twice);
     Ok(value.ok_or("a large value is not text, JSON or a vector"))
+}
+
+/// `front` and the `len` bytes an LZ4 block decodes to, or `None`. `grow` is asked for them before
+/// they are made, and only when no more than 255 times the block, the most a block decodes to.
+fn unpack(
+    front: &[u8],
+    block: &[u8],
+    len: u64,
+    grow: impl FnOnce(u64) -> types::Result<()>,
+) -> types::Result<Option<Vec<u8>>> {
+    if len > 255 * block.len() as u64 {
+        return Ok(None);
+    }
+    grow(front.len() as u64 + len)?;
+    let mut plain = vec![0; front.len() + len as usize];
+    plain[..front.len()].copy_from_slice(front);
+    let decoded = decompress_into(block, &mut plain[front.len()..]);
+    Ok((decoded.ok() == Some(len as usize)).then_some(plain))
 }
 
 /// Reads one value back from its plain record.

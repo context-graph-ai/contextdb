@@ -290,14 +290,23 @@ fn a_commit_on_disk_is_reported_and_served_though_the_read_after_it_fails() {
     };
     let db = support::open_with(&folder, options()).expect("open");
     support::declare(&db);
-    // A second table twice the size of that 8 MiB page cache, in rows small enough to be
-    // kept in the table's own pages. Reading all of it leaves the cache full of its pages, so
+    // A second table four times the size of that 8 MiB page cache, in rows small enough to be
+    // kept in the table's own pages and of text that no compressor shortens, so that a row takes
+    // the room it is written with. Reading all of it leaves the cache full of its pages, so
     // the pages a commit writes afterwards have to be read back from the file.
     support::run(
         &db,
         "CREATE TABLE padding (id INTEGER PRIMARY KEY, body TEXT)",
     );
-    let body = "x".repeat(800);
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let body: String = (0..800)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            char::from(b'a' + (state >> 60) as u8)
+        })
+        .collect();
     for first in (1..=PADDING_ROWS).step_by(2000) {
         let tx = db.transaction().expect("begin");
         for id in first..first + 2000 {

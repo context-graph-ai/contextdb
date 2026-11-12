@@ -15,8 +15,8 @@ use lz4_flex::block::{compress_into, get_maximum_output_size};
 use redb::{ReadableDatabase, ReadableTable};
 
 use super::{
-    Cell, ChangeSet, Compact, CountId, EntryShape, IndexId, KEY_LIMIT, Key, Read, Store, TableId,
-    VectorId, VectorRecord, keys, record,
+    Cell, ChangeSet, Compact, CountId, Dropped, EntryShape, IndexId, KEY_LIMIT, Key, Read, Store,
+    TableId, VectorId, VectorRecord, keys, record,
 };
 use crate::memory::Budget;
 use crate::types::{ColumnType, Error, Result, SortDirection, TxId, Uuid, Value};
@@ -135,7 +135,7 @@ fn a_bound_of_fewer_columns_stands_for_every_key_that_begins_with_it() {
 }
 
 #[test]
-fn a_row_reads_back_as_written_with_its_large_values_beside_it() {
+fn a_row_reads_back_as_written_packed_or_not_with_its_large_values_beside_it() {
     let long = "long text, ".repeat(400);
     let values = vec![
         Value::Null,
@@ -175,13 +175,127 @@ fn a_row_reads_back_as_written_with_its_large_values_beside_it() {
         })
         .collect();
     assert_eq!(read, values);
+
+    // Through a store. A row's record (35 bytes, the text, and a large text beside the row) of
+    // 256 bytes or more is kept as one block when that saves an eighth; a shorter one, and one
+    // that does not shrink, as is.
+    let (same, scatter, long) = ("packs well, ".repeat(100), scattered(600), scattered(2000));
+    let cases = [
+        (&same[..220], false),
+        (&same[..221], true),
+        (&scatter[..], false),
+    ];
+    let folder = fresh_folder("packed-rows");
+    let put = |changes: &mut ChangeSet, id: i64, cells: Vec<Cell>, new_key: bool| {
+        let key = key(&[Value::Int64(id)]);
+        let staged = changes.put_row(TableId(1), key, cells, Vec::new(), new_key);
+        staged.expect("stage");
+    };
+    let here = |id: i64, middle: &str| {
+        vec![
+            Cell::Here(Value::Int64(id)),
+            Cell::Here(text(middle)),
+            Cell::Here(text(&long)),
+        ]
+    };
+    commit_staged(&folder, |changes| {
+        for (id, (body, _)) in (1..).zip(cases) {
+            put(changes, id, here(id, body), true);
+        }
+    });
+    for ((_, bytes), (body, packed)) in records(&folder, ROWS).iter().zip(cases) {
+        let (plain, stored) = (35 + body.len(), bytes.len());
+        let kept = if packed {
+            stored <= plain - plain / 8
+        } else {
+            stored == plain
+        };
+        assert!(
+            kept,
+            "a record of {plain} bytes (packed: {packed}) is stored as {stored}"
+        );
+    }
+    // The large text a row's cell keeps beside it, loaded.
+    let large = |read: &dyn Read, cell: &Cell| {
+        let Cell::Beside(at) = cell else {
+            panic!("the large text is kept beside its row")
+        };
+        let budget = Budget::new(None).expect("a budget");
+        let loaded = read.load(at, &mut budget.reserve(0, "query").expect("a reservation"));
+        assert_eq!(loaded.expect("load"), text(&long), "the large text");
+    };
+    let before = on_the_newest_moment(&folder, |read| {
+        let scan = read.rows(TableId(1), Bound::Unbounded, Bound::Unbounded);
+        let scan = scan
+            .and_then(Iterator::collect::<Result<Vec<_>>>)
+            .expect("scan");
+        for ((key, row), (id, (body, _))) in scan.iter().zip((1..).zip(cases)) {
+            let by_key = read.row(TableId(1), key).expect("read");
+            assert_eq!(by_key.as_ref(), Some(row), "row {id} by key and by scan");
+            assert_eq!(row.cells[..2], here(id, body)[..2], "row {id} as written");
+            large(read, &row.cells[2]);
+        }
+        scan
+    });
+
+    // An UPDATE that does not assign the large text hands its cell back as read: the text stays
+    // where it is, inside a row that is packed.
+    let (second, kept) = (&before[1].0, &before[1].1.cells[2]);
+    commit_staged(&folder, |changes| {
+        let cells = [&here(2, &same[..300])[..2], std::slice::from_ref(kept)].concat();
+        put(changes, 2, cells, false);
+    });
+    let after = on_the_newest_moment(&folder, |read| {
+        let row = read
+            .row(TableId(1), second)
+            .expect("read")
+            .expect("the row");
+        large(read, &row.cells[2]);
+        row
+    });
+    assert_eq!(
+        after.cells[1],
+        Cell::Here(text(&same[..300])),
+        "the assigned cell is new"
+    );
+    assert_eq!(&after.cells[2], kept, "the large text is kept where it was");
+
+    // Dropping the text column rewrites each row, packed or not, to the cells that stay.
+    let drop = Dropped::Cell(TableId(1), 1);
+    commit_staged(&folder, |changes| changes.stage_drop(drop).expect("stage"));
+    on_the_newest_moment(&folder, |read| {
+        for id in 1..=3 {
+            let row = read.row(TableId(1), &key(&[Value::Int64(id)]));
+            let cells = row.expect("read").expect("the row").cells;
+            assert_eq!(cells[0], Cell::Here(Value::Int64(id)), "row {id}");
+            assert_eq!(cells.len(), 2, "row {id} lost its text cell only");
+            large(read, &cells[1]);
+        }
+    });
+    std::fs::remove_dir_all(&folder).expect("remove the test's folder");
 }
 
 /// The storage library's table of large values, as `disk` declares it: place to slice.
 const BESIDE: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("beside");
 
+/// The storage library's table of rows, as `disk` declares it.
+const ROWS: redb::TableDefinition<&[u8], &[u8]> = redb::TableDefinition::new("rows");
+
 /// The bytes of one slice of a large value, as `disk` cuts them.
 const SLICE: u64 = 243;
+
+/// Changes one of the storage library's tables as a commit of that library, so the page
+/// checksums are right for what it leaves.
+fn tamper<K: redb::Key + 'static, V: redb::Value + 'static>(
+    folder: &Path,
+    table: redb::TableDefinition<K, V>,
+    change: impl FnOnce(&mut redb::Table<'_, K, V>),
+) {
+    let data = redb::Database::open(folder.join("data")).expect("open the data file");
+    let write = data.begin_write().expect("begin");
+    change(&mut write.open_table(table).expect("the table"));
+    write.commit().expect("commit");
+}
 
 /// The one row of the stores the tests below write: table 1, key 1.
 fn the_row() -> (TableId, Key) {
@@ -197,18 +311,25 @@ fn fresh_folder(name: &str) -> PathBuf {
     folder
 }
 
-/// Writes a store of one row, the number 1 and then `value`, under no memory limit, so that a
-/// value the store compresses is compressed, and closes it.
-fn store_one_row(folder: &Path, value: Value) {
+/// Writes a store of this one row (table 1, key 1) with these vector cells kept reduced, under
+/// no memory limit, so that a value the store compresses is compressed, and closes it.
+fn store_row(folder: &Path, cells: Vec<Cell>, reduced: Vec<Compact>) {
     let (table, row_key) = the_row();
     let budget = Budget::new(None).expect("a budget");
     let store = Store::open_for_writing(folder, &budget, None).expect("open a fresh store");
     let mut changes = ChangeSet::new(store.view().expect("a view"), &budget).expect("begin");
-    let row = vec![Cell::Here(Value::Int64(1)), Cell::Here(value)];
-    changes
-        .put_row(table, row_key, row, Vec::new(), true)
-        .expect("stage");
+    let staged = changes.put_row(table, row_key, cells, reduced, true);
+    staged.expect("stage");
     store.commit(changes).expect("commit");
+}
+
+/// Writes a store of one row, the number 1 and then `value`.
+fn store_one_row(folder: &Path, value: Value) {
+    store_row(
+        folder,
+        vec![Cell::Here(Value::Int64(1)), Cell::Here(value)],
+        Vec::new(),
+    );
 }
 
 /// Opens the store and loads the large value of its one row. Returns what the load gave, where
@@ -273,15 +394,10 @@ fn a_value_without_its_last_slice_is_damage(name: &str, value: &Value, plain: us
     let slices = beside.bytes.div_ceil(SLICE);
     assert!(slices > 1 && beside.bytes % SLICE != 0, "{slices} slices");
 
-    let data = redb::Database::open(folder.join("data")).expect("open the data file");
-    let write = data.begin_write().expect("begin");
-    {
-        let mut kept = write.open_table(BESIDE).expect("the large values");
+    tamper(&folder, BESIDE, |kept| {
         let last = kept.remove(beside.place + slices - 1);
         assert!(last.expect("remove the last slice").is_some());
-    }
-    write.commit().expect("commit");
-    drop(data);
+    });
 
     loading_is_damage(&folder, "a large value whose last slice is gone");
     std::fs::remove_dir_all(&folder).expect("remove the test's folder");
@@ -317,10 +433,7 @@ fn a_block_of_other_bytes_is_damage(name: &str, value: &Value, wrong: &[u8]) {
     let (loaded, beside, _, _) = load_the_value(&folder);
     assert!(loaded.expect("load the value as it was written") == *value);
 
-    let data = redb::Database::open(folder.join("data")).expect("open the data file");
-    let write = data.begin_write().expect("begin");
-    {
-        let mut kept = write.open_table(BESIDE).expect("the large values");
+    tamper(&folder, BESIDE, |kept| {
         let first = kept.get(beside.place).expect("read the first slice");
         let first = first.expect("the first slice is there").value().to_vec();
         assert!(first[0] & 0x80 != 0, "the value is stored compressed");
@@ -340,9 +453,7 @@ fn a_block_of_other_bytes_is_damage(name: &str, value: &Value, wrong: &[u8]) {
         for (place, slice) in (beside.place..).zip(record.chunks(SLICE as usize)) {
             kept.insert(place, slice).expect("write a slice");
         }
-    }
-    write.commit().expect("commit");
-    drop(data);
+    });
 
     loading_is_damage(&folder, "a block that decodes to bytes of another kind");
     std::fs::remove_dir_all(&folder).expect("remove the test's folder");
@@ -392,13 +503,25 @@ fn on_the_newest_moment<T>(folder: &Path, read: impl FnOnce(&dyn Read) -> T) -> 
     read(&view)
 }
 
-/// Stages with `stage` on the store's newest moment and commits.
-fn commit_staged(folder: &Path, stage: impl FnOnce(&mut ChangeSet)) {
+/// Stages with `stage` on the store's newest moment and commits, or says why it could not.
+fn try_commit(
+    folder: &Path,
+    stage: impl FnOnce(&mut ChangeSet) -> Result<()>,
+) -> Result<crate::types::TxId> {
     let budget = Budget::new(None).expect("a budget");
     let store = Store::open_for_writing(folder, &budget, None).expect("open the store");
     let mut changes = ChangeSet::new(store.view().expect("a view"), &budget).expect("begin");
-    stage(&mut changes);
-    store.commit(changes).expect("commit");
+    stage(&mut changes)?;
+    store.commit(changes)
+}
+
+/// Stages with `stage` on the store's newest moment and commits.
+fn commit_staged(folder: &Path, stage: impl FnOnce(&mut ChangeSet)) {
+    let staged = |changes: &mut ChangeSet| {
+        stage(changes);
+        Ok(())
+    };
+    try_commit(folder, staged).expect("commit");
 }
 
 /// Asserts that a read was refused as damage of the store in this folder.
@@ -432,14 +555,9 @@ fn write_record(
     key: &[u8],
     value: &[u8],
 ) {
-    let data = redb::Database::open(folder.join("data")).expect("open the data file");
-    let write = data.begin_write().expect("begin");
-    write
-        .open_table(table)
-        .expect("the table")
-        .insert(key, value)
-        .expect("write the record");
-    write.commit().expect("commit");
+    tamper(folder, table, |records| {
+        records.insert(key, value).expect("write the record");
+    });
 }
 
 #[test]
@@ -899,22 +1017,19 @@ fn reduced(count: usize) -> (Vec<f32>, f32, Vec<i8>) {
 /// to the store with its scale and codes.
 fn store_reduced_vector(folder: &Path, count: usize) {
     let (numbers, scale, codes) = reduced(count);
-    let budget = Budget::new(None).expect("a budget");
-    let store = Store::open_for_writing(folder, &budget, None).expect("open a fresh store");
-    let mut changes = ChangeSet::new(store.view().expect("a view"), &budget).expect("begin");
     let row = vec![
         Cell::Here(Value::Int64(1)),
         Cell::Here(Value::Vector(numbers)),
     ];
-    let kept = vec![Compact {
-        at: 1,
-        scale,
-        codes,
-    }];
-    changes
-        .put_row(TableId(1), key(&[Value::Int64(1)]), row, kept, true)
-        .expect("stage");
-    store.commit(changes).expect("commit");
+    store_row(
+        folder,
+        row,
+        vec![Compact {
+            at: 1,
+            scale,
+            codes,
+        }],
+    );
 }
 
 #[test]
@@ -932,21 +1047,7 @@ fn a_reduced_record_of_another_length_is_damage() {
     );
 
     // The record now says it holds one number more than its bytes do.
-    let data = redb::Database::open(folder.join("data")).expect("open the data file");
-    let write = data.begin_write().expect("begin");
-    {
-        let mut kept = write.open_table(BESIDE).expect("the large values");
-        let first = kept.get(beside.place).expect("read the first slice");
-        let mut first = first.expect("the first slice is there").value().to_vec();
-        assert_eq!(first[0], 0x88, "the tag of a reduced vector");
-        assert_eq!(first[1..9], (COUNT as u64).to_le_bytes());
-        first[1..9].copy_from_slice(&(COUNT as u64 + 1).to_le_bytes());
-        kept.insert(beside.place, first.as_slice())
-            .expect("write the slice");
-    }
-    write.commit().expect("commit");
-    drop(data);
-
+    record_length(&folder, beside.place, COUNT as u64 + 1);
     loading_is_damage(&folder, "a reduced vector whose count is not its bytes'");
     std::fs::remove_dir_all(&folder).expect("remove the test's folder");
 }
@@ -1054,19 +1155,66 @@ fn a_recorded_length_of_255_times_the_block_is_the_limits_refusal_and_one_more_i
         );
         std::fs::remove_dir_all(&folder).expect("remove the test's folder");
     }
+
+    // A packed row records the length it unpacks to, in four bytes after its marker byte: one
+    // more or less than the block decodes to, or more than a block can, is damage on every path
+    // that reads a stored row, and the refused change leaves the row as it was.
+    let folder = fresh_folder("recorded-length-packed");
+    let (table, row_key) = the_row();
+    let cells = vec![
+        Cell::Here(Value::Int64(1)),
+        Cell::Here(text(&"A packed row repeats itself. ".repeat(10))),
+        Cell::Here(text(&scattered(2000))),
+    ];
+    store_row(&folder, cells.clone(), Vec::new());
+    let [(stored_key, packed)] = <[_; 1]>::try_from(records(&folder, ROWS)).expect("one row");
+    let plain = 35 + 290_u32;
+    assert_eq!(
+        packed[1..5],
+        plain.to_le_bytes(),
+        "the row is packed and records its length"
+    );
+    for wrong in [plain + 1, plain - 1, 255 * (packed.len() as u32 - 5) + 1] {
+        let mut bytes = packed.clone();
+        bytes[1..5].copy_from_slice(&wrong.to_le_bytes());
+        write_record(&folder, ROWS, &stored_key, &bytes);
+        let by_key = on_the_newest_moment(&folder, |read| read.row(table, &row_key).map(drop));
+        let scan = on_the_newest_moment(&folder, |read| {
+            let scan = read.rows(table, Bound::Unbounded, Bound::Unbounded);
+            scan.and_then(Iterator::collect::<Result<Vec<_>>>).map(drop)
+        });
+        let change =
+            |stage: &dyn Fn(&mut ChangeSet) -> Result<()>| try_commit(&folder, stage).map(drop);
+        let update = change(&|c| c.put_row(table, row_key.clone(), cells.clone(), vec![], false));
+        let delete = change(&|c| c.delete_row(table, &row_key));
+        let drop_table = change(&|c| c.stage_drop(Dropped::Rows(table)));
+        let drop_column = change(&|c| c.stage_drop(Dropped::Cell(table, 1)));
+        let paths = [
+            ("a read by key", by_key),
+            ("a scan", scan),
+            ("an update", update),
+            ("a delete", delete),
+            ("a drop of the table", drop_table),
+            ("a drop of a column", drop_column),
+        ];
+        for (path, outcome) in paths {
+            assert_damage(
+                outcome,
+                &folder,
+                &format!("{path} of a packed row that records {wrong}"),
+            );
+        }
+    }
+    std::fs::remove_dir_all(&folder).expect("remove the test's folder");
 }
 
 /// Puts `wrong` as the recorded length in the first slice of the large value at `place`, as a
 /// commit of the storage library, so the page checksum is right for it.
 fn record_length(folder: &Path, place: u64, wrong: u64) {
-    let data = redb::Database::open(folder.join("data")).expect("open the data file");
-    let write = data.begin_write().expect("begin");
-    {
-        let mut kept = write.open_table(BESIDE).expect("the large values");
+    tamper(folder, BESIDE, |kept| {
         let first = kept.get(place).expect("read the first slice");
         let mut first = first.expect("the first slice is there").value().to_vec();
         first[1..9].copy_from_slice(&wrong.to_le_bytes());
         kept.insert(place, first.as_slice()).expect("write");
-    }
-    write.commit().expect("commit");
+    });
 }

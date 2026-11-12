@@ -155,6 +155,11 @@ pub trait Key: Value {
     ///
     /// The implementation must ensure there is a total order
     fn compare(data1: &[u8], data2: &[u8]) -> Ordering;
+
+    /// Whether `compare` orders keys as their bytes, so a leaf may keep their shared start once
+    fn compares_as_bytes() -> bool {
+        false
+    }
 }
 
 impl Value for () {
@@ -345,6 +350,10 @@ impl Value for &[u8] {
 impl Key for &[u8] {
     fn compare(data1: &[u8], data2: &[u8]) -> Ordering {
         data1.cmp(data2)
+    }
+
+    fn compares_as_bytes() -> bool {
+        true
     }
 }
 

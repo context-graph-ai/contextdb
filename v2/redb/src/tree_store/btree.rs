@@ -983,9 +983,9 @@ impl<K: Key, V: Value> Btree<K, V> {
         match node_mem[0] {
             LEAF => {
                 let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
-                let (key_range, value_range) =
-                    accessor.entry_ranges(accessor.num_pairs() - 1).unwrap();
-                let key_guard = AccessGuard::with_page(page.clone(), key_range);
+                let last = accessor.num_pairs() - 1;
+                let (_, value_range) = accessor.entry_ranges(last).unwrap();
+                let key_guard = accessor.key_guard(&page, last);
                 let value_guard = AccessGuard::with_page(page, value_range);
                 Ok(Some((key_guard, value_guard)))
             }
