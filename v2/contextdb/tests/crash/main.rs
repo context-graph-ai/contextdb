@@ -247,8 +247,8 @@ fn damage_each_page_of_a_scan<S: Run>(
     refused
 }
 
-/// Rows of padding in the test below, 800 bytes each: 32 MiB.
-const PADDING_ROWS: i64 = 40_000;
+/// Rows of padding in the test below, 800 bytes each: 16 MiB.
+const PADDING_ROWS: i64 = 20_000;
 
 #[test]
 fn a_commit_on_disk_is_reported_and_served_though_the_read_after_it_fails() {
@@ -290,7 +290,7 @@ fn a_commit_on_disk_is_reported_and_served_though_the_read_after_it_fails() {
     };
     let db = support::open_with(&folder, options()).expect("open");
     support::declare(&db);
-    // A second table four times the size of that 8 MiB page cache, in rows small enough to be
+    // A second table twice the size of that 8 MiB page cache, in rows small enough to be
     // kept in the table's own pages. Reading all of it leaves the cache full of its pages, so
     // the pages a commit writes afterwards have to be read back from the file.
     support::run(

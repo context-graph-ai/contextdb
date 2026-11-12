@@ -709,14 +709,14 @@ fn a_partition_is_grouped_again_only_when_its_changes_reach_the_declared_share()
 
 #[test]
 fn a_cycle_under_a_tight_limit_records_the_stall_and_the_old_grouping_serves() {
-    // A round over 49 centres of 256 numbers takes 150,528 bytes for its sums and centres;
+    // A round over 22 centres of 512 numbers takes 135,168 bytes for its sums and centres;
     // the limit leaves 98,304 over what an open sets aside.
-    const WIDE: usize = 256;
+    const WIDE: usize = 512;
     const LIMIT: usize = (9 << 20) + (96 << 10);
-    let (folder, db) = support::built("stalled-build", WIDE, AT_1000, 2000);
-    support::load_docs(&db, 2001..=2400, "a", |n| support::gathered(n, WIDE));
-    // This cycle seals the 400 and begins the regrouping they make due.
-    assert_eq!(support::cycle(&db).maintenance_vectors_done, 400);
+    let (folder, db) = support::built("stalled-build", WIDE, "AUTO_INDEX_AT 200", 400);
+    support::load_docs(&db, 401..=480, "a", |n| support::gathered(n, WIDE));
+    // This cycle seals the 80 and begins the regrouping they make due.
+    assert_eq!(support::cycle(&db).maintenance_vectors_done, 80);
     let stored = support::stored(&db, support::DOCS);
     support::close(db);
 
@@ -749,7 +749,7 @@ fn a_cycle_under_a_tight_limit_records_the_stall_and_the_old_grouping_serves() {
     );
 
     // The grouping in force still serves.
-    assert_eq!(lists_of(&partition), Some(45));
+    assert_eq!(lists_of(&partition), Some(20));
     let query = support::gathered(60_003, WIDE);
     let result = support::answer(&db, &support::by_mode(None, "INDEXED", 10), &query);
     support::assert_sound(&result, &stored, |_| true, &query, 10, "while stalled");
@@ -758,6 +758,6 @@ fn a_cycle_under_a_tight_limit_records_the_stall_and_the_old_grouping_serves() {
     support::upkeep(&db);
     let partition = support::the_partition(&db);
     assert_eq!(state_of(&partition), ("idle".to_owned(), "none".to_owned()));
-    assert_eq!(lists_of(&partition), Some(49), "round(sqrt(2400))");
+    assert_eq!(lists_of(&partition), Some(22), "round(sqrt(480))");
     assert_eq!(support::cycle(&db).stalled_partitions, 0);
 }

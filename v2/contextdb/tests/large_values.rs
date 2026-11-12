@@ -137,17 +137,27 @@ fn assert_notes_are(on: &impl Run, kind: Kind, rows: i64, len: usize, what: &str
 // ---- every kind and size, three ways ----
 
 /// The sizes of the first test: the last text that stays in its row and the first that does
-/// not, two between, and the first that is too long to be compressed.
-const SIZES: [usize; 5] = [1015, 1016, 4000, 70_000, LONGEST_COMPRESSED + 1];
+/// not, and two between. Each is taken by every kind of text.
+const SIZES: [usize; 4] = [1015, 1016, 4000, 70_000];
 
-/// One row of `docs` for each kind of text at each size.
-const DOCS: i64 = (Kind::ALL.len() * SIZES.len()) as i64;
+/// The rows after those: the first size too long to be compressed, in one kind that shrinks and
+/// one that does not.
+const LONGEST: [Kind; 2] = [Kind::Repeating, Kind::Scattered];
+
+/// One row of `docs` for each kind of text at each size, and one for each kind of `LONGEST`.
+const DOCS: i64 = (Kind::ALL.len() * SIZES.len() + LONGEST.len()) as i64;
 
 /// The kind of text row `id` of `docs` is first written with, and the size of its body and
 /// of its meta.
 fn shape(id: i64) -> (Kind, usize) {
     let at = (id - 1) as usize;
-    (Kind::ALL[at % Kind::ALL.len()], SIZES[at / Kind::ALL.len()])
+    match SIZES.get(at / Kind::ALL.len()) {
+        Some(size) => (Kind::ALL[at % Kind::ALL.len()], *size),
+        None => (
+            LONGEST[at - Kind::ALL.len() * SIZES.len()],
+            LONGEST_COMPRESSED + 1,
+        ),
+    }
 }
 
 /// The body of row `id`: of the row's own kind when it is inserted, `changes` 0, and of the

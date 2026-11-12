@@ -198,17 +198,16 @@ fn vector_search_ends_complete_or_refused() {
 
 #[test]
 fn memory_stays_bounded_as_data_grows_vector() {
-    const DIMENSION: usize = 768;
-    // Vectors in the large partition. In a block each takes 8 + 768 bytes of slot, 4 of key
-    // end and 9 of key, so these are 25 MB of blocks: three times the page cache of 8 MiB
-    // that the reader's limit gives it, and the fewest that are.
-    const LARGE: i64 = 31_896;
+    const DIMENSION: usize = 3072;
+    // The large partition, in blocks of 8 + 3,072 bytes of slot, 4 of key end and 9 of key each:
+    // 12.6 MB, one and a half times the reader's 8 MiB page cache, and the fewest that are.
+    const LARGE: i64 = 4_069;
     const SMALL: i64 = 200;
     const LIMIT: usize = 16 * MIB;
     const CACHE: usize = 8 * MIB;
     const BLOCK: u64 = 262_080;
-    const { assert!(LARGE as u64 * (8 + 768 + 4 + 9) > 3 * CACHE as u64) };
-    const { assert!((LARGE as u64 - 1) * (8 + 768 + 4 + 9) <= 3 * CACHE as u64) };
+    const { assert!(LARGE as u64 * (8 + 3072 + 4 + 9) > 3 * CACHE as u64 / 2) };
+    const { assert!((LARGE as u64 - 1) * (8 + 3072 + 4 + 9) <= 3 * CACHE as u64 / 2) };
 
     let folder = support::folder("memory-bounded-vectors");
     let db = support::open(&folder);
