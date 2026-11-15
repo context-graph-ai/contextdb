@@ -21,12 +21,14 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # The size of the shipped code, rounded up to 500 lines, and the number of tests, rounded up
-  # to 10. A change that crosses either number edits it here, in the same change, where its
-  # reader sees that the code grew or shrank. Neither ever passes 150,000 lines or 1,000 tests.
-  SHIPPED_LINES: 21000
-  TESTS: 380
-  TEST_LINES: 38000
+  # The shipped code, rounded up to 500 lines; the tests, rounded up to 10; the lines of tests,
+  # rounded up to 500. Each holds from both sides, at most the number and within one rounding of
+  # it, so a cleanup lowers it for good. Reaching one means a refactor first: a number is raised
+  # only when a planned stage of the work ends, never inside a fix (v2/AGENTS.md). Neither size
+  # ever passes 150,000 lines or 1,000 tests.
+  SHIPPED_LINES: 25000
+  TESTS: 400
+  TEST_LINES: 41000
 
 jobs:
   lint:
@@ -80,12 +82,13 @@ jobs:
           test "$TESTS" -le 1000
           test "$tests" -le "$TESTS"
           test "$tests" -gt "$((TESTS - 10))"
-      - name: Test lines are at most the stated number
+      - name: Test lines are at most the stated number and within 500 of it
         if: matrix.os == 'ubuntu-latest'
         run: |
           lines=$(find v2/*/tests v2/*/src -type f \( -path '*/tests/*' -o -name tests.rs \) -exec cat {} + | wc -l)
           echo "$lines test lines; the stated number is $TEST_LINES"
           test "$lines" -le "$TEST_LINES"
+          test "$lines" -gt "$((TEST_LINES - 500))"
 
   minimum-rust:
     runs-on: ubuntu-latest

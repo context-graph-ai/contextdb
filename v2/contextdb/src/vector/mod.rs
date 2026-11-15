@@ -41,7 +41,7 @@ mod train;
 pub(crate) use build::{prepare, remaining, stage_refusal, stage_step, waiting};
 pub(crate) use inspect::{Inspected, State, partitions};
 pub(crate) use seal::{Sealed, seal};
-pub(crate) use search::{Nearest, Route, plan, search};
+pub(crate) use search::{Nearest, Planned, Route, plan, search};
 pub(crate) use slot::{Reduced, distance};
 pub(crate) use stage::stage;
 pub(crate) use tally::Tally;

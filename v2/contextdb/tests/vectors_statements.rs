@@ -15,9 +15,6 @@ use support::{Call, Near, Run};
 
 const DIMENSION: usize = 8;
 
-/// How the refusal of a statement that only a later version runs ends.
-const LATER_VERSION: &str = "is not supported in this version of the library";
-
 fn column(table: &str, column: &str) -> VectorIndexRef {
     VectorIndexRef {
         table: table.to_owned(),
@@ -70,10 +67,13 @@ fn refused_as_indexed(outcome: contextdb::Result<contextdb::QueryResult>, table:
     }
 }
 
-/// True for a sentence that names both the function `ROW_VECTOR`, in any letter case, and the
-/// `<=>` it was written beside. Every test of that refusal holds it to both.
+/// True for a sentence that names the function `ROW_VECTOR`, in any letter case, the `<=>` it was
+/// written beside, and the scalar subquery to write instead. Every test of that refusal holds it
+/// to all three.
 fn names_row_vector_beside_a_distance(sentence: &str) -> bool {
-    sentence.to_uppercase().contains("ROW_VECTOR") && sentence.contains("<=>")
+    sentence.to_uppercase().contains("ROW_VECTOR")
+        && sentence.contains("<=>")
+        && sentence.contains("scalar subquery")
 }
 
 #[test]
@@ -149,7 +149,7 @@ fn vector_search_mode_routes_each_request() {
     let tx = db.transaction().expect("begin");
     through(&tx, "a transaction");
     tx.rollback();
-    let reader = ReadSession::open(&folder).expect("open the store for reading");
+    let reader = support::open_reader(&folder, None);
     through(&reader, "a read session");
 
     // A table of one row and a column declared SEARCH_MODE EXACT, with nothing else set.
@@ -180,14 +180,14 @@ const SMALL_RECORD_READS: usize = 4;
 fn indexed_search_is_refused_at_every_door() {
     let folder = support::folder("indexed-refused");
     let db = support::open(&folder);
-    declare(&db, "plain", "PARTITION_KEY (ctx) AUTO_INDEX_AT 1000");
+    declare(&db, "plain", "PARTITION_KEY (ctx) INDEXING_THRESHOLD 1000");
     declare(
         &db,
         "indexed",
-        "PARTITION_KEY (ctx) SEARCH_MODE INDEXED AUTO_INDEX_AT 1000",
+        "PARTITION_KEY (ctx) SEARCH_MODE INDEXED INDEXING_THRESHOLD 1000",
     );
     declare(&db, "empty", "SEARCH_MODE INDEXED");
-    declare(&db, "small", "PARTITION_KEY (ctx) AUTO_INDEX_AT 1000");
+    declare(&db, "small", "PARTITION_KEY (ctx) INDEXING_THRESHOLD 1000");
     let tx = db.transaction().expect("begin");
     fill(&tx, "small", 1..=300);
     tx.commit().expect("commit");
@@ -206,6 +206,10 @@ fn indexed_search_is_refused_at_every_door() {
         (
             "plain",
             search_sql("plain", Some("ctx = 'c1'"), "USE VECTOR INDEXED", 5),
+        ),
+        (
+            "plain",
+            search_sql("plain", Some("id = 1"), "USE VECTOR INDEXED", 5),
         ),
         ("indexed", search_sql("indexed", None, "", 5)),
         (
@@ -228,7 +232,7 @@ fn indexed_search_is_refused_at_every_door() {
         db.committed_watermark(),
         support::int(&db, "SELECT COUNT(*) FROM indexed"),
     );
-    let reader = ReadSession::open(&folder).expect("open the store for reading");
+    let reader = support::open_reader(&folder, None);
     let tx = db.transaction().expect("begin");
     for (table, sql) in &asking {
         // Never an answer, through the writer, a transaction and a reader alike.
@@ -236,7 +240,7 @@ fn indexed_search_is_refused_at_every_door() {
         refused_as_indexed(support::search(&tx, sql, &query), table, sql);
         refused_as_indexed(support::search(&reader, sql, &query), table, sql);
     }
-    // A partition with no grouping and fewer vectors outside one than twice AUTO_INDEX_AT is
+    // A partition with no grouping and fewer vectors outside one than twice INDEXING_THRESHOLD is
     // the index's one-group case: INDEXED answers it, and its answer and its work are EXACT's.
     let small = support::stored(&db, "SELECT id, ctx, tag, v FROM small");
     type Scope = (Option<&'static str>, fn(&[Value]) -> bool);
@@ -354,10 +358,10 @@ fn indexed_search_is_refused_at_every_door() {
 }
 
 #[test]
-fn the_largest_auto_index_at_is_declared_and_served() {
+fn the_largest_indexing_threshold_is_declared_and_served() {
     let folder = support::folder("largest-auto-index-at");
     let db = support::open(&folder);
-    declare(&db, "largest", "AUTO_INDEX_AT 18446744073709551615");
+    declare(&db, "largest", "INDEXING_THRESHOLD 18446744073709551615");
     fill(&db, "largest", 1..=20);
     let query = support::vector(91_500, DIMENSION);
     // The column is below its size: every mode answers exactly, before a cycle and after.
@@ -413,7 +417,7 @@ fn vector_query_errors_are_typed() {
         )
         .expect("insert a row");
     }
-    let reader = ReadSession::open(&folder).expect("open the store for reading");
+    let reader = support::open_reader(&folder, None);
     let state = |db: &Database| {
         let rows = support::rows(db, "SELECT id, ctx, r, v, w FROM docs ORDER BY id");
         (rows, db.committed_watermark())
@@ -458,21 +462,6 @@ fn vector_query_errors_are_typed() {
         other => panic!("{sql}\nwas refused as {other:?}, not as a plan error"),
     };
 
-    // A search with no LIMIT has no kind of its own: it is refused as every statement of a
-    // later version is, in a sentence that names it.
-    for sql in [
-        "SELECT id FROM docs ORDER BY v <=> $q",
-        "SELECT id, v <=> $q AS distance FROM docs ORDER BY distance",
-        "SELECT id FROM docs WHERE ctx = 'a' ORDER BY v <=> $q USE VECTOR EXACT",
-    ] {
-        match refusal(sql, &good, &good) {
-            Error::PlanError(text) => assert!(
-                text.contains("vector search without LIMIT") && text.ends_with(LATER_VERSION),
-                "{sql}\nwas refused in the sentence: {text}"
-            ),
-            other => panic!("{sql}\nwas refused as {other:?}, not as a plan error"),
-        }
-    }
     // USE VECTOR in a SELECT that does not order by a distance.
     for sql in [
         "SELECT id FROM docs ORDER BY id USE VECTOR EXACT LIMIT 3",
@@ -569,47 +558,13 @@ fn vector_query_errors_are_typed() {
         ),
         other => panic!("{sql}\ngot {other:?}"),
     }
-    // A distance anywhere but as the one ORDER BY key of a search, ascending, and in that
-    // search's select list.
+    // A distance is not carried into a write; every other use is an answer (`vector_search.sql`).
     for sql in [
-        // In a WHERE.
-        "SELECT id FROM docs WHERE v <=> $q < 0.5",
-        "SELECT id FROM docs WHERE v <=> $q < 0.5 ORDER BY id LIMIT 3",
-        "SELECT id FROM docs WHERE v <=> $q < 0.5 ORDER BY v <=> $q LIMIT 3",
         "DELETE FROM docs WHERE v <=> $q < 0.5",
-        // In a select list with no ORDER BY on it.
-        "SELECT id, v <=> $q AS distance FROM docs",
-        "SELECT id, v <=> $q AS distance FROM docs ORDER BY id LIMIT 3",
-        // With DESC.
-        "SELECT id FROM docs ORDER BY v <=> $q DESC LIMIT 3",
-        "SELECT id, v <=> $q AS distance FROM docs ORDER BY distance DESC LIMIT 3",
-        // Beside a second ORDER BY item.
-        "SELECT id FROM docs ORDER BY v <=> $q, id LIMIT 3",
-        "SELECT id FROM docs ORDER BY id, v <=> $q LIMIT 3",
-        // With a left side that is not a column.
-        "SELECT id FROM docs ORDER BY $q <=> v LIMIT 3",
-        // In a write.
         "UPDATE docs SET r = v <=> $q WHERE id = 1",
-        "INSERT INTO docs (id, ctx, r) VALUES (99, 'a', $v <=> $q)",
     ] {
         plan_error(sql, &["<=>"]);
     }
-    // A second distance that is not the ORDER BY's own: of another column, or to another
-    // vector. The refusal names `<=>` and the column, as `column <name>`: the letter alone is
-    // in nearly every sentence.
-    plan_error(
-        "SELECT id, w <=> $q AS other FROM docs ORDER BY v <=> $q LIMIT 3",
-        &["<=>", "column w"],
-    );
-    plan_error(
-        "SELECT id, v <=> $p AS other FROM docs ORDER BY v <=> $q LIMIT 3",
-        &["<=>", "column v"],
-    );
-    plan_error(
-        "SELECT id, v <=> $q AS distance, 1 - (w <=> $q) AS other FROM docs \
-         ORDER BY distance LIMIT 3",
-        &["<=>", "column w"],
-    );
 
     // There is no score column: on a table with no such column it is a name like any other.
     for sql in [
@@ -637,27 +592,16 @@ fn vector_query_errors_are_typed() {
 
 #[test]
 fn what_the_parser_reads_and_this_version_does_not_run_is_refused_when_planned() {
+    // The scripts prove the kind of each refusal; this proves its sentence, which names the form
+    // so that a person knows what to write instead, and that it is the same sentence through
+    // the writer, a transaction and a reader.
     let folder = support::folder("refused-when-planned");
     let db = support::open(&folder);
     support::run(
         &db,
-        "CREATE TABLE pairs (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, v VECTOR(3), \
-         w VECTOR(3))",
+        "CREATE TABLE pairs (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, v VECTOR(3))",
     );
-    support::run(
-        &db,
-        "INSERT INTO pairs (id, a, b, v, w) VALUES (1, 1, 2, [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]), \
-         (2, 3, 4, [0.0, 1.0, 0.0], [1.0, 0.0, 0.0])",
-    );
-    let reader = ReadSession::open(&folder).expect("open the store for reading");
-    let state = |db: &Database| {
-        let rows = support::rows(db, "SELECT id, a, b, v, w FROM pairs ORDER BY id");
-        (rows, db.committed_watermark())
-    };
-    let before = state(&db);
-
-    // The sentence a statement is refused in. It is a plan error, never a syntax error, and
-    // the same through the writer, a transaction and a reader.
+    let reader = support::open_reader(&folder, None);
     let refused_when_planned = |sql: &str| -> String {
         let tx = db.transaction().expect("begin");
         let none = params! {};
@@ -678,50 +622,50 @@ fn what_the_parser_reads_and_this_version_does_not_run_is_refused_when_planned()
         let [sentence, ..] = sentences;
         sentence
     };
-
-    // A row value is read wherever an expression is, and refused by name anywhere but beside
-    // IN: compared with `=`, and in a select list.
-    for sql in [
-        "SELECT id FROM pairs WHERE (a, b) = (1, 2)",
-        "SELECT (a, b) FROM pairs",
+    for (sql, form) in [
+        ("SELECT (a, b) FROM pairs", "row value"),
+        (
+            "SELECT a FROM pairs INTERSECT SELECT a FROM pairs",
+            "INTERSECT",
+        ),
+        ("SELECT a FROM pairs EXCEPT SELECT a FROM pairs", "EXCEPT"),
+        (
+            "SELECT p.a FROM pairs p RIGHT JOIN pairs q ON p.a = q.a",
+            "RIGHT JOIN",
+        ),
+        (
+            "SELECT p.a FROM pairs p FULL JOIN pairs q ON p.a = q.a",
+            "FULL JOIN",
+        ),
     ] {
         let sentence = refused_when_planned(sql);
         assert!(
-            sentence.to_lowercase().contains("row value"),
-            "{sql}\nwas refused without naming the row value: {sentence}"
+            sentence.to_lowercase().contains(&form.to_lowercase()),
+            "{sql}\nwas refused without naming {form}: {sentence}"
         );
     }
-    // Anything is read on the right of `<=>`, and anything but a vector literal, its quoted
-    // text or a bound name is refused naming `<=>`: a column, and ROW_VECTOR(...), whose
-    // refusal names the function too.
-    let sql = "SELECT id FROM pairs ORDER BY v <=> w LIMIT 3";
-    let sentence = refused_when_planned(sql);
-    assert!(
-        sentence.contains("<=>"),
-        "{sql}\nwas refused without naming <=>: {sentence}"
-    );
+    for (sql, form) in [
+        ("SELECT RANK() OVER (ORDER BY a) FROM pairs", "RANK"),
+        ("SELECT SUM(a) OVER (ORDER BY a) FROM pairs", "SUM"),
+        (
+            "SELECT ROW_NUMBER() OVER (PARTITION BY a) FROM pairs",
+            "ORDER BY",
+        ),
+    ] {
+        match support::refusal(&db, sql) {
+            Error::WindowFunctionNotSupported { form: found } => assert!(
+                found.contains(form),
+                "{sql}\nwas refused without naming {form}: {found}"
+            ),
+            other => panic!("{sql}\nwas refused as {other:?}"),
+        }
+    }
     let sql = "SELECT id FROM pairs ORDER BY v <=> ROW_VECTOR('pairs', 'v', 1) LIMIT 3";
     let sentence = refused_when_planned(sql);
     assert!(
         names_row_vector_beside_a_distance(&sentence),
         "{sql}\nwas refused without naming both ROW_VECTOR and <=>: {sentence}"
     );
-    // A search with no LIMIT is refused as every statement of a later version is, by its
-    // name.
-    let sql = "SELECT id FROM pairs ORDER BY v <=> [1.0, 0.0, 0.0]";
-    let sentence = refused_when_planned(sql);
-    assert!(
-        sentence.contains("vector search without LIMIT") && sentence.ends_with(LATER_VERSION),
-        "{sql}\nwas refused in the sentence: {sentence}"
-    );
-
-    // Each of them left the store as it was, and the column still answers.
-    assert!(state(&db) == before);
-    let stored = support::stored(&db, "SELECT id, a, b, v FROM pairs");
-    let query = [1.0_f32, 0.0, 0.0];
-    let wanted = stored.nearest(|_| true, &query, 2);
-    let sql = support::nearest_sql("pairs", "v", None, 2);
-    support::assert_nearest(&db, &sql, &query, &wanted, "after every refusal");
 }
 
 /// The words of a declaration's line for one column: what stands between spaces, commas and
@@ -998,7 +942,7 @@ fn vector_column_declarations_are_checked_stored_and_printed_back() {
         printed,
         "after reopen"
     );
-    let reader = ReadSession::open(&folder).expect("open the store for reading");
+    let reader = support::open_reader(&folder, None);
     assert_eq!(
         reader.declaration("t").expect("a reader's declaration"),
         printed
@@ -1046,70 +990,6 @@ fn refused_at_every_door(db: &Database, reader: &ReadSession, sql: &str, query: 
 }
 
 #[test]
-fn a_second_sort_key_after_a_distance_is_refused_as_a_later_form_whose_order_by_is_there() {
-    let folder = support::folder("second-sort-key");
-    let db = support::open(&folder);
-    declare(&db, "docs", "");
-    fill(&db, "docs", 1..=5);
-    let reader = ReadSession::open(&folder).expect("open the store for reading");
-    let query = support::vector(93_000, DIMENSION);
-    let before = (
-        support::rows(&db, "SELECT id, ctx, tag, v FROM docs ORDER BY id"),
-        db.committed_watermark(),
-    );
-
-    // What a statement is told whose distance is in no ORDER BY at all: there the ORDER BY is
-    // what is missing, and the sentence may say so.
-    let no_order_by = "SELECT id, v <=> $q AS distance FROM docs LIMIT 3";
-    let missing = match refused_at_every_door(&db, &reader, no_order_by, &query) {
-        Error::PlanError(text) => text,
-        other => panic!("{no_order_by}\nwas refused as {other:?}"),
-    };
-
-    // A search with a second sort key after its distance has its ORDER BY. It is a form of a
-    // later version: refused when planned, as every such form is, naming `<=>`, and not in
-    // the sentence of a statement that lacks the ORDER BY. That holds with USE VECTOR too,
-    // which is not told that it "requires ORDER BY ... <=>" by a statement that wrote one.
-    let mut wrong = Vec::new();
-    for sql in [
-        "SELECT id FROM docs ORDER BY v <=> $q, id LIMIT 3",
-        "SELECT id, v <=> $q AS distance FROM docs ORDER BY distance, id LIMIT 3",
-        "SELECT id FROM docs ORDER BY v <=> $q, id USE VECTOR EXACT LIMIT 3",
-    ] {
-        match refused_at_every_door(&db, &reader, sql, &query) {
-            Error::PlanError(text) => {
-                if !(text.contains("<=>") && text.ends_with(LATER_VERSION)) {
-                    wrong.push(format!(
-                        "{sql}\nwas not refused as a form of a later version that names <=>: {text}"
-                    ));
-                }
-                if text == missing {
-                    wrong.push(format!(
-                        "{sql}\nwas told what a statement with no ORDER BY on its distance is \
-                         told: {text}"
-                    ));
-                }
-            }
-            other => wrong.push(format!(
-                "{sql}\nwas refused as {other:?} ({other}), not as a plan error"
-            )),
-        }
-    }
-    assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
-
-    // Each of them left the store as it was, and the search without the second key answers.
-    let after = (
-        support::rows(&db, "SELECT id, ctx, tag, v FROM docs ORDER BY id"),
-        db.committed_watermark(),
-    );
-    assert!(after == before, "a refused statement changed the store");
-    let stored = support::stored(&db, "SELECT id, ctx, tag, v FROM docs");
-    let wanted = stored.nearest(|_| true, &query, 3);
-    let sql = support::nearest_sql("docs", "v", None, 3);
-    support::assert_nearest(&db, &sql, &query, &wanted, "after every refusal");
-}
-
-#[test]
 fn a_distance_on_a_column_of_another_table_is_a_column_that_is_not_found() {
     let folder = support::folder("distance-wrongly-qualified");
     let db = support::open(&folder);
@@ -1117,7 +997,7 @@ fn a_distance_on_a_column_of_another_table_is_a_column_that_is_not_found() {
     declare(&db, "other", "");
     fill(&db, "docs", 1..=5);
     fill(&db, "other", 1..=5);
-    let reader = ReadSession::open(&folder).expect("open the store for reading");
+    let reader = support::open_reader(&folder, None);
     let query = support::vector(94_000, DIMENSION);
 
     // Under the name of a table that is declared and is not the statement's, and under a name
@@ -1182,7 +1062,7 @@ fn a_distance_on_a_table_that_does_not_exist_is_a_table_that_is_not_found() {
     let db = support::open(&folder);
     declare(&db, "other", "");
     fill(&db, "other", 1..=5);
-    let reader = ReadSession::open(&folder).expect("open the store for reading");
+    let reader = support::open_reader(&folder, None);
     let query = support::vector(94_100, DIMENSION);
 
     // What any statement on a table that is not there is told.
@@ -1267,6 +1147,136 @@ fn a_distance_in_the_where_of_a_write_is_refused_on_a_table_with_no_row() {
     );
 }
 
+/// Runs a statement with `$q` and `$p` bound, on the writer.
+fn rows_of(db: &Database, sql: &str, q: &[f32], p: &[f32]) -> Vec<Vec<Value>> {
+    let bound = params! { "q" => q.to_vec(), "p" => p.to_vec() };
+    match db.execute(sql, &bound) {
+        Ok(result) => result.rows().to_vec(),
+        Err(error) => panic!("{sql}\nwas refused: {error:?}"),
+    }
+}
+
+#[test]
+fn a_distance_is_a_value_of_the_row_on_every_route() {
+    let db = support::open(&support::folder("distance-on-every-route"));
+    declare(&db, "docs", "");
+    fill(&db, "docs", 1..=60);
+    let (q, p) = (
+        support::vector(1, DIMENSION),
+        support::vector(37, DIMENSION),
+    );
+    // Each statement runs with the distance as its first sort key (a search) and written so that
+    // no search can take it: the same rows in the same order, the same distances.
+    for template in [
+        "SELECT id, v <=> $q AS distance FROM docs ORDER BY {o} LIMIT 7",
+        "SELECT id FROM docs WHERE tag < 20 ORDER BY {o} LIMIT 5 OFFSET 2",
+        "SELECT id, v <=> $p AS other FROM docs WHERE v <=> $p < 0.9 ORDER BY {o}, id DESC LIMIT 5",
+    ] {
+        let by_search = rows_of(&db, &template.replace("{o}", "v <=> $q"), &q, &p);
+        let by_scan = rows_of(&db, &template.replace("{o}", "(v <=> $q) + 0"), &q, &p);
+        assert!(!by_search.is_empty(), "{template}\nfound nothing");
+        assert!(
+            by_search == by_scan,
+            "{template}\nthe search gave {by_search:?} and the ordinary route {by_scan:?}"
+        );
+    }
+}
+
+#[test]
+fn a_filtered_search_reads_its_index_range_and_a_ranked_one_asks_every_vector() {
+    let db = support::open(&support::folder("counted-small-set-and-rank"));
+    declare(&db, "docs", "");
+    declare(&db, "bare", "");
+    support::run(&db, "CREATE INDEX docs_tag ON docs (tag)");
+    fill(&db, "docs", 1..=200);
+    fill(&db, "bare", 1..=200);
+    let query = support::vector(5, DIMENSION);
+    let ask = |sql: String| {
+        db.execute(&sql, &params! { "q" => query.clone() })
+            .expect(&sql)
+    };
+    // Four rows of each tag: with an index over the filtered column only those four are
+    // compared, without one every row is read.
+    let by_tag = |table: &str| {
+        ask(format!(
+            "SELECT id FROM {table} WHERE tag = 7 ORDER BY v <=> $q LIMIT 3"
+        ))
+    };
+    let (indexed, bare) = (by_tag("docs"), by_tag("bare"));
+    assert_eq!(indexed.rows(), bare.rows(), "the index changes no answer");
+    assert_eq!(indexed.distance_evaluations(), 4, "the rows of the range");
+    assert!(
+        indexed.rows_examined() < bare.rows_examined(),
+        "the table was read"
+    );
+    let range =
+        ask("SELECT id FROM docs WHERE tag >= 7 AND tag < 8 ORDER BY v <=> $q LIMIT 3".into());
+    assert_eq!(range.distance_evaluations(), 4, "the rows of a range");
+    // Ungrouped rows weigh 1 in 16, so 12 rows are few: under INDEXED four rows are compared.
+    let by_index = ask(
+        "SELECT id FROM docs WHERE tag = 7 ORDER BY v <=> $q USE VECTOR INDEXED LIMIT 3".into(),
+    );
+    assert_eq!(by_index.distance_evaluations(), 4, "the rows of the tag");
+    // Ten tags are 40 of 200 rows: not few, so the index buys nothing and costs nothing; four
+    // rows of a range are few.
+    let many = |table: &str| {
+        ask(format!(
+            "SELECT id FROM {table} WHERE tag IN (10, 11, 12, 13, 14, 15, 16, 17, 18, 19) \
+             ORDER BY v <=> $q LIMIT 3"
+        ))
+    };
+    let (indexed, bare) = (many("docs"), many("bare"));
+    assert_eq!(indexed.rows(), bare.rows(), "the index changes no answer");
+    assert_eq!(
+        indexed.distance_evaluations(),
+        bare.distance_evaluations(),
+        "many rows are not walked"
+    );
+    assert_eq!(indexed.rows_examined(), bare.rows_examined(), "nor read");
+    // A rank policy: EXACT asks every allowed vector, and each of the 40 candidates is one
+    // lookup of its joined row (counted as a row examined).
+    support::run(
+        &db,
+        "CREATE TABLE results (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL)",
+    );
+    support::run(&db, "CREATE INDEX results_task ON results (task_id)");
+    let policy = "JOIN results ON task_id, FORMULA '{vector_score}', SORT_KEY worth";
+    support::run(
+        &db,
+        &format!(
+            "CREATE TABLE tasks (id INTEGER PRIMARY KEY, v VECTOR({DIMENSION}) RANK_POLICY ({policy}))"
+        ),
+    );
+    for n in 1..=40_i64 {
+        let values = params! { "v" => support::vector(n, DIMENSION) };
+        db.execute(
+            &format!("INSERT INTO tasks (id, v) VALUES ({n}, $v)"),
+            &values,
+        )
+        .expect("task");
+        support::run(
+            &db,
+            &format!("INSERT INTO results (id, task_id) VALUES ({n}, {n})"),
+        );
+    }
+    let ask_tasks = |rank: &str| {
+        ask(format!(
+            "SELECT id FROM tasks ORDER BY v <=> $q USE VECTOR EXACT {rank} LIMIT 3"
+        ))
+    };
+    let (plain, ranked) = (ask_tasks(""), ask_tasks("USE RANK worth"));
+    assert_eq!(
+        ranked.distance_evaluations(),
+        40,
+        "EXACT asks every allowed vector"
+    );
+    assert_eq!(
+        ranked.rows_examined(),
+        plain.rows_examined() + 40,
+        "one lookup per candidate"
+    );
+}
+
 /// A table `t` whose one VECTOR column `v` is declared with this text, as a statement.
 fn with_vector(declared: &str) -> String {
     format!("CREATE TABLE t (id INTEGER PRIMARY KEY, ctx TEXT NOT NULL, v {declared})")
@@ -1287,13 +1297,13 @@ fn the_index_clauses_are_read_checked_and_printed_back() {
         ),
         (
             "b",
-            "VECTOR(4) WITH (quantization = 'F32') AUTO_INDEX_AT 5000",
-            &["b", "VECTOR", "4", "AUTO_INDEX_AT", "5000"],
+            "VECTOR(4) WITH (quantization = 'F32') INDEXING_THRESHOLD 5000",
+            &["b", "VECTOR", "4", "INDEXING_THRESHOLD", "5000"],
         ),
         (
             "c",
             "VECTOR(4) PARTITION_KEY (ctx) SEARCH_MODE INDEXED \
-             AUTO_INDEX_AT 18446744073709551615 CONSOLIDATION NONE",
+             INDEXING_THRESHOLD 18446744073709551615 COMPACTION NONE",
             &[
                 "c",
                 "VECTOR",
@@ -1304,20 +1314,20 @@ fn the_index_clauses_are_read_checked_and_printed_back() {
                 "256",
                 "SEARCH_MODE",
                 "INDEXED",
-                "AUTO_INDEX_AT",
+                "INDEXING_THRESHOLD",
                 "18446744073709551615",
-                "CONSOLIDATION",
+                "COMPACTION",
                 "NONE",
             ],
         ),
         (
             "d",
-            "VECTOR(4) consolidation (tombstone_percent = 100)",
+            "VECTOR(4) compaction (tombstone_percent = 100)",
             &[
                 "d",
                 "VECTOR",
                 "4",
-                "CONSOLIDATION",
+                "COMPACTION",
                 "TOMBSTONE_PERCENT",
                 "=",
                 "100",
@@ -1325,12 +1335,12 @@ fn the_index_clauses_are_read_checked_and_printed_back() {
         ),
         (
             "e",
-            "VECTOR(4) CONSOLIDATION (CHANGE_PERCENT = 1, TOMBSTONE_PERCENT = 100)",
+            "VECTOR(4) COMPACTION (CHANGE_PERCENT = 1, TOMBSTONE_PERCENT = 100)",
             &[
                 "e",
                 "VECTOR",
                 "4",
-                "CONSOLIDATION",
+                "COMPACTION",
                 "CHANGE_PERCENT",
                 "=",
                 "1",
@@ -1364,13 +1374,9 @@ fn the_index_clauses_are_read_checked_and_printed_back() {
     support::close(db);
     let db = support::open(&folder);
     assert_eq!(db.declaration("t").expect("the declaration"), printed);
-    let reader = ReadSession::open(&folder).expect("open the store for reading");
+    let reader = support::open_reader(&folder, None);
     assert_eq!(reader.declaration("t").expect("a reader's"), printed);
-    let again = support::open(&support::folder("index-clauses-again"));
-    for statement in printed.split_inclusive(";\n") {
-        support::run(&again, statement);
-    }
-    assert_eq!(again.declaration("t").expect("the declaration"), printed);
+    support::assert_roundtrips("index-clauses", &db, &["t"]);
 }
 
 #[test]
@@ -1394,39 +1400,39 @@ fn the_index_clauses_are_refused_by_kind() {
             "quantization has an invalid vector policy value",
         ),
         (
-            "VECTOR(4) AUTO_INDEX_AT 0",
-            Issue::AutoIndexAtNotPositive,
-            "AUTO_INDEX_AT must be a positive integer",
+            "VECTOR(4) INDEXING_THRESHOLD 0",
+            Issue::IndexingThresholdNotPositive,
+            "INDEXING_THRESHOLD must be a positive integer",
         ),
         (
-            "VECTOR(4) AUTO_INDEX_AT -1",
-            Issue::AutoIndexAtNotPositive,
-            "AUTO_INDEX_AT must be a positive integer",
+            "VECTOR(4) INDEXING_THRESHOLD -1",
+            Issue::IndexingThresholdNotPositive,
+            "INDEXING_THRESHOLD must be a positive integer",
         ),
         (
-            "VECTOR(4) AUTO_INDEX_AT 18446744073709551616",
-            Issue::AutoIndexAtOutOfRange,
-            "AUTO_INDEX_AT is outside the persisted numeric range",
+            "VECTOR(4) INDEXING_THRESHOLD 18446744073709551616",
+            Issue::IndexingThresholdOutOfRange,
+            "INDEXING_THRESHOLD is outside the persisted numeric range",
         ),
         (
-            "VECTOR(4) CONSOLIDATION (CHANGE_PERCENT = 0)",
-            Issue::ConsolidationPercentOutOfRange,
-            "vector consolidation percentages must be integers from 1 through 100",
+            "VECTOR(4) COMPACTION (CHANGE_PERCENT = 0)",
+            Issue::CompactionPercentOutOfRange,
+            "vector compaction percentages must be integers from 1 through 100",
         ),
         (
-            "VECTOR(4) CONSOLIDATION (CHANGE_PERCENT = 101)",
-            Issue::ConsolidationPercentOutOfRange,
-            "vector consolidation percentages must be integers from 1 through 100",
+            "VECTOR(4) COMPACTION (CHANGE_PERCENT = 101)",
+            Issue::CompactionPercentOutOfRange,
+            "vector compaction percentages must be integers from 1 through 100",
         ),
         (
-            "VECTOR(4) CONSOLIDATION (TOMBSTONE_PERCENT = -5)",
-            Issue::ConsolidationPercentOutOfRange,
-            "vector consolidation percentages must be integers from 1 through 100",
+            "VECTOR(4) COMPACTION (TOMBSTONE_PERCENT = -5)",
+            Issue::CompactionPercentOutOfRange,
+            "vector compaction percentages must be integers from 1 through 100",
         ),
         (
-            "VECTOR(4) CONSOLIDATION (CHANGE_PERCENT = 20, TOMBSTONE_PERCENT = 0)",
-            Issue::ConsolidationPercentOutOfRange,
-            "vector consolidation percentages must be integers from 1 through 100",
+            "VECTOR(4) COMPACTION (CHANGE_PERCENT = 20, TOMBSTONE_PERCENT = 0)",
+            Issue::CompactionPercentOutOfRange,
+            "vector compaction percentages must be integers from 1 through 100",
         ),
     ];
     for (declared, wanted, sentence) in refused {
@@ -1447,7 +1453,7 @@ fn the_index_clauses_are_refused_by_kind() {
             "{name} (...) is not part of this library: the index sizes its own groups and measures \
              how far a search scans; for the true nearest rows write USE VECTOR EXACT or \
              SEARCH_MODE EXACT, and to move the size from which AUTO uses the index write \
-             AUTO_INDEX_AT"
+             INDEXING_THRESHOLD"
         )
     };
     for (declared, sentence) in [
@@ -1472,65 +1478,6 @@ fn the_index_clauses_are_refused_by_kind() {
             other => panic!("{sql}\nwas not refused by name: {other:?}"),
         }
     }
-    // A CONSOLIDATION list that is empty, names a member twice or names another member, and
-    // a clause out of its place, are syntax errors.
-    for declared in [
-        "VECTOR(4) CONSOLIDATION ()",
-        "VECTOR(4) CONSOLIDATION (CHANGE_PERCENT = 20, CHANGE_PERCENT = 30)",
-        "VECTOR(4) CONSOLIDATION (LISTS = 20)",
-        "VECTOR(4) AUTO_INDEX_AT 1000 SEARCH_MODE EXACT",
-        "VECTOR(4) AUTO_INDEX_AT 1000 WITH (quantization = 'SQ8')",
-    ] {
-        let sql = with_vector(declared);
-        match support::refusal(&db, &sql) {
-            Error::ParseError(_) => {}
-            other => panic!("{sql}\nwas refused as {other:?}"),
-        }
-    }
     assert!(db.table_names().is_empty(), "a refused statement declared");
     assert_eq!(db.committed_watermark(), fresh);
-}
-
-#[test]
-fn the_inspection_statements_are_read() {
-    let folder = support::folder("inspection-statements");
-    let db = support::open(&folder);
-    declare(&db, "docs", "");
-    let reader = ReadSession::open(&folder).expect("open the store for reading");
-    // Every form, in any letter case, with the rows it returns from a store of one column
-    // with no key and no vector: one index and its one partition.
-    let forms = [
-        ("SHOW VECTOR_INDEXES", 1),
-        ("show vector_indexes", 1),
-        ("SHOW VECTOR_PARTITIONS", 1),
-        ("SHOW VECTOR_PARTITIONS FOR docs.v", 1),
-        ("show vector_partitions for docs.v limit 5", 1),
-        ("SHOW VECTOR_PARTITIONS LIMIT 0", 0),
-        ("SHOW VECTOR_PARTITIONS LIMIT 1 OFFSET 0", 1),
-        ("SHOW VECTOR_PARTITIONS FOR docs.v LIMIT 1 OFFSET 1", 0),
-    ];
-    let before = db.committed_watermark();
-    let tx = db.transaction().expect("begin");
-    for (sql, rows) in forms {
-        assert_eq!(support::rows(&db, sql).len(), rows, "{sql}");
-        assert_eq!(
-            support::rows(&tx, sql).len(),
-            rows,
-            "{sql}, in a transaction"
-        );
-        assert_eq!(support::rows(&reader, sql).len(), rows, "{sql}, a reader");
-    }
-    tx.rollback();
-    assert_eq!(db.committed_watermark(), before);
-    // OFFSET stands only after LIMIT, and FOR names a table and a column.
-    for sql in [
-        "SHOW VECTOR_PARTITIONS OFFSET 1",
-        "SHOW VECTOR_PARTITIONS FOR docs",
-        "SHOW VECTOR_INDEXES FOR docs.v",
-    ] {
-        match support::refusal(&db, sql) {
-            Error::ParseError(_) => {}
-            other => panic!("{sql}\nwas refused as {other:?}"),
-        }
-    }
 }

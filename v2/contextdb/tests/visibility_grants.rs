@@ -5,34 +5,13 @@
 
 mod support;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
-use contextdb::{ContextId, Database, Error, Principal, ScopeLabel, Uuid, Value, params};
+use contextdb::{Database, Error, Principal, Value, params};
 
-use support::Run;
+use support::{Run, acl, context, context_set, label_set};
 
 // ---- who is asking ----
-
-/// Context number `n`.
-fn context(n: u128) -> Uuid {
-    Uuid::from_u128(0x00C0_0000 + n)
-}
-
-/// Access-control id number `n`.
-fn acl(n: u128) -> Uuid {
-    Uuid::from_u128(0x00AC_0000 + n)
-}
-
-fn context_set(numbers: &[u128]) -> BTreeSet<ContextId> {
-    numbers
-        .iter()
-        .map(|n| ContextId::new(context(*n)))
-        .collect()
-}
-
-fn label_set(names: &[&str]) -> BTreeSet<ScopeLabel> {
-    names.iter().map(|name| ScopeLabel::new(*name)).collect()
-}
 
 /// A handle that names this agent and nothing else.
 fn agent(db: &Database, name: &str) -> Database {

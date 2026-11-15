@@ -125,6 +125,54 @@ fn real(number: f64) -> [u8; 8] {
     ordered.to_be_bytes()
 }
 
+/// The values a key of ascending columns was made from; `None` for bytes that are no such key.
+pub(super) fn decode(mut key: &[u8]) -> Option<Vec<Value>> {
+    let whole = |bytes: [u8; 8]| i64::from_be_bytes(bytes) ^ i64::MIN;
+    let mut values = Vec::new();
+    while let Some([tag]) = take(&mut key) {
+        values.push(match tag {
+            0xFE => Value::Null,
+            1 => Value::Bool(take::<1>(&mut key)? != [0]),
+            2 => Value::Int64(whole(take(&mut key)?)),
+            3 => {
+                let ordered = u64::from_be_bytes(take(&mut key)?);
+                let bits = if ordered >> 63 == 0 {
+                    !ordered
+                } else {
+                    ordered ^ (1 << 63)
+                };
+                Value::Float64(f64::from_bits(bits))
+            }
+            4 => {
+                let mut text = Vec::new();
+                loop {
+                    match take(&mut key)? {
+                        [0] => match take(&mut key)? {
+                            [0] => break,
+                            [0xFF] => text.push(0),
+                            _ => return None,
+                        },
+                        [byte] => text.push(byte),
+                    }
+                }
+                Value::Text(String::from_utf8(text).ok()?)
+            }
+            5 => Value::Uuid(Uuid::from_bytes(take(&mut key)?)),
+            6 => Value::Timestamp(whole(take(&mut key)?)),
+            7 => Value::TxId(TxId(u64::from_be_bytes(take(&mut key)?))),
+            _ => return None,
+        });
+    }
+    Some(values)
+}
+
+/// The next bytes of a key, `None` when it is cut short.
+fn take<const N: usize>(key: &mut &[u8]) -> Option<[u8; N]> {
+    let (taken, rest) = key.split_first_chunk()?;
+    *key = rest;
+    Some(*taken)
+}
+
 /// The span of keys between two bounds. A bound stands for every key that begins with it: an
 /// included bound takes them all in, an excluded bound leaves them all out.
 pub(super) fn span(from: Bound<&Key>, to: Bound<&Key>) -> Span {
@@ -300,52 +348,4 @@ impl EntryShape {
         let (key, cut) = encode(values, &self.directions, self.room)?;
         Ok(Entry { key: Key(key), cut })
     }
-}
-
-/// The values a key of ascending columns was made from; `None` for bytes that are no such key.
-pub(super) fn decode(mut key: &[u8]) -> Option<Vec<Value>> {
-    let whole = |bytes: [u8; 8]| i64::from_be_bytes(bytes) ^ i64::MIN;
-    let mut values = Vec::new();
-    while let Some([tag]) = take(&mut key) {
-        values.push(match tag {
-            0xFE => Value::Null,
-            1 => Value::Bool(take::<1>(&mut key)? != [0]),
-            2 => Value::Int64(whole(take(&mut key)?)),
-            3 => {
-                let ordered = u64::from_be_bytes(take(&mut key)?);
-                let bits = if ordered >> 63 == 0 {
-                    !ordered
-                } else {
-                    ordered ^ (1 << 63)
-                };
-                Value::Float64(f64::from_bits(bits))
-            }
-            4 => {
-                let mut text = Vec::new();
-                loop {
-                    match take(&mut key)? {
-                        [0] => match take(&mut key)? {
-                            [0] => break,
-                            [0xFF] => text.push(0),
-                            _ => return None,
-                        },
-                        [byte] => text.push(byte),
-                    }
-                }
-                Value::Text(String::from_utf8(text).ok()?)
-            }
-            5 => Value::Uuid(Uuid::from_bytes(take(&mut key)?)),
-            6 => Value::Timestamp(whole(take(&mut key)?)),
-            7 => Value::TxId(TxId(u64::from_be_bytes(take(&mut key)?))),
-            _ => return None,
-        });
-    }
-    Some(values)
-}
-
-/// The next bytes of a key, `None` when it is cut short.
-fn take<const N: usize>(key: &mut &[u8]) -> Option<[u8; N]> {
-    let (taken, rest) = key.split_first_chunk()?;
-    *key = rest;
-    Some(*taken)
 }

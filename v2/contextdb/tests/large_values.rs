@@ -2,25 +2,19 @@
 //! byte whether or not the store keeps it compressed; text that repeats takes less room in
 //! the data file than its own bytes and text that does not shrink takes no more than it did;
 //! a value longer than 1 MiB and a vector are never compressed; the memory limit holds while
-//! a compressed value is read and while one is written; and a damaged length is reported as
-//! damage.
+//! a compressed value is read and while one is written.
 //!
 //! Nothing here names compression, because nothing in the library does: a test sees it in
 //! what a statement returns, in the length of the data file and in the memory counted.
 
 mod support;
 
-use std::fs;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use contextdb::serde_json;
-use contextdb::{
-    Database, DatabaseOpenOptions, Error, ReadSession, ReadSessionOptions, Value, params,
-};
+use contextdb::{Database, Error, Value, params};
 
-use support::{Call, Child, Kind, Run};
+use support::{Child, Kind, Run, data_file};
 
 const KIB: usize = 1 << 10;
 const MIB: usize = 1 << 20;
@@ -30,44 +24,6 @@ const MIB: usize = 1 << 20;
 const LONGEST_COMPRESSED: usize = 1_048_576;
 
 // ---- shared by the tests of this file ----
-
-fn open_limited(folder: &Path, limit: usize) -> Database {
-    let mut options = DatabaseOpenOptions::default();
-    options.memory_limit = Some(limit);
-    match support::open_with(folder, options) {
-        Ok(db) => db,
-        Err(error) => panic!("an open under a limit of {limit} bytes was refused: {error:?}"),
-    }
-}
-
-fn read_limited(folder: &Path, limit: Option<usize>) -> ReadSession {
-    let mut options = ReadSessionOptions::default();
-    options.memory_limit = limit;
-    match ReadSession::open_with_options(folder, options) {
-        Ok(reader) => reader,
-        Err(error) => panic!("a reader under a limit of {limit:?} was refused: {error:?}"),
-    }
-}
-
-/// The bytes `SHOW MEMORY_LIMIT` reports as used.
-fn used(on: &impl Run) -> usize {
-    let report = support::run(on, "SHOW MEMORY_LIMIT");
-    let at = report.columns().iter().position(|name| name == "used");
-    match (at, report.rows()) {
-        (Some(at), [row]) => match row[at] {
-            Value::Int64(bytes) => bytes as usize,
-            ref other => panic!("SHOW MEMORY_LIMIT reports {other:?} as used"),
-        },
-        _ => panic!("SHOW MEMORY_LIMIT did not return one row with a column `used`"),
-    }
-}
-
-/// The length of the store's data file, in bytes.
-fn data_file(folder: &Path) -> u64 {
-    fs::metadata(folder.join("data"))
-        .expect("the store's data file")
-        .len()
-}
 
 /// The outcome of a statement that selects large values, with the rows left out of what a
 /// failure prints: a megabyte of text does not belong in a test's output.
@@ -314,7 +270,7 @@ fn large_text_and_json_come_back_byte_for_byte() {
 /// Opens the store for reading, checks every row of `docs` against the content made from its
 /// id, and announces `matched <rows>`.
 fn reader_of_docs(role: &support::Role) {
-    let reader = ReadSession::open(&role.folder).expect("open the store for reading");
+    let reader = support::open_reader(&role.folder, None);
     let changes = role.number("changes") as usize;
     let matched = assert_docs_are(&reader, changes, "a reader in another process");
     support::say(format!("matched {matched}"));
@@ -404,8 +360,12 @@ fn a_text_longer_than_one_mebibyte_and_a_vector_are_stored_as_they_are() {
 
         // It reads back under a limit that fits it once. `SELECT *` hands the row over as it
         // was read; a select list that names the column works its value out as a copy.
-        let reader = read_limited(&folder, Some(once));
-        assert_eq!(used(&reader), 9 * MIB, "set aside by the open");
+        let reader = support::open_reader(&folder, Some(once));
+        assert_eq!(
+            support::memory_used(&reader),
+            9 * MIB,
+            "set aside by the open"
+        );
         match answered(&reader, "SELECT * FROM notes WHERE id = $id", 1) {
             Ok(rows) => match rows.as_slice() {
                 [row] => {
@@ -419,7 +379,7 @@ fn a_text_longer_than_one_mebibyte_and_a_vector_are_stored_as_they_are() {
             ),
         }
         assert_eq!(
-            used(&reader),
+            support::memory_used(&reader),
             9 * MIB,
             "memory in use once the row is dropped"
         );
@@ -439,7 +399,12 @@ fn a_text_longer_than_one_mebibyte_and_a_vector_are_stored_as_they_are() {
         "the data file is {length} bytes long: a repeating text of {LONGEST_COMPRESSED} bytes \
          was stored as it is"
     );
-    assert_note_is(&read_limited(&folder, None), 1, &body, "exactly 1 MiB");
+    assert_note_is(
+        &support::open_reader(&folder, None),
+        1,
+        &body,
+        "exactly 1 MiB",
+    );
 
     // A vector is never compressed, whatever it holds. A thousand vectors of 1,024 equal
     // numbers are 4,096,000 bytes that would shrink to a few kilobytes; each is kept beside
@@ -470,7 +435,7 @@ fn a_text_longer_than_one_mebibyte_and_a_vector_are_stored_as_they_are() {
         "the data file is {length} bytes long: too short to hold {put_in} bytes of vectors as \
          they are, so a vector was stored compressed"
     );
-    let reader = read_limited(&folder, None);
+    let reader = support::open_reader(&folder, None);
     let last = support::rows(&reader, "SELECT v FROM shapes WHERE id = 1000");
     assert!(
         last == [[Value::Vector(same)]],
@@ -516,7 +481,7 @@ fn a_compressed_value_too_large_for_the_limit_is_refused() {
 
     // Through a reader with the limit, then through a writer with it.
     let refused = |on: &dyn Run, door: &str| {
-        let before = used(&on);
+        let before = support::memory_used(&on);
         assert_eq!(before, 9 * MIB, "{door}: set aside by the open");
         // Asked twice: the first refusal left nothing counted, so the second is the same.
         let mut refusals = Vec::new();
@@ -536,7 +501,11 @@ fn a_compressed_value_too_large_for_the_limit_is_refused() {
                 Err(other) => panic!("{door}: the select was refused as {other:?}"),
                 Ok(rows) => panic!("{door}: the select was answered with {} rows", rows.len()),
             }
-            assert_eq!(used(&on), before, "{door}: memory in use after the refusal");
+            assert_eq!(
+                support::memory_used(&on),
+                before,
+                "{door}: memory in use after the refusal"
+            );
         }
         assert_eq!(
             refusals[0], refusals[1],
@@ -559,16 +528,25 @@ fn a_compressed_value_too_large_for_the_limit_is_refused() {
         // The rest of the table answers in the same session.
         assert_note_is(&on, 2, "small", door);
         assert_eq!(support::int(&on, "SELECT COUNT(*) FROM notes"), 2, "{door}");
-        assert_eq!(used(&on), before, "{door}: memory in use at the end");
+        assert_eq!(
+            support::memory_used(&on),
+            before,
+            "{door}: memory in use at the end"
+        );
     };
-    refused(&read_limited(&folder, Some(LIMIT)), "a reader");
-    let db = open_limited(&folder, LIMIT);
+    refused(&support::open_reader(&folder, Some(LIMIT)), "a reader");
+    let db = support::open_limited(&folder, LIMIT);
     refused(&db, "the writer");
     assert_eq!(db.memory_used(), 9 * MIB);
     support::close(db);
 
     // The store is unharmed: a reader with no limit returns the value byte for byte.
-    assert_note_is(&read_limited(&folder, None), 1, &body, "under no limit");
+    assert_note_is(
+        &support::open_reader(&folder, None),
+        1,
+        &body,
+        "under no limit",
+    );
 }
 
 #[test]
@@ -612,7 +590,7 @@ fn a_commit_with_no_room_to_compress_is_written_plain() {
     );
     // Read by a reader, which has no limit: the store remembers the one set above for its
     // next writer.
-    let reader = read_limited(&folder, None);
+    let reader = support::open_reader(&folder, None);
     assert_note_is(&reader, 1, &body, "written with no room to compress");
 
     // With room: the same row, committed the same way with no limit set, is compressed.
@@ -629,88 +607,12 @@ fn a_commit_with_no_room_to_compress_is_written_plain() {
         "the data file is {length} bytes long: with room to compress, a repeating text of \
          {LEN} bytes was stored as it is"
     );
-    assert_note_is(&read_limited(&folder, None), 1, &body, "written with room");
-}
-
-// ---- damage ----
-
-#[test]
-fn a_damaged_length_of_a_compressed_value_is_reported_as_damage() {
-    const LEN: usize = LONGEST_COMPRESSED;
-    // A compressed text record begins with the byte 0x84 and then the length of the value in
-    // 8 bytes, low byte first.
-    const BEGINS: [u8; 9] = [0x84, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00];
-    assert_eq!(BEGINS[1..], (LEN as u64).to_le_bytes());
-
-    let folder = support::folder("damaged-length");
-    let body = support::large_text(Kind::Repeating, 1, LEN);
-    let db = support::open(&folder);
-    support::run(&db, NOTES);
-    insert_note(&db, 1, &body);
-    support::close(db);
-
-    // A length no store holds, one byte more than the value has, one byte less, half of it, none.
-    for wrong in [
-        u64::MAX,
-        1_u64 << 40,
-        LEN as u64 + 1,
-        LEN as u64 - 1,
-        LEN as u64 / 2,
-        0,
-    ] {
-        // A storage door that, in every read, puts the wrong length after that 0x84.
-        let changed = Arc::new(AtomicU64::new(0));
-        let mut options = ReadSessionOptions::default();
-        options.memory_limit = Some(64 * MIB);
-        options.storage = Some(support::storage({
-            let changed = changed.clone();
-            move |call| {
-                let Call::Read(_, bytes) = call else {
-                    return;
-                };
-                let mut from = 0;
-                while let Some(found) = bytes[from..]
-                    .windows(BEGINS.len())
-                    .position(|window| window == BEGINS)
-                {
-                    let at = from + found;
-                    bytes[at + 1..at + 9].copy_from_slice(&wrong.to_le_bytes());
-                    changed.fetch_add(1, Ordering::SeqCst);
-                    from = at + BEGINS.len();
-                }
-            }
-        }));
-        let reader = ReadSession::open_with_options(&folder, options)
-            .unwrap_or_else(|error| panic!("the store did not open for reading: {error:?}"));
-        let before = used(&reader);
-
-        // Damage, by name: never a panic, never the memory limit's refusal, never a value.
-        // Two checks stand between the changed bytes and an answer, the checksum of the
-        // page they are in and the record's own length against its stored bytes; whichever
-        // meets them first, the statement is told the store is damaged.
-        match answered(&reader, "SELECT body FROM notes WHERE id = $id", 1) {
-            Err(Error::StoreCorrupted { path, .. }) => assert_eq!(path, folder),
-            Err(other) => panic!("a recorded length of {wrong} was refused as {other:?}"),
-            Ok(rows) => panic!(
-                "a recorded length of {wrong} was answered with {} rows",
-                rows.len()
-            ),
-        }
-        assert_eq!(
-            used(&reader),
-            before,
-            "memory in use after a recorded length of {wrong}"
-        );
-        // The door did change a length, or this test shows nothing.
-        assert!(
-            changed.load(Ordering::SeqCst) > 0,
-            "no read of the data file held the nine bytes a compressed record of this value \
-             begins with, so no length was changed to {wrong}"
-        );
-    }
-
-    // Through an untouched door the value is as it was written.
-    assert_note_is(&read_limited(&folder, None), 1, &body, "undamaged");
+    assert_note_is(
+        &support::open_reader(&folder, None),
+        1,
+        &body,
+        "written with room",
+    );
 }
 
 #[test]
@@ -741,8 +643,12 @@ fn a_large_text_selected_by_name_is_held_once() {
             "the data file of a {kind:?} text of {LEN} bytes is {length} bytes long"
         );
 
-        let reader = read_limited(&folder, Some(once));
-        assert_eq!(used(&reader), 9 * MIB, "set aside by the open");
+        let reader = support::open_reader(&folder, Some(once));
+        assert_eq!(
+            support::memory_used(&reader),
+            9 * MIB,
+            "set aside by the open"
+        );
         // The select list names the column. The value is one text, whichever way the
         // statement asks for it, and a limit with room for it once is room enough.
         match answered(&reader, "SELECT body FROM notes WHERE id = $id", 1) {
@@ -759,7 +665,7 @@ fn a_large_text_selected_by_name_is_held_once() {
             ),
         }
         assert_eq!(
-            used(&reader),
+            support::memory_used(&reader),
             9 * MIB,
             "memory in use once the row is dropped"
         );

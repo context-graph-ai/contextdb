@@ -81,6 +81,25 @@ fn default_now_stores_the_time_the_clock_door_gives() {
         support::int(&db, "SELECT COUNT(*) FROM events WHERE created < NOW()"),
         1
     );
+
+    // A clock set before 1970 gives a negative number of milliseconds, not zero or a refusal.
+    struct Before;
+    impl Clock for Before {
+        fn now(&self) -> SystemTime {
+            UNIX_EPOCH - Duration::from_millis(1_500)
+        }
+    }
+    let mut options = DatabaseOpenOptions::default();
+    options.clock = Some(Arc::new(Before));
+    let early = support::open_with(&support::folder("clock-before-1970"), options)
+        .expect("open the store under a clock before 1970");
+    let declared = "CREATE TABLE e (id INTEGER PRIMARY KEY, made TIMESTAMP NOT NULL DEFAULT NOW())";
+    support::run(&early, declared);
+    support::run(&early, "INSERT INTO e (id) VALUES (1)");
+    assert_eq!(
+        support::rows(&early, "SELECT made FROM e"),
+        [[Value::Timestamp(-1_500)]]
+    );
 }
 
 #[test]

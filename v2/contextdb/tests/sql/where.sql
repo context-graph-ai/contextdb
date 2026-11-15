@@ -79,6 +79,12 @@ SELECT id FROM readings WHERE NULL ORDER BY id;
 ----
 id
 
+# NULL is unknown unless the other side settles the answer, whichever side it is on.
+SELECT NULL AND FALSE AS a, FALSE AND NULL AS b, NULL AND TRUE AS c, TRUE AND TRUE AS d, TRUE OR NULL AS e, NULL OR TRUE AS f, NULL OR FALSE AS g, FALSE OR FALSE AS h, NOT NULL AS i, NULL = NULL AS j;
+----
+a | b | c | d | e | f | g | h | i | j
+false | false | NULL | true | true | true | NULL | false | NULL | NULL
+
 # AND, OR and NOT. AND binds tighter than OR.
 SELECT id FROM readings WHERE a > 6 AND b > 0 ORDER BY id;
 ----

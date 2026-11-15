@@ -8,6 +8,8 @@
 mod alter;
 mod ddl;
 mod expr;
+mod graph;
+mod select;
 
 use std::str::FromStr;
 
@@ -17,6 +19,7 @@ use pest::error::{InputLocation, LineColLocation};
 use super::ast::*;
 use super::{not_carried, not_supported};
 use crate::types::{Error, Result};
+use select::select;
 
 #[derive(pest_derive::Parser)]
 #[grammar = "sql/grammar.pest"]
@@ -26,7 +29,7 @@ type Pair<'a> = pest::iterators::Pair<'a, Rule>;
 
 /// The deepest an expression may nest, in the text and in the tree built from it. It bounds the
 /// parser's own recursion and the recursion of everything that later walks an expression.
-const MAX_EXPR_NESTING: usize = 128;
+pub(crate) const MAX_EXPR_NESTING: usize = 64;
 
 pub(super) fn parse(text: &str) -> Result<Statement> {
     check_source_nesting(text)?;
@@ -38,22 +41,27 @@ pub(super) fn parse(text: &str) -> Result<Statement> {
                 let words: Vec<&str> = part.as_str().split_whitespace().collect();
                 words.join(" ").to_ascii_uppercase()
             }
-            Rule::subquery => "IN (SELECT ...)".to_owned(),
+            Rule::subquery => "INSERT ... SELECT".to_owned(),
             Rule::vector_options => "USE VECTOR with options".to_owned(),
             _ => continue,
         };
         if matches!(&*later, "IVF" | "SEARCH") {
             let instead = "the index sizes its own groups and measures how far a search scans; \
                            for the true nearest rows write USE VECTOR EXACT or SEARCH_MODE EXACT, \
-                           and to move the size from which AUTO uses the index write AUTO_INDEX_AT";
+                           and to move the size from which AUTO uses the index write INDEXING_THRESHOLD";
             return Err(not_carried(&format!("{later} (...)"), instead));
         }
         return Err(not_supported(&later));
     }
-    let pair = read
-        .flatten()
-        .nth(1)
-        .expect("the grammar's statement rule holds one statement");
+    statement(
+        read.flatten()
+            .nth(1)
+            .expect("the statement rule holds one statement"),
+    )
+}
+
+/// The statement one rule of the grammar matched.
+fn statement(pair: Pair) -> Result<Statement> {
     match pair.as_rule() {
         Rule::stored_procedure => Err(Error::StoredProcNotSupported),
         Rule::create_table_stmt => ddl::create_table(pair).map(Statement::CreateTable),
@@ -84,6 +92,10 @@ pub(super) fn parse(text: &str) -> Result<Statement> {
         Rule::select_stmt => select(pair).map(Statement::Select),
         Rule::set_memory_limit => memory_limit(pair).map(Statement::SetMemoryLimit),
         Rule::show_vector_indexes => Ok(Statement::ShowVectorIndexes),
+        Rule::explain_stmt => {
+            let explained = pair.into_inner().next().expect("the statement explained");
+            statement(explained).map(|explained| Statement::Explain(Box::new(explained)))
+        }
         Rule::show_vector_partitions => {
             let mut names = idents(pair.clone()).into_iter();
             let count = |rule, what| {
@@ -124,9 +136,9 @@ fn syntax_error(text: &str, error: &pest::error::Error<Rule>) -> Error {
     }
 }
 
-fn depth_error(depth: usize) -> Error {
+pub(crate) fn depth_error(depth: usize) -> Error {
     refuse(format!(
-        "expression nesting of {depth} is deeper than the limit of {MAX_EXPR_NESTING}"
+        "nesting of {depth} is deeper than the limit of {MAX_EXPR_NESTING}"
     ))
 }
 
@@ -349,58 +361,6 @@ fn direction(written: Option<Pair<'_>>) -> SortDirection {
         Some(written) if written.as_str().eq_ignore_ascii_case("DESC") => SortDirection::Desc,
         _ => SortDirection::Asc,
     }
-}
-
-fn select(pair: Pair<'_>) -> Result<Select> {
-    let mut select = Select {
-        columns: Vec::new(),
-        table: first_ident(pair.clone()),
-        where_clause: where_clause(pair.clone())?,
-        order_by: Vec::new(),
-        use_vector: None,
-        limit: None,
-    };
-    for part in pair.into_inner() {
-        match part.as_rule() {
-            Rule::select_list => {
-                for item in part.into_inner() {
-                    select.columns.push(match item.as_rule() {
-                        Rule::star => SelectColumn {
-                            expr: expr::star(),
-                            alias: None,
-                        },
-                        _ => {
-                            let mut parts = item.into_inner();
-                            SelectColumn {
-                                expr: expr::expr(parts.next().expect("an expression"))?,
-                                alias: parts.next().map(|alias| ident(&alias)),
-                            }
-                        }
-                    });
-                }
-            }
-            Rule::order_by_clause => {
-                for item in part.into_inner() {
-                    let mut parts = item.into_inner();
-                    select.order_by.push(OrderByItem {
-                        expr: expr::expr(parts.next().expect("a sort key"))?,
-                        direction: direction(parts.next()),
-                    });
-                }
-            }
-            Rule::use_vector_clause => {
-                let mode = part.into_inner().next().expect("a mode");
-                select.use_vector = Some(search_mode(&mode));
-            }
-            Rule::limit_clause => {
-                let count = part.into_inner().next().expect("a count");
-                select.limit = Some(number(&count, "LIMIT")?);
-            }
-            // The table and the WHERE clause, read above.
-            _ => {}
-        }
-    }
-    Ok(select)
 }
 
 /// The bytes of `SET MEMORY_LIMIT <count>G|M|K`, or no limit for the word NONE.

@@ -38,3 +38,8 @@ SHOW MEMORY_LIMIT;
 ----
 limit | used | available | startup_ceiling | ceiling_refresh_failures
 none | * | * | * | *
+
+# A ceiling no number holds is a syntax error.
+SET MEMORY_LIMIT 99999999999999999999G;
+----
+error: ParseError

@@ -1,8 +1,6 @@
 //! The rows an UPDATE or DELETE acts on, handed over a batch at a time.
 
-use std::collections::HashMap;
-
-use super::expression::reads;
+use super::expression::{EvalContext, reads};
 use super::table::Source;
 use super::visible::{Reader, Visible};
 use crate::memory::{Budget, Reservation};
@@ -23,8 +21,8 @@ pub(crate) struct Asked<'a> {
     /// cell it is stored as and never loaded.
     pub needed: &'a [bool],
     pub reader: &'a Reader,
-    pub params: &'a HashMap<String, Value>,
-    pub now: i64,
+    /// What the filter is worked out with: the statement's time and the values of its SELECTs.
+    pub ctx: EvalContext<'a>,
 }
 
 /// The most rows one batch holds.
@@ -54,13 +52,13 @@ pub(crate) fn rows_for_write(
     let Asked { table, filter, .. } = *asked;
     let mut filtered = vec![false; table.meta.columns.len()];
     if let Some(filter) = filter {
-        reads(filter, table, asked.params, &mut filtered)?;
+        reads(filter, &table.scope(), asked.ctx.params, &mut filtered)?;
     }
     // What the reader's filter holds is given back when the batch is found.
     let mut seeing = budget.reserve(0, "query")?;
     let visible = Visible::new(table, catalog, asked.reader, &mut seeing)?;
-    let source = Source::new(table, filter, asked.params, asked.now, read, visible)
-        .reading(filtered, asked.needed);
+    let source =
+        Source::new(table, filter, &asked.ctx, read, visible).reading(filtered, asked.needed);
     let mut path = source.choose(&[], asked.assigned)?;
     path.one = false;
     let mut reservation = budget.reserve(0, "query")?;

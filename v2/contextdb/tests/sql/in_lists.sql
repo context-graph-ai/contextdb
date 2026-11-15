@@ -112,17 +112,9 @@ SELECT id FROM stock WHERE (ref, bin) IN (('550e8400-e29b-41d4-a716-446655440002
 id
 2
 
-# Refused by name: a row value anywhere but beside IN, one of another length than its partner,
-# and a list that is a SELECT.
-SELECT id FROM stock WHERE (kind, bin) = ('bolt', 1);
-----
-error: PlanError
-
+# Refused by name: a row value of another length than its partner, and a list that is a
+# SELECT.
 SELECT id FROM stock WHERE (kind, bin) IN (('bolt', 1, 2));
-----
-error: PlanError
-
-SELECT id FROM stock WHERE id IN (SELECT id FROM stock);
 ----
 error: PlanError
 

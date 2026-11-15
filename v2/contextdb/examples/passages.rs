@@ -7,7 +7,7 @@
 //!   dump, declared as Context Graph declares its table. Lines `passages_<count>_...`.
 //! - `passages single <dump folder> <folder>`: the first 10,000 passages, in dump order, of
 //!   the dump's (Context, generation) pair of index 1, in a table whose vector column also
-//!   declares `AUTO_INDEX_AT 1000`. Lines `single_<count>_...`.
+//!   declares `INDEXING_THRESHOLD 1000`. Lines `single_<count>_...`.
 //! - `passages first single|store <dump folder> <store folder>`: what the program starts
 //!   itself as, to open a built store in a new process and run one search.
 //!
@@ -24,7 +24,7 @@
 //! What it does, in order, each store loaded 500 passages to a commit with no memory limit
 //! and every read session opened under 1 GiB unless a line's name says another limit:
 //!
-//! 1. `sealed`: a store whose column declares `AUTO_INDEX_AT 1000000000`, so that no partition
+//! 1. `sealed`: a store whose column declares `INDEXING_THRESHOLD 1000000000`, so that no partition
 //!    is ever grouped. One search of every question with every vector still waiting; cycles
 //!    until nothing waits; its size; EXACT in each scope (`exact_before`).
 //! 2. `built`: the store as its case declares it. Cycles until nothing remains; what
@@ -77,7 +77,7 @@ const DIMENSIONS: usize = 768;
 const PER_COMMIT: usize = 500;
 const ROUNDS: usize = 5;
 /// The clause of a column no partition of which is ever grouped.
-const NEVER_GROUPED: &str = " AUTO_INDEX_AT 1000000000";
+const NEVER_GROUPED: &str = " INDEXING_THRESHOLD 1000000000";
 
 struct Passage {
     id: Uuid,
@@ -208,7 +208,7 @@ impl<'a> Case<'a> {
     }
 
     /// The first 10,000 passages of the pair of index 1, in a column that declares
-    /// `AUTO_INDEX_AT 1000`.
+    /// `INDEXING_THRESHOLD 1000`.
     fn single(dump: &'a Dump) -> Case<'a> {
         let places = 0..dump.passages.len();
         let of_pair = places.filter(|at| dump.passages[*at].pair == 1);
@@ -217,7 +217,7 @@ impl<'a> Case<'a> {
             dump,
             prefix: format!("single_{}_", loaded.len()),
             loaded,
-            declared: " AUTO_INDEX_AT 1000",
+            declared: " INDEXING_THRESHOLD 1000",
             scopes: vec![("", vec![dump.pair(1)])],
             answers: None,
         }
@@ -697,8 +697,8 @@ fn reduced(case: &Case<'_>, store: &Path, sealed: u64, exact: &[Asked]) -> Falli
 fn measure(case: &Case<'_>, folder: &Path, extras: &str) -> Fallible<()> {
     support::must_be_empty(folder);
     std::fs::create_dir_all(folder)?;
-    if case.declared == " AUTO_INDEX_AT 1000" {
-        line(&case.name("auto_index_at"), 1000, "vectors");
+    if case.declared == " INDEXING_THRESHOLD 1000" {
+        line(&case.name("indexing_threshold"), 1000, "vectors");
     }
     let (held, sealed_bytes, exact) = sealed(case, &folder.join("sealed"))?;
     built(case, folder, held, sealed_bytes)?;

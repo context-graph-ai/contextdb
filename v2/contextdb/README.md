@@ -14,21 +14,23 @@ This is the first version of contextdb 2. What it has:
   may move through, edges that may not close a cycle, rows that follow a change of another row;
 - who may see and write a row: Contexts, scope labels and principals;
 - `ALTER TABLE`, `DROP TABLE` and `DROP INDEX`;
-- `INSERT` (also `ON CONFLICT ... DO UPDATE`), `UPDATE`, `DELETE` and `SELECT` over one table;
+- `INSERT` (also `ON CONFLICT ... DO UPDATE`), `UPDATE`, `DELETE` and `SELECT`, which joins
+  tables, groups, takes `WITH`, `UNION`, subqueries, `ROW_NUMBER()` and a pattern over a table
+  of edges (`GRAPH_TABLE`);
 - vector search: the rows nearest a vector by cosine distance, each with its distance, over
   vectors that a column may keep in partitions; exact on request, and through an index that
-  `run_maintenance_cycle` builds and brings up to date once a column holds many vectors;
+  `run_maintenance_cycle` builds and brings up to date once a column holds many vectors; a
+  search can be ranked by a formula the column declares (`USE RANK`);
+- `EXPLAIN` of any `SELECT`, `INSERT`, `UPDATE` or `DELETE`, which says how it would be answered;
 - transactions, whose conflicts are decided when they commit;
 - one process writing a store while any number of other processes read it;
 - a memory limit that holds.
 
-What it does not have yet: joins, grouping, graph patterns, ranked search (`USE RANK`) and sync
-between machines; the statements that use them are listed under Statements, and each is refused
-and changes nothing. Some clauses are accepted, kept and printed back by `.schema`, and nothing
-acts on them yet: `RETAIN` (no row expires), `HISTORY`, `SYNC`, `SYNC CONFLICT`,
-`DELIVERY MANIFEST`, `EDGE DISCARD` and `RANK_POLICY` (which only keeps `ALTER` from dropping or
-renaming a column it reads); so is an index on a JSON field, `CREATE INDEX name ON table ((column -> 'key'))`:
-writes to its table are accepted and pass over it, and no query reads it. `table_meta` reports `RETAIN`, `HISTORY`, `SYNC` and `SYNC CONFLICT`.
+What it does not have yet: sync between machines, recursive queries, and the SQL named under
+Statements as refused; each of those is refused and changes nothing. Some clauses are accepted,
+kept and printed back by `.schema`, and nothing acts on them yet: `RETAIN` (no row expires),
+`HISTORY`, `SYNC`, `SYNC CONFLICT`, `DELIVERY MANIFEST` and `EDGE DISCARD`. `table_meta`
+reports `RETAIN`, `HISTORY`, `SYNC` and `SYNC CONFLICT`.
 
 It is not on crates.io yet. Clone <https://github.com/context-graph-ai/contextdb> and use it from that checkout:
 
@@ -76,7 +78,7 @@ fn main() -> contextdb::Result<()> {
 
 It prints `buy oat milk: 0.006` and then `call the plumber: 1.000`. Call `db.close()?` when you
 are done, as the later programs do: it lets the store go at once, and every later call on the
-handle returns `DatabaseClosed`. After writing vectors, a host calls `db.run_maintenance_cycle()?`
+handle that can fail returns `DatabaseClosed` (the four that return a plain value panic; see Refusals). After writing vectors, a host calls `db.run_maintenance_cycle()?`
 again and again (see Upkeep under Vector search), because this version does not do it by itself;
 a search before that still finds every vector, and reads more to do it. This page is also the
 crate's documentation, and the documentation tests compile this program as it is written here.
@@ -93,12 +95,12 @@ CREATE TABLE [IF NOT EXISTS] name (
          [CONTEXT_ID]
          [SCOPE_LABEL ('label', ...) | SCOPE_LABEL_READ ('label', ...) WRITE ('label', ...)]
          [ACL REFERENCES table (column)]
-         [RANK_POLICY (JOIN table ON column, FORMULA 'formula', SORT_KEY key)],
+         [RANK_POLICY (JOIN table ON column, FORMULA 'formula', SORT_KEY name)],
   column VECTOR(n) [WITH (quantization = 'F32' | 'SQ8')]             -- F32 when left out
                    [PARTITION_KEY (column, ...) [MAX_PARTITIONS m]]  -- m is 256 when left out
                    [SEARCH_MODE AUTO | EXACT | INDEXED]
-                   [AUTO_INDEX_AT a]                                 -- a is 100000 when left out
-                   [CONSOLIDATION NONE | CONSOLIDATION (CHANGE_PERCENT = c, TOMBSTONE_PERCENT = t)],
+                   [INDEXING_THRESHOLD a]                                 -- a is 100000 when left out
+                   [COMPACTION NONE | COMPACTION (CHANGE_PERCENT = c, TOMBSTONE_PERCENT = t)],
   ...,
   [PRIMARY KEY (column, ...)],
   [UNIQUE (column, ...)],
@@ -126,18 +128,27 @@ ALTER TABLE table SET RETAIN ... | SET HISTORY ... | SET SYNC ... | SET SYNC CON
                       | SET MAINTAIN COUNT ...;
 ALTER TABLE table DROP RETAIN;
 ALTER TABLE table ALTER COLUMN column SET MAX_PARTITIONS m | SET SEARCH_MODE mode
-  | SET AUTO_INDEX_AT a | SET AUTO_INDEX_AT DEFAULT
-  | SET CONSOLIDATION NONE | SET CONSOLIDATION (CHANGE_PERCENT = c, TOMBSTONE_PERCENT = t)
-  | SET CONSOLIDATION DEFAULT;
+  | SET INDEXING_THRESHOLD a | SET INDEXING_THRESHOLD DEFAULT
+  | SET COMPACTION NONE | SET COMPACTION (CHANGE_PERCENT = c, TOMBSTONE_PERCENT = t)
+  | SET COMPACTION DEFAULT;
 DROP TABLE [IF EXISTS] table;
 DROP INDEX [IF EXISTS] name ON table;
 INSERT INTO table (column, ...) VALUES (value, ...), (value, ...)
   [ON CONFLICT (column, ...) DO UPDATE SET column = value, ...];
 UPDATE table SET column = value, ... [WHERE condition];
 DELETE FROM table [WHERE condition];
-SELECT column, ... | * FROM table [WHERE condition] [ORDER BY column [ASC | DESC], ...] [LIMIT n];
+[WITH name AS (select), ...]
+SELECT [DISTINCT] expression [AS name], ... | * [FROM table [alias]
+    [[INNER | LEFT] JOIN table [alias] ON condition | CROSS JOIN table [alias]] ...]
+  [WHERE condition] [GROUP BY expression, ...] [HAVING condition]
+  [UNION [ALL] SELECT ...]
+  [ORDER BY expression [ASC | DESC], ...] [LIMIT n] [OFFSET m];
+SELECT ... FROM GRAPH_TABLE(edge_table MATCH (a)-[:TYPE]->{1,n}(b) [WHERE condition]
+  COLUMNS (a.id AS name, b.id AS name, depth AS name));
 SELECT column, ... | * FROM table [WHERE condition]
-  ORDER BY column <=> vector [USE VECTOR AUTO | EXACT | INDEXED] LIMIT k;
+  ORDER BY column <=> vector [USE VECTOR AUTO | EXACT | INDEXED] [USE RANK name] [LIMIT k] [OFFSET m];
+                                                           -- USE RANK needs a LIMIT
+EXPLAIN select | insert | update | delete;
 SET MEMORY_LIMIT 512M;   SET MEMORY_LIMIT NONE;   SHOW MEMORY_LIMIT;
 SHOW VECTOR_INDEXES;
 SHOW VECTOR_PARTITIONS [FOR table.column] [LIMIT count [OFFSET start]];
@@ -145,30 +156,86 @@ SHOW VECTOR_PARTITIONS [FOR table.column] [LIMIT count [OFFSET start]];
 
 - A default is a literal or `NOW()`. A table, column or index name written without quotes is
   folded to lower case, as in Postgres; a state or an edge type is a value and is kept as written.
-- A condition or a value is built from column names, literals, `$name` values,
-  `=  !=  <>  <  <=  >  >=`, `AND`, `OR`, `NOT`, `IS NULL`, `IS NOT NULL`, `+  -  *  /`,
-  parentheses and `NOW()`. A comparison with NULL is not true, as in standard SQL.
+- A condition or a value is built from column names (`table.column` or `alias.column` when
+  tables are joined), literals, `$name` values, `=  !=  <>  <  <=  >  >=`, `AND`, `OR`, `NOT`,
+  `IS NULL`, `IS NOT NULL`, `+  -  *  /`, parentheses, `NOW()` and `COALESCE(a, b, ...)`; no
+  other function is read. A comparison with NULL is not true, as in standard SQL.
+  `x LIKE 'a%'` and `NOT LIKE` match text (`%` any run, `_` one character, backslash escapes
+  either), and `x BETWEEN a AND b` and `NOT BETWEEN` include both ends. A JSON column is read
+  with `->` (the field as JSON) and `->>` (the field as text). JSON values compare by value,
+  so `5` equals `5.0`, and sort as Postgres `jsonb` sorts them: null, string, number, boolean,
+  array, object; an array or an object by its size first; an object's keys shorter first, then
+  by their bytes. `<` and `>` between JSON values are refused. A statement nests at most 64
+  levels of parentheses, `NOT`, unary minus and subqueries; one deeper is a `ParseError`.
+  An index over a field, `CREATE INDEX name ON table ((column -> 'key'))`, answers a condition on
+  that field and follows the rows it indexes.
 - `x IN (a, b, ...)` and `x NOT IN (a, b, ...)` test a value against a list, and
   `(x, y) IN ((a, b), (c, d), ...)` tests several columns at once, both as standard SQL has
-  them. A list is written out: `IN (SELECT ...)` is refused.
-- `SELECT` also takes `COUNT(*)`, `COUNT(column)`, `SUM`, `MIN` and `MAX` over the rows that
-  match, and `AS` to name a column of the result.
+  them. `x IN (SELECT ...)` and `(SELECT ...)` as one value take a subquery that does not read
+  the outer row; one that does, and `EXISTS`, are refused (`SubqueryNotSupported`).
+- `SELECT` takes `COUNT(*)`, `COUNT(column)`, `SUM`, `MIN`, `MAX` and `AVG`, with `GROUP BY` and
+  `HAVING`, `DISTINCT`, and `AS` to name a column of the result. `ORDER BY` takes any
+  expression of the select list or the table; `LIMIT` and `OFFSET` take a number or a `$name`.
+- `INNER JOIN`, `LEFT JOIN` and `CROSS JOIN` join tables, each table with an optional alias.
+  `RIGHT JOIN`, `FULL JOIN` and a second table after a comma are refused. `FROM` takes a table
+  name or a `GRAPH_TABLE`; a subquery there (`FROM (SELECT ...) AS x`) is a `ParseError`, and
+  `WITH x AS (SELECT ...) SELECT ... FROM x` gives the same rows.
+- `UNION` and `UNION ALL` join the answers of several `SELECT`s, and `ORDER BY`, `LIMIT` and
+  `OFFSET` after the last apply to the whole; `UNION` drops repeated rows and `UNION ALL` keeps them. `INTERSECT` and `EXCEPT` are refused.
+- `WITH name AS (select)` names an answer for the statement that follows; `WITH RECURSIVE` is
+  refused (`RecursiveCteNotSupported`).
+- `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)` is the one window function; any other is
+  refused (`WindowFunctionNotSupported`).
+- **Names in a result.** A column is named by its `AS`; without one, a column by its own name,
+  a function by its name (`ROW_NUMBER()` is `row_number`, `COUNT(*)` is `count`), and a
+  subquery that gives one item by that item (`SELECT *` gives `?column?`). A bare `ORDER BY` name that the select list gives is that output column; one that
+  two different items give, as in `SELECT t.id, id FROM t ORDER BY id`, is refused as ambiguous
+  (`PlanError`), where Postgres answers. The same `SELECT` item written twice in `GROUP BY`, `DISTINCT` or `ORDER BY` is one expression.
+- **A whole number and a REAL** are compared by exact value, not as two doubles: a stored
+  9007199254740992.0 is not equal to 9007199254740993, which Postgres calls equal. The two differ only
+  past 2^53, and equality stays transitive across `UNION`, `GROUP BY` and `DISTINCT`. Text
+  quoted into a `UUID` or `TIMESTAMP` column is read as one, and any other comparison of unlike
+  types is refused when the statement is read, whatever the table holds.
+- **`GRAPH_TABLE(edge_table MATCH (a)-[:TYPE]->{1,n}(b) ... COLUMNS (...))`** is a pattern over a
+  table of edges (`source_id`, `target_id`, `edge_type`). With one step and no range it gives a
+  row for each matching edge; with a range `{m,n}` it walks along matching edges and reports
+  each node once, at the shallowest `depth` it is reached in, whether the filter names no start
+  (every node is then a start), one or several (a start a cycle leads back to is reported too); `<-` and `-` (either way)
+  follow an edge against the arrow or from either end. A walk is at most 10 steps
+  (`BfsDepthExceeded`); a step with no upper bound is refused (`UnboundedTraversal`), and so is a
+  label on a node and a pattern with no `COLUMNS`. A pattern stands alone in `FROM`; to join it
+  to a table, name it in a `WITH` first.
+- `ORDER BY ... USE RANK name` orders a search by the formula of the `RANK_POLICY` of the column whose `SORT_KEY` is `name`,
+  highest first, before the `LIMIT` and `OFFSET`. It needs a vector order and a `LIMIT`
+  (`UseRankRequiresVectorOrder`, `UseRankRequiresLimit`), and a rank the column does not
+  declare is refused (`RankPolicyNotFound`).
+- `EXPLAIN` before a `SELECT`, `INSERT`, `UPDATE` or `DELETE` prints how it would be answered
+  and does nothing else: an explained write changes no row. It refuses a statement exactly as
+  the statement would be refused for what is wrong in the statement itself (an unknown column,
+  a number of values that does not match the columns, an `ON CONFLICT` rule the table cannot
+  keep), and not what only its rows would be refused for. A statement with two faults is
+  refused for either one. A `$name` with no value is refused by name (`no value is bound to
+  $name`, as a run refuses it), except a search's vector, which needs no value, and a parameter beside a key
+  column, which gives `partitions: every partition ($name is not bound)`. A bound value of the
+  wrong type or width, and a table with an access list and no principal (`PrincipalRequired`),
+  are refused as a run refuses them.
+  What a similarity search prints is described under [Vector search](#vector-search).
 - `ORDER BY` puts NULL last ascending and first descending.
-- The second `SELECT` is a vector search, and the clauses of a `VECTOR` column and the two
-  `SHOW` statements are described under [Vector search](#vector-search).
+- The vector search form, the clauses of a `VECTOR` column and the two `SHOW` statements are
+  described under [Vector search](#vector-search).
 - `--` and `/* */` comments are read past.
 - The library has one way to run a transaction, `Database::transaction`; its `execute` refuses
   `BEGIN`, `COMMIT` and `ROLLBACK` by name, which are words of the `contextdb` program.
 
-Not in this version, and refused: `JOIN`, `GROUP BY`, `HAVING`, `DISTINCT`, `LIKE`, `BETWEEN`,
-`OFFSET`, `UNION`, `WITH`, subqueries, `INSERT ... SELECT`, graph patterns, `USE RANK`,
-`DROP TRIGGER`, `CREATE PROCEDURE` and `CREATE FUNCTION`, table aliases, `CREATE UNIQUE INDEX`
+Not in this version, and refused: `INSERT ... SELECT`, `INTERSECT`, `EXCEPT`, `RIGHT` and `FULL`
+`JOIN`, recursive `WITH`, `EXISTS`, a subquery that reads the outer row, a window function other
+than `ROW_NUMBER`, `DROP TRIGGER`, `CREATE PROCEDURE` and `CREATE FUNCTION`, `CREATE UNIQUE INDEX`
 (write `UNIQUE` on the column or in the table); and the vector clauses `IVF (...)`, `SEARCH (...)` and
 `WITH (quantization = 'SQ4')`, which no version reads; the refusal of each says what to write instead.
 Most are refused by name; this is the sentence the refusal prints:
 
 ```text
-plan error: LIKE is not supported in this version of the library
+plan error: INSERT ... SELECT is not supported in this version of the library
 ```
 
 ## Column types
@@ -226,7 +293,8 @@ CREATE TABLE chunks (
   it is set when the row is inserted and never changed.
 - **`STATE MACHINE (column: from -> [to, ...])`**: an `UPDATE` may move the column only along a
   listed arrow. A state with no list is a state a row cannot leave. A new row may start in any
-  state.
+  state. A state machine over a column that is `IMMUTABLE`, or on a table that is, is refused
+  when the table is declared, since no update could ever move the state.
 - **`DAG ('edge_type', ...)`** is for a table of edges, one with `source_id UUID`,
   `target_id UUID` and `edge_type TEXT`: an edge of a listed type that would close a cycle is
   refused, by the statement that writes it and again at commit.
@@ -451,18 +519,28 @@ A table opts in by declaring a column:
 What a narrowed handle gets:
 
 - A list read (a scan, a range, a count) leaves hidden rows out, and says nothing of them.
-- A `SELECT` that names one hidden row whole, by its primary key or a `UNIQUE` rule, is refused
+- A `SELECT` that names one hidden row whole, by its primary key or a `UNIQUE` rule (`=` a
+  value, a `$name` or a `(SELECT ...)`; not `IN` or `OR`), is refused
   by the rule that hid it: `ContextScopeViolation`, `ScopeLabelViolation`, `AclDenied`, or
   `PrincipalRequired` for a table that wants a principal and got none. That tells "not yours"
   from "not there", which is an empty answer; the sentence never carries a value or a number of
-  the hidden row.
+  the hidden row. A `GRAPH_TABLE` whose filter names one start node by `id` with `=` (a value,
+  a `$name` or a `(SELECT ...)`) is refused likewise when the node is hidden; a list of starts
+  (`IN`, `OR`) leaves the hidden node out and answers the rest, and NULL names no start.
 - An `UPDATE` or `DELETE` changes no row the handle cannot see, and says it changed none; an
   `INSERT` or `UPDATE` that would put a row outside the handle's Contexts, labels or grants is
   refused by the same kinds, and so is a statement whose `PROPAGATE` would move a row the handle
   may not write.
 - The statements named above as the unnarrowed handle's reach every Context at once and are
   refused with `AdminRequired`, naming the statement.
-  `explain` prints the declaration lines of a search and no record of a partition.
+  The answer, the refusals and `explain` of a narrowed handle do not depend on the counts,
+  vectors or index state of data it may not see, so the state of the index is neither printed
+  nor allowed to refuse it: its `INDEXED` search is answered as
+  `AUTO` answers it, and its `explain` of a search prints the declaration lines (`requested_mode`
+  as declared), `filter_path` and `recovery`, and no `resolved_mode`, `key`, `route`, partition,
+  `small_set` or `refusal` line. The work counters a result carries (`rows_examined`,
+  `distance_evaluations`) count every row the engine read, hidden ones included, so a host that
+  serves a narrowed reader should not pass them on.
 
 ```rust,no_run
 use std::collections::BTreeSet;
@@ -581,9 +659,9 @@ Error: schema invalid: table 'docs' is referenced by table 'chunks', so it was n
 - `SET RETAIN`, `SET HISTORY`, `SET SYNC`, `SET SYNC CONFLICT` and `SET MAINTAIN COUNT` replace
   that clause; `DROP RETAIN` takes `RETAIN` off. No statement removes a `HISTORY` clause: `SET
   HISTORY ALL` is the way back. A new set of counts is installed whole or not at all.
-- `ALTER COLUMN v SET MAX_PARTITIONS m`, `SET SEARCH_MODE mode`, `SET AUTO_INDEX_AT a` and
-  `SET CONSOLIDATION ...` change a `VECTOR` column; `DEFAULT` after `AUTO_INDEX_AT` or
-  `CONSOLIDATION` puts back the default.
+- `ALTER COLUMN v SET MAX_PARTITIONS m`, `SET SEARCH_MODE mode`, `SET INDEXING_THRESHOLD a` and
+  `SET COMPACTION ...` change a `VECTOR` column; `DEFAULT` after `INDEXING_THRESHOLD` or
+  `COMPACTION` puts back the default.
 - `DROP TABLE` refuses a table another table references, and `DROP INDEX name ON table` names
   the table, because two tables may use one index name. `IF EXISTS` makes a missing table or
   index a no-op.
@@ -666,14 +744,29 @@ SELECT id, embedding <=> $q AS distance FROM notes ORDER BY distance LIMIT 10;
   vector is NULL is in no answer. The distance to a vector of all zeros is 1.
 - How much of the column a search compares with `$q` is the search's mode: `EXACT` compares
   every stored vector and returns the true nearest rows; `INDEXED` chooses among them through
-  the column's index; `AUTO`, the default, is `EXACT` until a column is large and then uses the
+  the column's index (a narrowed handle's `INDEXED` is `AUTO`); `AUTO`, the default, is `EXACT` until a column is large and then uses the
   index (the paragraph on modes below).
 
-Only `<=>`, cosine, is here: pgvector's `<->` and `<#>` are a parse error. `<=>` has a value
-only for the rows of a search, so it is refused everywhere else: in `WHERE`,
-in the select list of a statement that does not order by it, in an `INSERT`, `UPDATE` or
-`DELETE`, with a vector other than the one the statement orders by, and in an `ORDER BY` that
-is `DESC`, has a second item or has no `LIMIT`; a search takes no `OFFSET` either.
+Only `<=>`, cosine, is here: pgvector's `<->` and `<#>` are a parse error. A distance is a value
+of the row, so `<=>` stands wherever an expression may in a `SELECT`: in `WHERE`, in the select
+list, farthest first (`DESC`), as one of several sort keys, between two columns, and with no
+`LIMIT`, which orders every row that has a vector. A search takes `OFFSET` after its `LIMIT`. It is
+refused in an `UPDATE`'s value and in a `DELETE`'s filter, and on a table that
+declares `PROPAGATE ON STATE ... EXCLUDE VECTOR` it is answered only as
+`ORDER BY column <=> vector LIMIT n`. `USE VECTOR` on an `ORDER BY` that is not a distance is refused (`UseVectorRequiresVectorOrder`).
+
+`ORDER BY column <=> vector USE RANK name LIMIT n` orders the rows by the formula of the
+column's `RANK_POLICY` instead of by distance, highest rank first, before `LIMIT` and `OFFSET`
+are applied. The policy gives each row the row of the table named after `JOIN` that is found
+through the column named after `ON` (the joined table needs an index that leads with it): of
+the rows found that the reader may see, the one of lowest key; with none, its columns are NULL.
+`FORMULA` is numbers and `{column}` names of either table, and `{vector_score}`, which is one
+minus the distance, joined by `+` and `*` or written as `coalesce(<formula>, <number>)`. A row
+with no rank comes last, and rows of one rank in key order. No rank or score column is added to
+the answer. The policy is named by its `SORT_KEY`: a column `v VECTOR(2) RANK_POLICY (JOIN
+results ON task_id, FORMULA '{confidence} + {vector_score} * coalesce({success}, 1.0)', SORT_KEY
+effective_confidence)` is searched by `ORDER BY v <=> [1.0, 0.0] USE RANK effective_confidence
+LIMIT 6`.
 
 **Upkeep.** Beside every stored vector the engine keeps a one-byte copy of each of its numbers
 and packs the copies of many vectors into a block, which a search screens quickly to rule most
@@ -692,7 +785,7 @@ built, each step in a commit of its own: begin, ten rounds that find the centres
 vectors under them, pack the groups into blocks, measure (twice), and put the new grouping in
 force. A partition is grouped again when the vectors written, removed or changed since reach
 `CHANGE_PERCENT` of its grouping (20 when left out) or the removed or changed ones reach
-`TOMBSTONE_PERCENT` (10); `CONSOLIDATION NONE` never groups it again. The call returns a
+`TOMBSTONE_PERCENT` (10); `COMPACTION NONE` never groups it again. The call returns a
 `MaintenanceReport`, and its `vector` field says what is left:
 `maintenance_vectors_done` and `maintenance_vectors_remaining` (vectors), `remaining_partitions`
 (partitions with a grouping due or being built) and `stalled_partitions` (those whose last step
@@ -732,24 +825,26 @@ the statement's, else the column's, else `AUTO`.
 - `INDEXED` searches the waiting vectors of each selected partition and, of the rest, only
   the vectors the index chooses (the paragraph on the index below). A partition with no grouping,
   or with a grouping of one group, has nothing to choose among, and is searched as `EXACT`
-  searches it. `INDEXED` is refused, before anything is read, when a selected partition's
-  writes are far ahead of upkeep (for a partition with no grouping or a grouping of one group,
-  the vectors outside its grouping number at least twice `AUTO_INDEX_AT`; for one with more
-  groups, at least twice what makes it due to be grouped again, which under
-  `CONSOLIDATION NONE` is never), and when a filter on rows leaves it nothing to choose among, as the
-  paragraph on filters below says.
+  searches it. For the unnarrowed handle `INDEXED` is refused, before anything is read, where
+  no index can answer: when a
+  selected partition's writes are far ahead of upkeep (for a partition with no grouping or a
+  grouping of one group, the vectors outside its grouping number at least twice
+  `INDEXING_THRESHOLD`; for one with more groups, at least twice what makes it due to be grouped
+  again, which under `COMPACTION NONE` is never), whatever the filter is, even a
+  key; and when a filter on rows leaves it nothing to choose among, as the paragraph on filters
+  below says.
 - `AUTO`, which is the default, adds up the vectors of the partitions the statement selects.
-  Below `AUTO_INDEX_AT` it is `EXACT`. From there on each selected partition that has a
+  Below `INDEXING_THRESHOLD` it is `EXACT`. From there on each selected partition that has a
   grouping and is not far behind is searched as `INDEXED` searches it, and every other
   partition as `EXACT` does. `AUTO` is never refused for a grouping.
 
-`AUTO_INDEX_AT` is 100,000 when not written. Until a column holds that many vectors in all its
+`INDEXING_THRESHOLD` is 100,000 when not written. Until a column holds that many vectors in all its
 partitions together (or declares `SEARCH_MODE INDEXED`), no centre, sketch or mean is
 written, and `durable_index_bytes` is 0 unless removed or changed rows (10% by default) have
 given a partition a grouping of one group, which takes 28 bytes. In a column that has reached it, a partition is grouped once it
 holds a hundredth of it, 1,000 vectors when nothing is written, so a store of many middling
 partitions is indexed too; a partition of a few hundred vectors is not cut into groups. A
-declared `AUTO_INDEX_AT` of any size is served. A column that should never be grouped declares
+declared `INDEXING_THRESHOLD` of any size is served. A column that should never be grouped declares
 one it will not reach.
 
 **The index.** An indexed search of a partition that has groups compares the search vector with
@@ -772,13 +867,25 @@ kinds, rows written after the build that are unlike the rows the build saw, and 
 other than ten are not what the measure was taken on. `USE VECTOR EXACT` or `SEARCH_MODE EXACT`
 is exact.
 
-A search with a filter on rows uses the index too. The filter is asked of each row the search
-visits, and the search widens until it holds as many allowed rows as were asked for: a filter
-that passes most rows costs what the unfiltered search costs, and one that passes few costs
-more, up to the work of `EXACT`. `INDEXED` is refused by name only when a filter passes too few
-rows for the index to choose among, because being sure of the answer would mean asking the filter
-of the whole table under the index's name; `AUTO` does that work and returns every row there
-is.
+A search with a filter on rows is answered one of two ways, and which is decided by counting.
+When the filter reaches rows through an index or a key (`filter_path` in `EXPLAIN`, below; ranges joined by `OR` give no single range and read every row), the
+engine first counts the rows that path reaches, from the index entries or the keys alone and
+reading no row, and stops counting one past the bound. If there are at most as many as a 128th of
+the vectors of the selected partitions that an index with several groups answers plus a 16th of
+the vectors of the others, and never fewer than the rows the statement asks for (`LIMIT` plus
+`OFFSET`, one more for a second sort key), those rows are read and compared with the search
+vector one by one, whatever the mode: the answer is exact, and no index is searched. A row the
+reader may not see still counts. A filter that reads the whole table, or no index or key, is
+never counted so, and neither is one that reaches more rows than the bound. Otherwise the search
+goes through the index, or exactly, and the filter is asked of each row it visits; the search
+widens until it holds as many allowed rows as were asked for: a filter that passes most rows
+costs what the unfiltered search costs, and one that passes few costs more, up to the work of
+`EXACT`. For the unnarrowed handle `INDEXED` is refused by name only when a filter passes too few rows for the index to
+choose among, because being sure of the answer would mean asking the filter of the whole table
+under the index's name; `AUTO` does that work and returns every row there is. `EXPLAIN` prints
+`small_set: yes` when the filter reaches few enough rows to be compared one by one, and `no`
+when it reaches more; the line is left out when the filter has no index or key to read by, and
+then `recovery:` names the index to create.
 
 ```text
 notes.embedding cannot be searched INDEXED for this statement now: its index is behind its writes, or the statement's filter leaves the index nothing to choose among; run a maintenance cycle, or use EXACT or AUTO
@@ -790,7 +897,8 @@ the rows whose distance it worked out. It is an exact count, the same on every r
 same store, and 0 for any other statement. An indexed search usually counts far fewer than an
 exact one, and can count more when it leaves few groups out, because it estimates a sketch of
 every vector it keeps; each of those counts an eighth of the bytes. `Database::explain`, and
-`ReadSession::explain`, return what a similarity search would do, without running it. This
+`ReadSession::explain`, return what a statement would do, without running it (the `EXPLAIN`
+statement under Statements gives the same lines as the rows of a `QUERY PLAN` column). This
 program builds a store of 2,000 vectors, runs upkeep as above, and searches it both ways:
 
 ```rust,no_run
@@ -815,7 +923,7 @@ fn vector(id: u64) -> Vec<f32> {
 fn main() -> contextdb::Result<()> {
     let db = Database::open("./notes-index")?;
     db.execute(
-        "CREATE TABLE notes (id INTEGER PRIMARY KEY, embedding VECTOR(8) AUTO_INDEX_AT 1000)",
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, embedding VECTOR(8) INDEXING_THRESHOLD 1000)",
         &params! {},
     )?;
     let tx = db.transaction()?;
@@ -864,7 +972,7 @@ INDEXED: 225 distance evaluations
 the same ten rows: true
 requested_mode: AUTO
 resolved_mode: AUTO
-effective_auto_index_at: 1000
+effective_indexing_threshold: 1000
 aggregate_allowed_vectors: 2000
 partition_key_columns: []
 partitions: 1
@@ -873,18 +981,32 @@ partition: {}
   lists: 45
   probes: 8
   live_rows: 2000
-  outside_grouping: 0
+  unindexed_rows: 0
 refusal: none
 ```
 
 `lists` is the groups of the grouping in force and `probes` the most of them a search scanned
-for the questions its build made, `outside_grouping` the slots in blocks written since (stale ones
+for the questions its build made, `unindexed_rows` the slots in blocks written since (stale ones
 included) plus the vectors still waiting, and `route` is `exact` or `indexed`; `refusal` is `none` or, for INDEXED over a partition that is
 behind its writes, the sentence the search would be refused with (the refusal for a filter is
-known only when the search runs). A statement that names a partition with a `$name` has nothing to select
-with, since `explain` binds nothing: it lists every partition of the column and says so,
-`partitions: every partition ($t is not bound)`. `explain` of a statement that is not a
-similarity search is refused as a later version's.
+known only when the search runs); a narrowed handle is given no `refusal` line. A statement that names a partition with a `$name` has nothing to select
+with, when `Database::explain` is given no value for it: it lists every partition of the column and says so,
+`partitions: every partition ($t is not bound)`.
+
+When the search has a filter on rows whose every name has a value, the lines before `refusal`
+also say how the filter is read: `filter_path:` with the index or key it goes through, or `none`; the
+`predicates_pushed` and `indexes_considered` lines of any other statement; `small_set: yes` or
+`no` (the paragraph on filters above), only when the filter has a path; and, when no index
+serves, `recovery:` with the `CREATE INDEX` statement that would. Of a statement that is not a
+similarity search, `explain` says the path each table is read by: `IndexScan { index: name }` with the
+columns it pushes into the index and why each other index was passed over, or `Scan`; a join
+says it for each table; a grouped count says `maintained count: used (...)` when a count the
+table keeps serves it and otherwise `maintained count: not declared` with the `ALTER TABLE ... SET
+MAINTAIN COUNT` that would. An `INSERT`, `UPDATE` or `DELETE` is explained as it would run
+and changes nothing. What is wrong with the statement itself (an unknown column, a
+value count that does not match the columns, a conflict rule the table cannot keep) is refused
+as the statement is, before anything is read; what is wrong only with the rows it would meet
+(a subquery that gives several rows where one is wanted) is not.
 
 **Quantization.** `WITH (quantization = 'SQ8')` on a column keeps each vector as one scale and
 one whole number from -127 to 127 for each of its numbers, so a vector of `n` numbers takes
@@ -914,8 +1036,8 @@ quantization: F32
 vector_count: 2000
 …
 search_mode: AUTO
-declared_auto_index_at: 1000
-effective_auto_index_at: 1000
+declared_indexing_threshold: 1000
+effective_indexing_threshold: 1000
 …
 durable_vector_bytes: 32000
 durable_index_bytes: 7856
@@ -932,7 +1054,7 @@ table: notes
 column: embedding
 partition_key: {}
 live_rows: 2000
-pending_inserts: 0
+pending_tuples: 0
 tombstones: 0
 durable_vector_bytes: 32000
 durable_index_bytes: 7856
@@ -948,13 +1070,14 @@ probes: 8
 recovery_action: none
 ```
 
-`.explain <sql>` in the shell prints what `Database::explain` returns, the text shown above.
+`.explain <sql>` in the shell prints what `Database::explain` returns, the text shown above. A
+statement with two faults may be refused for either.
 
 Inspection tells the groups a partition has (`lists`) and the most groups a search scanned
 while the index was measured (`probes`); it does not print the measured distance or width. A
 column with no `PARTITION_KEY` has one row in `SHOW VECTOR_PARTITIONS`, with `partition_key`
 `{}`, and a partitioned column with no vector has none. A partition's `maintenance_state` is `idle`, `pending` (a grouping is due and not begun),
-`building` or `stalled`, and its `maintenance_reason` says why upkeep has work: `first_grouping`,
+`building` or `stalled`, and its `maintenance_reason` says why upkeep has work: `unindexed`,
 `changes`, `tombstones`, `damaged` or `memory_limit`. For `pending` and `building` the
 `recovery_action` is `run a maintenance cycle`, and for `stalled` it is `raise the memory limit`.
 
@@ -1103,8 +1226,7 @@ A statement ends at `;`. `BEGIN;`, `COMMIT;` and `ROLLBACK;` run a transaction, 
 `--write`; a `BEGIN` inside a transaction, and a `COMMIT` or `ROLLBACK` outside one, change nothing,
 answer `ok` and print a `warning:` line on the error stream; `.tables` lists
 the tables, `.schema <table>` prints a table's declaration, `.explain <sql>` prints how a
-similarity search would be answered without running it (anything else it refuses like a statement
-of a later version), and `.help` lists the commands. With
+statement would be answered without running it, and `.help` lists the commands. With
 statements piped in there is no prompt, and a refusal does not stop what comes after it. A
 refused statement or command is one line on the error stream, `Error: ` and then the refusal's
 sentence, or the program's own sentence where one of its options is the way on; a line that
@@ -1123,7 +1245,10 @@ options, the exit statuses and the JSON forms.
 
 ## Numbers
 
-Measured at one commit by `v2/numbers.sh`, which prints them again on any machine: a release
+Measured at one commit, `4b31bf214`, by `v2/numbers.sh`, which prints them again on any machine.
+That commit is before the joins, grouping, graph patterns and the other SQL above were added, so
+the two counts below are of that engine; `docs/performance/README.md` has the bars the engine is
+held to and the newest figure against each. A release
 build on a 16-core AMD Ryzen 9 9955HX with 64 GB of memory and an NVMe drive, running Linux and
 nothing else. Every search time is the 95th percentile of 100 questions asked one after the
 other by one thread, in a read session under a 1 GiB memory limit unless a row says 64 MiB, in
@@ -1152,11 +1277,11 @@ how many of the 100 questions got all ten.
 | Lines that differ from redb 4.1.0 in the storage library under the engine, which is redb 4.1.0 with the changes listed in `v2/redb/README.md` | 626 |
 
 Searches for the ten nearest, indexed beside exact from the same run. Where a store is below
-`AUTO_INDEX_AT` nothing is grouped and an indexed search is the exact one.
+`INDEXING_THRESHOLD` nothing is grouped and an indexed search is the exact one.
 
 | Search | Indexed | Exact | Recall, questions with all ten |
 |---|---|---|---|
-| 10,000 generated vectors, one partition, 100 groups (`AUTO_INDEX_AT 1000`) | 0.544 ms | 1.194 ms | 0.9960, 96 of 100 |
+| 10,000 generated vectors, one partition, 100 groups (`INDEXING_THRESHOLD 1000`) | 0.544 ms | 1.194 ms | 0.9960, 96 of 100 |
 | 100,008 real passages, eight partitions, 884 groups: one partition | 0.696 ms | 1.407 ms | 1.0000, 100 of 100 |
 | the same: several partitions | 1.568 ms | 3.829 ms | 0.9990, 99 of 100 |
 | the same: all eight | 4.115 ms | 10.904 ms | 0.9990, 99 of 100 |
@@ -1179,3 +1304,14 @@ With `WITH (quantization = 'SQ8')` the same two stores of real passages take 0.4
 100,008). Searched exactly, the same ten rows come back as from the full-precision store on 88,
 84 and 79 questions of 100 in the 11,588 (one, several, all partitions) and on 86, 83 and 85 in
 the 100,008.
+
+## Questions
+
+**Do a row, its relationships and its vectors commit together?** Yes. A relationship is a row in
+a table of edges (`source_id`, `target_id`, `edge_type`) and a vector is a column of a row, so
+all three are rows of tables, and one commit writes every row of it, the values kept beside
+them, the index entries, the counts, the schema records and the vector part's records in one
+storage transaction: after a kill either all of it is there or none. A statement run on its own
+is a commit of its own; to write a row, its edges and its vector together, run the statements in
+one `Database::transaction` and call `commit`, and a transaction dropped or rolled back writes
+none of them.

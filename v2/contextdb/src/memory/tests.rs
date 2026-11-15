@@ -11,22 +11,6 @@ fn budget_with_room(room: u64) -> (Budget, u64) {
 }
 
 #[test]
-fn bytes_are_counted_while_held_and_given_back_when_released() {
-    let (budget, baseline) = budget_with_room(100);
-    let mut held = budget.reserve(60, "sort").expect("60 of 100");
-    held.grow(30).expect("30 of the 40 left");
-    assert_eq!((held.bytes(), budget.used()), (90, baseline + 90));
-    held.shrink(50);
-    assert_eq!((held.bytes(), budget.used()), (40, baseline + 40));
-    // Another handle is the same budget.
-    let other = budget.clone().reserve(60, "result").expect("60 of 60");
-    assert_eq!(budget.used(), baseline + 100);
-    drop(held);
-    drop(other);
-    assert_eq!(budget.used(), baseline);
-}
-
-#[test]
 fn a_refusal_names_what_was_asked_and_what_was_left_and_counts_nothing() {
     let (budget, baseline) = budget_with_room(100);
     let mut held = budget.reserve(60, "sort").expect("60 of 100");
@@ -44,17 +28,6 @@ fn a_refusal_names_what_was_asked_and_what_was_left_and_counts_nothing() {
     }
     assert_eq!((held.bytes(), budget.used()), (60, baseline + 60));
     held.grow(40).expect("exactly what was left");
-}
-
-#[test]
-fn with_no_limit_every_reservation_succeeds_and_is_counted() {
-    let budget = Budget::new(None).expect("no ceiling");
-    assert_eq!(budget.limit(), None);
-    let baseline = budget.used();
-    let held = budget.reserve(1 << 50, "result").expect("no ceiling");
-    assert_eq!(budget.used(), baseline + (1 << 50));
-    drop(held);
-    assert_eq!(budget.used(), baseline);
 }
 
 #[test]

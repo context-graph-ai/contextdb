@@ -1,10 +1,8 @@
-//! Tests of this part's two pure functions: reading a moment, and bringing a value to a type.
-
-use serde_json::json;
+//! Tests of this part's two pure functions: reading a moment, and refusing a wrong type.
 
 use super::typed;
 use crate::types::timestamp_millis;
-use crate::types::{ColumnDef, ColumnType, Error, Uuid, Value};
+use crate::types::{ColumnDef, ColumnType, Error, Value};
 
 #[test]
 fn an_iso_8601_moment_is_read_as_milliseconds_since_1970_utc() {
@@ -45,7 +43,7 @@ fn an_iso_8601_moment_is_read_as_milliseconds_since_1970_utc() {
 }
 
 #[test]
-fn a_value_is_brought_to_its_columns_type_or_refused() {
+fn a_value_of_another_type_is_refused_naming_the_type_expected_and_the_one_given() {
     let typed = |column_type, value| {
         let column = ColumnDef {
             name: "c".to_owned(),
@@ -59,39 +57,7 @@ fn a_value_is_brought_to_its_columns_type_or_refused() {
     };
     let text = |text: &str| Value::Text(text.to_owned());
 
-    // The documented conversions, and a value that already is of the type.
-    for (column_type, given, stored) in [
-        (ColumnType::Real, Value::Int64(2), Value::Float64(2.0)),
-        (
-            ColumnType::Uuid,
-            text("550E8400-E29B-41D4-A716-446655440000"),
-            Value::Uuid(Uuid::from_u128(0x550e_8400_e29b_41d4_a716_4466_5544_0000)),
-        ),
-        (
-            ColumnType::Timestamp,
-            text("1970-01-01T00:00:01Z"),
-            Value::Timestamp(1_000),
-        ),
-        (
-            ColumnType::Json,
-            text(r#"[1, "two"]"#),
-            Value::Json(json!([1, "two"])),
-        ),
-        (
-            ColumnType::Vector(3),
-            text("[1, 2.5, -3]"),
-            Value::Vector(vec![1.0, 2.5, -3.0]),
-        ),
-        (ColumnType::Text, text("kept"), text("kept")),
-        (ColumnType::Integer, Value::Null, Value::Null),
-    ] {
-        assert_eq!(
-            typed(column_type, given).expect("a value that fits"),
-            stored
-        );
-    }
-
-    // Anything else is refused by the column's name, and says what was expected and given.
+    // A value of another type is refused by the column's name, and says what was expected and given.
     for (column_type, given, expected, actual) in [
         (ColumnType::Integer, text("three"), "INTEGER", "Text"),
         (

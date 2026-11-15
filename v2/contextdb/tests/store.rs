@@ -22,10 +22,7 @@ fn a_fresh_store_is_one_folder_and_works_with_no_configuration() {
         other => panic!("a fresh store answered {other:?} when asked for a table"),
     }
 
-    support::run(
-        &db,
-        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
-    );
+    support::run(&db, support::NOTES);
     assert_eq!(db.table_names(), ["notes"]);
     db.execute(
         "INSERT INTO notes (id, body) VALUES ($id, $body)",
@@ -49,9 +46,7 @@ fn what_was_committed_is_there_after_close_and_reopen() {
     let db = support::open(&folder);
     support::declare(&db);
     support::insert(&db, 1..=20);
-    let tx = db.transaction().expect("begin");
-    support::insert(&tx, 21..=40);
-    tx.commit().expect("commit");
+    support::insert_together(&db, 21..=40);
     support::run(&db, "DELETE FROM t WHERE id > 35");
     support::close(db);
 
@@ -62,6 +57,23 @@ fn what_was_committed_is_there_after_close_and_reopen() {
     support::insert(&db, 36..=36);
     support::close(db);
     support::assert_rows_are(&support::open(&folder), 1..=36);
+
+    // A handle closed here refuses by name, a second close is allowed.
+    let db = support::open(&folder);
+    let tx = db.transaction().expect("begin");
+    db.close().expect("close");
+    db.close().expect("close a second time");
+    let select = "SELECT id FROM t";
+    assert!(matches!(
+        support::refusal(&db, select),
+        Error::DatabaseClosed
+    ));
+    assert!(matches!(
+        support::refusal(&tx, select),
+        Error::DatabaseClosed
+    ));
+    assert!(matches!(tx.commit(), Err(Error::DatabaseClosed)));
+    assert!(matches!(db.transaction(), Err(Error::DatabaseClosed)));
 }
 
 #[test]
@@ -84,17 +96,29 @@ fn a_second_writer_is_refused_at_once_naming_the_holder_and_the_next_open_needs_
     // The holder is waiting for a line and will not let go, so an open that returns at all has
     // not waited for it. Refused twice: a refused open takes nothing away from the holder.
     for _ in 0..2 {
-        match support::open_with(&folder, DatabaseOpenOptions::default()) {
-            Err(Error::DatabaseLocked { holder_pid, path }) => {
+        let Err(refusal) = support::open_with(&folder, DatabaseOpenOptions::default()) else {
+            panic!("a second writer was let in beside the first");
+        };
+        let said = refusal.to_string();
+        match refusal {
+            Error::DatabaseLocked { holder_pid, path } => {
                 assert_eq!(
                     holder_pid,
                     holder.id(),
                     "the refusal names the process that holds it"
                 );
                 assert_eq!(path, folder, "the refusal names the store");
+                assert_eq!(
+                    said,
+                    format!(
+                        "another session holds this store for writing: process {holder_pid} \
+                         holds {}; open a read session to read it",
+                        folder.display()
+                    ),
+                    "the refusal names the holder, the path and how to read"
+                );
             }
-            Err(other) => panic!("a second writer was refused as {other:?}"),
-            Ok(_) => panic!("a second writer was let in beside the first"),
+            other => panic!("a second writer was refused as {other:?}"),
         }
     }
     holder.tell("commit");
@@ -207,7 +231,7 @@ fn a_store_closed_here_opens_again_while_a_child_process_holds_a_copy_of_its_loc
 
 #[test]
 fn a_grouping_is_there_after_close_and_reopen() {
-    let (folder, db) = support::built("grouping-after-reopen", 16, "AUTO_INDEX_AT 1000", 2000);
+    let (folder, db) = support::built("grouping-after-reopen", 16, "INDEXING_THRESHOLD 1000", 2000);
     let query = support::gathered(99_000, 16);
     let sql = support::by_mode(None, "INDEXED", 10);
     // The partitions as inspection lists them, and an indexed search's rows and work.

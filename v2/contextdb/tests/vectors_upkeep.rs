@@ -9,8 +9,7 @@ use std::fs;
 use std::sync::atomic::Ordering;
 
 use contextdb::{
-    Database, DatabaseOpenOptions, MaintenanceReport, QueryResult, ReadSession, ReadSessionOptions,
-    Value, params,
+    Database, DatabaseOpenOptions, MaintenanceReport, QueryResult, ReadSession, Value, params,
 };
 
 use support::{Child, Run};
@@ -36,7 +35,7 @@ fn sealing_advances_only_when_asked_and_in_bounded_cycles() {
     support::declare_docs(
         &db,
         DIMENSION,
-        "PARTITION_KEY (ctx) AUTO_INDEX_AT 1000000000",
+        "PARTITION_KEY (ctx) INDEXING_THRESHOLD 1000000000",
     );
     // Five thousand vectors: three thousand under a, the partition made first, and two
     // thousand under b.
@@ -364,11 +363,7 @@ fn looping(role: &support::Role) {
 /// announces the answer's line and `reads <n>`, the storage reads the search made. Then it
 /// searches once more and announces that answer's line.
 fn stopped(role: &support::Role) {
-    let (door, searching, reads) = support::pausing_at_read(role.number("pause_at"));
-    let mut options = ReadSessionOptions::default();
-    options.storage = Some(door);
-    let reader =
-        ReadSession::open_with_options(&role.folder, options).expect("open the store for reading");
+    let (reader, searching, reads) = support::reader_pausing(role);
     let (sql, query) = (search_of_ten(), searched_for());
 
     searching.store(true, Ordering::SeqCst);
@@ -393,7 +388,7 @@ fn a_small_fixed_store_stays_within_its_recorded_size() {
     let db = support::open(&folder);
     support::run(
         &db,
-        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, embedding VECTOR(384) AUTO_INDEX_AT 1000000000)",
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, embedding VECTOR(384) INDEXING_THRESHOLD 1000000000)",
     );
     // Nothing in the content, its order or the store depends on a clock, a random number or a
     // thread, so the file has the same length on every machine and every run.
@@ -433,7 +428,7 @@ fn a_small_fixed_store_stays_within_its_recorded_size() {
 /// The dimension of the tests of a grouping, and the clause under which a partition of 2,000
 /// rows is cut into groups.
 const GROUPED: usize = 16;
-const AT_1000: &str = "AUTO_INDEX_AT 1000";
+const AT_1000: &str = "INDEXING_THRESHOLD 1000";
 
 fn gathered(n: i64) -> Vec<f32> {
     support::gathered(n, GROUPED)
@@ -468,7 +463,7 @@ fn a_grouping_is_built_in_bounded_cycles_and_switched_in_one() {
     let db = support::open(&folder);
     // 2,000 rows are this column's size, and half of the 4,000 vectors a partition of it may
     // have outside a grouping and still be searched INDEXED: every search below is served.
-    support::declare_docs(&db, GROUPED, "AUTO_INDEX_AT 2000");
+    support::declare_docs(&db, GROUPED, "INDEXING_THRESHOLD 2000");
     support::load_docs(&db, 1..=2000, "a", gathered);
     let query = gathered(60_000);
     let late = support::vector(60_001, GROUPED);
@@ -589,7 +584,7 @@ fn vectors_sealed_while_a_first_build_starts_are_found_after_the_switch() {
     let folder = support::folder("sealed-while-first-build-starts");
     let db = support::open(&folder);
     // The grouping is never built again, so the vectors sealed after it stay in its tail.
-    support::declare_docs(&db, WIDE, "AUTO_INDEX_AT 1000 CONSOLIDATION NONE");
+    support::declare_docs(&db, WIDE, "INDEXING_THRESHOLD 1000 COMPACTION NONE");
     support::load_docs(&db, 1..=2000, "a", wide);
     // The first cycle seals and begins the partition's first build. The 3,500 rows written
     // then are sealed by the second, before the build's first round: a whole block of them
@@ -621,7 +616,7 @@ fn vectors_sealed_while_a_first_build_starts_are_found_after_the_switch() {
 
 #[test]
 fn a_grouping_holds_every_live_vector_once_and_no_stale_slot() {
-    let clauses = "PARTITION_KEY (ctx) AUTO_INDEX_AT 1000";
+    let clauses = "PARTITION_KEY (ctx) INDEXING_THRESHOLD 1000";
     let (_, db) = support::built("grouping-no-stale", GROUPED, clauses, 1000);
     support::load_docs(&db, 1001..=2000, "b", gathered);
     support::upkeep(&db);
@@ -668,7 +663,7 @@ fn a_partition_is_grouped_again_only_when_its_changes_reach_the_declared_share()
         ("regroup-default", "", 400_i64),
         (
             "regroup-declared",
-            " CONSOLIDATION (CHANGE_PERCENT = 50)",
+            " COMPACTION (CHANGE_PERCENT = 50)",
             1000,
         ),
     ] {
@@ -695,8 +690,8 @@ fn a_partition_is_grouped_again_only_when_its_changes_reach_the_declared_share()
     support::cycle(&db);
     assert_eq!(state(&db), named("building", "tombstones"));
 
-    // Under CONSOLIDATION NONE the first grouping stays, whatever changes.
-    let clauses = format!("{AT_1000} CONSOLIDATION NONE");
+    // Under COMPACTION NONE the first grouping stays, whatever changes.
+    let clauses = format!("{AT_1000} COMPACTION NONE");
     let (_, db) = support::built("regroup-none", GROUPED, &clauses, 2000);
     support::load_docs(&db, 2001..=3000, "a", gathered);
     support::run(&db, "DELETE FROM docs WHERE id <= 500");
@@ -713,7 +708,7 @@ fn a_cycle_under_a_tight_limit_records_the_stall_and_the_old_grouping_serves() {
     // the limit leaves 98,304 over what an open sets aside.
     const WIDE: usize = 512;
     const LIMIT: usize = (9 << 20) + (96 << 10);
-    let (folder, db) = support::built("stalled-build", WIDE, "AUTO_INDEX_AT 200", 400);
+    let (folder, db) = support::built("stalled-build", WIDE, "INDEXING_THRESHOLD 200", 400);
     support::load_docs(&db, 401..=480, "a", |n| support::gathered(n, WIDE));
     // This cycle seals the 80 and begins the regrouping they make due.
     assert_eq!(support::cycle(&db).maintenance_vectors_done, 80);

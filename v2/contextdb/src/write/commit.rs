@@ -6,9 +6,9 @@
 use std::collections::HashMap;
 use std::ops::Bound;
 
-use super::{Given, Rules, column, equal, pick};
+use super::{Given, Rules, pick};
 use crate::memory::{Budget, Reservation};
-use crate::query::{self, Reader};
+use crate::query::{self, Reader, equal};
 use crate::schema::{Catalog, Reference, Table};
 use crate::store::{Cell, ChangeSet, Key, Read, Row, RowGuard, View};
 use crate::types::{Error, Result, TxId, Value, shown};
@@ -83,7 +83,7 @@ pub(crate) fn check_at_commit(
         if let Some(before) = before {
             if let (true, Some((row, _))) = (new_key, row) {
                 if there.is_some() {
-                    return Err(rules.violation(rules.key_columns(), pick(&table.key, row)));
+                    return Err(rules.violation(&table.key, row));
                 }
             } else if before.row(id, key)? != there {
                 overtaken += 1;
@@ -95,7 +95,7 @@ pub(crate) fn check_at_commit(
             let mut loaded = budget.reserve(0, "query")?;
             for &(child, reference) in children {
                 let at = reference.parent_columns.iter();
-                let at: Vec<usize> = at.map(|name| column(table, name)).collect::<Result<_>>()?;
+                let at: Vec<usize> = at.map(|name| table.column(name)).collect::<Result<_>>()?;
                 let old = at.iter().map(|&at| held(table, was, at, base, &mut loaded));
                 let old: Vec<Value> = old.collect::<Result<_>>()?;
                 let whole = !old.contains(&Value::Null);
@@ -137,10 +137,11 @@ pub(crate) fn check_at_commit(
         }
         rules.acyclic(changes, rules.edge(None, row)?)?;
         for index in &rules.indexes {
-            if let Some(columns) = index.rule(row)
-                && rules.taken(changes, index, &index.entry(row)?, row, key)?
+            if index.rule(row)
+                && let Some(entry) = index.entry(row)?
+                && rules.taken(changes, index, &entry, row, key)?
             {
-                return Err(rules.violation(columns.to_owned(), pick(&index.columns, row)));
+                return Err(rules.violation(&index.columns, row));
             }
         }
     }
@@ -213,7 +214,7 @@ fn parent(
     let Some(rule) = rule else {
         return Ok(false);
     };
-    let at = named.iter().map(|name| column(table, name));
+    let at = named.iter().map(|name| table.column(name));
     let at: Vec<usize> = at.collect::<Result<_>>()?;
     holds(table, rule, &at, values, read, given)
 }
@@ -254,8 +255,7 @@ fn holds(
         assigned: &[],
         needed: &vec![false; table.meta.columns.len()],
         reader: given.reader,
-        params: &bound,
-        now: given.now,
+        ctx: query::EvalContext::new(&bound, given.now),
     };
     let found = query::rows_for_write(&asked, None, given.catalog, read, given.budget)?;
     Ok(found.is_some())

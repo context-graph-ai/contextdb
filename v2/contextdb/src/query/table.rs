@@ -1,21 +1,20 @@
-//! The one source of a table's rows: which rows a statement has to read, reading them through
-//! the reader's filter and the statement's own, and working out the select list for a row that
-//! was read.
+//! The one source of a table's rows: which rows a statement has to read, and reading them
+//! through the reader's filter and the statement's own.
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::ops::Bound;
+use std::ops::Bound::{self, Unbounded};
 
-use super::expression::{EvalContext, Scope, column_index, eval, most_bytes, reads, sort_order};
+use super::expression::{EvalContext, Scope, eval, sort_order};
 use super::row_overhead;
 use super::visible::Visible;
 use crate::memory::Reservation;
-use crate::schema::Table;
+use crate::schema::{Table, field_key};
 use crate::sql::Expr;
-use crate::sql::ast::{BinOp, SortDirection as Asked};
-use crate::sql::plan::{ProjectColumn, SortKey};
-use crate::store::{Cell, Entry, Key, Read, Row};
+use crate::sql::ast::{BinOp, ColumnRef, Literal, SortDirection as Asked};
+use crate::sql::plan::SortKey;
+use crate::store::{Cell, Entry, Key, Keys, Read, Row};
 use crate::types::{ColumnType, Result, SortDirection, Value, heap_bytes};
 
 /// The keys or entries between two bounds.
@@ -40,20 +39,36 @@ pub(super) struct Path {
     pub(super) one: bool,
     /// True when the rows arrive in the order asked for, so that they need no sort.
     pub(super) in_order: bool,
+    /// How many leading columns of the key or index it reads are given one value each, or any
+    /// values when they make the whole key, whose rows a list names exactly.
+    pub(super) pinned: usize,
     /// The columns of that order. A run of entries that hold cut values is in the order of
     /// their digests, and is put in the order of the values themselves before it is handed on.
     order: Vec<(usize, SortDirection)>,
 }
 
+impl Path {
+    /// True when a row's values give this path the whole key, or more than `own` columns.
+    pub(super) fn serves(&self, own: usize) -> bool {
+        matches!(self.reach, Reach::Keys(_)) || self.pinned > own
+    }
+}
+
 /// A part of a filter that every kept row must pass, and that compares a column with values
 /// known before any row is read: one value, or for `=` the values of an `IN` list.
 pub(super) struct Term {
+    /// The column; for the field an index over a JSON path keeps, the table's number of columns
+    /// and the index's place: a column only that index has.
     pub(super) column: usize,
     pub(super) op: BinOp,
     pub(super) values: Vec<Value>,
     /// True for `column = value`, which names one value.
     one: bool,
 }
+
+/// A key or index tried for a path, with how many of its leading columns were given a value and
+/// whether the next was given a range.
+type Tried = (Ordered, usize, bool);
 
 /// Something that keeps the rows of a table in an order: the table itself, under its primary
 /// key, or one of its indexes.
@@ -165,31 +180,79 @@ pub(super) fn as_key(column: ColumnType, value: Value) -> Option<Value> {
         | (ColumnType::Uuid, value @ Value::Uuid(_))
         | (ColumnType::Timestamp, value @ Value::Timestamp(_))
         | (ColumnType::TxId, value @ Value::TxId(_)) => Some(value),
-        (ColumnType::Real, Value::Int64(value)) => Some(Value::Float64(value as f64)),
+        (ColumnType::Real, Value::Int64(value)) if (value as f64) as i128 == i128::from(value) => {
+            Some(Value::Float64(value as f64))
+        }
         (ColumnType::Uuid, Value::Text(value)) => value.parse().ok().map(Value::Uuid),
         _ => None,
     }
 }
 
+/// True for a value known before any row: a literal, a `$name`, and a SELECT when it is run.
+pub(super) fn known(value: &Expr, ctx: &EvalContext) -> bool {
+    let ran = ctx.said.is_none() && matches!(value, Expr::Subquery(_));
+    ran || matches!(value, Expr::Literal(_) | Expr::Parameter(_))
+}
+
 /// Gathers the terms of a filter: the comparisons, `IS NULL` and `IN` lists joined by AND at
-/// its top. Answers whether the filter is nothing but the terms gathered.
+/// its top, its columns named as `scope` names the table's, and the values of a SELECT after
+/// `IN`. Answers whether the filter is nothing but the terms gathered.
 pub(super) fn collect(
     table: &Table,
+    scope: &Scope,
     filter: &Expr,
     ctx: &EvalContext,
     terms: &mut Vec<Term>,
 ) -> Result<bool> {
-    let known = |value: &Expr| matches!(value, Expr::Literal(_) | Expr::Parameter(_));
-    let (column, op, values, one) = match filter {
+    let worked = |value: &Expr| eval(value, scope, &[], ctx);
+    let (column, op, mut values, one) = match filter {
         Expr::BinaryOp { left, op, right } if *op == BinOp::And => {
-            let left = collect(table, left, ctx, terms)?;
-            return Ok(collect(table, right, ctx, terms)? && left);
+            let left = collect(table, scope, left, ctx, terms)?;
+            return Ok(collect(table, scope, right, ctx, terms)? && left);
         }
         Expr::BinaryOp { left, op, right } => match (&**left, &**right, op) {
             (_, _, BinOp::Neq | BinOp::Or) => return Ok(false),
-            (Expr::Column(column), value, op) if known(value) => (column, *op, vec![value], true),
+            // `doc -> 'k' -> 'j' = value` is a term of the index over that path, if there is one.
+            (mut json @ Expr::Field { .. }, value, BinOp::Eq) if known(value, ctx) => {
+                let mut path = Vec::new();
+                while let Expr::Field {
+                    json: of,
+                    key,
+                    as_text: false,
+                } = json
+                    && let Expr::Literal(Literal::Text(key)) = &**key
+                {
+                    path.insert(0, key);
+                    json = of;
+                }
+                let Expr::Column(column) = json else {
+                    return Ok(false);
+                };
+                let name = &table.meta.columns[scope.find(column)?.0].name;
+                let place = table.meta.indexes.iter().position(|index| {
+                    index.json_path.iter().eq(path.iter().copied()) && index.columns[0].0 == *name
+                });
+                let field = match worked(value)? {
+                    Value::Text(text) => serde_json::from_str(&text).ok(),
+                    Value::Json(field) => Some(field),
+                    _ => None,
+                };
+                let (Some(place), Some(key)) = (place, field.as_ref().and_then(field_key)) else {
+                    return Ok(false);
+                };
+                terms.push(Term {
+                    column: table.meta.columns.len() + place,
+                    op: BinOp::Eq,
+                    values: vec![key],
+                    one: true,
+                });
+                return Ok(true);
+            }
+            (column @ Expr::Column(_), value, op) if known(value, ctx) => {
+                (column, *op, vec![worked(value)?], true)
+            }
             // `5 < id` is `id > 5`.
-            (value, Expr::Column(column), op) if known(value) => {
+            (value, column @ Expr::Column(_), op) if known(value, ctx) => {
                 let turned = match op {
                     BinOp::Lt => BinOp::Gt,
                     BinOp::Lte => BinOp::Gte,
@@ -197,14 +260,14 @@ pub(super) fn collect(
                     BinOp::Gte => BinOp::Lte,
                     other => *other,
                 };
-                (column, turned, vec![value], true)
+                (column, turned, vec![worked(value)?], true)
             }
             _ => return Ok(false),
         },
         Expr::IsNull { expr, negated } => match &**expr {
             Expr::Column(column) if !negated => {
                 terms.push(Term {
-                    column: column_index(table, column)?,
+                    column: scope.find(column)?.0,
                     op: BinOp::Eq,
                     values: vec![Value::Null],
                     one: false,
@@ -216,28 +279,28 @@ pub(super) fn collect(
         Expr::InList {
             expr,
             list,
-            negated,
-        } => match &**expr {
-            Expr::Column(column) if !negated && list.iter().all(known) => {
-                (column, BinOp::Eq, list.iter().collect(), false)
-            }
-            _ => return Ok(false),
-        },
+            negated: false,
+        } if list.iter().all(|value| known(value, ctx)) => {
+            let values = list.iter().map(worked).collect::<Result<_>>()?;
+            (&**expr, BinOp::Eq, values, false)
+        }
+        Expr::InSubquery {
+            expr,
+            query,
+            negated: false,
+        } if ctx.said.is_none() => (&**expr, BinOp::Eq, ctx.subquery(query)?.to_vec(), false),
         _ => return Ok(false),
     };
-    let column = column_index(table, column)?;
-    let mut keys = Vec::new();
-    for value in values {
-        match eval(value, &table.scope(), &[], ctx)? {
-            // A NULL in a list equals nothing.
-            Value::Null if !one => {}
-            value => match as_key(table.meta.columns[column].column_type, value) {
-                Some(value) => keys.push(value),
-                None => return Ok(false),
-            },
-        }
-    }
-    let values = keys;
+    let Expr::Column(column) = column else {
+        return Ok(false);
+    };
+    let column = scope.find(column)?.0;
+    // A NULL in a list equals nothing.
+    values.retain(|value| one || *value != Value::Null);
+    let kind = table.meta.columns[column].column_type;
+    let Some(values) = values.into_iter().map(|key| as_key(kind, key)).collect() else {
+        return Ok(false);
+    };
     terms.push(Term {
         column,
         op,
@@ -245,6 +308,35 @@ pub(super) fn collect(
         one,
     });
     Ok(true)
+}
+
+/// Why a key or index none of whose leading columns `filter` gives a value lost, when a part of
+/// it reads `column` in a way no key or index serves.
+fn residual(filter: &Expr, column: &str) -> Option<&'static str> {
+    fn reads(expr: &Expr, column: &str) -> bool {
+        let mut inner = crate::sql::inside(expr).into_iter();
+        matches!(expr, Expr::Column(c) if c.column == column) || inner.any(|e| reads(e, column))
+    }
+    let known = |expr: &Expr| matches!(expr, Expr::Literal(_) | Expr::Parameter(_));
+    match filter {
+        Expr::BinaryOp { left, op, right } if *op == BinOp::And => {
+            residual(left, column).or_else(|| residual(right, column))
+        }
+        _ if !reads(filter, column) => None,
+        Expr::Like { .. } => Some("LIKE is residual-only"),
+        Expr::BinaryOp { op: BinOp::Or, .. } => Some("OR gives no single range"),
+        Expr::BinaryOp { left, right, .. } => match (&**left, &**right) {
+            (Expr::FunctionCall { name, .. }, _) | (_, Expr::FunctionCall { name, .. }) => {
+                Some(match name.starts_with("__") {
+                    true => "arithmetic in predicate",
+                    false => "function call in predicate",
+                })
+            }
+            (side, other) if known(side) || known(other) => None,
+            _ => Some("non-literal rhs"),
+        },
+        _ => None,
+    }
 }
 
 /// A row a walk holds back: its key, its values, the cells not taken from it, and the bytes
@@ -260,10 +352,14 @@ fn held_bytes(key: &Key) -> u64 {
 /// here, so every one has passed the reader's filter.
 pub(super) struct Source<'a> {
     table: &'a Table,
+    /// The table's columns under the name the statement gives the table.
     scope: Scope<'a>,
     filter: Option<&'a Expr>,
-    params: &'a HashMap<String, Value>,
-    now: i64,
+    /// The terms of the filter, gathered once and shared by every path tried.
+    terms: OnceCell<Vec<Term>>,
+    /// What the filter is worked out with beside a row; the caller's, so that it holds
+    /// whatever the statement worked out before any row.
+    ctx: &'a EvalContext<'a>,
     read: &'a dyn Read,
     /// The reader's filter, which remembers the grants it has looked up; `None` when it reads
     /// no column of a row, and so hides none.
@@ -281,8 +377,7 @@ impl<'a> Source<'a> {
     pub(super) fn new(
         table: &'a Table,
         filter: Option<&'a Expr>,
-        params: &'a HashMap<String, Value>,
-        now: i64,
+        ctx: &'a EvalContext<'a>,
         read: &'a dyn Read,
         visible: Visible<'a>,
     ) -> Source<'a> {
@@ -293,14 +388,21 @@ impl<'a> Source<'a> {
             table,
             scope: table.scope(),
             filter,
-            params,
-            now,
+            terms: OnceCell::new(),
+            ctx,
             read,
             visible: seen.contains(&true).then(|| RefCell::new(visible)),
             seen,
             filtered: vec![false; width],
             rest: vec![false; width],
         }
+    }
+
+    /// The source whose filter names the table's columns under `qualifier`, the name the
+    /// statement gives the table, in place of the table's own.
+    pub(super) fn named(mut self, qualifier: &'a str) -> Source<'a> {
+        self.scope = Scope::of(qualifier, &self.table.meta.columns);
+        self
     }
 
     /// `filtered` marks the columns the filter reads and `wanted` every column the statement
@@ -330,12 +432,52 @@ impl<'a> Source<'a> {
     /// Rows are kept under their primary key, so the key is answered from the table itself. Its
     /// own index, `__pk_<column>`, is declared and has no entries, and is never walked.
     pub(super) fn choose(&self, order: &[SortKey], assigned: &[usize]) -> Result<Path> {
-        let mut terms = Vec::new();
-        if let Some(filter) = self.filter {
-            let ctx = EvalContext::new(self.params, self.now);
-            collect(self.table, filter, &ctx, &mut terms)?;
+        self.given(&[], order, assigned)
+    }
+
+    /// [`Source::choose`] for the rows whose column at each place of `given` equals the value
+    /// beside it, as well as passing the filter: a join gives the values of its left row. A
+    /// value that is no key of its column gives nothing to the path; `None` stands for the
+    /// value a row will give, when the path is said before any row is read.
+    pub(super) fn given(
+        &self,
+        given: &[(usize, Option<&Value>)],
+        order: &[SortKey],
+        assigned: &[usize],
+    ) -> Result<Path> {
+        Ok(self.scored(given, order, assigned)?.0)
+    }
+
+    /// The path [`Source::given`] picks, and each key or index tried: first the one the path
+    /// reads, when one did better than the whole table.
+    fn scored(
+        &self,
+        given: &[(usize, Option<&Value>)],
+        order: &[SortKey],
+        assigned: &[usize],
+    ) -> Result<(Path, Vec<Tried>)> {
+        let own = match self.terms.get() {
+            Some(own) => own,
+            None => {
+                let mut own = Vec::new();
+                if let Some(filter) = self.filter {
+                    collect(self.table, &self.scope, filter, self.ctx, &mut own)?;
+                }
+                self.terms.get_or_init(|| own)
+            }
+        };
+        let (columns, mut terms) = (&self.table.meta.columns, Vec::new());
+        for &(column, value) in given {
+            let value = value.map_or(Some(Value::Null), |value| {
+                as_key(columns[column].column_type, value.clone())
+            });
+            terms.extend(value.map(|value| Term {
+                column,
+                op: BinOp::Eq,
+                values: vec![value],
+                one: false,
+            }));
         }
-        let columns = &self.table.meta.columns;
         let column_named = |name: &String| columns.iter().position(|column| column.name == *name);
         // The order asked for, when it is plain columns.
         let asked: Option<Vec<(usize, SortDirection)>> = order
@@ -348,7 +490,7 @@ impl<'a> Source<'a> {
                     Asked::Asc => SortDirection::Asc,
                     Asked::Desc => SortDirection::Desc,
                 };
-                Some((column_index(self.table, column).ok()?, direction))
+                Some((self.scope.find(column).ok()?.0, direction))
             })
             .collect();
 
@@ -361,63 +503,61 @@ impl<'a> Source<'a> {
         };
         let indexes = self.table.meta.indexes.iter().enumerate();
         let indexes = indexes
-            .filter(|(_, index)| !index.name.starts_with("__pk_") && index.json_path.is_empty())
+            .filter(|(_, index)| !index.name.starts_with("__pk_"))
+            .filter(|(_, index)| {
+                let mut columns = index.columns.iter().map(|(name, _)| column_named(name));
+                !columns.any(|at| at.is_some_and(|at| assigned.contains(&at)))
+            })
             .map(|(at, index)| Ordered {
                 index: Some(at),
                 unique: index.name.starts_with("__unique_"),
-                columns: index
-                    .columns
-                    .iter()
-                    .filter_map(|(name, direction)| Some((column_named(name)?, *direction)))
-                    .collect(),
-            })
-            .filter(|index| {
-                !index
-                    .columns
-                    .iter()
-                    .any(|column| assigned.contains(&column.0))
+                columns: match index.json_path.is_empty() {
+                    true => (index.columns.iter())
+                        .filter_map(|(name, direction)| Some((column_named(name)?, *direction)))
+                        .collect(),
+                    false => vec![(columns.len() + at, SortDirection::Asc)],
+                },
             });
 
         // Until something better is found: the whole table, in no order that was asked for.
         let mut best = (
-            (0, false, false),
+            (false, 0, false, false),
             Path {
                 reach: Reach::Rows(vec![(Bound::Unbounded, Bound::Unbounded)]),
                 one: false,
                 in_order: false,
+                pinned: 0,
                 order: Vec::new(),
             },
         );
+        let mut tried = Vec::new();
         // A table that declares no key keeps its rows under numbers no statement names.
         let the_table = Some(the_table).filter(|_| !self.table.key.is_empty());
         for ordered in the_table.into_iter().chain(indexes) {
-            // The leading columns the filter gives values for. One list at most is taken, so
-            // the ranges read are no more than the values the statement wrote.
-            let mut listed = false;
+            // The leading columns given values. One list at most is taken, and none for a row's
+            // values, so the ranges read are no more than the values the statement wrote.
+            let mut listed = !given.is_empty();
             let pins: Vec<&Term> = (ordered.columns.iter())
                 .map_while(|(column, _)| {
                     let equal = |term: &&Term| term.column == *column && term.op == BinOp::Eq;
-                    let term = terms.iter().find(equal)?;
+                    let term = terms.iter().chain(own).find(equal)?;
                     let list = term.values.len() != 1;
                     let taken = !(list && listed);
                     listed |= list;
                     taken.then_some(term)
                 })
                 .collect();
-            let mut tuples = vec![Vec::new()];
-            for pin in &pins {
-                let mut longer = Vec::new();
-                for tuple in &tuples {
-                    for value in &pin.values {
-                        longer.push([tuple.as_slice(), std::slice::from_ref(value)].concat());
-                    }
-                }
-                tuples = longer;
-            }
             let mut ranges = Vec::new();
             let (mut ranged, mut cut) = (false, false);
-            for tuple in &tuples {
-                let (entry, range, is_ranged) = ordered.range(self.table, tuple, &terms)?;
+            // A key for each value of the list taken, if one is, among the single values.
+            let each = pins
+                .iter()
+                .map(|pin| pin.values.len())
+                .find(|&len| len != 1);
+            for at in 0..each.unwrap_or(1) {
+                let one = |pin: &&Term| pin.values[at.min(pin.values.len() - 1)].clone();
+                let tuple: Vec<Value> = pins.iter().map(one).collect();
+                let (entry, range, is_ranged) = ordered.range(self.table, &tuple, own)?;
                 cut |= entry.cut.is_some();
                 ranged = is_ranged;
                 ranges.push((entry.key, range));
@@ -449,17 +589,111 @@ impl<'a> Source<'a> {
                 reach,
                 one,
                 in_order,
+                pinned: pins
+                    .iter()
+                    .filter(|pin| whole_key || pin.values.len() == 1)
+                    .count(),
                 order,
             };
-            if whole_key {
-                return Ok(path);
-            }
-            let score = (pins.len(), ranged, in_order);
+            // The whole key is better than any index.
+            let score = (whole_key, pins.len(), ranged, in_order);
+            let pinned = pins.len();
             if score > best.0 {
                 best = (score, path);
+                tried.insert(0, (ordered, pinned, ranged));
+            } else {
+                tried.push((ordered, pinned, ranged));
             }
         }
-        Ok(best.1)
+        Ok((best.1, tried))
+    }
+
+    /// Says, when the statement is explained, the path [`Source::given`] picks, with `joined`
+    /// given by a row when that serves better than the filter alone: its key or index (`Scan`
+    /// when no column is given a value or a range), the columns given, and why each other lost.
+    pub(super) fn say(
+        &self,
+        joined: &[usize],
+        order: &[SortKey],
+        assigned: &[usize],
+    ) -> Result<()> {
+        let Some(said) = self.ctx.said else {
+            return Ok(());
+        };
+        let row: Vec<_> = joined.iter().map(|&column| (column, None)).collect();
+        let (path, mut tried) = self.scored(&row, order, assigned)?;
+        if !path.serves(self.choose(order, assigned)?.pinned) {
+            tried = self.scored(&[], order, assigned)?.1;
+        }
+        let (table, columns) = (self.table, &self.table.meta.columns);
+        let indexes = &table.meta.indexes;
+        let name = |index: Option<usize>| {
+            let key = indexes.iter().find(|index| index.name.starts_with("__pk_"));
+            index
+                .map_or(key, |at| indexes.get(at))
+                .map_or("", |index| &index.name)
+        };
+        // A column only an index over a JSON path has is named by the column it reads.
+        let column = |at: usize| match columns.get(at) {
+            Some(column) => column.name.clone(),
+            None => table.meta.indexes[at - columns.len()].columns[0].0.clone(),
+        };
+        let chosen = tried.first().filter(|tried| tried.1 > 0 || tried.2);
+        let mut lines = vec![match chosen {
+            Some((by, ..)) => format!("IndexScan {{ index: {} }}", name(by.index)),
+            None => "Scan".to_owned(),
+        }];
+        if let Some((by, pinned, ranged)) = chosen {
+            let pushed = by.columns.iter().take(pinned + usize::from(*ranged));
+            let pushed: Vec<String> = pushed.map(|(at, _)| column(*at)).collect();
+            lines.push(format!("  predicates_pushed: [{}]", pushed.join(", ")));
+        }
+        let pinned = chosen.map_or(0, |chosen| chosen.1);
+        let whole = chosen.is_some_and(|(by, n, _)| by.index.is_none() && by.columns.len() == *n);
+        let ranged = chosen.is_some_and(|chosen| chosen.2);
+        let considered: Vec<String> = (tried[usize::from(chosen.is_some())..].iter())
+            .map(|(other, other_pinned, other_ranged)| {
+                let first = column(other.columns[0].0);
+                let reason = match *other_pinned {
+                    0 => (self.filter.and_then(|filter| residual(filter, &first)))
+                        .unwrap_or("first column not in WHERE"),
+                    other_pinned if other_pinned < pinned => {
+                        "fewer predicate columns matched than chosen index"
+                    }
+                    _ if whole || ranged && !other_ranged => "lower selectivity than chosen index",
+                    _ => "tied with chosen index; lost by creation order",
+                };
+                format!("{}: {reason}", name(other.index))
+            })
+            .collect();
+        if !considered.is_empty() {
+            lines.push(format!("  indexes_considered: [{}]", considered.join(", ")));
+        }
+        said.borrow_mut().extend(lines);
+        Ok(())
+    }
+
+    /// Whether the path reaches at most `most` rows, counted by keys or index entries alone and
+    /// no further than one past `most`. The whole table is never few.
+    pub(super) fn few(&self, path: &Path, most: u64) -> Result<bool> {
+        let ranges = match &path.reach {
+            Reach::Keys(keys) => return Ok(keys.len() as u64 <= most),
+            Reach::Rows(ranges) if ranges[..] == [(Unbounded, Unbounded)] => return Ok(false),
+            Reach::Rows(ranges) | Reach::Index(_, ranges) => ranges,
+        };
+        let of = match path.reach {
+            Reach::Index(at, _) => Keys::Index(self.table.index_ids[at]),
+            _ => Keys::Table(self.table.id),
+        };
+        let mut left = most.saturating_add(1);
+        for (from, to) in ranges {
+            let (from, to) = (from.as_ref(), to.as_ref());
+            left -= self.read.counted(of, from, to, left as usize)?;
+            if left == 0 {
+                break;
+            }
+        }
+        Ok(left > 0)
     }
 
     /// Reads the rows the path reaches and hands `each` every one the reader may see and the
@@ -564,7 +798,7 @@ impl<'a> Source<'a> {
                             break 'ranges;
                         }
                         let Some(row) = self.read.row(table, &key)? else {
-                            continue;
+                            return Err(self.read.damaged("an index entry names no row"));
                         };
                         examined += 1;
                         let Some((values, cells, bytes)) = self.pass(row, path.one, reservation)?
@@ -638,65 +872,6 @@ impl<'a> Source<'a> {
         Ok(passed.map(|(values, _, bytes)| (values, bytes)))
     }
 
-    /// For each item of a select list, the column whose value it moves out of a row: the column
-    /// it names, when no other item of the list reads that column. Any other item copies what
-    /// it reads. Empty for `SELECT *`, which hands the row over as it is.
-    pub(super) fn moved(&self, columns: Option<&[ProjectColumn]>) -> Result<Vec<Option<usize>>> {
-        let columns = columns.unwrap_or_default();
-        let mut readers = vec![0; self.table.meta.columns.len()];
-        for column in columns {
-            let mut read = vec![false; readers.len()];
-            reads(&column.expr, self.table, self.params, &mut read)?;
-            for (readers, read) in readers.iter_mut().zip(read) {
-                *readers += usize::from(read);
-            }
-        }
-        let alone = |column: &ProjectColumn| match &column.expr {
-            Expr::Column(named) => column_index(self.table, named).ok(),
-            _ => None,
-        };
-        let moved = columns.iter().map(alone);
-        Ok(moved.map(|at| at.filter(|at| readers[*at] == 1)).collect())
-    }
-
-    /// The select list worked out for one row this source handed over, or the row itself for
-    /// `SELECT *`. `moved` is [`Source::moved`] of the list, and `distance` is the row's distance
-    /// when a similarity search found it. The memory of the values is asked for before they
-    /// are made, and the row's bytes are given back once they are. A value that is moved is
-    /// held once: what it takes passes from the row to the result and is not asked for again.
-    pub(super) fn output(
-        &self,
-        columns: Option<&[ProjectColumn]>,
-        moved: &[Option<usize>],
-        mut row: Vec<Value>,
-        bytes: u64,
-        distance: Option<f64>,
-        reservation: &mut Reservation,
-    ) -> Result<Vec<Value>> {
-        let Some(columns) = columns else {
-            return Ok(row);
-        };
-        let most = columns
-            .iter()
-            .map(|column| most_bytes(&column.expr, &self.scope, &row, self.params));
-        let passed = moved.iter().flatten().map(|at| heap_bytes(&row[*at]));
-        let passed = passed.sum::<u64>().min(bytes);
-        reservation.grow(row_overhead(columns.len()) + most.sum::<u64>() - passed)?;
-        let values = columns
-            .iter()
-            .zip(moved)
-            .map(|(column, moved)| match moved {
-                Some(at) => Ok(std::mem::replace(&mut row[*at], Value::Null)),
-                None => {
-                    let ctx = EvalContext::new(self.params, self.now).found(distance);
-                    eval(&column.expr, &self.scope, &row, &ctx)
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-        reservation.shrink(bytes - passed);
-        Ok(values)
-    }
-
     /// A stored row the reader may see and the filter passes: its values, the cells not taken
     /// from it, both in column order, and the bytes of `reservation` the values hold. A row
     /// that does not pass holds none. A column the statement does not read is left as NULL.
@@ -725,8 +900,7 @@ impl<'a> Source<'a> {
         if passes {
             self.take(&mut cells, &mut values, &self.filtered, reservation)?;
             if let Some(filter) = self.filter {
-                let ctx = EvalContext::new(self.params, self.now);
-                passes = eval(filter, &self.scope, &values, &ctx)? == Value::Bool(true);
+                passes = eval(filter, &self.scope, &values, self.ctx)? == Value::Bool(true);
             }
         }
         if !passes {
@@ -769,3 +943,33 @@ impl<'a> Source<'a> {
 /// What a row that passed hands over: its values, the cells not taken from it, and the bytes
 /// its values hold.
 type Passed = (Vec<Value>, Vec<Cell>, u64);
+
+/// What passes exactly the rows that hold `values` in `columns`, side by side, and the
+/// parameters it reads them from: each under its column's name.
+pub(crate) fn equal(
+    table: &Table,
+    columns: &[usize],
+    values: &[Value],
+) -> (Expr, HashMap<String, Value>) {
+    let mut bound = HashMap::new();
+    let each = columns.iter().zip(values).map(|(&at, value)| {
+        let name = &table.meta.columns[at].name;
+        bound.insert(name.clone(), value.clone());
+        let column = ColumnRef {
+            table: None,
+            column: name.clone(),
+        };
+        Expr::BinaryOp {
+            left: Box::new(Expr::Column(column)),
+            op: BinOp::Eq,
+            right: Box::new(Expr::Parameter(name.clone())),
+        }
+    });
+    let filter = each.reduce(|left, right| Expr::BinaryOp {
+        left: Box::new(left),
+        op: BinOp::And,
+        right: Box::new(right),
+    });
+    let filter = filter.expect("a key and a UNIQUE rule have a column");
+    (filter, bound)
+}

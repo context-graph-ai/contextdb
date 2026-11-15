@@ -4,8 +4,8 @@
 
 use std::collections::BTreeSet;
 
-use super::{Rules, column, equal};
-use crate::query::{self, Reader};
+use super::Rules;
+use crate::query::{self, Reader, equal};
 use crate::sql::{Expr, Plan};
 use crate::store::{Cell, Key, Read};
 use crate::types::{Error, Result, Uuid, Value};
@@ -37,11 +37,7 @@ impl Rules<'_> {
             });
         }
         for (name, _) in assignments {
-            if table
-                .rules
-                .immutable_columns
-                .contains(&column(table, name)?)
-            {
+            if table.rules.immutable_columns.contains(&table.column(name)?) {
                 return Err(Error::ImmutableColumn {
                     table: table.name.clone(),
                     column: name.clone(),
@@ -58,7 +54,7 @@ impl Rules<'_> {
         let Some(machine) = &self.table.meta.state_machine else {
             return Ok(None);
         };
-        let at = column(self.table, &machine.column)?;
+        let at = self.table.column(&machine.column)?;
         let moves = assigned.contains(&at);
         needed[at] |= moves;
         Ok(moves.then_some(at))
@@ -116,7 +112,7 @@ impl Rules<'_> {
     /// Where an edge's source, target and type are in a row.
     fn edge_columns(&self) -> Result<[usize; 3]> {
         let [source, target, kind] =
-            ["source_id", "target_id", "edge_type"].map(|name| column(self.table, name));
+            ["source_id", "target_id", "edge_type"].map(|name| self.table.column(name));
         Ok([source?, target?, kind?])
     }
 

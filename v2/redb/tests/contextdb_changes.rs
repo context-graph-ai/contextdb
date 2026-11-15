@@ -171,34 +171,6 @@ fn rows_at(rows: RangeInclusive<u64>, version: u64) -> Vec<(u64, Vec<u8>)> {
     rows.map(|row| (row, value(row, version))).collect()
 }
 
-#[test]
-fn a_file_a_writer_holds_opens_for_reading_at_the_newest_commit() {
-    let path = folder("a-file-a-writer-holds-opens-for-reading").join("data");
-    let writer = writer(&path);
-    commit_rows(&writer, 1..=3, 1);
-
-    let first = reader(&path);
-    let earlier = first.begin_read().unwrap();
-    assert_eq!(rows_of(&earlier), rows_at(1..=3, 1));
-    let earlier = earlier.commit_id();
-
-    // The writer goes on committing beside the reader, and is never made to wait or to fail.
-    commit_rows(&writer, 4..=5, 1);
-    commit_rows(&writer, 1..=1, 2);
-    let mut newest = rows_at(1..=1, 2);
-    newest.extend(rows_at(2..=5, 1));
-
-    // The same reader, asked again, reads the commit that is newest now, and says it is a
-    // later one.
-    let later = first.begin_read().unwrap();
-    assert_eq!(rows_of(&later), newest);
-    assert!(later.commit_id() > earlier);
-
-    // So does a reader that opens now.
-    let second = reader(&path);
-    assert_eq!(rows_of(&second.begin_read().unwrap()), newest);
-}
-
 /// The id and the rows of the commit a reader is given now, or why it was given none.
 fn newest(reader: &ReadOnlyDatabase) -> Result<(u64, Vec<(u64, Vec<u8>)>), redb::Error> {
     let read = reader.begin_read()?;

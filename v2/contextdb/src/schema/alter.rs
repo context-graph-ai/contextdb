@@ -355,8 +355,10 @@ fn altered(
             column,
             search_mode,
         } => clause(column, &|v| v.search_mode = Some(*search_mode)),
-        AlterAction::SetAutoIndexAt(c, to) => clause(c, &|v| v.auto_index_at.clone_from(to)),
-        AlterAction::SetConsolidation(c, to) => clause(c, &|v| v.consolidation.clone_from(to)),
+        AlterAction::SetIndexingThreshold(c, to) => {
+            clause(c, &|v| v.indexing_threshold.clone_from(to))
+        }
+        AlterAction::SetCompaction(c, to) => clause(c, &|v| v.compaction.clone_from(to)),
     }
 }
 

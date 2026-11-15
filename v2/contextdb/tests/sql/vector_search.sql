@@ -83,7 +83,7 @@ id | similarity
 # A distance with no name is called what any unnamed expression is called.
 SELECT id, v <=> '[1,0,0,0]' FROM points ORDER BY v <=> '[1,0,0,0]' LIMIT 2;
 ----
-id | expr
+id | ?column?
 1 | 0.0
 2 | 0.0
 
@@ -242,7 +242,7 @@ id | status
 
 SHOW VECTOR_PARTITIONS FOR claims.v;
 ----
-table | column | partition_key | live_rows | pending_inserts | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | availability_reason | maintenance_state | maintenance_reason | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | lists | probes | recovery_action
+table | column | partition_key | live_rows | pending_tuples | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | availability_reason | maintenance_state | maintenance_reason | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | lists | probes | recovery_action
 claims | v | {} | 2 | 2 | 0 | 0 | 0 | true | none | idle | none | 0 | 0 | 0 | NULL | NULL | none
 
 UPDATE claims SET status = 'active' WHERE id IN (1, 2, 3);
@@ -257,3 +257,98 @@ id
 5
 3
 4
+
+# A distance is a value of the row: <=> stands wherever an expression may. No LIMIT orders every
+# row with a vector (row 6 has none and is in no answer):
+SELECT id FROM points WHERE id > 3 ORDER BY v <=> '[1,0,0,0]';
+----
+id
+5
+7
+8
+4
+
+# in a WHERE beside a search; in the select list; farthest first; with a second sort key at one
+# distance (rows 1 and 2 are both 0); between two columns.
+SELECT id FROM points WHERE v <=> '[1,0,0,0]' < 1.5 ORDER BY v <=> '[1,0,0,0]' LIMIT 4;
+----
+id
+1
+2
+5
+3
+
+SELECT id, v <=> '[1,0,0,0]' AS distance FROM points WHERE id IN (1, 4, 5) ORDER BY distance DESC LIMIT 3;
+----
+id | distance
+4 | 2.0
+5 | *
+1 | 0.0
+
+SELECT id FROM points ORDER BY v <=> '[1,0,0,0]', id DESC LIMIT 1;
+----
+id
+2
+
+CREATE TABLE pairs (id INTEGER PRIMARY KEY, a VECTOR(2), b VECTOR(2));
+INSERT INTO pairs (id, a, b) VALUES (3, [0.0, 1.0], [1.0, 0.0]), (1, [1.0, 0.0], [0.0, 1.0]), (2, [1.0, 0.0], [1.0, 0.0]);
+SELECT id FROM pairs ORDER BY a <=> b LIMIT 3;
+----
+id
+2
+1
+3
+
+# EXCLUDE VECTOR rows stay out of an indexed-WHERE search and an aliased one. Row 1 is nearest.
+CREATE TABLE held (id INTEGER PRIMARY KEY, status TEXT NOT NULL, grp INTEGER NOT NULL, v VECTOR(2))
+STATE MACHINE (status: active -> [gone], gone -> [active]) PROPAGATE ON STATE gone EXCLUDE VECTOR;
+CREATE INDEX held_grp ON held (grp);
+INSERT INTO held (id, status, grp, v) VALUES (1, 'active', 1, [1.0, 0.0]), (2, 'active', 1, [0.5, 0.5]), (3, 'active', 2, [0.0, 1.0]);
+UPDATE held SET status = 'gone' WHERE id = 1;
+----
+rows affected: 1
+
+SELECT id FROM held WHERE grp = 1 ORDER BY v <=> [1.0, 0.0] LIMIT 5;
+----
+id
+2
+
+SELECT id FROM held h ORDER BY h.v <=> [1.0, 0.0] LIMIT 5;
+----
+id
+2
+3
+
+# On a table with EXCLUDE VECTOR states <=> is answered only as ORDER BY v <=> q LIMIT n.
+SELECT id FROM held ORDER BY v <=> [1.0, 0.0];
+----
+error: PlanError
+
+SELECT id FROM held ORDER BY v <=> [1.0, 0.0] DESC LIMIT 5;
+----
+error: PlanError
+
+SELECT id FROM held ORDER BY (v <=> [1.0, 0.0]) + 0 LIMIT 5;
+----
+error: PlanError
+
+SELECT id, v <=> [1.0, 0.0] AS distance FROM held WHERE id = 1;
+----
+error: PlanError
+
+# Row 6 has no vector: in no answer, however the sort key is wrapped or followed.
+SELECT id FROM points ORDER BY (v <=> [1.0, 0.0, 0.0, 0.0]) + 0 LIMIT 10;
+----
+id
+1
+2
+5
+3
+7
+8
+4
+
+# LIMIT 0 is still validated.
+SELECT id FROM points ORDER BY v <=> [1.0, 0.0, 0.0] LIMIT 0;
+----
+error: VectorIndexDimensionMismatch

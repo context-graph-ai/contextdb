@@ -8,7 +8,7 @@
 // Each test program uses a part of this module; the rest would be reported as never used.
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write};
@@ -24,8 +24,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::Duration;
 
 use contextdb::{
-    Database, DatabaseOpenOptions, Error, QueryResult, ReadSession, StorageBackend, Transaction,
-    Value, WrapStorage, params,
+    ContextId, Database, DatabaseOpenOptions, Error, QueryResult, ReadSession, ReadSessionOptions,
+    ScopeLabel, StorageBackend, Transaction, Uuid, Value, WrapStorage, params,
 };
 
 // ---- folders and opening ----
@@ -71,6 +71,30 @@ pub fn open_with(folder: &Path, options: DatabaseOpenOptions) -> contextdb::Resu
 /// Closes a store and gives up the handle, so that the folder is free for the next open.
 pub fn close(db: Database) {
     db.close().expect("close the store");
+}
+
+/// Closes a store and opens it again with no configuration.
+pub fn reopen(db: Database, folder: &Path) -> Database {
+    close(db);
+    open(folder)
+}
+
+/// Opens a store for writing under a memory limit of this many bytes. It must open.
+pub fn open_limited(folder: &Path, limit: usize) -> Database {
+    let mut options = DatabaseOpenOptions::default();
+    options.memory_limit = Some(limit);
+    open_with(folder, options).unwrap_or_else(|error| {
+        panic!("an open under a limit of {limit} bytes was refused: {error:?}")
+    })
+}
+
+/// Opens a store for reading, under a memory limit when one is given. It must open.
+pub fn open_reader(folder: &Path, limit: Option<usize>) -> ReadSession {
+    let mut options = ReadSessionOptions::default();
+    options.memory_limit = limit;
+    ReadSession::open_with_options(folder, options).unwrap_or_else(|error| {
+        panic!("a reader under a limit of {limit:?} was refused: {error:?}")
+    })
 }
 
 // ---- statements ----
@@ -138,6 +162,114 @@ pub fn refusal(on: &impl Run, sql: &str) -> Error {
     }
 }
 
+/// One column of what `SHOW MEMORY_LIMIT` reports.
+pub fn memory_shown(on: &impl Run, column: &str) -> Value {
+    let report = run(on, "SHOW MEMORY_LIMIT");
+    let at = report
+        .columns()
+        .iter()
+        .position(|name| name == column)
+        .unwrap_or_else(|| panic!("SHOW MEMORY_LIMIT has no column {column}"));
+    match report.rows() {
+        [row] => row[at].clone(),
+        rows => panic!("SHOW MEMORY_LIMIT returned {} rows", rows.len()),
+    }
+}
+
+/// The bytes `SHOW MEMORY_LIMIT` reports as used.
+pub fn memory_used(on: &impl Run) -> usize {
+    match memory_shown(on, "used") {
+        Value::Int64(bytes) => bytes as usize,
+        other => panic!("SHOW MEMORY_LIMIT reports {other:?} as used"),
+    }
+}
+
+/// The first column of every row a statement returns, which must be an INTEGER.
+pub fn ids(on: &impl Run, sql: &str) -> Vec<i64> {
+    rows(on, sql)
+        .iter()
+        .map(|row| match row.first() {
+            Some(Value::Int64(id)) => *id,
+            other => panic!("{sql}\nreturned {other:?} where an INTEGER was wanted"),
+        })
+        .collect()
+}
+
+/// What a table is printed back as.
+pub fn printed(db: &Database, table: &str) -> String {
+    db.declaration(table)
+        .unwrap_or_else(|error| panic!("the declaration of {table} was refused: {error:?}"))
+}
+
+/// Asserts that what these tables are printed back as declares the same tables in an empty
+/// store (made under `prefix`), printed the same. The tables are named in the order they may be
+/// declared in. Gives back the printed texts, in that order.
+pub fn assert_roundtrips(prefix: &str, db: &Database, tables: &[&str]) -> Vec<String> {
+    let texts: Vec<String> = tables.iter().map(|table| printed(db, table)).collect();
+    let again = open(&folder(&format!("{prefix}-again")));
+    for text in &texts {
+        for statement in text.split_inclusive(";\n") {
+            run(&again, statement);
+        }
+    }
+    for (table, text) in tables.iter().zip(&texts) {
+        let declared = again.declaration(table).expect("the declaration");
+        assert_eq!(
+            &declared, text,
+            "{prefix}: {table} declared from its printed text"
+        );
+    }
+    texts
+}
+
+// ---- who is asking ----
+
+/// Context number `n`.
+pub fn context(n: u128) -> Uuid {
+    Uuid::from_u128(0x00C0_0000 + n)
+}
+
+/// Access-control id number `n`.
+pub fn acl(n: u128) -> Uuid {
+    Uuid::from_u128(0x00AC_0000 + n)
+}
+
+/// A handle narrowed to the Contexts with these numbers.
+pub fn in_contexts(db: &Database, numbers: &[u128]) -> Database {
+    db.scoped_with_contexts(context_set(numbers))
+}
+
+/// The length of the store's data file, in bytes.
+pub fn data_file(folder: &Path) -> u64 {
+    fs::metadata(folder.join("data"))
+        .expect("the store's data file")
+        .len()
+}
+
+/// The keys of a search's answer, in its order; each must be an INTEGER.
+pub fn near_ids(answer: &[Near]) -> Vec<i64> {
+    answer
+        .iter()
+        .map(|near| match near.key {
+            Value::Int64(id) => id,
+            ref other => panic!("the key {other:?} is not an INTEGER"),
+        })
+        .collect()
+}
+
+/// The Contexts with these numbers.
+pub fn context_set(numbers: &[u128]) -> BTreeSet<ContextId> {
+    numbers
+        .iter()
+        .map(|n| ContextId::new(context(*n)))
+        .collect()
+}
+
+/// The scope labels with these names.
+pub fn label_set(names: &[&str]) -> BTreeSet<ScopeLabel> {
+    names.iter().map(|name| ScopeLabel::new(*name)).collect()
+}
+
 // ---- the table most tests use ----
 
 /// Row `n` of this table is `(n, "row-000000n", n % 10)`: see [`row`].
@@ -178,6 +310,13 @@ pub fn insert(on: &impl Run, numbers: impl IntoIterator<Item = i64>) {
             panic!("inserting row {n} was refused: {error:?}");
         }
     }
+}
+
+/// Inserts the rows with these numbers in one transaction and commits it.
+pub fn insert_together(db: &Database, numbers: impl IntoIterator<Item = i64>) {
+    let tx = db.transaction().expect("begin");
+    insert(&tx, numbers);
+    tx.commit().expect("commit");
 }
 
 /// Asserts that the table holds exactly the rows with these numbers, each one whole, and that
@@ -697,6 +836,55 @@ pub fn insert_docs(
     }
 }
 
+/// The words of a declaration in lower case and its quoted texts as they are written: what the
+/// declaration says, whatever the order, the spacing and the punctuation it says it in. A type
+/// is given the name it is printed under, and a quoted name that needs no quotes loses them.
+pub fn words(sql: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut rest = sql.chars().peekable();
+    while let Some(first) = rest.next() {
+        if first == '\'' || first == '"' {
+            let mut text = String::from(first);
+            loop {
+                let next = rest.next().expect("a quoted text ends with its quote");
+                text.push(next);
+                // The quote written twice is one quote of the text.
+                if next == first && rest.next_if_eq(&first).is_none() {
+                    break;
+                }
+            }
+            let inner = &text[1..text.len() - 1];
+            let plain = first == '"'
+                && inner.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+                && inner
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+            found.push(if plain { inner.to_owned() } else { text });
+        } else if first.is_ascii_alphanumeric() || first == '_' {
+            let mut word = String::from(first.to_ascii_lowercase());
+            while let Some(next) =
+                rest.next_if(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+            {
+                word.push(next.to_ascii_lowercase());
+            }
+            match word.as_str() {
+                "int" => found.push("integer".to_owned()),
+                "bool" => found.push("boolean".to_owned()),
+                "float" => found.push("real".to_owned()),
+                "state_machine" => found.extend(["state".to_owned(), "machine".to_owned()]),
+                _ => found.push(word),
+            }
+        }
+    }
+    found
+}
+
+/// The index of `events` by kind and then newest first.
+pub const EVENTS_INDEX: &str = "CREATE INDEX events_kind_seq ON events (kind ASC, seq DESC)";
+
+/// A table of notes, each a key and a body.
+pub const NOTES: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)";
+
 /// A text value, for comparing with a column of a stored row.
 pub fn text(value: &str) -> Value {
     Value::Text(value.to_owned())
@@ -1015,6 +1203,17 @@ impl StorageBackend for Watched {
         (self.watch)(Call::Write(offset, data))?;
         self.file.write_all_at(data, offset)
     }
+}
+
+/// The child's store opened for reading through [`pausing_at_read`]'s door, with its flag and
+/// count.
+pub fn reader_pausing(role: &Role) -> (ReadSession, Arc<AtomicBool>, Arc<AtomicU64>) {
+    let (door, searching, reads) = pausing_at_read(role.number("pause_at"));
+    let mut options = ReadSessionOptions::default();
+    options.storage = Some(door);
+    let reader =
+        ReadSession::open_with_options(&role.folder, options).expect("open the store for reading");
+    (reader, searching, reads)
 }
 
 /// A storage door for a child that is to be stopped inside one statement. While the flag it

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Run the pull-request workflow on this machine, each job in a box shaped like a hosted runner.
 
-    python3 scripts/ci-local.py [--tree DIR] [--work DIR] [--tmp DIR] [--out DIR] [--boxes N]
-                                [--only REGEX] [--base SHA] [--path-prepend DIR ...]
+    python3 scripts/ci-local.py [--workflow FILE] [--tree DIR] [--work DIR] [--tmp DIR] [--out DIR]
+                                [--boxes N] [--only REGEX] [--base SHA] [--path-prepend DIR ...]
 
 The job graph, matrices, `if:` conditions, `env:` blocks, outputs and `run:` steps are read from
-.github/workflows/ci.yml at run time and executed the way a GitHub-hosted runner executes them for a
+the workflow (.github/workflows/ci.yml, or check.yml for the packages under v2/) at run time and executed the way a GitHub-hosted runner executes them for a
 pull_request event: jobs start when their `needs` finish, matrix legs run concurrently, step
 outputs, GITHUB_ENV and GITHUB_PATH flow between steps, `continue-on-error` and step outcomes behave
 as on GitHub. A workflow construct this script does not model (an unknown action, expression
@@ -38,7 +38,8 @@ parent slice hit its own cap is reported INCONCLUSIVE, never as the job's verdic
 
 Artifacts are kept by name under --work, so the shared-build jobs pack their target once and the
 test jobs restore it, as on GitHub. Hosted chores that need root (`sudo`, apt) are skipped and
-listed; the tools they install must already be on PATH. The build cache action restores nothing
+listed; the tools they install must already be on PATH, and so must each tool the tool-install
+action names (its version is not checked). The build cache action restores nothing
 here, so a job GitHub serves from a warm cache compiles cold here.
 
 When `build-any` is on PATH every box step is admitted through it (the shared build-host
@@ -46,7 +47,7 @@ contract), and the box keeps the CPU set that admission chose.
 
 Output in --out: jobs.tsv (job, name, result, cause, minutes in the box, peak memory, peak disk),
 steps.tsv, logs/, not-run.tsv and result.txt. Exit status 0 when the final required job passed,
-1 when it did not, 3 on workflow drift, 130 when stopped by SIGINT/SIGTERM (the report is still
+1 when it did not (a workflow without a `required` job: when every job passed), 3 on workflow drift, 130 when stopped by SIGINT/SIGTERM (the report is still
 written; unfinished jobs are marked interrupted).
 """
 import argparse
@@ -67,7 +68,6 @@ from pathlib import Path
 
 import yaml
 
-WORKFLOW = '.github/workflows/ci.yml'
 BOX_CPUS = 4
 # Free memory the shared parent slice must have before another box step starts.
 STEP_HEADROOM = 8 * 1024 ** 3
@@ -79,7 +79,7 @@ HOSTED_FREE_AFTER_CLEANUP = 92_027_510_784
 DISK_POLL_SECONDS = 20
 SLICE = 'cilocal.slice'
 KNOWN_ACTIONS = ('actions/checkout', 'actions-rust-lang/setup-rust-toolchain', 'Swatinem/rust-cache',
-                 'actions/upload-artifact', 'actions/download-artifact')
+                 'actions/upload-artifact', 'actions/download-artifact', 'taiki-e/install-action')
 # Hosted-runner chores that need root; the tools they install must already be present here.
 ROOT_CHORE = re.compile(r'\bsudo\b|\bapt-get\b')
 # Commands that never compile; every other step is admitted through the build-host wrapper.
@@ -505,6 +505,11 @@ class Box:
         if action == 'actions/download-artifact':
             return self.run.download(self, to_str(w.get('name') or ''), to_str(w.get('pattern') or ''),
                                      to_str(w.get('path') or '.'), name)
+        if action == 'taiki-e/install-action':
+            path = self.run.base_env(self)['PATH']
+            missing = [t for t in re.split(r'[,\s]+', to_str(w.get('tool'))) if t and not shutil.which(t.split('@')[0], path=path)]
+            self.run.note(self, name, f'tools missing from PATH: {missing}' if missing else 'tools taken from PATH')
+            return not missing
         raise Drift(f'unsupported action {uses!r}')
 
     # -- run: steps
@@ -613,7 +618,7 @@ class LocalRun:
         self.stop_file = self.work / 'STOP'
         self.t0 = time.time()
         self.artifacts = self.work / 'artifacts'
-        self.doc = yaml.safe_load((self.tree / WORKFLOW).read_text())
+        self.doc = yaml.safe_load((self.tree / a.workflow).read_text())
         self.default_shell = ((self.doc.get('defaults') or {}).get('run') or {}).get('shell', 'bash')
 
     def git(self, *args, cwd=None):
@@ -1012,7 +1017,8 @@ class LocalRun:
             line = f'DRIFT {self.drift}'
             code = 3
         else:
-            final = self.needs.get('required', {}).get('result', 'missing')
+            final = (self.needs['required']['result'] if 'required' in self.doc['jobs'] else
+                     'success' if all(n['result'] in ('success', 'skipped') for n in self.needs.values()) else 'failure')
             failed = sorted(r[1] for r in rows if r[2] != 'success')
             line = f'{"PASS" if final == "success" else "FAIL"} required={final} jobs={len(rows)} not-success={len(failed)}'
             code = 0 if final == 'success' else 1
@@ -1137,6 +1143,7 @@ def main():
         box_main(sys.argv[2:])
     here = Path(__file__).resolve().parents[1]
     p = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    p.add_argument('--workflow', default='.github/workflows/ci.yml', help='workflow file, relative to the tree')
     p.add_argument('--tree', default=str(here), help='checkout to run (default: this repository)')
     p.add_argument('--work', default=os.environ.get('CI_LOCAL_WORK', str(here / 'target/ci-local/work')),
                    help='per-run box checkouts, targets and artifacts')

@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::memory::Budget;
 use crate::query::{self, QueryResult};
-use crate::schema::{self, Catalog};
+use crate::schema::Catalog;
 use crate::sql::{self, Effect, Plan};
 use crate::store::{Store, View, WrapStorage};
 use crate::system::{self, Clock};
@@ -119,7 +119,7 @@ impl ReadSession {
     /// - [`crate::Error::StoreIo`] when the folder or its data file cannot be read, and
     ///   [`crate::Error::StoreCorrupted`] when what was read fails its check.
     pub fn execute(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
-        let plan = sql::plan(&sql::parse(sql)?)?;
+        let plan = sql::plan(sql::parse(sql)?)?;
         if plan.effect() != Effect::Reads {
             return Err(Error::ReadOnlySession);
         }
@@ -141,11 +141,11 @@ impl ReadSession {
     ///
     /// As [`ReadSession::execute`] for a statement that reads.
     pub fn explain(&self, sql: &str) -> Result<String> {
-        let plan = sql::plan(&sql::parse(sql)?)?;
+        let plan = sql::plan(sql::parse(sql)?)?;
         let now = system::now_millis(&*self.clock);
         let (view, catalog) = self.newest()?;
-        let admin = query::Reader::admin();
-        query::explain(&plan, &catalog, &view, &admin, &self.budget, now)
+        let (admin, budget) = (query::Reader::admin(), &self.budget);
+        query::explain(&plan, &HashMap::new(), &catalog, &view, &admin, budget, now)
     }
 
     /// The names of the store's tables as of the newest commit, in name order. A store with no
@@ -157,9 +157,7 @@ impl ReadSession {
     /// [`crate::Error::StoreIo`] when the folder or its data file cannot be read, and
     /// [`crate::Error::StoreCorrupted`] when what was read fails its check.
     pub fn table_names(&self) -> Result<Vec<String>> {
-        let (_, catalog) = self.newest()?;
-        let tables = catalog.tables().into_iter();
-        Ok(tables.map(|table| table.name.clone()).collect())
+        Ok(self.newest()?.1.table_names())
     }
 
     /// A table's declaration as SQL text, as of the newest commit: its `CREATE TABLE` statement,
@@ -174,11 +172,7 @@ impl ReadSession {
     /// - [`crate::Error::StoreIo`] when the folder or its data file cannot be read, and
     ///   [`crate::Error::StoreCorrupted`] when what was read fails its check.
     pub fn declaration(&self, table: &str) -> Result<String> {
-        let (_, catalog) = self.newest()?;
-        match catalog.table(table) {
-            Some(table) => Ok(schema::render(table)),
-            None => Err(Error::TableNotFound(table.to_owned())),
-        }
+        self.newest()?.1.declaration(table)
     }
 
     /// The newest commit and the tables declared at it. The view holds that commit's pages for

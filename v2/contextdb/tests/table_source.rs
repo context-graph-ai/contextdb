@@ -4,16 +4,14 @@
 
 mod support;
 
-use std::collections::BTreeSet;
+use contextdb::{Error, Principal, Value, params};
 
-use contextdb::{ContextId, Error, Principal, ScopeLabel, Uuid, Value, params};
+use support::{acl, context, context_set, label_set};
 
 #[test]
 fn a_narrowed_reader_naming_a_hidden_row_by_its_key_is_refused_by_the_rule_that_hid_it() {
     let folder = support::folder("table-source-hidden-row-by-key");
     let db = support::open(&folder);
-    let context = |n: u128| Uuid::from_u128(0x00C0_0000 + n);
-    let acl = |n: u128| Uuid::from_u128(0x00AC_0000 + n);
 
     // Row 1 of each table is in the reader's view and row 2 is hidden by the table's rule.
     support::run(
@@ -60,8 +58,7 @@ fn a_narrowed_reader_naming_a_hidden_row_by_its_key_is_refused_by_the_rule_that_
     )
     .expect("grant access id 1");
 
-    let contexts: BTreeSet<ContextId> = [ContextId::new(context(1))].into();
-    let labels: BTreeSet<ScopeLabel> = [ScopeLabel::new("public")].into();
+    let (contexts, labels) = (context_set(&[1]), label_set(&["public"]));
     let agent = Principal::Agent("a".to_owned());
     let in_one = db.scoped_with_constraints(Some(contexts), None, None);
     let public = db.scoped_with_constraints(None, Some(labels), None);

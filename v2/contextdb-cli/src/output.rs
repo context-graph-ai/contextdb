@@ -283,7 +283,9 @@ pub fn table(columns: &[String], rows: &[Vec<Value>]) -> String {
     let line = |cells: &[String]| {
         let mut line = String::from("|");
         for (cell, width) in cells.iter().zip(&widths) {
-            line.push_str(&format!(" {cell:<width$} |"));
+            // Padded by hand: a formatter refuses a width past 65,535.
+            let pad = " ".repeat(width - cell.chars().count());
+            line.push_str(&format!(" {cell}{pad} |"));
         }
         line.push('\n');
         line

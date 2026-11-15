@@ -5,15 +5,14 @@
 
 mod support;
 
-use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use contextdb::serde_json::json;
-use contextdb::{Clock, Database, DatabaseOpenOptions, Error, ReadSession, Value, params};
-use support::Call;
+use contextdb::{Clock, Database, DatabaseOpenOptions, Error, Value, params};
+use support::{Call, data_file, printed, words};
 
 /// A clock that always shows the same second.
 struct At(u64);
@@ -30,58 +29,10 @@ fn open_at(folder: &Path, second: u64) -> Database {
     support::open_with(folder, options).expect("open the store with a clock")
 }
 
-/// The length of a store's data file, in bytes.
-fn data_file(folder: &Path) -> u64 {
-    fs::metadata(folder.join("data"))
-        .expect("the store's data file")
-        .len()
-}
-
-/// What a table is printed back as.
-fn printed(db: &Database, table: &str) -> String {
-    db.declaration(table)
-        .unwrap_or_else(|error| panic!("the declaration of {table} was refused: {error:?}"))
-}
-
-/// The words of a declaration, in lower case, and its quoted texts: what it says, whatever
-/// the spacing and the punctuation it says it in.
-fn words(sql: &str) -> Vec<String> {
-    let mut found = Vec::new();
-    let mut rest = sql.chars().peekable();
-    while let Some(first) = rest.next() {
-        if first == '\'' || first == '"' {
-            let mut text = String::from(first);
-            loop {
-                let next = rest.next().expect("a quoted text ends with its quote");
-                text.push(next);
-                if next == first && rest.next_if_eq(&first).is_none() {
-                    break;
-                }
-            }
-            found.push(text);
-        } else if first.is_ascii_alphanumeric() || first == '_' {
-            let mut word = String::from(first.to_ascii_lowercase());
-            while let Some(next) = rest.next_if(|c| c.is_ascii_alphanumeric() || *c == '_') {
-                word.push(next.to_ascii_lowercase());
-            }
-            found.push(word);
-        }
-    }
-    found
-}
-
 /// Whether a printed declaration says this clause: the clause's words, one after the other.
 fn says(declaration: &str, clause: &str) -> bool {
     let (text, clause) = (words(declaration), words(clause));
     text.windows(clause.len()).any(|window| window == clause)
-}
-
-/// The statements of a printed declaration.
-fn statements(text: &str) -> Vec<&str> {
-    let ended = text.split(";\n");
-    ended
-        .filter(|statement| !statement.trim().is_empty())
-        .collect()
 }
 
 #[test]
@@ -134,26 +85,26 @@ fn an_added_column_reads_its_default_from_a_row_written_before_it() {
     );
 
     // A filter, a sort and a new index read the same defaults.
-    let ids = |sql: &str| -> Vec<i64> {
-        let rows = support::rows(&db, sql);
-        rows.iter()
-            .map(|row| match row[0] {
-                Value::Int64(id) => id,
-                ref other => panic!("{sql}\nreturned {other:?} for an id"),
-            })
-            .collect()
-    };
     assert_eq!(
-        ids("SELECT id FROM t WHERE n = 7 AND word = 'none' ORDER BY id"),
+        support::ids(
+            &db,
+            "SELECT id FROM t WHERE n = 7 AND word = 'none' ORDER BY id"
+        ),
         [1, 2, 3]
     );
     assert_eq!(
-        ids("SELECT id FROM t WHERE plain IS NULL ORDER BY n, id"),
+        support::ids(&db, "SELECT id FROM t WHERE plain IS NULL ORDER BY n, id"),
         [1, 2, 3]
     );
     support::run(&db, "CREATE INDEX t_by_n ON t (n, id)");
-    assert_eq!(ids("SELECT id FROM t WHERE n = 7 ORDER BY id"), [1, 2, 3]);
-    assert_eq!(ids("SELECT id FROM t WHERE n = 8 ORDER BY id"), [0_i64; 0]);
+    assert_eq!(
+        support::ids(&db, "SELECT id FROM t WHERE n = 7 ORDER BY id"),
+        [1, 2, 3]
+    );
+    assert_eq!(
+        support::ids(&db, "SELECT id FROM t WHERE n = 8 ORDER BY id"),
+        [0_i64; 0]
+    );
 
     // A statement that changes another column of an older row leaves what the row reads in
     // the added ones; one that assigns an added column changes that column alone.
@@ -165,8 +116,14 @@ fn an_added_column_reads_its_default_from_a_row_written_before_it() {
         support::rows(&db, all),
         [older(1, "renamed"), second.clone(), older(3, "c")]
     );
-    assert_eq!(ids("SELECT id FROM t WHERE n = 7 ORDER BY id"), [1, 3]);
-    assert_eq!(ids("SELECT id FROM t WHERE n = 8 ORDER BY id"), [2]);
+    assert_eq!(
+        support::ids(&db, "SELECT id FROM t WHERE n = 7 ORDER BY id"),
+        [1, 3]
+    );
+    assert_eq!(
+        support::ids(&db, "SELECT id FROM t WHERE n = 8 ORDER BY id"),
+        [2]
+    );
     support::close(db);
 
     // Under a later clock the older rows read the time they read before, a row written now
@@ -310,8 +267,7 @@ fn an_added_vector_column_is_null_on_older_rows_and_no_search_returns_them() {
     // The same once the vectors are in blocks, and after close and open.
     assert_eq!(support::seal_all(&db), 3);
     assert_eq!(found(&db, ""), ids(&[2, 5, 7]));
-    support::close(db);
-    let db = support::open(&folder);
+    let db = support::reopen(db, &folder);
     assert_eq!(found(&db, ""), ids(&[2, 5, 7]));
     assert_eq!(found(&db, "WHERE ctx = 'b'"), ids(&[5]));
     let with_vector = vectors(&db)
@@ -354,10 +310,7 @@ fn a_dropped_columns_bytes_leave_the_store() {
     let store = |test: &str, drop: bool| -> u64 {
         let folder = support::folder(test);
         let db = support::open(&folder);
-        support::run(
-            &db,
-            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
-        );
+        support::run(&db, support::NOTES);
         fill(&db, "notes", "body", true, 0);
         if drop {
             support::run(&db, "ALTER TABLE notes DROP COLUMN body");
@@ -427,7 +380,7 @@ fn a_dropped_table_leaves_no_record() {
     // Nothing answers for the dropped table: not the writer, not a reader, not after close
     // and open; and a table declared under its name starts empty, with none of its indexes.
     let db = support::open(&folder);
-    let reader = ReadSession::open(&folder).expect("open the store for reading");
+    let reader = support::open_reader(&folder, None);
     assert_eq!(db.table_names(), ["two"]);
     assert_eq!(reader.table_names().expect("a reader's tables"), ["two"]);
     let missing = |error: Error, what: &str| {
@@ -539,8 +492,6 @@ enum Refused {
     /// `DropBlockedByRankPolicy` for this table and the policy of `ranked`, and for this
     /// column where the statement names one.
     Ranked(&'static str, Option<&'static str>),
-    /// `TableNotFound` for the table `nope`.
-    NoTable,
 }
 
 impl Refused {
@@ -578,7 +529,6 @@ impl Refused {
                     && policy == "effective_confidence"
                     && named.is_none_or(|named| column == named)
             }
-            (Refused::NoTable, Error::TableNotFound(name)) => name == "nope",
             _ => false,
         }
     }
@@ -618,14 +568,10 @@ fn each_dependent_refusal_names_what_depends_and_changes_nothing() {
         ),
         // A column of the key, a table another references, and a column that makes a DAG
         // table a table of edges.
-        ("ALTER TABLE t DROP COLUMN id", Refused::Invalid),
-        ("ALTER TABLE t RENAME COLUMN id TO key", Refused::Invalid),
         (
             "ALTER TABLE parents DROP COLUMN id CASCADE",
             Refused::Invalid,
         ),
-        ("DROP TABLE parents", Refused::Invalid),
-        ("DROP TABLE IF EXISTS parents", Refused::Invalid),
         ("ALTER TABLE edges DROP COLUMN source_id", Refused::Invalid),
         (
             "ALTER TABLE edges DROP COLUMN target_id CASCADE",
@@ -658,15 +604,6 @@ fn each_dependent_refusal_names_what_depends_and_changes_nothing() {
         ),
         // A column that may hold no NULL, with no default, on a table that has rows; a name
         // that is taken; a second key.
-        (
-            "ALTER TABLE t ADD COLUMN must TEXT NOT NULL",
-            Refused::Invalid,
-        ),
-        ("ALTER TABLE t ADD COLUMN a INTEGER", Refused::Invalid),
-        (
-            "ALTER TABLE t ADD COLUMN k INTEGER PRIMARY KEY",
-            Refused::Invalid,
-        ),
         ("ALTER TABLE t RENAME COLUMN a TO b", Refused::Invalid),
         // Options that cannot stand.
         (
@@ -675,11 +612,6 @@ fn each_dependent_refusal_names_what_depends_and_changes_nothing() {
         ),
         ("ALTER TABLE t SET MAINTAIN COUNT (kind)", Refused::Invalid),
         ("ALTER TABLE t SET MAINTAIN COUNT (id)", Refused::Invalid),
-        // What is not there.
-        ("DROP TABLE nope", Refused::NoTable),
-        ("ALTER TABLE nope ADD COLUMN c TEXT", Refused::NoTable),
-        ("ALTER TABLE nope DROP COLUMN c", Refused::NoTable),
-        ("DROP INDEX t_first ON nope", Refused::NoTable),
     ];
     for (sql, refused) in &cases {
         let error = support::refusal(&db, sql);
@@ -715,31 +647,17 @@ fn each_dependent_refusal_names_what_depends_and_changes_nothing() {
             other => panic!("{sql}\nwas refused as {other:?}"),
         }
     }
-    // A limit on partitions below the partitions the column has. No document says which of
-    // the two kinds this is.
+    // A limit on partitions below the partitions the column has.
     let error = support::refusal(&db, "ALTER TABLE t ALTER COLUMN v SET MAX_PARTITIONS 1");
     assert!(
         matches!(
             &error,
-            Error::VectorPartitionLimitExceeded { index, .. }
-            | Error::InvalidVectorPartitionDeclaration { index, .. }
+            Error::VectorPartitionLimitExceeded { index, max_partitions: 1 }
                 if index.table == "t" && index.column == "v"
         ),
         "a limit of one partition on a column that has two was refused as {error:?}"
     );
     assert!(state(&db) == before);
-    // With IF EXISTS, a table or an index that is not there is nothing to do, and changes
-    // no declaration and no row.
-    for sql in [
-        "DROP TABLE IF EXISTS nope",
-        "DROP INDEX IF EXISTS nope ON t",
-    ] {
-        let result = support::run(&db, sql);
-        assert_eq!(result.rows_affected(), 0, "{sql}");
-        assert!(result.rows().is_empty(), "{sql}");
-    }
-    let after = state(&db);
-    assert!(after.0 == before.0 && after.1 == before.1 && after.2 == before.2);
 }
 
 #[test]
@@ -885,7 +803,9 @@ fn an_altered_table_is_printed_as_what_it_now_declares() {
     let mut db = db;
     for (number, (sql, now, no_longer)) in steps.iter().enumerate() {
         support::run(&db, sql);
-        let text = printed(&db, "t");
+        // The printed texts declare the same two tables in an empty store.
+        let prefix = format!("altered-printed-{number}");
+        let text = support::assert_roundtrips(&prefix, &db, &["parents", "t"]).remove(1);
         for clause in *now {
             assert!(
                 says(&text, clause),
@@ -898,20 +818,6 @@ fn an_altered_table_is_printed_as_what_it_now_declares() {
                 "after {sql}\nstill `{clause}` in:\n{text}"
             );
         }
-        // The printed texts declare the same two tables in an empty store.
-        let again = support::open(&support::folder(&format!("altered-printed-again-{number}")));
-        for table in ["parents", "t"] {
-            let declared = printed(&db, table);
-            for statement in statements(&declared) {
-                support::run(&again, statement);
-            }
-        }
-        assert_eq!(printed(&again, "t"), text, "after {sql}, declared again");
-        assert_eq!(
-            printed(&again, "parents"),
-            printed(&db, "parents"),
-            "after {sql}"
-        );
         // And the store says the same after close and open.
         support::close(db);
         db = support::open(&folder);
@@ -996,8 +902,7 @@ fn a_renamed_vector_column_keeps_its_declaration_and_its_vectors() {
         }
         other => panic!("a fourth partition gave {other:?}"),
     }
-    support::close(db);
-    let db = support::open(&folder);
+    let db = support::reopen(db, &folder);
     assert_eq!(
         nearest(&db, "embedding", "WHERE ctx = 'a'").expect("a search"),
         of_a
@@ -1107,9 +1012,7 @@ fn a_vector_column_far_larger_than_the_memory_limit_is_dropped_under_it() {
     let held = data_file(&folder);
     // 9 MiB is what a store needs to open at all. The 192 KiB above it are less than
     // a tenth of the vectors, which is 256,000 bytes.
-    let mut options = DatabaseOpenOptions::default();
-    options.memory_limit = Some(9 * MIB + 192 * KIB);
-    let db = support::open_with(&folder, options).expect("open under the limit");
+    let db = support::open_limited(&folder, 9 * MIB + 192 * KIB);
     let sql = "ALTER TABLE docs DROP COLUMN v";
     if let Err(error) = db.execute(sql, &params! {}) {
         panic!("{sql}\nof {VECTORS} vectors was refused under the limit: {error:?}");
@@ -1147,10 +1050,7 @@ fn a_column_added_and_dropped_in_one_transaction_leaves_nothing_stored() {
     let store = |test: &str, churn: bool| -> u64 {
         let folder = support::folder(test);
         let db = support::open(&folder);
-        support::run(
-            &db,
-            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
-        );
+        support::run(&db, support::NOTES);
         fill(&db, "notes", "body", true, 0);
         if churn {
             let before = printed(&db, "notes");

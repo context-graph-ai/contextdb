@@ -67,5 +67,34 @@ error: PlanError
 
 SELECT COUNT(*) FROM items WHERE id = 7;
 ----
-COUNT
+count
+0
+
+# A SELECT among the VALUES is worked out before the row is stored.
+CREATE TABLE counted (id INTEGER PRIMARY KEY, seen INTEGER);
+INSERT INTO counted (id, seen) VALUES (1, 0), (2, 0);
+INSERT INTO counted (id, seen) VALUES (3, (SELECT COUNT(*) FROM counted));
+----
+rows affected: 1
+
+SELECT seen FROM counted WHERE id = 3;
+----
+seen
+2
+
+# A comparison of unlike types with the value a SELECT gives is refused in VALUES, and nothing is stored.
+CREATE TABLE words (id INTEGER PRIMARY KEY, label TEXT);
+INSERT INTO words (id, label) VALUES (1, 'seven');
+CREATE TABLE flags (id INTEGER PRIMARY KEY, ok BOOLEAN);
+INSERT INTO flags (id, ok) VALUES (1, 10 = (SELECT label FROM words WHERE id = 1));
+----
+error: PlanError
+
+INSERT INTO flags (id, ok) VALUES (2, 10 NOT IN (SELECT label FROM words WHERE id = 99));
+----
+error: PlanError
+
+SELECT COUNT(*) FROM flags;
+----
+count
 0

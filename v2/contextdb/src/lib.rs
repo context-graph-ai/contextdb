@@ -19,8 +19,10 @@ pub use read::{ReadSession, ReadSessionOptions};
 pub use store::{StorageBackend, WrapStorage};
 pub use system::Clock;
 pub use types::{
-    ColumnType, ContextId, Error, Principal, Result, ScopeLabel, TableMeta, TxId, Uuid, Value,
-    VectorIndexRef, VectorPartitionDeclarationIssue, VectorPolicyDeclarationIssue,
+    ColumnDef, ColumnDefault, ColumnType, ConflictPolicy, ContextId, Error, History, IndexDecl,
+    KeptCounts, Principal, Result, Retain, RetainUnit, ScopeLabel, SortDirection, StateMachine,
+    SyncDirection, TableMeta, TxId, Uuid, Value, VectorIndexRef, VectorPartitionDeclarationIssue,
+    VectorPolicyDeclarationIssue,
 };
 pub use upkeep::{MaintenanceReport, VectorMaintenanceReport};
 

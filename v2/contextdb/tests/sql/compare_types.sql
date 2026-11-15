@@ -156,3 +156,38 @@ SELECT id, n, label FROM things ORDER BY id;
 id | n | label
 1 | 9 | seven
 3 | NULL | NULL
+
+# The value a SELECT gives has its column's type: a number is not compared with text there.
+SELECT id FROM things WHERE n IN (SELECT label FROM things);
+----
+error: PlanError
+
+# A whole number and a REAL are equal only when they are the same number, through an index too.
+CREATE TABLE wide (id INTEGER PRIMARY KEY, x REAL);
+CREATE INDEX wide_x ON wide (x);
+INSERT INTO wide (id, x) VALUES (1, 9007199254740992.0);
+----
+rows affected: 1
+
+SELECT id FROM wide WHERE x = 9007199254740993;
+----
+id
+
+SELECT id FROM wide WHERE x >= 9007199254740993;
+----
+id
+
+SELECT id FROM wide WHERE x = 9007199254740992;
+----
+id
+1
+
+# A whole number a REAL cannot hold is above the REAL that is nearest it.
+INSERT INTO wide (id, x) VALUES (2, 9223372036854775808.0);
+----
+rows affected: 1
+
+SELECT id FROM wide WHERE x > 9223372036854775807;
+----
+id
+2

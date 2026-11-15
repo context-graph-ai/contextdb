@@ -5,9 +5,11 @@
 //! once for every level of nesting, to the limit, on the caller's stack. So each is kept small:
 //! what is not on that path is in a function of its own, and a list is gathered with a loop.
 
-use super::{MAX_EXPR_NESTING, Pair, Rule, depth_error, has, ident, number, string};
+use super::{
+    MAX_EXPR_NESTING, Pair, Rule, child, depth_error, direction, has, ident, number, select, string,
+};
 use crate::sql::ast::*;
-use crate::types::Result;
+use crate::types::{Error, Result};
 
 pub(super) fn expr(pair: Pair<'_>) -> Result<Expr> {
     // `[NOT] comparison {AND | OR [NOT] comparison}`. AND binds tighter than OR: `all` gathers
@@ -32,7 +34,11 @@ pub(super) fn expr(pair: Pair<'_>) -> Result<Expr> {
         }
     }
     any.push(balanced(all, BinOp::And));
-    let built = balanced(any, BinOp::Or);
+    within_limit(balanced(any, BinOp::Or))
+}
+
+/// `built`, refused when it nests deeper than the limit.
+fn within_limit(built: Expr) -> Result<Expr> {
     let depth = depth_of(&built);
     if depth > MAX_EXPR_NESTING {
         return Err(depth_error(depth));
@@ -51,22 +57,15 @@ pub(super) fn exprs(pair: Pair<'_>) -> Result<Vec<Expr>> {
     Ok(exprs)
 }
 
-/// How many expressions deep the tree goes below its root.
+/// How many expressions deep the tree goes below its root. A SELECT inside it is a tree of its
+/// own.
 fn depth_of(expr: &Expr) -> usize {
-    let below = match expr {
-        Expr::BinaryOp { left, right, .. } => depth_of(left).max(depth_of(right)),
-        Expr::UnaryOp { operand, .. } => depth_of(operand),
-        Expr::FunctionCall { args, .. } => args.iter().map(depth_of).max().unwrap_or(0),
-        Expr::IsNull { expr, .. } => depth_of(expr),
-        Expr::Distance { left, right } => depth_of(left).max(depth_of(right)),
-        Expr::Row(items) => items.iter().map(depth_of).max().unwrap_or(0),
-        Expr::InList { expr, list, .. } => {
-            let items = list.iter().map(depth_of).max().unwrap_or(0);
-            depth_of(expr).max(items)
-        }
-        Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) => return 0,
-    };
-    below + 1
+    let leaf = matches!(
+        expr,
+        Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) | Expr::Subquery(_)
+    );
+    let below = crate::sql::inside(expr).into_iter().map(depth_of);
+    below.max().unwrap_or(0) + usize::from(!leaf)
 }
 
 /// Joins the operands of a run of ANDs or ORs into a tree as shallow as it can be, keeping
@@ -97,66 +96,109 @@ fn not(operand: Expr) -> Expr {
 
 /// One comparison: its left side and what the grammar read after it, if anything.
 fn comparison_expr(left: Pair<'_>, suffix: Option<Pair<'_>>) -> Result<Expr> {
-    let left = Box::new(distance_expr(left)?);
-    let Some(suffix) = suffix else {
-        return Ok(*left);
-    };
-    if suffix.as_rule() == Rule::is_null_suffix {
+    let left = distance_expr(left)?;
+    match suffix {
+        Some(suffix) => compared(Box::new(left), suffix),
+        None => Ok(left),
+    }
+}
+
+/// `left` with what the grammar read after it.
+fn compared(left: Box<Expr>, suffix: Pair<'_>) -> Result<Expr> {
+    let negated = has(&suffix, Rule::not_op);
+    let rule = suffix.as_rule();
+    if rule == Rule::is_null_suffix {
         return Ok(Expr::IsNull {
             expr: left,
-            negated: has(&suffix, Rule::not_op),
+            negated,
         });
     }
-    if suffix.as_rule() == Rule::in_suffix {
-        return Ok(Expr::InList {
+    if rule == Rule::in_suffix {
+        return Ok(match child(suffix.clone(), Rule::select_stmt) {
+            Some(query) => Expr::InSubquery {
+                expr: left,
+                query: subquery(query)?,
+                negated,
+            },
+            None => Expr::InList {
+                expr: left,
+                negated,
+                list: exprs(suffix)?,
+            },
+        });
+    }
+    let mut operands = suffix
+        .clone()
+        .into_inner()
+        .filter(|part| part.as_rule() == Rule::distance_expr);
+    let mut operand = || distance_expr(operands.next().expect("an operand")).map(Box::new);
+    Ok(match rule {
+        Rule::match_suffix => return Err(Error::FullTextSearchNotSupported),
+        Rule::like_suffix => Expr::Like {
             expr: left,
-            negated: has(&suffix, Rule::not_op),
-            list: exprs(suffix)?,
-        });
-    }
-    let mut parts = suffix.into_inner();
-    let op = match parts.next().expect("an operator").as_str() {
-        "=" => BinOp::Eq,
-        "!=" | "<>" => BinOp::Neq,
-        "<" => BinOp::Lt,
-        "<=" => BinOp::Lte,
-        ">" => BinOp::Gt,
-        _ => BinOp::Gte,
-    };
-    Ok(Expr::BinaryOp {
-        left,
-        op,
-        right: Box::new(distance_expr(parts.next().expect("an operand"))?),
+            pattern: operand()?,
+            negated,
+        },
+        Rule::between_suffix => Expr::Between {
+            expr: left,
+            low: operand()?,
+            high: operand()?,
+            negated,
+        },
+        _ => Expr::BinaryOp {
+            left,
+            op: match suffix.into_inner().next().expect("an operator").as_str() {
+                "=" => BinOp::Eq,
+                "!=" | "<>" => BinOp::Neq,
+                "<" => BinOp::Lt,
+                "<=" => BinOp::Lte,
+                ">" => BinOp::Gt,
+                _ => BinOp::Gte,
+            },
+            right: operand()?,
+        },
     })
 }
 
-/// `sum [<=> sum]`: a sum alone, or the distance between two.
+/// `sum {<=> | -> | ->> sum}`, read left to right: a distance, or a field of a JSON value. A
+/// chain of operators builds a tree one deeper per operator, so its depth is checked as it
+/// grows.
 fn distance_expr(pair: Pair<'_>) -> Result<Expr> {
-    let mut sides = pair.into_inner();
-    let left = additive_expr(sides.next().expect("an operand"))?;
-    let Some(right) = sides.next() else {
-        return Ok(left);
-    };
-    Ok(Expr::Distance {
-        left: Box::new(left),
-        right: Box::new(additive_expr(right)?),
+    let mut parts = pair.into_inner();
+    let mut built = additive_expr(parts.next().expect("an operand"))?;
+    while let Some(op) = parts.next() {
+        let right = additive_expr(parts.next().expect("an operand"))?;
+        built = distance_or_field(op.as_str(), Box::new(built), Box::new(right))?;
+    }
+    Ok(built)
+}
+
+fn distance_or_field(op: &str, left: Box<Expr>, right: Box<Expr>) -> Result<Expr> {
+    within_limit(match op {
+        "<=>" => Expr::Distance { left, right },
+        arrow => Expr::Field {
+            json: left,
+            key: right,
+            as_text: arrow == "->>",
+        },
     })
+}
+
+/// A SELECT that stands inside an expression.
+fn subquery(pair: Pair<'_>) -> Result<Box<Select>> {
+    select(pair).map(Box::new)
 }
 
 /// `left <op> right` as a call of `__add`, `__sub`, `__mul` or `__div`. A chain of operators
 /// builds a tree one deeper per operator, so its depth is checked as it grows.
 fn arithmetic(op: &str, left: Expr, right: Expr) -> Result<Expr> {
-    let depth = depth_of(&left).max(depth_of(&right)) + 1;
-    if depth > MAX_EXPR_NESTING {
-        return Err(depth_error(depth));
-    }
     let name = match op {
         "+" => "__add",
         "-" => "__sub",
         "*" => "__mul",
         _ => "__div",
     };
-    Ok(Expr::FunctionCall {
+    within_limit(Expr::FunctionCall {
         name: name.to_owned(),
         args: vec![left, right],
     })
@@ -236,6 +278,10 @@ fn primary_expr(primary: Pair<'_>) -> Result<Expr> {
                 _ => Expr::Row(items),
             })
         }
+        Rule::exists => Err(Error::SubqueryNotSupported),
+        Rule::scalar_select => {
+            subquery(primary.into_inner().next().expect("a SELECT")).map(Expr::Subquery)
+        }
         Rule::function_call => function_call(primary),
         Rule::column_ref | Rule::braced => Ok(column_ref(primary)),
         // The parts of a rank formula.
@@ -285,8 +331,49 @@ fn function_call(pair: Pair<'_>) -> Result<Expr> {
     for arg in parts {
         args.push(match arg.as_rule() {
             Rule::star => star(),
+            Rule::over => return row_number(&name, &args, arg),
             _ => expr(arg)?,
         });
     }
     Ok(Expr::FunctionCall { name, args })
+}
+
+/// The sort keys of an ORDER BY, in written order.
+pub(super) fn sort_keys(clause: Pair<'_>) -> Result<Vec<OrderByItem>> {
+    let mut keys = Vec::new();
+    for item in clause.into_inner() {
+        let mut parts = item.into_inner();
+        keys.push(OrderByItem {
+            expr: expr(parts.next().expect("a sort key"))?,
+            direction: direction(parts.next()),
+        });
+    }
+    Ok(keys)
+}
+
+/// The one window function, `ROW_NUMBER() OVER ([PARTITION BY ...] ORDER BY ...)`. Any other
+/// function before OVER, and a window with no ORDER BY, is refused by name.
+fn row_number(name: &str, args: &[Expr], over: Pair<'_>) -> Result<Expr> {
+    let mut partition_by = Vec::new();
+    let mut order_by = Vec::new();
+    for part in over.into_inner() {
+        if part.as_rule() == Rule::partition_by {
+            partition_by = exprs(part)?;
+            continue;
+        }
+        order_by = sort_keys(part)?;
+    }
+    let form = if !name.eq_ignore_ascii_case("ROW_NUMBER") {
+        format!("{name} OVER")
+    } else if !args.is_empty() {
+        "ROW_NUMBER with arguments".to_owned()
+    } else if order_by.is_empty() {
+        "ROW_NUMBER without ORDER BY".to_owned()
+    } else {
+        return Ok(Expr::RowNumber {
+            partition_by,
+            order_by,
+        });
+    };
+    Err(Error::WindowFunctionNotSupported { form })
 }

@@ -46,6 +46,3 @@ pub(crate) fn now_millis(clock: &dyn Clock) -> i64 {
         Err(before) => -(before.duration().as_millis() as i64),
     }
 }
-
-#[cfg(test)]
-mod tests;

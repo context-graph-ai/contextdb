@@ -18,32 +18,39 @@ stmt = _{
     | show_memory_limit
     | show_vector_indexes
     | show_vector_partitions
+    | explain_stmt
     | select_stmt
-    | later
+    | !with_word ~ later
 }
 
 // A statement or clause that a later version of the library reads, or that no version reads
 // (IVF and SEARCH). It is recognised by its first words alone and the rest of the text is left
 // unread, so that the statement is refused by that name and not as a syntax error. `later`
 // stands only where nothing this version reads can begin with one of these words: after a whole
-// statement or clause, and after an expression, where LIKE and BETWEEN would follow. DISTINCT and
-// GRAPH_TABLE stand where a name could, so they are looked for first.
+// statement or clause, and after an expression, where ILIKE and the two other distances would
+// follow. A statement that begins with WITH is a SELECT.
 later = { later_name ~ ANY* }
 later_name = @{
     (
-        ^"DROP" ~ SPACE+ ~ (^"TRIGGER" | ^"ROUTE" | ^"SCHEDULE") | ^"WITH" | ^"BEGIN" | ^"COMMIT" | ^"ROLLBACK" | ^"PURGE" | ^"DISCARD"
-        | ^"DECLARE" | ^"DISTINCT" | ^"GRAPH_TABLE"
-        | ((^"LEFT" | ^"INNER" | ^"CROSS") ~ SPACE+)? ~ ^"JOIN"
-        | ^"GROUP" ~ SPACE+ ~ ^"BY" | ^"HAVING" | ^"UNION" | ^"OFFSET"
-        | ^"USE" ~ SPACE+ ~ ^"RANK"
-        | (^"NOT" ~ SPACE+)? ~ (^"LIKE" | ^"BETWEEN")
+        ^"SHOW" ~ SPACE+
+        ~ (^"TENANT" | ^"SYNC_CONFLICT_POLICY" | ^"SYNC" | ^"DELIVERY" | ^"DISK_LIMIT")
+        | ^"SET" ~ SPACE+
+        ~ (^"DISK_LIMIT" | ^"MAINTENANCE_POLL_INTERVAL" | ^"READ_CACHE_SHARE" | ^"STORAGE_COMPACTION")
+        | ^"CREATE" ~ SPACE+ ~ (^"TRIGGER" | ^"EVENT" | ^"SINK" | ^"ROUTE" | ^"SCHEDULE")
+        | ^"FOLLOWS"
+        | ^"DROP" ~ SPACE+ ~ (^"TRIGGER" | ^"ROUTE" | ^"SCHEDULE") | ^"WITH" | ^"BEGIN" | ^"COMMIT" | ^"ROLLBACK" | ^"PURGE" | ^"DISCARD"
+        | ^"DECLARE"
+        | (^"NOT" ~ SPACE+)? ~ ^"ILIKE"
         | ^"EXPIRES" | ^"SEARCH" | ^"IVF"
     ) ~ !ident_char
+    | "<->" | "<#>"
 }
-// Two forms of a later version that begin with words this version reads, so each is known by
-// where it stands: a SELECT as the list of IN, and the options after the mode of USE VECTOR.
-// Like `later`, each leaves the rest of the text unread.
+// The word a SELECT in parentheses opens with. It is looked ahead for, so that what stands in
+// parentheses is read once: as a SELECT or as expressions.
 subquery = @{ ^"SELECT" ~ !ident_char }
+// The options after the mode of USE VECTOR are a later version's and begin with a mark this
+// version reads, so they are known by where they stand. Like `later`, the rule leaves the rest
+// of the text unread.
 vector_options = { "(" }
 
 set_memory_limit = { ^"SET" ~ ^"MEMORY_LIMIT" ~ "="? ~ ("'" ~ memory_limit_value ~ "'" | memory_limit_value) }
@@ -52,34 +59,81 @@ memory_limit_value = { ^"none" | size_with_unit }
 size_with_unit = @{ ASCII_DIGIT+ ~ ("G" | "M" | "K") }
 
 show_vector_indexes = { ^"SHOW" ~ ^"VECTOR_INDEXES" }
+explain_stmt = { ^"EXPLAIN" ~ stmt }
 show_vector_partitions = {
     ^"SHOW" ~ ^"VECTOR_PARTITIONS" ~ (^"FOR" ~ identifier ~ "." ~ identifier)?
     ~ (limit_clause ~ offset_clause?)?
 }
-offset_clause = { ^"OFFSET" ~ integer }
 
+// ORDER BY and what follows it are over the whole statement: over every SELECT of a UNION.
 select_stmt = {
-    ^"SELECT"
-    ~ (
-        &^"DISTINCT" ~ later
-        | select_list ~ ^"FROM"
-          ~ (
-              &(^"GRAPH_TABLE" ~ "(") ~ later
-              | identifier ~ where_clause? ~ order_by_clause? ~ use_vector_clause? ~ limit_clause?
-                ~ later?
-          )
-    )
+    with_clause? ~ select_core ~ (set_op ~ all? ~ select_core)*
+    ~ order_by_clause? ~ use_vector_clause? ~ use_rank_clause? ~ limit_clause? ~ offset_clause?
+    ~ later?
+}
+with_clause = { with_word ~ recursive? ~ cte ~ ("," ~ cte)* }
+with_word = @{ ^"WITH" ~ !ident_char }
+// WITH RECURSIVE, which no version has: it is read so that it is refused by its own kind.
+recursive = @{ ^"RECURSIVE" ~ !ident_char }
+cte = { identifier ~ ^"AS" ~ "(" ~ select_stmt ~ ")" }
+// INTERSECT and EXCEPT, RIGHT and FULL JOIN and a second table after a comma are no version's:
+// each is read so that it is refused by its name.
+set_op = @{ (^"UNION" | ^"INTERSECT" | ^"EXCEPT") ~ !ident_char }
+all = @{ ^"ALL" ~ !ident_char }
+select_core = {
+    ^"SELECT" ~ distinct? ~ select_list
+    ~ (^"FROM" ~ (graph_table | table_ref ~ more_tables? ~ join*))?
+    ~ where_clause? ~ group_by_clause? ~ having_clause?
+}
+distinct = @{ ^"DISTINCT" ~ !ident_char }
+table_ref = { identifier ~ alias? }
+// The rows a pattern matches over an edge table, which stands alone in FROM. A step with no
+// count is one hop; `+`, `*` and a count with no upper bound are read so that each is refused
+// by its own name.
+graph_table = {
+    ^"GRAPH_TABLE" ~ "(" ~ identifier ~ ^"MATCH" ~ node_pattern ~ edge_step+
+    ~ where_clause? ~ graph_columns? ~ ")"
+}
+node_pattern = { "(" ~ identifier? ~ label? ~ ")" }
+label = { ":" ~ as_written }
+edge_step = { (incoming ~ edge ~ "-" | "-" ~ edge ~ outgoing | "-" ~ edge ~ "-") ~ hops? ~ node_pattern }
+incoming = { "<-" }
+outgoing = { "->" }
+edge = { "[" ~ identifier? ~ label? ~ "]" }
+hops = { "+" | "*" | "{" ~ integer ~ "," ~ integer? ~ "}" }
+graph_columns = { ^"COLUMNS" ~ "(" ~ select_item ~ ("," ~ select_item)* ~ ")" }
+more_tables = { "," ~ ANY* }
+join = { cross ~ table_ref | join_kind ~ table_ref ~ ^"ON" ~ expr }
+cross = { ^"CROSS" ~ join_word }
+join_kind = { (^"INNER" | ^"LEFT" | ^"RIGHT" | ^"FULL")? ~ join_word }
+join_word = @{ ^"JOIN" ~ !ident_char }
+// A name given with AS, or without it when the word begins no clause.
+alias = ${ as_alias | !clause_word ~ identifier }
+// Without AS, the name of a select item is a name only before what may follow an item, so that
+// a misspelt FROM is the word a syntax error stops at.
+item_alias = ${ as_alias | !clause_word ~ identifier ~ &(WHITESPACE* ~ ("," | ")" | ";" | !ANY | clause_word)) }
+as_alias = _{ ^"AS" ~ !ident_char ~ WHITESPACE* ~ identifier }
+clause_word = _{
+    (
+        ^"FROM" | ^"WHERE" | ^"JOIN" | ^"INNER" | ^"LEFT" | ^"RIGHT" | ^"FULL" | ^"CROSS" | ^"ON"
+        | ^"GROUP" | ^"HAVING" | ^"UNION" | ^"INTERSECT" | ^"EXCEPT" | ^"ORDER" | ^"USE"
+        | ^"LIMIT" | ^"OFFSET"
+    ) ~ !ident_char
 }
 select_list = { star | select_item ~ ("," ~ select_item)* }
 star = { "*" }
-select_item = { expr ~ (^"AS" ~ identifier)? }
+select_item = { expr ~ item_alias? }
 where_clause = { ^"WHERE" ~ expr }
 order_by_clause = { ^"ORDER" ~ ^"BY" ~ order_item ~ ("," ~ order_item)* }
 order_item = { expr ~ sort_dir? }
 sort_dir = { ^"ASC" | ^"DESC" }
 use_vector_clause = { ^"USE" ~ ^"VECTOR" ~ search_mode ~ (vector_options ~ ANY*)? }
 search_mode = @{ (^"AUTO" | ^"EXACT" | ^"INDEXED") ~ !ident_char }
-limit_clause = { ^"LIMIT" ~ integer }
+use_rank_clause = { ^"USE" ~ ^"RANK" ~ identifier }
+limit_clause = { ^"LIMIT" ~ (integer | parameter) }
+offset_clause = { ^"OFFSET" ~ (integer | parameter) }
+group_by_clause = { ^"GROUP" ~ ^"BY" ~ expr ~ ("," ~ expr)* }
+having_clause = { ^"HAVING" ~ expr }
 
 create_table_stmt = {
     ^"CREATE" ~ ^"TABLE" ~ if_not_exists? ~ identifier
@@ -105,16 +159,16 @@ data_type = {
 vector_type = {
     ^"VECTOR" ~ "(" ~ integer ~ ")"
     ~ quantization? ~ partition_key? ~ max_partitions? ~ (^"SEARCH_MODE" ~ search_mode)?
-    ~ auto_index_at? ~ consolidation?
+    ~ indexing_threshold? ~ compaction?
     // WITH stands first or nowhere: after another clause it is no clause of a later version.
     ~ !(^"WITH" ~ !ident_char)
 }
 quantization = { ^"WITH" ~ "(" ~ ^"quantization" ~ "=" ~ string ~ ")" }
 partition_key = { ^"PARTITION_KEY" ~ "(" ~ identifier ~ ("," ~ identifier)* ~ ")" }
 max_partitions = { ^"MAX_PARTITIONS" ~ signed }
-auto_index_at = { ^"AUTO_INDEX_AT" ~ signed }
-consolidation = {
-    ^"CONSOLIDATION"
+indexing_threshold = { ^"INDEXING_THRESHOLD" ~ signed }
+compaction = {
+    ^"COMPACTION"
     ~ (
         ^"NONE"
         | "("
@@ -214,12 +268,12 @@ rename_column = { ^"RENAME" ~ column_word ~ identifier ~ ^"TO" ~ identifier }
 alter_column = {
     ^"ALTER" ~ column_word ~ identifier ~ ^"SET"
     ~ (
-        ^"MAX_PARTITIONS" ~ signed | ^"SEARCH_MODE" ~ search_mode | auto_index_at | consolidation
-        | auto_index_default | consolidation_default | later
+        ^"MAX_PARTITIONS" ~ signed | ^"SEARCH_MODE" ~ search_mode | indexing_threshold | compaction
+        | indexing_threshold_default | compaction_default | later
     )
 }
-auto_index_default = { ^"AUTO_INDEX_AT" ~ ^"DEFAULT" }
-consolidation_default = { ^"CONSOLIDATION" ~ ^"DEFAULT" }
+indexing_threshold_default = { ^"INDEXING_THRESHOLD" ~ ^"DEFAULT" }
+compaction_default = { ^"COMPACTION" ~ ^"DEFAULT" }
 // Whole words, so that a column whose name begins with one is still a column.
 column_word = @{ ^"COLUMN" ~ !ident_char }
 retain_word = @{ ^"RETAIN" ~ !ident_char }
@@ -232,9 +286,10 @@ if_exists = { ^"IF" ~ ^"EXISTS" }
 insert_stmt = {
     ^"INSERT" ~ ^"INTO" ~ identifier
     ~ ("(" ~ identifier ~ ("," ~ identifier)* ~ ")")?
-    ~ ^"VALUES" ~ values_row ~ ("," ~ values_row)*
-    ~ on_conflict? ~ later?
+    ~ (^"VALUES" ~ values_row ~ ("," ~ values_row)* ~ on_conflict? ~ later? | insert_select)
 }
+// INSERT ... SELECT, which no version has: its first word is read so that it is refused by name.
+insert_select = { subquery ~ ANY* }
 on_conflict = {
     ^"ON" ~ ^"CONFLICT" ~ columns ~ ^"DO" ~ ^"UPDATE" ~ ^"SET" ~ assignment ~ ("," ~ assignment)*
 }
@@ -253,22 +308,36 @@ or_op = @{ ^"OR" ~ !ident_char }
 and_op = @{ ^"AND" ~ !ident_char }
 not_op = @{ ^"NOT" ~ !ident_char }
 
-comparison_suffix = _{ is_null_suffix | in_suffix | cmp_suffix | later }
+comparison_suffix = _{
+    cmp_suffix | &ASCII_ALPHA ~ (is_null_suffix | in_suffix | between_suffix | like_suffix | match_suffix | later)
+}
 cmp_suffix = { cmp_op ~ distance_expr }
 cmp_op = { "=" | "!=" | "<>" | "<=" | ">=" | "<" | ">" }
 is_null_suffix = { ^"IS" ~ not_op? ~ ^"NULL" }
-in_suffix = { not_op? ~ ^"IN" ~ "(" ~ (subquery ~ ANY* | expr ~ ("," ~ expr)* ~ ")") }
+in_suffix = { not_op? ~ ^"IN" ~ "(" ~ (&subquery ~ select_stmt | expr ~ ("," ~ expr)*) ~ ")" }
+// The AND between the two ends belongs to BETWEEN: it is read here, before `expr` looks for one.
+between_suffix = { not_op? ~ between_op ~ distance_expr ~ and_op ~ distance_expr }
+like_suffix = { not_op? ~ like_op ~ distance_expr }
+// A full-text search, which no version has: it is read so that it is refused by its own kind.
+match_suffix = { match_op ~ distance_expr }
+// Whole words, so that a name that begins with one is still a name.
+between_op = @{ ^"BETWEEN" ~ !ident_char }
+like_op = @{ ^"LIKE" ~ !ident_char }
+match_op = @{ ^"MATCH" ~ !ident_char }
 
-// The distance operator binds tighter than a comparison and looser than `+` and `-`.
-distance_expr = { additive_expr ~ ("<=>" ~ additive_expr)? }
+// The distance operator and the two that read a field of a JSON value bind alike, as in
+// Postgres: tighter than a comparison, looser than `+` and `-`, from left to right.
+distance_expr = { additive_expr ~ (other_op ~ additive_expr)* }
+other_op = { "<=>" | "->>" | "->" }
 
 additive_expr = { unary_minus* ~ primary_expr ~ (math_op ~ unary_minus* ~ primary_expr)* }
 math_op = { "+" | "-" | "*" | "/" }
 unary_minus = { "-" }
 
 primary_expr = _{
-    function_call
-    | parameter
+    parameter
+    | exists
+    | function_call
     | null_lit
     | bool_lit
     | float
@@ -276,6 +345,7 @@ primary_expr = _{
     | string
     | vector_lit
     | column_ref
+    | scalar_select
     | parenthesized
 }
 // One expression in parentheses is that expression; two or more are a row value. One rule reads
@@ -284,7 +354,15 @@ primary_expr = _{
 parenthesized = { "(" ~ expr ~ ("," ~ expr)* ~ ")" }
 vector_lit = { "[" ~ vector_component ~ ("," ~ vector_component)* ~ "]" }
 vector_component = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
-function_call = { as_written ~ "(" ~ (star | (expr ~ ("," ~ expr)*))? ~ ")" }
+function_call = { as_written ~ "(" ~ (star | (expr ~ ("," ~ expr)*))? ~ ")" ~ over? }
+// The window of a function. Any function may be written before it: the builder refuses all but
+// the one this version has.
+over = { ^"OVER" ~ "(" ~ partition_by? ~ order_by_clause? ~ ")" }
+partition_by = { ^"PARTITION" ~ ^"BY" ~ expr ~ ("," ~ expr)* }
+// A SELECT in parentheses standing as one value, and EXISTS, which no version has: it is read
+// so that it is refused by its own kind.
+scalar_select = { "(" ~ &subquery ~ select_stmt ~ ")" }
+exists = { ^"EXISTS" ~ "(" ~ &subquery ~ select_stmt ~ ")" }
 column_ref = { identifier ~ ("." ~ identifier)? }
 
 // A rank formula, which no statement reads: numbers and `{column}`s joined by `+` and `*`, in

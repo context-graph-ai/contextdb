@@ -1,6 +1,6 @@
 //! Printing a declaration back as SQL.
 
-use super::{Consolidation, Quantization, RESERVED_PREFIXES, Table};
+use super::{Compaction, Quantization, RESERVED_PREFIXES, Table};
 use crate::sql::ast::{EdgeDiscard, Propagation};
 use crate::types::{
     ColumnDefault, ConflictPolicy, History, KeptCounts, RetainUnit, SortDirection, SyncDirection,
@@ -162,19 +162,19 @@ fn column(table: &Table, at: usize) -> String {
             Some(VectorSearchMode::Exact) => " SEARCH_MODE EXACT",
             Some(VectorSearchMode::Indexed) => " SEARCH_MODE INDEXED",
         });
-        if let Some(at) = vector.auto_index_at {
-            text.push_str(&format!(" AUTO_INDEX_AT {at}"));
+        if let Some(at) = vector.indexing_threshold {
+            text.push_str(&format!(" INDEXING_THRESHOLD {at}"));
         }
-        match vector.consolidation {
+        match vector.compaction {
             None => {}
-            Some(Consolidation::None) => text.push_str(" CONSOLIDATION NONE"),
-            Some(Consolidation::Percent { change, tombstone }) => {
+            Some(Compaction::None) => text.push_str(" COMPACTION NONE"),
+            Some(Compaction::Percent { change, tombstone }) => {
                 let members = [("CHANGE_PERCENT", change), ("TOMBSTONE_PERCENT", tombstone)];
                 let written = members.iter().filter_map(|(member, percent)| {
                     percent.map(|percent| format!("{member} = {percent}"))
                 });
                 let written: Vec<String> = written.collect();
-                text.push_str(&format!(" CONSOLIDATION ({})", written.join(", ")));
+                text.push_str(&format!(" COMPACTION ({})", written.join(", ")));
             }
         }
     }

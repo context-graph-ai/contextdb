@@ -1,7 +1,7 @@
 //! Checking a declaration: what CREATE TABLE and CREATE INDEX may say, and the table each gives.
 
-use super::{Catalog, Consolidation, Quantization, RESERVED_PREFIXES, Table, VectorColumn, rules};
-use crate::sql::ast::{self, ConsolidationClause, Expr, Literal};
+use super::{Catalog, Compaction, Quantization, RESERVED_PREFIXES, Table, VectorColumn, rules};
+use crate::sql::ast::{self, CompactionClause, Expr, Literal};
 use crate::sql::not_carried;
 use crate::sql::plan::{CreateIndexPlan, CreateTablePlan};
 use crate::store::{IndexId, TableId, VectorId};
@@ -176,27 +176,27 @@ fn vector_column(
             return Err(policy(PolicyIssue::InvalidMember { member }));
         }
     };
-    let auto_index_at = match &declared.vector.auto_index_at {
+    let indexing_threshold = match &declared.vector.indexing_threshold {
         None => None,
         Some(written) => match written.parse::<u64>() {
             Ok(at) if at > 0 => Some(at),
             Err(_) if !written.starts_with('-') => {
-                return Err(policy(PolicyIssue::AutoIndexAtOutOfRange));
+                return Err(policy(PolicyIssue::IndexingThresholdOutOfRange));
             }
-            _ => return Err(policy(PolicyIssue::AutoIndexAtNotPositive)),
+            _ => return Err(policy(PolicyIssue::IndexingThresholdNotPositive)),
         },
     };
     let percent = |written: &Option<String>| match written {
         None => Ok(None),
         Some(written) => match written.parse::<u8>() {
             Ok(percent @ 1..=100) => Ok(Some(percent)),
-            _ => Err(policy(PolicyIssue::ConsolidationPercentOutOfRange)),
+            _ => Err(policy(PolicyIssue::CompactionPercentOutOfRange)),
         },
     };
-    let consolidation = match &declared.vector.consolidation {
+    let compaction = match &declared.vector.compaction {
         None => None,
-        Some(ConsolidationClause::None) => Some(Consolidation::None),
-        Some(ConsolidationClause::Percent { change, tombstone }) => Some(Consolidation::Percent {
+        Some(CompactionClause::None) => Some(Compaction::None),
+        Some(CompactionClause::Percent { change, tombstone }) => Some(Compaction::Percent {
             change: percent(change)?,
             tombstone: percent(tombstone)?,
         }),
@@ -207,8 +207,8 @@ fn vector_column(
         partition_key: declared.vector.partition_key.clone(),
         max_partitions,
         search_mode: declared.vector.search_mode,
-        auto_index_at,
-        consolidation,
+        indexing_threshold,
+        compaction,
         quantization,
     })
 }

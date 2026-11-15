@@ -4,12 +4,8 @@
 
 mod support;
 
-use std::path::Path;
-
 use contextdb::serde_json::{self, json};
-use contextdb::{
-    Database, DatabaseOpenOptions, Error, ReadSession, ReadSessionOptions, Value, params,
-};
+use contextdb::{Error, Value, params};
 
 use support::Run;
 
@@ -19,7 +15,7 @@ const MIB: usize = 1 << 20;
 fn a_statement_that_would_cross_the_limit_is_refused_by_name_and_committed_rows_stay() {
     let folder = support::folder("memory-limit-refuses");
     let limit = 16 * MIB;
-    let db = open_limited(&folder, limit);
+    let db = support::open_limited(&folder, limit);
     assert_eq!(db.memory_limit(), Some(limit));
     support::declare(&db);
     support::insert(&db, 1..=10);
@@ -83,7 +79,7 @@ fn a_reader_has_its_own_limit() {
     let all = "SELECT id, body FROM big ORDER BY id";
 
     // A reader with a limit of 16 MiB is refused, and the refusal names the reader's limit.
-    let narrow = read_limited(&folder, 16 * MIB);
+    let narrow = support::open_reader(&folder, Some(16 * MIB));
     over_the_limit(support::refusal(&narrow, all), 16 * MIB);
     // The session is as good as before: it reads what fits.
     assert_eq!(support::int(&narrow, "SELECT COUNT(*) FROM big"), 40);
@@ -93,14 +89,14 @@ fn a_reader_has_its_own_limit() {
     );
 
     // A reader with no limit, and the writer that has none, answer the same statement.
-    let wide = ReadSession::open(&folder).expect("open the store for reading");
+    let wide = support::open_reader(&folder, None);
     assert_eq!(support::rows(&wide, all).len(), 40);
     assert_eq!(support::rows(&db, all).len(), 40);
 
     // A writer with a limit of 32 MiB is refused by its own limit, while the two readers go on
     // by theirs.
     support::close(db);
-    let db = open_limited(&folder, 32 * MIB);
+    let db = support::open_limited(&folder, 32 * MIB);
     over_the_limit(support::refusal(&db, all), 32 * MIB);
     over_the_limit(support::refusal(&narrow, all), 16 * MIB);
     assert_eq!(support::rows(&wide, all).len(), 40);
@@ -131,8 +127,11 @@ fn a_value_too_large_for_the_limit_is_refused_while_its_row_is_still_counted() {
 
     // Through a reader with the limit, then through a writer with it. Neither open is refused:
     // nothing of the large value is read until a statement selects it.
-    the_large_value_is_refused_and_its_row_counted(&read_limited(&folder, limit), limit);
-    the_large_value_is_refused_and_its_row_counted(&open_limited(&folder, limit), limit);
+    the_large_value_is_refused_and_its_row_counted(
+        &support::open_reader(&folder, Some(limit)),
+        limit,
+    );
+    the_large_value_is_refused_and_its_row_counted(&support::open_limited(&folder, limit), limit);
 }
 
 fn the_large_value_is_refused_and_its_row_counted(on: &impl Run, limit: usize) {
@@ -163,6 +162,13 @@ fn the_large_value_is_refused_and_its_row_counted(on: &impl Run, limit: usize) {
         [[Value::Json(json!({ "k": 1 }))]]
     );
     assert_eq!(support::int(on, "SELECT COUNT(id) FROM docs"), 3);
+    let join = "SELECT a.id FROM docs a JOIN docs b ON a.id = b.id \
+                WHERE a.id IN (SELECT id FROM docs WHERE id = 2) LIMIT 1";
+    assert_eq!(support::rows(on, join), [[Value::Int64(2)]]);
+    // A window reads only the columns it names: the value no column of it names is never loaded.
+    let window = "WITH r AS (SELECT id, title, ROW_NUMBER() OVER (PARTITION BY title ORDER BY id) \
+                  AS n FROM docs) SELECT id FROM r WHERE title = 'doc-2' AND n <= 3";
+    assert_eq!(support::rows(on, window), [[Value::Int64(2)]]);
 }
 
 #[test]
@@ -170,9 +176,7 @@ fn memory_in_use_goes_back_when_a_result_is_dropped() {
     let folder = support::folder("memory-goes-back");
     let db = support::open(&folder);
     support::declare(&db);
-    let tx = db.transaction().expect("begin");
-    support::insert(&tx, 1..=1000);
-    tx.commit().expect("commit");
+    support::insert_together(&db, 1..=1000);
     // Run the scan once before measuring, so that anything the first statement sets up for good
     // is already there.
     let _ = support::run(&db, support::SCAN);
@@ -205,6 +209,15 @@ fn memory_in_use_goes_back_when_a_result_is_dropped() {
         "memory in use after the result was dropped"
     );
 
+    // What a subquery's list took goes back when the part reading it is done.
+    let held = |filter: &str| {
+        let arm = format!("SELECT COUNT(*) FROM t WHERE {filter}");
+        let _result = support::run(&db, &format!("{arm} UNION ALL {arm}"));
+        db.memory_used()
+    };
+    let _ = held("id >= 1");
+    let plain = held("id >= 1");
+    assert_eq!(held("id IN (SELECT id FROM t)"), plain, "with a subquery");
     // The same for the rows a transaction holds, when it is rolled back.
     let tx = db.transaction().expect("begin");
     support::insert(&tx, 1001..=1100);
@@ -238,33 +251,36 @@ fn a_declared_limit_survives_reopen_however_it_was_set() {
     db.set_memory_limit(Some(512 * MIB))
         .expect("declare a limit");
     assert_eq!(db.memory_limit(), Some(512 * MIB));
-    assert_eq!(shown(&db, "limit"), Value::Int64(536_870_912));
-    let db = reopen(db, &folder);
+    assert_eq!(
+        support::memory_shown(&db, "limit"),
+        Value::Int64(536_870_912)
+    );
+    let db = support::reopen(db, &folder);
     assert_eq!(db.memory_limit(), Some(512 * MIB));
 
     // Declared in SQL, in the sizes SQL takes.
     support::run(&db, "SET MEMORY_LIMIT 2G");
     assert_eq!(db.memory_limit(), Some(2_147_483_648));
-    let db = reopen(db, &folder);
+    let db = support::reopen(db, &folder);
     assert_eq!(db.memory_limit(), Some(2_147_483_648));
 
     // An open that names a limit has that limit for as long as it is open. The store goes on
     // remembering the one that was declared.
     support::close(db);
-    let db = open_limited(&folder, 64 * MIB);
+    let db = support::open_limited(&folder, 64 * MIB);
     assert_eq!(db.memory_limit(), Some(64 * MIB));
-    let db = reopen(db, &folder);
+    let db = support::reopen(db, &folder);
     assert_eq!(db.memory_limit(), Some(2_147_483_648));
 
     // Declared as none, either way, it is none after reopening.
     support::run(&db, "SET MEMORY_LIMIT NONE");
     assert_eq!(db.memory_limit(), None);
-    let db = reopen(db, &folder);
+    let db = support::reopen(db, &folder);
     assert_eq!(db.memory_limit(), None);
     support::run(&db, "SET MEMORY_LIMIT 512M");
     assert_eq!(db.memory_limit(), Some(512 * MIB));
     db.set_memory_limit(None).expect("declare no limit");
-    let db = reopen(db, &folder);
+    let db = support::reopen(db, &folder);
     assert_eq!(db.memory_limit(), None);
 
     // A reader reports a limit too, and it is the reader's own, not the one the store keeps.
@@ -276,13 +292,19 @@ fn a_declared_limit_survives_reopen_however_it_was_set() {
         "startup_ceiling",
         "ceiling_refresh_failures",
     ];
-    let reader = read_limited(&folder, 64 * MIB);
+    let reader = support::open_reader(&folder, Some(64 * MIB));
     assert_eq!(
         support::run(&reader, "SHOW MEMORY_LIMIT").columns(),
         columns
     );
-    assert_eq!(shown(&reader, "limit"), Value::Int64(64 * MIB as i64));
-    match (shown(&reader, "used"), shown(&reader, "available")) {
+    assert_eq!(
+        support::memory_shown(&reader, "limit"),
+        Value::Int64(64 * MIB as i64)
+    );
+    match (
+        support::memory_shown(&reader, "used"),
+        support::memory_shown(&reader, "available"),
+    ) {
         (Value::Int64(used), Value::Int64(available)) => {
             assert_eq!(
                 used + available,
@@ -293,13 +315,19 @@ fn a_declared_limit_survives_reopen_however_it_was_set() {
         other => panic!("a reader with a limit reports used and available as {other:?}"),
     }
     // A reader that was given no limit has none, whatever the store keeps for its writer.
-    let reader = ReadSession::open(&folder).expect("open the store for reading");
+    let reader = support::open_reader(&folder, None);
     assert_eq!(
         support::run(&reader, "SHOW MEMORY_LIMIT").columns(),
         columns
     );
-    assert_eq!(shown(&reader, "limit"), Value::Text("none".to_owned()));
-    assert_eq!(shown(&db, "limit"), Value::Int64(2_147_483_648));
+    assert_eq!(
+        support::memory_shown(&reader, "limit"),
+        Value::Text("none".to_owned())
+    );
+    assert_eq!(
+        support::memory_shown(&db, "limit"),
+        Value::Int64(2_147_483_648)
+    );
 }
 
 #[test]
@@ -315,17 +343,17 @@ fn a_limit_set_inside_a_transaction_holds_at_once_and_a_rollback_does_not_undo_i
     support::insert(&tx, 1..=1);
     support::run(&tx, "SET MEMORY_LIMIT 512M");
     let limit = Value::Int64(536_870_912);
-    assert_eq!(shown(&tx, "limit"), limit);
-    assert_eq!(shown(&db, "limit"), limit);
+    assert_eq!(support::memory_shown(&tx, "limit"), limit);
+    assert_eq!(support::memory_shown(&db, "limit"), limit);
     assert_eq!(db.memory_limit(), Some(512 * MIB));
 
     // The rollback takes the row back and leaves the limit, in this open and in the store.
     tx.rollback();
     assert_eq!(support::int(&db, "SELECT COUNT(*) FROM t"), 0);
-    assert_eq!(shown(&db, "limit"), limit);
+    assert_eq!(support::memory_shown(&db, "limit"), limit);
     assert_eq!(db.memory_limit(), Some(512 * MIB));
-    let db = reopen(db, &folder);
-    assert_eq!(shown(&db, "limit"), limit);
+    let db = support::reopen(db, &folder);
+    assert_eq!(support::memory_shown(&db, "limit"), limit);
     assert_eq!(db.memory_limit(), Some(512 * MIB));
 
     // The same when the transaction is dropped instead.
@@ -335,30 +363,15 @@ fn a_limit_set_inside_a_transaction_holds_at_once_and_a_rollback_does_not_undo_i
         // The transaction is dropped here, uncommitted.
     }
     assert_eq!(db.memory_limit(), Some(2_147_483_648));
-    let db = reopen(db, &folder);
-    assert_eq!(shown(&db, "limit"), Value::Int64(2_147_483_648));
+    let db = support::reopen(db, &folder);
+    assert_eq!(
+        support::memory_shown(&db, "limit"),
+        Value::Int64(2_147_483_648)
+    );
     assert_eq!(db.memory_limit(), Some(2_147_483_648));
 }
 
 // ---- shared by the tests of this file ----
-
-fn open_limited(folder: &Path, limit: usize) -> Database {
-    let mut options = DatabaseOpenOptions::default();
-    options.memory_limit = Some(limit);
-    support::open_with(folder, options).expect("open the store for writing under a limit")
-}
-
-fn read_limited(folder: &Path, limit: usize) -> ReadSession {
-    let mut options = ReadSessionOptions::default();
-    options.memory_limit = Some(limit);
-    ReadSession::open_with_options(folder, options)
-        .expect("open the store for reading under a limit")
-}
-
-fn reopen(db: Database, folder: &Path) -> Database {
-    support::close(db);
-    support::open(folder)
-}
 
 /// Asserts that a refusal is the memory limit's and names this limit. Returns the bytes that
 /// were asked for and the bytes that were left.
@@ -381,19 +394,5 @@ fn over_the_limit(refusal: Error, limit: usize) -> (u64, u64) {
             (requested_bytes, available_bytes)
         }
         other => panic!("crossing the memory limit was refused as {other:?}"),
-    }
-}
-
-/// One column of what `SHOW MEMORY_LIMIT` reports.
-fn shown(on: &impl Run, column: &str) -> Value {
-    let report = support::run(on, "SHOW MEMORY_LIMIT");
-    let at = report
-        .columns()
-        .iter()
-        .position(|name| name == column)
-        .unwrap_or_else(|| panic!("SHOW MEMORY_LIMIT has no column {column}"));
-    match report.rows() {
-        [row] => row[at].clone(),
-        rows => panic!("SHOW MEMORY_LIMIT returned {} rows", rows.len()),
     }
 }
