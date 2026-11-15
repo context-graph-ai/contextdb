@@ -5,41 +5,13 @@
 
 mod support;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
-use contextdb::{
-    ContextId, Database, DatabaseOpenOptions, Error, Principal, ScopeLabel, Uuid, Value, params,
-};
+use contextdb::{Database, Error, Principal, Uuid, Value, params};
 
-use support::Run;
+use support::{Run, acl, context, context_set, ids, in_contexts, label_set};
 
 // ---- who is asking ----
-
-/// Context number `n`.
-fn context(n: u128) -> Uuid {
-    Uuid::from_u128(0x00C0_0000 + n)
-}
-
-/// Access-control id number `n`.
-fn acl(n: u128) -> Uuid {
-    Uuid::from_u128(0x00AC_0000 + n)
-}
-
-fn context_set(numbers: &[u128]) -> BTreeSet<ContextId> {
-    numbers
-        .iter()
-        .map(|n| ContextId::new(context(*n)))
-        .collect()
-}
-
-fn label_set(names: &[&str]) -> BTreeSet<ScopeLabel> {
-    names.iter().map(|name| ScopeLabel::new(*name)).collect()
-}
-
-/// A handle narrowed to the Contexts with these numbers.
-fn in_contexts(db: &Database, numbers: &[u128]) -> Database {
-    db.scoped_with_contexts(context_set(numbers))
-}
 
 /// A handle narrowed to these scope labels.
 fn with_labels(db: &Database, names: &[&str]) -> Database {
@@ -60,23 +32,6 @@ fn human(name: &str) -> Principal {
 }
 
 // ---- what a statement answered ----
-
-/// The first column of every row a statement returns, which must be an INTEGER.
-fn ids(on: &impl Run, sql: &str) -> Vec<i64> {
-    ids_with(on, sql, &params! {})
-}
-
-fn ids_with(on: &impl Run, sql: &str, values: &HashMap<String, Value>) -> Vec<i64> {
-    let result = match on.run(sql, values) {
-        Ok(result) => result,
-        Err(error) => panic!("{sql}\nwas refused: {error:?}"),
-    };
-    let first = |row: &Vec<Value>| match row.first() {
-        Some(Value::Int64(id)) => *id,
-        other => panic!("{sql}\nreturned {other:?} where an INTEGER was wanted"),
-    };
-    result.rows().iter().map(first).collect()
-}
 
 /// The ids `SELECT id FROM <table> <tail>` returns.
 fn seen(on: &impl Run, table: &str, tail: &str) -> Vec<i64> {
@@ -756,7 +711,7 @@ fn a_hidden_row_named_whole_is_refused_and_a_list_read_leaves_it_out(gate: Gate)
         "SELECT payload FROM ledger WHERE slug = 'shut-two'",
         "SELECT payload FROM ledger WHERE a = 1 AND b = 2",
         "SELECT payload FROM ledger WHERE b = 2 AND a = 2",
-        "SELECT id, slug, a, b, payload FROM ledger WHERE id = 4",
+        "SELECT payload FROM ledger WHERE id = (SELECT 2)",
         "SELECT id FROM ledger WHERE slug = 'shut-four'",
     ] {
         refused(&handle, sql, rule, "ledger");
@@ -1370,12 +1325,48 @@ fn a_search_returns_the_nearest_rows_the_handle_may_see_and_no_hidden_row() {
         }
     }
 
+    let tags = "CREATE TABLE tags (id INTEGER PRIMARY KEY, c UUID NOT NULL CONTEXT_ID, label TEXT \
+                SCOPE_LABEL_READ ('a', 'b') WRITE ('a', 'b'), v VECTOR(1) PARTITION_KEY (c))";
+    support::run(&db, tags);
+    let c = context(1);
+    let row = format!("INSERT INTO tags VALUES (1, '{c}', 'b', [1.0])");
+    support::run(&db, &row);
+    let by_label = with_labels(&in_contexts(&db, &[1]), &["a"]);
+    let sql = support::nearest_sql("tags", "v", None, 2);
+    let found = support::search(&by_label, &sql, &[1.0]).expect("a search");
+    assert_eq!(found.rows().len(), 0, "the nearest row is under label b");
+    let said = by_label.explain(&sql).expect("explained");
+    assert!(!said.contains(&c.to_string()), "no partition told");
+    let keys = "CREATE TABLE keys (id INTEGER PRIMARY KEY, c UUID NOT NULL CONTEXT_ID, acl_id UUID \
+                ACL REFERENCES acl_grants(acl_id), v VECTOR(1) PARTITION_KEY (c))";
+    support::run(&db, keys);
+    let row = format!("INSERT INTO keys VALUES (1, '{c}', '{}', [1.0])", acl(1));
+    support::run(&db, &row);
+    let said = reader_in_one
+        .explain(&sql.replace("tags", "keys"))
+        .expect("explained");
+    assert!(
+        !said.contains(&c.to_string()),
+        "an access list may hide rows"
+    );
     // With no principal that holds grants the search is refused like any read of the table.
     let sql = support::nearest_sql("passages", "v", None, 5);
-    match support::search(&in_contexts(&db, &[1]), &sql, &query) {
-        Err(Error::PrincipalRequired { table }) => assert_eq!(table, "passages"),
-        other => panic!("{sql}\nthrough a handle with no principal gave {other:?}"),
+    for asked in [support::nearest_sql("passages", "v", None, 0), sql.clone()] {
+        match support::search(&in_contexts(&db, &[1]), &asked, &query) {
+            Err(Error::PrincipalRequired { table }) => assert_eq!(table, "passages"),
+            other => panic!("{asked}\nthrough a handle with no principal gave {other:?}"),
+        }
     }
+    // Explaining it is refused alike, and a principal that holds grants is told the filter path.
+    for said in [&sql, "INSERT INTO passages (id) VALUES (1)"] {
+        let r = in_contexts(&db, &[1]).explain(said);
+        assert!(matches!(r, Err(Error::PrincipalRequired { .. })), "{r:?}");
+    }
+    let filtered = support::nearest_sql("passages", "v", Some("id > 10"), 5);
+    let text = reader_in_one
+        .explain(&filtered)
+        .expect("a principal explains");
+    assert!(text.contains("filter_path:"), "{text}");
 }
 
 // ---- a handle made from a narrowed handle ----
@@ -1476,9 +1467,7 @@ fn twenty_four_thousand_access_ids_are_read_under_a_limit_with_no_room_to_rememb
     // 64 KiB and a row eight times over, and do not hold an entry for each id: 24,000 ids of
     // 16 bytes alone are 384,000 bytes, and the 12,000 that are granted are 192,000.
     let limit = 9 * MIB + 128 * KIB;
-    let mut options = DatabaseOpenOptions::default();
-    options.memory_limit = Some(limit);
-    let db = support::open_with(&folder, options).expect("open the store under the limit");
+    let db = support::open_limited(&folder, limit);
     let reader = named(&db, agent("reader"));
     let in_use = db.memory_used();
     let granted = ROWS / 2;
@@ -1597,4 +1586,31 @@ fn a_narrowed_handle_is_refused_every_declaration_and_setting_and_changes_nothin
     for (sql, _) in statements.iter().chain(&readings) {
         support::run(&db, sql);
     }
+}
+
+#[test]
+fn a_ranked_search_treats_a_hidden_row_joined_by_a_unique_column_as_unmatched() {
+    let db = support::open(&support::folder("visibility-rank-unique"));
+    for sql in [
+        "CREATE TABLE results (id INTEGER PRIMARY KEY, context_id UUID CONTEXT_ID, \
+         task_id INTEGER UNIQUE, weight REAL)",
+        "CREATE TABLE tasks (id INTEGER PRIMARY KEY, v VECTOR(2) RANK_POLICY (JOIN results ON \
+         task_id, FORMULA '{vector_score} * coalesce({weight}, 1.0)', SORT_KEY s))",
+        "INSERT INTO tasks (id, v) VALUES (1, [1.0, 0.0]), (2, [1.0, 1.0])",
+    ] {
+        support::run(&db, sql);
+    }
+    for (id, task, context_number, weight) in [(10_i64, 1_i64, 2, 0.1_f64), (11, 2, 1, 1.0)] {
+        let values =
+            params! {"id" => id, "task" => task, "c" => context(context_number), "w" => weight};
+        let sql =
+            "INSERT INTO results (id, context_id, task_id, weight) VALUES ($id, $c, $task, $w)";
+        db.execute(sql, &values).expect("insert result");
+    }
+    let sql = "SELECT id FROM tasks ORDER BY v <=> [1.0, 0.0] USE RANK s LIMIT 2";
+    assert_eq!(
+        ids(&in_contexts(&db, &[1]), sql),
+        vec![1, 2],
+        "a result hidden from the reader is no answer and no refusal: its task ranks as unmatched"
+    );
 }

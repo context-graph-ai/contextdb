@@ -6,6 +6,7 @@ use std::fmt;
 use std::ops::Range;
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
 pub use uuid::Uuid;
 
 /// What every fallible call of this library returns.
@@ -13,7 +14,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// The position the engine gave a commit. Positions rise with every commit of one store, and a
 /// position that reached the disk is never given out again.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct TxId(pub u64);
 
 /// One stored or bound value.
@@ -21,7 +23,7 @@ pub struct TxId(pub u64);
 /// `params!` and `Value::from` take these Rust types: `bool`, `i64` (not `i32`), `f64`, `&str`,
 /// `String`, [`Uuid`], `Vec<f32>` and `serde_json::Value`. A timestamp is written as
 /// `Value::Timestamp(milliseconds)`, and no value at all as `Value::Null`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     /// No value: SQL NULL. Fits a column of any type that is not declared NOT NULL.
     Null,
@@ -389,11 +391,20 @@ pub enum Error {
         column: String,
         policy: String,
     },
+    /// `USE RANK` named a sort key the searched column declares no rank policy for.
+    RankPolicyNotFound {
+        index: VectorIndexRef,
+        sort_key: String,
+    },
     /// A `RANK_POLICY` whose declaration cannot stand; `reason` says why.
     RankPolicyInvalid {
         index: VectorIndexRef,
         reason: String,
     },
+    /// `USE RANK` was written in a SELECT that does not order by `<=>`.
+    UseRankRequiresVectorOrder,
+    /// `USE RANK` was written in a SELECT with no `LIMIT`.
+    UseRankRequiresLimit,
     /// A handle narrowed to some Contexts named, by its key, a row of another Context, or
     /// wrote a row outside them.
     ContextScopeViolation { table: String },
@@ -407,8 +418,20 @@ pub enum Error {
     PrincipalRequired { table: String },
     /// A narrowed handle ran a statement only the handle that declared no narrowing may run.
     AdminRequired { statement: String },
+    /// A graph pattern's upper bound is above the deepest walk the engine makes.
+    BfsDepthExceeded { depth: u32, max: u32 },
+    /// A variable-length graph pattern was written with no upper bound.
+    UnboundedTraversal,
+    /// `WITH RECURSIVE`.
+    RecursiveCteNotSupported,
+    /// A window function other than `ROW_NUMBER() OVER ([PARTITION BY ...] ORDER BY ...)`.
+    WindowFunctionNotSupported { form: String },
+    /// `EXISTS`, or a subquery that reads a row of the statement around it.
+    SubqueryNotSupported,
     /// `CREATE PROCEDURE` or `CREATE FUNCTION`.
     StoredProcNotSupported,
+    /// `column MATCH pattern`, a full-text search.
+    FullTextSearchNotSupported,
     /// A statement wrote a `TXID` value above its own transaction's number.
     TxIdOutOfRange { value: u64, max: u64 },
 }
@@ -629,9 +652,16 @@ impl fmt::Display for Error {
                 column,
                 policy,
             } => write!(f, "{table}.{column} is read by the rank policy {policy}"),
+            Error::RankPolicyNotFound { index, sort_key } => {
+                write!(f, "no rank policy named {sort_key} is declared on {index}")
+            }
             Error::RankPolicyInvalid { index, reason } => {
                 write!(f, "invalid rank policy on {index}: {reason}")
             }
+            Error::UseRankRequiresVectorOrder => {
+                f.write_str("USE RANK requires ORDER BY embedding <=> $param in the same query")
+            }
+            Error::UseRankRequiresLimit => f.write_str("USE RANK requires LIMIT"),
             Error::ContextScopeViolation { table } => write!(
                 f,
                 "context scope violation: this row of {table} is outside the Contexts this \
@@ -656,9 +686,30 @@ impl fmt::Display for Error {
                 "{statement} reaches every Context, label and principal: run it through the \
                  handle that declared no narrowing"
             ),
+            Error::BfsDepthExceeded { depth, max } => write!(
+                f,
+                "graph traversal depth {depth} is above the limit of {max}"
+            ),
+            Error::UnboundedTraversal => {
+                f.write_str("a variable-length pattern needs an upper bound, as in ->{1,3}")
+            }
+            Error::RecursiveCteNotSupported => f.write_str("WITH RECURSIVE is not supported"),
+            Error::WindowFunctionNotSupported { form } => write!(
+                f,
+                "window function not supported: {form}; ROW_NUMBER() OVER ([PARTITION BY ...] \
+                 ORDER BY ...) is"
+            ),
+            Error::SubqueryNotSupported => f.write_str(
+                "this subquery is not supported: a subquery stands inside IN, or alone as one \
+                 value, and reads no row of the statement around it",
+            ),
             Error::StoredProcNotSupported => {
                 f.write_str("stored procedures and functions are not supported")
             }
+            Error::FullTextSearchNotSupported => f.write_str(
+                "full-text search (WHERE column MATCH pattern) is not supported; LIKE matches a \
+                 pattern",
+            ),
             Error::TxIdOutOfRange { value, max } => write!(
                 f,
                 "TXID {value} is above this transaction's own number, {max}"
@@ -936,12 +987,12 @@ pub enum VectorPolicyDeclarationIssue {
     DimensionsNotPositive,
     /// `WITH (...)` gives this member a value it does not take.
     InvalidMember { member: &'static str },
-    /// `AUTO_INDEX_AT` is zero or negative.
-    AutoIndexAtNotPositive,
-    /// `AUTO_INDEX_AT` is larger than the engine keeps.
-    AutoIndexAtOutOfRange,
-    /// A percentage of `CONSOLIDATION` is not a whole number from 1 to 100.
-    ConsolidationPercentOutOfRange,
+    /// `INDEXING_THRESHOLD` is zero or negative.
+    IndexingThresholdNotPositive,
+    /// `INDEXING_THRESHOLD` is larger than the engine keeps.
+    IndexingThresholdOutOfRange,
+    /// A percentage of `COMPACTION` is not a whole number from 1 to 100.
+    CompactionPercentOutOfRange,
 }
 
 impl fmt::Display for VectorPolicyDeclarationIssue {
@@ -951,12 +1002,14 @@ impl fmt::Display for VectorPolicyDeclarationIssue {
             Self::InvalidMember { member } => {
                 write!(f, "{member} has an invalid vector policy value")
             }
-            Self::AutoIndexAtNotPositive => f.write_str("AUTO_INDEX_AT must be a positive integer"),
-            Self::AutoIndexAtOutOfRange => {
-                f.write_str("AUTO_INDEX_AT is outside the persisted numeric range")
+            Self::IndexingThresholdNotPositive => {
+                f.write_str("INDEXING_THRESHOLD must be a positive integer")
             }
-            Self::ConsolidationPercentOutOfRange => {
-                f.write_str("vector consolidation percentages must be integers from 1 through 100")
+            Self::IndexingThresholdOutOfRange => {
+                f.write_str("INDEXING_THRESHOLD is outside the persisted numeric range")
+            }
+            Self::CompactionPercentOutOfRange => {
+                f.write_str("vector compaction percentages must be integers from 1 through 100")
             }
         }
     }
@@ -966,7 +1019,7 @@ impl fmt::Display for VectorPolicyDeclarationIssue {
 /// `USE VECTOR` asks for in one statement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VectorSearchMode {
-    /// The engine chooses: through the index from the column's `AUTO_INDEX_AT` vectors on,
+    /// The engine chooses: through the index from the column's `INDEXING_THRESHOLD` vectors on,
     /// wherever the index is usable, and exactly otherwise. The answer is never short.
     #[default]
     Auto,

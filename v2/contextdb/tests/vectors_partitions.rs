@@ -7,12 +7,9 @@ mod support;
 
 use std::sync::atomic::Ordering;
 
-use contextdb::{
-    Database, DatabaseOpenOptions, Error, ReadSession, ReadSessionOptions, Value, VectorIndexRef,
-    params,
-};
+use contextdb::{Database, DatabaseOpenOptions, Error, ReadSession, Value, VectorIndexRef, params};
 
-use support::{Child, Near, Run};
+use support::{Child, Near, Run, near_ids as ids};
 
 /// A table whose VECTOR column is partitioned by two columns.
 const NOTES: &str = "SELECT id, ctx, kind, v FROM notes";
@@ -40,16 +37,6 @@ fn insert_note(on: &impl Run, id: i64, ctx: &str, kind: i64, vector: Vec<f32>) {
 /// True for a row of `notes` under this key tuple.
 fn under(row: &[Value], ctx: &str, kind: i64) -> bool {
     row[1] == support::text(ctx) && row[2] == Value::Int64(kind)
-}
-
-fn ids(answer: &[Near]) -> Vec<i64> {
-    answer
-        .iter()
-        .map(|near| match near.key {
-            Value::Int64(id) => id,
-            ref other => panic!("the key {other:?} is not an INTEGER"),
-        })
-        .collect()
 }
 
 #[test]
@@ -744,11 +731,7 @@ fn the_partition_cap_counts_live_partitions_while_a_reader_holds_an_earlier_stat
 /// for a line. Then it searches every partition again and announces each row as
 /// `now <key> <bits>`, then `done`.
 fn searcher(role: &support::Role) {
-    let (door, searching, reads) = support::pausing_at_read(role.number("pause_at"));
-    let mut options = ReadSessionOptions::default();
-    options.storage = Some(door);
-    let reader =
-        ReadSession::open_with_options(&role.folder, options).expect("open the store for reading");
+    let (reader, searching, reads) = support::reader_pausing(role);
     let query = support::vector(83_000, 64);
 
     searching.store(true, std::sync::atomic::Ordering::SeqCst);

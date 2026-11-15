@@ -27,7 +27,7 @@ fn assert_fields(row: &Shown, wanted: &[(&str, Value)], what: &str) {
 /// under `b`, which together bring the column to its declared size; and `plain.e`, with no
 /// key and no vector.
 fn two_columns(name: &str) -> (std::path::PathBuf, contextdb::Database) {
-    let clauses = "PARTITION_KEY (ctx) AUTO_INDEX_AT 1000 CONSOLIDATION (CHANGE_PERCENT = 50)";
+    let clauses = "PARTITION_KEY (ctx) INDEXING_THRESHOLD 1000 COMPACTION (CHANGE_PERCENT = 50)";
     let (folder, db) = support::built(name, 8, clauses, 0);
     support::run(
         &db,
@@ -63,15 +63,15 @@ fn show_vector_indexes_describes_every_vector_column() {
                 ("max_partitions", int(256)),
                 ("live_partitions", int(2)),
                 ("search_mode", text("AUTO")),
-                ("declared_auto_index_at", int(1000)),
-                ("effective_auto_index_at", int(1000)),
-                ("declared_consolidation_mode", text("PERCENT")),
-                ("declared_consolidation_change_percent", int(50)),
-                ("declared_consolidation_tombstone_percent", Value::Null),
-                ("effective_consolidation_mode", text("PERCENT")),
-                ("effective_consolidation_change_percent", int(50)),
-                ("effective_consolidation_tombstone_percent", int(10)),
-                ("pending_inserts", int(400)),
+                ("declared_indexing_threshold", int(1000)),
+                ("effective_indexing_threshold", int(1000)),
+                ("declared_compaction_mode", text("PERCENT")),
+                ("declared_compaction_change_percent", int(50)),
+                ("declared_compaction_tombstone_percent", Value::Null),
+                ("effective_compaction_mode", text("PERCENT")),
+                ("effective_compaction_change_percent", int(50)),
+                ("effective_compaction_tombstone_percent", int(10)),
+                ("pending_tuples", int(400)),
                 ("tombstones", int(0)),
                 ("durable_vector_bytes", int(600 * 16)),
                 ("durable_index_bytes", int(0)),
@@ -103,15 +103,15 @@ fn show_vector_indexes_describes_every_vector_column() {
                 ("max_partitions", Value::Null),
                 ("live_partitions", int(0)),
                 ("search_mode", text("AUTO")),
-                ("declared_auto_index_at", Value::Null),
-                ("effective_auto_index_at", int(100_000)),
-                ("declared_consolidation_mode", Value::Null),
-                ("declared_consolidation_change_percent", Value::Null),
-                ("declared_consolidation_tombstone_percent", Value::Null),
-                ("effective_consolidation_mode", text("PERCENT")),
-                ("effective_consolidation_change_percent", int(20)),
-                ("effective_consolidation_tombstone_percent", int(10)),
-                ("pending_inserts", int(0)),
+                ("declared_indexing_threshold", Value::Null),
+                ("effective_indexing_threshold", int(100_000)),
+                ("declared_compaction_mode", Value::Null),
+                ("declared_compaction_change_percent", Value::Null),
+                ("declared_compaction_tombstone_percent", Value::Null),
+                ("effective_compaction_mode", text("PERCENT")),
+                ("effective_compaction_change_percent", int(20)),
+                ("effective_compaction_tombstone_percent", int(10)),
+                ("pending_tuples", int(0)),
                 ("indexed_available", Value::Bool(true)),
                 ("maintenance_state", text("idle")),
                 ("maintenance_vectors_total", int(0)),
@@ -173,6 +173,9 @@ fn show_vector_partitions_lists_partitions_by_key_with_limit_and_offset() {
     assert_eq!(keys("SHOW VECTOR_PARTITIONS LIMIT 5 OFFSET 2"), [plain]);
     assert_eq!(keys("SHOW VECTOR_PARTITIONS LIMIT 2"), [a, b]);
     assert_eq!(keys("SHOW VECTOR_PARTITIONS FOR plain.e"), [plain]);
+    // Any letter case reads, and LIMIT 0 gives no row.
+    assert_eq!(keys("show vector_partitions for docs.v limit 5"), [a, b]);
+    assert!(keys("SHOW VECTOR_PARTITIONS LIMIT 0").is_empty());
 
     let rows = support::shown(&db, "SHOW VECTOR_PARTITIONS");
     let text = support::text;
@@ -181,14 +184,14 @@ fn show_vector_partitions_lists_partitions_by_key_with_limit_and_offset() {
         &rows[0],
         &[
             ("live_rows", int(600)),
-            ("pending_inserts", int(0)),
+            ("pending_tuples", int(0)),
             ("tombstones", int(0)),
             ("durable_vector_bytes", int(600 * 16)),
             ("durable_index_bytes", int(0)),
             ("indexed_available", Value::Bool(true)),
             ("availability_reason", text("none")),
             ("maintenance_state", text("pending")),
-            ("maintenance_reason", text("first_grouping")),
+            ("maintenance_reason", text("unindexed")),
             ("maintenance_vectors_total", int(600)),
             ("maintenance_vectors_done", int(0)),
             ("maintenance_vectors_remaining", int(600)),
@@ -202,7 +205,7 @@ fn show_vector_partitions_lists_partitions_by_key_with_limit_and_offset() {
         &rows[1],
         &[
             ("live_rows", int(400)),
-            ("pending_inserts", int(400)),
+            ("pending_tuples", int(400)),
             ("durable_vector_bytes", int(0)),
             ("lists", Value::Null),
         ],
@@ -213,7 +216,7 @@ fn show_vector_partitions_lists_partitions_by_key_with_limit_and_offset() {
         &rows[2],
         &[
             ("live_rows", int(0)),
-            ("pending_inserts", int(0)),
+            ("pending_tuples", int(0)),
             ("tombstones", int(0)),
             ("durable_vector_bytes", int(0)),
             ("durable_index_bytes", int(0)),
@@ -251,7 +254,13 @@ fn searched(filter: Option<&str>, mode: &str) -> String {
 fn inspection_and_explain_read_no_block_and_change_nothing() {
     // One block of 2,000 slots of 72 bytes with keys of 9: 170,004 bytes.
     const BLOCK: u64 = 4 + 2000 * (72 + 4 + 9);
-    let (folder, db) = support::built("inspection-reads-no-block", 64, "AUTO_INDEX_AT 1000", 2000);
+    let (folder, db) = support::built(
+        "inspection-reads-no-block",
+        64,
+        "INDEXING_THRESHOLD 1000",
+        2000,
+    );
+    support::run(&db, "CREATE INDEX docs_ctx ON docs (ctx)");
     support::close(db);
     let (door, bytes) = support::counting_bytes_read();
     let mut options = DatabaseOpenOptions::default();
@@ -270,6 +279,22 @@ fn inspection_and_explain_read_no_block_and_change_nothing() {
         read < BLOCK,
         "inspection and explain read {read} bytes; the block is {BLOCK}"
     );
+    // A count answered from an index range is read when run and not when explained.
+    let (count, warm) = (
+        "SELECT COUNT(*) FROM docs WHERE ctx = 'a'",
+        bytes.load(Ordering::SeqCst),
+    );
+    db.explain(count).expect("explain a count");
+    assert_eq!(
+        bytes.load(Ordering::SeqCst),
+        warm,
+        "explaining a count read the file"
+    );
+    support::run(&db, count);
+    assert!(
+        bytes.load(Ordering::SeqCst) > warm,
+        "running the count reads its range"
+    );
     assert_eq!(db.committed_watermark(), before);
 }
 
@@ -281,7 +306,7 @@ fn lines_of(explained: &str) -> Vec<&str> {
 #[test]
 fn explain_names_how_each_partition_is_searched() {
     // Partition a is built; b has 2,000 vectors outside any grouping, twice the declared size.
-    let clauses = "PARTITION_KEY (ctx) AUTO_INDEX_AT 1000";
+    let clauses = "PARTITION_KEY (ctx) INDEXING_THRESHOLD 1000";
     let (folder, db) = support::built("explain-routes", 16, clauses, 2000);
     support::load_docs(&db, 2001..=4000, "b", |n| support::gathered(n, 16));
     let reader = ReadSession::open(&folder).expect("open for reading");
@@ -302,7 +327,7 @@ fn explain_names_how_each_partition_is_searched() {
     for wanted in [
         "requested_mode: EXACT",
         "resolved_mode: EXACT",
-        "effective_auto_index_at: 1000",
+        "effective_indexing_threshold: 1000",
         "aggregate_allowed_vectors: 4000",
         r#"partition_key_columns: ["ctx"]"#,
         "partitions: 2",
@@ -329,7 +354,7 @@ fn explain_names_how_each_partition_is_searched() {
     assert!(lines[at + 3].starts_with("probes: "), "{explained}");
     assert_eq!(
         lines[at + 4..at + 6],
-        ["live_rows: 2000", "outside_grouping: 0"]
+        ["live_rows: 2000", "unindexed_rows: 0"]
     );
     assert!(explained.contains("\n  route: indexed\n"), "{explained}");
     assert!(lines.contains(&"partitions: 1") && lines.contains(&"refusal: none"));
@@ -338,7 +363,7 @@ fn explain_names_how_each_partition_is_searched() {
     let explained = explain(&searched(None, "INDEXED"));
     let refusal = format!("refusal: docs.v{}", support::INDEXED_REFUSED);
     assert_eq!(lines_of(&explained).last(), Some(&refusal.as_str()));
-    assert!(explained.contains("outside_grouping: 2000"), "{explained}");
+    assert!(explained.contains("unindexed_rows: 2000"), "{explained}");
 
     // Under AUTO each partition goes its own way and nothing is refused.
     let explained = explain(&searched(None, "AUTO"));
@@ -380,29 +405,36 @@ fn explain_names_how_each_partition_is_searched() {
         "a handle narrowed to Context 1 was told of other partitions:\n{seen}"
     );
     assert_eq!(db.explain(sql).expect("explain"), whole);
+    // Nor is a handle narrowed to no Context, or to one the table does not hold.
+    let other = ContextId::new(Uuid::from_u128(3));
+    for contexts in [BTreeSet::new(), BTreeSet::from([other])] {
+        let scoped = db.scoped_with_contexts(contexts);
+        let seen = scoped.explain(sql).expect("explains");
+        assert!(!seen.contains(&one.to_string()), "{seen}");
+    }
 
-    // Any other statement is a later version's to explain.
-    match db.explain("SELECT id FROM docs") {
+    // A statement that reads no stored table is not explained.
+    match db.explain("SELECT 1") {
         Err(error) => assert!(
             error.to_string().ends_with(
                 "explaining this statement is not supported in this version of the library"
             ),
             "{error}"
         ),
-        Ok(explained) => panic!("a plain SELECT was explained:\n{explained}"),
+        Ok(explained) => panic!("a SELECT of no table was explained:\n{explained}"),
     }
 }
 
 #[test]
 fn explain_says_that_auto_below_the_columns_size_resolves_to_exact() {
-    // Fifty vectors in a column whose size is the 100,000 of no AUTO_INDEX_AT.
+    // Fifty vectors in a column whose size is the 100,000 of no INDEXING_THRESHOLD.
     let (_, db) = support::built("explain-auto-below-its-size", 16, "", 50);
     let explained = db.explain(&searched(None, "AUTO")).expect("explain");
     let lines = lines_of(&explained);
     for wanted in [
         "requested_mode: AUTO",
         "resolved_mode: EXACT",
-        "effective_auto_index_at: 100000",
+        "effective_indexing_threshold: 100000",
         "aggregate_allowed_vectors: 50",
         "refusal: none",
     ] {

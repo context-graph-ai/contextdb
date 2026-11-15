@@ -21,8 +21,8 @@ use redb::{ReadOnlyTable, ReadTransaction, ReadableDatabase, ReadableTable, Tabl
 use super::folder::Hold;
 use super::keys::{self, Span, stored};
 use super::{
-    Beside, ChangeSet, CountId, EntryIter, IndexId, Joined, KeptIter, Key, Read, Row, RowIter,
-    TableId, View,
+    Beside, ChangeSet, CountId, EntryIter, IndexId, Joined, KeptIter, Key, Keys, Read, Row,
+    RowIter, TableId, View,
 };
 use super::{VectorNumber, VectorRecord};
 use super::{counts, drop, record, split};
@@ -216,14 +216,14 @@ impl Moment {
     }
 
     /// The records of one table, index or count inside a span, in key order, each read with
-    /// `read` from its key and its value.
+    /// `read` from its key and its value, both lent.
     fn scan<T, F>(
         &self,
         table: &ReadOnlyTable<&'static [u8], &'static [u8]>,
         id: u32,
         (start, end): &Span,
         read: F,
-    ) -> Result<impl Iterator<Item = Result<(Key, T)>> + use<T, F>>
+    ) -> Result<impl Iterator<Item = Result<T>> + use<T, F>>
     where
         F: Fn(&[u8], &[u8]) -> Option<T>,
     {
@@ -236,9 +236,7 @@ impl Moment {
                 .next_lent()
                 .map_err(|error| failed(&folder, "read", error));
             Some(entry.transpose()?.and_then(|(key, record)| {
-                let read = read(&key[4..], record);
-                let read = read.ok_or_else(|| failed(&folder, "read", unsound()))?;
-                Ok((Key(key[4..].to_vec()), read))
+                read(&key[4..], record).ok_or_else(|| failed(&folder, "read", unsound()))
             }))
         }))
     }
@@ -249,10 +247,9 @@ impl Moment {
         table: u32,
         span: &Span,
     ) -> Result<impl Iterator<Item = Result<(Key, Row)>> + use<>> {
-        self.scan(&self.rows, table, span, |_, row| {
-            Some(Row {
-                cells: record::decode_row(&record::plain(row).ok()?),
-            })
+        self.scan(&self.rows, table, span, |key, row| {
+            let cells = record::decode_row(&record::plain(row).ok()?);
+            Some((Key(key.to_vec()), Row { cells }))
         })
     }
 
@@ -266,15 +263,7 @@ impl Moment {
         span: &Span,
     ) -> Result<impl Iterator<Item = Result<(Key, Joined)>> + use<>> {
         self.scan(&self.index, index, span, |joined, record| {
-            let number =
-                |at: usize| Some(u32::from_le_bytes(*record.get(at..)?.first_chunk()?) as usize);
-            let length = number(0)?;
-            let cut = match record.len() {
-                4 => None,
-                8 => Some(number(4)?),
-                _ => return None,
-            };
-            (length <= joined.len() && cut.is_none_or(|cut| cut <= length)).then_some((length, cut))
+            Some((Key(joined.to_vec()), entry_of(joined, record)?))
         })
     }
 
@@ -284,7 +273,9 @@ impl Moment {
         count: u32,
         span: &Span,
     ) -> Result<impl Iterator<Item = Result<(Key, u64)>> + use<>> {
-        self.scan(&self.counts, count, span, |_, record| counts::read(record))
+        self.scan(&self.counts, count, span, |key, record| {
+            Some((Key(key.to_vec()), counts::read(record)?))
+        })
     }
 
     /// Every schema record, in the order of their names.
@@ -328,6 +319,18 @@ impl Moment {
     }
 }
 
+/// What an index record holds beside its entry: see [`Moment::joined`].
+fn entry_of(joined: &[u8], record: &[u8]) -> Option<Joined> {
+    let number = |at: usize| Some(u32::from_le_bytes(*record.get(at..)?.first_chunk()?) as usize);
+    let length = number(0)?;
+    let cut = match record.len() {
+        4 => None,
+        8 => Some(number(4)?),
+        _ => return None,
+    };
+    (length <= joined.len() && cut.is_none_or(|cut| cut <= length)).then_some((length, cut))
+}
+
 impl Read for View {
     fn commit(&self) -> TxId {
         self.moment.commit
@@ -339,6 +342,17 @@ impl Read for View {
 
     fn rows(&self, table: TableId, from: Bound<&Key>, to: Bound<&Key>) -> Result<RowIter<'_>> {
         Ok(Box::new(self.moment.rows(table.0, &keys::span(from, to))?))
+    }
+
+    fn counted(&self, of: Keys, from: Bound<&Key>, to: Bound<&Key>, most: usize) -> Result<u64> {
+        let (moment, span) = (&*self.moment, keys::span(from, to));
+        let (records, id, index) = match of {
+            Keys::Table(table) => (&moment.rows, table.0, false),
+            Keys::Index(index) => (&moment.index, index.0, true),
+        };
+        let sound = |k: &[u8], r: &[u8]| (!index || entry_of(k, r).is_some()).then_some(());
+        let found = moment.scan(records, id, &span, sound)?.take(most);
+        found.map(|found| found.and(Ok(1))).sum()
     }
 
     fn index(&self, index: IndexId, from: Bound<&Key>, to: Bound<&Key>) -> Result<EntryIter<'_>> {

@@ -82,6 +82,21 @@ fn arg(path: &Path) -> &str {
     path.to_str().unwrap()
 }
 
+/// A read shell over `store`.
+fn run_read(dir: &Path, store: &Path, input: impl AsRef<[u8]>) -> Run {
+    shell(dir, &[arg(store)], input)
+}
+
+/// A read-write shell over `store`.
+fn run_write(dir: &Path, store: &Path, input: impl AsRef<[u8]>) -> Run {
+    shell(dir, &[arg(store), "--write"], input)
+}
+
+/// A read shell over `store` that prints JSON documents.
+fn run_json(dir: &Path, store: &Path, input: impl AsRef<[u8]>) -> Run {
+    shell(dir, &[arg(store), "--json"], input)
+}
+
 /// Every line of a stream as a JSON document.
 fn documents(stream: &str) -> Vec<Json> {
     stream
@@ -172,7 +187,7 @@ fn reading_a_missing_store_is_refused_and_creates_nothing() {
     let dir = folder("reading-a-missing-store");
     let store = dir.join("store");
 
-    let run = shell(&dir, &[arg(&store)], SELECT_NOTES);
+    let run = run_read(&dir, &store, SELECT_NOTES);
     assert_eq!(run.code, Some(1), "{}", run.stderr);
     assert_eq!(run.stdout, "");
     assert!(
@@ -192,7 +207,7 @@ fn reading_a_missing_store_is_refused_and_creates_nothing() {
     let broken = dir.join("broken");
     std::fs::create_dir_all(broken.join("data")).unwrap();
     for (path, kind) in [(&store, "store_not_found"), (&broken, "store_io")] {
-        let run = shell(&dir, &[arg(path), "--json"], SELECT_NOTES);
+        let run = run_json(&dir, path, SELECT_NOTES);
         assert_eq!(run.code, Some(1), "{}", run.stderr);
         assert_eq!(run.stdout, "");
         let refusals = documents(&run.stderr);
@@ -217,11 +232,7 @@ fn write_creates_a_missing_store() {
     let store = dir.join("store");
 
     let insert = "INSERT INTO notes (id, body) VALUES (1, 'first');\n";
-    let run = shell(
-        &dir,
-        &[arg(&store), "--write"],
-        format!("{CREATE_NOTES}{insert}"),
-    );
+    let run = run_write(&dir, &store, format!("{CREATE_NOTES}{insert}"));
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert_eq!(run.errors(), Vec::<&str>::new());
     assert!(
@@ -235,17 +246,13 @@ fn write_creates_a_missing_store() {
     );
 
     // It was a whole read-write session: the next shell reads what it wrote.
-    let run = shell(&dir, &[arg(&store)], SELECT_NOTES);
+    let run = run_read(&dir, &store, SELECT_NOTES);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert_eq!(run.stdout, ONE_NOTE);
 
     // On a store that is there, --write opens it and keeps what it holds.
     let insert = "INSERT INTO notes (id, body) VALUES (2, 'second');\n";
-    let run = shell(
-        &dir,
-        &[arg(&store), "--write"],
-        format!("{insert}{SELECT_NOTES}"),
-    );
+    let run = run_write(&dir, &store, format!("{insert}{SELECT_NOTES}"));
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert!(run.stdout.contains(TWO_NOTES), "{}", run.stdout);
 }
@@ -369,7 +376,7 @@ SELECT nope FROM notes;
 INSERT INTO notes (id, body) VALUES (2, 'second');
 SELECT COUNT(*) AS n FROM notes;
 ";
-    let run = shell(&dir, &[arg(&store), "--write"], input);
+    let run = run_write(&dir, &store, input);
 
     // A statement may span lines, a command is one line, and every result is on the output.
     let first = run
@@ -419,7 +426,7 @@ SELECT COUNT(*) AS n FROM notes;
     assert_eq!(run.code, Some(1));
 
     // A run in which every statement succeeded exits 0 and prints its results and nothing else.
-    let run = shell(&dir, &[arg(&store)], SELECT_NOTES);
+    let run = run_read(&dir, &store, SELECT_NOTES);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert_eq!(run.stdout, TWO_NOTES);
 
@@ -456,7 +463,7 @@ SELECT COUNT(*) AS n FROM notes;
         let mut input = script.as_bytes().to_vec();
         input.extend_from_slice(b"\xff\xfe\n");
         input.extend_from_slice(b"INSERT INTO notes (id, body) VALUES (11, 'after');\nCOMMIT;\n");
-        let run = shell(&dir, &[arg(&store), "--write"], input);
+        let run = run_write(&dir, &store, input);
         assert_eq!(
             run.code,
             Some(1),
@@ -470,7 +477,7 @@ SELECT COUNT(*) AS n FROM notes;
             "the refusal must name the line that cannot be decoded, line {line}: {}",
             run.stderr
         );
-        let run = shell(&dir, &[arg(&store)], "SELECT COUNT(*) AS n FROM notes;\n");
+        let run = run_read(&dir, &store, "SELECT COUNT(*) AS n FROM notes;\n");
         assert!(
             run.stdout.contains(&format!("| {kept} |")),
             "only the statements before the undecodable line stand ({kept} notes): {}",
@@ -541,11 +548,7 @@ fn a_read_shell_refuses_a_write_by_name() {
     let dir = folder("a-read-shell-refuses-a-write");
     let store = dir.join("store");
     let insert = "INSERT INTO notes (id, body) VALUES (1, 'first');\n";
-    let made = shell(
-        &dir,
-        &[arg(&store), "--write"],
-        format!("{CREATE_NOTES}{insert}"),
-    );
+    let made = run_write(&dir, &store, format!("{CREATE_NOTES}{insert}"));
     assert_eq!(made.code, Some(0), "{}", made.stderr);
 
     let writes = "\
@@ -557,7 +560,7 @@ BEGIN;
 ";
     // Each of the five is refused, telling the person what to add, and the read after them
     // answers with the row as it was.
-    let run = shell(&dir, &[arg(&store)], format!("{writes}{SELECT_NOTES}"));
+    let run = run_read(&dir, &store, format!("{writes}{SELECT_NOTES}"));
     assert_eq!(run.code, Some(1));
     assert_eq!(run.errors().len(), 5, "{}", run.stderr);
     assert!(
@@ -569,7 +572,7 @@ BEGIN;
     assert!(!run.stdout.contains("ok ("), "{}", run.stdout);
 
     // A program reads the refusal's kind.
-    let run = shell(&dir, &[arg(&store), "--json"], writes);
+    let run = run_json(&dir, &store, writes);
     assert_eq!(run.code, Some(1));
     let refusals: Vec<Json> = documents(&run.stderr)
         .into_iter()
@@ -584,11 +587,7 @@ BEGIN;
     }
 
     // Nothing was written: one row, one table.
-    let run = shell(
-        &dir,
-        &[arg(&store), "--json"],
-        format!("{SELECT_NOTES}.tables\n"),
-    );
+    let run = run_json(&dir, &store, format!("{SELECT_NOTES}.tables\n"));
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     let results = documents(&run.stdout);
     assert_eq!(
@@ -618,8 +617,18 @@ fn a_read_shell_answers_while_a_writer_holds_the_store() {
         )
         .unwrap();
 
+    // The same for a similarity search: from [1, 0, 0] row 1 is at distance 1 and row 2 at 2.
+    for sql in [
+        "CREATE TABLE passages (id INTEGER PRIMARY KEY, embedding VECTOR(3))",
+        "INSERT INTO passages (id, embedding) VALUES (1, [0.0, 1.0, 0.0]), (2, [-1.0, 0.0, 0.0])",
+    ] {
+        writer.execute(sql, &params! {}).unwrap();
+    }
+    let search = "SELECT id, embedding <=> [1.0, 0.0, 0.0] AS distance FROM passages \
+                  ORDER BY distance LIMIT 2;\n";
+
     // The store really is held: a second writer is refused, naming this process.
-    let second = shell(&dir, &[arg(&store), "--write"], SELECT_NOTES);
+    let second = run_write(&dir, &store, SELECT_NOTES);
     assert_eq!(second.code, Some(1), "{}", second.stderr);
     assert!(
         second.stderr.contains(&std::process::id().to_string()),
@@ -628,20 +637,37 @@ fn a_read_shell_answers_while_a_writer_holds_the_store() {
     );
 
     // A read shell needs nothing from the writer and answers.
-    let run = shell(&dir, &[arg(&store)], SELECT_NOTES);
+    let run = run_read(&dir, &store, SELECT_NOTES);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert_eq!(run.stdout, ONE_NOTE);
+    let run = run_read(&dir, &store, search);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(nearest(&tables(&run.stdout)[0]), [(1, 1.0), (2, 2.0)]);
 
-    // The writer was not held up by it, and the next read shell reads its next commit.
+    // The writer was not held up by it, and the next read shell reads its next commit, in which
+    // row 3 is the nearest.
+    writer
+        .execute(
+            "INSERT INTO passages (id, embedding) VALUES (3, [1.0, 0.0, 0.0])",
+            &params! {},
+        )
+        .unwrap();
     writer
         .execute(
             "INSERT INTO notes (id, body) VALUES (2, 'second')",
             &params! {},
         )
         .unwrap();
-    let run = shell(&dir, &[arg(&store)], SELECT_NOTES);
+    let run = run_read(&dir, &store, SELECT_NOTES);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert_eq!(run.stdout, TWO_NOTES);
+    let run = run_read(&dir, &store, search);
+    assert_eq!(
+        nearest(&tables(&run.stdout)[0]),
+        [(3, 0.0), (1, 1.0)],
+        "{}",
+        run.stdout
+    );
 
     writer.close().unwrap();
 }
@@ -663,7 +689,7 @@ SELECT id FROM notes ORDER BY id;
 ROLLBACK;
 SELECT id, body FROM notes ORDER BY id;
 ";
-    let run = shell(&dir, &[arg(&store), "--write"], input);
+    let run = run_write(&dir, &store, input);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert_eq!(run.errors(), Vec::<&str>::new());
 
@@ -681,15 +707,15 @@ SELECT id, body FROM notes ORDER BY id;
     assert!(seen_inside < seen_after);
 
     // The committed transaction reached the store, and the rolled-back one never did.
-    let run = shell(&dir, &[arg(&store)], SELECT_NOTES);
+    let run = run_read(&dir, &store, SELECT_NOTES);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert_eq!(run.stdout, TWO_NOTES);
 
     // As in Postgres, BEGIN inside a transaction and COMMIT or ROLLBACK outside one each warn on
     // the error stream and the run still ends well, so a script that lost its BEGIN is told.
-    let run = shell(
+    let run = run_write(
         &dir,
-        &[arg(&store), "--write"],
+        &store,
         "BEGIN;\nBEGIN;\nCOMMIT;\nCOMMIT;\nROLLBACK;\n",
     );
     assert_eq!(run.code, Some(0), "{}", run.stderr);
@@ -728,11 +754,11 @@ CREATE TABLE notes (
 );
 ";
     let authors = "CREATE TABLE authors (id UUID PRIMARY KEY, name TEXT);\n";
-    let made = shell(&dir, &[arg(&store), "--write"], format!("{notes}{authors}"));
+    let made = run_write(&dir, &store, format!("{notes}{authors}"));
     assert_eq!(made.code, Some(0), "{}", made.stderr);
 
     // `.tables` lists the names in order, one a line.
-    let tables = shell(&dir, &[arg(&store)], ".tables\n");
+    let tables = run_read(&dir, &store, ".tables\n");
     assert_eq!(tables.code, Some(0), "{}", tables.stderr);
     let names: Vec<&str> = tables
         .stdout
@@ -741,26 +767,23 @@ CREATE TABLE notes (
         .collect();
     assert_eq!(names, ["authors", "notes"], "{}", tables.stdout);
 
-    let schema = shell(&dir, &[arg(&store)], ".schema notes\n");
+    let schema = run_read(&dir, &store, ".schema notes\n");
     assert_eq!(schema.code, Some(0), "{}", schema.stderr);
     assert_eq!(schema.stdout, notes);
 
     // Each command has a short spelling that prints the same.
-    assert_eq!(shell(&dir, &[arg(&store)], "\\dt\n").stdout, tables.stdout);
-    assert_eq!(
-        shell(&dir, &[arg(&store)], "\\d notes\n").stdout,
-        schema.stdout
-    );
+    assert_eq!(run_read(&dir, &store, "\\dt\n").stdout, tables.stdout);
+    assert_eq!(run_read(&dir, &store, "\\d notes\n").stdout, schema.stdout);
 
     // What `.schema` printed declares the same table again in another store.
     let copy = dir.join("copy");
-    let made = shell(&dir, &[arg(&copy), "--write"], &schema.stdout);
+    let made = run_write(&dir, &copy, &schema.stdout);
     assert_eq!(made.code, Some(0), "{}", made.stderr);
-    assert_eq!(shell(&dir, &[arg(&copy)], ".schema notes\n").stdout, notes);
+    assert_eq!(run_read(&dir, &copy, ".schema notes\n").stdout, notes);
 
     // A command used wrongly prints how it is used, never that it is unknown.
     for (input, command) in [(".schema\n", ".schema"), (".tables extra\n", ".tables")] {
-        let run = shell(&dir, &[arg(&store)], input);
+        let run = run_read(&dir, &store, input);
         let usage = run.stderr.lines().find(|line| line.starts_with("Usage:"));
         assert!(
             usage.is_some_and(|line| line.contains(command)),
@@ -820,7 +843,7 @@ fn the_memory_limit_option_is_the_sessions_ceiling() {
         "startup_ceiling",
         "ceiling_refresh_failures",
     ];
-    let run = shell(&dir, &[arg(&store), "--json"], "SHOW MEMORY_LIMIT;\n");
+    let run = run_json(&dir, &store, "SHOW MEMORY_LIMIT;\n");
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert_eq!(
         documents(&run.stdout)[0]["result"]["columns"],
@@ -918,11 +941,7 @@ VALUES (1, 'a', [1.0, 0.0, 0.0]), (2, 'a', [0.0, 1.0, 0.0]), (3, 'b', [-1.0, 0.0
     let rows = "SELECT id, v FROM t ORDER BY id;\n";
 
     // Declared, written and searched in one piped write session.
-    let run = shell(
-        &dir,
-        &[arg(&store), "--write"],
-        format!("{declare}{search}{rows}"),
-    );
+    let run = run_write(&dir, &store, format!("{declare}{search}{rows}"));
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert_eq!(run.errors(), Vec::<&str>::new());
     let printed = tables(&run.stdout);
@@ -948,7 +967,7 @@ VALUES (1, 'a', [1.0, 0.0, 0.0]), (2, 'a', [0.0, 1.0, 0.0]), (3, 'b', [-1.0, 0.0
     assert_eq!(printed[1][5], ["5", "[0.1, 0.2, 0.3]"], "{}", run.stdout);
 
     // For a program the distance is a number, a vector an array of numbers and no vector null.
-    let run = shell(&dir, &[arg(&store), "--json"], format!("{search}{rows}"));
+    let run = run_json(&dir, &store, format!("{search}{rows}"));
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     let results = documents(&run.stdout);
     assert_eq!(results.len(), 2, "{}", run.stdout);
@@ -979,7 +998,7 @@ VALUES (1, 'a', [1.0, 0.0, 0.0]), (2, 'a', [0.0, 1.0, 0.0]), (3, 'b', [-1.0, 0.0
 
     // `.schema` prints the VECTOR column with its clauses in the order they are declared in,
     // and with the limit of 256 partitions that a key declared without one has.
-    let schema = shell(&dir, &[arg(&store)], ".schema t\n");
+    let schema = run_read(&dir, &store, ".schema t\n");
     assert_eq!(schema.code, Some(0), "{}", schema.stderr);
     let words = schema
         .stdout
@@ -994,21 +1013,18 @@ VALUES (1, 'a', [1.0, 0.0, 0.0]), (2, 'a', [0.0, 1.0, 0.0]), (3, 'b', [-1.0, 0.0
 
     // What it printed declares the same table again in another store.
     let copy = dir.join("copy");
-    let made = shell(&dir, &[arg(&copy), "--write"], &schema.stdout);
+    let made = run_write(&dir, &copy, &schema.stdout);
     assert_eq!(made.code, Some(0), "{}", made.stderr);
-    assert_eq!(
-        shell(&dir, &[arg(&copy)], ".schema t\n").stdout,
-        schema.stdout
-    );
+    assert_eq!(run_read(&dir, &copy, ".schema t\n").stdout, schema.stdout);
 }
 
 #[test]
 fn an_indexed_search_runs_through_the_program() {
     let dir = folder("an-indexed-search-runs");
     let store = dir.join("store");
-    let made = shell(
+    let made = run_write(
         &dir,
-        &[arg(&store), "--write"],
+        &store,
         "CREATE TABLE passages (id INTEGER PRIMARY KEY, embedding VECTOR(3));\n\
          INSERT INTO passages (id, embedding) VALUES (1, [0.0, 1.0, 0.0]), (2, [1.0, 0.0, 0.0]);\n",
     );
@@ -1045,19 +1061,19 @@ fn an_indexed_search_runs_through_the_program() {
         );
     }
 
-    // Two vectors outside any grouping under AUTO_INDEX_AT 1: the index is behind its writes,
+    // Two vectors outside any grouping under INDEXING_THRESHOLD 1: the index is behind its writes,
     // and INDEXED is refused by name rather than answered as an exact scan.
     let behind = dir.join("behind");
-    let made = shell(
+    let made = run_write(
         &dir,
-        &[arg(&behind), "--write"],
-        "CREATE TABLE behind (id INTEGER PRIMARY KEY, v VECTOR(3) AUTO_INDEX_AT 1);\n\
+        &behind,
+        "CREATE TABLE behind (id INTEGER PRIMARY KEY, v VECTOR(3) INDEXING_THRESHOLD 1);\n\
          INSERT INTO behind (id, v) VALUES (1, [1.0, 0.0, 0.0]), (2, [0.0, 1.0, 0.0]);\n",
     );
     assert_eq!(made.code, Some(0), "{}", made.stderr);
-    let run = shell(
+    let run = run_json(
         &dir,
-        &[arg(&behind), "--json"],
+        &behind,
         search("INDEXED")
             .replace("passages", "behind")
             .replace("embedding", "v"),
@@ -1082,68 +1098,30 @@ VALUES (1, 'a', [1.0, 0.0, 0.0]), (2, 'a', [0.0, 1.0, 0.0]), (3, 'b', [-1.0, 0.0
 ";
 
 /// The fields of `SHOW VECTOR_INDEXES`, in the order they are printed.
-const INDEX_FIELDS: [&str; 31] = [
-    "table",
-    "column",
-    "dimension",
-    "quantization",
-    "vector_count",
-    "bytes",
-    "partition_key_columns",
-    "max_partitions",
-    "live_partitions",
-    "search_mode",
-    "declared_auto_index_at",
-    "effective_auto_index_at",
-    "declared_consolidation_mode",
-    "declared_consolidation_change_percent",
-    "declared_consolidation_tombstone_percent",
-    "effective_consolidation_mode",
-    "effective_consolidation_change_percent",
-    "effective_consolidation_tombstone_percent",
-    "pending_inserts",
-    "tombstones",
-    "durable_vector_bytes",
-    "durable_index_bytes",
-    "indexed_available",
-    "maintenance_state",
-    "maintenance_vectors_total",
-    "maintenance_vectors_done",
-    "maintenance_vectors_remaining",
-    "unavailable_partitions",
-    "stalled_partitions",
-    "broad_route",
-    "recovery_action",
-];
+const INDEX_FIELDS: &str = "\
+table column dimension quantization vector_count bytes partition_key_columns \
+max_partitions live_partitions search_mode declared_indexing_threshold \
+effective_indexing_threshold declared_compaction_mode \
+declared_compaction_change_percent declared_compaction_tombstone_percent \
+effective_compaction_mode effective_compaction_change_percent \
+effective_compaction_tombstone_percent pending_tuples tombstones \
+durable_vector_bytes durable_index_bytes indexed_available maintenance_state \
+maintenance_vectors_total maintenance_vectors_done maintenance_vectors_remaining \
+unavailable_partitions stalled_partitions broad_route recovery_action";
 
 /// The fields of `SHOW VECTOR_PARTITIONS`, in the order they are printed.
-const PARTITION_FIELDS: [&str; 18] = [
-    "table",
-    "column",
-    "partition_key",
-    "live_rows",
-    "pending_inserts",
-    "tombstones",
-    "durable_vector_bytes",
-    "durable_index_bytes",
-    "indexed_available",
-    "availability_reason",
-    "maintenance_state",
-    "maintenance_reason",
-    "maintenance_vectors_total",
-    "maintenance_vectors_done",
-    "maintenance_vectors_remaining",
-    "lists",
-    "probes",
-    "recovery_action",
-];
+const PARTITION_FIELDS: &str = "\
+table column partition_key live_rows pending_tuples tombstones durable_vector_bytes \
+durable_index_bytes indexed_available availability_reason maintenance_state \
+maintenance_reason maintenance_vectors_total maintenance_vectors_done \
+maintenance_vectors_remaining lists probes recovery_action";
 
 #[test]
 fn vector_inspection_prints_one_field_to_a_line() {
     let dir = folder("vector-inspection-prints");
     let store = dir.join("store");
     let more = "CREATE TABLE other (id INTEGER PRIMARY KEY, w VECTOR(2));\n";
-    let made = shell(&dir, &[arg(&store), "--write"], format!("{KINDS}{more}"));
+    let made = run_write(&dir, &store, format!("{KINDS}{more}"));
     assert_eq!(made.code, Some(0), "{}", made.stderr);
 
     // Each statement with the fields it prints and, for each row, the values of three of them.
@@ -1154,17 +1132,18 @@ fn vector_inspection_prints_one_field_to_a_line() {
         ["other", "w", "{}"],
     ];
     let cases = [
-        ("SHOW VECTOR_INDEXES;\n", &INDEX_FIELDS[..], &indexes[..]),
+        ("SHOW VECTOR_INDEXES;\n", INDEX_FIELDS, &indexes[..]),
         (
             "SHOW VECTOR_PARTITIONS;\n",
-            &PARTITION_FIELDS[..],
+            PARTITION_FIELDS,
             &partitions[..],
         ),
     ];
     for (statement, fields, rows) in cases {
+        let fields: Vec<&str> = fields.split(' ').collect();
         // For a person: rows with an empty line between them, each `name: value` lines in the
         // statement's order, and no line too long for a terminal.
-        let run = shell(&dir, &[arg(&store)], statement);
+        let run = run_read(&dir, &store, statement);
         assert_eq!(run.code, Some(0), "{}", run.stderr);
         assert!(
             run.stdout.lines().all(|line| line.chars().count() <= 120),
@@ -1194,7 +1173,7 @@ fn vector_inspection_prints_one_field_to_a_line() {
         }
 
         // For a program: the usual result document, its columns the same names.
-        let run = shell(&dir, &[arg(&store), "--json"], statement);
+        let run = run_json(&dir, &store, statement);
         assert_eq!(run.code, Some(0), "{}", run.stderr);
         let results = documents(&run.stdout);
         assert_eq!(results.len(), 1, "{}", run.stdout);
@@ -1209,7 +1188,7 @@ fn vector_inspection_prints_one_field_to_a_line() {
 fn explain_prints_how_each_partition_is_searched() {
     let dir = folder("explain-prints");
     let store = dir.join("store");
-    let made = shell(&dir, &[arg(&store), "--write"], KINDS);
+    let made = run_write(&dir, &store, KINDS);
     assert_eq!(made.code, Some(0), "{}", made.stderr);
 
     // Four vectors in two partitions, far below the 100,000 from which AUTO uses a grouping,
@@ -1219,7 +1198,7 @@ fn explain_prints_how_each_partition_is_searched() {
     let lines = [
         "requested_mode: AUTO",
         "resolved_mode: EXACT",
-        "effective_auto_index_at: 100000",
+        "effective_indexing_threshold: 100000",
         "aggregate_allowed_vectors: 4",
         r#"partition_key_columns: ["kind"]"#,
         "partitions: 2",
@@ -1228,13 +1207,13 @@ fn explain_prints_how_each_partition_is_searched() {
         "  lists: *",
         "  probes: *",
         "  live_rows: 2",
-        "  outside_grouping: 2",
+        "  unindexed_rows: 2",
         r#"partition: {"kind":"b"}"#,
         "  route: exact",
         "  lists: *",
         "  probes: *",
         "  live_rows: 2",
-        "  outside_grouping: 2",
+        "  unindexed_rows: 2",
         "refusal: none",
     ];
     let same = |printed: &[&str]| {
@@ -1248,7 +1227,7 @@ fn explain_prints_how_each_partition_is_searched() {
     let search = ".explain SELECT id FROM notes ORDER BY v <=> '[1,0,0]' LIMIT 3\n";
 
     // The lines and nothing else: the search is not run, so no table of rows is printed.
-    let run = shell(&dir, &[arg(&store)], search);
+    let run = run_read(&dir, &store, search);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert!(
         same(&run.stdout.lines().collect::<Vec<_>>()),
@@ -1256,10 +1235,10 @@ fn explain_prints_how_each_partition_is_searched() {
         run.stdout
     );
 
-    // Any other statement is refused in one line, and the session goes on to the next.
-    let other = ".explain SELECT id FROM notes ORDER BY id\n";
+    // A statement that reads no stored table is refused in one line; the session goes on.
+    let other = ".explain SELECT 1\n";
     let next = "SELECT id FROM notes WHERE id = 5;\n";
-    let run = shell(&dir, &[arg(&store)], format!("{other}{next}"));
+    let run = run_read(&dir, &store, format!("{other}{next}"));
     assert_eq!(run.code, Some(1), "{}", run.stderr);
     let refusals: Vec<&str> = run.stderr.lines().collect();
     assert_eq!(refusals.len(), 1, "{}", run.stderr);
@@ -1274,7 +1253,7 @@ fn explain_prints_how_each_partition_is_searched() {
     assert_eq!(tables(&run.stdout), [[["id"], ["5"]]], "{}", run.stdout);
 
     // For a program: one document that holds the same lines.
-    let run = shell(&dir, &[arg(&store), "--json"], search);
+    let run = run_json(&dir, &store, search);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     let results = documents(&run.stdout);
     assert_eq!(results.len(), 1, "{}", run.stdout);
@@ -1288,66 +1267,91 @@ fn explain_prints_how_each_partition_is_searched() {
 }
 
 #[test]
-fn help_lists_explain() {
-    let dir = folder("help-lists-explain");
+fn explain_prints_the_path_of_a_statement_and_runs_nothing() {
+    let dir = folder("explain-prints-the-path");
     let store = dir.join("store");
-    let made = shell(&dir, &[arg(&store), "--write"], CREATE_NOTES);
+    let declare = "\
+CREATE TABLE notes (id INTEGER PRIMARY KEY, tag TEXT);
+CREATE INDEX notes_tag ON notes (tag);
+INSERT INTO notes (id, tag) VALUES (1, 'a'), (2, 'b');
+";
+    let made = run_write(&dir, &store, declare);
     assert_eq!(made.code, Some(0), "{}", made.stderr);
-    let run = shell(&dir, &[arg(&store)], ".help\n");
-    assert_eq!(run.code, Some(0), "{}", run.stderr);
+
+    // The path of a read, in the words the library documents.
+    let read = run_read(
+        &dir,
+        &store,
+        ".explain SELECT id FROM notes WHERE tag = 'a'\n",
+    );
+    assert_eq!(read.code, Some(0), "{}", read.stderr);
+    assert_eq!(read.errors(), Vec::<&str>::new());
+    for words in ["IndexScan { index: notes_tag }", "predicates_pushed: [tag]"] {
+        assert!(
+            read.stdout.contains(words),
+            "no `{words}` in:\n{}",
+            read.stdout
+        );
+    }
+
+    // The path of a write is printed and the write is not made, in a session that may write.
+    let asked = run_write(
+        &dir,
+        &store,
+        ".explain DELETE FROM notes WHERE id = 1\nSELECT COUNT(*) AS n FROM notes;\n",
+    );
+    assert_eq!(asked.code, Some(0), "{}", asked.stderr);
+    assert_eq!(asked.errors(), Vec::<&str>::new());
     assert!(
-        run.stdout.lines().any(|line| line.starts_with(".explain")),
+        asked.stdout.contains("IndexScan { index: __pk_id }"),
         "{}",
-        run.stdout
+        asked.stdout
+    );
+    let counted = tables(&asked.stdout);
+    let count = counted.last().expect("the count is printed");
+    assert_eq!(count.last().unwrap(), &["2"], "{}", asked.stdout);
+
+    // The command is listed in the help.
+    let help = run_read(&dir, &store, ".help\n");
+    assert!(
+        help.stdout.lines().any(|line| line.starts_with(".explain")),
+        "{}",
+        help.stdout
     );
 }
 
 #[test]
-fn a_read_shell_searches_while_a_writer_holds_the_store() {
-    let dir = folder("a-read-shell-searches-while-a-writer-holds");
+fn a_cell_70000_characters_wide_is_printed_without_a_panic() {
+    let dir = folder("a-cell-70000-characters-wide");
     let store = dir.join("store");
 
-    // This test is the writer, and holds the store until the end. From [1, 0, 0] row 1 is at
-    // distance 1 and row 2 at 2.
+    // This test is the writer, and holds the store until the end; the shell reads beside it.
     let writer = Database::open(&store).unwrap();
-    for sql in [
-        "CREATE TABLE passages (id INTEGER PRIMARY KEY, embedding VECTOR(3))",
-        "INSERT INTO passages (id, embedding) VALUES (1, [0.0, 1.0, 0.0]), (2, [-1.0, 0.0, 0.0])",
-    ] {
-        writer.execute(sql, &params! {}).unwrap();
-    }
-    let search = "SELECT id, embedding <=> [1.0, 0.0, 0.0] AS distance FROM passages \
-                  ORDER BY distance LIMIT 2;\n";
-
-    // The store really is held: a second writer is refused, naming this process.
-    let second = shell(&dir, &[arg(&store), "--write"], search);
-    assert_eq!(second.code, Some(1), "{}", second.stderr);
-    assert!(
-        second.stderr.contains(&std::process::id().to_string()),
-        "{}",
-        second.stderr
-    );
-
-    // A read shell needs nothing from the writer: it searches and gets the rows.
-    let run = shell(&dir, &[arg(&store)], search);
-    assert_eq!(run.code, Some(0), "{}", run.stderr);
-    let printed = tables(&run.stdout);
-    assert_eq!(printed.len(), 1, "{}", run.stdout);
-    assert_eq!(nearest(&printed[0]), [(1, 1.0), (2, 2.0)], "{}", run.stdout);
-
-    // The writer was not held up by it, and the next read shell searches its next commit, in
-    // which row 3 is the nearest.
     writer
         .execute(
-            "INSERT INTO passages (id, embedding) VALUES (3, [1.0, 0.0, 0.0])",
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
             &params! {},
         )
         .unwrap();
-    let run = shell(&dir, &[arg(&store)], search);
-    assert_eq!(run.code, Some(0), "{}", run.stderr);
-    let printed = tables(&run.stdout);
-    assert_eq!(printed.len(), 1, "{}", run.stdout);
-    assert_eq!(nearest(&printed[0]), [(3, 0.0), (1, 1.0)], "{}", run.stdout);
+    writer
+        .execute(
+            "INSERT INTO notes (id, body) VALUES ($id, $body)",
+            &params! { "id" => 4_242_421_i64, "body" => "x".repeat(70_000) },
+        )
+        .unwrap();
 
-    writer.close().unwrap();
+    // `shell` itself fails the test on a panic; a panic also ends the program with 101.
+    let run = run_read(&dir, &store, SELECT_NOTES);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.errors(), Vec::<&str>::new());
+    // The row is printed: its other cell is there, however the wide one is shown.
+    assert!(
+        run.stdout.contains("4242421"),
+        "the row's id is not in the {} bytes printed",
+        run.stdout.len()
+    );
+    assert!(
+        run.stdout.contains("(1 row)"),
+        "no count of rows is printed"
+    );
 }

@@ -1,5 +1,5 @@
 //! The index of a VECTOR column: a partition of a column that is large enough is cut into
-//! groups, and a search under INDEXED, or under AUTO from `AUTO_INDEX_AT` vectors on, looks at
+//! groups, and a search under INDEXED, or under AUTO from `INDEXING_THRESHOLD` vectors on, looks at
 //! the nearest groups first. Every row it returns has its true distance; a column below its
 //! size is searched whole and pays nothing; and INDEXED is refused by name where the index
 //! cannot serve the statement.
@@ -8,6 +8,7 @@ mod support;
 
 use std::collections::BTreeSet;
 use std::io;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -18,7 +19,7 @@ use contextdb::{
 const DIMENSION: usize = 16;
 
 /// The clause under which a partition of 2,000 rows is cut into groups.
-const GROUPED: &str = "AUTO_INDEX_AT 1000";
+const GROUPED: &str = "INDEXING_THRESHOLD 1000";
 
 /// Question `j`: a vector near one of the eight directions the rows are scattered around.
 fn question(j: i64) -> Vec<f32> {
@@ -69,23 +70,17 @@ fn an_indexed_search_reads_sketches_before_blocks() {
     const ROWS: i64 = 256;
     let folder = support::folder("indexed-reads-sketches");
     let db = support::open(&folder);
-    support::declare_docs(&db, WIDE, "AUTO_INDEX_AT 256");
+    support::declare_docs(&db, WIDE, "INDEXING_THRESHOLD 256");
     support::load_docs(&db, 1..=ROWS, "a", |n| support::ringed(n, ROWS, WIDE));
     support::upkeep(&db);
     assert_eq!(lists(&support::the_partition(&db)), Value::Int64(16));
     support::close(db);
 
-    // Each search runs first in a session of its own, so every page it needs is read once.
     let query = support::ringed(157, 2 * ROWS, WIDE);
     let read_by = |mode: &str| -> u64 {
-        let (door, bytes) = support::counting_bytes_read();
-        let mut options = ReadSessionOptions::default();
-        options.storage = Some(door);
-        let reader = ReadSession::open_with_options(&folder, options).expect("open for reading");
-        let opened = bytes.load(Ordering::SeqCst);
-        let result = support::answer(&reader, &support::by_mode(None, mode, 10), &query);
-        assert_eq!(result.rows().len(), 10, "rows under {mode}");
-        bytes.load(Ordering::SeqCst) - opened
+        let (bytes, result) = read_alone(&folder, &support::by_mode(None, mode, 10), &query);
+        assert_eq!(result.expect(mode).rows().len(), 10, "rows under {mode}");
+        bytes
     };
     // EXACT reads every block. INDEXED reads what EXACT does not, the centres and the
     // sketches, and still reads less: it left blocks unread.
@@ -211,12 +206,12 @@ fn refused_whole_while_one_partition_is_behind(name: &str, clauses: &str, indexe
 fn indexed_is_refused_whole_when_one_partition_is_behind() {
     refused_whole_while_one_partition_is_behind(
         "behind-use-vector",
-        "PARTITION_KEY (ctx) AUTO_INDEX_AT 1000",
+        "PARTITION_KEY (ctx) INDEXING_THRESHOLD 1000",
         "INDEXED",
     );
     refused_whole_while_one_partition_is_behind(
         "behind-declared",
-        "PARTITION_KEY (ctx) SEARCH_MODE INDEXED AUTO_INDEX_AT 1000",
+        "PARTITION_KEY (ctx) SEARCH_MODE INDEXED INDEXING_THRESHOLD 1000",
         "",
     );
 }
@@ -231,10 +226,10 @@ fn auto_and_exact(
 }
 
 #[test]
-fn auto_uses_groupings_from_auto_index_at_on() {
-    // Two built partitions of 1,200 under AUTO_INDEX_AT 2000: the count is over the selected
+fn auto_uses_groupings_from_indexing_threshold_on() {
+    // Two built partitions of 1,200 under INDEXING_THRESHOLD 2000: the count is over the selected
     // partitions together.
-    let clauses = "PARTITION_KEY (ctx) AUTO_INDEX_AT 2000";
+    let clauses = "PARTITION_KEY (ctx) INDEXING_THRESHOLD 2000";
     let (_, db) = support::built("auto-threshold", DIMENSION, clauses, 1200);
     support::load_docs(&db, 1201..=2400, "b", gathered);
     support::upkeep(&db);
@@ -261,12 +256,12 @@ fn auto_uses_groupings_from_auto_index_at_on() {
     );
 
     // A column below its declared size stays ungrouped however many cycles run: 1,000 rows
-    // under AUTO_INDEX_AT 50000 are not 50,000, though one partition holds a hundredth of it.
+    // under INDEXING_THRESHOLD 50000 are not 50,000, though one partition holds a hundredth of it.
     let index_bytes = |db: &contextdb::Database| {
         let index = support::shown(db, "SHOW VECTOR_INDEXES").remove(0);
         support::whole(&index, "durable_index_bytes")
     };
-    let clauses = "PARTITION_KEY (ctx) AUTO_INDEX_AT 50000";
+    let clauses = "PARTITION_KEY (ctx) INDEXING_THRESHOLD 50000";
     let (_, db) = support::built("auto-below-declared", DIMENSION, clauses, 400);
     support::load_docs(&db, 401..=1000, "b", gathered);
     for _ in 0..3 {
@@ -279,15 +274,18 @@ fn auto_uses_groupings_from_auto_index_at_on() {
     assert_eq!(grouped, [Value::Null, Value::Null]);
     assert_eq!(index_bytes(&db), 0);
 
-    // With no AUTO_INDEX_AT the number in force is 100,000: a partition of 1,200 stays
+    // With no INDEXING_THRESHOLD the number in force is 100,000: a partition of 1,200 stays
     // ungrouped, and AUTO over it is EXACT.
     let (_, db) = support::built("auto-undeclared", DIMENSION, "", 1200);
     let index = support::shown(&db, "SHOW VECTOR_INDEXES").remove(0);
     assert_eq!(
-        support::field(&index, "declared_auto_index_at"),
+        support::field(&index, "declared_indexing_threshold"),
         &Value::Null
     );
-    assert_eq!(support::whole(&index, "effective_auto_index_at"), 100_000);
+    assert_eq!(
+        support::whole(&index, "effective_indexing_threshold"),
+        100_000
+    );
     assert_eq!(lists(&support::the_partition(&db)), Value::Null);
     assert_eq!(index_bytes(&db), 0);
     let [auto, exact] = auto_and_exact(&db, None, &query);
@@ -300,7 +298,7 @@ fn auto_uses_groupings_from_auto_index_at_on() {
 
 #[test]
 fn auto_searches_each_partition_by_what_its_grouping_saves() {
-    let clauses = "PARTITION_KEY (ctx) AUTO_INDEX_AT 1000";
+    let clauses = "PARTITION_KEY (ctx) INDEXING_THRESHOLD 1000";
     let (_, db) = support::built("auto-each-partition", DIMENSION, clauses, 2000);
     // Five pending rows under another context, nearer the question than any row of the first.
     let query = question(3);
@@ -447,7 +445,7 @@ fn a_search_with_a_filter_on_rows_widens_until_it_is_whole() {
     let every = search(&db, None, "INDEXED", 5000).expect("every row");
     support::assert_sound(&every, &stored, all, &query, 2000, "a LIMIT above the rows");
 
-    let clauses = "SEARCH_MODE INDEXED AUTO_INDEX_AT 1000";
+    let clauses = "SEARCH_MODE INDEXED INDEXING_THRESHOLD 1000";
     let (_, declared) = support::built("filter-widens-declared", DIMENSION, clauses, 2000);
     support::assert_indexed_refused(search(&declared, few, "", 10), "SEARCH_MODE INDEXED");
 }
@@ -545,7 +543,7 @@ fn an_indexed_search_short_of_its_limit_is_refused_before_the_whole_table_is_rea
     const ROWS: i64 = 256;
     let folder = support::folder("indexed-refused-before-the-table");
     let db = support::open(&folder);
-    support::declare_docs(&db, WIDE, "AUTO_INDEX_AT 256");
+    support::declare_docs(&db, WIDE, "INDEXING_THRESHOLD 256");
     support::load_docs(&db, 1..=ROWS, "a", |n| support::ringed(n, ROWS, WIDE));
     support::upkeep(&db);
     assert_eq!(lists(&support::the_partition(&db)), Value::Int64(16));
@@ -558,16 +556,7 @@ fn an_indexed_search_short_of_its_limit_is_refused_before_the_whole_table_is_rea
     let query = support::ringed(157, 2 * ROWS, WIDE);
     let wanted = stored.nearest(passes, &query, 10);
     assert_eq!(wanted.len(), 3);
-    // Each search runs first in a session of its own, so every page it needs is read once.
-    let read_by = |mode: &str| -> (u64, contextdb::Result<QueryResult>) {
-        let (door, bytes) = support::counting_bytes_read();
-        let mut options = ReadSessionOptions::default();
-        options.storage = Some(door);
-        let reader = ReadSession::open_with_options(&folder, options).expect("open for reading");
-        let opened = bytes.load(Ordering::SeqCst);
-        let outcome = support::search(&reader, &support::by_mode(few, mode, 10), &query);
-        (bytes.load(Ordering::SeqCst) - opened, outcome)
-    };
+    let read_by = |mode: &str| read_alone(&folder, &support::by_mode(few, mode, 10), &query);
     // AUTO asks the filter of every row, which is the whole table's work, and answers.
     let (whole, auto) = read_by("AUTO");
     let auto = auto.expect("AUTO, three rows pass");
@@ -584,6 +573,18 @@ fn an_indexed_search_short_of_its_limit_is_refused_before_the_whole_table_is_rea
         "INDEXED was refused after reading {refused} bytes of the data file; AUTO, which asks \
          the filter of all {ROWS} rows, read {whole}"
     );
+}
+
+/// Runs a search in a read session of its own, so every page it needs is read once, and gives
+/// the bytes of the data file it read and its answer.
+fn read_alone(folder: &Path, sql: &str, query: &[f32]) -> (u64, contextdb::Result<QueryResult>) {
+    let (door, bytes) = support::counting_bytes_read();
+    let mut options = ReadSessionOptions::default();
+    options.storage = Some(door);
+    let reader = ReadSession::open_with_options(folder, options).expect("open for reading");
+    let opened = bytes.load(Ordering::SeqCst);
+    let outcome = support::search(&reader, sql, query);
+    (bytes.load(Ordering::SeqCst) - opened, outcome)
 }
 
 /// One store of [`a_nearer_allowed_row_in_a_group_taken_later_is_in_the_answer`], with row
@@ -714,7 +715,7 @@ fn a_search_with_no_room_for_its_sketches_is_refused_by_the_memory_limit() {
 
 #[test]
 fn a_filter_of_partition_keys_only_is_no_filter_on_rows() {
-    let clauses = "PARTITION_KEY (ctx) AUTO_INDEX_AT 1000";
+    let clauses = "PARTITION_KEY (ctx) INDEXING_THRESHOLD 1000";
     let (_, db) = support::built("keys-only-filter", DIMENSION, clauses, 2000);
     support::load_docs(&db, 2001..=2005, "b", gathered);
     support::upkeep(&db);
@@ -798,17 +799,8 @@ fn an_indexed_search_whose_first_pass_takes_every_slot_is_refused_before_a_row_i
     support::close(db);
 
     let query = support::vector(2, WIDE);
-    // Each search runs first in a session of its own, so every page it needs is read once.
-    let read_by = |mode: &str| -> (u64, contextdb::Result<QueryResult>) {
-        let (door, bytes) = support::counting_bytes_read();
-        let mut options = ReadSessionOptions::default();
-        options.storage = Some(door);
-        let reader = ReadSession::open_with_options(&folder, options).expect("open for reading");
-        let opened = bytes.load(Ordering::SeqCst);
-        let sql = support::by_mode(Some("tag = 1"), mode, 2);
-        let outcome = support::search(&reader, &sql, &query);
-        (bytes.load(Ordering::SeqCst) - opened, outcome)
-    };
+    let read_by =
+        |mode: &str| read_alone(&folder, &support::by_mode(Some("tag = 1"), mode, 2), &query);
     let vector_bytes = 4 * WIDE as u64;
     let (asked, exact) = read_by("EXACT");
     assert_eq!(exact.expect("EXACT, one row passes").rows().len(), 1);

@@ -23,7 +23,7 @@ const HELP: [&str; 8] = [
     "BEGIN; ... COMMIT;  Run statements as one transaction; ROLLBACK; undoes them, except SET MEMORY_LIMIT. Needs --write.",
     ".tables   \\dt       List the tables.",
     ".schema <table>   \\d <table>   Show a table's declaration as SQL.",
-    ".explain <sql>      Show how a similarity search would be answered, without running it.",
+    ".explain <sql>      Show the path a statement would take, without running it.",
     "SHOW VECTOR_INDEXES; SHOW VECTOR_PARTITIONS;   Describe the VECTOR columns and their partitions.",
     ".help     \\?        Show this list.",
     ".quit     \\q        End the session.",

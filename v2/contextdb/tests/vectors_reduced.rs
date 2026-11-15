@@ -114,7 +114,10 @@ fn a_reduced_column_is_grouped_and_searched_as_any_other() {
     assert_eq!(support::upkeep(&db).0, 16, "the cycles of a build of 2,000");
     let index = support::shown(&db, "SHOW VECTOR_INDEXES").remove(0);
     assert_eq!(support::word(&index, "quantization"), "SQ8");
-    assert_eq!(support::whole(&index, "effective_auto_index_at"), 100_000);
+    assert_eq!(
+        support::whole(&index, "effective_indexing_threshold"),
+        100_000
+    );
     assert_eq!(
         support::field(&support::the_partition(&db), "lists"),
         &Value::Int64(45)

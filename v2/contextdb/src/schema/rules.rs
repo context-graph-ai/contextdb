@@ -73,7 +73,7 @@ pub(super) fn position(table: &str, meta: &TableMeta, name: &str) -> Result<usiz
 }
 
 /// Whether the index is one behind a key or a UNIQUE rule.
-fn is_rule(index: &crate::types::IndexDecl) -> bool {
+pub(super) fn is_rule(index: &crate::types::IndexDecl) -> bool {
     index.name.starts_with("__pk_") || index.name.starts_with("__unique_")
 }
 
@@ -92,12 +92,17 @@ pub(super) fn of(
         Some(SyncDirection::Off | SyncDirection::PullOnly)
     );
     let current = meta.history == Some(History::CurrentOnly);
+    let state = meta.state_machine.as_ref().map(|machine| &machine.column);
+    let mut fixed = create.columns.iter().filter(|c| c.immutable);
     let refused = if meta.immutable && current {
         "IMMUTABLE with HISTORY CURRENT ONLY: an IMMUTABLE table has no older version to drop, \
          so leave one of the two out"
     } else if meta.immutable && meta.retain.is_some() {
         "IMMUTABLE with RETAIN: an IMMUTABLE table has no row to expire, so leave one of the two \
          out"
+    } else if state.is_some() && (meta.immutable || fixed.any(|c| Some(&c.name) == state)) {
+        "a STATE MACHINE over a state that is IMMUTABLE: a state that is never changed has no \
+         next state, so leave one of the two out"
     } else if current && delivers && meta.conflict != Some(ConflictPolicy::KeepLatest) {
         "HISTORY CURRENT ONLY on a table that sends its rows out and keeps the first write: \
          another machine would take a newest value as the first, so write SYNC CONFLICT KEEP \

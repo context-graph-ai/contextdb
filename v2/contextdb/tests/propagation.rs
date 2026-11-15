@@ -172,16 +172,15 @@ fn an_aborting_propagation_names_its_table_and_undoes_its_statement_and_no_other
     assert_eq!(statuses(&db, "tasks"), wanted);
 }
 
+const EDGES: &str = "CREATE TABLE edges (id INTEGER PRIMARY KEY, source_id UUID NOT NULL, \
+                     target_id UUID NOT NULL, edge_type TEXT NOT NULL)";
+
 /// Declares `claims`, whose rows follow each other into `invalidated` along incoming `CITES`
 /// edges, with this `clause` after the declaration, and the edge table beside it. Claim `n`
 /// has the id `Uuid::from_u128(n)`.
 fn store_of_claims(name: &str, claims: u128, clause: &str) -> Database {
     let db = support::open(&support::folder(name));
-    support::run(
-        &db,
-        "CREATE TABLE edges (id INTEGER PRIMARY KEY, source_id UUID NOT NULL, \
-         target_id UUID NOT NULL, edge_type TEXT NOT NULL)",
-    );
+    support::run(&db, EDGES);
     support::run(
         &db,
         &format!(
@@ -252,11 +251,7 @@ fn node(n: u128) -> Uuid {
 /// `rules` after its columns.
 fn store_of_nodes(name: &str, rules: &str, first: &str, count: u128) -> Database {
     let db = support::open(&support::folder(name));
-    support::run(
-        &db,
-        "CREATE TABLE edges (id INTEGER PRIMARY KEY, source_id UUID NOT NULL, \
-         target_id UUID NOT NULL, edge_type TEXT NOT NULL)",
-    );
+    support::run(&db, EDGES);
     support::run(
         &db,
         &format!(

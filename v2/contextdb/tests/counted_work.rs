@@ -22,10 +22,7 @@ fn store(name: &str) -> (PathBuf, Database) {
         "CREATE TABLE events (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, seq INTEGER NOT NULL, \
          note TEXT)",
     );
-    support::run(
-        &db,
-        "CREATE INDEX events_kind_seq ON events (kind ASC, seq DESC)",
-    );
+    support::run(&db, support::EVENTS_INDEX);
     let tx = db.transaction().expect("begin");
     support::insert(&tx, 1..=1000);
     for n in 1..=1000_i64 {
@@ -87,6 +84,10 @@ fn a_lookup_by_primary_key_reads_one_row() {
     let missing = support::run(&db, "SELECT id, name, tag FROM t WHERE id = 5000");
     assert!(missing.rows().is_empty());
     assert_eq!(missing.rows_examined(), 0);
+    let sql = "SELECT id FROM t WHERE id IN (SELECT id FROM events WHERE id = 5)";
+    let found = support::run(&db, sql);
+    assert_eq!(found.rows(), [[Value::Int64(5)]]);
+    assert_eq!(found.rows_examined(), 2, "a key from a SELECT");
 }
 
 #[test]

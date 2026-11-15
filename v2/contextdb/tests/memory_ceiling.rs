@@ -18,7 +18,7 @@ use std::fs;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use contextdb::{
-    Database, DatabaseOpenOptions, Error, ReadSession, ReadSessionOptions, Value, params,
+    Database, DatabaseOpenOptions, Error, ReadSession, ReadSessionOptions, Uuid, Value, params,
 };
 
 const LIMIT: usize = 64 << 20;
@@ -179,6 +179,16 @@ fn load_and_scan(role: support::Role) {
     assert_eq!(support::int(&db, "SELECT COUNT(name) FROM t"), ROWS);
     support::say("scanned names");
     assert_eq!(support::int(&db, "SELECT SUM(tag) FROM t"), ROWS / 10 * 45);
+    // A filtered sum takes each row that passes once (CDB-330): tags 0 to 2 of every ten rows,
+    // and the tags of the half of the rows whose name sorts after row 500000.
+    assert_eq!(
+        support::int(&db, "SELECT SUM(tag) FROM t WHERE tag < 3"),
+        ROWS / 10 * 3
+    );
+    assert_eq!(
+        support::int(&db, "SELECT SUM(tag) FROM t WHERE name > 'row-0500000'"),
+        ROWS / 20 * 45
+    );
     support::say("scanned tags");
     // And one page from the far end of the table, each row whole.
     let last_page = db
@@ -587,7 +597,7 @@ fn an_indexed_search_and_a_build_stay_under_the_limit() {
     let folder = support::folder("build-under-the-limit");
     let db = support::open(&folder);
     write_the_filler(&db);
-    support::declare_docs(&db, 64, "AUTO_INDEX_AT 1000");
+    support::declare_docs(&db, 64, "INDEXING_THRESHOLD 1000");
     support::load_docs(&db, 1..=1100, "a", |n| support::gathered(n, 64));
     support::close(db);
 
@@ -689,4 +699,81 @@ fn a_build_under_the_limit(role: &support::Role) {
     support::close(db);
     support::say(format!("before {before}"));
     support::say(format!("peak {}", ALLOCATED.peak.load(Ordering::Relaxed)));
+}
+
+// ---- one more edge from a node that has many ----
+
+const EDGES_FROM_ONE_NODE: i64 = 20_000;
+
+/// The bytes a walk over this node's edges would hold at the least: a node id and its place in
+/// the walk, 40 bytes each, for each edge. One edge written beside them must take far less.
+const A_WALK_OVER_THEM: u64 = EDGES_FROM_ONE_NODE as u64 * 40;
+
+#[test]
+fn one_more_edge_from_a_node_with_many_edges_reads_none_of_them() {
+    if let Some(role) = support::role() {
+        return one_more_edge(&role);
+    }
+    let folder = support::folder("edges-from-one-node");
+    let db = support::open(&folder);
+    support::run(
+        &db,
+        "CREATE TABLE edges (id INTEGER PRIMARY KEY, source_id UUID NOT NULL, \
+         target_id UUID NOT NULL, edge_type TEXT NOT NULL) DAG('E')",
+    );
+    let tx = db.transaction().expect("begin");
+    for id in 1..=EDGES_FROM_ONE_NODE {
+        let values = params! { "id" => id, "to" => Uuid::from_u128(id as u128 + 1) };
+        tx.execute(
+            "INSERT INTO edges (id, source_id, target_id, edge_type) \
+             VALUES ($id, '00000000-0000-0000-0000-000000000001', $to, 'E')",
+            &values,
+        )
+        .expect("an edge from the one node");
+    }
+    tx.commit().expect("commit the edges");
+    support::close(db);
+
+    let lines = support::Child::start(
+        "one_more_edge_from_a_node_with_many_edges_reads_none_of_them",
+        "edge",
+        &folder,
+    )
+    .end();
+    assert!(
+        lines.iter().any(|line| line == "accepted"),
+        "the edge was not accepted: {lines:?}"
+    );
+    let taken = support::last_number(&lines, "taken").expect("the child announces it");
+    assert!(
+        taken < A_WALK_OVER_THEM / 2,
+        "one edge from a node with {EDGES_FROM_ONE_NODE} edges took {taken} bytes, as much as a \
+         walk over the node's edges ({A_WALK_OVER_THEM}): writing an edge reads the other edges \
+         of its source, so what it costs grows with how many there are"
+    );
+}
+
+/// Opens the store, writes one more edge from the node, and announces `accepted` and
+/// `taken <bytes>`, the most the process held above what it held before the edge.
+fn one_more_edge(role: &support::Role) {
+    let mut options = DatabaseOpenOptions::default();
+    options.memory_limit = Some(BUILD_LIMIT);
+    let db = support::open_with(&role.folder, options).expect("open the store under the limit");
+    let before = ALLOCATED.now.load(Ordering::Relaxed);
+    ALLOCATED.peak.store(before, Ordering::Relaxed);
+    let values = params! {
+        "id" => EDGES_FROM_ONE_NODE + 1,
+        "to" => Uuid::from_u128(EDGES_FROM_ONE_NODE as u128 + 10)
+    };
+    match db.execute(
+        "INSERT INTO edges (id, source_id, target_id, edge_type) \
+         VALUES ($id, '00000000-0000-0000-0000-000000000001', $to, 'E')",
+        &values,
+    ) {
+        Ok(_) => support::say("accepted"),
+        Err(error) => support::say(format!("refused {error:?}")),
+    }
+    let peak = ALLOCATED.peak.load(Ordering::Relaxed);
+    support::say(format!("taken {}", peak - before));
+    support::close(db);
 }

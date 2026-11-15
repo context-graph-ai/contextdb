@@ -256,13 +256,13 @@ pub(super) fn table_option(part: Pair<'_>, options: &mut TableOptions) -> Result
     Ok(())
 }
 
-/// `CONSOLIDATION NONE` or `CONSOLIDATION (...)`, which is NONE when it has no member.
-pub(super) fn consolidation(clause: Pair<'_>) -> ConsolidationClause {
+/// `COMPACTION NONE` or `COMPACTION (...)`, which is NONE when it has no member.
+pub(super) fn compaction(clause: Pair<'_>) -> CompactionClause {
     let member = |rule| child(clause.clone(), rule).and_then(signed);
     let [change, tombstone] = [Rule::change_percent, Rule::tombstone_percent].map(member);
     match (change, tombstone) {
-        (None, None) => ConsolidationClause::None,
-        (change, tombstone) => ConsolidationClause::Percent { change, tombstone },
+        (None, None) => CompactionClause::None,
+        (change, tombstone) => CompactionClause::Percent { change, tombstone },
     }
 }
 
@@ -285,9 +285,9 @@ pub(super) fn column_def(pair: Pair<'_>) -> Result<ColumnDef> {
                     Rule::partition_key => vector.partition_key = idents(clause),
                     Rule::max_partitions => vector.max_partitions = signed(clause),
                     Rule::search_mode => vector.search_mode = Some(search_mode(&clause)),
-                    Rule::auto_index_at => vector.auto_index_at = signed(clause),
-                    // The one clause left: CONSOLIDATION.
-                    _ => vector.consolidation = Some(consolidation(clause)),
+                    Rule::indexing_threshold => vector.indexing_threshold = signed(clause),
+                    // The one clause left: COMPACTION.
+                    _ => vector.compaction = Some(compaction(clause)),
                 }
             }
             DataType::Vector(number::<u32>(&dimension, "the VECTOR dimension")? as usize)

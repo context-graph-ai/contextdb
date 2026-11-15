@@ -261,35 +261,35 @@ error: ColumnNotFound
 # The thresholds of the search index are changed online, and the next search and upkeep cycle
 # read them: the declaration says what was written and what is in force, and DEFAULT takes the
 # declaration away.
-ALTER TABLE docs ALTER COLUMN v SET AUTO_INDEX_AT 5000;
-ALTER TABLE docs ALTER COLUMN v SET CONSOLIDATION (CHANGE_PERCENT = 30, TOMBSTONE_PERCENT = 5);
+ALTER TABLE docs ALTER COLUMN v SET INDEXING_THRESHOLD 5000;
+ALTER TABLE docs ALTER COLUMN v SET COMPACTION (CHANGE_PERCENT = 30, TOMBSTONE_PERCENT = 5);
 SHOW VECTOR_INDEXES;
 ----
-table | column | dimension | quantization | vector_count | bytes | partition_key_columns | max_partitions | live_partitions | search_mode | declared_auto_index_at | effective_auto_index_at | declared_consolidation_mode | declared_consolidation_change_percent | declared_consolidation_tombstone_percent | effective_consolidation_mode | effective_consolidation_change_percent | effective_consolidation_tombstone_percent | pending_inserts | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | maintenance_state | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | unavailable_partitions | stalled_partitions | broad_route | recovery_action
+table | column | dimension | quantization | vector_count | bytes | partition_key_columns | max_partitions | live_partitions | search_mode | declared_indexing_threshold | effective_indexing_threshold | declared_compaction_mode | declared_compaction_change_percent | declared_compaction_tombstone_percent | effective_compaction_mode | effective_compaction_change_percent | effective_compaction_tombstone_percent | pending_tuples | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | maintenance_state | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | unavailable_partitions | stalled_partitions | broad_route | recovery_action
 docs | loose | * | * | * | * | * | * | * | * | NULL | 100000 | NULL | NULL | NULL | PERCENT | 20 | 10 | * | * | * | * | * | * | * | * | * | * | * | * | *
 docs | v | * | * | * | * | * | * | * | * | 5000 | 5000 | PERCENT | 30 | 5 | PERCENT | 30 | 5 | * | * | * | * | * | * | * | * | * | * | * | * | *
 
-ALTER TABLE docs ALTER COLUMN v SET AUTO_INDEX_AT DEFAULT;
-ALTER TABLE docs ALTER COLUMN v SET CONSOLIDATION NONE;
+ALTER TABLE docs ALTER COLUMN v SET INDEXING_THRESHOLD DEFAULT;
+ALTER TABLE docs ALTER COLUMN v SET COMPACTION NONE;
 SHOW VECTOR_INDEXES;
 ----
-table | column | dimension | quantization | vector_count | bytes | partition_key_columns | max_partitions | live_partitions | search_mode | declared_auto_index_at | effective_auto_index_at | declared_consolidation_mode | declared_consolidation_change_percent | declared_consolidation_tombstone_percent | effective_consolidation_mode | effective_consolidation_change_percent | effective_consolidation_tombstone_percent | pending_inserts | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | maintenance_state | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | unavailable_partitions | stalled_partitions | broad_route | recovery_action
+table | column | dimension | quantization | vector_count | bytes | partition_key_columns | max_partitions | live_partitions | search_mode | declared_indexing_threshold | effective_indexing_threshold | declared_compaction_mode | declared_compaction_change_percent | declared_compaction_tombstone_percent | effective_compaction_mode | effective_compaction_change_percent | effective_compaction_tombstone_percent | pending_tuples | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | maintenance_state | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | unavailable_partitions | stalled_partitions | broad_route | recovery_action
 docs | loose | * | * | * | * | * | * | * | * | NULL | 100000 | NULL | NULL | NULL | PERCENT | 20 | 10 | * | * | * | * | * | * | * | * | * | * | * | * | *
 docs | v | * | * | * | * | * | * | * | * | NULL | 100000 | NONE | NULL | NULL | NONE | NULL | NULL | * | * | * | * | * | * | * | * | * | * | * | * | *
 
-ALTER TABLE docs ALTER COLUMN v SET CONSOLIDATION DEFAULT;
+ALTER TABLE docs ALTER COLUMN v SET COMPACTION DEFAULT;
 SHOW VECTOR_INDEXES;
 ----
-table | column | dimension | quantization | vector_count | bytes | partition_key_columns | max_partitions | live_partitions | search_mode | declared_auto_index_at | effective_auto_index_at | declared_consolidation_mode | declared_consolidation_change_percent | declared_consolidation_tombstone_percent | effective_consolidation_mode | effective_consolidation_change_percent | effective_consolidation_tombstone_percent | pending_inserts | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | maintenance_state | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | unavailable_partitions | stalled_partitions | broad_route | recovery_action
+table | column | dimension | quantization | vector_count | bytes | partition_key_columns | max_partitions | live_partitions | search_mode | declared_indexing_threshold | effective_indexing_threshold | declared_compaction_mode | declared_compaction_change_percent | declared_compaction_tombstone_percent | effective_compaction_mode | effective_compaction_change_percent | effective_compaction_tombstone_percent | pending_tuples | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | maintenance_state | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | unavailable_partitions | stalled_partitions | broad_route | recovery_action
 docs | loose | * | * | * | * | * | * | * | * | NULL | 100000 | NULL | NULL | NULL | PERCENT | 20 | 10 | * | * | * | * | * | * | * | * | * | * | * | * | *
 docs | v | * | * | * | * | * | * | * | * | NULL | 100000 | NULL | NULL | NULL | PERCENT | 20 | 10 | * | * | * | * | * | * | * | * | * | * | * | * | *
 
 # A value CREATE TABLE refuses is refused here, and the declaration stays as it was.
-ALTER TABLE docs ALTER COLUMN v SET AUTO_INDEX_AT 0;
+ALTER TABLE docs ALTER COLUMN v SET INDEXING_THRESHOLD 0;
 ----
 error: InvalidVectorPolicyDeclaration
 
-ALTER TABLE docs ALTER COLUMN v SET CONSOLIDATION (CHANGE_PERCENT = 101);
+ALTER TABLE docs ALTER COLUMN v SET COMPACTION (CHANGE_PERCENT = 101);
 ----
 error: InvalidVectorPolicyDeclaration
 

@@ -7,7 +7,6 @@
 
 mod support;
 
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -19,51 +18,6 @@ use support::{Call, Run};
 
 const MIB: usize = 1 << 20;
 const KIB: usize = 1 << 10;
-
-fn open_limited(folder: &Path, limit: usize) -> Database {
-    let mut options = DatabaseOpenOptions::default();
-    options.memory_limit = Some(limit);
-    match support::open_with(folder, options) {
-        Ok(db) => db,
-        Err(error) => panic!("an open under a limit of {limit} bytes was refused: {error:?}"),
-    }
-}
-
-fn read_limited(folder: &Path, limit: Option<usize>) -> ReadSession {
-    let mut options = ReadSessionOptions::default();
-    options.memory_limit = limit;
-    match ReadSession::open_with_options(folder, options) {
-        Ok(reader) => reader,
-        Err(error) => panic!("a reader under a limit of {limit:?} was refused: {error:?}"),
-    }
-}
-
-fn reopen(db: Database, folder: &Path) -> Database {
-    support::close(db);
-    support::open(folder)
-}
-
-/// One column of what `SHOW MEMORY_LIMIT` reports.
-fn shown(on: &impl Run, column: &str) -> Value {
-    let report = support::run(on, "SHOW MEMORY_LIMIT");
-    let at = report
-        .columns()
-        .iter()
-        .position(|name| name == column)
-        .unwrap_or_else(|| panic!("SHOW MEMORY_LIMIT has no column {column}"));
-    match report.rows() {
-        [row] => row[at].clone(),
-        rows => panic!("SHOW MEMORY_LIMIT returned {} rows", rows.len()),
-    }
-}
-
-/// The bytes `SHOW MEMORY_LIMIT` reports as used.
-fn used(on: &impl Run) -> usize {
-    match shown(on, "used") {
-        Value::Int64(bytes) => bytes as usize,
-        other => panic!("SHOW MEMORY_LIMIT reports {other:?} as used"),
-    }
-}
 
 #[test]
 fn vector_search_ends_complete_or_refused() {
@@ -107,7 +61,7 @@ fn vector_search_ends_complete_or_refused() {
     let outcomes = |on: &dyn Run, state: &str| -> [bool; 2] {
         [0, 1].map(|number| {
             let (sql, wanted) = &searches[number];
-            let before = used(&on);
+            let before = support::memory_used(&on);
             let answered = match support::search(&on, sql, &query) {
                 Ok(result) => {
                     let found = support::found(&result, sql);
@@ -117,7 +71,11 @@ fn vector_search_ends_complete_or_refused() {
                 Err(Error::MemoryBudgetExceeded { .. }) => false,
                 Err(other) => panic!("{state}: {sql}\nwas refused as {other:?}"),
             };
-            assert_eq!(used(&on), before, "{state}: memory in use after {sql}");
+            assert_eq!(
+                support::memory_used(&on),
+                before,
+                "{state}: memory in use after {sql}"
+            );
             answered
         })
     };
@@ -135,7 +93,7 @@ fn vector_search_ends_complete_or_refused() {
         64 * MIB,
     ];
     for limit in limits {
-        let reader = read_limited(&folder, Some(limit));
+        let reader = support::open_reader(&folder, Some(limit));
         let answered = outcomes(&reader, &format!("a reader under {limit} bytes"));
         if limit == 9 * MIB {
             assert_eq!(
@@ -149,17 +107,17 @@ fn vector_search_ends_complete_or_refused() {
         }
     }
     // The same through the writer.
-    let db = open_limited(&folder, 9 * MIB);
+    let db = support::open_limited(&folder, 9 * MIB);
     assert_eq!(outcomes(&db, "the writer under 9 MiB"), [false, false]);
     assert_eq!(db.memory_used(), 9 * MIB);
     support::close(db);
-    let db = open_limited(&folder, 64 * MIB);
+    let db = support::open_limited(&folder, 64 * MIB);
     assert_eq!(outcomes(&db, "the writer under 64 MiB"), [true, true]);
     assert_eq!(db.memory_used(), 17 * MIB);
     support::close(db);
 
     // A cycle under a limit too small for it is refused by name, and nothing was sealed.
-    let db = open_limited(&folder, 9 * MIB + 64 * KIB);
+    let db = support::open_limited(&folder, 9 * MIB + 64 * KIB);
     let before = db.memory_used();
     match db.run_maintenance_cycle() {
         Err(Error::MemoryBudgetExceeded { .. }) => {}
@@ -198,16 +156,17 @@ fn vector_search_ends_complete_or_refused() {
 
 #[test]
 fn memory_stays_bounded_as_data_grows_vector() {
-    const DIMENSION: usize = 3072;
-    // The large partition, in blocks of 8 + 3,072 bytes of slot, 4 of key end and 9 of key each:
-    // 12.6 MB, one and a half times the reader's 8 MiB page cache, and the fewest that are.
-    const LARGE: i64 = 4_069;
+    const DIMENSION: usize = 768;
+    // Vectors in the large partition of a plain column. In a block each takes 8 + 768 bytes of
+    // slot, 4 of key end and 9 of key, so these are 10.5 MB of blocks: 1.25 times the page
+    // cache of 8 MiB that the reader's limit gives it, and the fewest that are.
+    const LARGE: i64 = 13_290;
     const SMALL: i64 = 200;
     const LIMIT: usize = 16 * MIB;
     const CACHE: usize = 8 * MIB;
     const BLOCK: u64 = 262_080;
-    const { assert!(LARGE as u64 * (8 + 3072 + 4 + 9) > 3 * CACHE as u64 / 2) };
-    const { assert!((LARGE as u64 - 1) * (8 + 3072 + 4 + 9) <= 3 * CACHE as u64 / 2) };
+    const { assert!(LARGE as u64 * (8 + 768 + 4 + 9) * 4 > 5 * CACHE as u64) };
+    const { assert!((LARGE as u64 - 1) * (8 + 768 + 4 + 9) * 4 <= 5 * CACHE as u64) };
 
     let folder = support::folder("memory-bounded-vectors");
     let db = support::open(&folder);
@@ -248,7 +207,11 @@ fn memory_stays_bounded_as_data_grows_vector() {
         at_open < BLOCK,
         "opening the store read {at_open} bytes of it before any statement"
     );
-    assert_eq!(used(&reader), 9 * MIB, "set aside by an open under 16 MiB");
+    assert_eq!(
+        support::memory_used(&reader),
+        9 * MIB,
+        "set aside by an open under 16 MiB"
+    );
 
     // It searches the small partition and answers, reading a small part of the file.
     for k in [10, 1000] {
@@ -256,7 +219,7 @@ fn memory_stays_bounded_as_data_grows_vector() {
         let sql = support::nearest_sql("docs", "v", Some("ctx = 'small'"), k);
         support::assert_nearest(&reader, &sql, &query, &wanted, "the small partition");
         assert_eq!(
-            used(&reader),
+            support::memory_used(&reader),
             9 * MIB,
             "memory in use once the answer is dropped"
         );
@@ -280,14 +243,14 @@ fn the_page_cache_follows_the_limit_in_force() {
     let db = support::open(&folder);
     assert_eq!(db.memory_limit(), None);
     assert_eq!(db.memory_used(), 9 * MIB, "set aside with no limit");
-    assert_eq!(used(&db), 9 * MIB);
+    assert_eq!(support::memory_used(&db), 9 * MIB);
     support::declare(&db);
     support::insert(&db, 1..=10);
     support::close(db);
 
     // Under a limit the cache is a quarter of it and never less than 8 MiB.
     for (limit, set_aside) in [(64, 17), (16, 9), (9, 9), (32, 9), (40, 11), (1024, 257)] {
-        let db = open_limited(&folder, limit * MIB);
+        let db = support::open_limited(&folder, limit * MIB);
         assert_eq!(db.memory_limit(), Some(limit * MIB));
         assert_eq!(
             db.memory_used(),
@@ -304,9 +267,9 @@ fn the_page_cache_follows_the_limit_in_force() {
     // A reader's cache follows the limit of its own options, and with none it has no limit
     // and the smallest cache.
     for (limit, set_aside) in [(None, 9), (Some(64), 17), (Some(16), 9), (Some(1024), 257)] {
-        let reader = read_limited(&folder, limit.map(|limit| limit * MIB));
+        let reader = support::open_reader(&folder, limit.map(|limit| limit * MIB));
         assert_eq!(
-            used(&reader),
+            support::memory_used(&reader),
             set_aside * MIB,
             "a reader under {limit:?} MiB"
         );
@@ -322,28 +285,40 @@ fn the_page_cache_follows_the_limit_in_force() {
         9 * MIB,
         "the cache of an open keeps its size"
     );
-    let db = reopen(db, &folder);
+    let db = support::reopen(db, &folder);
     assert_eq!(db.memory_limit(), Some(512 * MIB));
     assert_eq!(
         db.memory_used(),
         129 * MIB,
         "set aside under a remembered limit of 512 MiB"
     );
-    assert_eq!(used(&db), 129 * MIB);
-    assert_eq!(shown(&db, "limit"), Value::Int64(512 * MIB as i64));
-    assert_eq!(shown(&db, "available"), Value::Int64(383 * MIB as i64));
+    assert_eq!(support::memory_used(&db), 129 * MIB);
+    assert_eq!(
+        support::memory_shown(&db, "limit"),
+        Value::Int64(512 * MIB as i64)
+    );
+    assert_eq!(
+        support::memory_shown(&db, "available"),
+        Value::Int64(383 * MIB as i64)
+    );
     // A reader does not take the limit the store remembers.
-    let reader = read_limited(&folder, None);
-    assert_eq!(shown(&reader, "limit"), Value::Text("none".to_owned()));
-    assert_eq!(used(&reader), 9 * MIB);
-    let reader = read_limited(&folder, Some(16 * MIB));
-    assert_eq!(used(&reader), 9 * MIB);
-    assert_eq!(shown(&reader, "available"), Value::Int64(7 * MIB as i64));
+    let reader = support::open_reader(&folder, None);
+    assert_eq!(
+        support::memory_shown(&reader, "limit"),
+        Value::Text("none".to_owned())
+    );
+    assert_eq!(support::memory_used(&reader), 9 * MIB);
+    let reader = support::open_reader(&folder, Some(16 * MIB));
+    assert_eq!(support::memory_used(&reader), 9 * MIB);
+    assert_eq!(
+        support::memory_shown(&reader, "available"),
+        Value::Int64(7 * MIB as i64)
+    );
     // An open that names a limit has its own cache and leaves what the store remembers.
     support::close(db);
-    let db = open_limited(&folder, 64 * MIB);
+    let db = support::open_limited(&folder, 64 * MIB);
     assert_eq!(db.memory_used(), 17 * MIB);
-    let db = reopen(db, &folder);
+    let db = support::reopen(db, &folder);
     assert_eq!(db.memory_limit(), Some(512 * MIB));
     assert_eq!(db.memory_used(), 129 * MIB);
 }
@@ -398,9 +373,9 @@ fn a_limit_below_the_sessions_cache_is_refused_and_one_above_it_is_taken() {
         // The limit in force, the memory set aside and the limit the store remembers stay as
         // they were.
         assert_eq!(db.memory_limit(), None);
-        assert_eq!(shown(&db, "limit"), none);
+        assert_eq!(support::memory_shown(&db, "limit"), none);
         assert_eq!(db.memory_used(), 9 * MIB);
-        let db = reopen(db, &folder);
+        let db = support::reopen(db, &folder);
         assert_eq!(db.memory_limit(), None, "a refused limit was remembered");
         assert_eq!(db.memory_used(), 9 * MIB);
 
@@ -408,10 +383,13 @@ fn a_limit_below_the_sessions_cache_is_refused_and_one_above_it_is_taken() {
         // sizes its cache from it.
         set(&db, 512).expect("a limit above what is set aside");
         assert_eq!(db.memory_limit(), Some(512 * MIB));
-        assert_eq!(shown(&db, "limit"), Value::Int64(512 * MIB as i64));
+        assert_eq!(
+            support::memory_shown(&db, "limit"),
+            Value::Int64(512 * MIB as i64)
+        );
         assert_eq!(db.memory_used(), 9 * MIB);
-        assert_eq!(used(&db), 9 * MIB);
-        let db = reopen(db, &folder);
+        assert_eq!(support::memory_used(&db), 9 * MIB);
+        let db = support::reopen(db, &folder);
         assert_eq!(db.memory_limit(), Some(512 * MIB));
         assert_eq!(db.memory_used(), 129 * MIB);
         // Now 129 MiB is the smallest.
@@ -426,7 +404,7 @@ fn a_limit_below_the_sessions_cache_is_refused_and_one_above_it_is_taken() {
         // Opened with options that name 16 MiB: 9 MiB are set aside. 8 MiB is refused and
         // 1 GiB is taken, and the next open with no options is under 1 GiB.
         let folder = support::folder(&format!("limit-below-small-cache-{name}"));
-        let db = open_limited(&folder, 16 * MIB);
+        let db = support::open_limited(&folder, 16 * MIB);
         assert_eq!(db.memory_used(), 9 * MIB);
         refused_below_the_cache(set(&db, 8), 8 * MIB, 9 * MIB);
         assert_eq!(db.memory_limit(), Some(16 * MIB));
@@ -437,11 +415,11 @@ fn a_limit_below_the_sessions_cache_is_refused_and_one_above_it_is_taken() {
             None,
             "a refused limit was remembered"
         );
-        let db = open_limited(&folder, 16 * MIB);
+        let db = support::open_limited(&folder, 16 * MIB);
         set(&db, 1024).expect("a limit above what is set aside");
         assert_eq!(db.memory_limit(), Some(1024 * MIB));
         assert_eq!(db.memory_used(), 9 * MIB);
-        let db = reopen(db, &folder);
+        let db = support::reopen(db, &folder);
         assert_eq!(db.memory_limit(), Some(1024 * MIB));
         assert_eq!(db.memory_used(), 257 * MIB);
         // Under the 1 GiB the store remembers the cache is 256 MiB, and 64 MiB is refused.
@@ -521,10 +499,16 @@ fn a_limit_of_64_mib_is_taken_in_a_store_opened_with_no_limit() {
         // session already has.
         set(&db, 64).expect("64 MiB in a session opened with no limit");
         assert_eq!(db.memory_limit(), Some(64 * MIB));
-        assert_eq!(shown(&db, "limit"), Value::Int64(64 * MIB as i64));
+        assert_eq!(
+            support::memory_shown(&db, "limit"),
+            Value::Int64(64 * MIB as i64)
+        );
         assert_eq!(db.memory_used(), 9 * MIB);
-        assert_eq!(used(&db), 9 * MIB);
-        assert_eq!(shown(&db, "available"), Value::Int64(55 * MIB as i64));
+        assert_eq!(support::memory_used(&db), 9 * MIB);
+        assert_eq!(
+            support::memory_shown(&db, "available"),
+            Value::Int64(55 * MIB as i64)
+        );
 
         // It holds at once for what statements take: a value of 56 MiB is more than the
         // 55 MiB the limit leaves and is refused by the memory limit; one of 1 MiB is taken.
@@ -545,12 +529,18 @@ fn a_limit_of_64_mib_is_taken_in_a_store_opened_with_no_limit() {
 
         // The store remembers it: the next plain open is under 64 MiB, with a cache of a
         // quarter of it, 16 MiB, and 1 MiB set aside before any statement.
-        let db = reopen(db, &folder);
+        let db = support::reopen(db, &folder);
         assert_eq!(db.memory_limit(), Some(64 * MIB));
         assert_eq!(db.memory_used(), 17 * MIB);
-        assert_eq!(used(&db), 17 * MIB);
-        assert_eq!(shown(&db, "limit"), Value::Int64(64 * MIB as i64));
-        assert_eq!(shown(&db, "available"), Value::Int64(47 * MIB as i64));
+        assert_eq!(support::memory_used(&db), 17 * MIB);
+        assert_eq!(
+            support::memory_shown(&db, "limit"),
+            Value::Int64(64 * MIB as i64)
+        );
+        assert_eq!(
+            support::memory_shown(&db, "available"),
+            Value::Int64(47 * MIB as i64)
+        );
         over_64_mib(
             db.execute(insert, &params! { "id" => 1_i64, "body" => large.as_str() }),
             "56 MiB after the reopen",
@@ -561,7 +551,7 @@ fn a_limit_of_64_mib_is_taken_in_a_store_opened_with_no_limit() {
         // The refusal that stays: a session opened under 1 GiB has a cache of 256 MiB, and
         // 64 MiB is refused there with the action, to open the store with the limit.
         let folder = support::folder(&format!("limit-64-under-1-gib-{name}"));
-        let db = open_limited(&folder, 1024 * MIB);
+        let db = support::open_limited(&folder, 1024 * MIB);
         assert_eq!(db.memory_used(), 257 * MIB);
         refused_below_the_cache(set(&db, 64), 64 * MIB, 257 * MIB);
         assert_eq!(db.memory_limit(), Some(1024 * MIB));
@@ -609,7 +599,7 @@ fn a_cycle_under_a_tight_limit_seals_what_fits_and_is_refused_only_when_one_part
 
     // The searches are a reader's, which has no limit of its own: ten rows of everything and
     // ten of one partition. Returns the rows each search read.
-    let reader = read_limited(&folder, None);
+    let reader = support::open_reader(&folder, None);
     let query = support::vector(95_000, DIMENSION);
     let searches = [None, Some("ctx = 'p07'")];
     let wanted_now = || {
@@ -637,7 +627,7 @@ fn a_cycle_under_a_tight_limit_seals_what_fits_and_is_refused_only_when_one_part
     );
 
     // Under the tight limit every cycle seals at least one partition and none is refused.
-    let db = open_limited(&folder, TIGHT);
+    let db = support::open_limited(&folder, TIGHT);
     let set_aside = db.memory_used();
     let mut remaining = ROWS as u64;
     let mut cycles = 0;
@@ -710,7 +700,7 @@ fn a_cycle_under_a_tight_limit_seals_what_fits_and_is_refused_only_when_one_part
     // Under a limit that leaves less than the block a cycle builds in, the working set of
     // that one partition does not fit, and the cycle is refused by name. Nothing was staged:
     // no commit was made and nothing is counted.
-    let db = open_limited(&folder, SHORT);
+    let db = support::open_limited(&folder, SHORT);
     let (set_aside, position) = (db.memory_used(), db.committed_watermark());
     match db.run_maintenance_cycle() {
         Err(Error::MemoryBudgetExceeded {
@@ -775,7 +765,7 @@ fn the_memory_of_a_search_is_given_back_when_its_result_is_dropped() {
         }
     }
     let query = support::vector(96_500, DIMENSION);
-    let reader = read_limited(&folder, Some(16 * MIB));
+    let reader = support::open_reader(&folder, Some(16 * MIB));
     // A transaction that has staged rows of its own: its searches read those too.
     let tx = db.transaction().expect("begin");
     support::insert_docs(&tx, 401..=420, DIMENSION, ctx);
@@ -797,7 +787,7 @@ fn the_memory_of_a_search_is_given_back_when_its_result_is_dropped() {
     ];
     for (on, door) in doors {
         for sql in &searches {
-            let before = used(&on);
+            let before = support::memory_used(&on);
             let result = match support::search(&on, sql, &query) {
                 Ok(result) => result,
                 Err(error) => panic!("through {door}: {sql}\nwas refused: {error:?}"),
@@ -807,7 +797,7 @@ fn the_memory_of_a_search_is_given_back_when_its_result_is_dropped() {
                 "through {door}: the rows of {sql}"
             );
             // While the result lives its rows are counted, so the figure does move.
-            let held = used(&on);
+            let held = support::memory_used(&on);
             assert!(
                 held > before,
                 "through {door}: with the result of {sql}\nin hand, {held} bytes are in use, \
@@ -815,7 +805,7 @@ fn the_memory_of_a_search_is_given_back_when_its_result_is_dropped() {
             );
             drop(result);
             assert_eq!(
-                used(&on),
+                support::memory_used(&on),
                 before,
                 "through {door}: memory in use once the result of {sql}\nis dropped"
             );
@@ -829,7 +819,7 @@ fn the_memory_of_a_search_is_given_back_when_its_result_is_dropped() {
 #[test]
 fn a_commit_with_no_room_for_its_vector_records_changes_nothing() {
     const DIMENSION: usize = 16;
-    let (folder, db) = support::built("commit-no-room", DIMENSION, "AUTO_INDEX_AT 1000", 2000);
+    let (folder, db) = support::built("commit-no-room", DIMENSION, "INDEXING_THRESHOLD 1000", 2000);
     let rows = "SELECT id, ctx, tag, v FROM docs ORDER BY id";
     let untouched = (support::rows(&db, rows), db.committed_watermark());
     support::close(db);
@@ -869,15 +859,15 @@ fn a_commit_with_no_room_for_its_vector_records_changes_nothing() {
     let spares = (0..=32).map(|step| step * 64 * KIB).chain([55 * MIB]);
     for spare in spares {
         let limit = 9 * MIB + spare;
-        let db = open_limited(&folder, limit);
-        let before = used(&db);
+        let db = support::open_limited(&folder, limit);
+        let before = support::memory_used(&db);
         let outcome = attempt(&db);
         assert_eq!(
-            used(&db),
+            support::memory_used(&db),
             before,
             "memory in use after a commit under {limit}"
         );
-        let db = reopen(db, &folder);
+        let db = support::reopen(db, &folder);
         match outcome {
             Ok(()) => {
                 assert_eq!(support::int(&db, "SELECT COUNT(*) FROM docs"), 2300);

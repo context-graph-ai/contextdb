@@ -13,9 +13,10 @@ lz4_flex = { version = "0.14", default-features = false, features = ["std", "saf
 pest = "2.8.6"
 pest_derive = "2.8.6"
 redb = { package = "contextdb-redb", version = "4.1.0", path = "../redb" }
+serde = { version = "1", features = ["derive"] }
 # Numbers in a stored JSON value are read back exactly as they were written.
 serde_json = { version = "1", features = ["float_roundtrip"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [lints]
 workspace = true

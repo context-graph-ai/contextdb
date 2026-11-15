@@ -226,6 +226,13 @@ pub(crate) struct Beside {
 /// Rows in key order.
 pub(crate) type RowIter<'a> = Box<dyn Iterator<Item = Result<(Key, Row)>> + 'a>;
 
+/// What [`Read::counted`] counts: the rows of a table, or the entries of an index.
+#[derive(Clone, Copy)]
+pub(crate) enum Keys {
+    Table(TableId),
+    Index(IndexId),
+}
+
 /// Index entries in entry order, each with the key of the row it points at and the place its
 /// first cut value's kept bytes end, when it holds one.
 pub(crate) type EntryIter<'a> = Box<dyn Iterator<Item = Result<(Key, Key, Option<usize>)>> + 'a>;
@@ -261,6 +268,10 @@ pub(crate) trait Read {
     /// A bound made from the first columns of a key stands for every key that begins with
     /// those values: included, it takes them all in; excluded, it leaves them all out.
     fn rows(&self, table: TableId, from: Bound<&Key>, to: Bound<&Key>) -> Result<RowIter<'_>>;
+
+    /// How many rows [`Read::rows`] or entries [`Read::index`] give between two keys, counted
+    /// no further than `most` with no row read and nothing copied.
+    fn counted(&self, of: Keys, from: Bound<&Key>, to: Bound<&Key>, most: usize) -> Result<u64>;
 
     /// The entries of an index between two entries, in entry order. Costs like [`Read::rows`],
     /// and a bound of fewer columns means what it means there: it is never taken as one exact
@@ -743,11 +754,13 @@ fn staged_in<C>(
         .flatten()
 }
 
-/// Stored records with a transaction's staged ones laid over them, in key order: a staged
-/// record stands in for the stored one with its key, and a staged removal, `None`, hides it.
-fn overlay<'a, T: 'a>(
+/// Stored records with a transaction's staged changes laid over them, in key order: `laid`
+/// gives what a key holds from its stored record, if any, and its staged change, and a key it
+/// gives nothing for is hidden.
+fn overlay<'a, T: 'a, C: 'a>(
     stored: impl Iterator<Item = Result<(Key, T)>> + 'a,
-    staged: impl Iterator<Item = (&'a Key, Option<T>)> + 'a,
+    staged: impl Iterator<Item = (&'a Key, C)> + 'a,
+    mut laid: impl FnMut(Option<T>, C) -> Option<T> + 'a,
 ) -> Box<dyn Iterator<Item = Result<(Key, T)>> + 'a> {
     let (mut stored, mut staged) = (stored.peekable(), staged.peekable());
     Box::new(std::iter::from_fn(move || {
@@ -759,12 +772,13 @@ fn overlay<'a, T: 'a>(
                 (Some(_), _) => Ordering::Less,
                 (None, Some(_)) => Ordering::Greater,
             };
-            match stored_is {
+            let before = match stored_is {
                 Ordering::Less => return stored.next(),
-                Ordering::Equal => drop(stored.next()),
-                Ordering::Greater => {}
-            }
-            if let Some((key, Some(record))) = staged.next() {
+                Ordering::Equal => stored.next()?.ok().map(|(_, record)| record),
+                Ordering::Greater => None,
+            };
+            let (key, change) = staged.next()?;
+            if let Some(record) = laid(before, change) {
                 return Some(Ok((key.clone(), record)));
             }
         }
@@ -816,17 +830,33 @@ impl Read for ChangeSet {
         let staged = staged.map(|(key, row)| (key, shown(row)));
         // A stored row is reshaped only while this change set drops something.
         if self.dropped.is_empty() {
-            return Ok(overlay(stored, staged));
+            return Ok(overlay(stored, staged, |_, row| row));
         }
         let stored = stored.map(move |row| row.map(|(key, row)| (key, self.shaped(table, row))));
-        Ok(overlay(stored, staged))
+        Ok(overlay(stored, staged, |_, row| row))
+    }
+
+    fn counted(&self, of: Keys, from: Bound<&Key>, to: Bound<&Key>, most: usize) -> Result<u64> {
+        // With nothing staged in what is counted, the stored records are counted where they are.
+        let found: Box<dyn Iterator<Item = Result<()>>> = match of {
+            Keys::Table(table) if self.rows.contains_key(&table.0) => {
+                Box::new(self.rows(table, from, to)?.map(|found| found.map(drop)))
+            }
+            Keys::Index(index) if self.index.contains_key(&index.0) => {
+                Box::new(self.index(index, from, to)?.map(|found| found.map(drop)))
+            }
+            _ => return self.base.counted(of, from, to, most),
+        };
+        found.take(most).map(|found| found.and(Ok(1))).sum()
     }
 
     fn index(&self, index: IndexId, from: Bound<&Key>, to: Bound<&Key>) -> Result<EntryIter<'_>> {
         let span = keys::span(from, to);
         let stored = self.base.moment.joined(index.0, &span)?;
         let staged = staged_in(&self.index, index.0, span).map(|(joined, entry)| (joined, *entry));
-        Ok(Box::new(overlay(stored, staged).map(split)))
+        Ok(Box::new(
+            overlay(stored, staged, |_, entry| entry).map(split),
+        ))
     }
 
     fn kept(&self, count: CountId, from: Bound<&Key>, to: Bound<&Key>) -> Result<KeptIter<'_>> {

@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use super::expression::reads;
+use super::expression::{EvalContext, reads};
 use super::table::Source;
 use crate::memory::Reservation;
 use crate::schema::{Catalog, Table};
@@ -118,7 +118,7 @@ impl<'a> Visible<'a> {
             // nobody.
             let grants = catalog.table(from).and_then(|table| {
                 let mut filtered = vec![false; table.meta.columns.len()];
-                reads(&filter, table, &params, &mut filtered).ok()?;
+                reads(&filter, &table.scope(), &params, &mut filtered).ok()?;
                 Some((table, filtered))
             });
             let grants = match grants {
@@ -247,7 +247,8 @@ impl Grants<'_> {
             reader,
             acl: None,
         };
-        let source = Source::new(self.table, Some(&self.filter), &self.params, 0, read, seen)
+        let ctx = EvalContext::new(&self.params, 0);
+        let source = Source::new(self.table, Some(&self.filter), &ctx, read, seen)
             .reading(self.filtered.clone(), &self.filtered);
         let mut path = source.choose(&[], &[])?;
         // A grant row the reader may not see is no grant, however the lookup names it.

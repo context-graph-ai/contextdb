@@ -10,20 +10,9 @@ mod support;
 
 use std::collections::BTreeMap;
 
-use contextdb::{Database, ReadSession, Value, params};
+use contextdb::{Database, Value, params};
 
-use support::{Near, Run};
-
-/// The keys of an answer, in its order.
-fn ids(answer: &[Near]) -> Vec<i64> {
-    answer
-        .iter()
-        .map(|near| match near.key {
-            Value::Int64(id) => id,
-            ref other => panic!("the key {other:?} is not an INTEGER"),
-        })
-        .collect()
-}
+use support::{Near, Run, near_ids as ids};
 
 /// Changes the vector of one row of `docs`, or takes it away for `None`.
 fn set_vector(on: &impl Run, id: i64, vector: Option<Vec<f32>>) {
@@ -134,10 +123,9 @@ fn exact_search_returns_the_true_nearest_vectors() {
         through(&db, "after one cycle");
         support::seal_all(&db);
         through(&db, "after the last cycle");
-        support::close(db);
-        let db = support::open(&folder);
+        let db = support::reopen(db, &folder);
         through(&db, "after close and reopen");
-        let reader = ReadSession::open(&folder).expect("open the store for reading");
+        let reader = support::open_reader(&folder, None);
         through(&reader, "through a read session");
     }
 }
@@ -251,8 +239,7 @@ fn exact_search_rescores_from_stored_vectors() {
 
     // The same after everything pending is sealed, and after the store is opened again.
     support::seal_all(&db);
-    support::close(db);
-    let db = support::open(&folder);
+    let db = support::reopen(db, &folder);
     let stored = support::stored(&db, support::DOCS);
     for query in left_behind.iter().rev().take(20) {
         for k in [1, 10, 1000] {
@@ -284,7 +271,7 @@ fn exact_search_reads_its_own_snapshot() {
     let query = support::vector(7, DIMENSION);
     let doubled: Vec<f32> = query.iter().map(|number| number * 2.0).collect();
     set_vector(&db, 160, Some(doubled));
-    let reader = ReadSession::open(&folder).expect("open the store for reading");
+    let reader = support::open_reader(&folder, None);
 
     // Holds a search over every partition, and over each one, to the rows `on` itself reads.
     fn agrees(on: &impl Run, query: &[f32], what: &str) -> Vec<Near> {
@@ -799,7 +786,7 @@ fn a_search_that_has_to_look_twice_returns_the_true_nearest() {
     let wanted = stored.nearest(not_near, &AHEAD, 10);
     assert_eq!(ids(&wanted), (11..=20).collect::<Vec<i64>>());
     through(&db, &stored, "near rows filtered out, ten rows pending");
-    let reader = ReadSession::open(&folder).expect("open the store for reading");
+    let reader = support::open_reader(&folder, None);
     through(&reader, &stored, "the same through a read session");
 
     // The same without a filter once the near rows are deleted: their slots stay in the block,
@@ -881,7 +868,7 @@ fn a_row_two_entries_lead_to_is_in_the_answer_once_and_pushes_no_row_out() {
     set_vector(&db, 30, Some(toward(0.86, 3)));
     let (answer, _) = nearest_ten(&db, "row 30 pending with a slot of its earlier vector");
     assert_eq!(answer, [41, 42, 30, 43, 44, 45, 46, 47, 48, 49]);
-    let reader = ReadSession::open(&folder).expect("open the store for reading");
+    let reader = support::open_reader(&folder, None);
     nearest_ten(&reader, "the same through a read session");
 
     // Two slots of one vector, one of them left behind. Rows 1 to 8, row 20, row 50 and

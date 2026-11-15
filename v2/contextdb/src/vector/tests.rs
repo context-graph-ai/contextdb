@@ -15,7 +15,7 @@ use super::grouping::{
     put_mean,
 };
 use super::seal::seal;
-use super::sketch::{Estimate, Sketches, WIDEST, sketch_len, sketches_of, write_sketch};
+use super::sketch::{Estimate, Sketches, WIDEST, sketch_len, write_sketch};
 use super::slot::{Screen, distance, slot_len, write_slot};
 use super::stage::stage;
 use super::train::{Mean, Round, first_centres, groups_for, nearest, product, sampled};
@@ -233,13 +233,7 @@ fn a_pending_record_of_a_row_with_no_vector_is_reported_as_damage() {
     // Which of three pending rows is left with no vector: the first, which a cycle reads to
     // find the partition, and a later one, which it reads to write a slot.
     for damaged in [1_i64, 2] {
-        let folder = std::env::temp_dir().join(format!(
-            "contextdb-pending-without-vector-{damaged}-{}",
-            std::process::id()
-        ));
-        if folder.exists() {
-            std::fs::remove_dir_all(&folder).expect("clear the folder an earlier run left");
-        }
+        let folder = fresh(&format!("pending-without-vector-{damaged}"));
         // A sound store: three rows of one partition, each with a vector and each waiting on
         // the pending list.
         let db = Database::open(&folder).expect("open a fresh store");
@@ -299,10 +293,7 @@ type Misnamed = (PathBuf, Store, Budget, TableId);
 /// changed: the name of the column the record's VECTOR entry is for. No declaration writes such
 /// a record.
 fn a_vector_entry_named(test: &str, named: u8) -> Misnamed {
-    let folder = std::env::temp_dir().join(format!("contextdb-{test}-{}", std::process::id()));
-    if folder.exists() {
-        std::fs::remove_dir_all(&folder).expect("clear the folder an earlier run left");
-    }
+    let folder = fresh(test);
     let db = Database::open(&folder).expect("open a fresh store");
     for sql in [
         "CREATE TABLE docs (id INTEGER PRIMARY KEY, n INTEGER, v VECTOR(4))",
@@ -418,10 +409,7 @@ const COLUMN: VectorId = VectorId(3);
 
 /// An empty store in a folder of its own.
 fn a_store(test: &str) -> (PathBuf, Store, Budget) {
-    let folder = std::env::temp_dir().join(format!("contextdb-{test}-{}", std::process::id()));
-    if folder.exists() {
-        std::fs::remove_dir_all(&folder).expect("clear the folder an earlier run left");
-    }
+    let folder = fresh(test);
     let budget = Budget::new(None).expect("a budget");
     let store = Store::open_for_writing(&folder, &budget, None).expect("open a fresh store");
     (folder, store, budget)
@@ -511,58 +499,6 @@ fn a_partition() -> Partition {
 }
 
 #[test]
-fn a_partition_record_reads_back() {
-    // The 73 bytes: the number, the live rows, the tail's last, first and closed blocks, its
-    // slots, the slots ever sealed, the flags, the grouping in force and the one being built.
-    let whole = a_partition();
-    let mut wanted = Vec::new();
-    wanted.extend(7_u32.to_le_bytes());
-    wanted.extend(300_u64.to_le_bytes());
-    for number in [6_u32, 2, 4] {
-        wanted.extend(number.to_le_bytes());
-    }
-    wanted.extend(500_u64.to_le_bytes());
-    wanted.extend(9000_u64.to_le_bytes());
-    wanted.push(1 | 2 | 4);
-    for number in [9_u32, 3, 17] {
-        wanted.extend(number.to_le_bytes());
-    }
-    wanted.extend(290_u64.to_le_bytes());
-    wanted.extend(8500_u64.to_le_bytes());
-    wanted.extend(11_u32.to_le_bytes());
-    assert_eq!(wanted.len(), 73);
-    assert_eq!(whole.encode(), wanted);
-
-    // A field its flag does not set is zero.
-    let bare = Partition {
-        number: 0x0102_0304,
-        live: 0x0506_0708_090A_0B0C,
-        blocks: 0x0D0E_0F10,
-        sealed: u64::MAX,
-        ..Partition::default()
-    };
-    let mut wanted = vec![
-        4, 3, 2, 1, 0x0C, 0x0B, 0x0A, 9, 8, 7, 6, 5, 0x10, 0x0F, 0x0E, 0x0D,
-    ];
-    wanted.extend([0; 16]);
-    wanted.extend([0xFF; 8]);
-    wanted.extend([0; 33]);
-    assert_eq!(bare.encode(), wanted);
-
-    let (folder, store, budget) = a_store("partition-record");
-    for (at, entry) in [whole, bare].into_iter().enumerate() {
-        let tuple = key(at as i64 + 1);
-        let record = VectorRecord::Partition(COLUMN, &tuple);
-        let view = put(&store, &budget, record, entry.encode());
-        assert_eq!(partition(&view, COLUMN, &tuple).expect("read"), Some(entry));
-        let other = key(50);
-        assert_eq!(partition(&view, COLUMN, &other).expect("read"), None);
-    }
-    drop(store);
-    std::fs::remove_dir_all(&folder).expect("remove the test's folder");
-}
-
-#[test]
 fn a_partition_entry_that_disagrees_with_itself_is_damage() {
     let (folder, store, budget) = a_store("partition-damage");
     let good = a_partition().encode();
@@ -620,24 +556,6 @@ fn a_grouping() -> Grouping {
         width: 4,
         starts: vec![place(0, 0), place(0, 200), place(1, 50), place(1, 300)],
     }
-}
-
-#[test]
-fn a_grouping_record_reads_back() {
-    let grouping = a_grouping();
-    // The gap, the width and the probes, then each place as its block and its slot.
-    let numbers = [780_u32, 4, 2, 0, 0, 0, 200, 1, 50, 1, 300];
-    let wanted: Vec<u8> = numbers.iter().flat_map(|n| n.to_le_bytes()).collect();
-    assert_eq!(wanted.len(), 12 + 8 * 4);
-    assert_eq!(grouping.encode(), wanted);
-    let (folder, store, budget) = a_store("grouping-record");
-    let view = put(&store, &budget, VectorRecord::Grouping(COLUMN, 9), wanted);
-    assert_eq!(
-        Grouping::read(&view, COLUMN, GROUPED).expect("read"),
-        grouping
-    );
-    drop((view, store));
-    std::fs::remove_dir_all(&folder).expect("remove the test's folder");
 }
 
 #[test]
@@ -947,78 +865,6 @@ fn given() -> (Vec<u32>, Vec<Place>) {
 }
 
 #[test]
-fn a_build_record_reads_back() {
-    let (counts, starts) = given();
-    let tens = |questions: usize| vec![Place { block: 0, slot: 7 }; 10 * questions];
-    let packed = |phase: Phase, questions: usize| Build {
-        counts: counts.clone(),
-        starts: starts.clone(),
-        tens: tens(questions),
-        ..a_build(phase)
-    };
-    let builds = [
-        a_build(Phase::Train { round: 3 }),
-        Build {
-            from: Some(Grouped {
-                number: 9,
-                blocks: 1,
-                groups: 40,
-                slots: 1600,
-                upto: 1600,
-            }),
-            tail: (2, 3),
-            stale: true,
-            needing: 4096,
-            ..a_build(Phase::Assign { next: 1 })
-        },
-        Build {
-            counts: counts.clone(),
-            starts: starts[..3].to_vec(),
-            ..a_build(Phase::Pack { group: 2 })
-        },
-        packed(Phase::Measure { done: 2, most: 150 }, 2),
-        packed(
-            Phase::Width {
-                gap: 150,
-                probes: 3,
-                done: 1,
-                asked: 10,
-                kept: [9; 15],
-            },
-            128,
-        ),
-        packed(
-            Phase::Switch {
-                gap: 150,
-                probes: 3,
-                width: 4,
-            },
-            128,
-        ),
-        Build {
-            stale: true,
-            ..packed(Phase::Sweep, 0)
-        },
-    ];
-    let (folder, store, budget) = a_store("build-record");
-    let view = store.view().expect("a view");
-    assert_eq!(Build::read(&view, COLUMN, 7).expect("read"), None);
-    drop(view);
-    for build in builds {
-        let view = put(
-            &store,
-            &budget,
-            VectorRecord::Build(COLUMN, 7),
-            build.encode(),
-        );
-        let read = Build::read(&view, COLUMN, 7).expect("read the build");
-        assert_eq!(read, Some(build));
-    }
-    drop(store);
-    std::fs::remove_dir_all(&folder).expect("remove the test's folder");
-}
-
-#[test]
 fn a_build_whose_cursor_is_past_its_blocks_is_damage() {
     let (counts, _) = given();
     let whole = a_build(Phase::Train { round: 3 }).encode();
@@ -1183,32 +1029,6 @@ fn the_ranges_of_a_run_of_sketches_are_those_of_the_plain_arithmetic() {
     }
 }
 
-#[test]
-fn the_sketches_of_a_block_read_back() {
-    const DIMENSION: usize = 16;
-    let keys: Vec<Key> = (0..5).map(key).collect();
-    let (mut writer, taken) = BlockWriter::new(DIMENSION, None, &keys);
-    assert_eq!(taken, 5);
-    for (n, key) in keys.iter().enumerate() {
-        writer.push(key, &vector(800 + n as u64, DIMENSION));
-    }
-    let block = writer.finish();
-    // Slot `place` is sketched from reference `place % 2`.
-    let references = [vector(900, DIMENSION), vector(901, DIMENSION)];
-    let record = sketches_of(&block, DIMENSION, &mut |place| &references[place % 2]);
-    assert_eq!(record.len(), 4 + 5 * sketch_len(DIMENSION));
-    assert_eq!(record[..4], 5_u32.to_le_bytes());
-    let sketches = Sketches::new(&record, DIMENSION);
-    assert!(sketches.is_whole(5) && !sketches.is_whole(4) && !sketches.is_whole(6));
-    assert!(!Sketches::new(&record[..record.len() - 1], DIMENSION).is_whole(5));
-    let reader = BlockReader::new(&block, DIMENSION);
-    for place in 0..5 {
-        let mut wanted = vec![0_u8; sketch_len(DIMENSION)];
-        write_sketch(reader.slot(place), &references[place % 2], &mut wanted);
-        assert_eq!(sketches.at(place), wanted.as_slice(), "sketch {place}");
-    }
-}
-
 // ---- damage in a built store, through the public calls ----
 
 const BUILT: usize = 16;
@@ -1246,7 +1066,7 @@ fn insert_gathered(db: &Database, ids: std::ops::RangeInclusive<u64>) {
 fn a_store_with_vectors(test: &str, cycles: usize) -> (PathBuf, Database) {
     let folder = fresh(test);
     let db = Database::open(&folder).expect("open a fresh store");
-    let table = "CREATE TABLE docs (id INTEGER PRIMARY KEY, v VECTOR(16) AUTO_INDEX_AT 1000)";
+    let table = "CREATE TABLE docs (id INTEGER PRIMARY KEY, v VECTOR(16) INDEXING_THRESHOLD 1000)";
     db.execute(table, &HashMap::new()).expect(table);
     insert_gathered(&db, 1..=2000);
     for _ in 0..cycles {

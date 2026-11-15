@@ -160,3 +160,20 @@ SELECT id, source_id, target_id FROM one_edge;
 ----
 id | source_id | target_id
 1 | 00000000-0000-0000-0000-000000000002 | 00000000-0000-0000-0000-000000000001
+
+# A table of edges that is also IMMUTABLE takes an edge, and refuses the edge that would close a cycle.
+CREATE TABLE fixed_edges (
+  id INTEGER PRIMARY KEY,
+  source_id UUID NOT NULL,
+  target_id UUID NOT NULL,
+  edge_type TEXT NOT NULL
+) DAG('X') IMMUTABLE;
+INSERT INTO fixed_edges (id, source_id, target_id, edge_type)
+VALUES (1, '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002', 'X');
+----
+rows affected: 1
+
+INSERT INTO fixed_edges (id, source_id, target_id, edge_type)
+VALUES (2, '00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 'X');
+----
+error: CycleDetected

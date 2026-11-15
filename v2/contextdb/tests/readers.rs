@@ -63,9 +63,7 @@ fn a_statement_reads_one_moment_while_commits_land_under_it() {
     let folder = support::folder("statement-one-moment");
     let db = support::open(&folder);
     support::declare(&db);
-    let tx = db.transaction().expect("begin");
-    support::insert(&tx, 1..=ROWS);
-    tx.commit().expect("commit");
+    support::insert_together(&db, 1..=ROWS);
 
     let mut reader = scanner_stopped_inside_its_scan(test, &folder, ROWS);
 
@@ -93,9 +91,7 @@ fn a_reader_keeps_answering_when_the_writer_is_killed_and_follows_the_restarted_
     let folder = support::folder("reader-outlives-writer");
     let db = support::open(&folder);
     support::declare(&db);
-    let tx = db.transaction().expect("begin");
-    support::insert(&tx, 1..=ROWS);
-    tx.commit().expect("commit");
+    support::insert_together(&db, 1..=ROWS);
     support::close(db);
 
     // A writer in another process, and this process as a reader of its store.
@@ -180,9 +176,7 @@ fn a_killed_reader_leaves_one_file_that_the_next_open_clears() {
     let readers = folder.join("readers");
     let db = support::open(&folder);
     support::declare(&db);
-    let tx = db.transaction().expect("begin");
-    support::insert(&tx, 1..=ROWS);
-    tx.commit().expect("commit");
+    support::insert_together(&db, 1..=ROWS);
     support::close(db);
 
     // Two readers, each stopped inside a statement: each holds one file.
@@ -402,7 +396,12 @@ fn a_reader_sees_one_grouping_whole_while_the_writer_builds_and_switches() {
         return searcher(&role);
     }
     let test = "a_reader_sees_one_grouping_whole_while_the_writer_builds_and_switches";
-    let (folder, db) = support::built("reader-beside-build", GROUPED, "AUTO_INDEX_AT 1000", 2000);
+    let (folder, db) = support::built(
+        "reader-beside-build",
+        GROUPED,
+        "INDEXING_THRESHOLD 1000",
+        2000,
+    );
     let line = |db: &contextdb::Database| told(&support::answer(db, &indexed_ten(), &asked()));
     let first = line(&db);
 
@@ -457,11 +456,7 @@ fn a_reader_sees_one_grouping_whole_while_the_writer_builds_and_switches() {
 /// search it announces `reading` and waits for a line; `pause_at` 0 never stops. Then it
 /// announces the answer's line and `reads <n>`, searches once more and announces that line.
 fn searcher(role: &support::Role) {
-    let (door, searching, reads) = support::pausing_at_read(role.number("pause_at"));
-    let mut options = ReadSessionOptions::default();
-    options.storage = Some(door);
-    let reader =
-        ReadSession::open_with_options(&role.folder, options).expect("open the store for reading");
+    let (reader, searching, reads) = support::reader_pausing(role);
     searching.store(true, Ordering::SeqCst);
     let result = support::search(&reader, &indexed_ten(), &asked())
         .expect("a reader is not refused because a build ran");
@@ -486,7 +481,7 @@ fn a_new_process_searches_a_built_grouping_at_once() {
         return;
     }
     let test = "a_new_process_searches_a_built_grouping_at_once";
-    let (folder, db) = support::built("first-search", GROUPED, "AUTO_INDEX_AT 1000", 2000);
+    let (folder, db) = support::built("first-search", GROUPED, "INDEXING_THRESHOLD 1000", 2000);
     let wanted = told(&support::answer(&db, &indexed_ten(), &asked()));
     support::close(db);
     // The first search of a fresh process does the work of its second and of the process

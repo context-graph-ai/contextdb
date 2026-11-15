@@ -1,41 +1,47 @@
-//! query: answers a SELECT from one table: which rows to read and through which index, the
-//! filter, the select list, COUNT, SUM, MIN and MAX, ORDER BY and LIMIT, and a similarity
-//! search, whose rows the vector part finds. It holds the one expression evaluator, and counts
-//! exactly the rows it reads.
+//! query: answers a SELECT from one table or from none: which rows to read and through which
+//! index, the filter, the select list, GROUP BY with COUNT, SUM, MIN, MAX and AVG, HAVING,
+//! ROW_NUMBER, DISTINCT, ORDER BY, LIMIT and OFFSET, and a similarity search, whose rows the
+//! vector part finds. It holds the one expression evaluator, and counts exactly the rows it
+//! reads.
 //!
 //! It never changes anything.
 
+mod aggregate;
 mod bind;
 mod counts;
 mod expression;
 mod for_write;
+mod graph;
 mod inspect;
+mod join;
+mod plan;
+mod rank;
 mod search;
+mod sort;
+mod subquery;
 mod table;
 #[cfg(test)]
 mod tests;
+mod union;
 mod visible;
+mod window;
 
-use std::cmp::Ordering;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
 
 pub(crate) use expression::{EvalContext, Scope, eval, reads};
 pub(crate) use for_write::{Asked, rows_for_write};
 pub(crate) use inspect::explain;
+pub(crate) use table::equal;
 pub(crate) use visible::{Reader, Visible};
 
 use crate::memory::{Budget, Reservation};
-use crate::schema::{Catalog, Table};
-use crate::sql::ast::SortDirection;
-use crate::sql::plan::{ProjectColumn, SortKey};
-use crate::sql::{Expr, Plan};
+use crate::schema::Catalog;
+use crate::sql::{Plan, not_supported};
 use crate::store::Read;
-use crate::types::{ColumnType, Error, Result, Value};
-use expression::{
-    Arithmetic, arithmetic, column_index, compare, most_bytes, sort_order, unsupported,
-};
-use table::Source;
+use crate::types::{Result, Value};
+use plan::Given;
 
 /// What a statement returned: the column names and rows of a SELECT, or the number of rows a
 /// write affected. Its rows stay counted against the memory limit until it is dropped.
@@ -150,15 +156,18 @@ pub(crate) fn memory_limit_shown(budget: &Budget, opened_under: Option<u64>) -> 
 
 /// Answers one planned SELECT from one store, for one reader.
 ///
-/// Every row comes from the table source, which picks an index when the plan's filter can use
-/// one and scans otherwise, and hands on only the rows `reader` may see. A `COUNT(*)` is
-/// answered with no row read when a kept number or the entries of one index range give it.
-/// Loads a value kept beside its row only when a selected or filtered column needs it. The
-/// result, and any sort or grouping on the way to it, grows through reservations on `budget`
-/// and refuses with `MemoryBudgetExceeded` before it grows.
+/// The statement is answered by the row sources `plan::select` puts one above the other. At
+/// the bottom is what FROM names: the table source, which picks an index when the filter can
+/// use one and scans otherwise, hands on only the rows `reader` may see, and loads a value kept
+/// beside its row only when a selected or filtered column needs it. Above it the rows are
+/// aggregated, or sorted when the path does not give the order and the select list worked
+/// out; then DISTINCT, OFFSET and LIMIT. A `COUNT(*)` is answered with no row read when a kept
+/// number or the entries of one index range give it. The result, and whatever a source keeps
+/// on the way to it, grows through reservations on `budget` and refuses with
+/// `MemoryBudgetExceeded` before it grows.
 ///
-/// A similarity search, `ORDER BY column <=> vector LIMIT k`, is answered by the vector part
-/// from the rows this part lets it see, and returns the nearest rows first.
+/// A similarity search, `ORDER BY column <=> vector LIMIT k`, is the table source of its
+/// statement: the vector part finds the nearest of the rows this part lets it see.
 pub(crate) fn run(
     plan: &Plan,
     params: &HashMap<String, Value>,
@@ -168,339 +177,74 @@ pub(crate) fn run(
     budget: &Budget,
     now: i64,
 ) -> Result<QueryResult> {
-    if let Some(found) = search::run(plan, params, catalog, read, reader, budget, now)? {
-        return Ok(found);
-    }
     if let Some(shown) = inspect::show(plan, catalog, read, budget)? {
         return Ok(shown);
     }
-    let select = Select::of(plan)?;
-    let table = catalog
-        .table(select.table)
-        .ok_or_else(|| Error::TableNotFound(select.table.to_owned()))?;
-
-    // Everything the statement names is looked up before a row is read.
-    let width = table.meta.columns.len();
-    let (mut filtered, mut wanted) = (vec![false; width], vec![false; width]);
-    if let Some(filter) = select.filter {
-        reads(filter, table, params, &mut filtered)?;
+    if let Plan::Explain(plan) = plan {
+        let lines = inspect::explain(plan, params, catalog, read, reader, budget, now)?;
+        let rows = lines.lines().map(|line| vec![Value::Text(line.to_owned())]);
+        return Ok(QueryResult::from_rows(
+            vec!["QUERY PLAN".to_owned()],
+            rows.collect(),
+        ));
     }
-    for key in select.order {
-        reads(&key.expr, table, params, &mut wanted)?;
-    }
-    let mut aggregates = Vec::new();
-    match select.columns {
-        None => wanted.fill(true),
-        Some(columns) => {
-            for column in columns {
-                let Some(aggregate) = Aggregate::of(&column.expr)? else {
-                    reads(&column.expr, table, params, &mut wanted)?;
-                    continue;
-                };
-                if let Some(of) = aggregate.of {
-                    reads(of, table, params, &mut wanted)?;
-                    aggregate.check(table, of)?;
-                }
-                aggregates.push(aggregate);
-            }
-            if !aggregates.is_empty() && aggregates.len() < columns.len() {
-                return Err(unsupported("a column beside an aggregate (GROUP BY)"));
-            }
-        }
-    }
-    let columns = names(table, select.columns, !aggregates.is_empty());
-
+    let Plan::Select(select) = plan else {
+        return Err(not_supported("this statement"));
+    };
+    let given = Given {
+        params,
+        catalog,
+        read,
+        reader,
+        budget,
+        ctx: EvalContext::new(params, now),
+        evaluations: &Cell::default(),
+        named: None,
+        bound: None,
+    };
     // What the reader's filter holds is given back with the statement.
     let mut seeing = budget.reserve(0, "query")?;
-    let visible = Visible::new(table, catalog, reader, &mut seeing)?;
-    let source =
-        Source::new(table, select.filter, params, now, read, visible).reading(filtered, &wanted);
-    let limit = select.limit.map_or(usize::MAX, |limit| {
-        usize::try_from(limit).unwrap_or(usize::MAX)
-    });
+    let (columns, source) = plan::select(select, &given, &mut seeing)?;
     let mut reservation = budget.reserve(0, "query")?;
     let mut rows = Vec::new();
-    let mut examined = 0;
-    let scope = table.scope();
-
-    if !aggregates.is_empty() {
-        let counted = match aggregates.iter().all(|aggregate| aggregate.of.is_none()) {
-            true => {
-                let ctx = EvalContext::new(params, now);
-                counts::count_without_rows(table, select.filter, reader, &ctx, read)?
-            }
-            false => None,
-        };
-        if let Some(count) = counted {
-            for aggregate in &mut aggregates {
-                aggregate.seen = count as i64;
-            }
-        } else {
-            let path = source.choose(&[], &[])?;
-            examined = source.walk(&path, &mut reservation, |_, row, bytes, reservation| {
-                for aggregate in &mut aggregates {
-                    aggregate.add(&scope, &row, params, now, reservation)?;
-                }
-                reservation.shrink(bytes);
-                Ok(true)
-            })?;
-        }
-        if limit > 0 {
-            // What a least or greatest value takes is already held.
-            reservation.grow(row_overhead(aggregates.len()))?;
-            rows.push(aggregates.into_iter().map(Aggregate::answer).collect());
-        }
-    } else if limit > 0 {
-        // The select list worked out for one row.
-        let moved = source.moved(select.columns)?;
-        let output = |row: Vec<Value>, bytes: u64, reservation: &mut Reservation| {
-            source.output(select.columns, &moved, row, bytes, None, reservation)
-        };
-        let path = source.choose(select.order, &[])?;
-        if path.in_order {
-            examined = source.walk(&path, &mut reservation, |_, row, bytes, reservation| {
-                rows.push(output(row, bytes, reservation)?);
-                Ok(rows.len() < limit)
-            })?;
-        } else {
-            let mut sorting: Vec<Sorting> = Vec::new();
-            let mut key_bytes = 0;
-            examined = source.walk(&path, &mut reservation, |_, row, bytes, reservation| {
-                let order = select.order;
-                let most = order
-                    .iter()
-                    .map(|key| most_bytes(&key.expr, &scope, &row, params));
-                let held = row_overhead(order.len()) + most.sum::<u64>();
-                reservation.grow(held + size_of::<Sorting>() as u64)?;
-                key_bytes += held + size_of::<Sorting>() as u64;
-                let keys = order
-                    .iter()
-                    .map(|key| eval(&key.expr, &scope, &row, &EvalContext::new(params, now)))
-                    .collect::<Result<Vec<_>>>()?;
-                sorting.push(Sorting { keys, row, bytes });
-                Ok(true)
-            })?;
-            sorting.sort_by(|a, b| {
-                let keys = a.keys.iter().zip(&b.keys).zip(select.order);
-                keys.map(|((a, b), key)| match key.direction {
-                    SortDirection::Desc => sort_order(a, b).reverse(),
-                    _ => sort_order(a, b),
-                })
-                .find(|order| order.is_ne())
-                .unwrap_or(Ordering::Equal)
-            });
-            for cut in sorting.drain(limit.min(sorting.len())..) {
-                reservation.shrink(cut.bytes);
-            }
-            for kept in sorting {
-                rows.push(output(kept.row, kept.bytes, &mut reservation)?);
-            }
-            reservation.shrink(key_bytes);
-        }
-    }
-
+    let examined = source.rows(&mut reservation, &mut |row, _, _| {
+        rows.push(row);
+        Ok(true)
+    })?;
     Ok(QueryResult {
         columns,
         rows,
         rows_affected: 0,
         rows_examined: examined,
-        distance_evaluations: 0,
+        distance_evaluations: given.evaluations.get(),
         _reservation: Some(reservation),
     })
 }
 
-/// What a result calls its columns: the table's own names for `SELECT *` (`None`), otherwise
-/// each item's `AS` name, a bare column's name, an aggregate's name, and `expr` for any other
-/// expression.
-fn names(table: &Table, columns: Option<&[ProjectColumn]>, aggregates: bool) -> Vec<String> {
-    let Some(columns) = columns else {
-        let declared = table.meta.columns.iter();
-        return declared.map(|column| column.name.clone()).collect();
+/// The values of the SELECTs of one statement, each under the place its text begins.
+pub(crate) type Values = Vec<(usize, Vec<Value>)>;
+
+/// The values of the SELECTs inside the INSERT, UPDATE or DELETE `plan` that `write` is run
+/// with, as [`run`] would read them from `read`, each read once before the write changes a row
+/// and held in `held`.
+pub(crate) fn written(
+    plan: &Plan,
+    write: &crate::write::Given,
+    read: &dyn Read,
+    held: &mut Reservation,
+) -> Result<Values> {
+    let given = Given {
+        params: write.params,
+        catalog: write.catalog,
+        read,
+        reader: write.reader,
+        budget: write.budget,
+        ctx: EvalContext::new(write.params, write.now),
+        evaluations: &Cell::default(),
+        named: None,
+        bound: None,
     };
-    columns
-        .iter()
-        .map(|column| match (&column.alias, &column.expr) {
-            (Some(alias), _) => alias.clone(),
-            (None, Expr::Column(column)) => column.column.clone(),
-            (None, Expr::FunctionCall { name, .. }) if aggregates => name.clone(),
-            (None, _) => "expr".to_owned(),
-        })
-        .collect()
-}
-
-/// One planned SELECT, as the planner nests it: LIMIT over the select list over ORDER BY over
-/// one table with its filter.
-struct Select<'a> {
-    table: &'a str,
-    filter: Option<&'a Expr>,
-    order: &'a [SortKey],
-    /// `None` for `SELECT *`.
-    columns: Option<&'a [ProjectColumn]>,
-    limit: Option<u64>,
-}
-
-impl<'a> Select<'a> {
-    /// Reads the shape out of a plan, refusing by name a plan this version does not answer.
-    fn of(mut plan: &'a Plan) -> Result<Select<'a>> {
-        let (mut limit, mut columns) = (None, None);
-        let mut order: &[SortKey] = &[];
-        if let Plan::Limit { input, count } = plan {
-            limit = Some(*count);
-            plan = &**input;
-        }
-        if let Plan::Project {
-            input,
-            columns: list,
-        } = plan
-        {
-            columns = Some(list.as_slice());
-            plan = &**input;
-        }
-        if let Plan::Sort { input, keys } = plan {
-            order = keys;
-            plan = &**input;
-        }
-        let Plan::Scan { table, filter } = plan else {
-            return Err(unsupported("this statement"));
-        };
-        let (table, filter) = (table.as_str(), filter.as_ref());
-        Ok(Select {
-            table,
-            filter,
-            order,
-            columns,
-            limit,
-        })
-    }
-}
-
-/// A row waiting to be sorted: the values it sorts by, and the bytes the row holds of the
-/// statement's reservation.
-struct Sorting {
-    keys: Vec<Value>,
-    row: Vec<Value>,
-    bytes: u64,
-}
-
-/// One aggregate of a select list, and its answer over the rows seen so far.
-struct Aggregate<'a> {
-    function: Function,
-    /// What is counted, added or compared; `None` for `COUNT(*)`.
-    of: Option<&'a Expr>,
-    /// How many rows took part: every row for `COUNT(*)`, otherwise those where `of` is not NULL.
-    seen: i64,
-    /// The sum, the least or the greatest so far; NULL until a row takes part.
-    value: Value,
-    /// The bytes of the statement's reservation that `value` holds.
-    held: u64,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum Function {
-    Count,
-    Sum,
-    Min,
-    Max,
-}
-
-impl<'a> Aggregate<'a> {
-    /// The aggregate an item of a select list is, if it is one.
-    fn of(expr: &'a Expr) -> Result<Option<Aggregate<'a>>> {
-        let Expr::FunctionCall { name, args } = expr else {
-            return Ok(None);
-        };
-        let functions = [
-            ("COUNT", Function::Count),
-            ("SUM", Function::Sum),
-            ("MIN", Function::Min),
-            ("MAX", Function::Max),
-        ];
-        let Some((_, function)) = functions
-            .into_iter()
-            .find(|(known, _)| name.eq_ignore_ascii_case(known))
-        else {
-            return Ok(None);
-        };
-        let [of] = args.as_slice() else {
-            return Err(Error::PlanError(format!("{name} takes one argument")));
-        };
-        let every_row = function == Function::Count
-            && matches!(of, Expr::Column(column) if column.column == "*");
-        Ok(Some(Aggregate {
-            function,
-            of: (!every_row).then_some(of),
-            seen: 0,
-            value: Value::Null,
-            held: 0,
-        }))
-    }
-
-    /// Refuses a SUM over a column that does not hold numbers, whatever rows the table has.
-    fn check(&self, table: &Table, of: &Expr) -> Result<()> {
-        let Expr::Column(column) = of else {
-            return Ok(());
-        };
-        let column = &table.meta.columns[column_index(table, column)?];
-        if self.function == Function::Sum
-            && !matches!(column.column_type, ColumnType::Integer | ColumnType::Real)
-        {
-            return Err(Error::PlanError(format!(
-                "SUM needs numbers, and the column {} holds none",
-                column.name
-            )));
-        }
-        Ok(())
-    }
-
-    /// Takes one row into the answer. A NULL takes no part in any aggregate but `COUNT(*)`.
-    /// The memory of the value is asked for before it is made, and given back unless the value
-    /// is kept as the least or the greatest so far.
-    fn add(
-        &mut self,
-        scope: &Scope,
-        row: &[Value],
-        params: &HashMap<String, Value>,
-        now: i64,
-        reservation: &mut Reservation,
-    ) -> Result<()> {
-        if let Some(of) = self.of {
-            let most = most_bytes(of, scope, row, params);
-            reservation.grow(most)?;
-            let value = eval(of, scope, row, &EvalContext::new(params, now))?;
-            if value == Value::Null {
-                reservation.shrink(most);
-                return Ok(());
-            }
-            let first = self.value == Value::Null;
-            let better = match self.function {
-                Function::Count => None,
-                Function::Sum => {
-                    let so_far = if first { &Value::Int64(0) } else { &self.value };
-                    self.value = arithmetic(Arithmetic::Add, so_far, &value)?;
-                    None
-                }
-                Function::Min => Some(Ordering::Less),
-                Function::Max => Some(Ordering::Greater),
-            };
-            if better.is_some_and(|better| first || compare(&value, &self.value) == Some(better)) {
-                reservation.shrink(self.held);
-                (self.value, self.held) = (value, most);
-            } else {
-                reservation.shrink(most);
-            }
-        }
-        self.seen += 1;
-        Ok(())
-    }
-
-    /// The answer over the rows taken: a count of nothing is zero, and every other aggregate of
-    /// nothing is NULL.
-    fn answer(self) -> Value {
-        match self.function {
-            Function::Count => Value::Int64(self.seen),
-            _ => self.value,
-        }
-    }
+    subquery::written(plan, &given, held)
 }
 
 /// The memory a row of this many values takes before any text, JSON or vector in it.

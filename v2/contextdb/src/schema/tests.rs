@@ -208,22 +208,22 @@ fn a_schema_record_with_one_byte_changed_is_a_whole_table_or_damage_and_never_a_
 
 #[test]
 fn the_index_clauses_of_a_vector_column_give_the_numbers_in_force() {
-    use super::{Consolidation, Quantization, VectorColumn};
+    use super::{Compaction, Quantization, VectorColumn};
     use crate::store::VectorId;
-    let column = |id, auto_index_at, consolidation, quantization| VectorColumn {
+    let column = |id, indexing_threshold, compaction, quantization| VectorColumn {
         id: VectorId(id),
         column: format!("v{id}"),
         partition_key: Vec::new(),
         max_partitions: None,
         search_mode: None,
-        auto_index_at,
-        consolidation,
+        indexing_threshold,
+        compaction,
         quantization,
     };
-    let percent = |change, tombstone| Some(Consolidation::Percent { change, tombstone });
+    let percent = |change, tombstone| Some(Compaction::Percent { change, tombstone });
     let vectors = [
         column(0, None, None, Quantization::F32),
-        column(1, Some(1000), Some(Consolidation::None), Quantization::Sq8),
+        column(1, Some(1000), Some(Compaction::None), Quantization::Sq8),
         column(
             2,
             Some(u64::MAX),
@@ -241,7 +241,7 @@ fn the_index_clauses_of_a_vector_column_give_the_numbers_in_force() {
             (
                 vector.index_at(),
                 vector.grouped_from(),
-                vector.consolidation(),
+                vector.compaction(),
             )
         })
         .collect();
@@ -264,7 +264,7 @@ fn dropping_a_vector_column_leaves_no_record_of_any_kind_for_it() {
     let folder = folder("drop-vector-records");
     declare(
         &folder,
-        &["CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR(4) AUTO_INDEX_AT 1000)"],
+        &["CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR(4) INDEXING_THRESHOLD 1000)"],
     );
     let id = table(&folder, "t").vectors[0].id;
     // One record of every kind the vector part keeps for the column, as sealing and building

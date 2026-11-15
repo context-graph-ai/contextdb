@@ -11,7 +11,7 @@
 //! number that is no column and bytes left over are all damage.
 
 use super::rules::{Count, RankPolicy, Reference};
-use super::{Consolidation, Quantization, Rules, Table, VectorColumn};
+use super::{Compaction, Quantization, Rules, Table, VectorColumn};
 use crate::sql::ast;
 use crate::store::{CountId, IndexId, Read, TableId, VectorId, View};
 use crate::types::{
@@ -205,7 +205,7 @@ fields! {
     ColumnDef { name, column_type, nullable, primary_key, unique, default }
     IndexDecl { name, columns, json_path }
     VectorColumn {
-        id, column, partition_key, max_partitions, search_mode, auto_index_at, consolidation,
+        id, column, partition_key, max_partitions, search_mode, indexing_threshold, compaction,
         quantization
     }
     StateMachine { column, transitions }
@@ -334,18 +334,18 @@ impl Stored for Value {
     }
 }
 
-impl Stored for Consolidation {
+impl Stored for Compaction {
     fn put(&self, out: &mut Vec<u8>) {
         match *self {
-            Consolidation::None => out.push(0),
-            Consolidation::Percent { change, tombstone } => (1u8, change, tombstone).put(out),
+            Compaction::None => out.push(0),
+            Compaction::Percent { change, tombstone } => (1u8, change, tombstone).put(out),
         }
     }
 
     fn get(read: &mut Reader) -> Option<Self> {
         match u8::get(read)? {
-            0 => Some(Consolidation::None),
-            1 => Some(Consolidation::Percent {
+            0 => Some(Compaction::None),
+            1 => Some(Compaction::Percent {
                 change: Stored::get(read)?,
                 tombstone: Stored::get(read)?,
             }),

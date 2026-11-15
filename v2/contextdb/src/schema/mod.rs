@@ -28,8 +28,11 @@ use std::sync::Arc;
 pub(crate) use self::alter::Declared;
 pub(crate) use self::rules::{Reference, Rules};
 use crate::query::Scope;
-use crate::sql::Plan;
-use crate::store::{Cell, ChangeSet, EntryShape, IndexId, Read, Row, TableId, VectorId, View};
+use crate::sql::plan::InsertPlan;
+use crate::sql::{Expr, Plan};
+use crate::store::{
+    Cell, ChangeSet, Entry, EntryShape, IndexId, Read, Row, TableId, VectorId, View,
+};
 use crate::types::{
     ColumnType, Error, IndexDecl, Result, TableMeta, Value, VectorIndexRef, VectorSearchMode,
 };
@@ -37,6 +40,9 @@ use crate::types::{
 /// What the name of an index the engine makes for itself begins with. An index of CREATE INDEX
 /// may not take one of these.
 const RESERVED_PREFIXES: [&str; 4] = ["__pk_", "__unique_", "__fk_", "__graph_"];
+
+/// What [`Table::insert`] gives.
+pub(crate) type Inserted<'p> = (Vec<usize>, Option<(Vec<usize>, Vec<(usize, &'p Expr)>)>);
 
 /// One declared table as the other parts use it. The rules a host reads are in `meta`; what
 /// `schema` works out from the declaration beyond them is in `rules`.
@@ -77,21 +83,21 @@ pub(crate) struct VectorColumn {
     pub max_partitions: Option<u32>,
     /// SEARCH_MODE as declared; `None` when the declaration names none.
     pub search_mode: Option<VectorSearchMode>,
-    /// AUTO_INDEX_AT as declared; `None` when the declaration names none.
-    pub auto_index_at: Option<u64>,
-    /// CONSOLIDATION as declared; `None` when the declaration names none.
-    pub consolidation: Option<Consolidation>,
+    /// INDEXING_THRESHOLD as declared; `None` when the declaration names none.
+    pub indexing_threshold: Option<u64>,
+    /// COMPACTION as declared; `None` when the declaration names none.
+    pub compaction: Option<Compaction>,
     /// How the column keeps a vector: what `WITH (quantization = ...)` declared.
     pub quantization: Quantization,
 }
 
-/// What `CONSOLIDATION` declares: when the vectors written since a partition was grouped, and
+/// What `COMPACTION` declares: when the vectors written since a partition was grouped, and
 /// the slots its rows have left behind, call for grouping it again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Consolidation {
-    /// `CONSOLIDATION NONE`: never for those reasons.
+pub(crate) enum Compaction {
+    /// `COMPACTION NONE`: never for those reasons.
     None,
-    /// `CONSOLIDATION (CHANGE_PERCENT = n, TOMBSTONE_PERCENT = n)`; a member that was not
+    /// `COMPACTION (CHANGE_PERCENT = n, TOMBSTONE_PERCENT = n)`; a member that was not
     /// written is `None` and takes its default.
     Percent {
         change: Option<u8>,
@@ -109,15 +115,15 @@ pub(crate) enum Quantization {
     Sq8,
 }
 
-/// AUTO_INDEX_AT of a column that declares none: a comparison of every vector of this many
+/// INDEXING_THRESHOLD of a column that declares none: a comparison of every vector of this many
 /// takes about a hundredth of a second on one core, and past it the groupings are worth using.
 const DEFAULT_INDEX_AT: u64 = 100_000;
-/// A partition is given its first grouping when it holds this share of AUTO_INDEX_AT: one in
+/// A partition is given its first grouping when it holds this share of INDEXING_THRESHOLD: one in
 /// a hundred, so that the groupings of a store spread over many partitions are in place before
 /// AUTO begins to use them.
 const GROUPED_SHARE: u64 = 100;
 /// CHANGE_PERCENT and TOMBSTONE_PERCENT of a column that declares none.
-const DEFAULT_CONSOLIDATION: (u8, u8) = (20, 10);
+const DEFAULT_COMPACTION: (u8, u8) = (20, 10);
 
 impl VectorColumn {
     /// The most partitions the column may have: what was declared, 256 when a PARTITION_KEY
@@ -133,26 +139,26 @@ impl VectorColumn {
         self.search_mode.unwrap_or_default()
     }
 
-    /// AUTO_INDEX_AT in force: what was declared, else 100,000. The count of vectors in the
+    /// INDEXING_THRESHOLD in force: what was declared, else 100,000. The count of vectors in the
     /// selected partitions together from which AUTO uses their groupings.
     pub(crate) fn index_at(&self) -> u64 {
-        self.auto_index_at.unwrap_or(DEFAULT_INDEX_AT)
+        self.indexing_threshold.unwrap_or(DEFAULT_INDEX_AT)
     }
 
     /// How many slots a partition's tail holds when its first grouping is due: a hundredth of
-    /// AUTO_INDEX_AT in force and one at least, so 1,000 where nothing is declared.
+    /// INDEXING_THRESHOLD in force and one at least, so 1,000 where nothing is declared.
     pub(crate) fn grouped_from(&self) -> u64 {
         (self.index_at() / GROUPED_SHARE).max(1)
     }
 
     /// CHANGE_PERCENT and TOMBSTONE_PERCENT in force, 20 and 10 where none was declared;
-    /// `None` under `CONSOLIDATION NONE`.
-    pub(crate) fn consolidation(&self) -> Option<(u8, u8)> {
-        let (change, tombstone) = DEFAULT_CONSOLIDATION;
-        match self.consolidation {
+    /// `None` under `COMPACTION NONE`.
+    pub(crate) fn compaction(&self) -> Option<(u8, u8)> {
+        let (change, tombstone) = DEFAULT_COMPACTION;
+        match self.compaction {
             None => Some((change, tombstone)),
-            Some(Consolidation::None) => None,
-            Some(Consolidation::Percent {
+            Some(Compaction::None) => None,
+            Some(Compaction::Percent {
                 change: c,
                 tombstone: t,
             }) => Some((c.unwrap_or(change), t.unwrap_or(tombstone))),
@@ -164,6 +170,70 @@ impl Table {
     /// The table's columns as an expression reaches them: under the table's name, in row order.
     pub(crate) fn scope(&self) -> Scope<'_> {
         Scope::of(&self.name, &self.meta.columns)
+    }
+
+    /// Where the column a statement or an index names is in a row of the table.
+    pub(crate) fn column(&self, name: &str) -> Result<usize> {
+        rules::position(&self.name, &self.meta, name)
+    }
+
+    /// Where each column a statement writes is in a row; one named twice is refused.
+    pub(crate) fn targets<'n>(&self, of: impl Iterator<Item = &'n String>) -> Result<Vec<usize>> {
+        let mut targets = Vec::new();
+        for name in of {
+            let at = self.column(name)?;
+            if targets.contains(&at) {
+                let table = &self.name;
+                let refusal = format!("{name} is named twice as a column {table} is written in");
+                return Err(Error::PlanError(refusal));
+            }
+            targets.push(at);
+        }
+        Ok(targets)
+    }
+
+    /// Where each assigned column is in a row, with its new value.
+    pub(crate) fn set<'e>(&self, set: &'e [(String, Expr)]) -> Result<Vec<(usize, &'e Expr)>> {
+        let at = self.targets(set.iter().map(|(name, _)| name))?;
+        let values = set.iter().map(|(_, value)| value);
+        Ok(at.into_iter().zip(values).collect())
+    }
+
+    /// Checks an INSERT's columns, its `ON CONFLICT` and the length of each row of VALUES. Gives
+    /// where each column is, and the columns of `ON CONFLICT` with where each assignment writes.
+    pub(crate) fn insert<'p>(&self, plan: &'p InsertPlan) -> Result<Inserted<'p>> {
+        let named = match plan.columns.is_empty() {
+            true => (0..self.meta.columns.len()).collect(),
+            false => self.targets(plan.columns.iter())?,
+        };
+        let conflict = match &plan.on_conflict {
+            Some(conflict) => {
+                let on = conflict.columns.iter().map(|name| self.column(name));
+                let mut on: Vec<usize> = on.collect::<Result<_>>()?;
+                on.sort_unstable();
+                let is_on = |index: &IndexDecl| {
+                    let at = index.columns.iter().map(|(name, _)| self.column(name).ok());
+                    let mut at: Vec<_> = at.collect::<Option<_>>().unwrap_or_default();
+                    at.sort_unstable();
+                    rules::is_rule(index) && at == on
+                };
+                if !self.meta.indexes.iter().any(is_on) {
+                    return Err(Error::PlanError(format!(
+                        "ON CONFLICT ({}) names neither the primary key nor a UNIQUE rule of {}",
+                        conflict.columns.join(", "),
+                        self.name
+                    )));
+                }
+                Some((on, self.set(&conflict.assignments)?))
+            }
+            None => None,
+        };
+        let (table, columns) = (&self.name, named.len());
+        if let Some(given) = plan.values.iter().map(Vec::len).find(|&n| n != columns) {
+            let refusal = format!("INSERT INTO {table} gives {given} values for {columns} columns");
+            return Err(Error::PlanError(refusal));
+        }
+        Ok((named, conflict))
     }
 
     /// The cell a stored row holds for a column. A row written before the column was added has
@@ -178,6 +248,19 @@ impl Table {
     /// How the entries of the index at this place in `meta.indexes` are made.
     pub(crate) fn entry_shape(&self, index: usize) -> &EntryShape {
         &self.shapes[index]
+    }
+
+    /// The entry, in the index at this place in `meta.indexes`, of a row holding `values` in its
+    /// columns. One over a JSON path has none for a row with no [`field_key`] at the path.
+    pub(crate) fn entry(&self, index: usize, values: &[Value]) -> Result<Option<Entry>> {
+        let path = &self.meta.indexes[index].json_path;
+        let field = match (path.is_empty(), values) {
+            (true, _) => return self.shapes[index].entry(values).map(Some),
+            (false, [Value::Json(json)]) => path.iter().try_fold(json, |json, key| json.get(key)),
+            (false, _) => None,
+        };
+        let key = field.and_then(field_key);
+        key.map(|key| self.shapes[index].entry(&[key])).transpose()
     }
 
     /// The table with the shape of each of its indexes, made once here: every table of a
@@ -225,6 +308,17 @@ impl Table {
     }
 }
 
+/// What an index over a JSON path keeps for the field there: its text as JSON writes it, a
+/// number as its REAL value (adding zero makes `-0` into `0`), so that fields `=` finds equal
+/// keep one text; nothing for an object or an array.
+pub(crate) fn field_key(field: &serde_json::Value) -> Option<Value> {
+    Some(Value::Text(match field {
+        serde_json::Value::Object(_) | serde_json::Value::Array(_) => return None,
+        serde_json::Value::Number(number) => (number.as_f64()? + 0.0).to_string(),
+        scalar => scalar.to_string(),
+    }))
+}
+
 /// Every table declared in a store at one moment.
 pub(crate) struct Catalog {
     tables: BTreeMap<String, Table>,
@@ -270,6 +364,17 @@ impl Catalog {
     /// Every table, in name order.
     pub(crate) fn tables(&self) -> Vec<&Table> {
         self.tables.values().collect()
+    }
+
+    /// The name of every table, in name order.
+    pub(crate) fn table_names(&self) -> Vec<String> {
+        self.tables.keys().cloned().collect()
+    }
+
+    /// A table's declaration as `.schema` prints it, or `TableNotFound`.
+    pub(crate) fn declaration(&self, name: &str) -> Result<String> {
+        let table = self.table(name).map(render);
+        table.ok_or_else(|| Error::TableNotFound(name.to_owned()))
     }
 
     /// The table that has the VECTOR column with this number, and what it keeps about it.
@@ -328,6 +433,6 @@ pub(crate) fn declare(
 }
 
 /// The declaration as `.schema` prints it: text that, run again, declares the same table.
-pub(crate) fn render(table: &Table) -> String {
+fn render(table: &Table) -> String {
     render::declaration(table)
 }

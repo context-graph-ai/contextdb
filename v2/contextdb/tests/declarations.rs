@@ -7,7 +7,8 @@ mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use contextdb::{Database, Error, ReadSession};
+use contextdb::{Database, Error};
+use support::{printed, words};
 
 /// The declarations of a program built on this library, as that program writes them.
 const CONSUMER_SCHEMA: &str = include_str!("fixtures/consumer_schema.sql");
@@ -69,49 +70,6 @@ fn referenced(sql: &str) -> BTreeSet<String> {
     parents.filter(|parent| *parent != own).collect()
 }
 
-/// The words of a declaration in lower case and its quoted texts as they are written: what the
-/// declaration says, whatever the order, the spacing and the punctuation it says it in. A type
-/// is given the name it is printed under, and a quoted name that needs no quotes loses them.
-fn words(sql: &str) -> Vec<String> {
-    let mut found = Vec::new();
-    let mut rest = sql.chars().peekable();
-    while let Some(first) = rest.next() {
-        if first == '\'' || first == '"' {
-            let mut text = String::from(first);
-            loop {
-                let next = rest.next().expect("a quoted text ends with its quote");
-                text.push(next);
-                // The quote written twice is one quote of the text.
-                if next == first && rest.next_if_eq(&first).is_none() {
-                    break;
-                }
-            }
-            let inner = &text[1..text.len() - 1];
-            let plain = first == '"'
-                && inner.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
-                && inner
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-            found.push(if plain { inner.to_owned() } else { text });
-        } else if first.is_ascii_alphanumeric() || first == '_' {
-            let mut word = String::from(first.to_ascii_lowercase());
-            while let Some(next) =
-                rest.next_if(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
-            {
-                word.push(next.to_ascii_lowercase());
-            }
-            match word.as_str() {
-                "int" => found.push("integer".to_owned()),
-                "bool" => found.push("boolean".to_owned()),
-                "float" => found.push("real".to_owned()),
-                "state_machine" => found.extend(["state".to_owned(), "machine".to_owned()]),
-                _ => found.push(word),
-            }
-        }
-    }
-    found
-}
-
 /// Asserts that the text a table is printed back as says everything its author wrote and
 /// nothing else. `written` is the table's `CREATE TABLE` and each `CREATE INDEX` on it.
 fn assert_prints_what_was_written(written: &[&str], printed: &str, table: &str) {
@@ -155,12 +113,6 @@ fn declare<S: AsRef<str>>(db: &Database, statements: impl IntoIterator<Item = S>
     }
 }
 
-/// What a table is printed back as.
-fn printed(db: &Database, table: &str) -> String {
-    db.declaration(table)
-        .unwrap_or_else(|error| panic!("the declaration of {table} was refused: {error:?}"))
-}
-
 /// The statements for each table, the table's own first, with the tables in the order they
 /// were declared.
 fn by_table(statements: &[String]) -> Vec<(String, Vec<&str>)> {
@@ -178,6 +130,11 @@ fn by_table(statements: &[String]) -> Vec<(String, Vec<&str>)> {
     tables
 }
 
+/// The tables' names, in the order they were declared.
+fn names_in_order<'a>(tables: &'a [(String, Vec<&str>)]) -> Vec<&'a str> {
+    tables.iter().map(|(table, _)| table.as_str()).collect()
+}
+
 /// Declares `written` in a fresh store and asserts, of every table: that it is printed back
 /// with what was written and nothing else; that what was printed, declared in an empty store,
 /// is printed the same; and that it is printed the same after the store is closed and opened,
@@ -187,7 +144,7 @@ fn assert_declared_and_printed_back(test: &str, written: &[String]) -> BTreeMap<
     let db = support::open(&folder);
     declare(&db, written);
     let tables = by_table(written);
-    let mut names: Vec<&str> = tables.iter().map(|(table, _)| table.as_str()).collect();
+    let mut names = names_in_order(&tables);
     names.sort_unstable();
     assert_eq!(db.table_names(), names, "the tables of the store");
 
@@ -198,21 +155,10 @@ fn assert_declared_and_printed_back(test: &str, written: &[String]) -> BTreeMap<
         texts.insert(table.clone(), text);
     }
 
-    let again = support::open(&support::folder(&format!("{test}-again")));
-    for (table, _) in &tables {
-        declare(&again, statements(&texts[table]));
-    }
-    for (table, text) in &texts {
-        assert_eq!(
-            &printed(&again, table),
-            text,
-            "{table}, declared from its printed text in an empty store, is printed differently"
-        );
-    }
+    support::assert_roundtrips(test, &db, &names_in_order(&tables));
 
-    support::close(db);
-    let db = support::open(&folder);
-    let reader = ReadSession::open(&folder).expect("open the store for reading");
+    let db = support::reopen(db, &folder);
+    let reader = support::open_reader(&folder, None);
     for (table, text) in &texts {
         assert_eq!(&printed(&db, table), text, "{table} after close and open");
         let read = reader.declaration(table).expect("a reader's declaration");
@@ -418,11 +364,7 @@ fn a_name_without_quotes_is_stored_in_lower_case_and_a_quoted_name_as_written() 
         "CREATE TABLE \"Mixed Case\" (\n  \"Id\" INTEGER PRIMARY KEY,\n  \"two words\" TEXT\n);\n"
     );
     // The printed texts declare the same two tables in an empty store.
-    let again = support::open(&support::folder("declared-names-again"));
-    for table in ["Mixed Case", "folded"] {
-        declare(&again, statements(&printed(&db, table)));
-        assert_eq!(printed(&again, table), printed(&db, table));
-    }
+    support::assert_roundtrips("declared-names", &db, &["Mixed Case", "folded"]);
     // The table is found by its stored name alone.
     for missing in ["Folded", "FOLDED", "mixed case"] {
         assert!(
@@ -491,8 +433,7 @@ CREATE INDEX by_stars ON notes (stars DESC, \"made at\");
 CREATE INDEX by_body ON notes (body);
 ";
     assert_eq!(printed(&db, "notes"), text);
-    support::close(db);
-    let db = support::open(&folder);
+    let db = support::reopen(db, &folder);
     assert_eq!(printed(&db, "notes"), text, "after close and open");
 }
 
@@ -502,10 +443,6 @@ enum Refused {
     Schema(&'static [&'static str]),
     /// `ParseError`, with a sentence that holds each of these.
     Parse(&'static [&'static str]),
-    /// `ParseError` or `SchemaInvalid`: no document says which of the two.
-    ParseOrSchema,
-    /// `StoredProcNotSupported`.
-    StoredProcedure,
 }
 
 #[test]
@@ -617,20 +554,12 @@ fn a_refused_declaration_says_why_and_declares_nothing() {
         // One key to a table.
         (
             "CREATE TABLE gauges (a INTEGER PRIMARY KEY, b TEXT, PRIMARY KEY (a, b))".to_owned(),
-            Refused::ParseOrSchema,
+            Refused::Schema(&["gauges", "PRIMARY KEY"]),
         ),
         (
             "CREATE TABLE gauges (a INTEGER, b TEXT, PRIMARY KEY (a, b), PRIMARY KEY (a))"
                 .to_owned(),
-            Refused::ParseOrSchema,
-        ),
-        (
-            "CREATE PROCEDURE tidy () AS 'DELETE FROM plans'".to_owned(),
-            Refused::StoredProcedure,
-        ),
-        (
-            "create function one () RETURNS INTEGER AS 'SELECT 1'".to_owned(),
-            Refused::StoredProcedure,
+            Refused::Parse(&["PRIMARY KEY"]),
         ),
     ];
     let declared = printed(&db, "plans");
@@ -640,8 +569,6 @@ fn a_refused_declaration_says_why_and_declares_nothing() {
         let as_expected = match (refused, &error) {
             (Refused::Schema(holds), Error::SchemaInvalid { reason }) => says(reason, holds),
             (Refused::Parse(holds), Error::ParseError(text)) => says(text, holds),
-            (Refused::ParseOrSchema, Error::ParseError(_) | Error::SchemaInvalid { .. }) => true,
-            (Refused::StoredProcedure, Error::StoredProcNotSupported) => true,
             _ => false,
         };
         assert!(as_expected, "{sql}\nwas refused as {error:?}");
@@ -787,7 +714,7 @@ fn a_declaration_that_says_a_thing_twice_or_two_ways_is_a_parse_error_that_names
                     "{name} (...) is not part of this library: the index sizes its own groups and \
                      measures how far a search scans; for the true nearest rows write USE VECTOR \
                      EXACT or SEARCH_MODE EXACT, and to move the size from which AUTO uses the \
-                     index write AUTO_INDEX_AT"
+                     index write INDEXING_THRESHOLD"
                 ),
                 "{sql}"
             ),

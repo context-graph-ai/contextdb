@@ -8,34 +8,34 @@ VALUES (1, 7, 0.5, 'north'), (2, 6, 1.5, 'south'), (3, NULL, NULL, NULL), (4, 9,
 # COUNT(*) counts rows and COUNT of a column counts its values that are not NULL.
 SELECT COUNT(*) FROM sales;
 ----
-COUNT
+count
 4
 
 SELECT COUNT(qty) FROM sales;
 ----
-COUNT
+count
 3
 
 SELECT COUNT(*) FROM sales WHERE qty > 6;
 ----
-COUNT
+count
 2
 
 SELECT COUNT(*) FROM sales WHERE id > 100;
 ----
-COUNT
+count
 0
 
 # SUM skips NULL, adds whole numbers as whole numbers and REAL as REAL, and is named after the
 # function unless the statement gives it a name.
 SELECT SUM(qty) FROM sales;
 ----
-SUM
+sum
 22
 
 SELECT SUM(price) FROM sales;
 ----
-SUM
+sum
 4.0
 
 SELECT SUM(qty) AS total FROM sales;
@@ -46,7 +46,7 @@ total
 # Over no rows SUM is NULL, not zero.
 SELECT SUM(qty) FROM sales WHERE id > 100;
 ----
-SUM
+sum
 NULL
 
 # A column that is not a number cannot be added.
@@ -64,25 +64,36 @@ error: PlanError
 # MIN and MAX skip NULL, and over no rows each is NULL.
 SELECT MIN(qty) FROM sales;
 ----
-MIN
+min
 6
 
 SELECT MAX(qty) FROM sales;
 ----
-MAX
+max
 9
 
 SELECT MIN(price), MAX(price) FROM sales;
 ----
-MIN | MAX
+min | max
 0.5 | 2.0
 
 SELECT MIN(region), MAX(region) FROM sales;
 ----
-MIN | MAX
+min | max
 east | south
 
 SELECT MIN(qty), MAX(qty) FROM sales WHERE id > 100;
 ----
-MIN | MAX
+min | max
 NULL | NULL
+
+# MIN and MAX of a VECTOR are refused, as pgvector has neither.
+CREATE TABLE vecs (id INTEGER PRIMARY KEY, v VECTOR(2));
+INSERT INTO vecs (id, v) VALUES (1, [1.0, 0.0]), (2, [0.0, 1.0]);
+SELECT MIN(v) FROM vecs;
+----
+error: PlanError
+
+SELECT MAX(v) FROM vecs;
+----
+error: PlanError

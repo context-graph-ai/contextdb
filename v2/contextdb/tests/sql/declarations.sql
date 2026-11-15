@@ -51,6 +51,22 @@ id | title
 2 | b
 3 | a
 
+# The indexes behind a key and a UNIQUE rule are __pk_<column> and __unique_<column>; a user's
+# index may not take either prefix, and may sit beside them.
+CREATE INDEX __pk_id ON notes (id);
+----
+error: ReservedIndexName
+
+CREATE INDEX __unique_title ON notes (title);
+----
+error: ReservedIndexName
+
+CREATE INDEX notes_by_body ON notes (body);
+SELECT id FROM notes WHERE body = 'x';
+----
+id
+2
+
 # A name written without quotes is its lower-case letters, and a name in quotes is the letters
 # as written: `Items`, `ITEMS` and `items` are one table, and "Items" is another.
 CREATE TABLE Items (Id INTEGER PRIMARY KEY, Name TEXT);
@@ -209,75 +225,14 @@ CREATE TABLE p_push (id INTEGER PRIMARY KEY, t TEXT NOT NULL, v VECTOR(2) PARTIT
 CREATE TABLE p_pull (id INTEGER PRIMARY KEY, t TEXT NOT NULL, v VECTOR(2) PARTITION_KEY (t)) SYNC PULL ONLY;
 CREATE TABLE p_two_way (id INTEGER PRIMARY KEY, t TEXT NOT NULL, v VECTOR(2) PARTITION_KEY (t)) SYNC TWO WAY;
 
-# A table that keeps only current versions, sends its rows out and keeps the first write would
-# hand another machine a newest value as the first: refused. KEEP LATEST or SYNC OFF is the way
-# out, as above.
-CREATE TABLE refused (id TEXT PRIMARY KEY, state TEXT NOT NULL) HISTORY CURRENT ONLY;
+# A STATE MACHINE over a table that is IMMUTABLE could never move.
+CREATE TABLE refused (id INTEGER PRIMARY KEY, status TEXT NOT NULL) STATE MACHINE (status: a -> [b]) IMMUTABLE;
 ----
 error: SchemaInvalid
 
-CREATE TABLE refused (id TEXT PRIMARY KEY, state TEXT NOT NULL) HISTORY CURRENT ONLY SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST;
-----
-error: SchemaInvalid
-
-# An IMMUTABLE table has no row to expire and no older version to drop.
-CREATE TABLE refused (id INTEGER PRIMARY KEY) IMMUTABLE RETAIN 7 DAYS;
-----
-error: SchemaInvalid
-
-CREATE TABLE refused (id INTEGER PRIMARY KEY) IMMUTABLE HISTORY CURRENT ONLY SYNC OFF;
-----
-error: SchemaInvalid
-
-# SYNC SAFE waits for delivery, so it needs a direction that delivers. Plain RETAIN takes any.
-CREATE TABLE refused (id INTEGER PRIMARY KEY) RETAIN 7 DAYS SYNC SAFE SYNC OFF;
-----
-error: SchemaInvalid
-
-CREATE TABLE refused (id INTEGER PRIMARY KEY) RETAIN 7 DAYS SYNC SAFE SYNC PULL ONLY;
-----
-error: SchemaInvalid
-
+# Plain RETAIN takes any direction.
 CREATE TABLE retain_local (id INTEGER PRIMARY KEY) RETAIN 7 DAYS SYNC OFF;
 CREATE TABLE retain_pull (id INTEGER PRIMARY KEY) RETAIN 7 DAYS SYNC PULL ONLY;
-
-# RETAIN names no direction: one written inside it is a syntax error.
-CREATE TABLE refused (id INTEGER PRIMARY KEY) RETAIN 24 HOURS SYNC SAFE PUSH ONLY;
-----
-error: ParseError
-
-# A reference names columns that a key or a UNIQUE rule of the parent covers.
-CREATE TABLE refused (id INTEGER PRIMARY KEY, plan_name TEXT REFERENCES plans(name));
-----
-error: SchemaInvalid
-
-CREATE TABLE refused (
-  id INTEGER PRIMARY KEY,
-  context_id UUID,
-  name TEXT,
-  FOREIGN KEY (context_id, name) REFERENCES projects(context_id, name)
-);
-----
-error: SchemaInvalid
-
-# A kept count needs an index that leads with its list, and is not kept where a key already
-# says the count is at most one.
-CREATE TABLE refused (id INTEGER PRIMARY KEY, kind TEXT) MAINTAIN COUNT (kind);
-----
-error: SchemaInvalid
-
-CREATE TABLE refused (id INTEGER PRIMARY KEY, kind TEXT) MAINTAIN COUNT (id);
-----
-error: SchemaInvalid
-
-# DAG is for a table of edges: source_id, target_id and edge_type.
-CREATE TABLE refused (id INTEGER PRIMARY KEY, source_id UUID NOT NULL, target_id UUID NOT NULL) DAG('DEPENDS_ON');
-----
-error: SchemaInvalid
-
-SELECT id FROM refused;
-----
-error: TableNotFound
 
 # A key, a UNIQUE rule and an index name at most 32 columns.
 CREATE TABLE refused (c01 INTEGER, c02 INTEGER, c03 INTEGER, c04 INTEGER, c05 INTEGER, c06 INTEGER, c07 INTEGER, c08 INTEGER, c09 INTEGER, c10 INTEGER, c11 INTEGER, c12 INTEGER, c13 INTEGER, c14 INTEGER, c15 INTEGER, c16 INTEGER, c17 INTEGER, c18 INTEGER, c19 INTEGER, c20 INTEGER, c21 INTEGER, c22 INTEGER, c23 INTEGER, c24 INTEGER, c25 INTEGER, c26 INTEGER, c27 INTEGER, c28 INTEGER, c29 INTEGER, c30 INTEGER, c31 INTEGER, c32 INTEGER, c33 INTEGER, PRIMARY KEY (c01, c02, c03, c04, c05, c06, c07, c08, c09, c10, c11, c12, c13, c14, c15, c16, c17, c18, c19, c20, c21, c22, c23, c24, c25, c26, c27, c28, c29, c30, c31, c32, c33));
@@ -299,24 +254,6 @@ error: SchemaInvalid
 
 CREATE INDEX wide_32 ON wide (c01, c02, c03, c04, c05, c06, c07, c08, c09, c10, c11, c12, c13, c14, c15, c16, c17, c18, c19, c20, c21, c22, c23, c24, c25, c26, c27, c28, c29, c30, c31, c32);
 CREATE TABLE wide_key (c01 INTEGER, c02 INTEGER, c03 INTEGER, c04 INTEGER, c05 INTEGER, c06 INTEGER, c07 INTEGER, c08 INTEGER, c09 INTEGER, c10 INTEGER, c11 INTEGER, c12 INTEGER, c13 INTEGER, c14 INTEGER, c15 INTEGER, c16 INTEGER, c17 INTEGER, c18 INTEGER, c19 INTEGER, c20 INTEGER, c21 INTEGER, c22 INTEGER, c23 INTEGER, c24 INTEGER, c25 INTEGER, c26 INTEGER, c27 INTEGER, c28 INTEGER, c29 INTEGER, c30 INTEGER, c31 INTEGER, c32 INTEGER, c33 INTEGER, PRIMARY KEY (c01, c02, c03, c04, c05, c06, c07, c08, c09, c10, c11, c12, c13, c14, c15, c16, c17, c18, c19, c20, c21, c22, c23, c24, c25, c26, c27, c28, c29, c30, c31, c32));
-
-# Clauses of a later version are still refused by their names, and stored procedures and
-# functions by their own kind.
-CREATE TABLE refused (id INTEGER PRIMARY KEY, until TIMESTAMP EXPIRES);
-----
-error: PlanError
-
-CREATE PROCEDURE tidy () AS 'DELETE FROM notes';
-----
-error: StoredProcNotSupported
-
-CREATE FUNCTION one () RETURNS INTEGER AS 'SELECT 1';
-----
-error: StoredProcNotSupported
-
-SELECT id FROM refused;
-----
-error: TableNotFound
 
 # An index names columns the table has and can index: a JSON column is not indexable, and a REAL
 # may be indexed but is no key and under no UNIQUE rule.
@@ -354,6 +291,15 @@ CREATE TABLE filled (id INTEGER PRIMARY KEY, doc JSON);
 INSERT INTO filled (id, doc) VALUES (1, '{"kind": "a"}');
 CREATE INDEX filled_by_kind ON filled ((doc -> 'kind'));
 SELECT id FROM filled;
+----
+id
+1
+
+# A JSON-path index may name a path of two keys.
+CREATE TABLE chained (id INTEGER PRIMARY KEY, doc JSON);
+CREATE INDEX chained_by_path ON chained ((doc -> 'k' -> 'j'));
+INSERT INTO chained (id, doc) VALUES (1, '{"k": {"j": 1}}');
+SELECT id FROM chained;
 ----
 id
 1

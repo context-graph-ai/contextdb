@@ -121,17 +121,29 @@ id | points
 1 | 30
 2 | NULL
 
-# With no ORDER BY, a read through an index comes in the index's order: its values, then the
-# row's key, whatever order the rows were written in.
-CREATE TABLE unordered (id INTEGER PRIMARY KEY, grp INTEGER NOT NULL);
-CREATE INDEX unordered_by_grp ON unordered (grp);
-INSERT INTO unordered (id, grp) VALUES (9, 2), (3, 1), (7, 2), (1, 1), (5, 2), (4, 1);
-SELECT id, grp FROM unordered WHERE grp >= 1;
+# An indexed read gives the same order on every route: rows written out of key order, read
+# through an index with a filter and no ORDER BY, come by indexed value and then by key (CDB-309).
+CREATE TABLE shelf (id INTEGER PRIMARY KEY, slot INTEGER NOT NULL);
+CREATE INDEX shelf_slot ON shelf (slot);
+INSERT INTO shelf (id, slot) VALUES (9, 2), (3, 1), (7, 2), (1, 2), (5, 1), (8, 3);
+
+SELECT id, slot FROM shelf WHERE slot >= 1;
 ----
-id | grp
-1 | 1
+id | slot
 3 | 1
-4 | 1
-5 | 2
+5 | 1
+1 | 2
 7 | 2
 9 | 2
+8 | 3
+
+# ORDER BY a whole number is not a column's place: it is refused, as the list of differences
+# from Postgres says (row 55), never taken for a constant.
+SELECT id FROM shelf ORDER BY 1 DESC LIMIT 2;
+----
+error: PlanError
+
+# Two output columns of one name that ORDER BY names are ambiguous, never read as a table column.
+SELECT slot AS id, id AS id FROM shelf ORDER BY id;
+----
+error: PlanError

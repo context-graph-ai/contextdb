@@ -129,7 +129,7 @@ struct Staged {
 }
 
 fn planned(sql: &str) -> Result<Plan> {
-    sql::plan(&sql::parse(sql)?)
+    sql::plan(sql::parse(sql)?)
 }
 
 /// Refuses `statement`, by its name, to a handle that declared a narrowing.
@@ -545,10 +545,7 @@ impl Database {
     ///
     /// On a handle that was closed, with the message "database handle is closed".
     pub fn table_names(&self) -> Vec<String> {
-        let open = self.must_be_open();
-        let newest = locked(&open.newest);
-        let tables = newest.catalog.tables().into_iter();
-        tables.map(|table| table.name.clone()).collect()
+        locked(&self.must_be_open().newest).catalog.table_names()
     }
 
     /// A table's declaration as SQL text, as of the newest commit: the `CREATE TABLE` statement
@@ -562,10 +559,7 @@ impl Database {
     /// [`crate::Error::DatabaseClosed`] on a handle that was closed. The answer is not read
     /// from the disk, so no other error is returned.
     pub fn declaration(&self, table: &str) -> Result<String> {
-        let open = self.opened()?;
-        let newest = locked(&open.newest);
-        let found = newest.catalog.table(table).map(schema::render);
-        found.ok_or_else(|| Error::TableNotFound(table.to_owned()))
+        locked(&self.opened()?.newest).catalog.declaration(table)
     }
 
     /// The number of the newest commit on disk: 0 for a store nothing was ever committed to,
@@ -599,7 +593,8 @@ impl Database {
         let open = self.opened()?;
         let (view, catalog) = open.newest()?;
         let now = system::now_millis(&*open.clock);
-        query::explain(&plan, &catalog, &view, &self.reader, &open.budget, now)
+        let (reader, budget) = (&self.reader, &open.budget);
+        query::explain(&plan, &HashMap::new(), &catalog, &view, reader, budget, now)
     }
 
     /// Runs one cycle of upkeep and returns what it did.
@@ -810,14 +805,14 @@ impl Transaction<'_> {
             op: BinOp::Eq,
             right: Box::new(Expr::Parameter("key".to_owned())),
         };
+        let params = HashMap::from([("key".to_owned(), key_value.clone())]);
         let asked = query::Asked {
             table: found,
             filter: Some(&filter),
             assigned: &[],
             needed: &needed,
             reader: &self.db.reader,
-            params: &HashMap::from([("key".to_owned(), key_value.clone())]),
-            now: 0,
+            ctx: query::EvalContext::new(&params, 0),
         };
         let rows = query::rows_for_write(&asked, None, &catalog, &staged.changes, &open.budget)?;
         let Some((key, cells)) = rows.and_then(|(rows, _)| rows.into_iter().next()) else {

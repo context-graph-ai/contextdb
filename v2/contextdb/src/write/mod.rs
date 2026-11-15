@@ -13,8 +13,8 @@
 //! caller undoes a refused statement by rewinding the change set.
 //!
 //! The values that name a row or a group (a primary key, a kept count's values, a partition
-//! key) are kept whole and refused past `KEY_LIMIT`. An index entry is made by
-//! `EntryShape::entry`, which cuts a long value, so no row is refused for one.
+//! key) are kept whole and refused past `KEY_LIMIT`. An index entry is made by `Table::entry`,
+//! which cuts a long value, so no row is refused for one.
 
 mod commit;
 mod counts;
@@ -30,14 +30,11 @@ use std::collections::{BTreeSet, HashMap};
 use std::ops::Bound;
 
 use crate::memory::Budget;
-use crate::query::{self, Reader, Visible};
+use crate::query::{self, Reader, Visible, equal};
 use crate::schema::{Catalog, Quantization, Table};
-use crate::sql::ast::{BinOp, ColumnRef};
 use crate::sql::plan::InsertPlan;
 use crate::sql::{Expr, Plan};
-use crate::store::{
-    Beside, Cell, ChangeSet, Compact, Entry, EntryShape, IndexId, KEY_LIMIT, Key, Read, Row,
-};
+use crate::store::{Beside, Cell, ChangeSet, Compact, Entry, IndexId, KEY_LIMIT, Key, Read, Row};
 use crate::types::{
     self, ColumnDefault, ColumnType, Error, Result, SortDirection, TxId, Value, shown, typed,
 };
@@ -82,23 +79,19 @@ pub(crate) fn apply(
     changes: &mut ChangeSet,
     partitions: &mut Tally,
 ) -> Result<u64> {
-    let name = match plan {
-        Plan::Insert(plan) => &plan.table,
-        Plan::Update(plan) => &plan.table,
-        Plan::Delete(plan) => &plan.table,
-        other => unreachable!("{other:?} writes no rows"),
-    };
+    let (name, ..) = plan.written().expect("an INSERT, UPDATE or DELETE");
     let table = given.catalog.table(name);
     let table = table.ok_or_else(|| Error::TableNotFound(name.clone()))?;
-    let rules = Rules::of(table, given)?;
+    let mut rules = Rules::of(table, given)?;
     rules.changeable(plan)?;
-    // What the reader's filter holds is given back with the statement.
+    // What the reader's filter and the statement's SELECTs hold is given back with it.
     let mut seeing = given.budget.reserve(0, "query")?;
+    rules.values = query::written(plan, given, &*changes, &mut seeing)?;
     let mut visible = Visible::new(table, given.catalog, given.reader, &mut seeing)?;
     let rows = match plan {
         Plan::Insert(plan) => rules.insert(plan, changes, partitions, &mut visible)?,
         Plan::Update(plan) => {
-            let (set, filter) = (rules.set(&plan.assignments)?, plan.where_clause.as_ref());
+            let (set, filter) = (table.set(&plan.assignments)?, plan.where_clause.as_ref());
             let params = given.params;
             rules.change(&set, filter, params, changes, partitions, &mut visible)?
         }
@@ -114,8 +107,8 @@ pub(crate) fn apply(
 }
 
 /// Stages an entry in a new index for every row the table already has, a batch of rows at a
-/// time, so that what is held here does not grow with the table. An index that holds no
-/// entries (the primary key's, or one over a JSON path) is passed over.
+/// time, so that what is held here does not grow with the table. The primary key's index,
+/// which holds no entries, is passed over.
 pub(crate) fn fill_index(
     table: &Table,
     index: IndexId,
@@ -142,19 +135,9 @@ pub(crate) fn fill_index(
     }
     let asked = rules.asked(None, &params, &[], &needed, &reader);
     rules.each(&asked, changes, |changes, key, cells| {
-        changes.put_index(index.id, index.entry(&split(cells).0)?, key)
+        let entry = index.entry(&split(cells).0)?;
+        entry.map_or(Ok(()), |entry| changes.put_index(index.id, entry, key))
     })
-}
-
-/// Where a column a statement or an index names is in a row of the table.
-fn column(table: &Table, name: &str) -> Result<usize> {
-    let mut columns = table.meta.columns.iter();
-    columns
-        .position(|column| column.name == name)
-        .ok_or_else(|| Error::ColumnNotFound {
-            table: table.name.clone(),
-            column: name.to_owned(),
-        })
 }
 
 /// What a write needs to know about its table, worked out once for a statement.
@@ -175,6 +158,8 @@ struct Rules<'a> {
     reduced: Vec<usize>,
     /// The rows that are to follow the rows whose state the statement has changed so far.
     followed: RefCell<Vec<propagate::Step>>,
+    /// The values of the SELECTs inside the statement, read before it changed a row.
+    values: query::Values,
 }
 
 /// One index of a table as a write uses it.
@@ -182,30 +167,25 @@ struct Index<'a> {
     id: IndexId,
     /// Where its columns are in a row, in index order.
     columns: Vec<usize>,
-    /// How its entries are made.
-    shape: &'a EntryShape,
-    /// The columns of the unique rule this index is behind, as a refusal names them. `schema`
-    /// makes one index for each unique rule and names it `__unique_...`.
-    unique: Option<String>,
+    /// Its table, and where it is among the table's indexes: how its entries are made.
+    table: &'a Table,
+    at: usize,
+    /// Whether it is the index of a unique rule, which `schema` names `__unique_...`.
+    unique: bool,
 }
 
 impl<'a> Rules<'a> {
     fn of(table: &'a Table, given: &'a Given<'a>) -> Result<Rules<'a>> {
         let held = table.meta.indexes.iter().enumerate().zip(&table.index_ids);
-        let held = held.filter(|((_, index), _)| {
-            !index.name.starts_with("__pk_") && index.json_path.is_empty()
-        });
+        let held = held.filter(|((_, index), _)| !index.name.starts_with("__pk_"));
         let indexes = held.map(|((at, index), &id)| {
-            let names: Vec<&str> = index.columns.iter().map(|(name, _)| &**name).collect();
-            let columns = names.iter().map(|name| column(table, name));
+            let columns = index.columns.iter().map(|(name, _)| table.column(name));
             Ok(Index {
                 id,
                 columns: columns.collect::<Result<_>>()?,
-                shape: table.entry_shape(at),
-                unique: index
-                    .name
-                    .starts_with("__unique_")
-                    .then(|| names.join(", ")),
+                table,
+                at,
+                unique: index.name.starts_with("__unique_"),
             })
         });
         let counts = table.rules.counts.iter();
@@ -215,7 +195,7 @@ impl<'a> Rules<'a> {
         let vectors = vectors.filter(|vector| !vector.partition_key.is_empty());
         let partitions = vectors.map(|vector| {
             let names = std::iter::once(&vector.column).chain(&vector.partition_key);
-            names.map(|name| column(table, name)).collect()
+            names.map(|name| table.column(name)).collect()
         });
         Ok(Rules {
             table,
@@ -226,9 +206,10 @@ impl<'a> Rules<'a> {
                 .collect(),
             partitions: partitions.collect::<Result<_>>()?,
             reduced: reduced
-                .map(|vector| column(table, &vector.column))
+                .map(|vector| table.column(&vector.column))
                 .collect::<Result<_>>()?,
             followed: RefCell::default(),
+            values: Vec::new(),
         })
     }
 
@@ -247,8 +228,7 @@ impl<'a> Rules<'a> {
             assigned,
             needed,
             reader,
-            params,
-            now: self.given.now,
+            ctx: query::EvalContext::new(params, self.given.now).over(&self.values),
         }
     }
 
@@ -274,30 +254,6 @@ impl<'a> Rules<'a> {
         Ok(())
     }
 
-    /// Where each assigned column is in a row, with its new value.
-    fn set<'e>(&self, assignments: &'e [(String, Expr)]) -> Result<Vec<(usize, &'e Expr)>> {
-        self.targets(assignments.iter().map(|(name, value)| (name, value)))
-    }
-
-    /// Where each column a statement writes is in a row, with what is written to it; one
-    /// named twice is refused.
-    fn targets<'n, T>(
-        &self,
-        named: impl Iterator<Item = (&'n String, T)>,
-    ) -> Result<Vec<(usize, T)>> {
-        let mut targets: Vec<(usize, T)> = Vec::new();
-        for (name, with) in named {
-            let at = column(self.table, name)?;
-            if targets.iter().any(|(target, _)| *target == at) {
-                let table = &self.table.name;
-                let refusal = format!("{name} is named twice as a column {table} is written in");
-                return Err(Error::PlanError(refusal));
-            }
-            targets.push((at, with));
-        }
-        Ok(targets)
-    }
-
     fn insert(
         &self,
         plan: &InsertPlan,
@@ -307,12 +263,7 @@ impl<'a> Rules<'a> {
     ) -> Result<u64> {
         let (table, given) = (self.table, self.given);
         let columns = &table.meta.columns;
-        let named: Vec<usize> = if plan.columns.is_empty() {
-            (0..columns.len()).collect()
-        } else {
-            let named = self.targets(plan.columns.iter().map(|name| (name, ())))?;
-            named.into_iter().map(|(at, ())| at).collect()
-        };
+        let (named, conflict) = table.insert(plan)?;
         // A column the statement leaves out starts at its default, or at NULL.
         let mut blank = vec![Value::Null; columns.len()];
         for (at, column) in columns.iter().enumerate() {
@@ -325,43 +276,12 @@ impl<'a> Rules<'a> {
                 None => {}
             }
         }
-        // `ON CONFLICT` names the primary key or a whole UNIQUE rule, in any order.
-        let conflict = match &plan.on_conflict {
-            Some(conflict) => {
-                let on = conflict.columns.iter().map(|name| column(table, name));
-                let mut on: Vec<usize> = on.collect::<Result<_>>()?;
-                on.sort_unstable();
-                let is_on = |columns: &[usize]| {
-                    let mut columns = columns.to_vec();
-                    columns.sort_unstable();
-                    columns == on
-                };
-                let mut unique = self.indexes.iter().filter(|index| index.unique.is_some());
-                if !is_on(&table.key) && !unique.any(|index| is_on(&index.columns)) {
-                    return Err(Error::PlanError(format!(
-                        "ON CONFLICT ({}) names neither the primary key nor a UNIQUE rule of {}",
-                        conflict.columns.join(", "),
-                        table.name
-                    )));
-                }
-                Some((on, self.set(&conflict.assignments)?))
-            }
-            None => None,
-        };
 
         let (mut stored, scope) = (0, table.scope());
+        let ctx = query::EvalContext::new(given.params, given.now).over(&self.values);
         for values in &plan.values {
-            if values.len() != named.len() {
-                return Err(Error::PlanError(format!(
-                    "INSERT INTO {} gives {} values for {} columns",
-                    table.name,
-                    values.len(),
-                    named.len()
-                )));
-            }
             let mut row = blank.clone();
             for (&at, value) in named.iter().zip(values) {
-                let ctx = query::EvalContext::new(given.params, given.now);
                 row[at] = query::eval(value, &scope, &[], &ctx)?;
             }
             let row = row.into_iter().enumerate();
@@ -407,7 +327,7 @@ impl<'a> Rules<'a> {
         let assigned: Vec<usize> = set.iter().map(|&(at, _)| at).collect();
         let mut needed = vec![false; table.meta.columns.len()];
         for &(_, value) in set {
-            query::reads(value, table, given.params, &mut needed)?;
+            query::reads(value, &table.scope(), given.params, &mut needed)?;
         }
         visible.reads(&mut needed);
         let state = self.state(&assigned, &mut needed)?;
@@ -415,7 +335,7 @@ impl<'a> Rules<'a> {
         // A row whose key changes is a new row at its new key, and one whose key or unique
         // value is still held by a row this statement has yet to change is taken out and put
         // back last: either is written whole.
-        let unique = self.indexes.iter().filter(|index| index.unique.is_some());
+        let unique = self.indexes.iter().filter(|index| index.unique);
         let named = table
             .key
             .iter()
@@ -437,10 +357,10 @@ impl<'a> Rules<'a> {
             held + size_of_val(row) as u64
         };
         // Every new value is worked out from the row as it was.
+        let ctx = query::EvalContext::new(given.params, given.now).over(&self.values);
         let assign = |old: &[Value]| -> Result<Vec<Value>> {
             let mut row = old.to_vec();
             for &(at, value) in set {
-                let ctx = query::EvalContext::new(given.params, given.now);
                 row[at] = self.settle(at, query::eval(value, &scope, old, &ctx)?)?;
             }
             Ok(row)
@@ -551,7 +471,9 @@ impl<'a> Rules<'a> {
         visible.may_write(&row, &*changes)?;
         self.count(changes, Some(&row), None)?;
         for index in &self.indexes {
-            changes.delete_index(index.id, &index.entry(&row)?.key, key)?;
+            if let Some(entry) = index.entry(&row)? {
+                changes.delete_index(index.id, &entry.key, key)?;
+            }
         }
         changes.delete_row(self.table.id, key)
     }
@@ -661,7 +583,7 @@ impl<'a> Rules<'a> {
         // A new row, or a row whose key changed: the transaction must find no row at this key.
         let new_key = was.is_none_or(|(old, _)| *old != key);
         if new_key && changes.row(table.id, &key)?.is_some() {
-            return Err(self.violation(self.key_columns(), pick(&table.key, &row)));
+            return Err(self.violation(&table.key, &row));
         }
         self.count(changes, was.map(|(_, old)| old), Some(&row))?;
         let own = was.map_or(&key, |(old, _)| old);
@@ -672,15 +594,20 @@ impl<'a> Rules<'a> {
             }
             let entry = index.entry(&row)?;
             if changed
-                && let Some(columns) = index.rule(&row)
-                && self.taken(&*changes, index, &entry, &row, own)?
+                && index.rule(&row)
+                && let Some(entry) = &entry
+                && self.taken(&*changes, index, entry, &row, own)?
             {
-                return Err(self.violation(columns.to_owned(), pick(&index.columns, &row)));
+                return Err(self.violation(&index.columns, &row));
             }
-            if let Some((_, old)) = was {
-                changes.delete_index(index.id, &index.entry(old)?.key, own)?;
+            if let Some((_, old)) = was
+                && let Some(old) = index.entry(old)?
+            {
+                changes.delete_index(index.id, &old.key, own)?;
             }
-            changes.put_index(index.id, entry, key.clone())?;
+            if let Some(entry) = entry {
+                changes.put_index(index.id, entry, key.clone())?;
+            }
         }
         // Noted once nothing can refuse the row any more.
         if new_key || self.partitions.iter().any(|group| differs(group)) {
@@ -744,67 +671,35 @@ impl<'a> Rules<'a> {
         Ok(found.is_some_and(|(rows, _)| rows.iter().any(|(key, _)| key != own)))
     }
 
-    /// The columns of the primary key, as a refusal names them.
-    fn key_columns(&self) -> String {
-        let columns = &self.table.meta.columns;
-        let key = self.table.key.iter();
-        let names: Vec<&str> = key.map(|&at| &*columns[at].name).collect();
-        names.join(", ")
-    }
-
-    fn violation(&self, column: String, key: Vec<Value>) -> Error {
+    /// The refusal of a row whose values in `columns`, its key or a unique rule's, another row
+    /// holds: the columns are named between commas.
+    fn violation(&self, columns: &[usize], row: &[Value]) -> Error {
+        let names: Vec<&str> = (columns.iter())
+            .map(|&at| &*self.table.meta.columns[at].name)
+            .collect();
         Error::UniqueViolation {
             table: self.table.name.clone(),
-            column,
-            key: shown(&key),
+            column: names.join(", "),
+            key: shown(&pick(columns, row)),
         }
     }
 }
 
 impl Index<'_> {
-    /// The row's entry in this index.
-    fn entry(&self, row: &[Value]) -> Result<Entry> {
-        self.shape.entry(&pick(&self.columns, row))
+    /// The row's entry in this index, if it has one.
+    fn entry(&self, row: &[Value]) -> Result<Option<Entry>> {
+        self.table.entry(self.at, &pick(&self.columns, row))
     }
 
-    /// The columns of the unique rule this index holds the row to. A NULL in any column of the
-    /// rule takes the row out of it.
-    fn rule(&self, row: &[Value]) -> Option<&str> {
-        let columns = self.unique.as_deref()?;
-        let whole = !self.columns.iter().any(|&at| row[at] == Value::Null);
-        whole.then_some(columns)
+    /// Whether its unique rule holds the row: a NULL in any column of the rule takes it out.
+    fn rule(&self, row: &[Value]) -> bool {
+        self.unique && !self.columns.iter().any(|&at| row[at] == Value::Null)
     }
 }
 
 /// The values a row has in these columns, in this order.
 fn pick(columns: &[usize], row: &[Value]) -> Vec<Value> {
     columns.iter().map(|&at| row[at].clone()).collect()
-}
-
-/// What passes exactly the rows that hold `values` in `columns`, side by side, and the
-/// parameters it reads them from: each under its column's name.
-fn equal(table: &Table, columns: &[usize], values: &[Value]) -> (Expr, HashMap<String, Value>) {
-    let mut bound = HashMap::new();
-    let each = columns.iter().zip(values).map(|(&at, value)| {
-        let name = &table.meta.columns[at].name;
-        bound.insert(name.clone(), value.clone());
-        let column = ColumnRef {
-            table: None,
-            column: name.clone(),
-        };
-        Expr::BinaryOp {
-            left: Box::new(Expr::Column(column)),
-            op: BinOp::Eq,
-            right: Box::new(Expr::Parameter(name.clone())),
-        }
-    });
-    let filter = each.reduce(|left, right| Expr::BinaryOp {
-        left: Box::new(left),
-        op: BinOp::And,
-        right: Box::new(right),
-    });
-    let filter = filter.expect("a key and a UNIQUE rule have a column");
-    (filter, bound)
 }
 
 /// A row's values in column order, with NULL for each large value that was left beside the

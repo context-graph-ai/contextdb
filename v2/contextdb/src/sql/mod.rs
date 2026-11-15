@@ -11,8 +11,10 @@ mod parser;
 pub(crate) mod plan;
 mod planner;
 
-pub(crate) use ast::{Expr, Statement};
-pub(crate) use plan::{Effect, PhysicalPlan as Plan};
+pub(crate) use ast::{Expr, Statement, Statement as Plan};
+pub(crate) use parser::{MAX_EXPR_NESTING, depth_error};
+pub(crate) use plan::Effect;
+pub(crate) use planner::{AGGREGATES, inside, inside_mut};
 
 use crate::types::{Error, Result};
 
@@ -30,9 +32,11 @@ pub(crate) fn formula(text: &str) -> Result<Expr> {
     parser::formula(text)
 }
 
-/// Plans a parsed statement. Refuses with `PlanError`. Looks at no table and no data.
-pub(crate) fn plan(statement: &Statement) -> Result<Plan> {
-    planner::plan(statement)
+/// Plans a parsed statement, which is its own plan once it passes. Refuses with `PlanError`.
+/// Looks at no table and no data.
+pub(crate) fn plan(statement: Statement) -> Result<Plan> {
+    planner::stands(&statement)?;
+    Ok(statement)
 }
 
 /// The refusal of a statement, a clause or a form that a later version of the library reads,

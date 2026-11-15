@@ -104,3 +104,59 @@ k | v
 99 | one
 100 | two
 101 | three
+
+# An UPDATE finds its rows with LIKE and BETWEEN as a SELECT does.
+CREATE TABLE stock (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER);
+INSERT INTO stock (id, name, qty) VALUES (1, 'bolt-1', 5), (2, 'bolt-2', 15), (3, 'nut-1', 7), (4, 'bolt-3', 9);
+UPDATE stock SET qty = 0 WHERE name LIKE 'bolt%' AND qty BETWEEN 1 AND 10;
+----
+rows affected: 2
+
+SELECT id, qty FROM stock ORDER BY id;
+----
+id | qty
+1 | 0
+2 | 15
+3 | 7
+4 | 0
+
+# A SELECT inside a write is read once, before the write changes a row.
+CREATE TABLE jobs (id INTEGER PRIMARY KEY, status TEXT NOT NULL, points INTEGER NOT NULL);
+INSERT INTO jobs (id, status, points) VALUES (1, 'open', 1), (2, 'open', 20), (3, 'done', 30), (4, 'done', 5);
+UPDATE jobs SET points = (SELECT MAX(points) FROM jobs) WHERE id IN (SELECT id FROM jobs WHERE status = 'open');
+----
+rows affected: 2
+
+SELECT id, points FROM jobs ORDER BY id;
+----
+id | points
+1 | 30
+2 | 30
+3 | 30
+4 | 5
+
+DELETE FROM jobs WHERE id IN (SELECT id FROM jobs WHERE status = 'done');
+----
+rows affected: 2
+
+SELECT id FROM jobs ORDER BY id;
+----
+id
+1
+2
+
+# A row is changed once in a statement, though its new key is met again further along the keys
+# the statement reads: 1, 2 and 3 move to 11, 12 and 13 and stay there, though 11, 12 and 13 are
+# still below 100.
+CREATE TABLE steps (id INTEGER PRIMARY KEY, n INTEGER NOT NULL);
+INSERT INTO steps (id, n) VALUES (1, 10), (2, 20), (3, 30);
+UPDATE steps SET id = id + 10 WHERE id < 100;
+----
+rows affected: 3
+
+SELECT id, n FROM steps ORDER BY id;
+----
+id | n
+11 | 10
+12 | 20
+13 | 30

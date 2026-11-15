@@ -571,6 +571,11 @@ fn a_kept_count_that_reaches_zero_leaves_no_record() {
     assert_eq!(records(&folder, COUNTS).len(), 1);
     commit_staged(&folder, |changes| {
         changes.add_kept(count, group.clone(), -2).expect("stage");
+        let laid = kept(&*changes, count).expect("read");
+        assert!(
+            laid.is_empty(),
+            "a staged -2 is laid over the stored 2: {laid:?}"
+        );
     });
     assert!(
         records(&folder, COUNTS).is_empty(),

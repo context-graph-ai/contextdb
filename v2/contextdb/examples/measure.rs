@@ -25,7 +25,7 @@
 //!   eight directions of its own for its appearance, tracks of ten sightings whose appearance
 //!   drifts, a little noise on every number; 100 questions, eighty new sightings of stored
 //!   subjects and twenty of subjects never stored. Each case loads two stores, 500 rows to a
-//!   commit: one whose column declares `AUTO_INDEX_AT 1000000000`, so that nothing is grouped,
+//!   commit: one whose column declares `INDEXING_THRESHOLD 1000000000`, so that nothing is grouped,
 //!   sealed and searched under EXACT; and one that declares nothing, with every maintenance
 //!   cycle run, opened and searched once in a new process (`measure first ...`, which the
 //!   program starts itself as) and then searched, in one read session under 1 GiB, under
@@ -517,7 +517,7 @@ fn index(
     std::fs::create_dir_all(folder)?;
     let store = folder.join("sealed");
     let ((db, questions), load) = {
-        let (filled, load) = timed(|| filled(&store, " AUTO_INDEX_AT 1000000000", rows));
+        let (filled, load) = timed(|| filled(&store, " INDEXING_THRESHOLD 1000000000", rows));
         (filled?, load)
     };
     line(&format!("{prefix}load"), seconds(load), "s");

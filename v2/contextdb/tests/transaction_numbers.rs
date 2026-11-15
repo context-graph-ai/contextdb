@@ -207,3 +207,34 @@ fn a_vector_column_is_partitioned_by_the_number_of_the_transaction_that_wrote_th
         assert_eq!(ids, (first..first + 5).collect::<Vec<_>>());
     }
 }
+
+#[test]
+fn a_position_and_a_row_of_every_kind_of_value_survive_json() {
+    use contextdb::{
+        Uuid,
+        serde_json::{self, json},
+    };
+    assert_eq!(
+        serde_json::to_string(&TxId(7)).unwrap(),
+        "7",
+        "a position is its bare number"
+    );
+    let row = vec![
+        Value::Null,
+        Value::Bool(true),
+        Value::Int64(-3),
+        Value::Float64(1.5),
+        Value::Text("t".into()),
+        Value::Uuid(Uuid::from_u128(9)),
+        Value::Timestamp(5),
+        Value::Json(json!({"k": [1, null]})),
+        Value::Vector(vec![0.5, 1.0]),
+        Value::TxId(TxId(7)),
+    ];
+    let text = serde_json::to_string(&row).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Vec<Value>>(&text).unwrap(),
+        row,
+        "a host reads back what it saved: {text}"
+    );
+}

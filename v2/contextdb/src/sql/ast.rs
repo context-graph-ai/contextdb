@@ -1,5 +1,7 @@
 //! A statement as it was written: what `parse` returns and `plan` reads.
 
+use std::sync::OnceLock;
+
 pub use crate::types::{
     ColumnType as DataType, ConflictPolicy, History, KeptCounts, Retain, RetainUnit, SortDirection,
     StateMachine, SyncDirection, VectorSearchMode,
@@ -19,6 +21,8 @@ pub enum Statement {
     SetMemoryLimit(SetMemoryLimitValue),
     ShowMemoryLimit,
     ShowVectorIndexes,
+    /// `EXPLAIN <statement>`: the statement's path, as rows, without running it.
+    Explain(Box<Statement>),
     ShowVectorPartitions {
         /// The table and column after `FOR`.
         column: Option<(String, String)>,
@@ -34,33 +38,137 @@ pub enum SetMemoryLimitValue {
     None,
 }
 
-#[derive(Debug, Clone)]
+/// One SELECT as it was written. ORDER BY and what follows it are over the whole statement:
+/// over every SELECT of `union` when there is one.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Select {
+    /// The SELECTs named by WITH, in written order.
+    pub with: Vec<(String, Select)>,
+    pub distinct: bool,
     /// `SELECT *` is one column named `*`.
     pub columns: Vec<SelectColumn>,
-    pub table: String,
-    pub where_clause: Option<Expr>,
-    /// The ORDER BY items. A similarity search has one, a distance ([`Expr::Distance`]) or the
-    /// name the select list gives one.
+    /// Empty for a SELECT without FROM.
+    pub from: Vec<FromItem>,
+    pub joins: Vec<Join>,
+    pub filter: Option<Expr>,
+    pub group_by: Vec<Expr>,
+    pub having: Option<Expr>,
+    /// The SELECTs after this one, in written order; true for UNION ALL.
+    pub union: Vec<(bool, Select)>,
+    /// A bare name the select list gives an item stands here as that item's expression.
     pub order_by: Vec<OrderByItem>,
     /// `USE VECTOR AUTO | EXACT | INDEXED`, when it was written.
     pub use_vector: Option<VectorSearchMode>,
+    /// The key after `USE RANK`.
+    pub use_rank: Option<String>,
     pub limit: Option<u64>,
+    pub offset: Option<u64>,
+    /// The `$name` written where the count of LIMIT stands, and of OFFSET.
+    pub limit_name: Option<String>,
+    pub offset_name: Option<String>,
+    /// Where its text begins in the statement: what a SELECT inside an expression is found by.
+    pub at: Note<usize>,
+    /// The type of its one column, kept from the first time a SELECT inside an expression is
+    /// framed.
+    pub gives: Note<OnceLock<DataType>>,
 }
 
-#[derive(Debug, Clone)]
+/// What is kept on a statement but is no part of what it says: printed as nothing, so the same
+/// expression written twice prints alike.
+#[derive(Clone, Default, PartialEq)]
+pub struct Note<T>(pub T);
+
+impl<T> std::fmt::Debug for Note<T> {
+    fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FromItem {
+    Table { name: String, alias: Option<String> },
+    Graph(GraphTable),
+}
+
+/// `GRAPH_TABLE(...)`: the rows a pattern matches over an edge table.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GraphTable {
+    pub edge_table: String,
+    pub start: NodePattern,
+    pub steps: Vec<EdgeStep>,
+    pub filter: Option<Expr>,
+    pub columns: Vec<SelectColumn>,
+    /// What COLUMNS calls each of its columns and the type of each, kept from the first time
+    /// the pattern is bound: the statement's text settles both.
+    pub output: Note<OnceLock<Vec<crate::types::ColumnDef>>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NodePattern {
+    pub alias: Option<String>,
+}
+
+/// One edge of a pattern and the node it leads to, followed at least `min` and at most `max`
+/// times; `max` is never above 10.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EdgeStep {
+    pub direction: EdgeDirection,
+    pub edge_type: Option<String>,
+    pub min: u32,
+    pub max: u32,
+    pub to: NodePattern,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeDirection {
+    Outgoing,
+    Incoming,
+    Both,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Join {
+    /// LEFT JOIN: a row of the left side with no partner is kept.
+    pub left_outer: bool,
+    pub item: FromItem,
+    /// `None` for CROSS JOIN.
+    pub on: Option<Expr>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct SelectColumn {
     pub expr: Expr,
     pub alias: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+impl SelectColumn {
+    /// What a result calls the column: its alias; without one a column's own name, a function's
+    /// name in lower case, `row_number`, the name a one-column SELECT gives, else `?column?`.
+    pub fn name(&self) -> String {
+        match (&self.alias, &self.expr) {
+            (Some(alias), _) => alias.clone(),
+            (None, Expr::Column(column)) => column.column.clone(),
+            // The four operators arrive as calls whose names begin `__`.
+            (None, Expr::FunctionCall { name, .. }) if !name.starts_with("__") => {
+                name.to_lowercase()
+            }
+            (None, Expr::RowNumber { .. }) => "row_number".to_owned(),
+            (None, Expr::Subquery(query)) => match query.columns.as_slice() {
+                [item] if item.name() != "*" => item.name(),
+                _ => "?column?".to_owned(),
+            },
+            _ => "?column?".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct OrderByItem {
     pub expr: Expr,
     pub direction: SortDirection,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Column(ColumnRef),
     Literal(Literal),
@@ -104,6 +212,49 @@ pub enum Expr {
         list: Vec<Expr>,
         negated: bool,
     },
+    /// `expr [NOT] IN (SELECT ...)`.
+    InSubquery {
+        expr: Box<Expr>,
+        query: Box<Select>,
+        negated: bool,
+    },
+    /// `(SELECT ...)` standing where a value does.
+    Subquery(Box<Select>),
+    /// `expr [NOT] LIKE pattern`.
+    Like {
+        expr: Box<Expr>,
+        pattern: Box<Expr>,
+        negated: bool,
+    },
+    /// `expr [NOT] BETWEEN low AND high`.
+    Between {
+        expr: Box<Expr>,
+        low: Box<Expr>,
+        high: Box<Expr>,
+        negated: bool,
+    },
+    /// `json -> key` and, with `as_text`, `json ->> key`. Both bind as `<=>` does.
+    Field {
+        json: Box<Expr>,
+        key: Box<Expr>,
+        as_text: bool,
+    },
+    /// `ROW_NUMBER() OVER ([PARTITION BY ...] ORDER BY ...)`. The parser refuses every other
+    /// function before `OVER`, and a window with no ORDER BY.
+    RowNumber {
+        partition_by: Vec<Expr>,
+        order_by: Vec<OrderByItem>,
+    },
+}
+
+impl Expr {
+    /// The expressions of one side of `=` or IN: those of a row value, or the one expression.
+    pub(crate) fn sides(&self) -> &[Expr] {
+        match self {
+            Expr::Row(items) => items,
+            one => std::slice::from_ref(one),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,7 +263,7 @@ pub struct ColumnRef {
     pub column: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     Null,
     Bool(bool),
@@ -285,20 +436,20 @@ pub struct VectorClauses {
     pub max_partitions: Option<String>,
     /// `SEARCH_MODE AUTO | EXACT | INDEXED`, when it was written.
     pub search_mode: Option<VectorSearchMode>,
-    /// The number after `AUTO_INDEX_AT`, kept as written for `schema` to judge.
-    pub auto_index_at: Option<String>,
-    /// `CONSOLIDATION NONE` or `CONSOLIDATION (...)`, when it was written.
-    pub consolidation: Option<ConsolidationClause>,
+    /// The number after `INDEXING_THRESHOLD`, kept as written for `schema` to judge.
+    pub indexing_threshold: Option<String>,
+    /// `COMPACTION NONE` or `COMPACTION (...)`, when it was written.
+    pub compaction: Option<CompactionClause>,
     /// The text of `WITH (quantization = '...')`, kept as written for `schema` to judge.
     pub quantization: Option<String>,
 }
 
-/// `CONSOLIDATION` as it was written.
+/// `COMPACTION` as it was written.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConsolidationClause {
-    /// `CONSOLIDATION NONE`.
+pub enum CompactionClause {
+    /// `COMPACTION NONE`.
     None,
-    /// `CONSOLIDATION (CHANGE_PERCENT = n, TOMBSTONE_PERCENT = n)`: each number as written,
+    /// `COMPACTION (CHANGE_PERCENT = n, TOMBSTONE_PERCENT = n)`: each number as written,
     /// `None` for a member that was not.
     Percent {
         change: Option<String>,
@@ -353,10 +504,10 @@ pub enum AlterAction {
         column: String,
         search_mode: VectorSearchMode,
     },
-    /// `ALTER COLUMN column SET AUTO_INDEX_AT n`, the number kept as written; `None` is DEFAULT.
-    SetAutoIndexAt(String, Option<String>),
-    /// `ALTER COLUMN column SET CONSOLIDATION ...`; `None` is DEFAULT.
-    SetConsolidation(String, Option<ConsolidationClause>),
+    /// `ALTER COLUMN column SET INDEXING_THRESHOLD n`, the number kept as written; `None` is DEFAULT.
+    SetIndexingThreshold(String, Option<String>),
+    /// `ALTER COLUMN column SET COMPACTION ...`; `None` is DEFAULT.
+    SetCompaction(String, Option<CompactionClause>),
 }
 
 #[derive(Debug, Clone)]

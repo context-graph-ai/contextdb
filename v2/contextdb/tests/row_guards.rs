@@ -10,6 +10,14 @@ use contextdb::{ContextId, Database, Error, Transaction, Uuid, Value, params};
 
 const LEASES: &str = "CREATE TABLE leases (id INTEGER PRIMARY KEY, generation UUID UNIQUE, \
                       owner TEXT, epoch INTEGER NOT NULL)";
+/// Leases 1 (owner `a`, epoch 2) and 2 (no owner, epoch 5), as two tests expect them.
+fn leases_as_left() -> [Vec<Value>; 2] {
+    [
+        vec![Value::Int64(1), support::text("a"), Value::Int64(2)],
+        vec![Value::Int64(2), Value::Null, Value::Int64(5)],
+    ]
+}
+
 const ALL_LEASES: &str = "SELECT id, owner, epoch FROM leases ORDER BY id";
 
 /// A store with `leases` 1 (owner `a`, epoch 1) and 2 (no owner, epoch 5), each with a
@@ -240,13 +248,7 @@ fn a_guard_taken_after_a_declaration_refuses_the_commit_when_its_value_was_chang
         support::refusal(&db, "SELECT COUNT(*) FROM audits"),
         Error::TableNotFound(table) if table == "audits"
     ));
-    assert_eq!(
-        support::rows(&db, ALL_LEASES),
-        [
-            vec![Value::Int64(1), support::text("a"), Value::Int64(2)],
-            vec![Value::Int64(2), Value::Null, Value::Int64(5)],
-        ]
-    );
+    assert_eq!(support::rows(&db, ALL_LEASES), leases_as_left());
 
     // A guard names places in the row as the transaction shows it, and holds the same values
     // whatever column the transaction dropped before or after it. Each case has a table of
@@ -417,11 +419,5 @@ fn a_guard_is_checked_again_at_commit_though_the_transaction_wrote_nothing() {
         .expect("commit over a guarded value that is held again");
 
     // Only the other commits wrote.
-    assert_eq!(
-        support::rows(&db, ALL_LEASES),
-        [
-            vec![Value::Int64(1), support::text("a"), Value::Int64(2)],
-            vec![Value::Int64(2), Value::Null, Value::Int64(5)],
-        ]
-    );
+    assert_eq!(support::rows(&db, ALL_LEASES), leases_as_left());
 }

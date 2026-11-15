@@ -2,13 +2,11 @@
 //! values as a key, holding how many rows the group has. A count that reaches zero has no
 //! record.
 
-use std::cmp::Ordering;
-
 use redb::{ReadableTable, Table};
 
 use super::disk::{Stored, unsound};
 use super::keys::{Span, stored};
-use super::{ChangeSet, CountId, KeptIter, Key, Staged, Undo, staged_in};
+use super::{ChangeSet, CountId, KeptIter, Key, Staged, Undo, overlay, staged_in};
 use crate::types::Result;
 
 impl ChangeSet {
@@ -38,29 +36,12 @@ pub(super) fn kept<'a>(
     count: CountId,
     span: &Span,
 ) -> Result<KeptIter<'a>> {
-    let mut stored = changes.base.moment.kept(count.0, span)?.peekable();
-    let mut staged = staged_in(&changes.kept, count.0, span.clone()).peekable();
-    Ok(Box::new(std::iter::from_fn(move || {
-        loop {
-            let stored_is = match (stored.peek(), staged.peek()) {
-                (None, None) => return None,
-                (Some(Ok((key, _))), Some((staged_key, _))) => key.cmp(staged_key),
-                // A failed read, or nothing staged from here on.
-                (Some(_), _) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-            };
-            let before = match stored_is {
-                Ordering::Less => return stored.next(),
-                Ordering::Equal => stored.next()?.map_or(0, |(_, count)| count),
-                Ordering::Greater => 0,
-            };
-            let (key, change) = staged.next()?;
-            match before.saturating_add_signed(*change) {
-                0 => {}
-                count => return Some(Ok((key.clone(), count))),
-            }
-        }
-    })))
+    let stored = changes.base.moment.kept(count.0, span)?;
+    let staged = staged_in(&changes.kept, count.0, span.clone());
+    let laid = |before: Option<u64>, change: &i64| {
+        Some(before.unwrap_or(0).saturating_add_signed(*change)).filter(|&count| count != 0)
+    };
+    Ok(overlay(stored, staged, laid))
 }
 
 /// Writes a commit's changes to the kept counts.

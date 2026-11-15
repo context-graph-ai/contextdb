@@ -1,6 +1,6 @@
 //! ALTER TABLE: one action, read into what it changes.
 
-use super::ddl::{column_def, consolidation, table_option};
+use super::ddl::{column_def, compaction, table_option};
 use super::{Pair, Rule, child, first_ident, ident, search_mode, signed, two_idents};
 use crate::sql::ast::*;
 use crate::types::Result;
@@ -32,12 +32,10 @@ pub(super) fn alter_table(pair: Pair<'_>) -> Result<AlterTable> {
                     column,
                     max_partitions: set.as_str().to_owned(),
                 },
-                Rule::auto_index_at => AlterAction::SetAutoIndexAt(column, signed(set)),
-                Rule::auto_index_default => AlterAction::SetAutoIndexAt(column, None),
-                Rule::consolidation => {
-                    AlterAction::SetConsolidation(column, Some(consolidation(set)))
-                }
-                Rule::consolidation_default => AlterAction::SetConsolidation(column, None),
+                Rule::indexing_threshold => AlterAction::SetIndexingThreshold(column, signed(set)),
+                Rule::indexing_threshold_default => AlterAction::SetIndexingThreshold(column, None),
+                Rule::compaction => AlterAction::SetCompaction(column, Some(compaction(set))),
+                Rule::compaction_default => AlterAction::SetCompaction(column, None),
                 // The one clause left: SEARCH_MODE.
                 _ => AlterAction::SetSearchMode {
                     column,

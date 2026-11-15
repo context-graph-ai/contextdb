@@ -25,7 +25,7 @@ pub(crate) struct Nearest<'a> {
     /// The table of the column, for the rows a transaction has staged.
     pub table: TableId,
     pub vector: VectorId,
-    /// What the column declares: `AUTO_INDEX_AT` and `CONSOLIDATION` decide what AUTO runs
+    /// What the column declares: `INDEXING_THRESHOLD` and `COMPACTION` decide what AUTO runs
     /// and when INDEXED may.
     pub column: &'a VectorColumn,
     /// The mode in force: the statement's, else the column's.
@@ -41,6 +41,9 @@ pub(crate) struct Nearest<'a> {
     /// The filter itself is asked through `distance_of`. This says one thing more: a search
     /// under INDEXED that runs out of sketches to choose among is refused.
     pub filtered: bool,
+    /// Whether a rank orders the answer: a partition searched exactly then asks the distance of
+    /// every live vector, and screens none.
+    pub ranked: bool,
 }
 
 /// One row of an answer.
@@ -73,8 +76,7 @@ pub(crate) enum Route {
 }
 
 /// What a search does with one of the partitions it selects, settled from the partition's
-/// small records before a block is read.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// small records before a block is read, and how far it has gone over it.
 pub(crate) struct Planned {
     /// The partition's key tuple.
     pub tuple: Key,
@@ -91,13 +93,7 @@ pub(crate) struct Planned {
     /// Whether INDEXED may be given this partition. A search under INDEXED with a partition
     /// that is not usable is refused whole.
     pub usable: bool,
-}
-
-/// One selected partition as a search goes over it.
-struct Target {
     partition: Partition,
-    /// What the plan says of it.
-    planned: Planned,
     /// The record of its grouping, read when its nearest groups are searched and it has more
     /// than one group.
     grouping: Option<Grouping>,
@@ -107,7 +103,7 @@ struct Target {
     next: f64,
 }
 
-impl Target {
+impl Planned {
     /// How many sketches a search reads of it at most: one for each slot, and none of a
     /// partition whose slots are screened with no sketch read.
     fn sketches(&self) -> u64 {
@@ -119,16 +115,26 @@ impl Target {
     }
 }
 
-/// The selected partitions in the order of their numbers, each with its pending rows counted
-/// and its route settled. [`directory::HELD`], its key tuple and the bytes of a `Target` are
-/// taken from `reservation` for each.
-fn targets(
+/// What a search would do with each partition it selects, in the order of their numbers:
+/// the one plan [`search`] runs and `.explain` prints. EXACT searches every slot of every
+/// one. INDEXED searches the nearest groups of every one, which for a partition with no
+/// grouping or a grouping of one group is every slot, through the slot screen alone. AUTO
+/// searches every slot of every one while the rows with a vector in all of them together are
+/// fewer than the column's `INDEXING_THRESHOLD`, and from there on the nearest groups of each
+/// partition that has a grouping and is usable, and every slot of the others. A filter on
+/// rows changes no route: it is asked of each row as the search visits it.
+///
+/// Only partition, pending and grouping records are read; EXACT reads no grouping record and
+/// answers no `probes`. What the list takes is taken from `reservation` first and stays taken
+/// until the caller lets it go: [`directory::HELD`], its key tuple and the bytes of a `Planned`
+/// for each.
+pub(crate) fn plan(
     nearest: &Nearest<'_>,
     read: &dyn Read,
     reservation: &mut Reservation,
-) -> Result<Vec<Target>> {
+) -> Result<Vec<Planned>> {
     let partitions = directory::selected(read, nearest.vector, nearest.scope, reservation)?;
-    reservation.grow((partitions.len() * size_of::<Target>()) as u64)?;
+    reservation.grow((partitions.len() * size_of::<Planned>()) as u64)?;
     let live: u64 = partitions.iter().map(|(_, partition)| partition.live).sum();
     let mode = match nearest.mode {
         VectorSearchMode::Auto if live < nearest.column.index_at() => VectorSearchMode::Exact,
@@ -159,7 +165,7 @@ fn targets(
         } else {
             Route::Exact
         };
-        let planned = Planned {
+        targets.push(Planned {
             tuple,
             live: partition.live,
             pending,
@@ -168,37 +174,13 @@ fn targets(
             probes: grouping.as_ref().map_or(0, |grouping| grouping.probes),
             route,
             usable,
-        };
-        targets.push(Target {
             partition,
-            planned,
             grouping,
             taken: 0,
             next: f64::INFINITY,
         });
     }
     Ok(targets)
-}
-
-/// What a search would do with each partition it selects, in the order of their numbers:
-/// the one plan [`search`] runs and `.explain` prints. EXACT searches every slot of every
-/// one. INDEXED searches the nearest groups of every one, which for a partition with no
-/// grouping or a grouping of one group is every slot, through the slot screen alone. AUTO
-/// searches every slot of every one while the rows with a vector in all of them together are
-/// fewer than the column's `AUTO_INDEX_AT`, and from there on the nearest groups of each
-/// partition that has a grouping and is usable, and every slot of the others. A filter on
-/// rows changes no route: it is asked of each row as the search visits it.
-///
-/// Only partition, pending and grouping records are read; EXACT reads no grouping record and
-/// answers no `probes`. What the list takes is taken from `reservation` first and stays taken
-/// until the caller lets it go.
-pub(crate) fn plan(
-    nearest: &Nearest<'_>,
-    read: &dyn Read,
-    reservation: &mut Reservation,
-) -> Result<Vec<Planned>> {
-    let targets = targets(nearest, read, reservation)?;
-    Ok(targets.into_iter().map(|target| target.planned).collect())
 }
 
 /// What a search reads blocks and sketches with.
@@ -526,7 +508,7 @@ const LOW: u64 = 8;
 /// grouping's gap and of the tail keep, or all of them where the grouping's width is 0.
 /// Blocks and sketches are read in place from the page cache; everything that grows is taken
 /// from `reservation` first. When the answer is returned, `reservation` holds 32 bytes and
-/// the key's for each of its rows and nothing else of the search.
+/// the key's for each of its rows and nothing else of the search but what [`plan`] took.
 ///
 /// A row is turned away when `distance_of` gives no distance for it. While the answer is short
 /// of `k` rows that were not turned away, the search takes four times as many sketches from
@@ -534,30 +516,30 @@ const LOW: u64 = 8;
 /// far its last row lies below the `k`-th best slot screened, and keeps every sketch that
 /// reaches that row. Having kept every sketch of every group it has done the work of EXACT and
 /// returns what there is; under INDEXED with `nearest.filtered` it answers `None` at the step
-/// that would keep them all. It answers `None` too, having read only small records, when the
-/// mode is INDEXED and a selected partition is not usable. With `None` the caller lets go of
-/// what `reservation` took.
+/// that would keep them all. With `None` the caller lets go of what `reservation` took.
+/// `targets` are what [`plan`] gave for `nearest`, and `reservation` holds what it took and
+/// nothing else.
 ///
 /// A record of the index that is damaged leaves the vectors whole. Under AUTO the search is
-/// then run again as EXACT, which reads no such record and answers in full, or tells the
-/// damage of a block; under INDEXED the damage is the answer. Nothing is rebuilt.
+/// then planned and run again as EXACT, which reads no such record and answers in full, or
+/// tells the damage of a block; under INDEXED the damage is the answer. Nothing is rebuilt.
 pub(crate) fn search(
     nearest: &Nearest<'_>,
     read: &dyn Read,
     reservation: &mut Reservation,
+    targets: &mut Vec<Planned>,
     distance_of: &mut dyn FnMut(&Key) -> Result<Option<f64>>,
 ) -> Result<Option<Outcome>> {
-    let before = reservation.bytes();
-    match answer(nearest, read, reservation, distance_of) {
+    match answer(nearest, read, reservation, targets, distance_of) {
         Err(Error::StoreCorrupted { .. }) if nearest.mode == VectorSearchMode::Auto => {
-            reservation.shrink(reservation.bytes() - before);
-            let mode = VectorSearchMode::Exact;
-            answer(
-                &Nearest { mode, ..*nearest },
-                read,
-                reservation,
-                distance_of,
-            )
+            targets.clear();
+            reservation.shrink(reservation.bytes());
+            let nearest = Nearest {
+                mode: VectorSearchMode::Exact,
+                ..*nearest
+            };
+            *targets = plan(&nearest, read, reservation)?;
+            answer(&nearest, read, reservation, targets, distance_of)
         }
         other => other,
     }
@@ -568,6 +550,7 @@ fn answer(
     nearest: &Nearest<'_>,
     read: &dyn Read,
     reservation: &mut Reservation,
+    targets: &mut [Planned],
     distance_of: &mut dyn FnMut(&Key) -> Result<Option<f64>>,
 ) -> Result<Option<Outcome>> {
     if nearest.k == 0 {
@@ -577,11 +560,7 @@ fn answer(
         }));
     }
     let before = reservation.bytes();
-    let mut targets = targets(nearest, read, reservation)?;
     let indexed = nearest.mode == VectorSearchMode::Indexed;
-    if indexed && targets.iter().any(|target| !target.planned.usable) {
-        return Ok(None);
-    }
     // The vector at length one that the screen keeps: four bytes a number.
     reservation.grow(4 * nearest.query.len() as u64)?;
     let screen = Screen::new(nearest.query);
@@ -607,6 +586,8 @@ fn answer(
         marks: BTreeMap::new(),
         evaluations: 0,
         refused: indexed && nearest.filtered,
+        ranked: nearest.ranked,
+        every: false,
     };
 
     // The rows that are in no block, exactly: those the reader has staged, then the pending
@@ -619,7 +600,7 @@ fn answer(
         return Ok(None);
     }
     let first = Key::from_values(&[], &[])?;
-    for target in &targets {
+    for target in &*targets {
         let run = (nearest.vector, target.partition.number);
         let from = VectorRecord::Pending(run.0, run.1, &first);
         read.vectors(from, &mut |record, _| match record {
@@ -636,15 +617,15 @@ fn answer(
     // out lies within the gap widened by the fall, nothing left out could have entered.
     // Otherwise rows were turned away or counted twice, and a further pass goes on from there.
     let mut most = nearest.k;
-    let mut ended = found.pass(&asked, &mut targets, &mut wide, None, None, 0.0)?;
+    let mut ended = found.pass(&asked, targets, &mut wide, None, None, 0.0)?;
     loop {
         let (floor, sketches, fall) = match found.last() {
             // Short of `k` rows: four times the sketches, and twice the groups once every
             // sketch of the groups taken was kept.
             None => {
                 most = most.max(ended.kept).saturating_mul(4);
-                let mut all = most as u64 >= targets.iter().map(Target::sketches).sum::<u64>();
-                for target in &mut targets {
+                let mut all = most as u64 >= targets.iter().map(Planned::sketches).sum::<u64>();
+                for target in &mut *targets {
                     target.taken = target.taken.saturating_mul(if ended.all { 2 } else { 1 });
                     let grouping = target.grouping.as_ref();
                     all &=
@@ -665,7 +646,7 @@ fn answer(
                 // as far below the best centre's: twice the angle from the vector of the
                 // search. The cover takes the groups that far out.
                 let fall = 4.0 * (found.lows.least() - last).max(0.0);
-                let nearer = |target: &Target| target.next <= fall * 10_000.0;
+                let nearer = |target: &Planned| target.next <= fall * 10_000.0;
                 let proven = last >= ended.threshold && last >= ended.sketches;
                 if proven && !targets.iter().any(nearer) {
                     break;
@@ -673,7 +654,7 @@ fn answer(
                 (last, None, fall)
             }
         };
-        ended = found.pass(&asked, &mut targets, &mut wide, Some(floor), sketches, fall)?;
+        ended = found.pass(&asked, targets, &mut wide, Some(floor), sketches, fall)?;
     }
 
     let pairs = found.answer.iter();
@@ -789,6 +770,10 @@ struct Found<'a> {
     /// Whether the search is refused when it runs out of sketches to choose among: the mode
     /// is INDEXED and the statement has a filter on rows.
     refused: bool,
+    /// Whether a rank orders the answer, and whether the partition in hand is then searched
+    /// exactly, so that every slot of it has its row's distance asked for.
+    ranked: bool,
+    every: bool,
 }
 
 impl Found<'_> {
@@ -847,6 +832,9 @@ impl Found<'_> {
         let word = bits.and_then(|bits| bits.get(slot / 64));
         if word.is_some_and(|word| word >> (slot % 64) & 1 == 1) {
             return Ok(());
+        }
+        if self.every {
+            return self.score(&block.key(slot));
         }
         self.evaluations += 1;
         let (low, high) = asked.screen.range(block.slot(slot));
@@ -930,7 +918,7 @@ impl Found<'_> {
     fn pass(
         &mut self,
         asked: &Asked<'_>,
-        targets: &mut [Target],
+        targets: &mut [Planned],
         wide: &mut Option<Wide>,
         floor: Option<f64>,
         most: Option<usize>,
@@ -965,6 +953,7 @@ impl Found<'_> {
             kept: 0,
         };
         for target in targets.iter_mut() {
+            self.every = self.ranked && target.route == Route::Exact;
             let partition = target.partition;
             let tail = first_of(partition.first)..first_of(partition.blocks);
             let (Some(grouping), Some(grouped)) = (&target.grouping, partition.grouping) else {

@@ -376,7 +376,7 @@ pub(super) struct Ground<'a> {
 /// the slots left behind come to `CHANGE_PERCENT` of its slots, or the slots left behind alone
 /// to `TOMBSTONE_PERCENT`. In any other column only the
 /// slots left behind count, against every slot the partition has: the build then has one
-/// group and writes no centre and no sketch. Under `CONSOLIDATION NONE` only a first grouping
+/// group and writes no centre and no sketch. Under `COMPACTION NONE` only a first grouping
 /// of a column at its size is ever due. The slots left behind are the slots of the grouping
 /// and the tail less the rows with a vector that are not pending.
 pub(super) fn due(
@@ -401,7 +401,7 @@ pub(super) fn due(
         grows || behind || (out + stale) * 100 >= u64::from(change) * grouped
     };
     // A partition with no slot has nothing to group: its pending rows are sealed first.
-    slots > 0 && column.consolidation().is_some_and(reached)
+    slots > 0 && column.compaction().is_some_and(reached)
 }
 
 /// True when the slots rows have left behind are alone enough for a grouping to be due: they
@@ -423,7 +423,7 @@ pub(super) fn left_behind(
         slots
     };
     let reached = |(_, share): (u8, u8)| stale * 100 >= u64::from(share) * of;
-    stale > 0 && column.consolidation().is_some_and(reached)
+    stale > 0 && column.compaction().is_some_and(reached)
 }
 
 /// True when the column is at its size, `vectors` being its rows with a vector.
@@ -435,12 +435,12 @@ fn sized(column: &VectorColumn, vectors: u64) -> bool {
 /// outside its grouping, in tail blocks and pending, are fewer than twice what makes a
 /// grouping due. A partition with no grouping, or with one of one group, is searched whole,
 /// and so while the vectors outside its grouping are fewer than twice the column's
-/// `index_at`. Under `CONSOLIDATION NONE` a grouping of more groups is always usable.
+/// `index_at`. Under `COMPACTION NONE` a grouping of more groups is always usable.
 pub(super) fn usable(partition: &Partition, pending: u64, column: &VectorColumn) -> bool {
     let out = partition.slots + pending;
     match partition.grouping.filter(|grouping| grouping.groups > 1) {
         None => out < column.index_at().saturating_mul(2),
-        Some(grouping) => column.consolidation().is_none_or(|(change, _)| {
+        Some(grouping) => column.compaction().is_none_or(|(change, _)| {
             let due = (100 * column.grouped_from()).max(u64::from(change) * grouping.slots);
             out.saturating_mul(100) < due.saturating_mul(2)
         }),

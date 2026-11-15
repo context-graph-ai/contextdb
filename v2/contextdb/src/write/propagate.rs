@@ -14,9 +14,9 @@
 
 use std::collections::VecDeque;
 
-use super::{Given, Rules, column, equal, split};
+use super::{Given, Rules, split};
 use crate::memory::Reservation;
-use crate::query::{Reader, Visible};
+use crate::query::{Reader, Visible, equal};
 use crate::schema::Table;
 use crate::sql::ast::{EdgePropagation, Propagation};
 use crate::store::{Beside, ChangeSet, Read};
@@ -59,7 +59,7 @@ impl Rules<'_> {
         let Some(machine) = &table.meta.state_machine else {
             return Ok(());
         };
-        let at = column(table, &machine.column)?;
+        let at = table.column(&machine.column)?;
         let Value::Text(state) = &row[at] else {
             return Ok(());
         };
@@ -92,7 +92,7 @@ impl Rules<'_> {
                 let rule = reference.on_state.as_ref();
                 if reference.parent == table.name && rule.is_some_and(|r| r.on_state == *state) {
                     let columns = reference.parent_columns.iter();
-                    let columns = columns.map(|name| column(table, name));
+                    let columns = columns.map(|name| table.column(name));
                     step(
                         child,
                         Via::Reference(place),
@@ -103,7 +103,7 @@ impl Rules<'_> {
         }
         for (place, edge) in table.rules.propagate_edges.iter().enumerate() {
             if edge.rule.on_state == *state {
-                step(table, Via::Edge(place), &[column(table, "id")?])?;
+                step(table, Via::Edge(place), &[table.column("id")?])?;
             }
         }
         Ok(())
@@ -187,14 +187,14 @@ impl Walk<'_> {
             return Ok(());
         }
         let given = self.given;
-        let key = [column(table, "id")?];
+        let key = [table.column("id")?];
         for edges in given.catalog.tables() {
             let mut indexes = edges.meta.indexes.iter();
             if !indexes.any(|index| index.name.starts_with("__graph_edge_")) {
                 continue;
             }
-            let ends = [column(edges, "source_id")?, column(edges, "target_id")?];
-            let kind = column(edges, "edge_type")?;
+            let ends = [edges.column("source_id")?, edges.column("target_id")?];
+            let kind = edges.column("edge_type")?;
             let rules = Rules::of(edges, given)?;
             for (near, far) in [(0, 1), (1, 0)] {
                 if edge.direction == ["INCOMING", "OUTGOING"][near] {
@@ -216,8 +216,8 @@ impl Walk<'_> {
     /// Moves to the state `rule` sets every row of `table` that holds `values` in `columns`
     /// and whose state lists that state as a next one, and notes who follows each. A row
     /// already in that state is passed by. A row in any other state is left as it is, or,
-    /// under `ABORT ON FAILURE`, refuses the statement; so is every row of a table whose rows
-    /// make no move: one with no state machine, and one that is IMMUTABLE or whose state is.
+    /// under `ABORT ON FAILURE`, refuses the statement; so is every row of a table with no
+    /// state machine.
     fn shift(
         &mut self,
         table: &Table,
@@ -231,11 +231,7 @@ impl Walk<'_> {
             return Ok(());
         }
         let machine = table.meta.state_machine.as_ref();
-        let state = match machine {
-            Some(machine) if !table.meta.immutable => Some(column(table, &machine.column)?),
-            _ => None,
-        };
-        let state = state.filter(|at| !table.rules.immutable_columns.contains(at));
+        let state = machine.map(|m| table.column(&m.column)).transpose()?;
         if state.is_none() && !rule.abort_on_failure {
             return Ok(());
         }

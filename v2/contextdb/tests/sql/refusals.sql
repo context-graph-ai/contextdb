@@ -21,10 +21,11 @@ SELECT id, nope FROM notes;
 ----
 error: ColumnNotFound
 
-# A sort key the engine cannot work out is refused, never answered unsorted.
+# A sort key the engine cannot work out is refused, never answered unsorted: this version has
+# no function of that name.
 SELECT tag FROM notes ORDER BY UPPER(tag);
 ----
-error: OrderByExpressionNotSupported
+error: PlanError
 
 # A key that names no row is an empty answer.
 SELECT id, tag FROM notes WHERE id = 404;
