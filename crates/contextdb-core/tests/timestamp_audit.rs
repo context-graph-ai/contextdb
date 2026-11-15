@@ -46,8 +46,10 @@ fn walk_dir_into(dir: &Path, root: &Path, out: &mut Vec<String>) {
 }
 
 fn path_is_excluded(rel: &str) -> bool {
-    rel.split('/')
-        .any(|component| component == ".git" || component == ".worktrees")
+    rel.starts_with("v2/")
+        || rel
+            .split('/')
+            .any(|component| component == ".git" || component == ".worktrees")
 }
 
 fn collapse_ws(line: &str) -> String {
