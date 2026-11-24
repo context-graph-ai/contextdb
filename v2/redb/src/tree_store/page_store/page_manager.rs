@@ -22,7 +22,7 @@ use std::io::ErrorKind;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
 // The region header is optional in the v3 file format
@@ -74,15 +74,15 @@ pub(crate) fn xxh3_checksum(data: &[u8]) -> Checksum {
     hash128_with_seed(data, 0)
 }
 
-struct InMemoryState {
-    header: DatabaseHeader,
+pub(super) struct InMemoryState {
+    pub(super) header: DatabaseHeader,
     // TODO: we should make this an Option because it is only valid after the Database initializes it
-    allocators: Allocators,
+    pub(super) allocators: Allocators,
 }
 
 impl InMemoryState {
-    fn new(header: DatabaseHeader) -> Self {
-        let allocators = Allocators::new(header.layout());
+    fn with_taken(header: DatabaseHeader, taken: bool) -> Self {
+        let allocators = Allocators::with_taken(header.layout(), taken);
         Self { header, allocators }
     }
 
@@ -100,15 +100,24 @@ impl InMemoryState {
 }
 
 pub(crate) struct TransactionalMemory {
+    pub(crate) last_freed_pages: AtomicU64,
     // Pages allocated since the last commit
     // TODO: maybe this should be moved to WriteTransaction?
-    allocated_since_commit: Mutex<PageNumberHashSet>,
+    pub(super) allocated_since_commit: Mutex<PageTrackerPolicy>,
     unpersisted: Mutex<PageNumberHashSet>,
     // True if the allocator state was corrupted when the file was opened
     // TODO: maybe we can remove this flag now that CheckedBackend exists?
-    needs_recovery: AtomicBool,
+    pub(super) needs_recovery: AtomicBool,
+    pub(super) recovery_end: AtomicU64,
+    pub(super) sweep: Mutex<Option<super::sweep::Sweep>>,
+    pub(super) incremental_recovery: bool,
+    secondary_valid: AtomicBool,
+    pub(super) commit_pages: Mutex<Option<PageNumber>>,
+    pub(crate) file_size_limit: AtomicU64,
+    pub(crate) compaction_position: Mutex<(bool, Option<Vec<u8>>, bool)>,
+    allocator_state_lowest: AtomicBool,
     storage: PagedCachedFile,
-    state: Mutex<InMemoryState>,
+    pub(super) state: Mutex<InMemoryState>,
     // The number of PageMut which are outstanding
     #[cfg(debug_assertions)]
     open_dirty_pages: Arc<Mutex<HashSet<PageNumber>>>,
@@ -117,14 +126,14 @@ pub(crate) struct TransactionalMemory {
     read_page_ref_counts: Arc<Mutex<HashMap<PageNumber, u64>>>,
     // Set of all allocated pages for debugging assertions
     #[cfg(debug_assertions)]
-    allocated_pages: Arc<Mutex<PageNumberHashSet>>,
+    pub(super) allocated_pages: Arc<Mutex<PageNumberHashSet>>,
     // Indicates that a non-durable commit has been made, so reads should be served from the secondary meta page
     read_from_secondary: AtomicBool,
-    page_size: u32,
+    pub(super) page_size: u32,
     // We store these separately from the layout because they're static, and accessed on the get_page()
     // code path where there is no locking
-    region_size: u64,
-    region_header_with_padding_size: u64,
+    pub(super) region_size: u64,
+    pub(super) region_header_with_padding_size: u64,
 }
 
 impl TransactionalMemory {
@@ -136,6 +145,7 @@ impl TransactionalMemory {
         requested_region_size: Option<u64>,
         cache_size: usize,
         read_only: bool,
+        incremental_recovery: bool,
     ) -> Result<Self, DatabaseError> {
         assert!(page_size.is_power_of_two() && page_size >= DB_HEADER_SIZE);
 
@@ -201,7 +211,7 @@ impl TransactionalMemory {
                 let file_len = storage.raw_file_len()?;
 
                 if file_len < layout.len() {
-                    storage.resize(layout.len())?;
+                    storage.resize(layout.len(), false)?;
                 }
             }
 
@@ -230,20 +240,15 @@ impl TransactionalMemory {
         assert!(storage.raw_file_len()? >= header.layout().len());
         let needs_recovery =
             header.recovery_required || header.layout().len() != storage.raw_file_len()?;
+        let mut secondary_valid = !repair_info.secondary_corrupted;
         if needs_recovery {
             if read_only {
                 return Err(DatabaseError::RepairAborted);
             }
-            let layout = header.layout();
-            let region_max_pages = layout.full_region_layout().num_pages();
-            let region_header_pages = layout.full_region_layout().get_header_pages();
-            header.set_layout(DatabaseLayout::recalculate(
-                storage.raw_file_len()?,
-                region_header_pages,
-                region_max_pages,
-                page_size.try_into().unwrap(),
-            ));
-            header.pick_primary_for_repair(repair_info)?;
+            header.reconcile_layout(storage.raw_file_len()?);
+            if !header.pick_primary_for_repair(repair_info)? {
+                secondary_valid = !repair_info.primary_corrupted;
+            }
             assert!(!repair_info.invalid_magic_number);
             storage
                 .write(0, DB_HEADER_SIZE, true)?
@@ -256,14 +261,23 @@ impl TransactionalMemory {
         assert_eq!(layout.len(), storage.raw_file_len()?);
         let region_size = layout.full_region_layout().len();
         let region_header_size = layout.full_region_layout().data_section().start;
-        let state = InMemoryState::new(header);
+        let state = InMemoryState::with_taken(header, needs_recovery && incremental_recovery);
 
         assert!(page_size >= DB_HEADER_SIZE);
 
         Ok(Self {
-            allocated_since_commit: Mutex::new(Default::default()),
+            last_freed_pages: AtomicU64::new(0),
+            allocated_since_commit: Mutex::new(PageTrackerPolicy::new_tracking()),
             unpersisted: Mutex::new(Default::default()),
             needs_recovery: AtomicBool::new(needs_recovery),
+            recovery_end: AtomicU64::new(0),
+            sweep: Mutex::new(None),
+            incremental_recovery,
+            secondary_valid: AtomicBool::new(secondary_valid),
+            commit_pages: Mutex::new(None),
+            file_size_limit: AtomicU64::new(u64::MAX),
+            compaction_position: Mutex::new((false, None, false)),
+            allocator_state_lowest: AtomicBool::new(false),
             storage,
             state: Mutex::new(state),
             #[cfg(debug_assertions)]
@@ -285,21 +299,38 @@ impl TransactionalMemory {
         file: Box<dyn StorageBackend>,
         page_size: usize,
         cache_size: usize,
+        incremental_recovery: bool,
     ) -> Result<Self, DatabaseError> {
         let storage = PagedCachedFile::new(file, page_size as u64, cache_size)?;
         if storage.raw_file_len()? < DB_HEADER_SIZE as u64 {
             return Err(StorageError::Io(ErrorKind::InvalidData.into()).into());
         }
-        let header = Self::read_newest_header(&storage)?;
+        let (header, secondary_valid) = Self::read_newest_header(&storage)?;
         assert_eq!(header.page_size() as usize, page_size);
         let layout = header.layout();
 
         Ok(Self {
-            allocated_since_commit: Mutex::new(Default::default()),
+            last_freed_pages: AtomicU64::new(0),
+            allocated_since_commit: Mutex::new(PageTrackerPolicy::new_tracking()),
             unpersisted: Mutex::new(Default::default()),
             needs_recovery: AtomicBool::new(false),
+            recovery_end: AtomicU64::new(0),
+            sweep: Mutex::new(None),
+            incremental_recovery,
+            secondary_valid: AtomicBool::new(secondary_valid),
+            commit_pages: Mutex::new(None),
+            file_size_limit: AtomicU64::new(u64::MAX),
+            compaction_position: Mutex::new((false, None, false)),
+            allocator_state_lowest: AtomicBool::new(false),
             storage,
-            state: Mutex::new(InMemoryState::new(header)),
+            // A reader never allocates, so it builds no allocators
+            state: Mutex::new(InMemoryState {
+                header,
+                allocators: Allocators {
+                    region_tracker: RegionTracker::new(0, 0),
+                    region_allocators: Vec::new(),
+                },
+            }),
             #[cfg(debug_assertions)]
             open_dirty_pages: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(debug_assertions)]
@@ -318,29 +349,38 @@ impl TransactionalMemory {
     // the byte that names the primary slot already written and that slot not yet, or only in
     // part. So the slot is chosen as repair chooses it, by the checksums and transaction ids of
     // the two slots. Every page of a commit is in the file before its slot is written.
-    fn read_newest_header(storage: &PagedCachedFile) -> Result<DatabaseHeader, DatabaseError> {
+    fn read_newest_header(
+        storage: &PagedCachedFile,
+    ) -> Result<(DatabaseHeader, bool), DatabaseError> {
         let header_bytes = storage.read_direct(0, DB_HEADER_SIZE)?;
         if header_bytes[..MAGICNUMBER.len()] != MAGICNUMBER {
             return Err(StorageError::Io(ErrorKind::InvalidData.into()).into());
         }
         let (mut header, repair_info) = DatabaseHeader::from_bytes(&header_bytes)?;
-        header.pick_primary_for_repair(repair_info)?;
+        let secondary_valid = if header.pick_primary_for_repair(repair_info)? {
+            !repair_info.secondary_corrupted
+        } else {
+            !repair_info.primary_corrupted
+        };
 
-        Ok(header)
+        Ok((header, secondary_valid))
     }
 
     // Moves a database opened with new_beside_writer() to the newest commit in the file
-    pub(crate) fn load_newest_commit(&self) -> Result<(), DatabaseError> {
-        let header = Self::read_newest_header(&self.storage)?;
+    pub(crate) fn load_newest_commit(&self) -> Result<bool, DatabaseError> {
+        let (header, secondary_valid) = Self::read_newest_header(&self.storage)?;
         let mut state = self.state.lock().unwrap();
         if header.primary_slot().transaction_id != state.header.primary_slot().transaction_id {
             // The writer may have written again to any page that none of the commits read so far
             // can reach, so nothing cached before this commit is served to a read of it
             self.storage.invalidate_cache_all();
             state.header = header;
+            self.secondary_valid
+                .store(secondary_valid, Ordering::Release);
+            return Ok(true);
         }
 
-        Ok(())
+        Ok(false)
     }
 
     pub(crate) fn cache_stats(&self) -> CacheStats {
@@ -349,6 +389,10 @@ impl TransactionalMemory {
 
     pub(crate) fn check_io_errors(&self) -> Result {
         self.storage.check_io_errors()
+    }
+
+    pub(crate) fn first_io_error(&self) -> Option<std::io::Error> {
+        self.storage.first_io_error()
     }
 
     #[cfg(debug_assertions)]
@@ -393,6 +437,10 @@ impl TransactionalMemory {
         // TODO: This ends up always being true because this is called from check_integrity() once the db is already open
         // TODO: Also we should recheck the layout
         let mut was_clean = true;
+        if header.layout().len() != self.storage.raw_file_len()? {
+            header.reconcile_layout(self.storage.raw_file_len()?);
+            was_clean = false;
+        }
         if header.recovery_required {
             if !header.pick_primary_for_repair(repair_info)? {
                 was_clean = false;
@@ -430,17 +478,28 @@ impl TransactionalMemory {
         self.state.lock().unwrap().allocators.xxh3_hash()
     }
 
+    // Closes the handle until reopened: a commit or rollback failed part way
+    pub(crate) fn fail(&self) {
+        self.storage.file.io_failed.store(true, Ordering::Release);
+    }
+
     // TODO: need a clearer distinction between this and needs_repair()
     pub(crate) fn storage_failure(&self) -> bool {
         self.needs_recovery.load(Ordering::Acquire)
     }
 
-    pub(crate) fn repair_primary_corrupted(&self) {
+    pub(crate) fn repair_primary_corrupted(&self) -> Result {
+        if !self.secondary_valid.load(Ordering::Acquire) {
+            return Err(StorageError::Corrupted("All roots are corrupted".into()));
+        }
         let mut state = self.state.lock().unwrap();
         state.header.swap_primary_slot();
+        Ok(())
     }
 
     pub(crate) fn begin_repair(&self) -> Result<()> {
+        self.sweep.lock().unwrap().take();
+        self.recovery_end.store(0, Ordering::Release);
         let mut state = self.state.lock().unwrap();
         state.allocators = Allocators::new(state.header.layout());
         #[cfg(debug_assertions)]
@@ -467,6 +526,45 @@ impl TransactionalMemory {
         Ok(())
     }
 
+    pub(crate) fn incremental_recovery(&self) -> bool {
+        self.incremental_recovery
+    }
+
+    pub(crate) fn next_commit_id(&self) -> TransactionId {
+        let state = self.state.lock().unwrap();
+        let primary = state.header.primary_slot().transaction_id;
+        if self.secondary_valid.load(Ordering::Acquire) {
+            primary
+                .max(state.header.secondary_slot().transaction_id)
+                .next()
+        } else {
+            primary.next()
+        }
+    }
+
+    pub(crate) fn commit_pages_to_free(&self) -> Option<PageNumber> {
+        self.state
+            .lock()
+            .unwrap()
+            .header
+            .primary_slot()
+            .commit_pages
+    }
+
+    pub(super) fn validate_page(&self, page: PageNumber) -> Result {
+        let layout = self.state.lock().unwrap().header.layout();
+        if page.page_order > MAX_MAX_PAGE_ORDER
+            || page.region >= layout.num_regions()
+            || ((u64::from(page.page_index) + 1) << page.page_order)
+                > u64::from(layout.region_layout(page.region).num_pages())
+        {
+            return Err(StorageError::Corrupted(
+                "Invalid commit page address".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn end_repair(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         state.header.recovery_required = false;
@@ -481,6 +579,7 @@ impl TransactionalMemory {
         &self,
         tree: &mut AllocatorStateTreeMut,
         transaction_id: TransactionId,
+        lowest: bool,
     ) -> Result<u32> {
         let state = self.state.lock().unwrap();
         let layout = state.header.layout();
@@ -493,6 +592,8 @@ impl TransactionalMemory {
             .map(|x| x.to_vec().len())
             .collect();
         drop(state);
+
+        let _reset = self.lowest_scope(lowest);
 
         for i in 0..num_regions {
             let region_bytes_len = region_lens[i as usize];
@@ -618,7 +719,7 @@ impl TransactionalMemory {
         #[cfg(debug_assertions)]
         {
             let allocated = self.allocated_pages.lock().unwrap();
-            allocated.contains(&page)
+            allocated.contains(&page) || self.recovery_old_page(page)
         }
         #[cfg(not(debug_assertions))]
         {
@@ -665,6 +766,10 @@ impl TransactionalMemory {
         debug_assert!(self.open_dirty_pages.lock().unwrap().is_empty());
         assert!(!self.needs_recovery.load(Ordering::Acquire));
 
+        let proof = *self.commit_pages.lock().unwrap();
+        if proof.is_some() {
+            super::commit_pages::write(self, proof)?;
+        }
         let mut state = self.state.lock().unwrap();
         // Trim surplus file space, before finalizing the commit
         let shrunk = if !matches!(shrink_policy, ShrinkPolicy::Never) {
@@ -678,14 +783,23 @@ impl TransactionalMemory {
 
         // Hand every page of this commit to the file before the header that names it, so that
         // whoever reads the file while it is being committed to never finds a header ahead of
-        // its pages
-        self.storage.write_barrier()?;
+        // its pages. A commit with no list that took pages syncs them first: a check of it
+        // reads only its roots
+        if self.incremental_recovery
+            && proof.is_none()
+            && !self.allocated_since_commit.lock().unwrap().is_empty()
+        {
+            self.storage.flush()?;
+        } else {
+            self.storage.write_barrier()?;
+        }
 
         let old_transaction_id = header.secondary_slot().transaction_id;
         let secondary = header.secondary_slot_mut();
         secondary.transaction_id = transaction_id;
         secondary.user_root = data_root;
         secondary.system_root = system_root;
+        secondary.commit_pages = proof;
 
         self.write_header(&header)?;
 
@@ -704,7 +818,7 @@ impl TransactionalMemory {
         self.storage.flush()?;
 
         if shrunk {
-            let result = self.storage.resize(header.layout().len());
+            let result = self.storage.resize(header.layout().len(), false);
             if result.is_err() {
                 // TODO: it would be nice to have a more cohesive approach to setting this.
                 // we do it in commit() & rollback() on failure, but there are probably other places that need it
@@ -713,8 +827,7 @@ impl TransactionalMemory {
             }
         }
         let mut allocated_since_commit = self.allocated_since_commit.lock().unwrap();
-        allocated_since_commit.clear();
-        allocated_since_commit.shrink_to_fit();
+        allocated_since_commit.reset();
         let mut unpersisted = self.unpersisted.lock().unwrap();
         unpersisted.clear();
         unpersisted.shrink_to_fit();
@@ -725,6 +838,8 @@ impl TransactionalMemory {
             old_transaction_id
         );
         state.header = header;
+        *self.commit_pages.lock().unwrap() = None;
+        self.secondary_valid.store(true, Ordering::Release);
         self.read_from_secondary.store(false, Ordering::Release);
         // Hold lock until read_from_secondary is set to false, so that the new primary state is read.
         // TODO: maybe we can remove the whole read_from_secondary flag?
@@ -749,8 +864,7 @@ impl TransactionalMemory {
 
         let mut unpersisted = self.unpersisted.lock().unwrap();
         let mut allocated_since_commit = self.allocated_since_commit.lock().unwrap();
-        unpersisted.extend(allocated_since_commit.drain());
-        allocated_since_commit.shrink_to_fit();
+        unpersisted.extend(allocated_since_commit.reset().iter());
         self.storage.write_barrier()?;
 
         let mut state = self.state.lock().unwrap();
@@ -769,11 +883,13 @@ impl TransactionalMemory {
         let result = self.rollback_uncommitted_writes_inner();
         if result.is_err() {
             self.needs_recovery.store(true, Ordering::Release);
+            self.fail();
         }
         result
     }
 
     fn rollback_uncommitted_writes_inner(&self) -> Result {
+        *self.commit_pages.lock().unwrap() = None;
         #[cfg(debug_assertions)]
         {
             let dirty_pages = self.open_dirty_pages.lock().unwrap();
@@ -794,7 +910,7 @@ impl TransactionalMemory {
                 .get_region_mut(region_index)
                 .free(page_number.page_index, page_number.page_order);
             #[cfg(debug_assertions)]
-            assert!(self.allocated_pages.lock().unwrap().remove(page_number));
+            assert!(self.allocated_pages.lock().unwrap().remove(&page_number));
 
             let address = page_number.address_range(
                 self.page_size.into(),
@@ -806,8 +922,7 @@ impl TransactionalMemory {
             self.storage.invalidate_cache(address.start, len);
             self.storage.cancel_pending_write(address.start, len);
         }
-        guard.clear();
-        guard.shrink_to_fit();
+        guard.reset();
 
         Ok(())
     }
@@ -977,7 +1092,7 @@ impl TransactionalMemory {
     }
 
     pub(crate) fn free(&self, page: PageNumber, allocated: &mut PageTrackerPolicy) {
-        self.allocated_since_commit.lock().unwrap().remove(&page);
+        self.allocated_since_commit.lock().unwrap().remove(page);
         self.free_helper(page, allocated);
     }
 
@@ -991,10 +1106,12 @@ impl TransactionalMemory {
                     .unwrap()
                     .contains_key(&page)
             );
-            assert!(self.allocated_pages.lock().unwrap().remove(&page));
+            assert!(
+                self.allocated_pages.lock().unwrap().remove(&page) || self.recovery_old_page(page)
+            );
             assert!(!self.open_dirty_pages.lock().unwrap().contains(&page));
         }
-        allocated.remove(page);
+        assert!(allocated.remove(page));
         let mut state = self.state.lock().unwrap();
         let region_index = page.region;
         // Free in the regional allocator
@@ -1039,7 +1156,7 @@ impl TransactionalMemory {
         page: PageNumber,
         allocated: &mut PageTrackerPolicy,
     ) -> bool {
-        if self.allocated_since_commit.lock().unwrap().remove(&page) {
+        if self.allocated_since_commit.lock().unwrap().remove(page) {
             self.free_helper(page, allocated);
             true
         } else {
@@ -1072,8 +1189,7 @@ impl TransactionalMemory {
         {
             page_number
         } else {
-            self.grow(&mut state, required_order)?;
-            Self::allocate_helper_retry(&mut state, required_order, lowest)?.unwrap()
+            self.grow(&mut state, required_order, lowest)?
         };
 
         #[cfg(debug_assertions)]
@@ -1188,7 +1304,12 @@ impl TransactionalMemory {
         Ok(true)
     }
 
-    fn grow(&self, state: &mut InMemoryState, required_order_allocation: u8) -> Result<()> {
+    fn grow(
+        &self,
+        state: &mut InMemoryState,
+        required_order_allocation: u8,
+        lowest: bool,
+    ) -> Result<PageNumber> {
         let layout = state.header.layout();
         let required_growth =
             2u64.pow(required_order_allocation.into()) * u64::from(state.header.page_size());
@@ -1199,7 +1320,9 @@ impl TransactionalMemory {
         // the allocation that needs the room. A smaller file doubles.
         let usable = layout.usable_bytes();
         let step = max(
-            if usable < (1 << 20) {
+            if self.recovery_end.load(Ordering::Acquire) != 0 {
+                4 << 20
+            } else if usable < (1 << 20) {
                 usable
             } else {
                 usable / 16
@@ -1223,7 +1346,7 @@ impl TransactionalMemory {
         } else {
             usable + step
         };
-        let new_layout = DatabaseLayout::calculate(
+        let mut new_layout = DatabaseLayout::calculate(
             next_desired_size,
             state.header.layout().full_region_layout().num_pages(),
             state
@@ -1233,19 +1356,45 @@ impl TransactionalMemory {
                 .get_header_pages(),
             self.page_size,
         );
+        let limit = self.file_size_limit.load(Ordering::Acquire);
+        if new_layout.len() > limit {
+            new_layout = DatabaseLayout::recalculate(
+                limit.max(layout.len()),
+                layout.full_region_layout().get_header_pages(),
+                layout.full_region_layout().num_pages(),
+                self.page_size,
+            );
+        }
+        let no_room = || -> Result<PageNumber> {
+            let limit = crate::FileSizeLimit(self.storage.raw_file_len()?, limit);
+            Err(std::io::Error::new(ErrorKind::StorageFull, limit).into())
+        };
+        // The larger layout must hold a free block of the size asked for, not only that many
+        // pages: the last region's free run at its end, and every region the growth adds
+        let (last, block) = (layout.num_regions() - 1, 1 << required_order_allocation);
+        let used = state.get_region(last).len() - state.get_region(last).trailing_free_pages();
+        let fits = (last..new_layout.num_regions()).any(|region| {
+            let start = if region == last {
+                used.next_multiple_of(block)
+            } else {
+                0
+            };
+            start + block <= new_layout.region_layout(region).num_pages()
+        });
+        if !fits {
+            return no_room();
+        }
         assert!(new_layout.len() >= layout.len());
 
-        let result = self.storage.resize(new_layout.len());
-        if result.is_err() {
-            // TODO: it would be nice to have a more cohesive approach to setting this.
-            // we do it in commit() & rollback() on failure, but there are probably other places that need it
-            self.needs_recovery.store(true, Ordering::Release);
-            return result;
-        }
+        self.storage.admit_growth(new_layout.len())?;
+        self.storage.resize(new_layout.len(), true)?;
 
         state.allocators.resize_to(new_layout);
         state.header.set_layout(new_layout);
-        Ok(())
+        match Self::allocate_helper_retry(state, required_order_allocation, lowest)? {
+            Some(page) => Ok(page),
+            None => no_room(),
+        }
     }
 
     pub(crate) fn allocate<'txn>(
@@ -1253,15 +1402,52 @@ impl TransactionalMemory {
         allocation_size: usize,
         allocated: &mut PageTrackerPolicy,
     ) -> Result<PageMut<'txn>> {
-        let result = self.allocate_helper(allocation_size, false, true);
+        let result = self.allocate_helper(
+            allocation_size,
+            self.allocator_state_lowest.load(Ordering::Acquire),
+            true,
+        );
         if let Ok(ref page) = result {
-            allocated.insert(page.get_page_number());
+            assert!(allocated.insert(page.get_page_number()));
         }
         result
     }
 
+    pub(crate) fn lowest_scope(&self, lowest: bool) -> impl Drop + '_ {
+        struct ResetLowest<'a>(&'a AtomicBool, bool);
+        impl Drop for ResetLowest<'_> {
+            fn drop(&mut self) {
+                self.0.store(self.1, Ordering::Release);
+            }
+        }
+        ResetLowest(
+            &self.allocator_state_lowest,
+            self.allocator_state_lowest.swap(lowest, Ordering::AcqRel),
+        )
+    }
+
     pub(crate) fn allocate_lowest<'txn>(&self, allocation_size: usize) -> Result<PageMut<'txn>> {
         self.allocate_helper(allocation_size, true, true)
+    }
+
+    pub(crate) fn count_uncommitted_pages(&self) -> usize {
+        self.allocated_since_commit.lock().unwrap().counts().0
+    }
+
+    pub(crate) fn has_free_tail(&self) -> Result<bool> {
+        let state = self.state.lock().unwrap();
+        let layout = state.header.layout();
+        let last = state.get_region(layout.num_regions() - 1);
+        Ok(last.trailing_free_pages() > 0 && (layout.num_regions() > 1 || last.len() > 1))
+    }
+
+    pub(crate) fn file_len(&self) -> Result<u64> {
+        self.storage.raw_file_len()
+    }
+
+    pub(crate) fn region_pages(&self) -> u64 {
+        let state = self.state.lock().unwrap();
+        u64::from(state.header.layout().full_region_layout().num_pages())
     }
 
     pub(crate) fn count_allocated_pages(&self) -> Result<u64> {
@@ -1288,19 +1474,23 @@ impl TransactionalMemory {
         self.page_size.try_into().unwrap()
     }
 
+    // Syncs, clears the recovery mark when the free-page map is whole, and closes the file
+    // whatever failed before, returning the first failure.
     pub(crate) fn close(&self) -> Result {
-        if !self.needs_recovery.load(Ordering::Acquire) && !thread::panicking() {
-            let mut state = self.state.lock()?;
-            if self.storage.flush().is_ok() {
-                state.header.recovery_required = false;
-                self.write_header(&state.header)?;
-                self.storage.flush()?;
+        let synced = self.storage.flush().and_then(|()| {
+            if self.needs_recovery.load(Ordering::Acquire)
+                || self.recovery_end.load(Ordering::Acquire) != 0
+                || thread::panicking()
+            {
+                return Ok(());
             }
-        }
-
-        self.storage.close()?;
-
-        Ok(())
+            let mut state = self.state.lock()?;
+            state.header.recovery_required = false;
+            self.write_header(&state.header)?;
+            self.storage.flush()
+        });
+        let closed = self.storage.close();
+        synced.and(closed)
     }
 }
 

@@ -5,8 +5,27 @@ redb 4.1.0 with changes for contextdb. Upstream version: [redb](https://github.c
 differently (below), so it opens only files that it wrote itself: upstream's tests of opening
 files written by redb 2.6 are removed, and every other upstream test passes unchanged.
 
+Backends may reject allocator growth through `StorageBackend::admit_growth` before cache
+invalidation, file resizing or allocator changes. A refusal takes the clean abort path;
+errors from the subsequent physical I/O retain the normal storage-failure behavior.
+
+`Table::insert_discard` replaces a value without copying its old bytes for a discarded
+return value. Ordinary `insert` keeps its existing return contract.
+
+`DRAIN_BYTES` describes the required bounded-drain workspace: one lent list, at most 4,096
+extracted entries, and deferred frees bounded by entries plus height. The recovery integration must enforce and witness that bound.
+
 This version changes the following and nothing else. Each change is written so that it can be
 proposed upstream.
+
+Page alignment uses `is_multiple_of` for its nonzero page size, preserving the
+rounding while passing the current strict clippy check. The example requiring the
+separate, unshipped `redb_derive` crate is removed.
+
+Checking a handle after an I/O failure:
+
+- `Database::check_io_errors` forwards the backend failure check; after failed physical I/O,
+  it returns `PreviousIo` until the database is reopened.
 
 Reading a file while its writer has it open:
 
@@ -22,6 +41,14 @@ Reading a file while its writer has it open:
 - Every commit now writes its pages to the file before it writes the header that names them, so
   a reader of the file never finds a header ahead of its pages.
 
+Reading a write transaction's current tables and reserving room:
+
+- `WriteTransaction::peek_table` reads a closed table at its current uncommitted root and refuses
+  one open for writing. Drop the table and all its guards before any mutation or transaction exit.
+- `WriteTransaction::reserve(pages)` allocates and frees that many pages within the transaction,
+  so later work can reuse them. The declared file-size limit still applies.
+- Normal tables release pages while walking branches; file growth reserves blocks or writes zeros.
+
 Checking pages when they are read:
 
 - A committed page that is read from the file is now checked, before it is cached or returned,
@@ -32,6 +59,31 @@ Checking pages when they are read:
   were written through the same handle.
 
 Keeping a file close to the size of what it holds:
+
+- `Builder::set_manual_compaction(true)` leaves ordinary commits untrimmed.
+  `WriteTransaction::compact_pages(allowance, from)` bounds candidate reads and relocation,
+  returns `(moved, next)` with an opaque position; commit and clean close trim.
+  `compaction_space(&mut allowance)` returns free, total, eligible pending, last freed pages and held readers;
+  its pending scan shares the read allowance and stops at churn. `compaction_state()` reads no tree.
+  Relocation uses free-now minus churn; one scoped file-size clip covers moves and metadata.
+  `compaction_position` and `set_compaction_position` keep the opaque position in a system table;
+  a clipped copy leaves an in-memory hint. Every immediate commit with quick repair disabled
+  prepares metadata before publication. Preparation reuses released pages and keeps their list;
+  a refused extension rolls back, restores those pages to allocated and leaves the handle writable.
+  `prepare_compaction_commit` applies the compaction-only growth clip, admits metadata before
+  releasing pending pages and selects maximum trimming for move and drain commits; the clip
+  is restored on transaction exit. `pending_free_pages` excludes the newest retired proof,
+  which each publication replaces, while retaining older chains and ordinary pending frees.
+  `compaction_backlog` applies the same exclusion to its pending batch count;
+  `has_free_tail` exposes the allocator's trim check. Drains commit only for those pending
+  entries or a trimmable tail. A drain admits iterations only while pending entries at or
+  before its starting physical commit remain, stopping once those are gone or a pass makes
+  no progress. An admitted pass still trims a free tail and may release newer frees.
+  `RELEASE_PAGES` bounds compaction's staged addresses at 4,096 (32 KiB encoded); ordinary release
+  uses its commit's allocated-page count clamped to 4,096..=131,072 (at most 1 MiB encoded).
+  Remaining entries wait. Failed writes and syncs still require reopening the handle.
+  Settings and position metadata have a bounded lookup cost; release has at most the bounded
+  entries' root-to-leaf paths. Discovery and pending inspection still share the work allowance.
 
 - A key type answers one new question, `Key::compares_as_bytes`: whether it orders keys exactly
   as their bytes. Only `&[u8]` answers yes.
@@ -151,3 +203,28 @@ Unless you explicitly state otherwise, any contribution intentionally
 submitted for inclusion in the work by you, as defined in the Apache-2.0
 license, shall be dual licensed as above, without any additional terms or
 conditions.
+
+`Database::set_file_size_limit` clips allocator growth and returns typed `FileSizeLimit` before
+backend resize when the requested pages cannot fit, leaving the handle usable.
+
+Recovering the last durable commit:
+
+- `Builder::set_incremental_recovery(true)` stores checksummed fixed-size chains of changed
+  pages. Reopen verifies that chain and the changed tree pages with file-sized bitmaps;
+  a broken newest commit falls back to the preceding complete state, including on the reader path.
+- Allocated-page tracking uses bitmaps. `flush_freed_pages` writes pending freed pages at
+  4,096 entries and appends across calls. Old proof chains enter the same bounded waiting-page
+  release as ordinary freed pages. Non-durable commits assert while this option is enabled.
+
+- An enabled unclean writing open forgets free space and pins its selected roots. It reads
+  the header and last commit proof; system/waiting trees and data branches are found later
+  by `Database::recovery_step(allowance)`. `recovery_state()` reports remaining work,
+  file bytes and effective growth ceiling; known space has no remaining-work value.
+  The same page visitor serves discovery and compaction. Old pages remain taken until the
+  checked marking pass completes, then holes are released in bounded chunks. Clean close
+  completes discovery before saving allocator state; a failed checked walk frees nothing.
+- `DISK_LIMIT` remains a hard physical ceiling. The engine gates host writes during
+  recovery at a reserve of `min(limit, max(limit / 100, 64 MiB))` inside that ceiling.
+  Below 64 MiB, writers wait for engine maintenance or receive the caller-maintenance
+  refusal until recovery ends. Healthy stores retain their configured ceiling and
+  fitting writes remain allowed.

@@ -116,10 +116,12 @@ impl LRUWriteCache {
 }
 
 #[derive(Debug)]
-struct CheckedBackend {
+pub(super) struct CheckedBackend {
     file: Box<dyn StorageBackend>,
-    io_failed: AtomicBool,
+    pub(super) io_failed: AtomicBool,
     closed: AtomicBool,
+    /// The first I/O error. Later calls report `PreviousIo`; close returns this one.
+    first_error: Mutex<Option<std::io::Error>>,
 }
 
 impl CheckedBackend {
@@ -128,7 +130,24 @@ impl CheckedBackend {
             file,
             io_failed: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            first_error: Mutex::new(None),
         }
+    }
+
+    fn note(&self, error: &std::io::Error) {
+        self.io_failed.store(true, Ordering::Release);
+        if let Ok(mut slot) = self.first_error.lock()
+            && slot.is_none()
+        {
+            *slot = Some(std::io::Error::new(error.kind(), error.to_string()));
+        }
+    }
+
+    fn first_io_error(&self) -> Option<std::io::Error> {
+        self.first_error.lock().ok().and_then(|slot| {
+            slot.as_ref()
+                .map(|error| std::io::Error::new(error.kind(), error.to_string()))
+        })
     }
 
     fn check_failure(&self) -> Result<()> {
@@ -154,35 +173,37 @@ impl CheckedBackend {
     fn len(&self) -> Result<u64> {
         self.check_failure()?;
         let result = self.file.len();
-        if result.is_err() {
-            self.io_failed.store(true, Ordering::Release);
+        if let Err(error) = &result {
+            self.note(error);
         }
         result.map_err(StorageError::from)
     }
 
     fn read(&self, offset: u64, out: &mut [u8]) -> Result<()> {
         self.check_failure()?;
-        let result = self.file.read(offset, out);
-        if result.is_err() {
-            self.io_failed.store(true, Ordering::Release);
+        let file_len = self.len()?;
+        if offset
+            .checked_add(out.len() as u64)
+            .is_none_or(|end| end > file_len)
+        {
+            return Err(StorageError::Corrupted(format!(
+                "Read outside file: offset {offset}, length {}, file length {file_len}",
+                out.len()
+            )));
         }
-        result.map_err(StorageError::from)
+        self.file.read(offset, out).map_err(StorageError::from)
     }
 
     fn set_len(&self, len: u64) -> Result<()> {
         self.check_failure()?;
-        let result = self.file.set_len(len);
-        if result.is_err() {
-            self.io_failed.store(true, Ordering::Release);
-        }
-        result.map_err(StorageError::from)
+        self.file.set_len(len).map_err(StorageError::from)
     }
 
     fn sync_data(&self) -> Result<()> {
         self.check_failure()?;
         let result = self.file.sync_data();
-        if result.is_err() {
-            self.io_failed.store(true, Ordering::Release);
+        if let Err(error) = &result {
+            self.note(error);
         }
         result.map_err(StorageError::from)
     }
@@ -190,15 +211,15 @@ impl CheckedBackend {
     fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
         self.check_failure()?;
         let result = self.file.write(offset, data);
-        if result.is_err() {
-            self.io_failed.store(true, Ordering::Release);
+        if let Err(error) = &result {
+            self.note(error);
         }
         result.map_err(StorageError::from)
     }
 }
 
 pub(super) struct PagedCachedFile {
-    file: CheckedBackend,
+    pub(super) file: CheckedBackend,
     page_size: u64,
     // Dynamic cache partitioning.  Three invariants:
     //
@@ -311,6 +332,10 @@ impl PagedCachedFile {
         self.file.check_failure()
     }
 
+    pub(crate) fn first_io_error(&self) -> Option<std::io::Error> {
+        self.file.first_io_error()
+    }
+
     pub(crate) fn raw_file_len(&self) -> Result<u64> {
         self.file.len()
     }
@@ -388,12 +413,20 @@ impl PagedCachedFile {
         Ok(())
     }
 
+    pub(super) fn admit_growth(&self, len: u64) -> Result {
+        Ok(self.file.file.admit_growth(len)?)
+    }
+
     // Caller should invalidate all cached pages that are no longer valid
-    pub(super) fn resize(&self, len: u64) -> Result {
+    pub(super) fn resize(&self, len: u64, abortable: bool) -> Result {
         // TODO: be more fine-grained about this invalidation
         self.invalidate_cache_all();
 
-        self.file.set_len(len)
+        let result = self.file.set_len(len);
+        if result.is_err() && !abortable {
+            self.file.io_failed.store(true, Ordering::Release);
+        }
+        result
     }
 
     pub(super) fn flush(&self) -> Result {

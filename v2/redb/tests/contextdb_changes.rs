@@ -5,13 +5,13 @@
 #![cfg(unix)]
 
 use std::collections::BTreeSet;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::ops::RangeInclusive;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 
 use redb::{
     AccessGuard, Builder, Database, MultimapTableDefinition, ReadOnlyDatabase, ReadTransaction,
@@ -19,92 +19,152 @@ use redb::{
     TableDefinition,
 };
 
+include!("compaction_steps.rs");
+#[path = "contextdb_changes/recovery_chain.rs"]
+mod recovery_chain;
+
 const ROWS: TableDefinition<u64, &[u8]> = TableDefinition::new("rows");
 
-/// The data file the way contextdb's store hands it over: the plain file. The store keeps its
-/// own lock on its folder, so this library's lock on the file is not what holds it for a writer.
-///
-/// `damaged` lists file offsets whose byte arrives with one bit flipped on every read. While
-/// `header` holds bytes, they are what a read of the start of the file is answered with. The
-/// file itself is never changed by either.
-#[derive(Debug)]
-struct PlainFile {
-    file: File,
-    damaged: Vec<u64>,
-    header: ServedHeader,
-    sent: Arc<AtomicU64>,
+#[test]
+fn an_aborted_prepare_restores_pages_before_full_repair() {
+    let path = folder("aborted-release").join("data");
+    let mut db = writer(&path);
+    commit_rows(&db, 1..=200, 0);
+    let pinned = db.begin_read().unwrap();
+    commit_rows(&db, 1..=200, 1);
+    drop(pinned);
+    let mut write = db.begin_write().unwrap();
+    let before = write.compaction_state().unwrap().0;
+    write.prepare_compaction_commit().unwrap();
+    assert!(write.compaction_state().unwrap().0 > before, "no release");
+    write.abort().unwrap();
+    commit_rows(&db, 201..=201, 2);
+    assert!(
+        db.check_integrity().unwrap(),
+        "allocator differs after full repair"
+    );
+    let copy = path.with_file_name("repair");
+    std::fs::copy(&path, &copy).unwrap(); // Dirty header: reopen performs full repair.
+    let mut repaired = Database::create(&copy).unwrap();
+    assert!(repaired.check_integrity().unwrap());
+    assert_eq!(
+        rows_of(&repaired.begin_read().unwrap()),
+        rows_of(&db.begin_read().unwrap())
+    );
 }
 
-/// The start of the file as a reader is to be served it, or `None` for what the file holds.
-type ServedHeader = Arc<Mutex<Option<Vec<u8>>>>;
-
-impl PlainFile {
-    fn open(path: &Path, damaged: Vec<u64>) -> PlainFile {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .unwrap();
-        PlainFile {
-            file,
-            damaged,
-            header: ServedHeader::default(),
-            sent: Arc::default(),
-        }
+/// Before a growth, the layout it would give is checked to hold a block of the size asked for
+/// (section 7, C4): a size limit that leaves room for the pages but for no block of their size
+/// answers no room with the file's length and the layout unchanged, and the next allocation that
+/// fits succeeds.
+#[test]
+fn a_size_limit_with_no_block_of_the_size_changes_nothing() {
+    let path = folder("no-block-of-the-size").join("data");
+    let db = writer(&path);
+    let write = db.begin_write().unwrap();
+    let mut table = write.open_table(ROWS).unwrap();
+    let mut row = 0;
+    while write.compaction_state().unwrap().0 > 1 {
+        row += 1; // use the free pages up, so the value below needs a growth
+        table.insert(row, &[7u8; 2000][..]).unwrap();
     }
-
-    /// The file as a reader opens it: for reading only.
-    fn read_only(path: &Path) -> PlainFile {
-        PlainFile::serving(path, ServedHeader::default())
-    }
-
-    /// The file for reading only, its start answered from `header` whenever that holds bytes.
-    fn serving(path: &Path, header: ServedHeader) -> PlainFile {
-        PlainFile {
-            file: File::open(path).unwrap(),
-            damaged: Vec::new(),
-            header,
-            sent: Arc::default(),
-        }
-    }
+    let (_, pages, ..) = write.compaction_state().unwrap();
+    // A block of 2^k pages starts at a multiple of 2^k pages. The layout's end is not one for this
+    // k, so growing by exactly 2^k pages gives that many pages and no block of them.
+    let block = 1u64 << (pages.trailing_zeros() + 1);
+    let len = length(&path);
+    db.set_file_size_limit(Some(len + block * 4096));
+    let value = vec![1u8; (block * 4096 * 3 / 4) as usize];
+    let refused = table.insert(0, value.as_slice()).map(|_| ());
+    assert!(
+        matches!(&refused, Err(StorageError::Io(e)) if e.kind() == io::ErrorKind::StorageFull),
+        "no block of the size is no room: {refused:?}"
+    );
+    let after = (length(&path), write.compaction_state().unwrap().1);
+    assert_eq!(
+        after,
+        (len, pages),
+        "a refused growth leaves the length and layout"
+    );
+    table.insert(row + 1, &[7u8; 2000][..]).unwrap();
+    drop(table);
+    write.commit().unwrap();
 }
 
-impl StorageBackend for PlainFile {
-    fn len(&self) -> io::Result<u64> {
-        Ok(self.file.metadata()?.len())
-    }
-
-    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
-        self.file.read_exact_at(out, offset)?;
-        for at in &self.damaged {
-            if (offset..offset + out.len() as u64).contains(at) {
-                out[(at - offset) as usize] ^= 0x01;
+#[test]
+fn a_disk_limit_inside_commit_leaves_the_same_handle_usable() {
+    for capped in [true, false] {
+        for k in 1.. {
+            let path = folder(&format!("late-commit-disk-limit-{capped}-{k}")).join("data");
+            let backend = PlainFile::open(&path, Vec::new());
+            let growth = backend.refuse_growth.clone();
+            let db = Builder::new().create_with_backend(backend).unwrap();
+            commit_rows(&db, 0..=0, 0);
+            let write = db.begin_write().unwrap();
+            let mut count = 0;
+            {
+                let mut table = write.open_table(ROWS).unwrap();
+                // Consume the current layout; commit must still allocate its bookkeeping.
+                loop {
+                    count += 1;
+                    table.insert(count, &[7u8; 2000][..]).unwrap();
+                    if write.compaction_state().unwrap().0 <= 1 {
+                        break;
+                    }
+                    assert!(count < 10000, "the fixture must consume the free pages");
+                }
+            }
+            // All row writes succeeded; only commit's bookkeeping can now need growth.
+            db.set_file_size_limit(capped.then_some(0));
+            growth.store(if capped { 0 } else { k }, Relaxed);
+            let outcome = write.commit();
+            if let Err(error) = &outcome {
+                let redb::CommitError::Storage(StorageError::Io(io)) = error else {
+                    panic!("the commit was refused as {error:?}");
+                };
+                assert_eq!(io.kind(), io::ErrorKind::StorageFull);
+                if capped {
+                    assert!(io.get_ref().is_some_and(|e| e.is::<redb::FileSizeLimit>()));
+                } else {
+                    assert_eq!(io.to_string(), "growth refused inside commit");
+                    assert_eq!(growth.load(Relaxed), 0, "the k-th growth was refused");
+                }
+                eprintln!(
+                    "late commit refused: capped={capped}, k={k}, rows={count}, error={error}"
+                );
+            } else {
+                assert!(
+                    !capped && growth.load(Relaxed) > 0,
+                    "the control had no refusal"
+                );
+                eprintln!("commit completed: k={k}, rows={count}");
+            }
+            growth.store(0, Relaxed);
+            db.set_file_size_limit(None);
+            // A limit refusal is recoverable: the same handle must commit again.
+            commit_rows(&db, 99999..=99999, 2);
+            let check = |db: &Database| {
+                let table = db.begin_read().unwrap().open_table(ROWS).unwrap();
+                assert_eq!(
+                    table.len().unwrap(),
+                    if outcome.is_err() { 2 } else { count + 2 }
+                );
+                assert_eq!(table.get(0).unwrap().unwrap().value(), value(0, 0));
+                assert_eq!(table.get(99999).unwrap().unwrap().value(), value(99999, 2));
+            };
+            check(&db);
+            drop(db);
+            check(&writer(&path));
+            if capped || outcome.is_ok() {
+                break;
             }
         }
-        if let Some(header) = self.header.lock().unwrap().as_deref() {
-            let served = header.iter().enumerate().skip(offset as usize);
-            for (at, byte) in served.take(out.len()) {
-                out[at - offset as usize] = *byte;
-            }
-        }
-        Ok(())
-    }
-
-    fn set_len(&self, len: u64) -> io::Result<()> {
-        self.file.set_len(len)
-    }
-
-    fn sync_data(&self) -> io::Result<()> {
-        self.file.sync_data()
-    }
-
-    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
-        self.sent.fetch_add(data.len() as u64, Relaxed);
-        self.file.write_all_at(data, offset)
     }
 }
+
+#[path = "support/plain_file.rs"]
+mod plain_file;
+use plain_file::{PlainFile, ServedHeader, Watch, pass};
 
 /// An empty folder of this test's own.
 fn folder(test: &str) -> PathBuf {
@@ -172,7 +232,9 @@ fn rows_at(rows: RangeInclusive<u64>, version: u64) -> Vec<(u64, Vec<u8>)> {
 }
 
 /// The id and the rows of the commit a reader is given now, or why it was given none.
-fn newest(reader: &ReadOnlyDatabase) -> Result<(u64, Vec<(u64, Vec<u8>)>), redb::Error> {
+type Given = Result<(u64, Vec<(u64, Vec<u8>)>), redb::Error>;
+
+fn newest(reader: &ReadOnlyDatabase) -> Given {
     let read = reader.begin_read()?;
     let table = read.open_table(ROWS)?;
     let mut rows = Vec::new();
@@ -185,11 +247,12 @@ fn newest(reader: &ReadOnlyDatabase) -> Result<(u64, Vec<(u64, Vec<u8>)>), redb:
 
 #[test]
 fn a_reader_that_catches_the_header_inside_a_commit_reads_the_last_whole_commit() {
+    recovery_chain::proof_survives_stops();
     let path = folder("a-reader-that-catches-the-header-inside-a-commit").join("data");
     let writer = writer(&path);
     let header = || std::fs::read(&path).unwrap()[..320].to_vec();
     // What a reader was given, in words a failure can show.
-    let told = |given: Result<(u64, Vec<(u64, Vec<u8>)>), redb::Error>| match given {
+    let told = |given: Given| match given {
         Err(error) => format!("refused with {error:?}"),
         Ok((id, rows)) => match (1..=3).find(|version| rows == rows_at(1..=3, *version)) {
             Some(version) => format!("commit {id} with the rows of version {version}"),
@@ -458,7 +521,7 @@ fn a_table_written_in_key_order_has_full_leaves() {
         let pick = |n| want.iter().nth(want.len() / n).unwrap();
         let (low, high) = (pick(3)[..4].to_vec(), pick(2)[..20].to_vec());
         let (near, held) = (low[..3].to_vec(), want.clone());
-        let gone = |k: &[u8]| k[k.len() - 1] % 3 == 0;
+        let gone = |k: &[u8]| k[k.len() - 1].is_multiple_of(3);
         let seen = |by: &str, k: &[u8]| assert!(held.contains(k), "{by} gave {k:?}, no stored key");
         let write = db.begin_write().unwrap();
         let mut table = write.open_table(SLICES).unwrap();

@@ -68,8 +68,8 @@ pub use db::{
     UntypedMultimapTableHandle, UntypedTableHandle,
 };
 pub use error::{
-    CommitError, CompactionError, DatabaseError, Error, SavepointError, SetDurabilityError,
-    StorageError, TableError, TransactionError,
+    CommitError, CompactionError, DatabaseError, Error, FileSizeLimit, SavepointError,
+    SetDurabilityError, StorageError, TableError, TransactionError,
 };
 pub use multimap_table::{
     MultimapRange, MultimapTable, MultimapValue, ReadOnlyMultimapTable,
@@ -79,7 +79,9 @@ pub use table::{
     ExtractIf, Range, ReadOnlyTable, ReadOnlyUntypedTable, ReadableTable, ReadableTableMetadata,
     Table, TableStats,
 };
-pub use transactions::{DatabaseStats, Durability, ReadTransaction, WriteTransaction};
+pub use transactions::{
+    DatabaseStats, Durability, RELEASE_PAGES, ReadTransaction, WriteTransaction,
+};
 pub use tree_store::{AccessGuard, AccessGuardMut, AccessGuardMutInPlace, Savepoint};
 pub use types::{Key, MutInPlaceValue, TypeName, Value};
 

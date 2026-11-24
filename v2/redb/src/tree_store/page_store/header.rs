@@ -1,10 +1,10 @@
 use crate::transaction_tracker::TransactionId;
-use crate::tree_store::Checksum;
 use crate::tree_store::btree_base::BtreeHeader;
 use crate::tree_store::page_store::layout::{DatabaseLayout, RegionLayout};
 use crate::tree_store::page_store::page_manager::{
     FILE_FORMAT_VERSION1, FILE_FORMAT_VERSION2, FILE_FORMAT_VERSION3, xxh3_checksum,
 };
+use crate::tree_store::{Checksum, PageNumber};
 use crate::{DatabaseError, Result, StorageError};
 use std::mem::size_of;
 
@@ -149,6 +149,15 @@ impl DatabaseHeader {
             None
         };
         DatabaseLayout::new(self.full_regions, full_layout, trailing)
+    }
+
+    pub(super) fn reconcile_layout(&mut self, len: u64) {
+        self.set_layout(DatabaseLayout::recalculate(
+            len,
+            self.region_header_pages,
+            self.region_max_data_pages,
+            self.page_size,
+        ));
     }
 
     pub(super) fn set_layout(&mut self, layout: DatabaseLayout) {
@@ -307,6 +316,7 @@ pub(super) struct TransactionHeader {
     pub(super) user_root: Option<BtreeHeader>,
     pub(super) system_root: Option<BtreeHeader>,
     pub(super) transaction_id: TransactionId,
+    pub(super) commit_pages: Option<PageNumber>,
 }
 
 impl TransactionHeader {
@@ -316,6 +326,7 @@ impl TransactionHeader {
             user_root: None,
             system_root: None,
             transaction_id,
+            commit_pages: None,
         }
     }
 
@@ -366,6 +377,7 @@ impl TransactionHeader {
             user_root,
             system_root,
             transaction_id,
+            commit_pages: super::commit_pages::next(&data[96..104]),
         };
 
         Ok((result, corrupted))
@@ -387,6 +399,8 @@ impl TransactionHeader {
         }
         result[TRANSACTION_ID_OFFSET..(TRANSACTION_ID_OFFSET + size_of::<u64>())]
             .copy_from_slice(&self.transaction_id.raw_id().to_le_bytes());
+        result[96..104]
+            .copy_from_slice(&self.commit_pages.map_or([255; 8], PageNumber::to_le_bytes));
         let checksum = xxh3_checksum(&result[..SLOT_CHECKSUM_OFFSET]);
         result[SLOT_CHECKSUM_OFFSET..(SLOT_CHECKSUM_OFFSET + size_of::<Checksum>())]
             .copy_from_slice(&checksum.to_le_bytes());

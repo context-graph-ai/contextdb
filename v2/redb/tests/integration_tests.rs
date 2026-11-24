@@ -432,8 +432,9 @@ fn small_db_is_small_file() {
 
     drop(db);
     let metadata = tmpfile.as_file().metadata().unwrap();
+    // LEAN-B82 keeps the last commit's replaced SYSTEM_FREED_TABLE page until the next commit (40,960 bytes).
     assert!(
-        metadata.len() < 40 * 1024,
+        metadata.len() <= 40 * 1024,
         "File size: {:?}",
         metadata.len()
     );
@@ -1197,9 +1198,10 @@ fn regression23() {
     }
     txn.commit().unwrap();
 
-    // Extra commit to finalize the cleanup of the freed pages
+    // Extra commits to finalize the cleanup of the freed pages (LEAN-B82 holds 1 replaced SYSTEM_FREED_TABLE page for 1 commit).
     let txn = db.begin_write().unwrap();
     txn.commit().unwrap();
+    db.begin_write().unwrap().commit().unwrap();
 
     let txn = db.begin_write().unwrap();
     let allocated_pages = txn.stats().unwrap().allocated_pages();

@@ -1,4 +1,5 @@
 use crate::multimap_table::{UntypedMultiBtree, relocate_subtrees};
+use crate::tree_store::Page;
 use crate::tree_store::{
     BtreeHeader, PageHint, PageNumber, PagePath, TransactionalMemory, UntypedBtree, UntypedBtreeMut,
 };
@@ -181,44 +182,48 @@ impl InternalTableDefinition {
         Ok(())
     }
 
-    pub(crate) fn visit_all_pages<'a, F>(
+    pub(crate) fn visit_all_pages<F>(
         &self,
         mem: Arc<TransactionalMemory>,
         hint: PageHint,
-        visitor: F,
+        mut visitor: F,
     ) -> Result
     where
-        F: FnMut(&PagePath) -> Result + 'a,
+        F: FnMut(&PagePath) -> Result,
     {
-        match self {
-            InternalTableDefinition::Normal {
-                table_root,
-                fixed_key_size,
-                fixed_value_size,
-                ..
-            } => {
-                let tree =
-                    UntypedBtree::new(*table_root, mem, hint, *fixed_key_size, *fixed_value_size);
-                tree.visit_all_pages(visitor)?;
+        self.visit_pages_from(mem, hint, &[], |path, _, page| {
+            if page.is_none() {
+                visitor(path)?;
             }
-            InternalTableDefinition::Multimap {
-                table_root,
-                fixed_key_size,
-                fixed_value_size,
-                ..
-            } => {
-                let tree = UntypedMultiBtree::new(
-                    *table_root,
-                    mem,
-                    hint,
-                    *fixed_key_size,
-                    *fixed_value_size,
-                );
-                tree.visit_all_pages(visitor)?;
+            Ok(true)
+        })
+        .map(|_| ())
+    }
+
+    pub(crate) fn visit_pages_from<F>(
+        &self,
+        mem: Arc<TransactionalMemory>,
+        hint: PageHint,
+        from: &[u32],
+        mut visitor: F,
+    ) -> Result<Option<Vec<u32>>>
+    where
+        F: FnMut(&PagePath, &mut bool, Option<&[u8]>) -> Result<bool>,
+    {
+        let root = self.private_get_root();
+        let key = self.private_get_fixed_key_size();
+        let value = self.private_get_fixed_value_size();
+        match self.get_type() {
+            TableType::Normal => UntypedBtree::new(root, mem, hint, key, value).visit_pages_from(
+                from,
+                |p, read, page, pos| {
+                    Ok((!visitor(p, read, page.map(|p| p.memory()))?).then(|| pos.to_vec()))
+                },
+            ),
+            TableType::Multimap => {
+                UntypedMultiBtree::new(root, mem, hint, key, value).visit_pages_from(from, visitor)
             }
         }
-
-        Ok(())
     }
 
     pub(crate) fn relocate_tree(
@@ -228,36 +233,23 @@ impl InternalTableDefinition {
         relocation_map: &HashMap<PageNumber, PageNumber>,
     ) -> Result<Option<BtreeHeader>> {
         let original_root = self.private_get_root();
-        let relocated_root = match self {
-            InternalTableDefinition::Normal { table_root, .. } => *table_root,
-            InternalTableDefinition::Multimap {
-                table_root,
-                fixed_key_size,
-                fixed_value_size,
-                ..
-            } => {
-                if let Some(header) = table_root {
-                    let (page_number, checksum) = relocate_subtrees(
-                        (header.root, header.checksum),
-                        *fixed_key_size,
-                        *fixed_value_size,
-                        mem.clone(),
-                        freed_pages.clone(),
-                        relocation_map,
-                    )?;
-                    Some(BtreeHeader::new(page_number, checksum, header.length))
-                } else {
-                    None
-                }
-            }
-        };
-        let mut tree = UntypedBtreeMut::new(
-            relocated_root,
-            mem,
-            freed_pages,
-            self.private_get_fixed_key_size(),
-            self.private_get_fixed_value_size(),
-        );
+        let key = self.private_get_fixed_key_size();
+        let value = self.private_get_fixed_value_size();
+        let mut root = original_root;
+        if self.get_type() == TableType::Multimap
+            && let Some(header) = root
+        {
+            let (page, checksum) = relocate_subtrees(
+                (header.root, header.checksum),
+                key,
+                value,
+                mem.clone(),
+                freed_pages.clone(),
+                relocation_map,
+            )?;
+            root = Some(BtreeHeader::new(page, checksum, header.length));
+        }
+        let mut tree = UntypedBtreeMut::new(root, mem, freed_pages, key, value);
         tree.relocate(relocation_map)?;
         if tree.get_root() != original_root {
             self.set_header(tree.get_root(), self.get_length());
@@ -267,7 +259,7 @@ impl InternalTableDefinition {
         }
     }
 
-    fn private_get_root(&self) -> Option<BtreeHeader> {
+    pub(crate) fn private_get_root(&self) -> Option<BtreeHeader> {
         match self {
             InternalTableDefinition::Normal { table_root, .. }
             | InternalTableDefinition::Multimap { table_root, .. } => *table_root,
@@ -281,14 +273,14 @@ impl InternalTableDefinition {
         }
     }
 
-    fn private_get_fixed_key_size(&self) -> Option<usize> {
+    pub(crate) fn private_get_fixed_key_size(&self) -> Option<usize> {
         match self {
             InternalTableDefinition::Normal { fixed_key_size, .. }
             | InternalTableDefinition::Multimap { fixed_key_size, .. } => *fixed_key_size,
         }
     }
 
-    fn private_get_fixed_value_size(&self) -> Option<usize> {
+    pub(crate) fn private_get_fixed_value_size(&self) -> Option<usize> {
         match self {
             InternalTableDefinition::Normal {
                 fixed_value_size, ..
