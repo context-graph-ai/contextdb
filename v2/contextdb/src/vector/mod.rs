@@ -44,4 +44,4 @@ pub(crate) use seal::seal;
 pub(crate) use search::{Nearest, Planned, Route, plan, search};
 pub(crate) use slot::{Reduced, distance};
 pub(crate) use tally::Tally;
-pub(crate) use unindexed::{Committed, Totals, erase, track_unindexed};
+pub(crate) use unindexed::{Committed, Totals, erase, left_behind, track_unindexed};

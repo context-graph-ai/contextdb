@@ -152,7 +152,7 @@ pub(super) fn write(
             }
             Dropped::Vectors(column) => {
                 let mut pending = 0;
-                for kind in 0..=keys::LEFT {
+                for kind in (0..=keys::LEFT).chain([keys::SLOT]) {
                     let table = if keys::with_blocks(kind) {
                         &mut *blocks
                     } else {

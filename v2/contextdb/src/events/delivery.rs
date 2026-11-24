@@ -84,15 +84,33 @@ pub(crate) fn prepare(changes: &mut ChangeSet, catalog: &Catalog, budget: &Budge
         }
     }
     routes.sort_by_key(|(_, event, route)| (&event.name, &route.name));
+    let routed = |id: TableId| routes.iter().any(|(t, _, _)| t.id == id);
     let mut changed = Vec::new();
     for (table, key, values, inserted) in changes.rows_changed() {
-        if routes.iter().any(|(t, _, _)| t.id == table) {
+        if routed(table) {
             held.grow(key.as_bytes().len() as u64 + 64)?;
             changed.push((table, key.clone(), values.is_some(), inserted));
         }
     }
-    let mut queued = false;
-    for (id, row_key, present, inserted) in changed {
+    // Written through, a row is found by its note and read back: new when the set began
+    // without it, and read as the set began when it is gone.
+    let (first, mut after) = (changes.first().clone(), vec![b'N']);
+    let (mut changed, mut queued) = (changed.into_iter(), false);
+    let mut read = budget.passing("routed row")?;
+    loop {
+        let (id, row_key, present, inserted) = match changed.next() {
+            Some(row) => row,
+            None if !routes.is_empty() && changes.streaming() => {
+                let cover = (budget, &mut read);
+                let next = changes.next_written(&*changes, &mut after, &routed, cover)?;
+                let Some((id, key, row)) = next else {
+                    break;
+                };
+                let inserted = !first.contains(id, &key)?;
+                (id, key, row.is_some(), inserted)
+            }
+            None => break,
+        };
         if !present && inserted {
             continue;
         }
@@ -111,10 +129,10 @@ pub(crate) fn prepare(changes: &mut ChangeSet, catalog: &Catalog, budget: &Budge
             let row = Some((id, &row_key));
             let mut cover = held.passing();
             queued |= changes.put_delivery(None, row, |view, staged, encoded| {
-                let base = if present {
-                    None
-                } else {
-                    view.row(id, &row_key, &mut cover)?
+                let from = if present { view } else { &first };
+                let base = match staged {
+                    Some(_) => None,
+                    None => from.row(id, &row_key, &mut cover)?,
                 };
                 let cell = |at: usize, loaded: &mut Reservation| -> Result<Cow<'_, Value>> {
                     if let Some((values, left)) = staged {
@@ -123,9 +141,9 @@ pub(crate) fn prepare(changes: &mut ChangeSet, catalog: &Catalog, budget: &Budge
                             None => Ok(Cow::Borrowed(values.get(at).unwrap_or(&table.missing[at]))),
                         };
                     }
-                    match base.as_ref().expect("a deleted row exists").cells.get(at) {
+                    match base.as_ref().expect("a row read back").cells.get(at) {
                         Some(Cell::Here(value)) => Ok(Cow::Borrowed(value)),
-                        Some(Cell::Beside(beside)) => view.load(beside, loaded).map(Cow::Owned),
+                        Some(Cell::Beside(beside)) => from.load(beside, loaded).map(Cow::Owned),
                         None => Ok(Cow::Borrowed(&table.missing[at])),
                     }
                 };
@@ -424,6 +442,56 @@ fn pass(
     Ok((progressed, cursor < upper))
 }
 
+/// What an erase does with the key and row of a delivery it takes.
+pub(crate) type Taken<'a> = dyn FnMut(&mut ChangeSet, &Key, &[Value]) -> Result<()> + 'a;
+
+/// Stages the removal of each queued delivery of a `table` row that is gone from the
+/// statement's first view, keeps no version there, and whose stored row `passes`, handing
+/// `each` its key and row: one walk of the queue, loading a body only for a row that is gone
+/// and, when the condition reaches only named keys (`reach`, in key order), one of them.
+pub(crate) fn erase_gone(
+    slot: &std::cell::RefCell<&mut ChangeSet>,
+    (table, reach): (&crate::schema::Table, Option<&[Key]>),
+    budget: &Budget,
+    passes: &mut dyn FnMut(&[Value]) -> Result<bool>,
+    each: &mut Taken,
+) -> Result<()> {
+    let first = slot.borrow().first().clone();
+    let mut cover = budget.passing("purge delivery row")?;
+    let (from, upper) = (key(0), key(u64::MAX));
+    let bounds = (Excluded(from.as_slice()), Included(upper.as_slice()));
+    first.deliveries(bounds, &mut |k, bytes| {
+        let mut decoded = budget.reserve(0, "purge delivery")?;
+        let mut d = identity(&first, k, bytes, &mut decoded)?;
+        if d.table != table.id
+            || reach.is_some_and(|keys| keys.binary_search(&d.row_key).is_err())
+            || first.row(table.id, &d.row_key, &mut cover)?.is_some()
+            || first
+                .versions(table.id, &d.row_key, &mut cover)?
+                .next()
+                .is_some()
+        {
+            return Ok(true);
+        }
+        load_body(&first, bytes, &mut d, &mut decoded)?;
+        let columns = table.meta.columns.iter().zip(&table.missing);
+        let row: Vec<_> = columns
+            .map(|(c, missing)| {
+                d.event
+                    .row_values
+                    .remove(&c.name)
+                    .unwrap_or(missing.clone())
+            })
+            .collect();
+        if passes(&row)? {
+            let changes = &mut **slot.borrow_mut();
+            changes.put_delivery(Some(d.event.action_id), None, |_, _, _| Ok(Some(None)))?;
+            each(changes, &d.row_key, &row)?;
+        }
+        Ok(true)
+    })
+}
+
 /// PURGE stages no deliveries of its own; only prior removals overlay this walk.
 pub(crate) fn erase(changes: &mut ChangeSet, budget: &Budget) -> Result<()> {
     let _held = budget.reserve(256 * 8, "purge deliveries")?;
@@ -441,7 +509,7 @@ pub(crate) fn erase(changes: &mut ChangeSet, budget: &Budget) -> Result<()> {
                 let mut decoded = budget.reserve(0, "purge delivery")?;
                 let d = identity(changes.base(), k, bytes, &mut decoded)?;
                 cursor.copy_from_slice(k);
-                if changes.noted(d.table, &d.row_key, budget)? {
+                if changes.noted(b'N', d.table, &d.row_key, budget)? {
                     actions[visited] = d.event.action_id;
                 }
                 visited += 1;

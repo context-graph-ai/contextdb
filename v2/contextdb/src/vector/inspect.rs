@@ -258,7 +258,7 @@ pub(crate) fn verify_record(
     bytes: &[u8],
     cover: &mut crate::memory::Passing,
 ) -> Result<()> {
-    use super::{directory::kept, pack};
+    use super::{directory, directory::kept, pack};
     use VectorRecord::*;
     let damage = || read.damaged("a vector record disagrees with its owner");
     let owner = |n| {
@@ -279,7 +279,7 @@ pub(crate) fn verify_record(
             bytes.is_empty()
                 && row.is_some_and(|r| !matches!(&*table.cell(&r, at), Cell::Here(Value::Null)))
         }
-        Block(_, number, _) | Binary(_, number, _) => {
+        Block(_, number, block) | Binary(_, number, block) => {
             let (p, b) = owner(number)?;
             let mut rows = |data: &super::block::BlockReader<'_>| {
                 let len = if matches!(record, Block(..)) {
@@ -289,6 +289,14 @@ pub(crate) fn verify_record(
                 };
                 for at in 0..len {
                     let key = data.key(at);
+                    // Every slot a row holds is noted in the row's `Slot` record.
+                    let here = [number, block, at as u32];
+                    let noted = |v: &[u8]| directory::slots(v).any(|slot| slot == here);
+                    if !key.as_bytes().is_empty()
+                        && kept(read, Slot(id, p.number, &key), noted)? != Some(true)
+                    {
+                        return Err(damage());
+                    }
                     let at_left = |v: &[u8]| build::left_at(read, p, v);
                     if !key.as_bytes().is_empty()
                         && !read.contains(table.id, &key)?
@@ -314,6 +322,10 @@ pub(crate) fn verify_record(
             })?
         }
         Left(_, number, _) => return build::left_at(read, &owner(number)?.0, bytes).map(drop),
+        Slot(_, number, _) => {
+            owner(number)?;
+            !bytes.is_empty() && bytes.len().is_multiple_of(12)
+        }
     };
     sound.then_some(()).ok_or_else(damage)
 }

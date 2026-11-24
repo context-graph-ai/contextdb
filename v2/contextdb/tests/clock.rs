@@ -211,6 +211,55 @@ fn each_retained_row_leaves_at_the_second_its_judgement_gives() {
         let kept = support::int(&open_at(&folder, 86_500), "SELECT COUNT(*) FROM t");
         assert_eq!(kept, i64::from(present), "{name}: after a restart");
     }
+    // A trigger's firings by their own stamps: after the clock stepped back, the later firing
+    // stamped 60 expires at 110 under 30 seconds while the earlier one stamped 100 stays. Once
+    // judged, a wider period after a reopen or another step back never returns it; the log
+    // keeps both.
+    let folder = support::folder("expiry-trigger-history");
+    let (db, second) = open_ticking(&folder, 100);
+    support::run(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY)");
+    support::run(&db, "CREATE TRIGGER seen ON t WHEN INSERT");
+    db.register_transactional_trigger_callback("seen", |_, _| Ok(()))
+        .unwrap();
+    db.complete_initialization().unwrap();
+    support::run(&db, "INSERT INTO t VALUES (1)");
+    second.store(60, Ordering::SeqCst);
+    support::run(&db, "INSERT INTO t VALUES (2)");
+    second.store(110, Ordering::SeqCst);
+    db.set_trigger_audit_retention(std::time::Duration::from_secs(30))
+        .unwrap();
+    let log = db.trigger_audit_log().unwrap().to_vec();
+    let history = |db: &Database| db.trigger_audit_history(|_| true).unwrap().to_vec();
+    assert_eq!(
+        (log.len(), history(&db)),
+        (2, log[..1].to_vec()),
+        "judged by stamp"
+    );
+    db.run_maintenance_cycle().unwrap();
+    support::close(db);
+    let db = open_at(&folder, 110);
+    let week = std::time::Duration::from_secs(7 * 86_400);
+    assert_eq!(
+        db.trigger_audit_retention().unwrap(),
+        week,
+        "seven days on every open"
+    );
+    assert_eq!(history(&db), log[..1], "an expired firing never comes back");
+    assert_eq!(*db.trigger_audit_log().unwrap(), log, "the log keeps both");
+    support::close(db);
+    let db = open_at(&folder, 50);
+    assert_eq!(history(&db), log[..1], "nor after the clock steps back");
+    // An unbounded period keeps a firing 0 ms old, and maintenance never judges it expired.
+    db.set_trigger_audit_retention(std::time::Duration::MAX)
+        .unwrap();
+    db.register_transactional_trigger_callback("seen", |_, _| Ok(()))
+        .unwrap();
+    db.complete_initialization().unwrap();
+    support::run(&db, "INSERT INTO t VALUES (3)");
+    db.run_maintenance_cycle().unwrap();
+    let fresh = db.trigger_audit_log().unwrap()[2].clone();
+    assert_eq!(history(&db), [log[0].clone(), fresh], "Duration::MAX");
+    support::close(db);
     let (db, second) = open_ticking(&support::folder("expiry-alter-and-indexes"), 100);
     support::run(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY)");
     support::run(&db, "INSERT INTO t VALUES (1)");

@@ -1,5 +1,6 @@
 //! The one writer turn, commit and publication.
 use super::*;
+use crate::events::AuditQueue;
 
 pub(crate) struct Turn(pub(crate) Mutex<bool>, pub(crate) std::sync::Condvar);
 pub(crate) struct Held<'a>(&'a Turn);
@@ -74,13 +75,26 @@ impl Open {
 
     pub(crate) fn commit(&self, held: Held<'_>, mut staged: Staged) -> Result<()> {
         let source = staged.source;
+        // A set written through ends its part before its triggers read its notes, and again
+        // after, so that the rows the callbacks wrote leave theirs before the rules are checked.
+        let part = |staged: &mut Staged| {
+            let (changes, passes) = (&mut staged.changes, &mut staged.passes);
+            self.part(changes, &staged.catalog, &staged.budget, passes)
+        };
         let overtaken = self
             .rebase(&mut staged)
+            .and_then(|overtaken| part(&mut staged).map(|()| overtaken))
             .inspect_err(|error| self.failed(&staged.changes, source, error))?;
-        let (staged, fired) =
+        let (mut staged, fired) =
             crate::events::fire(&self.this.upgrade().expect("active open store"), staged);
-        fired.inspect_err(|error| self.failed(&staged.changes, source, error))?;
+        if let Err(error) = fired.and_then(|()| part(&mut staged)) {
+            self.failed(&staged.changes, source, &error);
+            // The rest of the write goes first, its storage transaction and memory with it.
+            let audit = { staged }.audit;
+            return Err(self.rolled_back(&held, audit, error)?);
+        }
         let Staged {
+            audit,
             budget,
             mut changes,
             mut catalog,
@@ -98,10 +112,8 @@ impl Open {
             }
             self.host(|plugin| plugin.pre_commit(&changes, source))?;
             write::check_at_commit(&changes, &catalog, overtaken.as_ref(), &budget, |each| {
-                if erasing.is_some() {
-                    crate::erase::noted(&changes, &budget, &mut |id, key| {
-                        each((id, key, None, false))
-                    })
+                if changes.streaming() {
+                    write::written(&changes, &catalog, &budget, each)
                 } else {
                     changes.rows_changed().try_for_each(each)
                 }
@@ -117,14 +129,10 @@ impl Open {
                 own.stamp_retention(plans, &mut changes, now, &budget)?;
             }
             changes.set_number(number);
-            self.passes(
-                &mut changes,
-                &catalog,
-                &budget,
-                erasing == Some(true),
-                &mut passes,
-            )?;
-            let (vectors, deliveries) = passes.take().unwrap();
+            self.passes(&mut changes, &catalog, &budget, &mut passes)?;
+            let vectors = passes.take().unwrap();
+            let deliveries =
+                erasing != Some(true) && crate::events::prepare(&mut changes, &catalog, &budget)?;
             if erasing == Some(true) {
                 self.store.cut_off(None)?;
                 vector::erase(&mut changes, &catalog, &budget)?;
@@ -138,9 +146,8 @@ impl Open {
             // Only a declaration erases a trigger.
             let retire = declared.first().map(|_| self.triggers.retiring(&changes));
             let retire = retire.transpose()?;
-            changes.put_audit(&locked(&self.triggers.audit))?;
+            changes.put_audit(&audit, crate::system::now_millis(&*self.clock))?;
             let commit = self.store.commit(&mut changes)?;
-            *locked(&self.triggers.audit) = Default::default();
             if let Some(n) = changes.changed_setting(1) {
                 self.store.disk_limit(crate::settings::applied(1, n));
                 *locked(&self.disk) = crate::settings::applied(1, n);
@@ -153,13 +160,17 @@ impl Open {
             Ok(Some((event, vectors.wake || deliveries)))
         })();
         locked(&self.work).rows_read += changes.rows_read.get() - counted;
-        if let Err(error) = &result {
-            self.budget.restore_limit(before.0);
-            self.store.disk_limit(before.1);
-            *locked(&self.disk) = before.1;
-            self.failed(&changes, source, error);
-        }
-        let event = result?;
+        let event = match result {
+            Ok(event) => event,
+            Err(error) => {
+                self.budget.restore_limit(before.0);
+                self.store.disk_limit(before.1);
+                *locked(&self.disk) = before.1;
+                self.failed(&changes, source, &error);
+                drop((changes, passes, declared));
+                return Err(self.rolled_back(&held, audit, error)?);
+            }
+        };
         let tail = if event.is_some() && erasing == Some(true) {
             self.publish(&held).map(|_| ())
         } else {
@@ -175,25 +186,56 @@ impl Open {
         tail
     }
 
-    /// The same derived passes run after each removal part and once at finish.
+    /// Stores a refused write's firings, rolled back, in a commit of their own under the turn
+    /// it still holds, before its refusal returns; a refusal of that commit is the caller's.
+    fn rolled_back(&self, _held: &Held<'_>, mut audit: AuditQueue, error: Error) -> Result<Error> {
+        if !audit.0.0.is_empty() {
+            crate::events::rolled_back(&mut audit, &error)?;
+            let (view, catalog) = self.newest()?;
+            let mut changes = ChangeSet::new(view, &self.budget)?;
+            // Written through, a long write's firings leave in parts as the set fills.
+            self.store.through(&mut changes);
+            changes.set_number(self.number());
+            changes.put_audit(&audit, crate::system::now_millis(&*self.clock))?;
+            let after = self.store.commit(&mut changes)?;
+            self.adopt(after, catalog, vector::Totals::default());
+        }
+        Ok(error)
+    }
+
+    /// Ends a part of a change set written through: the passes run over the rows it staged,
+    /// then the rows are written, each leaving its note. A set with no row staged ends none.
+    pub(crate) fn part(
+        &self,
+        changes: &mut ChangeSet,
+        catalog: &Catalog,
+        budget: &Budget,
+        passes: &mut Option<vector::Committed>,
+    ) -> Result<()> {
+        if !changes.streaming() || changes.rows_changed().next().is_none() {
+            return Ok(());
+        }
+        self.passes(changes, catalog, budget, passes)?;
+        changes.put_part(true)
+    }
+
+    /// The same derived passes run at the end of each part and once at finish.
     pub(crate) fn passes(
         &self,
         changes: &mut ChangeSet,
         catalog: &Catalog,
         budget: &Budget,
-        purge: bool,
-        state: &mut Option<(vector::Committed, bool)>,
+        state: &mut Option<vector::Committed>,
     ) -> Result<()> {
         let now = (system::now_millis(&*self.clock) / 1000).clamp(0, i64::from(u32::MAX)) as u32;
         write::stage_retention(changes, catalog, now, budget)?;
         let live = locked(&self.live);
         // A later part of the transaction counts on from the totals of its earlier parts.
-        let (earlier, wake, sent) = state.take().map_or((None, false, false), |(v, d)| {
+        let (earlier, wake) = state.take().map_or((None, false), |v| {
             let mut totals = live.clone();
             totals.merge(v.totals, None);
-            (Some(totals), v.wake, d)
+            (Some(totals), v.wake)
         });
-        let deliveries = !purge && crate::events::prepare(changes, catalog, budget)?;
         let mut vectors =
             vector::track_unindexed(changes, catalog, budget, earlier.as_ref().unwrap_or(&live))?;
         if let Some(mut earlier) = earlier {
@@ -201,7 +243,7 @@ impl Open {
             vectors.totals = earlier;
         }
         vectors.wake |= wake;
-        *state = Some((vectors, sent | deliveries));
+        *state = Some(vectors);
         Ok(())
     }
 }

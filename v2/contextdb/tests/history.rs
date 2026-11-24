@@ -145,6 +145,17 @@ fn a_table_keeps_replaced_versions_until_it_declares_current_only_and_a_cleanup_
         versions(&db, "kept", 128).0.is_empty(),
         "a purged row has no versions"
     );
+    // A row deleted earlier is decided by its newest kept version, never an older one.
+    updated(&db, "deleted", "", 2);
+    support::run(&db, "DELETE FROM deleted WHERE id = 1");
+    support::run(&db, "PURGE FROM deleted WHERE id = 1 AND n = 0");
+    let kept = versions(&db, "deleted", 128).0;
+    assert_eq!(kept.len(), 3, "an older version does not decide");
+    support::run(&db, "PURGE FROM deleted WHERE n = 2");
+    assert!(
+        versions(&db, "deleted", 128).0.is_empty(),
+        "a purged row deleted earlier has no versions"
+    );
     db.verify().expect("every address freed once");
 }
 
@@ -212,4 +223,36 @@ fn row_versions_refuses_a_wrong_key_values_past_the_memory_limit_and_a_hidden_ve
         one.row_versions("seen", &key, 2).is_err(),
         "the hidden version beyond the limit refuses the call, and is never shown as more"
     );
+}
+
+/// A PURGE of kept versions of rows deleted earlier loads only the columns it tests and writes
+/// its removals in bounded parts: ten thousand keys, and one key whose kept version holds an
+/// 8 MiB value the condition does not read, are each erased within 16 MiB.
+#[test]
+fn a_purge_of_kept_versions_reads_only_what_it_tests_within_the_memory_limit() {
+    let db = support::open(&support::folder("history-purge-memory"));
+    support::run(&db, "CREATE TABLE many (id INTEGER PRIMARY KEY, n INTEGER)");
+    for from in (0..10_000).step_by(1_000) {
+        let rows: Vec<_> = (from..from + 1_000)
+            .map(|id| format!("({id}, {id})"))
+            .collect();
+        support::run(&db, &format!("INSERT INTO many VALUES {}", rows.join(", ")));
+    }
+    support::run(&db, "DELETE FROM many");
+    updated(&db, "wide", "", 0);
+    let body = support::large_text(support::Kind::Scattered, 2, 8 << 20);
+    db.execute("UPDATE wide SET body = $body", &params! { "body" => body })
+        .unwrap();
+    support::run(&db, "DELETE FROM wide");
+    db.set_memory_limit(Some(16 << 20)).unwrap();
+    for (purge, table, taken) in [
+        ("PURGE FROM many WHERE n >= 0", "many", 10_000),
+        ("PURGE FROM wide WHERE id = 1", "wide", 1),
+    ] {
+        let erased = db.execute(purge, &params! {}).unwrap().rows_affected();
+        assert_eq!(erased, taken, "{purge}");
+        let kept = db.row_versions(table, &[Value::Int64(1)], 4).unwrap();
+        assert!(kept.rows.rows().is_empty(), "{purge}: no version left");
+    }
+    db.verify().expect("every address freed once");
 }

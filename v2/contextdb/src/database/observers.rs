@@ -150,7 +150,6 @@ impl Open {
         self.plugin.as_deref().unwrap_or(&CorePlugin)
     }
     pub(super) fn failed(&self, changes: &ChangeSet, source: CommitSource, error: &Error) {
-        self.triggers.audit_failed(error);
         let _ = catch_unwind(AssertUnwindSafe(|| {
             self.host(|plugin| plugin.commit_failed(changes, source, error))
         }));

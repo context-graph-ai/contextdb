@@ -205,7 +205,7 @@ fn squeeze(record: &mut Vec<u8>, from: usize, front: &[u8], reservation: &mut Re
     room as u64
 }
 
-struct Length(usize);
+pub(crate) struct Length(pub(crate) usize);
 impl Write for Length {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.0 += bytes.len();

@@ -265,33 +265,55 @@ pub(super) fn nearest(
     Ok(found)
 }
 
-/// Stages the mean of a partition: `dimension` numbers of four bytes, low byte first.
+/// The running total of an IVF's packed members: how many, and the sum of their vectors.
+pub(super) type Total = (u64, Vec<f64>);
+
+/// Stages the total of an IVF's packed members: the count, then `dimension` numbers of eight
+/// bytes, low byte first. An erasure takes its slots away from it, never summing the rest.
 pub(super) fn put_mean(
     changes: &mut ChangeSet,
     vector: VectorId,
-    partition: u32,
-    mean: &[f32],
+    ivf: u32,
+    total: &Total,
 ) -> Result<()> {
-    let value = mean.iter().flat_map(|number| number.to_le_bytes());
-    changes.put_vector(VectorRecord::Mean(vector, partition), value.collect())
+    let sum = total.1.iter().flat_map(|number| number.to_le_bytes());
+    let value = total.0.to_le_bytes().into_iter().chain(sum);
+    changes.put_vector(VectorRecord::Mean(vector, ivf), value.collect())
 }
 
-/// The mean of a partition, read into memory that `held` is grown by first. A record that is
-/// missing for a partition whose entry says it has one, of another length than four bytes a
-/// number, or with a number that is not finite, is damage.
+/// The total of an IVF's packed members, read into memory that `held` is grown by first. A
+/// record that is missing for a partition whose entry says it has one, of another length, or
+/// with a number that is not finite, is damage.
+pub(super) fn total(
+    read: &dyn Read,
+    vector: VectorId,
+    ivf: u32,
+    dimension: usize,
+    held: &mut Reservation,
+) -> Result<Total> {
+    held.grow(8 * dimension as u64)?;
+    let found = kept(read, VectorRecord::Mean(vector, ivf), |value| {
+        let (count, sum) = value.split_first_chunk::<8>()?;
+        let (sum, []) = sum.as_chunks::<8>() else {
+            return None;
+        };
+        let sum: Vec<f64> = sum.iter().map(|n| f64::from_le_bytes(*n)).collect();
+        (sum.len() == dimension && sum.iter().all(|n| n.is_finite()))
+            .then(|| (u64::from_le_bytes(*count), sum))
+    })?;
+    let found = found.flatten();
+    found.ok_or_else(|| read.damaged("the mean of a partition is not what its entry says"))
+}
+
+/// The mean of an IVF's packed members, held as four bytes a number.
 pub(super) fn mean(
     read: &dyn Read,
     vector: VectorId,
-    partition: u32,
+    ivf: u32,
     dimension: usize,
     held: &mut Reservation,
 ) -> Result<Vec<f32>> {
-    held.grow(4 * dimension as u64)?;
-    let record = VectorRecord::Mean(vector, partition);
-    let found = kept(read, record, |value| {
-        (value.len() == 4 * dimension).then(|| numbers(value).collect::<Vec<f32>>())
-    })?;
-    let found = found.flatten();
-    let found = found.filter(|mean| mean.iter().all(|number| number.is_finite()));
-    found.ok_or_else(|| read.damaged("the mean of a partition is not what its entry says"))
+    let (count, sum) = total(read, vector, ivf, dimension, held)?;
+    held.shrink(4 * dimension as u64);
+    Ok(super::train::mean(&sum, count))
 }

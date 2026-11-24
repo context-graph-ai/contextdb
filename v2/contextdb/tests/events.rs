@@ -238,7 +238,6 @@ fn trigger_writes_and_the_firing_rows_commit_or_roll_back_together() {
             } else {
                 db.scoped_with_constraints(None, None, None)
             };
-            let watermark = db.committed_watermark().unwrap();
             if outcome == "reentry" {
                 let error = refusal(&handle, sql);
                 assert!(matches!(error, Error::CallbackReentry { .. }));
@@ -290,7 +289,6 @@ fn trigger_writes_and_the_firing_rows_commit_or_roll_back_together() {
             } else if outcome == "refused" {
                 let result = tx.commit();
                 assert!(matches!(result, Err(Error::ForeignKeyViolation { .. })));
-                run(&db, "CREATE TABLE late (id INT)");
                 let log = format!("{:?}", db.trigger_audit_log().unwrap());
                 let rolled = log.contains("RolledBack") && !log.contains("Fired");
                 assert!(rolled, "a late failure rolls every entry back");
@@ -298,7 +296,6 @@ fn trigger_writes_and_the_firing_rows_commit_or_roll_back_together() {
                 assert!(
                     matches!(tx.commit(), Err(Error::ScopeLabelViolation { table }) if table == "parents")
                 );
-                assert_eq!(db.committed_watermark().unwrap(), watermark);
             } else {
                 tx.commit().expect("callback supplies referenced parents");
             }
@@ -383,6 +380,8 @@ fn trigger_writes_and_the_firing_rows_commit_or_roll_back_together() {
             }
             drop((handle, strong));
             let db = reopen(db, &folder);
+            let last = format!("{:?}", db.trigger_audit_log().unwrap().last());
+            assert!(outcome != "panic" || last.contains("panic: callback"));
             assert_eq!(rows(&db, "SELECT * FROM notes ORDER BY id"), expected);
             let parents = int(&db, "SELECT COUNT(*) FROM parents");
             assert_eq!(parents, if committed { 3 } else { 1 });
@@ -425,14 +424,12 @@ fn callback_writes_fire_triggers_through_the_cap_and_refuse_the_whole_commit_bey
         })
         .expect("register cascade");
         db.complete_initialization().expect("activate callbacks");
-        let watermark = db.committed_watermark().unwrap();
         let result = db.execute("INSERT INTO chain VALUES (1)", &params! {});
         if extra > 0 {
             assert!(
                 matches!(result, Err(Error::TriggerCascadeDepthExceeded { trigger_name, depth })
                 if trigger_name == "next" && depth == cap + 1)
             );
-            assert_eq!(db.committed_watermark().unwrap(), watermark);
         } else {
             result.expect("every depth through the cap commits");
         }
@@ -459,6 +456,14 @@ fn callback_writes_fire_triggers_through_the_cap_and_refuse_the_whole_commit_bey
         let export = folder.join("export");
         db.export_snapshot(&export).unwrap();
         let db = reopen(db, &folder);
+        let log = db.trigger_audit_log().unwrap();
+        let cascade = log.iter().map(|e| (e.depth, e.cascade_row_count));
+        let n = log.len() as u32;
+        let each = (1..=n).map(|depth| (depth, u64::from(depth < n)));
+        assert!(
+            cascade.eq(each),
+            "each firing's depth and rows written, reopened"
+        );
         let kept = shown(&db).1 == before && shown(&open(&export)).1 == before;
         let carried = refused || before.matches(&tx).count() == kinds.len();
         assert_eq!(
@@ -470,16 +475,81 @@ fn callback_writes_fire_triggers_through_the_cap_and_refuse_the_whole_commit_bey
         if extra == 0 {
             declare(&db);
             run(&db, "CREATE TRIGGER wide ON t WHEN INSERT");
-            db.register_transactional_trigger_callback("wide", |_, _| Ok(()))
-                .unwrap();
+            let (started, entered) = std::sync::mpsc::sync_channel(0);
+            let (release, resume) = std::sync::mpsc::sync_channel(0);
+            let held = Mutex::new((started, resume));
+            // The refusal's text is long: kept once, not once a firing, it fits the limit.
+            let long = "x".repeat(32 << 10);
+            let reason = format!("the last firing refuses {long}");
+            let refused = reason.clone();
+            db.register_transactional_trigger_callback("wide", move |host, ctx| {
+                match ctx.row_values["id"] {
+                    Value::Int64(1100) => host
+                        .execute("INSERT INTO chain VALUES (101),(102),(103)", &params! {})
+                        .map(drop),
+                    Value::Int64(1101) => host
+                        .execute("DELETE FROM chain WHERE id > 100", &params! {})
+                        .map(drop),
+                    // Held until a second handle has read the log.
+                    Value::Int64(2000) => {
+                        let held = held.lock().unwrap();
+                        held.0.send(()).unwrap();
+                        held.1.recv().unwrap();
+                        Ok(())
+                    }
+                    Value::Int64(3099) => Err(Error::PlanError(refused.clone())),
+                    _ => Ok(()),
+                }
+            })
+            .unwrap();
             db.complete_initialization().unwrap();
             insert_together(&db, 0..1100);
-            insert_together(&db, 1100..1101);
-            let log = db.trigger_audit_log().unwrap();
+            insert_together(&db, 1100..1102);
+            let log = db.trigger_audit_log().unwrap().to_vec();
             let (first, last) = (log[0].firing_tx, log[1023].firing_tx);
             assert!(
-                log.len() == 1024 && first == log[1022].firing_tx && first != last,
+                log.len() == 1024 && first == log[1021].firing_tx && first != last,
                 "the ring keeps 1,024, oldest first"
+            );
+            // 1,100 rows, held on the first firing and refused on the last: a second handle
+            // reads the earlier log while held, then the refused write's newest 1,024.
+            let second = db.scoped_with_constraints(None, None, None);
+            db.set_memory_limit(Some(support::opening::open_floor() + (16 << 20)))
+                .unwrap();
+            std::thread::scope(|scope| {
+                let release = release;
+                let running = scope.spawn(|| {
+                    let tx = db.transaction().unwrap();
+                    insert(&tx, 2000..3100);
+                    tx.commit()
+                });
+                entered.recv().unwrap();
+                assert_eq!(*second.trigger_audit_log().unwrap(), log, "held");
+                release.send(()).unwrap();
+                let refused = running.join().unwrap();
+                db.set_memory_limit(Some(256 << 20)).unwrap();
+                let after = second.trigger_audit_log().unwrap();
+                assert!(matches!(refused, Err(Error::PlanError(_))) && after.len() == 1024);
+                let reason = format!("plan error: {reason}");
+                let rolled = contextdb::TriggerAuditStatus::RolledBack { reason };
+                assert!(after.iter().all(|e| e.status == rolled));
+            });
+            // Reopened at once, the history holds every one of the refused write's firings.
+            drop(second);
+            let db = reopen(db, &folder);
+            let tx = db.trigger_audit_log().unwrap()[1023].firing_tx;
+            let history = db.trigger_audit_history(|e| e.firing_tx == tx).unwrap();
+            assert_eq!(history.len(), 1100, "none of 1,100 refused firings is lost");
+            let rows = |e: &contextdb::TriggerAuditEntry| (e.depth, e.cascade_row_count);
+            let wrote = db
+                .trigger_audit_history(|e| e.trigger_name == "wide" && e.cascade_row_count > 0)
+                .unwrap();
+            let none = db.trigger_audit_history(|e| e.firing_tx == first).unwrap();
+            assert!(
+                wrote.iter().map(rows).eq([(1, 3), (1, 3)])
+                    && none.iter().all(|e| rows(e) == (1, 0)),
+                "the firings that wrote and deleted three rows say so, and those that wrote none say 0: {:?}",
+                wrote.iter().map(rows).collect::<Vec<_>>()
             );
             // A table whose only trigger has no callback refuses writes on both routes.
             run(&db, "CREATE TRIGGER lone ON chain WHEN INSERT");

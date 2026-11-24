@@ -22,7 +22,9 @@ mod propagate;
 mod rules;
 #[cfg(test)]
 mod tests;
-pub(crate) use self::commit::{check_at_commit, check_provenance, stage_retention};
+pub(crate) use self::commit::{
+    check_at_commit, check_provenance, parent, stage_retention, written,
+};
 pub(crate) use self::counts::fill_kept_count;
 
 use std::cell::RefCell;
@@ -55,10 +57,20 @@ pub(crate) struct Given<'a> {
     pub number: TxId,
     pub examined: crate::query::Counted<'a>,
     pub triggers: Option<&'a crate::events::Triggers>,
+    /// How a change set written through ends a part; with none, the statement stays in memory.
+    pub part: Option<Part<'a>>,
+}
+
+/// Ends a part of a change set written through.
+pub(crate) type Part<'a> = &'a dyn Fn(&mut ChangeSet) -> Result<()>;
+
+/// How a declaration ends a part: no row is staged, so it has no pass to run.
+fn put(changes: &mut ChangeSet) -> Result<()> {
+    changes.put_part(true)
 }
 
 impl<'a> Given<'a> {
-    fn admin(
+    pub(crate) fn admin(
         params: &'a HashMap<String, Value>,
         catalog: &'a Catalog,
         budget: &'a Budget,
@@ -75,6 +87,7 @@ impl<'a> Given<'a> {
             number: TxId(0),
             examined: None,
             triggers: None,
+            part: Some(&put),
         }
     }
 }
@@ -110,9 +123,21 @@ pub(crate) fn apply(
     crate::events::Triggers::ready(given.triggers, given.catalog, name)?;
     let mut rules = Rules::of(table, given)?;
     rules.changeable(plan)?;
+    rules.from = changes.queued;
     // What the reader's filter and the statement's SELECTs hold is given back with it.
     let mut seeing = given.budget.reserve(0, "query")?;
-    rules.values = query::written(plan, given, &*changes, &mut seeing, None)?;
+    // Written through, a long list is kept in the set's own records, as a DELETE's is.
+    rules.values = if rules.part(changes).is_some() {
+        let first = changes.first().clone();
+        let slot = RefCell::new(&mut *changes);
+        let sets = query::SetContext {
+            changes: &slot,
+            budget: given.budget,
+        };
+        query::written(plan, given, &first, &mut seeing, Some(sets))?
+    } else {
+        query::written(plan, given, &*changes, &mut seeing, None)?
+    };
     let mut visible = Visible::new(table, given.catalog, given.reader, &mut seeing)?;
     let rows = match plan {
         Plan::Insert(plan) => rules.insert(plan, changes, partitions, &mut visible)?,
@@ -212,8 +237,9 @@ pub(crate) struct Rules<'a> {
     partitions: Vec<Vec<usize>>,
     /// Where the VECTOR columns that keep a vector in one byte a number are in a row.
     reduced: Vec<usize>,
-    /// The rows that are to follow the rows whose state the statement has changed so far.
-    followed: RefCell<Vec<propagate::Step>>,
+    /// The number of the change set's last queued note when the statement began: the notes
+    /// queued after it, its steps and its lifted keys, are the statement's own.
+    from: u64,
     /// The values of the SELECTs inside the statement, read before it changed a row.
     pub(crate) values: query::Values,
 }
@@ -260,7 +286,7 @@ impl<'a> Rules<'a> {
             reduced: reduced
                 .map(|vector| table.column(&vector.column))
                 .collect::<Result<_>>()?,
-            followed: RefCell::default(),
+            from: 0,
             values: Vec::new(),
         })
     }
@@ -289,16 +315,22 @@ impl<'a> Rules<'a> {
         }
     }
 
+    /// How a change set written through ends a part of this statement.
+    fn part(&self, changes: &ChangeSet) -> Option<Part<'a>> {
+        self.given.part.filter(|_| changes.streaming())
+    }
+
     /// Hands `each` every row that was asked for, a batch at a time: a batch is staged, and
     /// given back, before the next is asked for after its last key, so that one batch is held
-    /// beside the change set and never the matched rows twice.
+    /// beside the change set and never the matched rows twice. Written through, the rows are
+    /// read from the moment the set began at, ending a part whenever it is full.
     pub(crate) fn each(
         &self,
         asked: &query::Asked,
         changes: &mut ChangeSet,
         mut each: impl FnMut(&mut ChangeSet, Key, Vec<Cell>) -> Result<()>,
     ) -> Result<()> {
-        if changes.streaming() {
+        if let Some(part) = self.part(changes) {
             let read = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let first = changes.first().counting(&read);
             let slot = RefCell::new(changes);
@@ -320,9 +352,7 @@ impl<'a> Rules<'a> {
                 &mut |(key, cells, bytes), held| {
                     let mut changes = slot.borrow_mut();
                     each(&mut changes, key, cells)?;
-                    if changes.part_bytes() >= crate::store::PART_BYTES {
-                        changes.put_part(true)?;
-                    }
+                    changes.part_full(Some(part))?;
                     held.shrink(bytes);
                     Ok(true)
                 },
@@ -332,6 +362,18 @@ impl<'a> Rules<'a> {
             changes.rows_read.set(changes.rows_read.get() + fetched);
             return walked;
         }
+        self.paged(asked, changes, None, each)
+    }
+
+    /// Hands `each` the rows asked for as they stand, a batch at a time, ending a `part`
+    /// between two batches whenever it is full. A propagation reads its followers so.
+    fn paged(
+        &self,
+        asked: &query::Asked,
+        changes: &mut ChangeSet,
+        part: Option<Part<'_>>,
+        mut each: impl FnMut(&mut ChangeSet, Key, Vec<Cell>) -> Result<()>,
+    ) -> Result<()> {
         let (catalog, budget) = (self.given.catalog, self.given.budget);
         let mut after = None;
         while let Some((batch, _held)) =
@@ -340,6 +382,7 @@ impl<'a> Rules<'a> {
             for (key, cells) in batch {
                 each(changes, key, cells)?;
             }
+            changes.part_full(part)?;
             if after.is_none() {
                 break;
             }
@@ -398,7 +441,7 @@ impl<'a> Rules<'a> {
                 }
             }
             changes.operation = Some(types::TriggerEvent::Insert);
-            self.put(changes, partitions, visible, None, row, Vec::new())?;
+            self.put(changes, partitions, visible, (None, None), row, Vec::new())?;
             stored += 1;
         }
         // A statement that stores no row stages no count change, not even one of zero.
@@ -457,10 +500,16 @@ impl<'a> Rules<'a> {
             let held = row.iter().map(types::heap_bytes).sum::<u64>();
             held + size_of_val(row) as u64
         };
-        // Every new value is worked out from the row as it was.
+        // New values are worked out from the row as it was; the set is lent for memberships.
         let ctx = query::EvalContext::new(given.params, given.now, given.kept).over(&self.values);
         // The row a value is worked out for is held until the next: it is staged or lifted.
-        let assign = |old: &[Value], cover: &mut Reservation| -> Result<Vec<Value>> {
+        let assign = |old: &[Value], cover: &mut Reservation, changes: &mut ChangeSet| {
+            let slot = RefCell::new(changes);
+            let sets = query::SetContext {
+                changes: &slot,
+                budget: given.budget,
+            };
+            let ctx = ctx.with_sets(Some(sets));
             let most = set.iter().map(|(_, v)| most_bytes(v, &scope, old, &ctx));
             cover.shrink(cover.bytes());
             cover.grow(bytes(old) + most.sum::<u64>())?;
@@ -469,7 +518,7 @@ impl<'a> Rules<'a> {
                 let value = query::eval(value, &scope, old, &ctx)?.into_owned();
                 row[at] = self.settle(at, value, cover)?;
             }
-            Ok(row)
+            Ok::<_, Error>(row)
         };
         let mut cover = given.budget.reserve(0, "write row")?;
         let mut count = 0;
@@ -482,40 +531,58 @@ impl<'a> Rules<'a> {
             // Checked before anything else, so a row this reader may not write is refused even
             // where the statement would leave it as it is.
             visible.may_write(&old, &*changes)?;
-            let row = assign(&old, &mut cover)?;
+            let row = assign(&old, &mut cover, changes)?;
             self.transition(state, &old, &row)?;
-            let unread = left.len();
             left.retain(|(at, _)| !assigned.contains(at));
-            // A row that already holds what it is set to is left alone: a statement that
-            // changes nothing stages nothing.
-            if row == old && left.len() == unread {
-                return Ok(());
-            }
-            self.moved(&old, &row, &left, &*changes)?;
+            self.moved(&old, &row, &left, changes)?;
             let (was, mark) = (Some((&key, &*old)), changes.mark());
-            match self.put(changes, partitions, visible, was, row, left) {
-                Ok(Some(key)) => {
+            match self.put(changes, partitions, visible, (was, None), row, left) {
+                // Read from the moment the set began at, a moved row is never met again.
+                Ok(Some(key)) if self.part(changes).is_none() => {
                     reserved.grow(key.as_bytes().len() as u64)?;
                     reached.insert(key);
                 }
-                Ok(None) => {}
+                Ok(_) => {}
                 Err(Error::UniqueViolation { .. }) => {
                     changes.rewind(mark);
-                    let row = assign(&old, &mut cover)?;
-                    reserved.grow(bytes(&row))?;
+                    let streaming = self.part(changes).is_some();
+                    let row = (!streaming).then(|| assign(&old, &mut cover, changes));
                     let cells = old.into_iter().map(Cell::Here).collect();
                     self.remove(changes, Some(partitions), visible, &key, cells)?;
+                    // Written through, only the key is queued and the row worked out after.
+                    let Some(row) = row.transpose()? else {
+                        return changes.queue(b'L', table.id, &key);
+                    };
+                    reserved.grow(bytes(&row) + key.as_bytes().len() as u64)?;
                     reserved.room(&mut lifted, usize::MAX)?;
-                    lifted.push(row);
+                    lifted.push((key, row));
                 }
                 Err(other) => return Err(other),
             }
             Ok(())
         })?;
         // Put back, a row is refused only by a row the statement leaves.
-        for row in lifted {
-            reserved.shrink(bytes(&row));
-            self.put(changes, partitions, visible, None, row, Vec::new())?;
+        // A row put back keeps its key: one under a hidden key is no new row.
+        for (key, row) in lifted {
+            reserved.shrink(bytes(&row) + key.as_bytes().len() as u64);
+            let at = (None, Some(&key));
+            self.put(changes, partitions, visible, at, row, Vec::new())?;
+        }
+        // Only the statement's own lifted keys: a callback's UPDATE finds none after its start.
+        let first = changes.first().clone();
+        let mut after = [&[b'L'][..], &self.from.to_be_bytes()].concat();
+        let mut read = given.budget.passing("lifted row")?;
+        while let Some((_, key, _held)) = changes.next_note(b'L', &mut after, given.budget)? {
+            let row = first.row(table.id, &key, &mut read)?.expect("a lifted row");
+            let width = 0..table.meta.columns.len();
+            let (mut old, left) =
+                split(width.map(|at| table.cell(&row, at).into_owned()).collect());
+            for (at, beside) in left {
+                old[at] = first.load(&beside, &mut cover)?;
+            }
+            let (row, at) = (assign(&old, &mut cover, changes)?, (None, Some(&key)));
+            self.put(changes, partitions, visible, at, row, Vec::new())?;
+            changes.part_full(self.part(changes))?;
         }
         Ok(count)
     }
@@ -627,10 +694,9 @@ impl<'a> Rules<'a> {
         let (row, _) = split(before.cells);
         visible.may_write(
             &row,
-            if changes.streaming() {
-                changes.first()
-            } else {
-                &*changes
+            match self.part(changes) {
+                Some(_) => changes.first(),
+                None => &*changes,
             },
         )?;
         self.count(changes, Some(&row), None)?;
@@ -698,13 +764,13 @@ impl<'a> Rules<'a> {
     /// go back to the store as they came. What the row keeps from before is its own and is
     /// not looked up, an entry whose values stay is left alone, and a row whose key changed
     /// leaves its old key. A table with no primary key keeps a new row under the next row
-    /// number.
+    /// number, or under `kept`, the key of a row taken out to be put back.
     fn put(
         &self,
         changes: &mut ChangeSet,
         partitions: &mut Tally,
         visible: &mut Visible,
-        was: Option<(&Key, &[Value])>,
+        (was, kept): (Option<(&Key, &[Value])>, Option<&Key>),
         mut row: Vec<Value>,
         left: Vec<(usize, Beside)>,
     ) -> Result<Option<Key>> {
@@ -734,10 +800,13 @@ impl<'a> Rules<'a> {
         let key = match was {
             Some((old, _)) if !differs(&table.key) => old.clone(),
             // The transaction's own number, which no other is given, and its count of such rows.
-            _ if table.key.is_empty() => {
-                let made = [self.given.number.0, changes.next_row_number()];
-                Key::from_values(&made.map(|number| Value::Int64(number as i64)), &[])?
-            }
+            _ if table.key.is_empty() => match kept {
+                Some(kept) => kept.clone(),
+                None => {
+                    let made = [self.given.number.0, changes.next_row_number()];
+                    Key::from_values(&made.map(|number| Value::Int64(number as i64)), &[])?
+                }
+            },
             // No directions: a row's key is encoded ascending.
             _ => self.identity(|| "primary key".to_owned(), &pick(&table.key, &row), &[])?,
         };
@@ -878,7 +947,7 @@ fn pick(columns: &[usize], row: &[Value]) -> Vec<Value> {
 
 /// A row's values in column order, with NULL for each large value that was left beside the
 /// row, and those cells with the columns they are of.
-fn split(cells: Vec<Cell>) -> (Vec<Value>, Vec<(usize, Beside)>) {
+pub(crate) fn split(cells: Vec<Cell>) -> (Vec<Value>, Vec<(usize, Beside)>) {
     let mut left = Vec::new();
     let values = cells.into_iter().enumerate().map(|(at, cell)| match cell {
         Cell::Here(value) => value,

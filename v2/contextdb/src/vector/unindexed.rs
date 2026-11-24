@@ -320,7 +320,7 @@ fn empty(
     }
     let mut held = budget.reserve(0, "empty partition")?;
     abandon(changes, vector, emptied, dimension, &mut held)?;
-    departed(changes, (vector, number), None, budget)?;
+    departed(changes, (vector, number), None, budget, None)?;
     Ok(())
 }
 
@@ -425,15 +425,19 @@ fn abandon(
 }
 
 /// Deletes a partition's `Left` records of noted rows, leapfrogging the two sorted runs
-/// through the store's typed lower-bound note seek. True when it deleted one.
+/// through the store's typed lower-bound note seek, with every one, and its `Slot` record,
+/// when `table` is `None`.
+/// With `into`, keeps each deleted key there and stops at [`build::STEP_SLOTS`] of them: true
+/// when it stopped there, so that a call again goes on after them.
 fn departed(
     changes: &mut ChangeSet,
     (id, partition): (VectorId, u32),
     table: Option<crate::store::TableId>,
     budget: &Budget,
+    mut into: Option<(&mut Vec<Key>, &mut Reservation)>,
 ) -> Result<bool> {
     let _keys = budget.reserve(3 * crate::store::KEY_LIMIT as u64, "departed keys")?;
-    let (mut cursor, mut found) = (Key::from_bytes(&[]), false);
+    let mut cursor = Key::from_bytes(&[]);
     loop {
         let (mut next, from) = (None, VectorRecord::Left(id, partition, &cursor));
         changes.vectors(from, &mut |record, _| {
@@ -443,34 +447,94 @@ fn departed(
             };
             Ok(false)
         })?;
-        let Some(key) = next else { return Ok(found) };
+        let Some(key) = next else { return Ok(false) };
         let chosen = match table {
-            Some(table) => changes.noted_from(table, &key, budget)?.map(|(key, _)| key),
+            Some(table) => erased_from(changes, table, &key, budget)?,
             None => Some(key.clone()),
         };
         let Some(chosen) = chosen else {
-            return Ok(found);
+            return Ok(false);
         };
         if chosen == key {
             changes.delete_vector(VectorRecord::Left(id, partition, &key))?;
-            found = true;
+            if table.is_none() {
+                changes.delete_vector(VectorRecord::Slot(id, partition, &key))?;
+            }
+            if let Some((keys, held)) = into.as_mut() {
+                held.room(&mut **keys, usize::MAX)?;
+                held.grow(key.as_bytes().len() as u64)?;
+                keys.push(key.clone());
+                if keys.len() as u64 == build::STEP_SLOTS {
+                    return Ok(true);
+                }
+            }
         }
         cursor = chosen;
     }
 }
 
-/// Erasure repairs vector-derived records before the commit, including in Caller mode.
+/// The first key from `from` whose vectors this erase takes: one it took, or one whose row
+/// was deleted earlier and whose vectors left behind it selected.
+fn erased_from(
+    changes: &ChangeSet,
+    table: crate::store::TableId,
+    from: &Key,
+    budget: &Budget,
+) -> Result<Option<Key>> {
+    let taken = changes.noted_from(b'N', table, from, budget)?;
+    let left = changes.noted_from(b'V', table, from, budget)?;
+    Ok(match (taken, left) {
+        (Some((a, _)), Some((b, _))) => Some(a.min(b)),
+        (a, b) => a.or(b).map(|(key, _)| key),
+    })
+}
+
+/// Hands `each` the key of every `Left` record of `table`'s vectors, or with `only` that key's
+/// for each record of it: the rows deleted earlier whose sealed vectors are still kept.
+pub(crate) fn left_behind(
+    read: &dyn Read,
+    table: &crate::schema::Table,
+    each: &mut dyn FnMut(&Key) -> Result<()>,
+) -> Result<()> {
+    for column in &table.vectors {
+        build::entries(read, column, None, &mut |_, p| {
+            let mut cursor = Key::from_bytes(&[]);
+            loop {
+                let mut next = None;
+                let from = VectorRecord::Left(column.id, p.number, &cursor);
+                read.vectors(from, &mut |record, _| {
+                    next = match record {
+                        VectorRecord::Left(v, n, key) if (v, n) == (column.id, p.number) => {
+                            Some(key.clone())
+                        }
+                        _ => None,
+                    };
+                    Ok(false)
+                })?;
+                match next {
+                    Some(key) => {
+                        each(&key)?;
+                        // The least key past it.
+                        cursor = Key::from_bytes(&[key.as_bytes(), &[0]].concat());
+                    }
+                    None => return Ok(true),
+                }
+            }
+        })?;
+    }
+    Ok(())
+}
+
+/// Erasure repairs vector-derived records before the commit, including in Caller mode: each
+/// erased row's slots are found through its `Slot` record and blanked, and only what they
+/// touched is worked out again.
 pub(crate) fn erase(changes: &mut ChangeSet, catalog: &Catalog, budget: &Budget) -> Result<()> {
-    use super::ivf;
     let changed = changes
         .changed_tables()
         .filter_map(|(id, _)| catalog.by_id(id));
     let tables: Vec<_> = changed.filter(|t| !t.vectors.is_empty()).collect();
     for table in tables {
-        if changes
-            .noted_from(table.id, &Key::from_bytes(&[]), budget)?
-            .is_none()
-        {
+        if erased_from(changes, table.id, &Key::from_bytes(&[]), budget)?.is_none() {
             continue;
         }
         for column in &table.vectors {
@@ -490,40 +554,23 @@ pub(crate) fn erase(changes: &mut ChangeSet, catalog: &Catalog, budget: &Budget)
                 }
                 after = partitions.last().map(|(key, _)| key.clone());
                 for (tuple, mut p) in partitions {
-                    if !departed(changes, (id, p.number), Some(table.id), budget)? {
-                        continue;
-                    }
                     let mut room = budget.reserve(0, "purge partition")?;
-                    abandon(changes, id, &p, dim, &mut room)?;
-                    p.building = None;
-                    changes.put_vector(VectorRecord::Partition(id, &tuple), p.encode())?;
-                    if let Some(g) = p.ivf {
-                        repair_grouped(changes, (id, g, dim), table.id, budget, &mut room)?;
-                    }
-                    let mean = p
-                        .ivf
-                        .filter(|g| g.groups > 1)
-                        .map(|g| ivf::mean(&*changes, id, g.number, dim, &mut room))
-                        .transpose()?;
-                    for block in p.first..p.blocks {
-                        let (writer, erased) = erased_block(
-                            &*changes,
-                            (id, p.number, block, dim),
-                            table.id,
-                            budget,
-                            &mut room,
-                        )?;
-                        if erased || mean.is_some() {
-                            let reference = mean.as_deref().map(|mean| move |_| mean);
-                            seal::put_block(
-                                (id, p.number, block),
-                                writer,
-                                (&mut room, Reservation::shrink),
-                                (dim, reference),
-                                |r, v| changes.put_vector(r, v),
-                            )?;
+                    let (mut keys, mut more) = (Vec::new(), true);
+                    while more {
+                        let into = Some((&mut keys, &mut room));
+                        more = departed(changes, (id, p.number), Some(table.id), budget, into)?;
+                        if keys.is_empty() {
+                            break;
                         }
-                        room.shrink(3 * super::block::BLOCK_BYTES as u64);
+                        if p.building.is_some() {
+                            abandon(changes, id, &p, dim, &mut room)?;
+                            p.building = None;
+                            changes.put_vector(VectorRecord::Partition(id, &tuple), p.encode())?;
+                        }
+                        repair(changes, (id, &p, dim), &keys, &mut room)?;
+                        let bytes = keys.iter().map(|key| key.as_bytes().len() as u64).sum();
+                        room.shrink(bytes);
+                        keys.clear();
                     }
                 }
             }
@@ -532,200 +579,245 @@ pub(crate) fn erase(changes: &mut ChangeSet, catalog: &Catalog, budget: &Budget)
     Ok(())
 }
 
-fn repair_grouped(
+/// Blanks the slots of `keys`, erased rows of partition `p`, in the blocks their `Slot`
+/// records name, and works out again what those slots touched: the IVF's total and the
+/// centroids and codes of the groups that lost one, and the codes of the tail blocks blanked,
+/// or of every tail block when the mean moved.
+fn repair(
     changes: &mut ChangeSet,
-    (id, g, dim): (VectorId, super::directory::Grouped, usize),
-    table: crate::store::TableId,
-    budget: &Budget,
+    (id, p, dim): (VectorId, &Partition, usize),
+    keys: &[Key],
     room: &mut Reservation,
 ) -> Result<()> {
+    use super::block::{BLOCK_BYTES, BlockWriter};
     use super::ivf::{self, Ivf, Place};
     use super::train;
-    room.grow((g.groups as usize + 8 * dim) as u64)?;
-    let mut ivf = Ivf::read(&*changes, id, g, room)?;
-    let starts = &mut ivf.starts;
-    let (many, groups) = (g.groups > 1, g.groups as usize);
-    let per = ivf::centroids_per_record(dim);
-    let index = (id, g.number, g.groups, dim);
-    let (mut sum, mut hand, mut cached) = (vec![0.0; dim], Vec::new(), (u32::MAX, Vec::new()));
-    let mut total = train::Mean::new(dim, room)?;
-    let mut changed = vec![0u8; groups]; // 0: unchanged, 1: changed, 2: empty.
-    for group in 0..groups {
-        let mut live = false;
-        sum.fill(0.0);
-        let (from, end) = (starts[group], starts[group + 1]);
-        for block in from.block..end.block + u32::from(end.slot > 0) {
-            if cached.0 != block {
-                room.shrink(std::mem::take(&mut cached.1).len() as u64);
-                let stored = VectorRecord::Block(id, g.number, block);
-                let bytes = directory::kept(&*changes, stored, |v| {
-                    pack::block(&*changes, v, dim)?;
-                    room.grow(v.len() as u64)?;
-                    Ok::<_, Error>(v.to_vec())
-                })?;
-                let bytes = bytes.ok_or_else(|| changes.damaged(super::block::BROKEN))??;
-                cached = (block, bytes);
+    let before = room.bytes();
+    // Each erased slot as (block's number, block, slot, key's place), read from the borrowed
+    // record and charged at its exact capacity before the list grows; grouped by block.
+    let mut slots: Vec<(u32, u32, u32, usize)> = Vec::new();
+    for (at, key) in keys.iter().enumerate() {
+        let record = VectorRecord::Slot(id, p.number, key);
+        let held = directory::kept(&*changes, record, |v| {
+            for [under, block, slot] in directory::slots(v) {
+                room.room(&mut slots, usize::MAX)?;
+                slots.push((under, block, slot, at));
             }
-            let owned = super::block::BlockReader::new(&cached.1, dim);
-            let (lo, len) = (from.max(Place { block, slot: 0 }).slot, owned.len() as u32);
-            let hi = end.min(Place { block, slot: len }).slot;
-            if (from.block == block && from.slot > len) || (end.block == block && end.slot > len) {
-                return Err(changes.damaged("a group's bounds exceed its block"));
-            }
-            for slot in lo as usize..hi as usize {
-                let key = owned.key(slot);
-                let erased = changes.noted(table, &key, budget)?;
-                changed[group] |= u8::from(erased);
-                if !erased && !key.as_bytes().is_empty() {
-                    live = true;
-                    train::add(&mut sum, owned.slot(slot));
-                    total.take(owned.slot(slot));
-                }
-            }
-        }
-        if !live {
-            changed[group] = 2;
-        }
-        let record = group / per;
-        if changed[group] > 0 && many {
-            if hand.is_empty() {
-                let range = (record * per) as u32..(record * per + per).min(groups) as u32;
-                hand = ivf::centroid_range(&*changes, index, range, room)?;
-            }
-            let centre = &mut hand[(group % per) * dim..][..dim];
-            centre.fill(0.0);
-            train::normalize(&sum, centre);
-        }
-        if !hand.is_empty() && ((group + 1).is_multiple_of(per) || group + 1 == groups) {
-            room.grow(4 * hand.len() as u64)?;
-            ivf::put_centroids_at(changes, (id, g.number, record as u32), &hand)?;
-            room.shrink(8 * std::mem::take(&mut hand).len() as u64);
+            Ok::<_, Error>(())
+        })?;
+        if held.transpose()?.is_some() {
+            changes.delete_vector(record)?;
         }
     }
-    room.shrink(std::mem::take(&mut cached.1).len() as u64);
-    drop(sum);
-    room.shrink(8 * dim as u64);
-    if many && changed.iter().any(|flag| *flag > 0) {
-        room.grow(4 * dim as u64)?;
-        let mean = total.finish();
-        room.shrink(8 * dim as u64);
-        room.grow(4 * dim as u64)?;
-        ivf::put_mean(changes, id, g.number, &mean)?;
-        drop(mean);
-        room.shrink(8 * dim as u64);
-    } else {
-        drop(total);
-        room.shrink(8 * dim as u64);
-    }
-    for block in 0..g.blocks {
-        let first = starts.partition_point(|s| *s <= Place { block, slot: 0 }) - 1;
-        let end = starts.partition_point(|s| s.block <= block).min(groups);
-        if !changed[first..end].iter().any(|flag| *flag > 0) {
+    slots.sort_unstable();
+    let slots = slots.chunk_by(|a, b| (a.0, a.1) == (b.0, b.1));
+    let slots = slots.map(|run| ((run[0].0, run[0].1), run));
+    let g = p.ivf;
+    let many = g.is_some_and(|g| g.groups > 1);
+    let mut ivf = g.map(|g| Ivf::read(&*changes, id, g, room)).transpose()?;
+    let total = |g: directory::Grouped| ivf::total(&*changes, id, g.number, dim, room);
+    let mut total = g.filter(|_| many).map(total).transpose()?;
+    let groups = g.map_or(0, |g| g.groups as usize);
+    let (mut changed, mut moved, mut tail) = (vec![false; groups], false, Vec::new());
+    for ((under, block), erased) in slots {
+        let in_tail = under == p.number && (p.first..p.blocks).contains(&block);
+        let grouped = g.is_some_and(|g| g.number == under && block < g.blocks);
+        if !in_tail && !grouped {
             continue;
         }
-        let (writer, _) = erased_block(&*changes, (id, g.number, block, dim), table, budget, room)?;
-        let bytes = writer.bytes() as u64;
-        room.grow(bytes)?;
-        let value = writer.finish();
-        room.shrink(bytes);
-        changes.put_vector(VectorRecord::Block(id, g.number, block), value)?;
-        if many {
-            changes.delete_vector(VectorRecord::Binary(id, g.number, block))?;
-        }
-        room.shrink(3 * super::block::BLOCK_BYTES as u64);
-    }
-    for group in (1..groups).rev() {
-        if changed[group] == 2 {
-            starts[group] = starts[group + 1];
-        }
-    }
-    let first = changed.iter().position(|flag| *flag != 2).unwrap_or(groups);
-    starts[..=first].fill(Place::default());
-    for block in 0..g.blocks * u32::from(many) {
-        use super::binary::{code_len, write_code};
-        let stored = VectorRecord::Binary(id, g.number, block);
-        if directory::kept(&*changes, stored, |_| ())?.is_some() {
-            continue;
-        }
-        let codes = pack::with_block(
-            &*changes,
-            VectorRecord::Block(id, g.number, block),
-            dim,
-            &mut |slots| {
-                room.grow((4 + slots.len() * code_len(dim)) as u64)?;
-                let mut codes = vec![0; 4 + slots.len() * code_len(dim)];
-                codes[..4].copy_from_slice(&(slots.len() as u32).to_le_bytes());
-                let (mut record, mut centres) = (usize::MAX, Vec::new());
-                for (slot, code) in codes[4..].chunks_exact_mut(code_len(dim)).enumerate() {
+        let record = VectorRecord::Block(id, under, block);
+        let writer = pack::with_block(&*changes, record, dim, &mut |reader| {
+            room.grow(3 * BLOCK_BYTES as u64)?;
+            let (mut writer, _) = BlockWriter::new(dim, None, &[]);
+            let blank = vec![0; super::slot::slot_len(dim)];
+            let (empty, mut hit) = (Key::from_bytes(&[]), false);
+            for at in 0..reader.len() {
+                let key = reader.key(at);
+                let gone = erased
+                    .iter()
+                    .any(|(_, _, slot, k)| *slot as usize == at && keys[*k] == key);
+                hit |= gone;
+                if gone && grouped {
                     let place = Place {
                         block,
-                        slot: slot as u32,
+                        slot: at as u32,
                     };
-                    let group = (starts.partition_point(|s| *s <= place) - 1).min(groups - 1);
-                    if record != group / per {
-                        let bytes = 4 * centres.len() as u64;
-                        drop(std::mem::take(&mut centres));
-                        room.shrink(bytes);
-                        record = group / per;
-                        let from = record * per;
-                        centres = ivf::centroid_range(
-                            &*changes,
-                            index,
-                            from as u32..(from + per).min(groups) as u32,
-                            room,
-                        )?;
+                    let starts = &ivf.as_ref().expect("an IVF in force").starts;
+                    changed[(starts.partition_point(|s| *s <= place) - 1).min(groups - 1)] = true;
+                    if let Some((count, sum)) = &mut total {
+                        train::scaled(sum, reader.slot(at), -1.0);
+                        *count = count.saturating_sub(1);
+                        moved = true;
                     }
-                    write_code(
-                        slots.slot(slot),
-                        &centres[(group % per) * dim..][..dim],
-                        code,
-                    );
                 }
-                let held = 4 * centres.len() as u64;
-                drop(centres);
-                room.shrink(held);
-                Ok(codes)
-            },
-        )?;
-        room.shrink(codes.len() as u64);
-        changes.put_vector(stored, codes)?;
+                let (key, slot) = if gone {
+                    (&empty, &blank[..])
+                } else {
+                    (&key, reader.slot(at))
+                };
+                writer.push_slot(key, slot);
+            }
+            Ok(hit.then_some(writer))
+        })?;
+        if let Some(writer) = writer {
+            let bytes = writer.bytes() as u64;
+            room.grow(bytes)?;
+            let value = writer.finish();
+            room.shrink(bytes);
+            changes.put_vector(record, value)?;
+            if in_tail {
+                tail.push(block);
+            }
+        }
+        room.shrink(3 * BLOCK_BYTES as u64);
     }
-    let bytes = (12 + 8 * starts.len()) as u64;
-    room.grow(bytes)?;
-    let value = ivf.encode();
-    room.shrink(bytes);
-    changes.put_vector(VectorRecord::Ivf(id, g.number), value)?;
+    if let (Some(g), Some(ivf)) = (g.filter(|_| many), ivf.as_mut()) {
+        regroup(changes, (id, g, dim), ivf, &changed, room)?;
+    }
+    let mean = match &total {
+        Some(total) if moved => {
+            ivf::put_mean(changes, id, g.expect("an IVF in force").number, total)?;
+            room.grow(4 * dim as u64)?;
+            tail = (p.first..p.blocks).collect();
+            Some(train::mean(&total.1, total.0))
+        }
+        Some(_) => Some(ivf::mean(
+            &*changes,
+            id,
+            g.expect("an IVF in force").number,
+            dim,
+            room,
+        )?),
+        None => None,
+    };
+    for block in tail {
+        seal::recode(changes, (id, p.number, block), dim, mean.as_deref(), room)?;
+    }
+    room.shrink(room.bytes() - before);
     Ok(())
 }
 
-fn erased_block(
-    read: &ChangeSet,
-    (id, under, at, dim): (VectorId, u32, u32, usize),
-    table: crate::store::TableId,
-    budget: &Budget,
-    held: &mut Reservation,
-) -> Result<(super::block::BlockWriter, bool)> {
-    pack::with_block(
-        read,
-        VectorRecord::Block(id, under, at),
-        dim,
-        &mut |block| {
-            held.grow(3 * super::block::BLOCK_BYTES as u64)?;
-            let (mut writer, _) = super::block::BlockWriter::new(dim, None, &[]);
-            let blank = vec![0; super::slot::slot_len(dim)];
-            let empty = Key::from_bytes(&[]);
-            let mut changed = false;
-            for slot in 0..block.len() {
-                let key = block.key(slot);
-                let erased = !key.as_bytes().is_empty() && read.noted(table, &key, budget)?;
-                changed |= erased;
-                writer.push_slot(
-                    if erased { &empty } else { &key },
-                    if erased { &blank } else { block.slot(slot) },
+/// Works out again, from their blocks as they are now, the centroids of the groups of `ivf`
+/// that lost a slot and the codes of the blocks those groups span; a group left with no slot
+/// is given no place.
+fn regroup(
+    changes: &mut ChangeSet,
+    (id, g, dim): (VectorId, super::directory::Grouped, usize),
+    ivf: &mut super::ivf::Ivf,
+    changed: &[bool],
+    room: &mut Reservation,
+) -> Result<()> {
+    use super::binary::{code_len, write_code};
+    use super::ivf::{self, Place};
+    use super::train;
+    let (groups, per) = (g.groups as usize, ivf::centroids_per_record(dim));
+    let index = (id, g.number, g.groups, dim);
+    let starts = &mut ivf.starts;
+    let (mut sum, mut hand) = (vec![0.0; dim], (usize::MAX, Vec::new()));
+    let (mut empty, mut spanned) = (vec![false; groups], std::collections::BTreeSet::new());
+    room.grow((9 * dim + groups) as u64)?;
+    let flush = |changes: &mut ChangeSet, room: &mut Reservation, hand: &mut (usize, Vec<f32>)| {
+        if !hand.1.is_empty() {
+            room.grow(4 * hand.1.len() as u64)?;
+            ivf::put_centroids_at(changes, (id, g.number, hand.0 as u32), &hand.1)?;
+            room.shrink(8 * std::mem::take(&mut hand.1).len() as u64);
+        }
+        Ok::<_, Error>(())
+    };
+    for group in (0..groups).filter(|group| changed[*group]) {
+        let (from, end) = (starts[group], starts[group + 1]);
+        let mut live = false;
+        sum.fill(0.0);
+        for block in from.block..end.block + u32::from(end.slot > 0) {
+            spanned.insert(block);
+            let record = VectorRecord::Block(id, g.number, block);
+            pack::with_block(&*changes, record, dim, &mut |owned| {
+                let (lo, len) = (from.max(Place { block, slot: 0 }).slot, owned.len() as u32);
+                let hi = end.min(Place { block, slot: len }).slot;
+                if (from.block == block && from.slot > len)
+                    || (end.block == block && end.slot > len)
+                {
+                    return Err(changes.damaged("a group's bounds exceed its block"));
+                }
+                for slot in
+                    (lo as usize..hi as usize).filter(|at| !owned.key(*at).as_bytes().is_empty())
+                {
+                    live = true;
+                    train::add(&mut sum, owned.slot(slot));
+                }
+                Ok(())
+            })?;
+        }
+        empty[group] = !live;
+        if hand.0 != group / per {
+            flush(changes, room, &mut hand)?;
+            let from = group / per * per;
+            let range = from as u32..(from + per).min(groups) as u32;
+            hand = (
+                group / per,
+                ivf::centroid_range(&*changes, index, range, room)?,
+            );
+        }
+        let centre = &mut hand.1[(group % per) * dim..][..dim];
+        centre.fill(0.0);
+        train::normalize(&sum, centre);
+    }
+    flush(changes, room, &mut hand)?;
+    drop(sum);
+    room.shrink(8 * dim as u64);
+    if empty.iter().any(|empty| *empty) {
+        for group in (1..groups).rev() {
+            if empty[group] {
+                starts[group] = starts[group + 1];
+            }
+        }
+        // The first groups that are empty begin, with the first that is not, at the start.
+        let first =
+            (0..groups).position(|group| !empty[group] && starts[group] != starts[group + 1]);
+        starts[..=first.unwrap_or(groups)].fill(Place::default());
+        let bytes = (12 + 8 * starts.len()) as u64;
+        room.grow(bytes)?;
+        let value = ivf.encode();
+        room.shrink(bytes);
+        changes.put_vector(VectorRecord::Ivf(id, g.number), value)?;
+    }
+    let starts = &ivf.starts;
+    for block in spanned {
+        let record = VectorRecord::Block(id, g.number, block);
+        let codes = pack::with_block(&*changes, record, dim, &mut |slots| {
+            room.grow((4 + slots.len() * code_len(dim)) as u64)?;
+            let mut codes = vec![0; 4 + slots.len() * code_len(dim)];
+            codes[..4].copy_from_slice(&(slots.len() as u32).to_le_bytes());
+            let (mut record, mut centres) = (usize::MAX, Vec::new());
+            for (slot, code) in codes[4..].chunks_exact_mut(code_len(dim)).enumerate() {
+                let place = Place {
+                    block,
+                    slot: slot as u32,
+                };
+                let group = (starts.partition_point(|s| *s <= place) - 1).min(groups - 1);
+                if record != group / per {
+                    let bytes = 4 * centres.len() as u64;
+                    drop(std::mem::take(&mut centres));
+                    room.shrink(bytes);
+                    record = group / per;
+                    let from = record * per;
+                    let range = from as u32..(from + per).min(groups) as u32;
+                    centres = ivf::centroid_range(&*changes, index, range, room)?;
+                }
+                write_code(
+                    slots.slot(slot),
+                    &centres[(group % per) * dim..][..dim],
+                    code,
                 );
             }
-
-            Ok((writer, changed))
-        },
-    )
+            let held = 4 * centres.len() as u64;
+            drop(centres);
+            room.shrink(held);
+            Ok(codes)
+        })?;
+        room.shrink(codes.len() as u64);
+        changes.put_vector(VectorRecord::Binary(id, g.number, block), codes)?;
+    }
+    room.shrink(groups as u64);
+    Ok(())
 }

@@ -1171,8 +1171,8 @@ fn the_memory_limit_option_is_the_sessions_ceiling() {
         default.is_u64(),
         "a writer with no limit declared shows the default, not {default}"
     );
-    // A writer with no limit counts the opening charge. A read shell with no limit counts the
-    // reader's floor.
+    // M4: a writer with no limit keeps the 8 MiB cache of an open without one, so it can take
+    // any limit at once; a read shell with no limit counts the reader's charge (M1).
     for (args, writer) in [
         (&[arg(&store), "--write", "--json"][..], true),
         (&[arg(&store), "--json"], false),
@@ -1182,7 +1182,7 @@ fn the_memory_limit_option_is_the_sessions_ceiling() {
         let expected = if writer {
             opening::opening_charge(&store, None)
         } else {
-            11_018_240
+            opening::reader_charge(&store, None)
         };
         assert_eq!(
             documents(&run.stdout)[0]["result"]["rows"][0]["used"],
@@ -1874,15 +1874,16 @@ fn compact_runs_to_the_end_and_stops_for_a_reader() {
         let run = shell(&dir, &[arg(&store), "--write", "--json"], input);
         documents(&run.stdout).pop().unwrap()["maintenance_cycle"].clone()
     };
+    let one = cycle(".maintenance compact 1\n");
+    let stepped = one["compacted_pages"].as_u64() <= Some(256) && one["work_remaining"] == true;
+    assert!(stepped, "compact report {one}");
     let held = cycle(".cursor open SELECT id FROM notes\n.maintenance compact\n");
     assert_eq!(
         held["compaction_waiting_on"], "Readers",
         "an open cursor keeps its view: stop"
     );
-    let one = cycle(".maintenance compact 1\n");
-    assert!(one["compacted_pages"].as_u64() <= Some(256) && one["work_remaining"] == true);
     let all = cycle(".maintenance compact\n");
-    // The one step already moved what was pending. A later compact has nothing left.
+    // The steps before moved what was pending. A later compact has nothing left.
     assert!(
         all["compacted_pages"].as_u64() == Some(0) && all["work_remaining"] == false,
         "compact report {all}"

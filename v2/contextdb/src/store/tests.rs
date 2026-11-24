@@ -869,6 +869,7 @@ fn the_records_of_an_ivf_keep_their_keys_apart() {
         Binary(column, 6, 0),
         Mean(column, 5),
         Left(column, 5, &row),
+        Slot(column, 5, &row),
     ];
     let stored = records.map(keys::vector);
     let apart: std::collections::BTreeSet<&Vec<u8>> = stored.iter().collect();

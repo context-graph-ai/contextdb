@@ -311,6 +311,7 @@ fn dropping_a_vector_column_leaves_no_record_of_any_kind_for_it() {
         Binary(id, 1, 0),
         Mean(id, 1),
         Left(id, 1, &row),
+        Slot(id, 1, &row),
     ];
     let budget = Budget::new(None).expect("a budget");
     {

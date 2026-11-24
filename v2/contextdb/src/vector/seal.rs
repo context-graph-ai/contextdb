@@ -186,13 +186,15 @@ pub(super) fn seal_partition(
         };
         if left == 0 {
             // A block that was full before this call is left as it is.
-            if !writer.is_empty() {
+            if writer.len() > 0 {
                 put(changes, held, block, writer)?;
             }
             block += 1;
             (writer, left) = BlockWriter::new(dimension, None, &keys[done..]);
         }
         writer.push(key, &numbers);
+        let slot = [number, block, writer.len() as u32 - 1];
+        directory::hold(changes, (vector, &partition), key, Some(slot), held)?;
         left -= 1;
         drop((row, numbers));
         held.shrink(held.bytes() - taken);
@@ -218,6 +220,27 @@ pub(super) fn seal_partition(
     let left = left.ok_or_else(|| changes.damaged(directory::SHORT))?;
     changes.put_vector_number(VectorNumber::Pending, left)?;
     Ok((sealed, following))
+}
+
+/// Stages again the binary codes of a block of `under` from `mean`, or, with none, removes them.
+pub(super) fn recode(
+    changes: &mut ChangeSet,
+    (vector, under, at): (VectorId, u32, u32),
+    dimension: usize,
+    mean: Option<&[f32]>,
+    held: &mut Reservation,
+) -> Result<()> {
+    let code = VectorRecord::Binary(vector, under, at);
+    let Some(mean) = mean else {
+        return changes.delete_vector(code);
+    };
+    let block = VectorRecord::Block(vector, under, at);
+    let codes = pack::with_block(&*changes, block, dimension, &mut |slots| {
+        held.grow((4 + slots.len() * code_len(dimension)) as u64)?;
+        Ok(codes_of(slots, dimension, &mut |_| mean))
+    })?;
+    held.shrink(codes.len() as u64);
+    changes.put_vector(code, codes)
 }
 
 /// Finishes a block with its output reserved first, then writes its binary codes and block.

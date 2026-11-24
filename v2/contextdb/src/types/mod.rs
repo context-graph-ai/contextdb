@@ -14,7 +14,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// The position the engine gave a commit. Positions rise with every commit of one store, and a
 /// position that reached the disk is never given out again.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(transparent)]
 pub struct TxId(pub u64);
 
