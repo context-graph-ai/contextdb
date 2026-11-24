@@ -144,13 +144,19 @@ pub(crate) fn check_at_commit(
             }
         }
         // A large value the row left where it is reads as NULL here, which takes the row out
-        // of a rule over it: the statement that staged the row changed no entry of that rule
-        // and no value of that reference, so the row holds what it held.
-        let Some((row, _)) = row else {
+        // of a unique rule over it: the statement that staged the row changed no entry of that
+        // rule, so the row holds what it held. A reference reads it, as a row written through
+        // keeps every large value beside it.
+        let Some((row, left)) = row else {
             return Ok(());
         };
+        let mut loaded = budget.reserve(0, "query")?;
         for reference in &table.rules.references {
-            let values = pick(&reference.columns, row);
+            let value = |&at: &usize| match left.iter().find(|(slot, _)| *slot == at) {
+                Some((_, beside)) => changes.load(beside, &mut loaded),
+                None => Ok(row[at].clone()),
+            };
+            let values: Vec<Value> = reference.columns.iter().map(value).collect::<Result<_>>()?;
             if values.contains(&Value::Null) {
                 continue;
             }
@@ -176,6 +182,30 @@ pub(crate) fn check_at_commit(
         }
         Ok(())
     })
+}
+
+/// Hands `each` every row a change set written through has written, as `check_at_commit`
+/// visits it: by its note, read back as it now is, `None` for a row it removed. A row of a
+/// table that names no parent and that no reference names is passed by.
+pub(crate) fn written(
+    changes: &ChangeSet,
+    catalog: &Catalog,
+    budget: &Budget,
+    mut each: impl FnMut((TableId, &Key, Option<StagedValues<'_>>, bool)) -> Result<()>,
+) -> Result<()> {
+    let checked = |id| {
+        let table = catalog.by_id(id);
+        table
+            .is_some_and(|t| !t.rules.references.is_empty() || catalog.children(t).next().is_some())
+    };
+    let (mut after, mut cover) = (vec![b'N'], budget.passing("commit row")?);
+    while let Some((id, key, row)) =
+        changes.next_written(changes, &mut after, &checked, (budget, &mut cover))?
+    {
+        let row = row.map(|row| super::split(row.cells));
+        each((id, &key, row.as_ref().map(|(v, l)| (&v[..], &l[..])), false))?;
+    }
+    Ok(())
 }
 
 /// Rejects overtaken inputs before callbacks load their large cells.
@@ -241,7 +271,7 @@ fn held(
 
 /// True when `read` shows a row of `table` that holds `values` in the columns `named`: the
 /// columns of its key or of one of its UNIQUE rules, in the rule's order.
-fn parent(
+pub(crate) fn parent(
     table: &Table,
     named: &[String],
     values: &[Value],

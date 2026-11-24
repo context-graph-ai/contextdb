@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 pub(crate) use expression::{EvalContext, Kept, Scope, eval, most_bytes, reads, sort_order};
-pub(crate) use for_write::{Asked, rows_for_write, walk_for_write};
+pub(crate) use for_write::{Asked, named_keys, rows_for_write, walk_for_write};
 pub(crate) use inspect::explain;
 pub(crate) use subquery::tables_read;
 pub(crate) use table::equal;

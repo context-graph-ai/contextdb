@@ -256,6 +256,7 @@ const ASSIGNED: u8 = 6;
 pub(super) const BINARY: u8 = 7;
 const MEAN: u8 = 8;
 pub(super) const LEFT: u8 = 9;
+pub(super) const SLOT: u8 = 37;
 
 /// True for the kinds of record that are kept in the table of blocks.
 pub(super) fn with_blocks(kind: u8) -> bool {
@@ -304,9 +305,14 @@ pub(super) fn vector(record: VectorRecord<'_>) -> Vec<u8> {
             let numbers = [number(column.0), number(partition)];
             [&[MEAN][..], numbers.as_flattened()].concat()
         }
-        VectorRecord::Left(column, partition, row) => {
+        VectorRecord::Left(column, partition, row) | VectorRecord::Slot(column, partition, row) => {
+            let kind = if matches!(record, VectorRecord::Left(..)) {
+                LEFT
+            } else {
+                SLOT
+            };
             let numbers = [number(column.0), number(partition)];
-            [&[LEFT][..], numbers.as_flattened(), &row.0].concat()
+            [&[kind][..], numbers.as_flattened(), &row.0].concat()
         }
     }
 }
@@ -334,10 +340,13 @@ pub(super) fn vector_of<'a>(stored: &[u8], key: &'a mut Key) -> Option<VectorRec
         ASSIGNED => VectorRecord::Assigned(column, number(5)?, number(9)?),
         BINARY => VectorRecord::Binary(column, number(5)?, number(9)?),
         MEAN => VectorRecord::Mean(column, number(5)?),
-        LEFT => {
+        LEFT | SLOT => {
             let partition = number(5)?;
             key.0.extend_from_slice(&stored[9..]);
-            VectorRecord::Left(column, partition, key)
+            match stored[0] {
+                LEFT => VectorRecord::Left(column, partition, key),
+                _ => VectorRecord::Slot(column, partition, key),
+            }
         }
         _ => return None,
     })

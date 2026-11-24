@@ -100,3 +100,20 @@ pub(crate) fn walk_for_write(
     };
     source.cells(&path, place, reservation, &mut keep).map(drop)
 }
+
+/// The keys the filter's path reaches, in key order, when it reaches only named keys; the
+/// filter is still to be tested on what each holds.
+pub(crate) fn named_keys(
+    asked: &Asked,
+    catalog: &Catalog,
+    read: &dyn Read,
+    reservation: &mut Reservation,
+) -> Result<Option<Vec<Key>>> {
+    let visible = Visible::new(asked.table, catalog, asked.reader, reservation)?;
+    let source = Source::new(asked.table, asked.filter, &asked.ctx, read, visible);
+    let path = source.choose(&[], &[])?;
+    Ok(match path.reach {
+        Reach::Keys(keys) => Some(keys),
+        _ => None,
+    })
+}

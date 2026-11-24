@@ -3,6 +3,10 @@ use super::*;
 
 pub(super) const NOTES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("notes");
 pub(super) const SETS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("sets");
+/// A key's note (`N`) is empty when taken, `WRITTEN` once its row first leaves in a part (counted,
+/// its version decided), `ERASED` when that removes a row whose removed versions are not kept.
+pub(super) const WRITTEN: u8 = 1;
+pub(super) const ERASED: u8 = 2;
 
 impl Store {
     pub(crate) fn through(&self, changes: &mut ChangeSet) {
@@ -20,8 +24,19 @@ impl ChangeSet {
     pub(crate) fn streaming(&self) -> bool {
         self.data.is_some()
     }
-    pub(crate) fn part_bytes(&self) -> u64 {
-        self.reserved.bytes()
+    /// Ends a part through `part`, when one is given, once the set holds `PART_BYTES`. A part is
+    /// given only at a row boundary of a set written through, where every rewind point of the
+    /// rows before has expired (a callback's statement has none), so their undo goes.
+    pub(crate) fn part_full(
+        &mut self,
+        part: Option<impl FnOnce(&mut Self) -> Result<()>>,
+    ) -> Result<()> {
+        let Some(part) = part else { return Ok(()) };
+        self.calls.clear();
+        match self.reserved.bytes() >= PART_BYTES {
+            true => part(self),
+            false => Ok(()),
+        }
     }
     pub(crate) fn changed_tables(&self) -> Box<dyn Iterator<Item = (TableId, u64)> + '_> {
         match self.data {
@@ -40,14 +55,16 @@ impl ChangeSet {
             return Ok(());
         }
         self.written |= !matches!(&undo, Undo::Vector(k, _) if k.0[0] >= NOTE);
-        if matches!(undo, Undo::Vector(..) | Undo::Number(..)) {
-            self.derived += bytes;
-        }
-        if let Undo::Row(id, _, None, _) = undo {
-            if !self.tally.contains_key(&TableId(id)) {
-                self.held.grow(384)?;
+        // A part's rows are undone as in memory; derived records leave with each full part.
+        match undo {
+            Undo::Vector(..) | Undo::Number(..) => self.derived += bytes,
+            undo => {
+                // Its rows are counted as they leave their notes (`disk::put`).
+                if let Undo::Row(id, ..) = undo {
+                    self.tallied(TableId(id))?;
+                }
+                self.calls.push((undo, bytes));
             }
-            *self.tally.entry(TableId(id)).or_default() += 1;
         }
         if self.derived == 0 || self.reserved.bytes() < PART_BYTES {
             return Ok(());
@@ -87,6 +104,7 @@ impl ChangeSet {
             self.schema.clear();
             self.dropped = Vec::new();
             self.copied = Vec::new();
+            self.calls.clear();
             let drain = u64::from(self.drain) * redb::WriteTransaction::DRAIN_BYTES as u64;
             self.reserved
                 .shrink(self.reserved.bytes().saturating_sub(drain));
@@ -108,10 +126,30 @@ impl ChangeSet {
         );
         Ok(())
     }
+    /// In memory, a note is the statement's workspace: no undo, one charge, given back at its end.
     pub(crate) fn put_temp(&mut self, kind: u8, key: &[u8], value: &[u8]) -> Result<()> {
+        let entry = STAGED_BYTES + 1 + key.len() as u64;
         let key = Key([&[kind], key].concat());
+        if self.data.is_none() {
+            self.reserved.grow(entry + value.len() as u64)?;
+            let before = self.vectors.insert(key, Some(value.to_vec())).flatten();
+            self.reserved
+                .shrink(before.map_or(0, |before| entry + before.len() as u64));
+            return Ok(());
+        }
         let bytes = self.counted(&key, value.len() as u64)?;
         self.stage_record(key, Some(value.to_vec()), bytes)
+    }
+    /// Gives back, as every statement ends, the notes a set held in memory keeps from [`NOTE`].
+    pub(crate) fn end_statement(&mut self) {
+        if self.data.is_none() {
+            let done = self.vectors.split_off(&Key(vec![NOTE]));
+            let bytes = done.iter().map(|(key, value)| {
+                let value = value.as_ref().map_or(0, Vec::len);
+                STAGED_BYTES + (key.0.len() + value) as u64
+            });
+            self.reserved.shrink(bytes.sum());
+        }
     }
     pub(crate) fn next_temp(
         &self,
@@ -159,14 +197,17 @@ impl ChangeSet {
         };
         read().map_err(|e| disk::failed(self.base.folder(), "read", e))?
     }
+    /// The first key from `from` of `table` noted under `kind`: `N` a taken key, `V` a key
+    /// whose vectors alone an erase takes.
     pub(crate) fn noted_from(
         &self,
+        kind: u8,
         table: TableId,
         from: &Key,
         budget: &Budget,
     ) -> Result<Option<(Key, Reservation)>> {
         let _seek = budget.reserve((from.0.len() + 10) as u64, "note seek")?;
-        let prefix = [&[b'N'][..], &table.0.to_be_bytes()].concat();
+        let prefix = [&[kind][..], &table.0.to_be_bytes()].concat();
         let from = [prefix.as_slice(), &from.0].concat();
         Ok(self
             .next_temp(NOTE, (Included(&from), Unbounded), budget)?
@@ -176,9 +217,25 @@ impl ChangeSet {
                 (Key(key), held)
             }))
     }
-    pub(crate) fn noted(&self, table: TableId, key: &Key, budget: &Budget) -> Result<bool> {
+    pub(crate) fn has_note(&self, kind: u8, table: TableId, budget: &Budget) -> Result<bool> {
+        let from = [&[kind][..], &table.0.to_be_bytes()].concat();
+        let end = match table.0.checked_add(1) {
+            Some(next) => [&[kind][..], &next.to_be_bytes()].concat(),
+            None => vec![kind + 1],
+        };
+        Ok(self
+            .next_temp(NOTE, (Included(&from), Excluded(&end)), budget)?
+            .is_some())
+    }
+    pub(crate) fn noted(
+        &self,
+        kind: u8,
+        table: TableId,
+        key: &Key,
+        budget: &Budget,
+    ) -> Result<bool> {
         let _held = budget.reserve((key.0.len() + 5) as u64, "note probe")?;
-        let key = [&[b'N'][..], &keys::stored(table.0, &key.0)].concat();
+        let key = [&[kind][..], &keys::stored(table.0, &key.0)].concat();
         Ok(self
             .next_temp(NOTE, (Included(&key), Included(&key)), budget)?
             .is_some())
@@ -202,17 +259,47 @@ impl ChangeSet {
         *after = key;
         Ok(Some((id, row, held)))
     }
-    pub(crate) fn note(&mut self, table: TableId, key: &Key) -> Result<()> {
-        self.put_temp(
-            NOTE,
-            &[&[b'N'][..], &keys::stored(table.0, &key.0)].concat(),
-            &[],
-        )
+    /// Counts a table among those the commit notice names, charging its summary once.
+    fn tallied(&mut self, table: TableId) -> Result<()> {
+        if !self.tally.contains_key(&table) {
+            self.held.grow(384)?;
+            self.tally.insert(table, 0);
+        }
+        Ok(())
     }
-    pub(crate) fn queue(&mut self, table: TableId, key: &Key) -> Result<()> {
+    /// Notes a key: `N` one the statement took, `V` one whose vectors and deliveries alone go,
+    /// `M` the values a follower reference names. A `V` note names its table among those the
+    /// commit changed, by no row, so the commit reaches what it notes.
+    pub(crate) fn note(&mut self, kind: u8, table: TableId, key: &Key) -> Result<()> {
+        let note = [&[kind][..], &keys::stored(table.0, &key.0)].concat();
+        self.put_temp(NOTE, &note, &[])?;
+        if kind == b'V' {
+            self.tallied(table)?;
+            self.written = true;
+        }
+        Ok(())
+    }
+    pub(crate) fn queue(&mut self, kind: u8, table: TableId, key: &Key) -> Result<()> {
         self.queued += 1;
-        let at = [&[b'Q'][..], &self.queued.to_be_bytes()].concat();
+        let at = [&[kind][..], &self.queued.to_be_bytes()].concat();
         self.put_temp(NOTE, &at, &keys::stored(table.0, &key.0))
+    }
+    /// The next written key after `after` of a table `wanted` admits, with its row as `view`
+    /// reads it: `None` for a row the set removed.
+    pub(crate) fn next_written(
+        &self,
+        view: &dyn Read,
+        after: &mut Vec<u8>,
+        wanted: &dyn Fn(TableId) -> bool,
+        (budget, cover): (&Budget, &mut Passing),
+    ) -> Result<Option<(TableId, Key, Option<Row>)>> {
+        while let Some((id, key, _held)) = self.next_note(b'N', after, budget)? {
+            if wanted(id) {
+                let row = view.row(id, &key, cover)?;
+                return Ok(Some((id, key, row)));
+            }
+        }
+        Ok(None)
     }
 }
 

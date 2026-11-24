@@ -87,9 +87,9 @@ impl BlockWriter {
         self.ends.push(self.keys.len() as u32);
     }
 
-    /// True when the writer has no slot.
-    pub(super) fn is_empty(&self) -> bool {
-        self.ends.is_empty()
+    /// How many slots the writer has.
+    pub(super) fn len(&self) -> usize {
+        self.ends.len()
     }
 
     /// The block's bytes.

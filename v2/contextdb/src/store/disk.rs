@@ -812,7 +812,7 @@ impl View {
         let mut lent = Key(Vec::new());
         self.pairs(|kind, key, value| {
             let bytes = (key.len() + value.len()) as u64;
-            if kind == 4 && key.first().is_some_and(|k| *k >= DELIVERY) {
+            if kind == 4 && key.first().is_some_and(|k| (DELIVERY..=AUDIT).contains(k)) {
                 return f(self.runtime_record(key, value)?, bytes);
             }
             if kind == 3 || kind == 4 {
@@ -914,7 +914,7 @@ impl View {
                         Key(joined[length..].to_vec()),
                     )?;
                 }
-                3 | 4 if kind == 3 || k.first().is_none_or(|k| *k < DELIVERY) => {
+                3 | 4 if kind == 3 || k.first().is_none_or(|k| !(DELIVERY..=AUDIT).contains(k)) => {
                     let record = m.told(keys::vector_of(k, &mut key).ok_or_else(unsound))?;
                     changes.put_vector(record, v.to_vec())?;
                 }
@@ -978,8 +978,11 @@ impl View {
         if key.first() == Some(&DELIVERY) {
             return Ok(Record::Delivery(key, value));
         }
-        if let [AUDIT, _, _] = *key {
-            return Ok(Record::Audit(value));
+        if key.first() == Some(&AUDIT) {
+            let entry = value
+                .get(8..)
+                .ok_or_else(|| self.damaged("an invalid audit record"));
+            return entry.map(Record::Audit);
         }
         let bad = || self.damaged("an invalid schedule cursor");
         let name = key
@@ -1091,6 +1094,20 @@ pub(super) fn write(data: &redb::Database, changes: &mut ChangeSet) -> Stored<u6
         None => begin(data, changes)?,
     };
     put(&write, changes)?;
+    // A key whose last write removed its row from a table that keeps no removed row's
+    // versions takes its versions with it, as it would have in one part.
+    if changes.data.is_some() && changes.keeps.values().any(|removed| !removed) {
+        let mut cover = changes.reserved.passing();
+        let (mut versions, mut beside) = (write.open_table(VERSIONS)?, write.open_table(BESIDE)?);
+        let notes = write.open_table(super::through::NOTES)?;
+        for note in notes.range(&[NOTE, b'N'][..]..&[NOTE, b'O'][..])? {
+            let (key, flag) = note?;
+            if flag.value() == [super::through::ERASED] {
+                let tables = (&mut versions, &mut beside);
+                release(tables, &key.value()[2..], None, &[], &mut cover, &write)?;
+            }
+        }
+    }
     write.delete_table(super::through::NOTES)?;
     write.delete_table(super::through::SETS)?;
     if number(&write.open_table(NUMBERS)?, PUBLICATION_OWED)? != 0 {
@@ -1124,6 +1141,10 @@ pub(super) fn put(write: &redb::WriteTransaction, changes: &mut ChangeSet) -> St
         let mut beside = write.open_table(BESIDE)?;
         let mut index = write.open_table(INDEX)?;
         let mut versions = write.open_table(VERSIONS)?;
+        let notes = changes.data.as_ref();
+        let mut notes = notes
+            .map(|_| write.open_table(super::through::NOTES))
+            .transpose()?;
         let first_free = number(&numbers, NEXT_PLACE)?;
         let mut free = first_free;
         let commit = changes.commit_number().0.to_be_bytes();
@@ -1131,9 +1152,42 @@ pub(super) fn put(write: &redb::WriteTransaction, changes: &mut ChangeSet) -> St
             let keeps = changes.keeps.get(table).filter(|_| !changes.erasing);
             for (key, row) in staged {
                 let key = stored(*table, &key.0);
+                // Written through, each row leaves its key's note written (see `WRITTEN`); a
+                // key taken but not yet written is written for the first time here.
+                let again = match &mut notes {
+                    Some(notes) => {
+                        use super::through::{ERASED, WRITTEN};
+                        let note = [&[NOTE, b'N'][..], &key].concat();
+                        let erased = keeps == Some(&false) && row.values.is_none();
+                        let state = [if erased { ERASED } else { WRITTEN }];
+                        let was = notes.insert(note.as_slice(), &state[..])?;
+                        was.is_some_and(|was| !was.value().is_empty())
+                    }
+                    None => false,
+                };
+                if notes.is_some() && !again {
+                    *changes.tally.entry(TableId(*table)).or_default() += 1;
+                }
+                let at = [key.as_slice(), &commit].concat();
                 match rows.get(key.as_slice())? {
-                    Some(old) if keeps.is_some_and(|removed| *removed || row.values.is_some()) => {
-                        let at = [key.as_slice(), &commit].concat();
+                    // The transaction's own earlier write: the first decided the version, so
+                    // only the slices neither it nor the new row holds are given back.
+                    Some(old) if again && keeps.is_some() => {
+                        let old = record::decode_record(old.value(), &mut cover)?;
+                        let version = versions.get(at.as_slice())?;
+                        let version = version.map(|v| record::decode_record(v.value(), &mut cover));
+                        let kept = version.transpose()?.into_iter().flat_map(Row::besides);
+                        let kept: Vec<_> =
+                            kept.chain(row.left.iter().map(|l| l.1.clone())).collect();
+                        for gone in old.besides().filter(|slice| !kept.contains(slice)) {
+                            remove_slices(&mut beside, &gone, write)?;
+                        }
+                    }
+                    Some(old)
+                        if keeps.is_some_and(|removed| {
+                            *removed || row.values.is_some() || notes.is_some()
+                        }) =>
+                    {
                         versions.insert_discard(at.as_slice(), old.value())?;
                     }
                     Some(old) => {
@@ -1141,6 +1195,11 @@ pub(super) fn put(write: &redb::WriteTransaction, changes: &mut ChangeSet) -> St
                         let after: Vec<_> = row.left.iter().map(|left| left.1.clone()).collect();
                         let tables = (&mut versions, &mut beside);
                         release(tables, &key, Some(old), &after, &mut cover, write)?;
+                    }
+                    // An erased key whose row was deleted earlier: its kept versions go.
+                    None if changes.erasing => {
+                        let tables = (&mut versions, &mut beside);
+                        release(tables, &key, None, &[], &mut cover, write)?;
                     }
                     None => {}
                 }

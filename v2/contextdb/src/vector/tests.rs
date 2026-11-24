@@ -177,7 +177,7 @@ fn a_block_reads_back_every_slot_and_key_and_stays_within_its_bytes() {
         .map(key)
         .collect();
     let (mut writer, taken) = BlockWriter::new(DIMENSION, None, &offered);
-    assert!(writer.is_empty());
+    assert!(writer.len() == 0);
     let mut pushed: Vec<(Key, Vec<f32>)> = Vec::new();
     let refused = loop {
         let n = pushed.len() as i64;
@@ -187,7 +187,7 @@ fn a_block_reads_back_every_slot_and_key_and_stays_within_its_bytes() {
         }
         let vector = vector(n as u64, DIMENSION);
         writer.push(&key, &vector);
-        assert!(!writer.is_empty());
+        assert!(writer.len() > 0);
         pushed.push((key, vector));
     };
     let block = writer.finish();
@@ -211,7 +211,7 @@ fn a_block_reads_back_every_slot_and_key_and_stays_within_its_bytes() {
     let first = first.finish();
     reads_back(&first, &pushed[..10]);
     let (mut second, room) = BlockWriter::new(DIMENSION, Some(&first), &offered[10..15]);
-    assert!(!second.is_empty());
+    assert!(second.len() > 0);
     for (at, (key, vector)) in pushed[10..15].iter().enumerate() {
         assert!(at < room);
         second.push(key, vector);
@@ -887,7 +887,8 @@ fn records_from(view: &View, from: VectorRecord<'_>) -> usize {
         | VectorRecord::Assigned(column, ..)
         | VectorRecord::Binary(column, ..)
         | VectorRecord::Mean(column, _)
-        | VectorRecord::Left(column, ..) => column,
+        | VectorRecord::Left(column, ..)
+        | VectorRecord::Slot(column, ..) => column,
     };
     let mut count = 0;
     view.vectors(from, &mut |record, _| {
@@ -1115,7 +1116,7 @@ fn damage_stores() -> HashMap<&'static str, Vec<u8>> {
                     "packed" => |_, p| matches!(p, Some(Phase::Measure { done: 0, .. })),
                     "width" => |_, p| matches!(p, Some(Phase::Width { .. })),
                     "switch" => |_, p| matches!(p, Some(Phase::Switch { .. })),
-                    "left-sweeping" => |_, p| p == Some(Phase::Sweep),
+                    "left-sweeping" => |_, p| matches!(p, Some(Phase::Sweep { .. })),
                     _ => IN_FORCE,
                 };
                 db = advance_to(&folder, db, reached);
@@ -1559,11 +1560,88 @@ fn every_damaged_vector_record_is_told_as_damage_by_each_path_that_meets_it() {
     // A mean as it is put reads back.
     let (folder, store, budget) = a_store("mean");
     let mut changes = ChangeSet::new(store.view().expect("a view"), &budget).expect("begin");
-    put_mean(&mut changes, COLUMN, 7, &vector(77, 16)).expect("stage the mean");
+    let sum = vector(77, 16).iter().map(|n| 2.0 * f64::from(*n)).collect();
+    put_mean(&mut changes, COLUMN, 7, &(2, sum)).expect("stage the mean");
     store.commit(changes).expect("commit");
     let held = &mut budget.reserve(0, "query").expect("a reservation");
     let read = mean(&store.view().expect("a view"), COLUMN, 7, 16, held);
     assert_eq!(read.expect("read the mean"), vector(77, 16));
+    std::fs::remove_dir_all(&folder).expect("remove the test's folder");
+}
+
+thread_local! {
+    /// Blocks read on this thread, counted as each is checked.
+    pub(super) static BLOCKS_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[test]
+fn a_purge_reads_only_the_blocks_of_the_groups_it_erases_from_and_keeps_the_mean() {
+    const WIDE: usize = 1024;
+    let folder = fresh("targeted-purge");
+    let db = opened(&folder);
+    let run = |db: &Database, sql: &str, id: u64, seed: u64| {
+        let given = crate::params! { "id" => id as i64, "v" => vector(seed, WIDE) };
+        db.execute(sql, &given).expect("a statement")
+    };
+    run(
+        &db,
+        "CREATE TABLE docs (id INTEGER PRIMARY KEY, v VECTOR(1024) INDEXING_THRESHOLD 1000)",
+        0,
+        0,
+    );
+    let tx = db.transaction().expect("begin");
+    for id in 1..=2000 {
+        let given = crate::params! { "id" => id as i64, "v" => vector(id, WIDE) };
+        tx.execute("INSERT INTO docs (id, v) VALUES ($id, $v)", &given)
+            .expect("insert");
+    }
+    tx.commit().expect("commit");
+    while db.run_maintenance_cycle().unwrap().work_remaining == Some(true) {}
+    // Row 7 again under its key, its first vector still in the IVF and its second in the tail.
+    run(&db, "DELETE FROM docs WHERE id = $id", 7, 0);
+    run(&db, "INSERT INTO docs (id, v) VALUES ($id, $v)", 7, 9_999);
+    db.run_maintenance_cycle().expect("seal row 7 again");
+    let (store, budget, column, entry) = beneath(&folder, db);
+    let g = entry.ivf.expect("an IVF");
+    assert!(
+        g.groups > 1 && g.blocks >= 7 && entry.blocks > entry.first,
+        "{entry:?}"
+    );
+    drop(store);
+
+    let db = opened(&folder);
+    for id in [7, 1500] {
+        BLOCKS_READ.with(|read| read.set(0));
+        run(&db, "PURGE FROM docs WHERE id = $id", id, 0);
+        let read = BLOCKS_READ.with(std::cell::Cell::get);
+        // Each erased slot's block, its group's two at most to sum and to code, the tail's one.
+        assert!(read <= 8, "{read} blocks read of {} in the IVF", g.blocks);
+    }
+    db.verify()
+        .expect("every slot noted and no erased row kept");
+    let (store, budget2, column2, entry) = beneath(&folder, db);
+    let (view, held) = (store.view().unwrap(), &mut budget2.reserve(0, "q").unwrap());
+    let mut sum = Mean::new(WIDE, held).expect("a sum");
+    let mut count = 0;
+    for at in 0..g.blocks {
+        let (_, bytes) = first_record(&view, VectorRecord::Block(column2, g.number, at));
+        let block = BlockReader::new(&bytes, WIDE);
+        for slot in (0..block.len()).filter(|s| !block.key(*s).as_bytes().is_empty()) {
+            let erased = [7, 1500].map(|n| Key::from_values(&[Value::Int64(n)], &[]).unwrap());
+            assert!(!erased.contains(&block.key(slot)), "an erased key kept");
+            sum.take(block.slot(slot));
+            count += 1;
+        }
+    }
+    let total = super::ivf::total(&view, column2, g.number, WIDE, held).expect("the total");
+    assert_eq!(
+        (total.0, entry.ivf.map(|g| g.number)),
+        (count, Some(g.number))
+    );
+    let found = mean(&view, column2, g.number, WIDE, held).expect("the mean");
+    let wanted = sum.finish();
+    assert!(found.iter().zip(wanted).all(|(a, b)| (a - b).abs() < 1e-6));
+    drop((view, store, budget, column));
     std::fs::remove_dir_all(&folder).expect("remove the test's folder");
 }
 

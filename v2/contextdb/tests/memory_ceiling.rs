@@ -599,14 +599,16 @@ const ENTRY: usize = 73 + 4 + 8 + 4 + 8;
 
 /// What the records the cycle stages come to, each its value, 320 bytes and twice its key: the
 /// block, whole, under a key of 13 bytes; the removal of each pending record, whose key is nine
-/// bytes and the row's key; the partition record under a key of 5; and the store's count of
-/// pending records, 320. Its 4,099 undo calls need 8,192 slots of 136 bytes; growth from
-/// 4,096 slots reserves the old and new buffers together.
+/// bytes and the row's key, and each row's slot record of 12 bytes under a key as long; the
+/// partition record under a key of 5; and the store's count of pending records, 320. Its 8,195
+/// undo calls need 16,384 slots of 136 bytes; growth from 8,192 slots reserves the old and new
+/// buffers together.
 const STAGED: usize = (BLOCK + 320 + 2 * 13)
     + SEALED * (320 + 2 * (9 + KEY))
+    + SEALED * (12 + 320 + 2 * (9 + KEY))
     + (ENTRY + 320 + 2 * 5)
     + 320
-    + 3 * (SEALED + 3).next_power_of_two() / 2 * 136;
+    + 3 * (2 * SEALED + 3).next_power_of_two() / 2 * 136;
 
 /// A limit that is exactly enough for that one partition: what an open sets aside, and
 /// every reservation of one cycle, each once.

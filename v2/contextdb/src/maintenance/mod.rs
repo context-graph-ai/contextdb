@@ -163,7 +163,8 @@ pub(crate) fn cycle(
     let (expired, deferred, mut more_expiry) = expire::run(open)?;
     let (removed, more_versions) = expire::versions(open)?;
     more_expiry |= more_versions;
-    changed |= expired > 0 || removed > 0;
+    let pruned = expire::audit(open)?;
+    changed |= expired > 0 || removed > 0 || pruned > 0;
     let (compacted, waiting, more_compaction, ratio) = if recovery.is_none() && !stopped() {
         if partial {
             let held = open.turn()?;

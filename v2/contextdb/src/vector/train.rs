@@ -87,7 +87,12 @@ pub(super) fn nearest_among(
 
 /// Adds the vector a slot keeps, its scale times each code, to `sum`.
 pub(super) fn add(sum: &mut [f64], slot: &[u8]) {
-    let scale = f64::from(slot::scale(slot));
+    scaled(sum, slot, 1.0);
+}
+
+/// Adds `by` times the vector a slot keeps to `sum`: -1 takes it away.
+pub(super) fn scaled(sum: &mut [f64], slot: &[u8], by: f64) {
+    let scale = by * f64::from(slot::scale(slot));
     for (sum, code) in sum.iter_mut().zip(&slot[SLOT_HEADER..]) {
         *sum += scale * f64::from(code.cast_signed());
     }

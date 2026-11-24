@@ -67,6 +67,8 @@ fn ivf_of(build: &Build, step: &mut Step, (gap, probes, width): (u32, u32, u8)) 
 
 /// Validates a borrowed block and returns its reader.
 pub(super) fn block<'a>(read: &dyn Read, v: &'a [u8], dim: usize) -> Result<BlockReader<'a>> {
+    #[cfg(test)]
+    super::tests::BLOCKS_READ.with(|read| read.set(read.get() + 1));
     let (r, err) = (BlockReader::new(v, dim), || read.damaged(BROKEN));
     r.is_whole().then_some(r).ok_or_else(err)
 }
@@ -106,7 +108,8 @@ pub(super) fn companions<T>(
     let groups = [
         p.ivf,
         b.and_then(|b| b.from),
-        b.filter(|b| b.phase != Phase::Sweep).map(packed),
+        b.filter(|b| !matches!(b.phase, Phase::Sweep { .. }))
+            .map(packed),
     ];
     let (span, many) = if n == p.number {
         (p.first..p.blocks, p.ivf.is_some_and(|g| g.groups > 1))
@@ -230,8 +233,8 @@ pub(super) fn pack(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
             train::normalize(sum, centroid);
         }
         if end == build.groups {
-            step.held.grow(12 * dimension as u64)?;
-            step.mean = Some(train::mean(&build.sum, packed(&build).slots));
+            step.held.grow(8 * dimension as u64)?;
+            step.mean = Some((packed(&build).slots, build.sum.clone()));
         }
     }
     found.sort_unstable();
@@ -269,7 +272,7 @@ pub(super) fn pack(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
     for (done, (key, (to, at))) in keys.iter().zip(&order).enumerate() {
         if left == 0 {
             // A block that was full before this step is left as it is.
-            if !writer.is_empty() {
+            if writer.len() > 0 {
                 put(step, &build, place.block, writer)?;
             }
             place = Place {
@@ -282,11 +285,15 @@ pub(super) fn pack(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
         // it that has no slot.
         build.starts.resize(*to as usize + 1, place);
         writer.push_slot(key, &slots[*at as usize * len..][..len]);
+        step.held
+            .grow((key.as_bytes().len() + size_of::<(Key, [u32; 3])>()) as u64)?;
+        step.slots
+            .push((key.clone(), Some([build.number, place.block, place.slot])));
         build.counts[*to as usize] += 1;
         left -= 1;
         place.slot += 1;
     }
-    if !writer.is_empty() {
+    if writer.len() > 0 {
         put(step, &build, place.block, writer)?;
     }
     build.starts.resize(end as usize + 1, place);
@@ -473,7 +480,7 @@ pub(super) fn width(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
 /// The last step: writes the IVF's record and has the partition's record name it, and
 /// removes what it replaces: the IVF the build read, the tail blocks it read with their
 /// binary codes, and the records of the build: all of them, or all but its own when some slot
-/// it read was stale, which then stays for [`sweep`].
+/// it read was stale, and its own, which stays for [`sweep`].
 pub(super) fn switch(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
     let Phase::Switch { gap, probes, width } = ground.build.phase else {
         unreachable!("a build that switches is in that phase")
@@ -502,18 +509,45 @@ pub(super) fn switch(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
     }
     // The centroids, blocks and binary codes the build wrote are the IVF's now.
     let written = build.written(vector, number, dimension);
+    let blocks = packed(&build).blocks;
+    let next = release(ground, step, (build.number, blocks), 0)?;
+    let sweeping = build.stale || next < blocks;
     step.removes.extend(written.filter(|record| match record {
         VectorRecord::Assigned(..) => true,
-        VectorRecord::Build(..) => !build.stale,
+        VectorRecord::Build(..) => !sweeping,
         _ => false,
     }));
-    if build.stale {
+    if sweeping {
         build.from = None;
         build.tens.clear();
-        build.phase = Phase::Sweep;
+        build.phase = Phase::Sweep { block: next };
         moved(ground, step, build);
     }
     Ok(())
+}
+
+/// Has each row of the IVF `number`'s blocks, from `block` on, let go of the slots it held in
+/// the blocks the switch removed, [`SWEPT`] rows a step at most; answers the block after the
+/// last it read.
+fn release(
+    ground: &Ground<'_>,
+    step: &mut Step,
+    (number, blocks): (u32, u32),
+    mut block: u32,
+) -> Result<u32> {
+    while block < blocks && step.slots.len() < SWEPT {
+        let record = VectorRecord::Block(step.work.vector, number, block);
+        with_block(ground.read, record, ground.dimension, &mut |slots| {
+            for at in (0..slots.len()).filter(|at| !slots.key(*at).as_bytes().is_empty()) {
+                step.held
+                    .grow((slots.key(at).as_bytes().len() + 64) as u64)?;
+                step.slots.push((slots.key(at), None));
+            }
+            Ok(())
+        })?;
+        block += 1;
+    }
+    Ok(block)
 }
 
 /// After the switch, removes up to 4,096 deletions through the source commit, inclusive.
@@ -539,10 +573,22 @@ pub(super) fn sweep(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
         }
         Ok(left.len() < SWEPT)
     })?;
+    let Phase::Sweep { mut block } = ground.build.phase else {
+        unreachable!("a build that sweeps is in that phase")
+    };
+    let ivf = ground
+        .partition
+        .ivf
+        .filter(|g| g.number == ground.build.number);
+    let blocks = (ground.build.number, ivf.map_or(0, |g| g.blocks));
     if step.left.is_empty() {
+        block = release(ground, step, blocks, block)?;
+    }
+    if step.left.is_empty() && block >= blocks.1 {
         step.removes.push(VectorRecord::Build(vector, number));
     } else {
-        let build = copy(ground, step)?;
+        let mut build = copy(ground, step)?;
+        build.phase = Phase::Sweep { block };
         moved(ground, step, build);
     }
     Ok(())

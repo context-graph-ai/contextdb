@@ -18,7 +18,7 @@ pub(crate) type SetRecord = ((Vec<u8>, Vec<u8>), Reservation);
 mod drop;
 mod folder;
 mod keys;
-mod record;
+pub(crate) mod record;
 mod recovery;
 #[cfg(test)]
 mod tests;
@@ -140,6 +140,10 @@ pub(crate) enum VectorRecord<'a> {
     /// row's key. The value is how many slots had been sealed into the partition's tail by
     /// then, so every slot of that key sealed earlier is stale.
     Left(VectorId, u32, &'a Key),
+    /// The slots a row's key holds in a partition: the partition's number and the row's key. The
+    /// value is the number each slot's block is kept under, the block's and the slot's, four
+    /// bytes each, low byte first, so an erasure reaches exactly the blocks that hold the key.
+    Slot(VectorId, u32, &'a Key),
 }
 
 /// A number the store keeps for the vector part.
@@ -443,7 +447,8 @@ pub struct ChangeSet {
     derived: u64,
     tally: BTreeMap<TableId, u64>,
     held: Reservation,
-    queued: u64,
+    /// The number of the last note queued: a statement's own are those queued after its start.
+    pub(crate) queued: u64,
     /// Staged rows by table and key.
     rows: Staged<StagedRow>,
     /// Staged index entries by index, each entry joined to the key of its row: the length of
@@ -855,22 +860,41 @@ impl ChangeSet {
         Ok(())
     }
 
-    pub(crate) fn put_audit(&mut self, (own, wait): &AuditQueue) -> Result<()> {
-        if own.is_empty() && wait.is_empty() {
+    /// Stores each firing under the next number of one sequence, stamped `now`.
+    /// Each is the entry's fields in order, the firing past the depth cap `DepthExceeded`.
+    pub(crate) fn put_audit(&mut self, (firings, _): &AuditQueue, now: i64) -> Result<()> {
+        let (entries, names, tx, status) = firings;
+        if entries.is_empty() {
             return Ok(());
         }
         let head = self.base.moment.number(disk::LAST_AUDIT)?;
-        let skip = (own.len() + wait.len()).saturating_sub(1024);
-        let mut count = 0;
-        for entry in wait.iter().chain(own).skip(skip) {
-            let value = serde_json::to_vec(entry).expect("an audit entry encodes");
-            let slot = ((head + count) % 1024) as u16;
-            let key = Key([&[AUDIT][..], &slot.to_be_bytes()].concat());
-            let bytes = self.counted(&key, value.len() as u64)?;
+        for (number, &(name, depth, rows)) in (head..).zip(entries) {
+            let deep = crate::events::TriggerAuditStatus::DepthExceeded;
+            let status = if depth > crate::events::CASCADE_DEPTH_CAP {
+                &deep
+            } else {
+                status
+            };
+            let entry = (&names[name as usize], tx, depth, u64::from(rows), status);
+            let key = Key([&[AUDIT][..], &number.to_be_bytes()].concat());
+            let mut length = record::Length(8);
+            serde_json::to_writer(&mut length, &entry).expect("an audit entry encodes");
+            // Charged before the copy is made.
+            let bytes = self.counted(&key, length.0 as u64)?;
+            let mut value = Vec::with_capacity(length.0);
+            value.extend(now.to_be_bytes());
+            serde_json::to_writer(&mut value, &entry).expect("an audit entry encodes");
             self.stage_record(key, Some(value), bytes)?;
-            count += 1;
         }
-        self.put_number(disk::LAST_AUDIT, head + count)
+        self.put_number(disk::LAST_AUDIT, head + entries.len() as u64)
+    }
+
+    /// Stages a stored firing as read from `key`, judged expired: removed, or kept `kept`.
+    pub(crate) fn expire_audit(&mut self, key: &[u8], kept: Option<&[u8]>) -> Result<()> {
+        let bytes = self.counted(&Key(key.into()), kept.map_or(0, <[u8]>::len) as u64)?;
+        let value =
+            kept.map(|kept| [&crate::events::EXPIRED.to_be_bytes()[..], &kept[8..]].concat());
+        self.stage_record(Key(key.into()), value, bytes)
     }
 
     /// Builds pending bytes under the journal's charge. Outer None skips; inner None removes.
@@ -964,21 +988,36 @@ impl ChangeSet {
         }))
     }
 
+    /// Rows written or removed since a mark, each with its staging operation (`None` for a
+    /// row leaving its key); a write whose row leaves its key later is told by that removal.
+    fn touched_since(
+        &self,
+        mark: usize,
+    ) -> impl Iterator<Item = (&u32, &Key, Option<TriggerEvent>)> {
+        (mark..self.calls.len()).filter_map(move |i| match &self.calls[i].0 {
+            Undo::Row(t, k, _, op) => (op.is_none()
+                || self.calls[i + 1..]
+                    .iter()
+                    .all(|(u, _)| !matches!(u, Undo::Row(a, b, _, None) if a == t && b == k)))
+            .then_some((t, k, *op)),
+            _ => None,
+        })
+    }
+
     /// Rows touched since a mark, with their current values and staging operation.
     pub(crate) fn rows_changed_since(
         &self,
         mark: usize,
     ) -> impl Iterator<Item = (TableId, &Key, StagedValues<'_>, TriggerEvent)> {
-        (mark..self.calls.len()).filter_map(move |i| match &self.calls[i].0 {
-            Undo::Row(t, k, _, Some(op)) => {
-                let r = self.rows.get(t)?.get(k)?;
-                self.calls[i + 1..]
-                    .iter()
-                    .all(|(u, _)| !matches!(u, Undo::Row(a, b, _, None) if a == t && b == k))
-                    .then_some((TableId(*t), k, (r.values.as_deref()?, &*r.left), *op))
-            }
-            _ => None,
+        self.touched_since(mark).filter_map(|(t, k, op)| {
+            let (r, op) = (self.rows.get(t)?.get(k)?, op?);
+            Some((TableId(*t), k, (r.values.as_deref()?, &*r.left), op))
         })
+    }
+
+    /// How many rows were written or removed since a mark.
+    pub(crate) fn rows_written_since(&self, mark: usize) -> usize {
+        self.touched_since(mark).count()
     }
 
     pub(crate) fn compact_pages(

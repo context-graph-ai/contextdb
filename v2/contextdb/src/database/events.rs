@@ -1,14 +1,16 @@
 //! The carried host callback API and its private handle into the committing transaction.
 
 use super::{Database, QueryResult, admin, locked};
-use crate::events::{Bound, CASCADE_DEPTH_CAP};
+use crate::events::{Bound, CASCADE_DEPTH_CAP, retained};
 use crate::query::Reader;
 use crate::sql::Effect;
 use crate::store::{AUDIT, LAST_AUDIT, Read};
 use crate::types::{Error, Principal, Result, SinkError, SinkEvent, TriggerContext, Value};
 use std::collections::HashMap;
 use std::ops::Bound::{Excluded, Included};
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 impl Database {
     /// Registers one declared trigger's host callback. It prepares rows in the firing
@@ -57,29 +59,48 @@ impl Database {
         self.opened()?.triggers.registered(|_| true)
     }
 
-    /// The newest 1,024 firings, oldest first. A refused write's firings are `RolledBack`, listed
-    /// from memory until a later write stores them (a handle closed first loses them), and its
-    /// `firing_tx` is a number no commit carries. Requires an unnarrowed handle.
+    /// The newest 1,024 firings, oldest first, whatever their age. A refused write's firings
+    /// are stored `RolledBack` before its refusal returns, under a `firing_tx` no commit
+    /// carries. Requires an unnarrowed handle.
     pub fn trigger_audit_log(&self) -> Result<crate::Owned<Vec<crate::TriggerAuditEntry>>> {
         admin(&self.reader, Some("trigger_audit_log"))?;
         let open = self.opened()?;
         let (view, _) = open.newest()?;
-        let mut held = open.budget.reserve(0, "trigger audit answer")?;
         let head = view.moment.number(LAST_AUDIT)?;
-        let mut answer = Vec::new();
-        let span = (Included(&[AUDIT][..]), Excluded(&[AUDIT + 1][..]));
-        view.deliveries(span, &mut |_, value| {
-            held.grow((size_of::<crate::TriggerAuditEntry>() + value.len()) as u64)?;
-            let entry = serde_json::from_slice(value);
-            answer.push(entry.map_err(|_| view.damaged("an invalid audit record"))?);
-            Ok(true)
-        })?;
-        let kept = answer.len().max(1);
-        answer.rotate_left(head as usize % kept);
-        let audit = locked(&open.triggers.audit);
-        held.grow((audit.1.len() * size_of::<crate::TriggerAuditEntry>()) as u64)?;
-        answer.extend(audit.1.iter().cloned());
-        Ok(crate::Owned::charged(answer, held))
+        audit(&open, &view, head.saturating_sub(1024), &|_, _| true)
+    }
+
+    /// The stored firings `keep` admits, oldest first, each inside the retention period by its
+    /// stamp. One the retention judged expired never returns, whatever the period or the clock
+    /// later. Requires an unnarrowed handle.
+    pub fn trigger_audit_history(
+        &self,
+        keep: impl Fn(&crate::TriggerAuditEntry) -> bool,
+    ) -> Result<crate::Owned<Vec<crate::TriggerAuditEntry>>> {
+        admin(&self.reader, Some("trigger_audit_history"))?;
+        let open = self.opened()?;
+        let (view, _) = open.newest()?;
+        let now = crate::system::now_millis(&*open.clock);
+        let period = open.audit_retention.load(Relaxed);
+        audit(&open, &view, 0, &|stamp, e| {
+            retained(stamp, now, period) && keep(e)
+        })
+    }
+
+    /// Sets how long a firing stays in the history: seven days on every open, never stored.
+    /// Requires an unnarrowed handle.
+    pub fn set_trigger_audit_retention(&self, period: Duration) -> Result<()> {
+        admin(&self.reader, Some("set_trigger_audit_retention"))?;
+        let millis = u64::try_from(period.as_millis()).unwrap_or(u64::MAX);
+        self.opened()?.audit_retention.store(millis, Relaxed);
+        Ok(())
+    }
+
+    /// How long a firing stays in the history. Requires an unnarrowed handle.
+    pub fn trigger_audit_retention(&self) -> Result<Duration> {
+        admin(&self.reader, Some("trigger_audit_retention"))?;
+        let millis = self.opened()?.audit_retention.load(Relaxed);
+        Ok(Duration::from_millis(millis))
     }
 
     /// The carried maximum callback depth. Initial firings start at one.
@@ -151,4 +172,32 @@ impl Database {
             })
         })
     }
+}
+
+/// The stored firings from number `from` that `keep` admits by stamp and entry, charged.
+fn audit(
+    open: &super::Open,
+    view: &crate::store::View,
+    from: u64,
+    keep: &dyn Fn(i64, &crate::TriggerAuditEntry) -> bool,
+) -> Result<crate::Owned<Vec<crate::TriggerAuditEntry>>> {
+    let mut held = open.budget.reserve(0, "trigger audit answer")?;
+    let mut answer = Vec::new();
+    let from = [&[AUDIT][..], &from.to_be_bytes()].concat();
+    let span = (Included(&from[..]), Excluded(&[AUDIT + 1][..]));
+    view.deliveries(span, &mut |_, value| {
+        let bad = || view.damaged("an invalid audit record");
+        held.grow(value.len() as u64)?;
+        let stamp = value.first_chunk().map(|s| i64::from_be_bytes(*s));
+        let entry = serde_json::from_slice(&value[8.min(value.len())..]).ok();
+        let (stamp, entry) = stamp.zip(entry).ok_or_else(bad)?;
+        match keep(stamp, &entry) {
+            true => held
+                .room(&mut answer, usize::MAX)
+                .map(|()| answer.push(entry))?,
+            false => held.shrink(value.len() as u64),
+        }
+        Ok(true)
+    })?;
+    Ok(crate::Owned::charged(answer, held))
 }

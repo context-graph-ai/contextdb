@@ -57,7 +57,7 @@ fn found_at_scale(rows: usize, pins: Option<[u64; 3]>) -> u64 {
 fn a_hundred_thousand_sightings_are_found_with_the_recorded_work_recall_and_length() {
     // Ordered allocation writes two fewer pages. Lowest-address recovery bookkeeping lets small stores shrink after deletes. This file has 16 more free, reusable interior pages, with identical live user and system page counts.
     // LEAN-B82 (edf6294fc) keeps replaced system-tree pages a commit longer: +8 pages, 433,819,648 at f00519315.
-    let work = found_at_scale(100_000, Some([916_228, 999, 433_852_416]));
+    let work = found_at_scale(100_000, Some([916_228, 999, 440_209_408]));
     // Bar 4: four times the rows costs at most 2.2 times the work, the square-root law the
     // 5 million figure rests on (design 8.1).
     let quarter = found_at_scale(25_000, None);

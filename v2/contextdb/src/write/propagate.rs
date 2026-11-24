@@ -11,38 +11,23 @@
 //!
 //! A follower is found whoever wrote, and written as the statement's reader: one that reader
 //! may not write refuses the statement.
+//!
+//! No step is held: each is queued as a note, and the followers end parts as the statement does.
 
-use std::collections::VecDeque;
-
-use super::{Given, Rules, split};
-use crate::memory::Reservation;
-use crate::query::{Reader, Visible, equal};
+use super::{Given, Part, Rules, split};
+use crate::query::{Kept, Reader, Visible, equal};
 use crate::schema::Table;
 use crate::sql::ast::{EdgePropagation, Propagation};
-use crate::store::{Beside, ChangeSet, Read};
+use crate::store::{Beside, ChangeSet, Key, Read, put_value, read_value};
 use crate::types::{Error, Result, Value, heap_bytes};
 use crate::vector::Tally;
 
 /// How many edges from a changed row a rule reaches when it names no `MAX DEPTH`.
 const MAX_DEPTH: u32 = 10;
 
-/// The rows that are to follow one row that changed its state.
-pub(super) struct Step {
-    /// The table whose rows follow.
-    table: String,
-    via: Via,
-    /// What finds them: the values the reference's columns hold in them, or the id of the row
-    /// that changed.
-    values: Vec<Value>,
-    /// The memory the step takes, given back when it has been followed.
-    _held: Reservation,
-}
-
-/// The declaration a step follows, by its place among those of the step's table.
-enum Via {
-    Reference(usize),
-    Edge(usize),
-}
+/// The notes of the steps, under the follower table: reference (0) or edge (1), its place, then
+/// the values that find the rows.
+const STEP: u8 = b'P';
 
 impl Rules<'_> {
     /// Notes the rows that follow a row of the table which an UPDATE takes from `old` to
@@ -53,7 +38,7 @@ impl Rules<'_> {
         old: &[Value],
         row: &[Value],
         left: &[(usize, Beside)],
-        read: &dyn Read,
+        changes: &mut ChangeSet,
     ) -> Result<()> {
         let table = self.table;
         let Some(machine) = &table.meta.state_machine else {
@@ -66,27 +51,18 @@ impl Rules<'_> {
         if old[at] == row[at] {
             return Ok(());
         }
-        let step = |follower: &Table, via: Via, columns: &[usize]| -> Result<()> {
-            let bytes =
-                3 * size_of::<Step>() + columns.len() * size_of::<Value>() + follower.name.len();
-            let mut held = self.given.budget.reserve(bytes as u64, "query_decode")?;
-            let mut values = Vec::new();
+        let mut step = |follower: &Table, via: u8, place: usize, columns: &[usize]| -> Result<()> {
+            let mut held = self.given.budget.reserve(0, "query_decode")?;
+            let mut note = [&[via][..], &(place as u32).to_be_bytes()].concat();
             for &at in columns {
-                values.push(match left.iter().find(|unread| unread.0 == at) {
-                    Some((_, beside)) => read.load(beside, &mut held)?,
-                    None => {
-                        held.grow(crate::types::heap_bytes(&row[at]))?;
-                        row[at].clone()
-                    }
-                });
+                let unread = left.iter().find(|unread| unread.0 == at);
+                let loaded = unread.map(|(_, beside)| changes.load(beside, &mut held));
+                let loaded = loaded.transpose()?;
+                let value = loaded.as_ref().unwrap_or(&row[at]);
+                held.grow(heap_bytes(value))?;
+                put_value(&mut note, value);
             }
-            self.followed.borrow_mut().push(Step {
-                table: follower.name.clone(),
-                via,
-                values,
-                _held: held,
-            });
-            Ok(())
+            changes.queue(STEP, follower.id, &Key::from_bytes(&note))
         };
         for child in self.given.catalog.children(table) {
             for (place, reference) in child.rules.references.iter().enumerate() {
@@ -94,17 +70,13 @@ impl Rules<'_> {
                 if reference.parent == table.name && rule.is_some_and(|r| r.on_state == *state) {
                     let columns = reference.parent_columns.iter();
                     let columns = columns.map(|name| table.column(name));
-                    step(
-                        child,
-                        Via::Reference(place),
-                        &columns.collect::<Result<Vec<_>>>()?,
-                    )?;
+                    step(child, 0, place, &columns.collect::<Result<Vec<_>>>()?)?;
                 }
             }
         }
         for (place, edge) in table.rules.propagate_edges.iter().enumerate() {
             if edge.rule.on_state == *state {
-                step(table, Via::Edge(place), &[table.column("id")?])?;
+                step(table, 1, place, &[table.column("id")?])?;
             }
         }
         Ok(())
@@ -117,54 +89,64 @@ struct Walk<'a> {
     given: &'a Given<'a>,
     /// Who writes the rows that follow.
     writer: &'a Reader,
-    /// Each step with the number of edges between its rows and a row the statement changed.
-    queue: VecDeque<(u32, Step)>,
-    /// That number for the step being followed.
+    /// How the statement ends a part: between two batches of the rows that follow.
+    part: Option<Part<'a>>,
+    /// The number of edges between the step's rows and a row the statement changed.
     depth: u32,
 }
 
 /// Follows every change of state the statement made to the rows of its table, and every change
-/// made by following. Called once the statement's own rows are written, so the statement finds
-/// its rows as they were before any of them was followed.
+/// made by following: its steps, queued after `rules.from`, a level at a time, each level the
+/// steps queued while the one before it was followed. Called once the statement's own rows are
+/// written, so the statement finds its rows as they were before any of them was followed.
 ///
 /// # Panics
 ///
 /// When a step names a table that is not in the statement's catalog.
 pub(super) fn follow(rules: &Rules, changes: &mut ChangeSet, partitions: &mut Tally) -> Result<()> {
-    let first = rules.followed.take();
-    if first.is_empty() {
+    if changes.queued == rules.from {
         return Ok(());
     }
     changes.operation = Some(crate::types::TriggerEvent::Update);
     let admin = Reader::admin();
     let narrowed = !rules.given.reader.is_admin();
+    // A follower is read as the rows stand, never from the moment the set began at.
     let given = Given {
         reader: &admin,
         examined: rules.given.examined.filter(|_| !narrowed),
+        part: None,
         ..*rules.given
     };
     let mut walk = Walk {
         given: &given,
         writer: rules.given.reader,
-        queue: first.into_iter().map(|step| (1, step)).collect(),
+        part: rules.part(changes),
         depth: 1,
     };
-    while let Some((depth, step)) = walk.queue.pop_front() {
-        walk.depth = depth;
-        let table = given.catalog.table(&step.table);
+    // The last step of the level being followed: those queued after it are one step further.
+    let mut after = [&[STEP][..], &rules.from.to_be_bytes()].concat();
+    let mut last = changes.queued;
+    while let Some((id, step, _held)) = changes.next_note(STEP, &mut after, given.budget)? {
+        if u64::from_be_bytes(after[1..9].try_into().unwrap()) > last {
+            (walk.depth, last) = (walk.depth + 1, changes.queued);
+        }
+        let table = given.catalog.by_id(id);
         let table = table.expect("a step names a table of the statement's catalog");
-        match step.via {
-            Via::Reference(place) => {
-                let reference = &table.rules.references[place];
-                if let Some(rule) = &reference.on_state {
-                    let columns = &reference.columns;
-                    walk.shift(table, columns, &step.values, rule, changes, partitions)?;
-                }
+        let (via, mut rest) = step.as_bytes().split_at(5);
+        let place = u32::from_be_bytes(via[1..].try_into().unwrap()) as usize;
+        let (mut held, mut values) = (given.budget.reserve(0, "query")?, Vec::new());
+        while !rest.is_empty() {
+            values.push(read_value(&mut rest, &mut held)?.expect("a step's value"));
+        }
+        if via[0] == 0 {
+            let reference = &table.rules.references[place];
+            if let Some(rule) = &reference.on_state {
+                let columns = &reference.columns;
+                walk.shift(table, columns, &values, rule, changes, partitions)?;
             }
-            Via::Edge(place) => {
-                let edge = &table.rules.propagate_edges[place];
-                walk.along(table, edge, &step.values[0], changes, partitions)?;
-            }
+        } else {
+            let edge = &table.rules.propagate_edges[place];
+            walk.along(table, edge, &values[0], changes, partitions)?;
         }
     }
     Ok(())
@@ -190,7 +172,12 @@ impl Walk<'_> {
         if !self.reaches(&edge.rule) {
             return Ok(());
         }
-        let given = self.given;
+        // Each step's filter is kept for that step alone, so a long walk holds one at a time.
+        let kept = Kept::new(self.given.budget.passing("expression evaluation")?);
+        let given = &Given {
+            kept: &kept,
+            ..*self.given
+        };
         let key = [table.column("id")?];
         for edges in given.catalog.edges() {
             let ends = [edges.column("source_id")?, edges.column("target_id")?];
@@ -204,7 +191,7 @@ impl Walk<'_> {
                 let (filter, bound) = equal(edges, &[ends[near], kind], &values);
                 let needed = vec![false; edges.meta.columns.len()];
                 let asked = rules.asked(Some(&filter), &bound, &[], &needed, given.reader);
-                rules.each(&asked, changes, |changes, _, cells| {
+                rules.paged(&asked, changes, self.part, |changes, _, cells| {
                     let other = split(cells).0.swap_remove(ends[far]);
                     self.shift(table, &key, &[other], &edge.rule, changes, partitions)
                 })?;
@@ -235,7 +222,11 @@ impl Walk<'_> {
         if state.is_none() && !rule.abort_on_failure {
             return Ok(());
         }
-        let given = self.given;
+        let kept = Kept::new(self.given.budget.passing("expression evaluation")?);
+        let given = &Given {
+            kept: &kept,
+            ..*self.given
+        };
         let rules = Rules::of(table, given)?;
         let mut seeing = given.budget.reserve(0, "query")?;
         let mut visible = Visible::new(table, given.catalog, self.writer, &mut seeing)?;
@@ -251,7 +242,7 @@ impl Walk<'_> {
         let asked = rules.asked(Some(&filter), &bound, assigned, &needed, given.reader);
         let mut cover = given.budget.passing("propagated row")?;
         let to = Value::Text(rule.set.clone());
-        rules.each(&asked, changes, |changes, key, cells| {
+        rules.paged(&asked, changes, self.part, |changes, key, cells| {
             let (old, left) = split(cells);
             if state.is_some_and(|at| old[at] == to) {
                 return Ok(());
@@ -279,14 +270,11 @@ impl Walk<'_> {
             cover.cover(bytes + size_of_val(old.as_slice()) as u64 + rule.set.len() as u64)?;
             let mut row = old.clone();
             row[at] = to.clone();
-            rules.moved(&old, &row, &left, &*changes)?;
+            rules.moved(&old, &row, &left, changes)?;
             let was = Some((&key, &*old));
-            rules.put(changes, partitions, &mut visible, was, row, left)?;
+            rules.put(changes, partitions, &mut visible, (was, None), row, left)?;
             Ok(())
         })?;
-        let next = self.depth + 1;
-        let noted = rules.followed.take().into_iter();
-        self.queue.extend(noted.map(|step| (next, step)));
         Ok(())
     }
 }

@@ -155,6 +155,9 @@ pub(crate) struct Open {
     pub(crate) maintenance: Maintenance,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) expiry: Mutex<maintenance::Expiry>,
+    /// The trigger history's retention in milliseconds, and the number its prune goes on from.
+    pub(crate) audit_retention: std::sync::atomic::AtomicU64,
+    pub(crate) audit_swept: Mutex<u64>,
     /// The limit this open started under, as `SHOW MEMORY_LIMIT` reports it.
     started_under: Option<u64>,
     disk_started_under: Option<u64>,
@@ -198,7 +201,7 @@ impl Drop for Writer {
 /// What one transaction has staged.
 pub(crate) struct Staged {
     pub(crate) erasing: Option<bool>,
-    pub(crate) passes: Option<(vector::Committed, bool)>,
+    pub(crate) passes: Option<vector::Committed>,
     pub(crate) budget: Budget,
     pub(crate) reader: query::Reader,
     pub(crate) changes: ChangeSet,
@@ -213,6 +216,8 @@ pub(crate) struct Staged {
     pub(crate) partitions: Tally,
     /// The transaction's number; zero for one that runs no statement of a host.
     pub(crate) number: TxId,
+    /// Its firings, until it commits or is refused.
+    pub(crate) audit: crate::events::AuditQueue,
     source: CommitSource,
     /// How much of `changes.rows_read` the handle's total work already has.
     pub(crate) counted: u64,
@@ -364,6 +369,8 @@ impl Database {
             committing: commit::Turn(Mutex::new(false), Default::default()),
             callback_wait: options.callback_wait.unwrap_or(Duration::from_secs(60)),
             expiry: Mutex::new(Default::default()),
+            audit_retention: (7 * 86_400_000).into(),
+            audit_swept: Mutex::new(0),
             newest: Mutex::new(newest),
             store,
         });
@@ -623,7 +630,7 @@ impl Database {
                 staged.reader = self.reader.clone();
                 let budget = &staged.budget;
                 staged.changes.set_number(staged.number);
-                if matches!(plan, Plan::Delete(_) | Plan::Purge(_))
+                if matches!(plan, Plan::Delete(_) | Plan::Purge(_) | Plan::Update(_))
                     || matches!(plan.effect(), Effect::Declares)
                 {
                     open.store.through(&mut staged.changes);
@@ -864,8 +871,9 @@ impl Database {
     /// Returns `CallbackReentry` on a callback handle or the firing thread during trigger
     /// dispatch, and `DatabaseClosed` after close.
     ///
-    /// The default engine worker can commit maintenance and advance this number
-    /// without any host write.
+    /// The default engine worker can commit maintenance and advance this number without any
+    /// host write; a refused write whose triggers fired advances it by the commit that stores
+    /// their rolled-back entries, past numbers other writes may hold.
     pub fn committed_watermark(&self) -> Result<TxId> {
         Ok(locked(&self.opened()?.newest).commit)
     }

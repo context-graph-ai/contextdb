@@ -7,16 +7,15 @@
 //! one commit. A step is worked out from one committed moment with no lock held, and staged
 //! under the commit lock only if the build has not moved since.
 
-use super::binary::{code_len, codes_of};
 use super::block::BlockReader;
 use super::directory::{self, Grouped, Partition, kept};
 use super::ivf::{self, Place, centroids_per_record};
-use super::pack;
 use super::train::{
     DRAWN, Mean, ROUNDS, Round, SAMPLE_TO_A_CENTROID, first_centroids, groups_for, nearest_among,
     sampled,
 };
 use super::unindexed::Totals;
+use super::{pack, seal};
 use crate::memory::{Budget, Reservation};
 use crate::schema::{Catalog, VectorColumn};
 use crate::sql::not_supported;
@@ -65,10 +64,10 @@ pub(super) enum Phase {
     },
     /// Everything is written: the next step makes the IVF the one in force.
     Switch { gap: u32, probes: u32, width: u8 },
-    /// The IVF is in force, and the build was of slots some of which were stale. The
-    /// next steps remove the `Left` records the build applied, and the last removes the
-    /// build's record.
-    Sweep,
+    /// The IVF is in force. The next steps remove the `Left` records the build applied, then
+    /// let go of the slots its rows held in what it replaced, from the IVF's block `block` on,
+    /// and the last removes the build's record.
+    Sweep { block: u32 },
 }
 
 /// How far the build of a partition's next IVF has come.
@@ -139,7 +138,7 @@ impl Build {
                 kept,
             } => (4, [&[gap, probes, done, asked], &kept[..]].concat()),
             Phase::Switch { gap, probes, width } => (5, vec![gap, probes, width.into()]),
-            Phase::Sweep => (6, Vec::new()),
+            Phase::Sweep { block } => (6, vec![block]),
         };
         let mut carried = [0; 19];
         carried[..fields.len()].copy_from_slice(&fields);
@@ -208,7 +207,7 @@ impl Build {
                 probes: short(8),
                 width: u8::try_from(short(9)).ok()?,
             },
-            6 => Phase::Sweep,
+            6 => Phase::Sweep { block: short(7) },
             _ => return None,
         };
         let mut places = (groups..lists.len()).step_by(2).map(|at| Place {
@@ -256,7 +255,7 @@ impl Build {
                 done, asked, kept, ..
             } => ended && done as usize <= questions && kept.iter().all(|kept| *kept <= asked),
             Phase::Switch { .. } => ended,
-            Phase::Sweep => ended && questions == 0,
+            Phase::Sweep { .. } => ended && questions == 0,
         };
         let placed = build.starts.is_sorted()
             && build
@@ -303,13 +302,13 @@ impl Build {
         let end = self.starts.last().copied().unwrap_or_default();
         let packed = end.block + u32::from(end.slot > 0);
         let (given, centroids, packed) = match self.phase {
-            Phase::Sweep => (0, 0, 0),
+            Phase::Sweep { .. } => (0, 0, 0),
             Phase::Train { round } => (0, centroids * u32::from(round > 0), packed),
             Phase::Assign { next } => (next, centroids * many, packed),
             _ => (self.blocks(), centroids * many, packed),
         };
-        let mean =
-            many > 0 && self.starts.len() > self.groups as usize && self.phase != Phase::Sweep;
+        let sweeping = matches!(self.phase, Phase::Sweep { .. });
+        let mean = many > 0 && self.starts.len() > self.groups as usize && !sweeping;
         std::iter::once(VectorRecord::Build(vector, partition))
             .chain(mean.then_some(VectorRecord::Mean(vector, number)))
             .chain((0..given).map(move |place| VectorRecord::Assigned(vector, number, place)))
@@ -381,8 +380,10 @@ pub(crate) struct Step {
     pub(super) switch: Option<Grouped>,
     /// The centroids a round made, in the order of the groups; empty for any other step.
     pub(super) centroids: Vec<f32>,
-    /// The finished packed mean, staged under this build's number.
-    pub(super) mean: Option<Vec<f32>>,
+    /// The finished packed members' total, staged under this build's number.
+    pub(super) mean: Option<ivf::Total>,
+    /// The keys whose `Slot` records the step writes again, each with the slot it packed.
+    pub(super) slots: Vec<(Key, Option<[u32; 3]>)>,
     /// How many vectors the step finished: those it packed.
     pub(super) done: u64,
     /// Slots read while packing, and (`compared`) the comparisons assigning made, apart from `done`.
@@ -592,6 +593,7 @@ pub(crate) fn prepare(
         switch: None,
         centroids: Vec::new(),
         mean: None,
+        slots: Vec::new(),
         done: 0,
         rows_read: 0,
         compared: 0,
@@ -626,7 +628,7 @@ pub(crate) fn prepare(
         Phase::Measure { .. } => pack::measure(&ground, &mut step)?,
         Phase::Width { .. } => pack::width(&ground, &mut step)?,
         Phase::Switch { .. } => pack::switch(&ground, &mut step)?,
-        Phase::Sweep => pack::sweep(&ground, &mut step)?,
+        Phase::Sweep { .. } => pack::sweep(&ground, &mut step)?,
     }
     Ok(Some(step))
 }
@@ -742,6 +744,8 @@ pub(crate) fn stage_step(step: Step, changes: &mut ChangeSet, vectors: u64) -> R
             .is_some_and(|[(_, now), _]| now == *fence)
         {
             changes.delete_vector(record)?;
+            // Its stale slots went with the switch: only those still in a block stay noted.
+            directory::hold(changes, (vector, &partition), key, None, &mut held)?;
         }
     }
     if !step.centroids.is_empty() {
@@ -755,18 +759,8 @@ pub(crate) fn stage_step(step: Step, changes: &mut ChangeSet, vectors: u64) -> R
             .then(|| ivf::mean(&*changes, vector, number, dimension, &mut held))
             .transpose()?;
         for at in partition.closed..partition.blocks {
-            let code = VectorRecord::Binary(vector, partition.number, at);
-            if let Some(mean) = &mean {
-                let block = VectorRecord::Block(vector, partition.number, at);
-                let codes = pack::with_block(&*changes, block, dimension, &mut |slots| {
-                    held.grow((4 + slots.len() * code_len(dimension)) as u64)?;
-                    Ok(codes_of(slots, dimension, &mut |_| mean))
-                })?;
-                held.shrink(codes.len() as u64);
-                changes.put_vector(code, codes)?;
-            } else {
-                changes.delete_vector(code)?;
-            }
+            let block = (vector, partition.number, at);
+            seal::recode(changes, block, dimension, mean.as_deref(), &mut held)?;
         }
     }
     if let Some(grouped) = step.switch {
@@ -783,6 +777,10 @@ pub(crate) fn stage_step(step: Step, changes: &mut ChangeSet, vectors: u64) -> R
     }
     if step.removes.contains(&own) {
         partition.building = None;
+    }
+    // After the switch, so that the slots of what it replaced are let go of.
+    for (key, at) in &step.slots {
+        directory::hold(changes, (vector, &partition), key, *at, &mut held)?;
     }
     if partition != was {
         changes.put_vector(entry, partition.encode())?;

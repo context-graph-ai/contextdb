@@ -63,7 +63,9 @@ fn imports_and_one_row_commits_keep_their_counted_write_bounds() {
             .unwrap()
     };
     find(1);
-    for (first, rows, pages) in [(1, 1000, 1815), (1001, 1, 28), (1002, 1000, 1835)] {
+    // With each sealed row's slot record kept in the vector part, a one-row commit writes 29
+    // pages, one more than before.
+    for (first, rows, pages) in [(1, 1000, 1815), (1001, 1, 29), (1002, 1000, 1835)] {
         if first == 1002 {
             support::run(
                 &db,

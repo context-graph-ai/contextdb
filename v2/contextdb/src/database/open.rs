@@ -23,6 +23,7 @@ impl Open {
             catalog,
             declared: Vec::new(),
             partitions: Tally::new(&budget)?,
+            audit: (Default::default(), budget.reserve(0, "trigger audit")?),
             budget,
             number: TxId(0),
             source: CommitSource::AutoCommit,
@@ -62,7 +63,7 @@ impl Open {
     }
 
     /// The next transaction's number: one past every number given out and every commit.
-    fn number(&self) -> TxId {
+    pub(super) fn number(&self) -> TxId {
         let mut last = locked(&self.numbered);
         *last += 1;
         TxId(*last)
@@ -82,6 +83,7 @@ impl Open {
         self.recorded(form.as_deref(), generation, |counted| {
             let before = staged.changes.rows_read.get();
             let result = self.statement(plan, (text, parsing), params, staged, reader, counted);
+            staged.changes.end_statement();
             let delta = staged.changes.rows_read.get() - before;
             staged.counted += delta;
             (result, delta)
@@ -176,7 +178,14 @@ impl Open {
                 let (catalog, changes) = (&staged.catalog, &mut staged.changes);
                 let partitions = &mut staged.partitions;
                 let kept = query::Kept::new(staged.budget.passing("expression evaluation")?);
+                let passes = std::cell::RefCell::new(&mut staged.passes);
+                let part = |changes: &mut ChangeSet| {
+                    self.part(changes, catalog, &staged.budget, &mut passes.borrow_mut())
+                };
+                // A callback's statement is staged in memory, over the rows its commit wrote.
+                let part: write::Part = &part;
                 let given = write::Given {
+                    part: (!self.triggers.firing_here()).then_some(part),
                     params,
                     catalog,
                     budget: &staged.budget,

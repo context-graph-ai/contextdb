@@ -6,7 +6,7 @@ use std::collections::btree_map::Entry;
 
 use crate::memory::Reservation;
 use crate::schema::VectorColumn;
-use crate::store::{Key, Read, VectorRecord};
+use crate::store::{ChangeSet, Key, Read, VectorId, VectorRecord};
 use crate::types::Result;
 
 /// What a column keeps about one partition.
@@ -229,4 +229,54 @@ pub(super) fn selected(
         )?;
     }
     Ok(found.into_values().collect())
+}
+
+/// Notes in `key`'s `Slot` record of partition `p` the slot `at` when given: the number its
+/// block is kept under, the block's and the slot's. Of the slots noted before, those in no
+/// block of `p` any more are let go: only its tail from `first`, its IVF and the IVF being
+/// built hold blocks. A key left with no slot has no record. The copy is allocated at its exact
+/// length, charged to `held` before it is made and given back once it is staged.
+pub(super) fn hold(
+    changes: &mut ChangeSet,
+    (vector, p): (VectorId, &Partition),
+    key: &Key,
+    at: Option<[u32; 3]>,
+    held: &mut Reservation,
+) -> Result<()> {
+    let record = VectorRecord::Slot(vector, p.number, key);
+    let live = |held: &&[u8]| {
+        let [under, block] =
+            [0, 4].map(|at| u32::from_le_bytes(held[at..at + 4].try_into().unwrap()));
+        (under == p.number && block >= p.first)
+            || [p.ivf.map(|g| g.number), p.building.map(|(n, _)| n)].contains(&Some(under))
+    };
+    let before = held.bytes();
+    let added = at.into_iter().flatten().flat_map(u32::to_le_bytes);
+    let mut copy = |v: &[u8]| {
+        let length = 12 * v.chunks_exact(12).filter(live).count() + added.clone().count();
+        held.grow(length as u64)?;
+        let mut value = Vec::with_capacity(length);
+        value.extend(v.chunks_exact(12).filter(live).flatten().copied());
+        value.extend(added.clone());
+        Ok::<_, crate::types::Error>((v.len(), value))
+    };
+    let (was, value) = match kept(&*changes, record, &mut copy)?.transpose()? {
+        Some(kept) => kept,
+        None => copy(&[])?,
+    };
+    let staged = match (at, value.is_empty()) {
+        (None, _) if value.len() == was => Ok(()),
+        (_, true) => changes.delete_vector(record),
+        (_, false) => changes.put_vector(record, value),
+    };
+    held.shrink(held.bytes() - before);
+    staged
+}
+
+/// The slots a `Slot` record notes.
+pub(super) fn slots(value: &[u8]) -> impl Iterator<Item = [u32; 3]> + '_ {
+    let number = |at: &[u8]| u32::from_le_bytes(at.try_into().unwrap());
+    value
+        .chunks_exact(12)
+        .map(move |c| [number(&c[..4]), number(&c[4..8]), number(&c[8..])])
 }

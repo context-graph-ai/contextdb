@@ -120,10 +120,27 @@ pub fn assert_partition_derived(records: &Records) {
             assert!((f64::from(*actual) - expected).abs() < 1e-6, "wrong centre");
         }
     }
-    let mean = floats(records.iter().find(|(k, _)| k[0] == 8).unwrap().1);
-    for (sum, actual) in total.iter().zip(&mean) {
-        let expected = sum / count.max(1) as f64;
-        assert!((f64::from(*actual) - expected).abs() < 1e-6, "wrong mean");
+    // The mean's record is the count of members, then the sum of their vectors.
+    let stored = records.iter().find(|(k, _)| k[0] == 8).unwrap().1;
+    let numbers: Vec<[u8; 8]> = stored
+        .chunks_exact(8)
+        .map(|n| n.try_into().unwrap())
+        .collect();
+    assert_eq!(
+        u64::from_le_bytes(numbers[0]),
+        count,
+        "wrong count of members"
+    );
+    let mean: Vec<f32> = numbers[1..]
+        .iter()
+        .map(|sum| (f64::from_le_bytes(*sum) / count.max(1) as f64) as f32)
+        .collect();
+    for (sum, actual) in total.iter().zip(&numbers[1..]) {
+        let actual = f64::from_le_bytes(*actual) / count.max(1) as f64;
+        assert!(
+            (actual - sum / count.max(1) as f64).abs() < 1e-6,
+            "wrong mean"
+        );
     }
     for (key, block) in records.iter().filter(|(k, _)| k[0] == 0) {
         let mut binary_key = key.clone();
