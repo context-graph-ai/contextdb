@@ -1,5 +1,6 @@
 //! Printing a declaration back as SQL.
 
+use super::rules::Reference;
 use super::{Compaction, Quantization, RESERVED_PREFIXES, Table};
 use crate::sql::ast::{EdgeDiscard, Propagation};
 use crate::types::{
@@ -23,7 +24,9 @@ pub(super) fn declaration(table: &Table) -> String {
     for rule in &meta.unique_constraints {
         lines.push(format!("UNIQUE ({})", list(rule, |column| name(column))));
     }
-    for reference in rules.references.iter().filter(|r| r.columns.len() > 1) {
+    let own =
+        |r: &Reference| inline(&rules.references, r.columns[0]).is_some_and(|i| std::ptr::eq(i, r));
+    for reference in rules.references.iter().filter(|r| !own(r)) {
         let columns = list(&reference.columns, column_name);
         lines.push(format!("FOREIGN KEY ({columns}) {}", parent(reference)));
     }
@@ -165,6 +168,9 @@ fn column(table: &Table, at: usize) -> String {
         if let Some(at) = vector.indexing_threshold {
             text.push_str(&format!(" INDEXING_THRESHOLD {at}"));
         }
+        if let Some(n) = vector.probes {
+            text.push_str(&format!(" PROBES {n}"));
+        }
         match vector.compaction {
             None => {}
             Some(Compaction::None) => text.push_str(" COMPACTION NONE"),
@@ -177,6 +183,9 @@ fn column(table: &Table, at: usize) -> String {
                 text.push_str(&format!(" COMPACTION ({})", written.join(", ")));
             }
         }
+    }
+    if rules.expires_column == Some(at) {
+        text.push_str(" EXPIRES");
     }
     for ranked in rules.rank_policies.iter().filter(|p| p.column == at) {
         let policy = &ranked.policy;
@@ -228,17 +237,26 @@ fn column(table: &Table, at: usize) -> String {
     if rules.immutable_columns.contains(&at) {
         text.push_str(" IMMUTABLE");
     }
-    for reference in rules.references.iter().filter(|r| r.columns == [at]) {
+    if let Some(reference) = inline(&rules.references, at) {
         text.push(' ');
         text.push_str(&parent(reference));
     }
     text
 }
 
+/// The one reference printed on its column, which reads one: one with ON STATE, else the first.
+fn inline(references: &[Reference], at: usize) -> Option<&Reference> {
+    let own = || references.iter().filter(move |r| r.columns == [at]);
+    (own().find(|r| r.on_state.is_some())).or_else(|| own().next())
+}
+
 /// What a reference says after its own columns: the parent, its columns, and the rule.
-fn parent(reference: &super::rules::Reference) -> String {
+fn parent(reference: &Reference) -> String {
     let columns = list(&reference.parent_columns, |column| name(column));
     let mut text = format!("REFERENCES {}({columns})", name(&reference.parent));
+    if reference.follows_parent_purge {
+        text.push_str(" FOLLOWS PARENT PURGE");
+    }
     if let Some(rule) = &reference.on_state {
         text.push_str(&format!(
             " ON STATE {} PROPAGATE SET {}{}",

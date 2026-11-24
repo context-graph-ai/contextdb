@@ -9,10 +9,13 @@ repository = "https://github.com/context-graph-ai/contextdb"
 
 [[bin]]
 name = "contextdb"
+doc = false
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+serde = { version = "1", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 contextdb = { version = "2.0.0", path = "../contextdb" }
 # Line editing and recall at a terminal, without its history-file and key-binding features.
 # Version 19 needs a newer compiler than this workspace builds with.

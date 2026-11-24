@@ -12,52 +12,52 @@ VALUES (1, 7, 2, 0.5, 'p', TRUE),
 # so row 3 is in none of these answers.
 SELECT id FROM readings WHERE a = 7 ORDER BY id;
 ----
-id
+id  (read 4, compared 0)
 1
 
 SELECT id FROM readings WHERE a != 7 ORDER BY id;
 ----
-id
+id  (read 4, compared 0)
 2
 4
 
 SELECT id FROM readings WHERE a <> 7 ORDER BY id;
 ----
-id
+id  (read 4, compared 0)
 2
 4
 
 SELECT id FROM readings WHERE a < 7 ORDER BY id;
 ----
-id
+id  (read 4, compared 0)
 2
 
 SELECT id FROM readings WHERE a <= 7 ORDER BY id;
 ----
-id
+id  (read 4, compared 0)
 1
 2
 
 SELECT id FROM readings WHERE a > 7 ORDER BY id;
 ----
-id
+id  (read 4, compared 0)
 4
 
 SELECT id FROM readings WHERE a >= 7 ORDER BY id;
 ----
-id
+id  (read 4, compared 0)
 1
 4
 
 SELECT id FROM readings WHERE tag >= 'q' ORDER BY id;
 ----
-id
+id  (read 4, compared 0)
 2
 4
 
 SELECT id FROM readings WHERE ratio < 100.0 ORDER BY id;
 ----
-id
+id  (read 4, compared 0)
 1
 2
 4
@@ -65,71 +65,71 @@ id
 # A boolean column is a predicate on its own, and so is its negation. NULL is neither.
 SELECT id FROM readings WHERE active ORDER BY id;
 ----
-id
+id  (read 4, compared 0)
 1
 4
 
 SELECT id FROM readings WHERE NOT active ORDER BY id;
 ----
-id
+id  (read 4, compared 0)
 2
 
 # A literal NULL matches nothing and is no error.
 SELECT id FROM readings WHERE NULL ORDER BY id;
 ----
-id
+id  (read 0, compared 0)
 
 # NULL is unknown unless the other side settles the answer, whichever side it is on.
 SELECT NULL AND FALSE AS a, FALSE AND NULL AS b, NULL AND TRUE AS c, TRUE AND TRUE AS d, TRUE OR NULL AS e, NULL OR TRUE AS f, NULL OR FALSE AS g, FALSE OR FALSE AS h, NOT NULL AS i, NULL = NULL AS j;
 ----
-a | b | c | d | e | f | g | h | i | j
+a | b | c | d | e | f | g | h | i | j  (read 0, compared 0)
 false | false | NULL | true | true | true | NULL | false | NULL | NULL
 
 # AND, OR and NOT. AND binds tighter than OR.
 SELECT id FROM readings WHERE a > 6 AND b > 0 ORDER BY id;
 ----
-id
+id  (read 4, compared 0)
 1
 
 SELECT id FROM readings WHERE a > 8 OR b = 3 ORDER BY id;
 ----
-id
+id  (read 4, compared 0)
 2
 4
 
 SELECT id FROM readings WHERE NOT (a > 6) ORDER BY id;
 ----
-id
+id  (read 4, compared 0)
 2
 
 SELECT id FROM readings WHERE a = 6 OR a = 7 AND b = 0 ORDER BY id;
 ----
-id
+id  (read 4, compared 0)
 2
 
 # IS NULL and IS NOT NULL are how a NULL is found.
 SELECT id FROM readings WHERE a IS NULL ORDER BY id;
 ----
-id
+id  (read 4, compared 0)
 3
 
 SELECT id FROM readings WHERE tag IS NOT NULL ORDER BY id;
 ----
-id
+id  (read 4, compared 0)
 1
 2
 4
 
 SELECT id FROM readings WHERE active IS NULL OR a IS NOT NULL AND b = 0 ORDER BY id;
 ----
-id
+id  (read 4, compared 0)
 3
 4
 
 # The four arithmetic operators, in a select list and in a predicate. A NULL operand gives NULL.
 SELECT id, a + b AS plus, a - b AS minus, a * b AS times FROM readings ORDER BY id;
 ----
-id | plus | minus | times
+id | plus | minus | times  (read 4, compared 0)
 1 | 9 | 5 | 14
 2 | 9 | 3 | 18
 3 | NULL | NULL | NULL
@@ -137,12 +137,12 @@ id | plus | minus | times
 
 SELECT a / b AS divided, ratio / 0.5 AS doubled FROM readings WHERE id = 2;
 ----
-divided | doubled
+divided | doubled  (read 1, compared 0)
 2 | 3.0
 
 SELECT id, a * ratio AS scaled FROM readings ORDER BY id;
 ----
-id | scaled
+id | scaled  (read 4, compared 0)
 1 | 3.5
 2 | 9.0
 3 | NULL
@@ -150,12 +150,16 @@ id | scaled
 
 SELECT id FROM readings WHERE a + b > 8 ORDER BY id;
 ----
-id
+id  (read 4, compared 0)
 1
 2
 4
 
 SELECT id FROM readings WHERE a * 2 - 1 = 13 ORDER BY id;
 ----
-id
+id  (read 4, compared 0)
 1
+
+SELECT -tag FROM readings;
+----
+error: PlanError | plan error: cannot negate a value that is not a number

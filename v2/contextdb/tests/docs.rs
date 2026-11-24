@@ -1,5 +1,6 @@
-//! Runs the SQL examples of the documentation: every fenced `sql` block of `README.md` and
-//! `docs/*.md` at the repository's root, each page top to bottom in a fresh store.
+//! Runs the SQL examples of the documentation: every fenced `sql` block of `README.md`,
+//! `docs/*.md` and `v2/contextdb/README.md` at the repository's root, each page top to bottom in a
+//! fresh store.
 //!
 //! A statement ends at a `;` that ends a line, and a new one begins at an unindented line that
 //! starts with a statement's first word (the unindented `SELECT` that closes a `WITH` belongs to
@@ -77,7 +78,7 @@ fn every_sql_example_of_the_documentation_does_what_its_page_shows() {
         .filter(|name| name.ends_with(".md"))
         .map(|name| format!("docs/{name}"))
         .collect();
-    pages.push("README.md".to_string());
+    pages.extend(["README.md", "v2/contextdb/README.md"].map(String::from));
     pages.sort();
     let mut expected = expected();
     let (mut blocks, mut failures) = (0, Vec::new());
@@ -272,7 +273,7 @@ fn run<'db>(db: &'db Database, open: &mut Option<Transaction<'db>>, text: &str) 
                 })
                 .map(|name: String| (name.clone(), bound(&name)))
                 .collect();
-            let dropped = match again.filter(|name| db.table_names().contains(name)) {
+            let dropped = match again.filter(|name| db.table_names().unwrap().contains(name)) {
                 Some(name) => drop_table(db, &name),
                 None => Ok(()),
             };
@@ -370,15 +371,32 @@ fn wrong_rows(result: &QueryResult, notes: &[String]) -> Option<String> {
 /// later example may declare a table an earlier one of the page's tables refers to.
 fn drop_table(db: &Database, name: &str) -> contextdb::Result<()> {
     let reference = format!("references {name}(");
-    for other in db.table_names() {
+    for other in db.table_names()?.iter() {
         let refers = other != name
             && db
-                .declaration(&other)
+                .declaration(other)
                 .is_ok_and(|text| text.to_ascii_lowercase().contains(&reference));
         if refers {
-            drop_table(db, &other)?;
+            drop_table(db, other)?;
         }
     }
     db.execute(&format!("DROP TABLE {name}"), &HashMap::new())
         .map(drop)
+}
+
+#[test]
+fn the_pages_say_purge_is_logical_erasure_and_not_forensic_deletion() {
+    let page = |name: &str| {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
+        let text = std::fs::read_to_string(path.join(name)).unwrap();
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    let (arch, index) = (page("architecture.md"), page("capability-index.md"));
+    for (page, said) in [
+        (&arch, "This is logical engine erasure, not a claim that"),
+        (&arch, "encryption-at-rest with key erasure is the route"),
+        (&index, "or removal from operator-held backups"),
+    ] {
+        assert!(page.contains(said), "PURGE is logical erasure; say: {said}");
+    }
 }

@@ -2,10 +2,10 @@
 
 use super::expr::{expr, exprs, sort_keys, star};
 use super::graph::graph_table;
-use super::{Pair, Rule, child, first_ident, number, search_mode, where_clause};
-use crate::sql::ast::{ColumnRef, Expr, FromItem, Join, Literal, Select, SelectColumn};
+use super::{Pair, Rule, child, first_ident, has, idents, number, search_mode, where_clause};
+use crate::sql::ast::{ColumnRef, Expr, FromItem, Join, Select, SelectColumn};
 use crate::sql::not_supported;
-use crate::types::{Error, Result};
+use crate::types::{Error, Result, Value};
 
 pub(super) fn select(pair: Pair<'_>) -> Result<Select> {
     let at = pair.as_span().start();
@@ -42,13 +42,23 @@ pub(super) fn select(pair: Pair<'_>) -> Result<Select> {
         }
     }
     let mut whole = whole.expect("the grammar's SELECT rule holds one SELECT");
+    with.append(&mut whole.with);
     (whole.with, whole.at.0) = (with, at);
     // A number where a key stands is not a column's place here, and is refused as no key.
     let keys = whole.order_by.iter().map(|key| &key.expr);
     let arms = std::iter::once(&whole).chain(whole.union.iter().map(|(_, arm)| arm));
     let mut keys = keys.chain(arms.flat_map(|arm| &arm.group_by));
-    if keys.any(|key| matches!(key, Expr::Literal(Literal::Integer(_)))) {
+    if keys.any(|key| matches!(key, Expr::Literal(Value::Int64(_)))) {
         return Err(not_supported("a column's number in ORDER BY or GROUP BY"));
+    }
+    // Equal keys cannot refine the order. Keep the first direction before expanding aliases.
+    for at in (1..whole.order_by.len()).rev() {
+        if whole.order_by[..at]
+            .iter()
+            .any(|key| key.expr == whole.order_by[at].expr)
+        {
+            whole.order_by.remove(at);
+        }
     }
     // The ORDER BY of a UNION names the columns of the whole, which hold every SELECT's values:
     // there a name is never the first SELECT's expression.
@@ -71,7 +81,7 @@ fn resolve_output_alias(expr: &Expr, columns: &[SelectColumn]) -> Result<Expr> {
     let Some(item) = items.next() else {
         return Ok(expr.clone());
     };
-    if items.any(|other| format!("{:?}", other.expr) != format!("{:?}", item.expr)) {
+    if items.any(|other| other.expr != item.expr) {
         let why = format!("ORDER BY \"{}\" is ambiguous", name.column);
         return Err(Error::PlanError(why));
     }
@@ -125,7 +135,7 @@ fn core(pair: Pair<'_>) -> Result<Select> {
                     });
                 }
             }
-            Rule::table_ref => select.from.push(table(part)),
+            Rule::table_ref => select.from.push(table(part, &mut select.with)?),
             Rule::graph_table => select.from.push(FromItem::Graph(graph_table(part)?)),
             Rule::more_tables => return Err(not_supported("FROM a, b")),
             Rule::join => {
@@ -139,7 +149,7 @@ fn core(pair: Pair<'_>) -> Result<Select> {
                 }
                 select.joins.push(Join {
                     left_outer: kind.starts_with("LEFT"),
-                    item: table(parts.next().expect("a table")),
+                    item: table(parts.next().expect("a table"), &mut select.with)?,
                     on: parts.next().map(expr).transpose()?,
                 });
             }
@@ -162,9 +172,24 @@ pub(super) fn column(item: Pair<'_>) -> Result<SelectColumn> {
 }
 
 /// A table of FROM or of a JOIN, with the name the statement gives it.
-fn table(pair: Pair<'_>) -> FromItem {
-    FromItem::Table {
-        alias: child(pair.clone(), Rule::alias).map(first_ident),
-        name: first_ident(pair),
+fn table(pair: Pair<'_>, with: &mut Vec<(String, Select)>) -> Result<FromItem> {
+    let Some(derived) = child(pair.clone(), Rule::derived_table) else {
+        return Ok(FromItem::Table {
+            alias: child(pair.clone(), Rule::alias).map(first_ident),
+            name: first_ident(pair),
+        });
+    };
+    if has(&derived, Rule::lateral) {
+        return Err(not_supported("LATERAL derived table"));
     }
+    let name = format!("\0derived{}", derived.as_span().start());
+    let alias = child(derived.clone(), Rule::alias).map_or_else(String::new, first_ident);
+    let names = child(derived.clone(), Rule::columns).map(idents);
+    let mut query = select(child(derived, Rule::select_stmt).expect("a derived SELECT"))?;
+    query.column_aliases = names.unwrap_or_default();
+    with.push((name.clone(), query));
+    Ok(FromItem::Table {
+        name,
+        alias: Some(alias),
+    })
 }

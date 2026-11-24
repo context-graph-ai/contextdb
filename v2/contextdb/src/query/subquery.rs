@@ -3,17 +3,25 @@
 //! then the statement itself over them. What such a statement borrows lives while its rows
 //! are read, so it is bound once when it is planned and put together when it is run.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use super::bind::{bind, kind};
 use super::expression::Scope;
 use super::plan::{self, Each, Given, Source};
-use super::{Values, Visible, aggregate, join, union};
+use super::{Values, Visible, aggregate, join, sets::List, union};
 use crate::memory::Reservation;
+use crate::schema::Catalog;
 use crate::sql::ast::Select;
 use crate::sql::plan::{FromItem, ProjectColumn, SelectPlan};
 use crate::sql::{Expr, MAX_EXPR_NESTING, Plan, depth_error, inside};
-use crate::types::{ColumnDef, ColumnType, Error, Result, Value};
+use crate::types::{ColumnDef, ColumnType, Error, Result, Value, heap_bytes};
+
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum Purpose {
+    Scalar,
+    Membership,
+    Held,
+}
 
 /// What a statement is put together with.
 pub(super) struct Pass<'r> {
@@ -21,8 +29,6 @@ pub(super) struct Pass<'r> {
     pub(super) reservation: &'r mut Reservation,
     /// False while the statement is only bound: no row is read.
     pub(super) run: bool,
-    /// The stored rows read on the way: those of subqueries and of WITH names that are kept.
-    pub(super) examined: u64,
 }
 
 /// What takes a statement once it is put together: its columns and the source of its rows.
@@ -53,7 +59,6 @@ impl<'a> Whole<'a> {
         let mut pass = Pass {
             reservation: &mut nothing,
             run: false,
-            examined: 0,
         };
         let columns =
             &mut |columns: &[ColumnDef], _: &dyn Source, _: &mut Pass<'_>| Ok(columns.to_vec());
@@ -62,21 +67,19 @@ impl<'a> Whole<'a> {
 }
 
 impl Source for Whole<'_> {
-    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<u64> {
+    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<()> {
         let mut pass = Pass {
             reservation,
             run: true,
-            examined: 0,
         };
-        let read = frame(
+        frame(
             self.select,
             0,
             self.depth,
             self.given,
             &mut pass,
             &mut |_, source, pass| source.rows(pass.reservation, each),
-        )?;
-        Ok(read + pass.examined)
+        )
     }
 }
 
@@ -113,7 +116,7 @@ impl<'a> Named<'a> {
         depth: usize,
         reservation: &mut Reservation,
         each: &mut Each<'_>,
-    ) -> Result<u64> {
+    ) -> Result<()> {
         let Some(kept) = &self.kept else {
             let given = Given {
                 named: self.before,
@@ -133,7 +136,7 @@ impl<'a> Named<'a> {
                 break;
             }
         }
-        Ok(0)
+        Ok(())
     }
 }
 
@@ -161,12 +164,20 @@ pub(super) fn frame<R>(
     };
     let start = pass.reservation.bytes();
     if let Some((name, plan)) = select.with.get(at) {
-        let columns = Whole {
+        let mut columns = Whole {
             select: plan,
             given,
             depth,
         }
         .bound()?;
+        if plan.column_aliases.len() > columns.len() {
+            return Err(Error::PlanError(
+                "derived table has more column aliases than columns".to_owned(),
+            ));
+        }
+        for (column, alias) in columns.iter_mut().zip(&plan.column_aliases) {
+            column.name = alias.clone();
+        }
         let mut named = Named {
             name,
             plan,
@@ -178,14 +189,13 @@ pub(super) fn frame<R>(
         // are read once and kept.
         if pass.run && reads(select, at + 1, name) > 1 {
             let mut rows = Vec::new();
-            let read = frame(plan, 0, depth, given, pass, &mut |_, source, pass| {
+            frame(plan, 0, depth, given, pass, &mut |_, source, pass| {
                 source.rows(pass.reservation, &mut |row, bytes, reservation| {
-                    reservation.grow(size_of::<(Vec<Value>, u64)>() as u64)?;
+                    reservation.room(&mut rows, usize::MAX)?;
                     rows.push((row, bytes));
                     Ok(true)
                 })
             })?;
-            pass.examined += read;
             named.kept = Some(rows);
         }
         let given = Given {
@@ -227,7 +237,7 @@ pub(super) fn frame<R>(
         (None, Some(held)) => Some(join::from(select, &given, held, depth)?),
         (None, None) => None,
     };
-    let (columns, source) = plan::one(select, &given, &mut seeing, from)?;
+    let (columns, source) = plan::one(select, &given, &mut seeing, from, pass.run)?;
     let framed = then(&columns, &*source, pass);
     pass.reservation.shrink(taken);
     framed
@@ -236,14 +246,14 @@ pub(super) fn frame<R>(
 /// Works out each SELECT of `found`, written inside a statement whose relations FROM names
 /// `outer`, `depth` statements deep: its values, under the place its text begins.
 pub(super) fn values(
-    found: Vec<(&Select, bool)>,
+    found: Vec<(&Select, Purpose)>,
     outer: &[&String],
     depth: usize,
     given: &Given<'_>,
     pass: &mut Pass<'_>,
 ) -> Result<Values> {
     let mut values = Vec::new();
-    for (query, one) in found {
+    for (query, purpose) in found {
         let single = &mut |columns: &[ColumnDef], source: &dyn Source, pass: &mut Pass<'_>| {
             if columns.len() != 1 {
                 return Err(Error::PlanError(
@@ -251,23 +261,30 @@ pub(super) fn values(
                 ));
             }
             let _ = query.gives.0.set(columns[0].column_type);
-            let mut found = Vec::new();
+            let mut found = List::Memory(Vec::new(), 0);
             if pass.run {
                 // What the row holds stays held for its value.
-                let rows = &mut |mut row: Vec<Value>, _, _: &mut Reservation| {
-                    if one && !found.is_empty() {
+                let rows = &mut |mut row: Vec<Value>, bytes, reservation: &mut Reservation| {
+                    if purpose == Purpose::Scalar && !found.small()?.is_empty() {
                         return Err(Error::PlanError(
                             "a SELECT that stands for one value gives one row".to_owned(),
                         ));
                     }
-                    found.push(row.swap_remove(0));
+                    let value = row.swap_remove(0);
+                    reservation.shrink(bytes - heap_bytes(&value));
+                    let sets = given.ctx.sets.filter(|_| purpose == Purpose::Membership);
+                    found.push(value, query.at.0, sets, reservation)?;
                     Ok(true)
                 };
-                pass.examined += source.rows(pass.reservation, rows)?;
+                source.rows(pass.reservation, rows)?;
             }
             Ok(found)
         };
-        let found = frame(query, 0, depth, given, pass, single);
+        let mut given = Given { ..*given };
+        given.ctx.membership =
+            (purpose == Purpose::Membership && given.ctx.sets.is_some()).then_some(query.at.0);
+        let found = frame(query, 0, depth, &given, pass, single);
+        pass.reservation.room(&mut values, usize::MAX)?;
         values.push((
             query.at.0,
             found.map_err(|refused| around(outer, query, refused))?,
@@ -286,14 +303,15 @@ pub(super) fn written(plan: &Plan, given: &Given, held: &mut Reservation) -> Res
     // A reader the written table refuses is refused before any SELECT of the statement.
     let table = given.catalog.table(name);
     let table = table.ok_or_else(|| Error::TableNotFound(name.clone()))?;
-    let seeing = given.budget.reserve(0, "query");
-    Visible::new(table, given.catalog, given.reader, &mut seeing?)?;
+    let mut seeing = given
+        .budget
+        .reserve(table.heap + 32 * table.meta.columns.len() as u64, "query")?;
+    Visible::new(table, given.catalog, given.reader, &mut seeing)?;
     let mut found = Vec::new();
     exprs.iter().for_each(|expr| gather(expr, &mut found));
     let mut pass = Pass {
         reservation: held,
         run: given.ctx.said.is_none(),
-        examined: 0,
     };
     let found = values(found, &[name], 0, given, &mut pass)?;
     let plain = match plan {
@@ -307,34 +325,153 @@ pub(super) fn written(plan: &Plan, given: &Given, held: &mut Reservation) -> Res
     Ok(found)
 }
 
-/// The SELECTs written inside the expressions of `select` itself, each with whether it
+/// Consumer-data tables read by a statement; visibility filters remain internal.
+pub(crate) fn tables_read(
+    plan: &Plan,
+    catalog: Option<&Catalog>,
+    allowed: Option<&BTreeSet<String>>,
+) -> Result<BTreeSet<String>> {
+    let mut found = BTreeSet::new();
+    match plan {
+        Plan::Select(select) => {
+            select_tables(select, &BTreeSet::new(), catalog, allowed, &mut found)
+        }
+        Plan::Explain(inner) => return tables_read(inner, catalog, allowed),
+        Plan::ShowReport(crate::sql::ast::Show {
+            report: 1,
+            column: Some((table, _)),
+            ..
+        }) => {
+            found.insert(table.clone());
+        }
+        _ => {
+            if let Some((table, exprs)) = plan.written() {
+                found.insert(table.clone());
+                let mut inner = Vec::new();
+                for expr in exprs {
+                    gather(expr, &mut inner);
+                }
+                for (select, _) in inner {
+                    select_tables(select, &BTreeSet::new(), catalog, allowed, &mut found);
+                }
+            }
+        }
+    }
+    if let Some(catalog) = catalog {
+        for name in found
+            .iter()
+            .filter(|name| allowed.is_none_or(|names| names.contains(*name)))
+        {
+            catalog
+                .table(name)
+                .ok_or_else(|| Error::TableNotFound(name.clone()))?;
+        }
+    }
+    Ok(found)
+}
+
+fn select_tables(
+    select: &SelectPlan,
+    scope: &BTreeSet<String>,
+    catalog: Option<&Catalog>,
+    allowed: Option<&BTreeSet<String>>,
+    found: &mut BTreeSet<String>,
+) {
+    let mut scope = scope.clone();
+    for (name, inner) in &select.with {
+        select_tables(inner, &scope, catalog, allowed, found);
+        scope.insert(name.clone());
+    }
+    for item in select
+        .from
+        .iter()
+        .chain(select.joins.iter().map(|join| &join.item))
+    {
+        match item {
+            FromItem::Table { name, .. } if !scope.contains(name) => {
+                found.insert(name.clone());
+            }
+            FromItem::Graph(pattern) => {
+                found.insert(pattern.edge_table.clone());
+                // A node's column COLUMNS names is read from each table that can carry the node.
+                let named = (pattern.columns.iter()).filter_map(|column| match &column.expr {
+                    Expr::Column(c) if c.table.is_some() && c.column != "id" => Some(&c.column),
+                    _ => None,
+                });
+                let tables = catalog.into_iter().flat_map(Catalog::tables);
+                let carry = tables.filter(|t| allowed.is_none_or(|names| names.contains(&t.name)));
+                let carry = carry.filter(|t| super::graph::node_id(t).is_some_and(|id| id.1));
+                let carry = carry.filter(|t| named.clone().any(|name| t.column(name).is_ok()));
+                found.extend(carry.map(|t| t.name.clone()));
+            }
+            _ => {}
+        }
+    }
+    if let (Some(key), Some((name, column, _))) = (&select.use_rank, super::search::asked(select))
+        && !scope.contains(name)
+        && allowed.is_none_or(|names| names.contains(name))
+        && let Some(table) = catalog.and_then(|catalog| catalog.table(name))
+        && let Ok(at) = table.column(&column.column)
+        && let Some(rank) = table
+            .rules
+            .rank_policies
+            .iter()
+            .find(|rank| rank.column == at && rank.policy.sort_key == *key)
+    {
+        found.insert(rank.policy.table.clone());
+    }
+    for inner in select
+        .union
+        .iter()
+        .map(|(_, inner)| inner)
+        .chain(subqueries(select).into_iter().map(|(inner, _)| inner))
+    {
+        select_tables(inner, &scope, catalog, allowed, found);
+    }
+}
+
+/// The SELECTs written inside the expressions of `select` itself, each once, with whether it
 /// stands for one value and not for the list after IN.
-fn subqueries(select: &SelectPlan) -> Vec<(&Select, bool)> {
+fn subqueries(select: &SelectPlan) -> Vec<(&Select, Purpose)> {
     let mut found = Vec::new();
     let columns = select.columns.iter().map(|column| &column.expr);
     let joins = select.joins.iter().filter_map(|join| join.on.as_ref());
     let order = select.order_by.iter().map(|key| &key.expr);
     let rest = (select.filter.iter().chain(&select.group_by)).chain(&select.having);
-    let patterns = select.from.iter().filter_map(|item| match item {
-        FromItem::Graph(pattern) => pattern.filter.as_ref(),
-        FromItem::Table { .. } => None,
-    });
-    for expr in columns
-        .chain(joins)
-        .chain(rest)
-        .chain(order)
-        .chain(patterns)
-    {
+    let patterns = select
+        .from
+        .iter()
+        .chain(select.joins.iter().map(|join| &join.item));
+    let patterns = patterns
+        .filter_map(|item| match item {
+            FromItem::Graph(pattern) => Some(pattern),
+            FromItem::Table { .. } => None,
+        })
+        .flat_map(|pattern| {
+            pattern
+                .filter
+                .iter()
+                .chain(pattern.columns.iter().map(|column| &column.expr))
+        });
+    for expr in columns.chain(joins).chain(rest).chain(order) {
         gather(expr, &mut found);
     }
+    let held = found.len();
+    patterns.for_each(|expr| gather(expr, &mut found));
+    found[held..]
+        .iter_mut()
+        .filter(|(_, purpose)| *purpose == Purpose::Membership)
+        .for_each(|(_, purpose)| *purpose = Purpose::Held);
+    let mut seen = std::collections::HashSet::new();
+    found.retain(|(query, _)| seen.insert(query.at.0));
     found
 }
 
 /// Adds the SELECTs written in `expr`, at any depth, to `found`.
-pub(super) fn gather<'s>(expr: &'s Expr, found: &mut Vec<(&'s Select, bool)>) {
+pub(super) fn gather<'s>(expr: &'s Expr, found: &mut Vec<(&'s Select, Purpose)>) {
     match expr {
-        Expr::Subquery(query) => found.push((query, true)),
-        Expr::InSubquery { query, .. } => found.push((query, false)),
+        Expr::Subquery(query) => found.push((query, Purpose::Scalar)),
+        Expr::InSubquery { query, .. } => found.push((query, Purpose::Membership)),
         _ => {}
     }
     for inner in inside(expr) {

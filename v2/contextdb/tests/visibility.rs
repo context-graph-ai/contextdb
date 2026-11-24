@@ -9,27 +9,8 @@ use std::collections::HashMap;
 
 use contextdb::{Database, Error, Principal, Uuid, Value, params};
 
-use support::{Run, acl, context, context_set, ids, in_contexts, label_set};
-
-// ---- who is asking ----
-
-/// A handle narrowed to these scope labels.
-fn with_labels(db: &Database, names: &[&str]) -> Database {
-    db.scoped_with_constraints(None, Some(label_set(names)), None)
-}
-
-/// A handle that names this principal and nothing else.
-fn named(db: &Database, principal: Principal) -> Database {
-    db.scoped_with_constraints(None, None, Some(principal))
-}
-
-fn agent(name: &str) -> Principal {
-    Principal::Agent(name.to_owned())
-}
-
-fn human(name: &str) -> Principal {
-    Principal::Human(name.to_owned())
-}
+use support::{GRANTS, Run, acl, agent, context, context_set, grant, human, ids, in_contexts};
+use support::{label_set, named, with_labels};
 
 // ---- what a statement answered ----
 
@@ -91,24 +72,8 @@ fn refused(on: &impl Run, sql: &str, rule: Rule, table: &str) -> Error {
 
 // ---- the documented tables: a grant table and notes under a Context and an access id ----
 
-const GRANTS: &str = "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, \
-                      principal_id TEXT, acl_id UUID)";
-
 const NOTES: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, context_id UUID CONTEXT_ID, \
                      acl_id UUID ACL REFERENCES acl_grants(acl_id), payload TEXT)";
-
-/// Grants a principal one access-control id. `number` makes the grant row's own key.
-fn grant(db: &Database, number: u128, kind: &str, name: &str, acl_id: Uuid) {
-    let values = params! {
-        "id" => Uuid::from_u128(0x0060_0000 + number), "kind" => kind, "name" => name,
-        "acl" => acl_id,
-    };
-    let sql = "INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) \
-               VALUES ($id, $kind, $name, $acl)";
-    if let Err(error) = db.execute(sql, &values) {
-        panic!("granting {acl_id} to {kind} {name} was refused: {error:?}");
-    }
-}
 
 /// Writes note `id`, with the payload `note-<id>`, under this Context and this access id, or
 /// under none of either for `None`.
@@ -176,6 +141,8 @@ fn a_handle_that_declares_nothing_reads_every_row_of_an_access_controlled_table(
         ["note-5"]
     );
     assert_eq!(support::int(&unnarrowed, "SELECT COUNT(*) FROM notes"), 7);
+    let source = support::rows(&unnarrowed, "SELECT acl_id FROM notes WHERE id = 5");
+    assert_eq!(source, [[Value::Uuid(acl(3))]], "the row's recorded source");
 }
 
 #[test]
@@ -183,6 +150,8 @@ fn a_principal_reads_the_rows_it_holds_a_grant_for_and_no_others() {
     let db = notes("visibility-grants");
     let reader = named(&db, agent("report-reader"));
     assert_eq!(ids(&reader, ALL_NOTES), [1, 3, 7]);
+    let session = reader.read_session(Default::default()).unwrap();
+    assert!(ids(&session, ALL_NOTES) == [1, 3, 7], "as the handle");
     assert_eq!(
         texts(&reader, "SELECT payload FROM notes ORDER BY id"),
         ["note-1", "note-3", "note-7"]
@@ -713,6 +682,12 @@ fn a_hidden_row_named_whole_is_refused_and_a_list_read_leaves_it_out(gate: Gate)
         "SELECT payload FROM ledger WHERE b = 2 AND a = 2",
         "SELECT payload FROM ledger WHERE id = (SELECT 2)",
         "SELECT id FROM ledger WHERE slug = 'shut-four'",
+        // Each names the one hidden row whatever the form it is written in: a sum, a row value,
+        // the same key twice, a key beside alternatives that each name the same row.
+        "SELECT payload FROM ledger WHERE id = 1 + 1",
+        "SELECT payload FROM ledger WHERE (a, b) = (1, 2)",
+        "SELECT payload FROM ledger WHERE id = 2 OR id = 2",
+        "SELECT payload FROM ledger WHERE id = 2 AND (payload = 'a' OR slug = 'b')",
     ] {
         refused(&handle, sql, rule, "ledger");
     }
@@ -758,11 +733,12 @@ fn a_hidden_row_named_whole_is_refused_and_a_list_read_leaves_it_out(gate: Gate)
     }
 
     // Every other shape is a list, a key in a list and a key in a range among them.
-    let lists: [(&str, &[i64]); 12] = [
+    let lists: [(&str, &[i64]); 13] = [
         ("ORDER BY id", &[1, 3]),
         ("WHERE a = 1 ORDER BY id", &[1]),
         ("WHERE b = 2 ORDER BY id", &[]),
         ("WHERE id IN (2)", &[]),
+        ("WHERE id = 2 AND id = 3", &[]),
         ("WHERE id IN (1, 2, 4) ORDER BY id", &[1]),
         ("WHERE id >= 2 AND id <= 2", &[]),
         ("WHERE id > 1 ORDER BY id", &[3]),
@@ -917,56 +893,273 @@ fn a_row_guard_answers_false_for_a_row_the_handle_may_not_see() {
     }
 }
 
-#[test]
-fn no_refusal_holds_a_value_or_a_number_of_a_row_the_handle_may_not_see() {
-    for gate in Gate::ALL {
-        let db = gate.store("visibility-refusal-words");
-        let handle = gate.handle(&db);
-        let rule = gate.rule();
-        let mut refusals = Vec::new();
-        for sql in [
-            "SELECT payload FROM ledger WHERE id = 2",
-            "SELECT payload FROM ledger WHERE slug = 'shut-two'",
-            "SELECT payload FROM ledger WHERE a = 2 AND b = 2",
-        ] {
-            refusals.push((sql, refused(&handle, sql, rule, "ledger")));
-        }
-        let by_key = "SELECT payload FROM ledger WHERE id = $id";
-        let key = params! { "id" => 4_i64 };
-        refusals.push((by_key, refused_with(&handle, by_key, &key, rule, "ledger")));
-        // A write outside the handle's reach: a new row, and a seen row moved out.
-        let outside = params! { "reach" => gate.reach(false) };
-        for sql in [
-            "INSERT INTO ledger (id, slug, a, b, reach, payload) \
-             VALUES (5, 'shut-five', 3, 3, $reach, 'secret-five')",
-            "UPDATE ledger SET reach = $reach WHERE id = 1",
-        ] {
-            refusals.push((sql, refused_with(&handle, sql, &outside, rule, "ledger")));
-        }
+// ---- one world under each rule, and what is done to the rows it hides ----
 
-        // The table's name has no digit in it, so a digit in a refusal is a key, a count, a
-        // Context or an access id; and no word of a hidden row's values is in one.
-        for (sql, refusal) in &refusals {
-            for said in [refusal.to_string(), format!("{refusal:?}")] {
-                assert!(
-                    !said.chars().any(|c| c.is_ascii_digit()),
-                    "{gate:?}: {sql}\nwas refused with a number in its words: {said}"
+type Sections = HashMap<String, Vec<String>>;
+
+/// The steps done to rows a handle may not see, by the sections of the world that do them.
+const STEPS: [&str; 6] = [
+    "hidden rows added",
+    "seal",
+    "build",
+    "hidden rows changed",
+    "hidden rows taken away",
+    "build",
+];
+
+/// The sections of `tests/fixtures/narrowed.sql` under this rule: each a list of statements,
+/// with `{reach}`, `{own}` and `{hid}` put in.
+fn world(gate: Gate) -> Sections {
+    let literal = |seen| match gate.reach(seen) {
+        Value::Uuid(id) => format!("'{id}'"),
+        Value::Text(text) => format!("'{text}'"),
+        other => unreachable!("{other:?}"),
+    };
+    let (mut sections, mut at) = (Sections::new(), "");
+    for line in include_str!("fixtures/narrowed.sql").lines().chain([
+        "## world",
+        "DELETE FROM vo WHERE id >= 100",
+        "INSERT INTO vo VALUES (3, {own}, [0.0, 0.0, 1.0])",
+        "CREATE INDEX vo_reach ON vo (reach)",
+        "## reads",
+        "SELECT id FROM vo WHERE id >= 100 ORDER BY v <=> [1.0, 0.0, 0.0] USE VECTOR AUTO LIMIT 2",
+        "SELECT id FROM vo WHERE id >= 100 ORDER BY v <=> [1.0, 0.0, 0.0] USE VECTOR INDEXED LIMIT 2",
+        "SELECT id FROM vo WHERE reach > {own} ORDER BY v <=> [1.0, 0.0, 0.0] USE VECTOR AUTO LIMIT 2",
+        "SELECT id FROM vo WHERE reach > {own} ORDER BY v <=> [1.0, 0.0, 0.0] USE VECTOR INDEXED LIMIT 2",
+        "SELECT id FROM vo WHERE id IN (1, 100) ORDER BY v <=> [1.0, 0.0, 0.0] LIMIT 2",
+        "SELECT id FROM vo WHERE reach = {own} ORDER BY v <=> [1.0, 0.0, 0.0] LIMIT 3",
+        "## hidden rows added",
+        "INSERT INTO vo VALUES (100, {hid}, [1.0, 0.0, 0.0]), (101, {hid}, [1.0, 0.0, 0.0]), (102, {hid}, [1.0, 0.0, 0.0])",
+    ]) {
+        if let Some(name) = line.strip_prefix("## ") {
+            at = name;
+        } else if !line.starts_with('#') {
+            let sql = line
+                .replace("{reach}", gate.column())
+                .replace("{own}", &literal(true));
+            let sql = sql.replace("{hid}", &literal(false));
+            sections.entry(at.to_owned()).or_default().push(sql);
+        }
+    }
+    sections
+}
+
+/// Everything a handle is told by the world's reads, asked plainly and through EXPLAIN, and by
+/// its writes, each rolled back. `leaks` gets every EXPLAIN that holds one of `words.1`.
+fn told(
+    on: &Database,
+    world: &Sections,
+    words: &[Vec<String>; 2],
+    leaks: &mut Vec<String>,
+) -> Vec<String> {
+    let session = on.read_session(contextdb::ReadLimits::default()).unwrap();
+    assert_eq!(
+        support::run(&session, "SHOW MEMORY_LIMIT").peak_bytes(),
+        None
+    );
+    let empty = support::ids(on, "SELECT id FROM vo ORDER BY id").is_empty();
+    let mut told = Vec::new();
+    let session = on.read_session(Default::default()).unwrap();
+    assert_eq!(
+        support::run(&session, "SHOW MEMORY_LIMIT").peak_bytes(),
+        None
+    );
+    for sql in ["SHOW VECTOR_INDEXES", "SHOW VECTOR_PARTITIONS"] {
+        let r = session.execute(sql, &params! {});
+        assert!(matches!(r, Err(Error::AdminRequired { .. })), "{r:?}");
+    }
+    for sql in &world["reads"] {
+        let plan = on.explain(sql);
+        assert!(
+            plan.is_ok() || sql.contains("INDEXED"),
+            "{sql} is explained"
+        );
+        let text = match plan {
+            Ok(text) => text.to_string(),
+            Err(refusal) => said(Err(refusal), sql, &words[0], leaks),
+        };
+        assert!(!text.is_empty(), "{sql} is told something");
+        for word in words[1].iter().filter(|word| text.contains(*word)) {
+            leaks.push(format!("{sql}\nis explained with `{word}`:\n{text}"));
+        }
+        told.push(format!("{sql}\n{text}"));
+        let result = on.execute(sql, &params! {});
+        if sql.contains("FROM vo ")
+            && (sql.contains("WHERE id IN (1, 100)") || sql.contains("WHERE reach ="))
+        {
+            let rows = result.as_ref().unwrap().rows();
+            let keys = vec![vec![Value::Int64(1)]; usize::from(!empty)];
+            if sql.contains("WHERE id IN") {
+                assert_eq!(rows, keys);
+            } else {
+                assert_eq!(rows.len(), if empty { 0 } else { 3 });
+            }
+        }
+        let answer = said(result, sql, &words[0], leaks);
+        told.push(format!("{sql}\n{answer}"));
+    }
+    for sql in &world["writes"] {
+        let tx = on.transaction().expect("begin");
+        let answer = said(tx.execute(sql, &params! {}), sql, &words[0], leaks);
+        told.push(format!("{sql}\n{answer}"));
+        tx.rollback();
+    }
+    told
+}
+
+/// The `Debug` of a result, or a refusal's `Debug` and words. `leaks` gets a refusal that holds
+/// a digit (no name in the world has one: it is a key, a count or an id) or one of `hidden`.
+fn said(
+    answer: contextdb::Result<contextdb::QueryResult>,
+    sql: &str,
+    hidden: &[String],
+    leaks: &mut Vec<String>,
+) -> String {
+    let refusal = match answer {
+        Ok(result) => return format!("{result:?}"),
+        Err(refusal) => refusal,
+    };
+    let words = format!("{refusal:?} {refusal}");
+    if words.contains(|c: char| c.is_ascii_digit()) || hidden.iter().any(|w| words.contains(w)) {
+        leaks.push(format!(
+            "{sql}\nwas refused with a digit or a hidden word: {words}"
+        ));
+    }
+    words
+}
+
+#[test]
+fn a_narrowed_reader_is_told_the_same_whatever_is_done_to_rows_it_may_not_see() {
+    let (mut leaks, mut moved) = (Vec::new(), Vec::new());
+    for gate in Gate::ALL {
+        let world = world(gate);
+        let db = support::open(&support::folder(&format!("narrowed-world-{gate:?}")));
+        if let Gate::Grant = gate {
+            support::run(&db, GRANTS);
+            grant(&db, 1, "Agent", "report-reader", acl(1));
+            grant(&db, 2, "Human", "someone-else", acl(2));
+        }
+        world["world"]
+            .iter()
+            .for_each(|sql| drop(support::run(&db, sql)));
+        let _ = support::cycle(&db);
+        // The rule's handle, and for Contexts one given none as well.
+        let mut handles = vec![gate.handle(&db)];
+        handles.extend(matches!(gate, Gate::Context).then(|| in_contexts(&db, &[])));
+        let id = match gate.reach(false) {
+            Value::Uuid(id) => id.to_string(),
+            Value::Text(label) => label,
+            other => unreachable!("{other:?}"),
+        };
+        // A refusal names no hidden value. An EXPLAIN says no key, route or refusal, no hidden
+        // id, and neither the 140 rows of `vd` there are nor the 137 the handle may not see.
+        let refusal = ["secret", "shut", "internal", "someone-else", &id];
+        let explain = ["key:", "route:", "refusal:", &id, "140", "137"];
+        let words = [
+            refusal.map(String::from).to_vec(),
+            explain.map(String::from).to_vec(),
+        ];
+        for table in ["vm", "vd", "vo"] {
+            let sql = format!(
+                "SELECT id FROM {table} ORDER BY v <=> [1.0, 0.0, 0.0] USE VECTOR INDEXED LIMIT 2"
+            );
+            let answer = gate.handle(&db).execute(&sql, &params! {});
+            if table == "vo" && matches!(gate, Gate::Context) {
+                assert_eq!(ids(&gate.handle(&db), &sql), [1, 2]);
+            } else if !format!("{answer:?}").starts_with("Err(VectorIndexedNarrowed") {
+                leaks.push(format!(
+                    "{gate:?}, {table}: expected VectorIndexedNarrowed, got {answer:?}"
+                ));
+            }
+        }
+        let before: Vec<_> = handles
+            .iter()
+            .map(|on| told(on, &world, &words, &mut leaks))
+            .collect();
+        for step in STEPS {
+            match step {
+                "seal" => drop(support::cycle(&db)),
+                "build" => drop(support::maintenance(&db)),
+                _ => world[step]
+                    .iter()
+                    .for_each(|sql| drop(support::run(&db, sql))),
+            }
+            for (on, before) in handles.iter().zip(&before) {
+                let now = told(on, &world, &words, &mut Vec::new());
+                let pairs = before.iter().zip(now).filter(|(was, now)| *was != now);
+                moved.extend(
+                    pairs.map(|(was, now)| format!("{gate:?} after {step}:\n{was}\n{now}")),
                 );
-                for hidden in ["secret", "shut", "internal", "someone-else"] {
-                    assert!(
-                        !said.contains(hidden),
-                        "{gate:?}: {sql}\nwas refused with `{hidden}` in its words: {said}"
-                    );
+            }
+        }
+        // Hidden rows fill both partitions: a third key is refused alike, naming nothing hidden.
+        let full = |on: &Database| on.execute(&world["limit"][0], &params! {}).unwrap_err();
+        let (narrowed, plain) = (full(&handles[0]), full(&db));
+        assert!(matches!(
+            narrowed,
+            Error::VectorPartitionLimitExceeded { .. }
+        ));
+        assert_eq!(format!("{narrowed:?}"), format!("{plain:?}"));
+        assert!(!format!("{narrowed:?}").contains(&id), "{gate:?}");
+        let empty = in_contexts(&db, &[])
+            .read_session(contextdb::ReadLimits::default())
+            .unwrap();
+        let shown = ["SHOW VECTOR_INDEXES", "SHOW VECTOR_PARTITIONS"]
+            .map(|sql| empty.execute(sql, &params! {}));
+        assert!(
+            shown
+                .iter()
+                .all(|result| matches!(result, Err(Error::AdminRequired { .. })))
+        );
+        for on in &handles {
+            assert!(
+                matches!(on.event_bus_status(), Err(Error::AdminRequired { statement }) if statement == "event_bus_status")
+            );
+            assert!(
+                matches!(on.sink_metrics("hidden"), Err(Error::AdminRequired { statement }) if statement == "sink_metrics")
+            );
+            assert!(
+                matches!(on.subscribe(), Err(Error::AdminRequired { statement }) if statement == "subscribe")
+            );
+            assert!(
+                matches!(on.subscribe_with_capacity(1), Err(Error::AdminRequired { statement }) if statement == "subscribe_with_capacity")
+            );
+            let report = on.work_done().map(|_| ());
+            if !matches!(report, Err(Error::AdminRequired { .. })) {
+                leaks.push(format!("{gate:?}: {report:?}"));
+            }
+            let report = on
+                .run_maintenance_cycle()
+                .expect("narrowed maintenance runs");
+            let counts: [Option<u64>; 8] = [
+                report.delivered,
+                report.expired_rows,
+                report.compacted_pages,
+                report.deferred,
+                report.vector.maintenance_vectors_done,
+                report.vector.maintenance_vectors_remaining,
+                report.vector.remaining_partitions,
+                report.vector.stalled_partitions,
+            ];
+            if counts != [None; 8] {
+                leaks.push(format!("{gate:?}: maintenance counts: {counts:?}"));
+            }
+            for sql in ["SELECT id FROM vm", "SHOW MEMORY_LIMIT"] {
+                let answer = on.execute(sql, &params! {}).expect("narrowed statement");
+                assert_eq!(answer.peak_bytes(), None, "{gate:?}: {sql}");
+                if sql == "SHOW MEMORY_LIMIT" {
+                    let limit = Value::Int64(support::limit(on).expect("finite limit") as i64);
+                    assert_eq!(answer.rows()[0][0], limit);
                 }
             }
         }
-        let now = support::rows(&db, LEDGER_ROWS);
-        support::assert_same_rows(
-            &now,
-            &ledger_rows(&[1, 2, 3, 4]),
-            "the ledger after refusals",
-        );
     }
+    assert!(
+        leaks.is_empty() && moved.is_empty(),
+        "told of rows it may not see:\n\n{}\n\nchanged by what was done to them:\n\n{}",
+        leaks.join("\n\n"),
+        moved.join("\n\n")
+    );
 }
 
 // ---- scope labels ----
@@ -1023,7 +1216,9 @@ fn a_simple_label_is_checked_when_a_row_is_written_and_hides_no_row() {
         refused(&public, sql, Rule::Label, "memos");
         support::assert_same_rows(&support::rows(&db, memos), &before, sql);
     }
-    assert_eq!(seen(&db, "memos", "ORDER BY id"), [1, 2, 3]);
+    // The handle with no labels writes a row with none.
+    assert_eq!(changed(&db, &new(7, "NULL")), 1);
+    assert_eq!(seen(&db, "memos", "ORDER BY id"), [1, 2, 3, 7]);
 }
 
 #[test]
@@ -1171,204 +1366,6 @@ fn a_principal_writes_only_rows_under_an_id_it_holds_a_grant_for() {
     );
 }
 
-// ---- what a narrowed handle is told by a count ----
-
-#[test]
-fn a_narrowed_handle_counts_its_own_rows_where_the_whole_table_is_counted_with_no_row_read() {
-    let db = support::open(&support::folder("visibility-counts"));
-    support::run(
-        &db,
-        "CREATE TABLE events (id INTEGER PRIMARY KEY, context_id UUID NOT NULL CONTEXT_ID, \
-         kind TEXT NOT NULL, UNIQUE (context_id, id)) MAINTAIN COUNT (context_id)",
-    );
-    support::run(&db, "CREATE INDEX events_kind ON events (kind)");
-    // Events 1 to 10 are under Context 1 and 11 to 15 under Context 2; event n is of kind
-    // k<n % 2>. Of kind k1 are five events of Context 1 and three of Context 2.
-    let tx = db.transaction().expect("begin");
-    for id in 1..=15_i64 {
-        tx.execute(
-            "INSERT INTO events (id, context_id, kind) VALUES ($id, $context, $kind)",
-            &params! {
-                "id" => id, "context" => context(if id <= 10 { 1 } else { 2 }),
-                "kind" => format!("k{}", id % 2),
-            },
-        )
-        .expect("insert an event");
-    }
-    tx.commit().expect("commit");
-
-    // A count through a handle is the number of its own rows, by the table's count, by the
-    // kept count of a Context and by an index range: never the table's 15, the other Context's
-    // 5 or the index range's 8. (That the whole table is counted with no row read is proved in
-    // `counted_work.rs` and `kept_counts.rs`; that a narrowed count reads its rows, in `kept_counts_narrowed.rs`.)
-    let count = |on: &Database, filter: &str, of: Option<u128>| {
-        let sql = format!("SELECT COUNT(*) FROM events{filter}");
-        let values = of.map_or_else(|| params! {}, |n| params! { "context" => context(n) });
-        match on.execute(&sql, &values).expect("a count").rows() {
-            [row] => match row.as_slice() {
-                [Value::Int64(count)] => *count,
-                other => panic!("{sql}\nreturned {other:?}, not one count"),
-            },
-            other => panic!("{sql}\nreturned {} rows, not one", other.len()),
-        }
-    };
-    let in_context = " WHERE context_id = $context";
-    let one = in_contexts(&db, &[1]);
-    assert_eq!(count(&one, "", None), 10);
-    assert_eq!(count(&one, in_context, Some(1)), 10);
-    assert_eq!(count(&one, in_context, Some(2)), 0);
-    assert_eq!(count(&one, " WHERE kind = 'k1'", None), 5);
-    assert_eq!(count(&one, " WHERE id > 8", None), 2);
-    assert_eq!(
-        count(&in_contexts(&db, &[2]), " WHERE kind = 'k1'", None),
-        3
-    );
-    assert_eq!(count(&in_contexts(&db, &[3]), "", None), 0);
-
-    // A count that names a hidden row by its key says the row is not the handle's, by the
-    // refusal or by 0, and never counts it.
-    let hidden = "SELECT COUNT(*) FROM events WHERE id = 11";
-    match one.execute(hidden, &params! {}) {
-        Ok(result) => assert_eq!(result.rows(), [[Value::Int64(0)]], "{hidden}"),
-        Err(Error::ContextScopeViolation { table }) => assert_eq!(table, "events"),
-        Err(other) => panic!("{hidden}\nwas refused with {other:?}"),
-    }
-
-    // The counts follow the rows the handle writes, for it and for the whole table.
-    assert_eq!(changed(&one, "DELETE FROM events WHERE kind = 'k1'"), 5);
-    assert_eq!(count(&one, "", None), 5);
-    assert_eq!(count(&db, "", None), 10);
-    assert_eq!(count(&db, in_context, Some(2)), 5);
-    assert_eq!(count(&db, " WHERE kind = 'k1'", None), 3);
-}
-
-// ---- what a narrowed handle is told by a search ----
-
-#[test]
-fn a_search_returns_the_nearest_rows_the_handle_may_see_and_no_hidden_row() {
-    const DIMENSION: usize = 8;
-    let db = support::open(&support::folder("visibility-search"));
-    support::run(&db, GRANTS);
-    grant(&db, 1, "Agent", "report-reader", acl(1));
-    grant(&db, 2, "Human", "someone-else", acl(2));
-    support::run(
-        &db,
-        &format!(
-            "CREATE TABLE passages (id INTEGER PRIMARY KEY, context_id UUID CONTEXT_ID, \
-             acl_id UUID ACL REFERENCES acl_grants(acl_id), v VECTOR({DIMENSION}))"
-        ),
-    );
-    let query = support::vector(1_000, DIMENSION);
-    let passage = |id: i64, context_number: u128, acl_number: u128, v: Vec<f32>| {
-        db.execute(
-            "INSERT INTO passages (id, context_id, acl_id, v) VALUES ($id, $context, $acl, $v)",
-            &params! {
-                "id" => id, "context" => context(context_number), "acl" => acl(acl_number),
-                "v" => v,
-            },
-        )
-        .unwrap_or_else(|error| panic!("passage {id} was refused: {error:?}"));
-    };
-    // Passage n of 1 to 40: Context 1 for odd n and 2 for even; access id 2 when n is a
-    // multiple of 3 and 1 otherwise. Three more hold the very vector searched with, so that
-    // each would be the first answer: 101 is hidden by its Context, 102 by its access id,
-    // 103 by both.
-    for n in 1..=40_i64 {
-        let context_number = if n % 2 == 1 { 1 } else { 2 };
-        let acl_number = if n % 3 == 0 { 2 } else { 1 };
-        passage(n, context_number, acl_number, support::vector(n, DIMENSION));
-    }
-    passage(101, 2, 1, query.clone());
-    passage(102, 1, 2, query.clone());
-    passage(103, 2, 2, query.clone());
-
-    let reader = named(&db, agent("report-reader"));
-    let reader_in_one =
-        db.scoped_with_constraints(Some(context_set(&[1])), None, Some(agent("report-reader")));
-    let in_context_one = |row: &[Value]| row[1] == Value::Uuid(context(1));
-    let granted = |row: &[Value]| row[2] == Value::Uuid(acl(1));
-
-    // Twice: with every vector waiting on its list, and with every vector in a block.
-    for sealed in [false, true] {
-        if sealed {
-            assert_eq!(support::seal_all(&db), 43, "vectors sealed");
-        }
-        let stored = support::stored(&db, "SELECT id, context_id, acl_id, v FROM passages");
-        for k in [1, 5, 43] {
-            for filter in [None, Some("id > 10")] {
-                let sql = support::nearest_sql("passages", "v", filter, k);
-                let passes = |row: &[Value]| {
-                    filter.is_none() || matches!(row[0], Value::Int64(id) if id > 10)
-                };
-                let what = |who: &str| format!("{who}, sealed: {sealed}");
-
-                // The handle that declares nothing finds the planted rows first.
-                let wanted = stored.nearest(passes, &query, k);
-                support::assert_nearest(&db, &sql, &query, &wanted, &what("declaring nothing"));
-                assert!(
-                    matches!(wanted[0].key, Value::Int64(101)),
-                    "the planted rows are not the nearest: {wanted:?}"
-                );
-
-                // A narrowed handle is answered with the nearest rows it may see, each at its
-                // true distance; a hidden row takes no place among them.
-                let wanted = stored.nearest(|row| passes(row) && granted(row), &query, k);
-                support::assert_nearest(&reader, &sql, &query, &wanted, &what("the principal"));
-                let wanted = stored.nearest(
-                    |row| passes(row) && granted(row) && in_context_one(row),
-                    &query,
-                    k,
-                );
-                let what = what("the principal in Context 1");
-                support::assert_nearest(&reader_in_one, &sql, &query, &wanted, &what);
-            }
-        }
-    }
-
-    let tags = "CREATE TABLE tags (id INTEGER PRIMARY KEY, c UUID NOT NULL CONTEXT_ID, label TEXT \
-                SCOPE_LABEL_READ ('a', 'b') WRITE ('a', 'b'), v VECTOR(1) PARTITION_KEY (c))";
-    support::run(&db, tags);
-    let c = context(1);
-    let row = format!("INSERT INTO tags VALUES (1, '{c}', 'b', [1.0])");
-    support::run(&db, &row);
-    let by_label = with_labels(&in_contexts(&db, &[1]), &["a"]);
-    let sql = support::nearest_sql("tags", "v", None, 2);
-    let found = support::search(&by_label, &sql, &[1.0]).expect("a search");
-    assert_eq!(found.rows().len(), 0, "the nearest row is under label b");
-    let said = by_label.explain(&sql).expect("explained");
-    assert!(!said.contains(&c.to_string()), "no partition told");
-    let keys = "CREATE TABLE keys (id INTEGER PRIMARY KEY, c UUID NOT NULL CONTEXT_ID, acl_id UUID \
-                ACL REFERENCES acl_grants(acl_id), v VECTOR(1) PARTITION_KEY (c))";
-    support::run(&db, keys);
-    let row = format!("INSERT INTO keys VALUES (1, '{c}', '{}', [1.0])", acl(1));
-    support::run(&db, &row);
-    let said = reader_in_one
-        .explain(&sql.replace("tags", "keys"))
-        .expect("explained");
-    assert!(
-        !said.contains(&c.to_string()),
-        "an access list may hide rows"
-    );
-    // With no principal that holds grants the search is refused like any read of the table.
-    let sql = support::nearest_sql("passages", "v", None, 5);
-    for asked in [support::nearest_sql("passages", "v", None, 0), sql.clone()] {
-        match support::search(&in_contexts(&db, &[1]), &asked, &query) {
-            Err(Error::PrincipalRequired { table }) => assert_eq!(table, "passages"),
-            other => panic!("{asked}\nthrough a handle with no principal gave {other:?}"),
-        }
-    }
-    // Explaining it is refused alike, and a principal that holds grants is told the filter path.
-    for said in [&sql, "INSERT INTO passages (id) VALUES (1)"] {
-        let r = in_contexts(&db, &[1]).explain(said);
-        assert!(matches!(r, Err(Error::PrincipalRequired { .. })), "{r:?}");
-    }
-    let filtered = support::nearest_sql("passages", "v", Some("id > 10"), 5);
-    let text = reader_in_one
-        .explain(&filtered)
-        .expect("a principal explains");
-    assert!(text.contains("filter_path:"), "{text}");
-}
-
 // ---- a handle made from a narrowed handle ----
 
 #[test]
@@ -1414,7 +1411,6 @@ fn twenty_four_thousand_access_ids_are_read_under_a_limit_with_no_room_to_rememb
     const ROWS: i64 = 24_000;
     const BATCH: i64 = 500;
     const KIB: usize = 1 << 10;
-    const MIB: usize = 1 << 20;
     let paper_acl = |n: i64| Uuid::from_u128(0x0A00_0000_0000 + n as u128);
 
     // Paper n of 24,000 is under an access id of its own, and the agent holds the id of
@@ -1463,13 +1459,13 @@ fn twenty_four_thousand_access_ids_are_read_under_a_limit_with_no_room_to_rememb
     }
     support::close(db);
 
-    // 9 MiB is what a store needs to open at all. The 128 KiB above it hold the filter's
+    // What a store needs to open at all, and 128 KiB above it that hold the filter's
     // 64 KiB and a row eight times over, and do not hold an entry for each id: 24,000 ids of
     // 16 bytes alone are 384,000 bytes, and the 12,000 that are granted are 192,000.
-    let limit = 9 * MIB + 128 * KIB;
+    let limit = support::opening::open_floor() + 128 * KIB;
     let db = support::open_limited(&folder, limit);
     let reader = named(&db, agent("reader"));
-    let in_use = db.memory_used();
+    let in_use = support::used(&db);
     let granted = ROWS / 2;
     assert_eq!(
         support::int(&reader, "SELECT COUNT(*) FROM papers"),
@@ -1481,9 +1477,11 @@ fn twenty_four_thousand_access_ids_are_read_under_a_limit_with_no_room_to_rememb
         granted * (granted + 1)
     );
     assert_eq!(
-        db.memory_used(),
-        in_use,
-        "memory in use after the statements"
+        support::used(&db),
+        in_use
+            + support::form_charge("SELECT COUNT(*) FROM papers")
+            + support::form_charge("SELECT SUM(n) FROM papers"),
+        "memory in use after the statements: the record's line for each of the two forms"
     );
     // A principal that holds none of the ids reads the table whole as well, and sees no row.
     let stranger = named(&db, agent("stranger"));
@@ -1503,12 +1501,30 @@ fn a_narrowed_handle_is_refused_every_declaration_and_setting_and_changes_nothin
         ("CREATE INDEX notes_by_tag ON notes (tag)", "CREATE INDEX"),
         ("ALTER TABLE notes ADD COLUMN extra TEXT", "ALTER TABLE"),
         ("SET MEMORY_LIMIT 64M", "SET MEMORY_LIMIT"),
+        ("SET DISK_LIMIT 16M", "SET DISK_LIMIT"),
+        (
+            "SET MAINTENANCE_POLL_INTERVAL 2 SECONDS",
+            "SET MAINTENANCE_POLL_INTERVAL",
+        ),
+        (
+            "SET STORAGE_COMPACTION START_RATIO 0.2",
+            "SET STORAGE_COMPACTION START_RATIO",
+        ),
+        (
+            "SET STORAGE_COMPACTION STOP_RATIO 0.01",
+            "SET STORAGE_COMPACTION STOP_RATIO",
+        ),
+        (
+            "SET UNINDEXED_VECTOR_LIMIT 400",
+            "SET UNINDEXED_VECTOR_LIMIT",
+        ),
         ("DROP INDEX notes_by_s ON notes", "DROP INDEX"),
         ("ALTER TABLE notes DROP COLUMN s CASCADE", "ALTER TABLE"),
         ("DROP TABLE notes", "DROP TABLE"),
     ];
     // The two readings of the vector part's state are the same: for every Context at once.
     let readings = [
+        ("SHOW CONTENT_SIZE", "SHOW CONTENT_SIZE"),
         ("SHOW VECTOR_INDEXES", "SHOW VECTOR_INDEXES"),
         ("SHOW VECTOR_PARTITIONS", "SHOW VECTOR_PARTITIONS"),
     ];
@@ -1550,7 +1566,7 @@ fn a_narrowed_handle_is_refused_every_declaration_and_setting_and_changes_nothin
     }
     // The Rust call that sets the same limit is refused as the statement is: a program holding
     // only a narrowed handle must not lower the limit of the whole store through the other door.
-    let bytes_before = db.memory_limit();
+    let bytes_before = support::limit(&db);
     for (narrowed_by, narrow) in &handles {
         match narrow(&db).set_memory_limit(Some(64 << 20)) {
             Err(Error::AdminRequired { statement }) => assert_eq!(
@@ -1564,7 +1580,7 @@ fn a_narrowed_handle_is_refused_every_declaration_and_setting_and_changes_nothin
         }
     }
     assert_eq!(
-        db.memory_limit(),
+        support::limit(&db),
         bytes_before,
         "a refused call changed the limit"
     );
@@ -1578,7 +1594,8 @@ fn a_narrowed_handle_is_refused_every_declaration_and_setting_and_changes_nothin
     let text = db.declaration("notes").expect("the table is still there");
     assert!(
         text.contains("notes_by_s") && !text.contains("notes_by_tag") && !text.contains("extra"),
-        "a refused statement changed the declaration:\n{text}"
+        "a refused statement changed the declaration:\n{}",
+        text.as_str()
     );
     assert_eq!(limit(&db), limit_before, "the memory limit");
     assert_eq!(seen(&db, "notes", "ORDER BY id"), [1, 2]);
@@ -1588,29 +1605,164 @@ fn a_narrowed_handle_is_refused_every_declaration_and_setting_and_changes_nothin
     }
 }
 
+/// A count through an index on a narrowed handle counts the rows the handle may see and no
+/// others: of three rows under one indexed value, one is hidden by the rule, and the count is
+/// the two the handle sees, the same as the table without the index gives, with no more rows
+/// examined than those two.
+fn a_count_through_an_index_counts_only_what_the_handle_sees(gate: Gate) {
+    let db = gate.store("visibility-count");
+    for twin in ["tagged", "plain"] {
+        support::run(
+            &db,
+            &format!(
+                "CREATE TABLE {twin} (id INTEGER PRIMARY KEY, tag INTEGER NOT NULL, {})",
+                gate.column()
+            ),
+        );
+        for (id, seen) in [(1_i64, true), (2, false), (3, true)] {
+            db.execute(
+                &format!("INSERT INTO {twin} (id, tag, reach) VALUES ($id, 7, $reach)"),
+                &params! { "id" => id, "reach" => gate.reach(seen) },
+            )
+            .expect("a row of the table");
+        }
+    }
+    support::run(&db, "CREATE INDEX tagged_tag ON tagged (tag)");
+    let handle = gate.handle(&db);
+    let (indexed, plain) = (
+        support::run(&handle, "SELECT COUNT(*) FROM tagged WHERE tag = 7"),
+        support::run(&handle, "SELECT COUNT(*) FROM plain WHERE tag = 7"),
+    );
+    assert_eq!(
+        indexed.rows(),
+        plain.rows(),
+        "{gate:?}: the index changes no count"
+    );
+    assert_eq!(
+        indexed.rows()[0][0],
+        Value::Int64(2),
+        "{gate:?}: the rows the handle sees"
+    );
+    assert!(
+        indexed.rows_examined() <= 2,
+        "{gate:?}: the hidden row is not examined, nor counted from its entry: {} examined",
+        indexed.rows_examined()
+    );
+}
+
 #[test]
-fn a_ranked_search_treats_a_hidden_row_joined_by_a_unique_column_as_unmatched() {
-    let db = support::open(&support::folder("visibility-rank-unique"));
+fn a_count_through_an_index_counts_only_what_a_context_handle_sees() {
+    a_count_through_an_index_counts_only_what_the_handle_sees(Gate::Context);
+}
+
+#[test]
+fn a_count_through_an_index_counts_only_what_a_label_handle_sees() {
+    a_count_through_an_index_counts_only_what_the_handle_sees(Gate::Label);
+}
+
+#[test]
+fn a_count_through_an_index_counts_only_what_a_grant_handle_sees() {
+    a_count_through_an_index_counts_only_what_the_handle_sees(Gate::Grant);
+}
+
+/// A key and thirteen two-way alternatives still name the one row: a whole handle reads that
+/// row alone, and a handle that may not see it is refused as it is for the key alone.
+fn thirteen_alternatives_beside_a_key_still_name_one_row(gate: Gate) {
+    let db = gate.store("visibility-thirteen");
+    let ors = (0..13)
+        .map(|_| "(a = 1 OR a = 9)")
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let sql = format!("SELECT payload FROM ledger WHERE id = 2 AND {ors}");
+    let whole = support::run(&db, &sql);
+    assert_eq!(
+        whole.rows().len(),
+        1,
+        "{gate:?}: the row passes every alternative"
+    );
+    assert_eq!(
+        whole.rows_examined(),
+        1,
+        "{gate:?}: the key names one row, and one row is read"
+    );
+    refused(&gate.handle(&db), &sql, gate.rule(), "ledger");
+}
+
+#[test]
+fn thirteen_alternatives_beside_a_key_name_one_row_for_every_rule() {
+    for gate in Gate::ALL {
+        thirteen_alternatives_beside_a_key_still_name_one_row(gate);
+    }
+}
+
+/// Two nodes and an edge between them, all under Context 1 but the far node's row, which is
+/// under Context 2, and a vector row the same way. A reader of Context 1 may not see them.
+fn hidden_far_node() -> Database {
+    let db = support::open(&support::folder("visibility-hidden-far-node"));
     for sql in [
-        "CREATE TABLE results (id INTEGER PRIMARY KEY, context_id UUID CONTEXT_ID, \
-         task_id INTEGER UNIQUE, weight REAL)",
-        "CREATE TABLE tasks (id INTEGER PRIMARY KEY, v VECTOR(2) RANK_POLICY (JOIN results ON \
-         task_id, FORMULA '{vector_score} * coalesce({weight}, 1.0)', SORT_KEY s))",
-        "INSERT INTO tasks (id, v) VALUES (1, [1.0, 0.0]), (2, [1.0, 1.0])",
+        "CREATE TABLE edges (id INTEGER PRIMARY KEY, source_id UUID NOT NULL, target_id UUID NOT NULL, \
+         edge_type TEXT NOT NULL, context_id UUID CONTEXT_ID)",
+        "CREATE TABLE things (id UUID PRIMARY KEY, label TEXT, context_id UUID CONTEXT_ID)",
+        "CREATE TABLE vecs (id INTEGER PRIMARY KEY, v VECTOR(2), context_id UUID CONTEXT_ID)",
     ] {
         support::run(&db, sql);
     }
-    for (id, task, context_number, weight) in [(10_i64, 1_i64, 2, 0.1_f64), (11, 2, 1, 1.0)] {
-        let values =
-            params! {"id" => id, "task" => task, "c" => context(context_number), "w" => weight};
-        let sql =
-            "INSERT INTO results (id, context_id, task_id, weight) VALUES ($id, $c, $task, $w)";
-        db.execute(sql, &values).expect("insert result");
+    let (near, far) = (Uuid::from_u128(1), Uuid::from_u128(2));
+    for (id, label, of) in [(near, "near", 1), (far, "far", 2)] {
+        let values = params! { "id" => id, "label" => label, "context" => context(of) };
+        db.execute(
+            "INSERT INTO things (id, label, context_id) VALUES ($id, $label, $context)",
+            &values,
+        )
+        .unwrap();
     }
-    let sql = "SELECT id FROM tasks ORDER BY v <=> [1.0, 0.0] USE RANK s LIMIT 2";
+    let values = params! { "from" => near, "to" => far, "context" => context(1) };
+    db.execute(
+        "INSERT INTO edges VALUES (1, $from, $to, 'E', $context)",
+        &values,
+    )
+    .unwrap();
+    for (id, of) in [(1, 1), (2, 2)] {
+        let values = params! { "id" => id, "v" => Value::Vector(vec![1.0, id as f32]), "context" => context(of) };
+        db.execute("INSERT INTO vecs VALUES ($id, $v, $context)", &values)
+            .unwrap();
+    }
+    db
+}
+
+#[test]
+fn a_node_whose_row_the_reader_may_not_see_gives_no_property_to_columns() {
+    let db = hidden_far_node();
+    let walk = "SELECT label FROM GRAPH_TABLE(edges MATCH (a)-[e]->(b) COLUMNS (b.label AS label))";
+    let all = support::rows(&db, walk);
     assert_eq!(
-        ids(&in_contexts(&db, &[1]), sql),
-        vec![1, 2],
-        "a result hidden from the reader is no answer and no refusal: its task ranks as unmatched"
+        all,
+        [[Value::Text("far".into())]],
+        "a handle that sees the far node reads its property"
+    );
+    let one = in_contexts(&db, &[1]);
+    assert!(
+        support::rows(&one, walk).is_empty(),
+        "a hidden node's property is never returned, not as NULL either"
+    );
+}
+
+#[test]
+fn a_row_vector_subquery_naming_a_hidden_row_is_refused_by_the_rule_that_hid_it() {
+    let db = hidden_far_node();
+    let nearest = |id: i64| {
+        format!("SELECT id FROM vecs ORDER BY v <=> (SELECT v FROM vecs WHERE id = {id}) LIMIT 5")
+    };
+    assert_eq!(
+        ids(&db, &nearest(2)),
+        [2, 1],
+        "a handle that sees row 2 searches by its vector, nearest first: row 2 itself at 0"
+    );
+    let one = in_contexts(&db, &[1]);
+    refused(&one, &nearest(2), Rule::Context, "vecs");
+    assert_eq!(
+        ids(&one, &nearest(1)),
+        [1],
+        "the reader's own row still serves"
     );
 }

@@ -11,15 +11,16 @@
 //! with the page cache already full: the limit has room for the whole cache, and a cache that
 //! is half empty would hide whatever the cycle held without reserving it.
 
+#[path = "support/streaming.rs"]
+mod streaming;
 mod support;
+use support::count;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use contextdb::{
-    Database, DatabaseOpenOptions, Error, ReadSession, ReadSessionOptions, Uuid, Value, params,
-};
+use contextdb::{Database, DatabaseOpenOptions, Error, ReadSession, Uuid, Value, params};
 
 const LIMIT: usize = 64 << 20;
 const ROWS: i64 = 1_000_000;
@@ -87,8 +88,72 @@ unsafe impl GlobalAlloc for Counting {
 
 #[test]
 fn a_million_rows_load_and_scan_under_64_mib() {
-    if let Some(role) = support::role() {
+    use support::*;
+    if let Some(role) = role() {
+        if role.name == "purge" {
+            return purge_with_one_centre_record(&role);
+        }
         return load_and_scan(role);
+    }
+    for (victim, group) in [(17, 0), (247, 15)] {
+        let path = folder(&format!("purge-one-centre-record-{victim}"));
+        let db = open(&path);
+        declare_docs(&db, 65_536, "INDEXING_THRESHOLD 1");
+        let direction = |id| {
+            let mut v = vec![0.0; 65_536];
+            v[usize::from(id != victim && id != victim + 1)] = 1.0;
+            if id == victim + 1 {
+                v[1] = 0.25;
+            }
+            v
+        };
+        load_docs(&db, 1..=256, "a", direction);
+        maintenance(&db);
+        let exported = path.join("before");
+        db.export_snapshot(&exported).unwrap();
+        let records = vector_records(&exported);
+        let ivf = records.iter().find(|(k, _)| k[0] == 3).unwrap().1;
+        let starts: Vec<_> = ivf[12..]
+            .chunks_exact(8)
+            .map(|p| {
+                3 * u32::from_le_bytes(p[..4].try_into().unwrap())
+                    + u32::from_le_bytes(p[4..].try_into().unwrap())
+            })
+            .collect();
+        assert_eq!(starts.len(), 17);
+        assert_eq!(starts[group + 1] - starts[group], 2);
+        if group == 15 {
+            assert!(starts[1..16].iter().all(|p| *p == starts[15]));
+        }
+        write_the_filler(&db);
+        close(db);
+        let lines = Child::start(
+            "a_million_rows_load_and_scan_under_64_mib",
+            &format!("purge victim={victim}"),
+            &path,
+        )
+        .end();
+        assert_eq!(last_number(&lines, "refused"), Some(0));
+        assert!(last_number(&lines, "rise").unwrap() <= 15 << 18);
+        let db = open(&path);
+        assert_eq!(int(&db, "SELECT COUNT(*) FROM docs"), 255);
+        let nearest = answer(&db, &by_mode(None, "EXACT", 1), &direction(victim + 1));
+        assert_eq!(nearest.rows()[0][0], Value::Int64(victim + 1));
+        db.verify().unwrap();
+        let exported = path.join("after");
+        db.export_snapshot(&exported).unwrap();
+        let records = vector_records(&exported);
+        let centres: Vec<_> = records.iter().filter(|(k, _)| k[0] == 4).collect();
+        let centre = centres[group].1;
+        let norm = (127.0_f32.powi(2) + 32.0_f32.powi(2)).sqrt();
+        for (at, bytes) in centre.chunks_exact(4).enumerate() {
+            let expected = [127.0 / norm, 32.0 / norm].get(at).copied().unwrap_or(0.0);
+            assert!(
+                (f32::from_le_bytes(bytes.try_into().unwrap()) - expected).abs() < 1e-6,
+                "wrong repaired centre"
+            );
+        }
+        close(db);
     }
     let folder = support::folder("million-rows");
     let db = support::open(&folder);
@@ -208,11 +273,11 @@ fn load_and_scan(role: support::Role) {
     // Memory the host takes for itself is not the store's: with twice the limit allocated
     // beside it, the store counts what it counted and still answers under its limit.
     let loaded = ALLOCATED.peak.load(Ordering::Relaxed);
-    let counted = db.memory_used();
+    let counted = support::used(&db);
     {
         let beside = vec![1_u8; 2 * LIMIT];
         assert_eq!(
-            db.memory_used(),
+            support::used(&db),
             counted,
             "memory the host allocated was counted against the store's limit"
         );
@@ -228,25 +293,97 @@ fn load_and_scan(role: support::Role) {
 }
 
 /// The value of the test below: 1 MiB of one sentence repeated, the largest the store
-/// compresses. And the reader's limit: the 9 MiB an open sets aside and 64 KiB, which is room
+/// compresses. And the reader's limit: what an open sets aside and 64 KiB, which is room
 /// for the value's stored record, a little over 4 KiB, and a sixteenth of what the value
 /// itself takes. The arithmetic is that of `a_compressed_value_too_large_for_the_limit_is_refused`
 /// in `large_values.rs`, which holds the refusal itself.
 const VALUE: usize = 1 << 20;
-const VALUE_LIMIT: usize = (9 << 20) + (64 << 10);
+/// Sinks, event types and routes the wide status row declares, each name some 2400 bytes.
+const WIDE: usize = 24;
+fn value_limit(folder: &std::path::Path) -> usize {
+    support::opening::opening_charge(folder, None) + (64 << 10)
+}
 
 /// The JSON cases of the test below: the same 1 MiB as text, in the shape that shrinks most
 /// (an array of small objects), whose tree in memory is some twenty times its text. The limit
-/// leaves 4 MiB beyond the open's 9 MiB: room for the text, none for the tree.
+/// leaves 4 MiB beyond what the open sets aside: room for the text, none for the tree.
 const JSON_ROOM: usize = 4 << 20;
-const JSON_LIMIT: usize = (9 << 20) + JSON_ROOM;
+fn json_limit(folder: &std::path::Path) -> usize {
+    support::opening::opening_charge(folder, None) + JSON_ROOM
+}
 
 #[test]
 fn a_refused_compressed_value_is_never_produced() {
     if let Some(role) = support::role() {
+        if role.name.starts_with("delivery") {
+            return delivery_allocation_row(&role);
+        }
         refused_select(&role);
         return refused_json(&role);
     }
+    let mut peaks = Vec::new();
+    for door in "delivery-status delivery-metrics delivery-pass1 delivery-pass10".split_whitespace()
+    {
+        let path = support::folder(door);
+        let count = if door.ends_with("10") { 10 } else { 1 };
+        let bytes = if door.contains("pass") { 8 } else { 2 << 20 };
+        let db = support::delivery_queue(&path, bytes, count);
+        write_the_filler(&db);
+        support::close(db);
+        let lines =
+            support::Child::start("a_refused_compressed_value_is_never_produced", door, &path)
+                .end();
+        let refused = support::last_number(&lines, "refused").unwrap();
+        peaks.push((refused, support::last_number(&lines, "rise").unwrap()));
+    }
+    // Many declarations with long names: a status that copies them uncharged would allocate far
+    // past the room the limit leaves; a charged one is refused before it copies them.
+    let path = support::folder("delivery-wide");
+    let db = support::delivery_queue(&path, 8, 1);
+    for n in 0..WIDE {
+        let name = |what: &str| {
+            format!(
+                "{what}_with_a_name_that_is_long_{n:05}_{}",
+                "x".repeat(2400)
+            )
+        };
+        let (event, sink) = (name("event"), name("sink"));
+        support::run(
+            &db,
+            &format!("CREATE EVENT TYPE {event} WHEN INSERT ON queued"),
+        );
+        support::run(&db, &format!("CREATE SINK {sink} TYPE callback"));
+        support::run(
+            &db,
+            &format!("CREATE ROUTE {} EVENT {event} TO {sink}", name("route")),
+        );
+    }
+    support::close(db);
+    let lines = support::Child::start(
+        "a_refused_compressed_value_is_never_produced",
+        "delivery-wide",
+        &path,
+    )
+    .end();
+    let (refused, rise) = (
+        support::last_number(&lines, "refused").unwrap(),
+        support::last_number(&lines, "rise").unwrap(),
+    );
+    assert!(
+        refused == 1 && rise < WIDE as u64 * 1024,
+        "an event bus status of {WIDE} sinks, event types and routes with long names was not \
+         charged before it was copied: refused {refused}, allocated {rise} bytes"
+    );
+    assert!(
+        peaks
+            .iter()
+            .all(|&(refused, peak)| refused == 0 && peak < 512 << 10),
+        "inspection/pass allocation: {peaks:?}"
+    );
+    assert!(
+        peaks[3].1 <= peaks[2].1 + (64 << 10),
+        "queue length changed delivery peak: {peaks:?}"
+    );
     let folder = support::folder("refused-value-never-produced");
     let db = support::open(&folder);
     support::run(
@@ -270,6 +407,7 @@ fn a_refused_compressed_value_is_never_produced() {
         )
         .unwrap_or_else(|error| panic!("note {id} was refused: {error:?}"));
     }
+    support::maintenance(&db);
     support::close(db);
     // The value is stored compressed: the file is too short to hold it as it is.
     let length = fs::metadata(folder.join("data"))
@@ -346,8 +484,7 @@ fn measured<T>(prefix: &str, statement: impl FnOnce() -> contextdb::Result<T>) -
 /// `rise <bytes>`: how far the most this process ever had allocated rose above what it had
 /// allocated just before the select.
 fn refused_select(role: &support::Role) {
-    let mut options = ReadSessionOptions::default();
-    options.memory_limit = Some(VALUE_LIMIT);
+    let options = support::reader_options(Some(value_limit(&role.folder)));
     let reader = ReadSession::open_with_options(&role.folder, options)
         .expect("open the store for reading under the limit");
     assert_eq!(support::int(&reader, "SELECT COUNT(*) FROM notes"), 2);
@@ -361,12 +498,11 @@ fn refused_select(role: &support::Role) {
     });
 }
 
-/// Selects the JSON value under [`JSON_LIMIT`] from a reader, then writes the text of a second
+/// Selects the JSON value under [`json_limit`] from a reader, then writes the text of a second
 /// value of the same shape from a writer under the same limit, and announces each as
 /// [`measured`] does, with the prefixes `select_` and `write_`. A refused write left no row.
 fn refused_json(role: &support::Role) {
-    let mut options = ReadSessionOptions::default();
-    options.memory_limit = Some(JSON_LIMIT);
+    let options = support::reader_options(Some(json_limit(&role.folder)));
     let reader = ReadSession::open_with_options(&role.folder, options)
         .expect("open the store for reading under the limit");
     assert_eq!(support::int(&reader, "SELECT COUNT(*) FROM records"), 1);
@@ -376,7 +512,7 @@ fn refused_json(role: &support::Role) {
     drop(reader);
 
     let mut options = DatabaseOpenOptions::default();
-    options.memory_limit = Some(JSON_LIMIT);
+    options.memory_limit = Some(json_limit(&role.folder));
     let db = support::open_with(&role.folder, options).expect("open the store under the limit");
     let text = contextdb::serde_json::to_string(&support::large_json(true, 2, VALUE))
         .expect("JSON writes as text");
@@ -444,22 +580,42 @@ const _: () = assert!(BLOCK == 249_860 && BLOCK <= 262_080);
 /// What the cycle's working memory comes to: the keys of the pending records it collected,
 /// each its bytes and 24; one block being built, 262,080 bytes, taken once; the partition
 /// record it adds to, the bytes of its key tuple, here none, and 64; and one row with its
-/// vector, a row of two values as a statement counts it and the vector's numbers once more.
-const WORKING: usize = SEALED * (KEY + 24)
+/// vector, a row header and two decoded cells, and its numbers. The cycle also retains
+/// the initial four-entry candidate reservation and its final one-entry work list.
+// A decoded cell holds either a Value or the large-value pointer (two u64s).
+type SeenCell = std::result::Result<Value, (u64, u64)>;
+const LISTED: usize = 4 * size_of::<(bool, u32, u32, Vec<u8>)>() + size_of::<(u32, Vec<u8>)>();
+const WORKING: usize = LISTED
+    + SEALED * (KEY + 24)
     + 262_080
     + 64
-    + (size_of::<Vec<Value>>() + 2 * size_of::<Value>() + 2 * 4 * SEALED_DIMENSION);
+    + (size_of::<(Option<u32>, Vec<SeenCell>, u64)>()
+        + 2 * size_of::<SeenCell>()
+        + 4 * SEALED_DIMENSION);
 
-/// What the records the cycle stages come to, each its value, 128 bytes and twice its key: the
+/// The partition record: step 4's 73 bytes, then its unindexed count (4), the bytes its pending
+/// vectors will take (8), the room left in its tail block (4), and assigned count (8).
+const ENTRY: usize = 73 + 4 + 8 + 4 + 8;
+
+/// What the records the cycle stages come to, each its value, 320 bytes and twice its key: the
 /// block, whole, under a key of 13 bytes; the removal of each pending record, whose key is nine
-/// bytes and the row's key; the partition's entry of 16 bytes under a key of 5; and the
-/// store's count of pending records, 128.
-const STAGED: usize =
-    (BLOCK + 128 + 2 * 13) + SEALED * (128 + 2 * (9 + KEY)) + (16 + 128 + 2 * 5) + 128;
+/// bytes and the row's key; the partition record under a key of 5; and the store's count of
+/// pending records, 320. Its 4,099 undo calls need 8,192 slots of 136 bytes; growth from
+/// 4,096 slots reserves the old and new buffers together.
+const STAGED: usize = (BLOCK + 320 + 2 * 13)
+    + SEALED * (320 + 2 * (9 + KEY))
+    + (ENTRY + 320 + 2 * 5)
+    + 320
+    + 3 * (SEALED + 3).next_power_of_two() / 2 * 136;
 
-/// A limit that is exactly enough for that one partition: the 9 MiB an open sets aside, and
+/// A limit that is exactly enough for that one partition: what an open sets aside, and
 /// every reservation of one cycle, each once.
-const SEALING_LIMIT: usize = (9 << 20) + WORKING + STAGED;
+fn sealing_limit(folder: &std::path::Path) -> usize {
+    support::opening::opening_charge(folder, None)
+        + WORKING
+        + STAGED
+        + support::limit_commit_bytes()
+}
 
 #[test]
 fn a_sealing_cycle_with_exactly_the_room_it_reserves_completes_within_the_limit() {
@@ -484,17 +640,18 @@ fn a_sealing_cycle_with_exactly_the_room_it_reserves_completes_within_the_limit(
     tx.commit().expect("commit the points");
     support::close(db);
 
+    let sealing_limit = sealing_limit(&folder);
     let lines = support::Child::start(
         "a_sealing_cycle_with_exactly_the_room_it_reserves_completes_within_the_limit",
         "sealer",
         &folder,
     )
     .end();
-    // The open set 9 MiB aside, so what the limit left the cycle is exactly its reservations.
+    // The open set its floor aside, so what the limit left the cycle is exactly its reservations.
     assert_eq!(
         support::last_number(&lines, "set_aside"),
-        Some(9 << 20),
-        "set aside by an open under {SEALING_LIMIT} bytes"
+        Some(support::opening::opening_charge(&folder, None) as u64),
+        "set aside by an open under {sealing_limit} bytes"
     );
     let refused: Vec<&String> = lines
         .iter()
@@ -515,11 +672,11 @@ fn a_sealing_cycle_with_exactly_the_room_it_reserves_completes_within_the_limit(
             support::last_number(&lines, "remaining")
         ),
         (Some(SEALED as u64), Some(0)),
-        "what the cycle sealed and left waiting"
+        "what the cycle sealed and left unindexed"
     );
     assert_eq!(
         support::last_number(&lines, "used_after"),
-        Some(9 << 20),
+        Some(support::opening::opening_charge(&folder, None) as u64),
         "memory in use after the cycle"
     );
     // What the process really took for the store, from before the open to the end, the
@@ -528,13 +685,13 @@ fn a_sealing_cycle_with_exactly_the_room_it_reserves_completes_within_the_limit(
     let peak = support::last_number(&lines, "peak").expect("the sealer announces it");
     let cached = support::last_number(&lines, "cached").expect("the sealer announces it");
     assert!(
-        peak <= before + SEALING_LIMIT as u64,
+        peak <= before + sealing_limit as u64,
         "with {before} bytes allocated before the store was opened, the process reached {peak}: \
-         {} bytes on the store's account under a limit of {SEALING_LIMIT}, {} past it, in a \
+         {} bytes on the store's account under a limit of {sealing_limit}, {} past it, in a \
          cycle over {SEALED} pending vectors, begun with {cached} bytes allocated for a full \
          cache",
         peak - before,
-        peak - before - SEALING_LIMIT as u64
+        peak - before - sealing_limit as u64
     );
 
     // The cycle's commit is there: every vector is in a block, and the nearest are found.
@@ -551,7 +708,7 @@ fn a_sealing_cycle_with_exactly_the_room_it_reserves_completes_within_the_limit(
     );
 }
 
-/// Opens the store under [`SEALING_LIMIT`], reads every filler row, and runs one maintenance
+/// Opens the store under [`sealing_limit`], reads every filler row, and runs one maintenance
 /// cycle. Announces `set_aside <bytes>`, what the open counts; `cached <bytes>`, what this
 /// process had allocated more than before the open once the filler rows were read; then
 /// `done <vectors>` and `remaining <vectors>`, or `refused <the refusal>`; `used_after <bytes>`;
@@ -559,26 +716,40 @@ fn a_sealing_cycle_with_exactly_the_room_it_reserves_completes_within_the_limit(
 /// `before <bytes>`, what this process had allocated when it opened the store, and
 /// `peak <bytes>`, the most it had allocated at any time after that.
 fn one_cycle_under_the_limit(role: &support::Role) {
+    let limit = sealing_limit(&role.folder);
     let before = ALLOCATED.now.load(Ordering::Relaxed);
     ALLOCATED.peak.store(before, Ordering::Relaxed);
     let mut options = DatabaseOpenOptions::default();
-    options.memory_limit = Some(SEALING_LIMIT);
+    options.memory_limit = Some(limit);
     let db = support::open_with(&role.folder, options).expect("open the store under the limit");
-    support::say(format!("set_aside {}", db.memory_used()));
+    support::say(format!("set_aside {}", support::used(&db)));
     fill_the_cache(&db);
     let cached = ALLOCATED.now.load(Ordering::Relaxed);
     support::say(format!("cached {}", cached.saturating_sub(before)));
     match db.run_maintenance_cycle() {
         Ok(report) => {
-            support::say(format!("done {}", report.vector.maintenance_vectors_done));
+            support::say(format!(
+                "done {}",
+                count(report.vector.maintenance_vectors_done)
+            ));
             support::say(format!(
                 "remaining {}",
-                report.vector.maintenance_vectors_remaining
+                count(report.vector.maintenance_vectors_remaining)
             ));
         }
         Err(error) => support::say(format!("refused {error:?}")),
     }
-    support::say(format!("used_after {}", db.memory_used()));
+    // What stays after the cycle: the open's charge and the statement record's lines, each
+    // charged for its text and its own bytes.
+    let used_after = support::used(&db);
+    let lines: usize = support::rows(&db, "SHOW STATEMENT_STATISTICS")
+        .iter()
+        .map(|line| match &line[0] {
+            Value::Text(form) => support::form_charge(form),
+            other => panic!("a statement is text, not {other:?}"),
+        })
+        .sum();
+    support::say(format!("used_after {}", used_after - lines));
     support::close(db);
     support::say(format!("before {before}"));
     support::say(format!("peak {}", ALLOCATED.peak.load(Ordering::Relaxed)));
@@ -669,9 +840,9 @@ fn a_build_under_the_limit(role: &support::Role) {
         match db.run_maintenance_cycle() {
             Ok(report) => {
                 let report = report.vector;
-                support::say(format!("stalled {}", report.stalled_partitions));
-                if report.maintenance_vectors_remaining == 0
-                    && report.remaining_partitions <= report.stalled_partitions
+                support::say(format!("stalled {}", count(report.stalled_partitions)));
+                if count(report.maintenance_vectors_remaining) == 0
+                    && count(report.remaining_partitions) <= count(report.stalled_partitions)
                 {
                     break;
                 }
@@ -776,4 +947,156 @@ fn one_more_edge(role: &support::Role) {
     let peak = ALLOCATED.peak.load(Ordering::Relaxed);
     support::say(format!("taken {}", peak - before));
     support::close(db);
+}
+fn delivery_allocation_row(role: &support::Role) {
+    let room = if role.name == "delivery-wide" {
+        // The open holds the declarations; the status copies their keys and pointers, about 50 KiB
+        // here, so a headroom of a third of that cannot hold it.
+        support::opening::opening_charge(&role.folder, None) - support::opening::open_floor()
+            + (16 << 10)
+    } else {
+        2 << 20
+    };
+    let db = support::open_limited(&role.folder, support::opening::open_floor() + room);
+    db.register_sink("outgoing", None, |_| Ok(())).unwrap();
+    if !role.name.starts_with("delivery-wide") {
+        fill_the_cache(&db);
+    }
+    measured("", || {
+        if role.name == "delivery-wide" {
+            return db.event_bus_status().map(drop);
+        }
+        let count = if role.name == "delivery-status" {
+            db.event_bus_status()?.sinks[0].metrics.queued
+        } else if role.name == "delivery-metrics" {
+            db.sink_metrics("outgoing")?.queued
+        } else {
+            count(db.run_maintenance_cycle()?.delivered)
+        };
+        assert_eq!(count, if role.name.ends_with("10") { 10 } else { 1 });
+        Ok(())
+    });
+}
+
+#[test]
+fn replacing_a_dirty_record_discards_its_old_bytes() {
+    use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
+    const TEST: &str = "replacing_a_dirty_record_discards_its_old_bytes";
+    const LEN: usize = 200 << 10;
+    const TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("wide");
+    let Some(role) = support::role() else {
+        let folder = support::folder(TEST);
+        let lines = support::Child::start(TEST, "replace", &folder).end();
+        eprintln!("allocation receipts: {lines:?}");
+        assert!(support::last_number(&lines, "discard_rise").unwrap() < LEN as u64);
+        assert!(support::last_number(&lines, "keep_rise").unwrap() >= LEN as u64);
+        return;
+    };
+    let (a, b, c) = (vec![1_u8; LEN], vec![2_u8; LEN], vec![3_u8; LEN]);
+    let path = role.folder.join("raw");
+    let db = redb::Database::create(&path).unwrap();
+    let tx = db.begin_write().unwrap();
+    {
+        let mut table = tx.open_table(TABLE).unwrap();
+        table.insert(1, a.as_slice()).unwrap();
+        measured("discard_", || {
+            table.insert_discard(1, b.as_slice()).unwrap();
+            Ok(())
+        });
+        measured("keep_", || {
+            assert_eq!(table.insert(1, c.as_slice()).unwrap().unwrap().value(), b);
+            Ok(())
+        });
+        assert_eq!(table.len().unwrap(), 1);
+        assert_eq!(table.get(1).unwrap().unwrap().value(), c);
+    }
+    tx.commit().unwrap();
+    drop(db);
+    let db = redb::Database::open(path).unwrap();
+    let tx = db.begin_read().unwrap();
+    let table = tx.open_table(TABLE).unwrap();
+    assert_eq!(table.len().unwrap(), 1);
+    assert_eq!(table.get(1).unwrap().unwrap().value(), c);
+
+    let folder = role.folder.join("sql");
+    let db = support::open(&folder);
+    support::run(&db, "CREATE TABLE t(id INT PRIMARY KEY, body TEXT)");
+    let a = params! { "v" => "a".repeat(LEN) };
+    let b = params! { "v" => "b".repeat(LEN) };
+    let tx = db.transaction().unwrap();
+    tx.execute("INSERT INTO t VALUES(1,$v)", &a).unwrap();
+    tx.execute("UPDATE t SET body=$v WHERE id=1", &a).unwrap();
+    measured("sql_", || tx.execute("UPDATE t SET body=$v WHERE id=1", &b));
+    let expected = support::rows(&tx, "SELECT id,body FROM t");
+    assert_eq!(
+        expected,
+        vec![vec![Value::Int64(1), support::text(&"b".repeat(LEN))]]
+    );
+    tx.commit().unwrap();
+    let db = support::reopen(db, &folder);
+    assert_eq!(support::rows(&db, "SELECT id,body FROM t"), expected);
+}
+
+fn purge_with_one_centre_record(role: &support::Role) {
+    let db = support::open_limited(&role.folder, support::opening::open_floor() + (15 << 18));
+    fill_the_cache(&db);
+    measured("", || {
+        db.execute(
+            "PURGE FROM docs WHERE id=$id",
+            &params! {"id"=>role.number("victim") as i64},
+        )
+        .inspect_err(|error| eprintln!("centroid PURGE: {error:?}"))
+    });
+}
+
+/// A cursor over a run of 1,000 tied rows, fetched one row per page, holds the rest of the run
+/// between pages (rule 4: what is held is charged). The bytes the process really holds beyond
+/// what it held before the cursor opened are covered by the bytes the session reports used,
+/// within room for the cursor's own small state: the list a run is held in is charged by what
+/// it holds, 80 bytes for each entry of it, which is 80,000 bytes at the first page.
+#[test]
+fn a_run_held_across_pages_is_charged_by_what_it_holds() {
+    const RUN: i64 = 1000;
+    // The cursor's own small state, the plan and a page: far under one run's list.
+    const ROOM: usize = 32 << 10;
+    let db = support::open(&support::folder("cursor-held-run"));
+    support::run(
+        &db,
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, g INTEGER NOT NULL, v INTEGER NOT NULL)",
+    );
+    support::run(&db, "CREATE INDEX pg ON p (g)");
+    let rows: Vec<String> = (1..=RUN).map(|id| format!("({id}, 0, {})", -id)).collect();
+    support::run(
+        &db,
+        &format!("INSERT INTO p (id, g, v) VALUES {}", rows.join(", ")),
+    );
+    let sql = "SELECT id FROM p ORDER BY g, v";
+    // Read once whole, so that the cache holds what the cursor will read.
+    assert_eq!(support::rows(&db, sql).len() as i64, RUN);
+    let session = db.read_session(contextdb::ReadLimits::default()).unwrap();
+    let (really, charged) = (
+        ALLOCATED.now.load(Ordering::Relaxed),
+        support::memory_used(&session),
+    );
+    let mut cursor = session.open_cursor(sql, &params! {}).unwrap();
+    let mut over = Vec::new();
+    for fetched in 1..RUN {
+        cursor.fetch(std::num::NonZeroUsize::new(1)).unwrap();
+        if ![1, 250, 500, 999].contains(&fetched) {
+            continue;
+        }
+        let charged_now = support::memory_used(&session).saturating_sub(charged);
+        let held_now = ALLOCATED.now.load(Ordering::Relaxed).saturating_sub(really);
+        eprintln!("page {fetched}: really {held_now}, charged {charged_now}");
+        if held_now > charged_now + ROOM {
+            over.push(format!(
+                "after {fetched} pages the cursor really holds {held_now} bytes more than before it opened, the session is charged {charged_now}"
+            ));
+        }
+    }
+    assert!(
+        over.is_empty(),
+        "what a cursor holds between pages is charged:\n{}",
+        over.join("\n")
+    );
 }

@@ -12,11 +12,11 @@ VALUES (1, 'one', 'draft'), (2, 'two', 'draft'), (3, 'three', 'active'), (4, 'fo
 # A listed transition.
 UPDATE tasks SET status = 'active' WHERE id = 1;
 ----
-rows affected: 1
+rows affected: 1  (read 1, compared 0)
 
 UPDATE tasks SET status = 'rejected' WHERE id = 2;
 ----
-rows affected: 1
+rows affected: 1  (read 1, compared 0)
 
 # Not listed: backwards, past a state, out of a state that lists nothing, and to a state the
 # declaration never names.
@@ -48,7 +48,7 @@ error: InvalidStateTransition
 
 SELECT id, status FROM tasks ORDER BY id;
 ----
-id | status
+id | status  (read 4, compared 0)
 1 | active
 2 | rejected
 3 | active
@@ -66,7 +66,7 @@ error: SchemaInvalid
 
 SELECT id, status FROM tasks ORDER BY id;
 ----
-id | status
+id | status  (read 4, compared 0)
 1 | active
 2 | rejected
 3 | active
@@ -75,21 +75,21 @@ id | status
 # Every row the statement reaches may move: both do.
 UPDATE tasks SET status = 'superseded' WHERE status = 'active';
 ----
-rows affected: 2
+rows affected: 2  (read 4, compared 0)
 
 # Another column of the row changes whatever state the row is in, and a statement that reaches
 # no row is refused for nothing.
 UPDATE tasks SET title = 'renamed' WHERE id = 2;
 ----
-rows affected: 1
+rows affected: 1  (read 1, compared 0)
 
 UPDATE tasks SET status = 'draft' WHERE id = 404;
 ----
-rows affected: 0
+rows affected: 0  (read 0, compared 0)
 
 SELECT id, title, status FROM tasks ORDER BY id;
 ----
-id | title | status
+id | title | status  (read 4, compared 0)
 1 | one | superseded
 2 | renamed | rejected
 3 | three | superseded
@@ -104,11 +104,11 @@ error: InvalidStateTransition
 INSERT INTO tasks (id, title, status) VALUES (4, 'four', 'draft')
 ON CONFLICT (id) DO UPDATE SET status = 'active';
 ----
-rows affected: 1
+rows affected: 1  (read 1, compared 0)
 
 SELECT id, status FROM tasks WHERE id = 4;
 ----
-id | status
+id | status  (read 1, compared 0)
 4 | active
 
 # One next state may be written without brackets.
@@ -123,7 +123,7 @@ error: InvalidStateTransition
 
 SELECT id, state FROM switches;
 ----
-id | state
+id | state  (read 1, compared 0)
 1 | idle
 
 # A table that keeps only the current version of a row keeps its state and holds every change
@@ -144,5 +144,21 @@ error: InvalidStateTransition
 UPDATE devices SET state = 'stopped' WHERE id = 1;
 SELECT id, state FROM devices;
 ----
-id | state
+id | state  (read 1, compared 0)
 1 | stopped
+
+CREATE TABLE decisions (id INTEGER PRIMARY KEY, title TEXT NOT NULL);
+CREATE TABLE invalidations (id INTEGER PRIMARY KEY, decision_id INTEGER NOT NULL REFERENCES decisions(id), severity TEXT NOT NULL, state TEXT NOT NULL, resolved_at TIMESTAMP)
+STATE MACHINE (state: pending -> [acknowledged, dismissed], acknowledged -> [resolved, dismissed]);
+INSERT INTO decisions (id, title) VALUES (1, 'first'), (2, 'second');
+INSERT INTO invalidations (id, decision_id, severity, state) VALUES (1, 1, 'high', 'pending'), (2, 2, 'low', 'pending');
+UPDATE invalidations SET state = 'resolved', resolved_at = NOW() WHERE id = 1;
+----
+error: InvalidStateTransition
+
+UPDATE invalidations SET state = 'acknowledged' WHERE id = 1;
+UPDATE invalidations SET state = 'resolved', resolved_at = NOW() WHERE id = 1;
+SELECT d.title, i.state FROM invalidations i JOIN decisions d ON d.id = i.decision_id WHERE i.resolved_at IS NOT NULL;
+----
+title | state  (read 3, compared 0)
+first | resolved

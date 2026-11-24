@@ -12,16 +12,15 @@ use crate::types::{Error, Result, Uuid, Value};
 
 /// What a node reached by a walk along edges is counted as: its id among the nodes reached and
 /// in the list of those still to leave from.
-const NODE_BYTES: u64 = 64;
+const NODE_BYTES: u64 = crate::memory::node::<crate::types::Uuid>();
 
 /// An edge of a type its table lists under DAG: its source, its target and its type.
 pub(super) type Edge = (Uuid, Uuid, String);
 
 impl Rules<'_> {
-    /// Refuses an UPDATE, a DELETE and an `ON CONFLICT DO UPDATE` on a table declared
-    /// IMMUTABLE, and an assignment to a column declared IMMUTABLE. No row is read: the table
-    /// says so, whatever it holds.
-    pub(super) fn changeable(&self, plan: &Plan) -> Result<()> {
+    /// Refuses DELETE, upsert and non-vector assignments on IMMUTABLE tables, and assignments
+    /// to IMMUTABLE columns.
+    pub(crate) fn changeable(&self, plan: &Plan) -> Result<()> {
         let table = self.table;
         let assignments: &[(String, Expr)] = match plan {
             Plan::Update(plan) => &plan.assignments,
@@ -31,7 +30,12 @@ impl Rules<'_> {
             },
             _ => &[],
         };
-        if table.meta.immutable {
+        if table.meta.immutable
+            && (!matches!(plan, Plan::Update(_))
+                || assignments
+                    .iter()
+                    .any(|(name, _)| table.vector(name).is_none()))
+        {
             return Err(Error::ImmutableTable {
                 table: table.name.clone(),
             });
@@ -153,16 +157,20 @@ impl Rules<'_> {
             let asked = self.asked(Some(&filter), &bound, &[], &needed, &reader);
             let mut after = None;
             while let Some((edges, _held)) =
-                query::rows_for_write(&asked, after.as_ref(), given.catalog, read, given.budget)?
+                query::rows_for_write(&asked, Some(&mut after), given.catalog, read, given.budget)?
             {
-                after = edges.last().map(|(key, _)| key.clone());
                 for (_, cells) in &edges {
                     if let Cell::Here(Value::Uuid(next)) = cells[at[1]]
-                        && reached.insert(next)
+                        && !reached.contains(&next)
                     {
-                        reserved.grow(NODE_BYTES)?;
+                        reserved.grow(NODE_BYTES * if reached.is_empty() { 4 } else { 1 })?;
+                        reached.insert(next);
+                        reserved.room(&mut leave, usize::MAX)?;
                         leave.push(next);
                     }
+                }
+                if after.is_none() {
+                    break;
                 }
             }
         }

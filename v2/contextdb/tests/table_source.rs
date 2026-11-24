@@ -170,7 +170,7 @@ fn a_large_value_no_statement_selects_is_not_loaded() {
     let title = "SELECT id, title FROM big WHERE id = 1";
     let small = vec![vec![Value::Int64(1), Value::Text("first".to_owned())]];
     assert_eq!(support::rows(&db, title), small, "before the limit");
-    db.set_memory_limit(Some(db.memory_used() + TEXT / 2))
+    db.set_memory_limit(Some(support::used(&db) + TEXT / 2))
         .expect("set a limit above what is in use");
 
     assert_eq!(
@@ -189,7 +189,8 @@ fn a_large_value_no_statement_selects_is_not_loaded() {
     );
 
     // With the limit lifted the text is there, whole.
-    db.set_memory_limit(None).expect("lift the limit");
+    db.set_memory_limit(Some(256 << 20))
+        .expect("lift the limit");
     let found = support::rows(&db, "SELECT body FROM big WHERE id = 1");
     support::assert_text_is(&found[0][0], &body, "the text, with no limit");
 }

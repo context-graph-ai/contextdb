@@ -4,9 +4,9 @@
 //! DISTINCT, and OFFSET and LIMIT leave rows out and stop the read. Every stage takes a source
 //! of rows and the scope of its columns, never a table.
 
-use std::cell::Cell;
-use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, HashMap};
+use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeSet, HashMap};
 
 use super::aggregate::{Grouped, Groups, spelled};
 use super::expression::{EvalContext, Scope, eval, holds, most_bytes, numbers, reads, unbound};
@@ -33,12 +33,32 @@ pub(super) type Each<'e> = dyn FnMut(Vec<Value>, u64, &mut Reservation) -> Resul
 /// the `Scope` that is made with it and handed to every stage that reads its rows.
 pub(super) trait Source {
     /// Hands `each` every row until it answers false. What the source keeps on the way is
-    /// asked of `reservation` before it is kept. Returns how many stored rows were read.
-    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<u64>;
+    /// asked of `reservation` before it is kept.
+    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<()>;
+    fn streaming(&self) -> bool {
+        false
+    }
+    fn page(&self, _walk: &Walk, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<()> {
+        self.rows(reservation, each)
+    }
+}
+
+/// The state carried through the existing table, cut and projection stages.
+#[derive(Default)]
+pub(super) struct Walk {
+    pub(super) after: RefCell<Option<table::Place>>,
+    /// The rows of a run the last page stopped inside, in their order and still charged.
+    pub(super) run: RefCell<Vec<table::Held>>,
+    /// The last row a walk in order handed on, as a debug build checks the next against it.
+    pub(super) last: RefCell<Option<Vec<Value>>>,
+    pub(super) offset: Cell<usize>,
+    pub(super) left: Cell<usize>,
+    pub(super) more: Cell<bool>,
 }
 
 /// What one statement is answered with, the same for every source of it.
 pub(super) struct Given<'a> {
+    pub(super) allowed: Option<&'a BTreeSet<String>>,
     pub(super) params: &'a HashMap<String, Value>,
     pub(super) catalog: &'a Catalog,
     pub(super) read: &'a dyn Read,
@@ -49,6 +69,7 @@ pub(super) struct Given<'a> {
     pub(super) ctx: EvalContext<'a>,
     /// The distances the statement's searches worked out, counted as they are.
     pub(super) evaluations: &'a Cell<u64>,
+    pub(super) examined: super::Counted<'a>,
     /// The last WITH name in reach, which leads to the ones before it.
     pub(super) named: Option<&'a subquery::Named<'a>>,
     /// For the SELECT of a WITH name read in place: the WHERE of the statement that reads it,
@@ -66,7 +87,7 @@ pub(super) fn select<'a>(
 ) -> Result<(Vec<String>, Box<dyn Source + 'a>)> {
     let (columns, source) = match subquery::Whole::of(select, given) {
         Some(whole) => (whole.bound()?, Box::new(whole) as Box<dyn Source + 'a>),
-        None => one(select, given, seeing, None)?,
+        None => one(select, given, seeing, None, true)?,
     };
     Ok((
         columns.into_iter().map(|column| column.name).collect(),
@@ -86,12 +107,14 @@ pub(super) fn one<'a>(
     given: &'a Given<'a>,
     seeing: &'a mut Reservation,
     from: Option<join::From<'a>>,
+    run: bool,
 ) -> Result<(Vec<ColumnDef>, Box<dyn Source + 'a>)> {
     let table = match (select.from.as_slice(), &from) {
         ([], _) | (_, Some(_)) => None,
         ([FromItem::Table { name, alias }], None) => {
             let table = given.catalog.table(name);
             let table = table.ok_or_else(|| Error::TableNotFound(name.clone()))?;
+            seeing.grow(table.heap + 32 * table.meta.columns.len() as u64)?;
             Some((table, alias.as_ref().unwrap_or(name).as_str()))
         }
         ([FromItem::Graph(_)], None) => None,
@@ -131,7 +154,9 @@ pub(super) fn one<'a>(
                     scope.open.push(name.clone());
                     None
                 }
-                near => numbers(eval(near, &table.scope(), &[], &given.ctx)?)?,
+                near => {
+                    numbers(&*eval(near, &table.scope(), &[], &given.ctx)?)?.map(Iterator::collect)
+                }
             };
             let actual = near.as_ref().map_or(expected, Vec::len);
             if actual != expected {
@@ -175,6 +200,12 @@ pub(super) fn one<'a>(
     if let Some(filter) = filter {
         reads(filter, &scope, params, &mut filtered)?;
     }
+    let membership = given.ctx.membership == Some(select.at.0)
+        && select.limit.is_none()
+        && select.offset.is_none()
+        && select.limit_name.is_none()
+        && select.offset_name.is_none();
+    let distinct = select.distinct && !membership;
     let (limit, offset) = limits(select, params)?;
     let list = list(select);
     let stored = table.map(|(table, _)| table);
@@ -229,7 +260,7 @@ pub(super) fn one<'a>(
     }
 
     // A count of every row is answered with no row read when a kept number gives it.
-    let counted = match (table, &groups) {
+    let mut counted = match (table, &groups) {
         (Some((table, _)), Some(groups)) if groups.counts_every_row() => {
             counts::count_without_rows(table, &scope, filter, given.reader, ctx, given.read)?
         }
@@ -250,12 +281,12 @@ pub(super) fn one<'a>(
         })
     };
     // Only the rows that can leave are kept, unless which rows leave is settled later.
-    let most = match select.distinct {
+    let most = match distinct {
         true => usize::MAX,
         false => limit.saturating_add(offset),
     };
     // Rows whose select list is worked out already: DISTINCT, then OFFSET and LIMIT.
-    let leave = |input: Box<dyn Source + 'a>| match select.distinct {
+    let leave = |input: Box<dyn Source + 'a>| match distinct {
         true => cut(Box::new(Distinct { input })),
         false => cut(input),
     };
@@ -264,6 +295,7 @@ pub(super) fn one<'a>(
     // window when there is one, and none for rows that are grouped.
     let order = match groups {
         Some(_) => &[],
+        None if membership => &[],
         None => select.order_by.as_slice(),
     };
     let reached = window.as_ref().map_or(order, Window::keys);
@@ -296,17 +328,27 @@ pub(super) fn one<'a>(
         (Some((table, qualifier)), None, ..) => {
             let visible = Visible::new(table, given.catalog, given.reader, seeing)?;
             let rows = table::Source::new(table, filter, ctx, given.read, visible)
+                .counted(given.examined)
                 .named(qualifier)
                 .reading(filtered, &wanted);
             let path = rows.choose(reached, &[])?;
             rows.say(&[], reached, &[])?;
+            // A count of every row for a whole-store reader, on a path that asks nothing of a
+            // row, is the number of the path's keys or entries, read not at all under LIMIT 0.
+            let every = groups.as_ref().is_some_and(Groups::counts_every_row) && limit > 0 && run;
+            if every && given.reader.is_admin() && path.checks.as_ref().is_some_and(Vec::is_empty) {
+                counted = Some(match ctx.said {
+                    Some(_) => 0,
+                    None => rows.entries(&path, u64::MAX, true)?,
+                });
+            }
             let in_order = path.in_order;
             (Box::new(Rows { table: rows, path }), in_order)
         }
         // With no table: the matches of a pattern or the rows of a join or of a WITH name, in
         // no order, or the one row of no FROM, each through the statement's filter.
         (None, _, Some(graph), _) => (Box::new(graph), reached.is_empty()),
-        (None, _, None, Some(from)) => (from.rows, false),
+        (None, _, None, Some(from)) => (from.rows, reached.is_empty()),
         (None, _, None, None) => (Box::new(One(Vec::new())), true),
     };
     if let (None, Some(filter)) = (table, filter) {
@@ -328,6 +370,9 @@ pub(super) fn one<'a>(
             most,
         };
         return Ok((columns, leave(Box::new(grouped))));
+    }
+    if !in_order && let Some(said) = ctx.said {
+        said.borrow_mut().push("Sort".into());
     }
     if let Some(window) = window {
         let numbered = Numbered {
@@ -360,7 +405,7 @@ pub(super) fn one<'a>(
             ctx,
         })
     };
-    let rows = match select.distinct {
+    let rows = match distinct {
         true => cut(Box::new(Distinct {
             input: listed(rows),
         })),
@@ -439,10 +484,55 @@ pub(super) struct Rows<'a> {
     pub(super) path: Path,
 }
 
+impl Rows<'_> {
+    /// In a debug build, checks that `row` comes no earlier in the order the path gives than
+    /// the row `last` holds, and makes it `last`.
+    fn checked(&self, last: &RefCell<Option<Vec<Value>>>, row: &[Value]) {
+        if cfg!(debug_assertions) && !self.path.asked.is_empty() {
+            let before = last.replace(Some(row.to_vec()));
+            let after =
+                |before: Vec<Value>| table::ordering(&self.path.asked, &before, row).is_le();
+            assert!(
+                before.is_none_or(after),
+                "a walk in order handed on a row out of it"
+            );
+        }
+    }
+}
+
 impl Source for Rows<'_> {
-    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<u64> {
-        let each = |_, row, bytes, reservation: &mut Reservation| each(row, bytes, reservation);
+    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<()> {
+        let last = RefCell::default();
+        let each = |_, row: Vec<Value>, bytes, reservation: &mut Reservation| {
+            self.checked(&last, &row);
+            each(row, bytes, reservation)
+        };
         self.table.walk(&self.path, reservation, each)
+    }
+    fn streaming(&self) -> bool {
+        true
+    }
+    fn page(&self, walk: &Walk, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<()> {
+        let (mut after, mut run) = (walk.after.borrow_mut(), walk.run.take());
+        // The places a held run has left empty stay charged while the list holds them.
+        let spare = |run: &Vec<_>| ((run.capacity() - run.len()) * size_of::<table::Held>()) as u64;
+        reservation.shrink(spare(&run));
+        walk.more.set(false);
+        let give = &mut |(_, row, _, bytes): table::Held, held: &mut Reservation| {
+            self.checked(&walk.last, &row);
+            let more = each(row, bytes, held)?;
+            walk.more.set(!more);
+            Ok(more)
+        };
+        // The rows of a run the last page stopped inside go first.
+        if !self.table.hand_on(&mut run, &[], reservation, give)? {
+            run.reverse();
+        } else {
+            run = (self.table).cells(&self.path, Some(&mut after), reservation, give)?;
+        }
+        reservation.grow(spare(&run))?;
+        walk.run.replace(run);
+        Ok(())
     }
 }
 
@@ -451,11 +541,11 @@ impl Source for Rows<'_> {
 struct One(Vec<Value>);
 
 impl Source for One {
-    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<u64> {
+    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<()> {
         let bytes = row_overhead(self.0.len());
         reservation.grow(bytes)?;
         each(self.0.clone(), bytes, reservation)?;
-        Ok(0)
+        Ok(())
     }
 }
 
@@ -469,10 +559,10 @@ pub(super) struct Filter<'a> {
 }
 
 impl Source for Filter<'_> {
-    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<u64> {
+    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<()> {
         self.input
             .rows(reservation, &mut |row, bytes, reservation| {
-                if eval(self.filter, &self.scope, &row, self.ctx)? == Value::Bool(true) {
+                if *eval(self.filter, &self.scope, &row, self.ctx)? == Value::Bool(true) {
                     return each(row, bytes, reservation);
                 }
                 reservation.shrink(bytes);
@@ -536,7 +626,7 @@ impl List<'_, '_> {
             .zip(self.moved)
             .map(|(column, moved)| match moved {
                 Some(at) => Ok(std::mem::replace(&mut row[*at], Value::Null)),
-                None => eval(&column.expr, self.scope, &row, self.ctx),
+                None => eval(&column.expr, self.scope, &row, self.ctx).map(Cow::into_owned),
             })
             .collect::<Result<Vec<_>>>()?;
         reservation.shrink(bytes - passed);
@@ -585,20 +675,39 @@ struct Project<'a> {
 }
 
 impl Source for Project<'_> {
-    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<u64> {
+    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<()> {
+        self.give(None, reservation, each)
+    }
+    fn streaming(&self) -> bool {
+        self.input.streaming()
+    }
+    fn page(&self, walk: &Walk, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<()> {
+        self.give(Some(walk), reservation, each)
+    }
+}
+impl Project<'_> {
+    fn give(
+        &self,
+        walk: Option<&Walk>,
+        reservation: &mut Reservation,
+        each: &mut Each<'_>,
+    ) -> Result<()> {
         let list = List {
             columns: self.columns,
             moved: &self.moved,
             scope: &self.scope,
             ctx: self.ctx,
         };
-        self.input
-            .rows(reservation, &mut |row, bytes, reservation| {
-                let before = reservation.bytes();
-                let row = list.of(row, bytes, reservation)?;
-                // What the row held has become what the worked-out values hold.
-                each(row, reservation.bytes() + bytes - before, reservation)
-            })
+        let mut each = |row, bytes, reservation: &mut Reservation| {
+            let before = reservation.bytes();
+            let row = list.of(row, bytes, reservation)?;
+            // What the row held has become what the worked-out values hold.
+            each(row, reservation.bytes() + bytes - before, reservation)
+        };
+        match walk {
+            Some(walk) => self.input.page(walk, reservation, &mut each),
+            None => self.input.rows(reservation, &mut each),
+        }
     }
 }
 
@@ -611,21 +720,41 @@ pub(super) struct Cut<'s> {
 }
 
 impl Source for Cut<'_> {
-    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<u64> {
-        if self.limit == 0 {
-            return Ok(0);
+    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<()> {
+        self.give(None, reservation, each)
+    }
+    fn streaming(&self) -> bool {
+        self.input.streaming()
+    }
+    fn page(&self, walk: &Walk, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<()> {
+        self.give(Some(walk), reservation, each)
+    }
+}
+impl Cut<'_> {
+    fn give(
+        &self,
+        walk: Option<&Walk>,
+        reservation: &mut Reservation,
+        each: &mut Each<'_>,
+    ) -> Result<()> {
+        let (offset, left) = (Cell::new(self.offset), Cell::new(self.limit));
+        let (offset, left) = walk.map_or((&offset, &left), |walk| (&walk.offset, &walk.left));
+        if left.get() == 0 {
+            return Ok(());
         }
-        let (mut skipped, mut left) = (0, 0);
-        self.input
-            .rows(reservation, &mut |row, bytes, reservation| {
-                if skipped < self.offset {
-                    skipped += 1;
-                    reservation.shrink(bytes);
-                    return Ok(true);
-                }
-                left += 1;
-                Ok(each(row, bytes, reservation)? && left < self.limit)
-            })
+        let mut each = |row, bytes, reservation: &mut Reservation| {
+            if offset.get() > 0 {
+                offset.set(offset.get() - 1);
+                reservation.shrink(bytes);
+                return Ok(true);
+            }
+            left.set(left.get() - 1);
+            Ok(each(row, bytes, reservation)? && left.get() > 0)
+        };
+        match walk {
+            Some(walk) => self.input.page(walk, reservation, &mut each),
+            None => self.input.rows(reservation, &mut each),
+        }
     }
 }
 
@@ -636,30 +765,26 @@ pub(super) struct Distinct<'s> {
 }
 
 impl Source for Distinct<'_> {
-    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<u64> {
-        // Beside a row: its entry here, and its place when the rows are put back in the order
-        // they arrived in.
-        let beside = 2 * size_of::<(Key<'_, ()>, (usize, u64))>() as u64;
-        let mut first = BTreeMap::new();
-        let examined = self
+    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<()> {
+        // A row is handed on when it is first seen; the copy kept to know it again is charged
+        // here, with its entry, until the rows end.
+        let beside = crate::memory::node::<Key<'_, ()>>();
+        let (mut seen, mut held) = (BTreeSet::new(), 0);
+        let more = self
             .input
             .rows(reservation, &mut |row, bytes, reservation| {
-                let arrived = first.len();
-                match first.entry(Key(row, &[], ())) {
-                    Entry::Vacant(new) => {
-                        reservation.grow(beside)?;
-                        new.insert((arrived, bytes));
-                    }
-                    Entry::Occupied(_) => reservation.shrink(bytes),
+                let row = Key(row, &[], ());
+                if seen.contains(&row) {
+                    reservation.shrink(bytes);
+                    return Ok(true);
                 }
-                Ok(true)
-            })?;
-        let mut kept: Vec<_> = first.into_iter().collect();
-        kept.sort_unstable_by_key(|(_, (arrived, _))| *arrived);
-        let kept = kept
-            .into_iter()
-            .map(|(Key(row, ..), (_, bytes))| (row, bytes, beside));
-        hand_on(kept, reservation, each)?;
-        Ok(examined)
+                let kept = bytes + beside * if seen.is_empty() { 4 } else { 1 };
+                reservation.grow(kept)?;
+                held += kept;
+                seen.insert(Key(row.0.clone(), &[], ()));
+                each(row.0, bytes, reservation)
+            });
+        reservation.shrink(held);
+        more
     }
 }

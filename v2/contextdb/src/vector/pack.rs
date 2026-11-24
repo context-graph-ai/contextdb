@@ -1,17 +1,19 @@
 //! The last steps of a build: packing the slots of each group into the blocks of the new
-//! grouping with a sketch of each, measuring how far a search scans and how wide it
-//! takes a sketch's estimate to be, and putting the grouping in force.
+//! IVF with a binary code of each, measuring how far a search scans and how wide it
+//! takes a binary code's estimate to be, and putting the IVF in force.
 
+use super::binary::{Codes, WIDEST, code_len};
 use super::block::{BLOCK_BYTES, BROKEN, BlockReader, BlockWriter};
 use super::build::{
     Build, Ground, MEASURED, Phase, STEP_COMPARISONS, STEP_SLOTS, Step, left_at, moved,
 };
-use super::directory::{Grouped, kept};
-use super::grouping::{Grouping, Place, centres, centres_to_a_record, mean, nearest};
-use super::seal::room;
-use super::search::{gap_needed, kept_by_width};
-use super::sketch::{WIDEST, sketch_len, sketches_of};
-use super::slot::{SLOT_HEADER, slot_len};
+use super::directory::{Grouped, Partition, kept};
+use super::ivf::{Ivf, Place, centroids, centroids_per_record, mean, nearest};
+use super::seal::put_block;
+use super::search::{BINARY_CODES, gap_needed, kept_by_width};
+use super::slot::slot_len;
+use super::train;
+use crate::memory::Reservation;
 use crate::store::{Key, Read, VectorId, VectorRecord};
 use crate::types::Result;
 
@@ -35,11 +37,12 @@ const COUNTED: &str = "a build of the vector part was given more slots than it c
 /// record the step puts.
 fn copy(ground: &Ground<'_>, step: &mut Step) -> Result<Build> {
     let lists = 12 * u64::from(ground.build.groups) + 8 + 80 * u64::from(MEASURED);
-    step.held.grow(2 * lists + FIELDS)?;
+    let sums = 8 * ground.build.sum.len() as u64;
+    step.held.grow(2 * (lists + sums) + FIELDS)?;
     Ok(ground.build.clone())
 }
 
-/// The grouping a build has packed, as the partition's record names it once it is in force.
+/// The IVF a build has packed, as the partition's record names it once it is in force.
 fn packed(build: &Build) -> Grouped {
     let end = build.starts.last().copied().unwrap_or_default();
     Grouped {
@@ -51,14 +54,10 @@ fn packed(build: &Build) -> Grouped {
     }
 }
 
-/// The grouping of the build's places with these three numbers, its places reserved first.
-fn grouping_of(
-    build: &Build,
-    step: &mut Step,
-    (gap, probes, width): (u32, u32, u8),
-) -> Result<Grouping> {
+/// The IVF of the build's places with these three numbers, its places reserved first.
+fn ivf_of(build: &Build, step: &mut Step, (gap, probes, width): (u32, u32, u8)) -> Result<Ivf> {
     step.held.grow(8 * build.starts.len() as u64)?;
-    Ok(Grouping {
+    Ok(Ivf {
         gap,
         probes,
         width,
@@ -66,72 +65,84 @@ fn grouping_of(
     })
 }
 
-/// Hands `each` the block kept under `record`, read in place. A block that is missing or not
-/// whole is damage.
-fn with_block(
-    read: &dyn Read,
-    record: VectorRecord<'_>,
-    dimension: usize,
-    each: &mut dyn FnMut(&BlockReader<'_>) -> Result<()>,
-) -> Result<()> {
-    let mut whole = false;
-    read.vectors(record, &mut |first, bytes| {
-        let block = BlockReader::new(bytes, dimension);
-        whole = first == record && block.is_whole();
-        if whole {
-            each(&block)?;
-        }
-        Ok(false)
-    })?;
-    if whole {
-        Ok(())
-    } else {
-        Err(read.damaged(BROKEN))
-    }
+/// Validates a borrowed block and returns its reader.
+pub(super) fn block<'a>(read: &dyn Read, v: &'a [u8], dim: usize) -> Result<BlockReader<'a>> {
+    let (r, err) = (BlockReader::new(v, dim), || read.damaged(BROKEN));
+    r.is_whole().then_some(r).ok_or_else(err)
 }
 
-/// Finishes a block of the build and puts it, its bytes reserved first. With centres, the
-/// record of its sketches is put with it, made from the whole block: the reference of a slot
-/// is the centre of the last group that begins at or before the slot's place.
-fn put_block(
-    step: &mut Step,
-    build: &Build,
-    block: u32,
-    writer: BlockWriter,
-    centres: &[f32],
-    dimension: usize,
-) -> Result<()> {
-    let vector = step.work.vector;
-    step.held.grow(writer.bytes() as u64)?;
-    let value = writer.finish();
-    if !centres.is_empty() {
-        let count = BlockReader::new(&value, dimension).len();
-        step.held.grow((4 + count * sketch_len(dimension)) as u64)?;
-        let mut centre = |slot: usize| {
-            let place = Place {
-                block,
-                slot: slot as u32,
-            };
-            let group = build.starts.partition_point(|start| *start <= place) - 1;
-            &centres[group * dimension..][..dimension]
-        };
-        let sketches = sketches_of(&value, dimension, &mut centre);
-        let record = VectorRecord::Sketch(vector, build.number, block);
-        step.puts.push((record, sketches));
+/// Validates a borrowed binary-code record and returns it with its slot count.
+pub(super) fn codes<'a>(read: &dyn Read, v: &'a [u8], dim: usize) -> Result<(Codes<'a>, usize)> {
+    let (n, c) = (
+        v.len().saturating_sub(4) / code_len(dim),
+        Codes::new(v, dim),
+    );
+    let err = || read.damaged(BINARY_CODES);
+    c.is_whole(n).then_some((c, n)).ok_or_else(err)
+}
+
+/// Hands `each` the block kept under `record`, read in place.
+pub(super) fn with_block<T>(
+    read: &dyn Read,
+    record: VectorRecord<'_>,
+    dim: usize,
+    each: &mut dyn FnMut(&BlockReader<'_>) -> Result<T>,
+) -> Result<T> {
+    kept(read, record, |v| each(&block(read, v, dim)?))?.ok_or_else(|| read.damaged(BROKEN))?
+}
+
+/// Validates a block and its companion codes against their partition or build owner.
+pub(super) fn companions<T>(
+    read: &dyn Read,
+    record: VectorRecord<'_>,
+    dim: usize,
+    (p, b): (&Partition, Option<&Build>),
+    lent: Option<&[u8]>,
+    each: &mut dyn FnMut(&BlockReader<'_>) -> Result<T>,
+) -> Result<T> {
+    let (VectorRecord::Block(id, n, at) | VectorRecord::Binary(id, n, at)) = record else {
+        unreachable!()
+    };
+    let groups = [
+        p.ivf,
+        b.and_then(|b| b.from),
+        b.filter(|b| b.phase != Phase::Sweep).map(packed),
+    ];
+    let (span, many) = if n == p.number {
+        (p.first..p.blocks, p.ivf.is_some_and(|g| g.groups > 1))
+    } else if let Some(g) = groups.into_iter().flatten().find(|g| g.number == n) {
+        (0..g.blocks, g.groups > 1)
+    } else {
+        return Err(read.damaged("a vector block has no owner"));
+    };
+    if !span.contains(&at) {
+        return Err(read.damaged("a vector block is outside its owner"));
     }
-    let record = VectorRecord::Block(vector, build.number, block);
-    step.puts.push((record, value));
-    Ok(())
+    let mut pair = |r: &BlockReader<'_>| {
+        let whole = |v: &[u8]| codes(read, v, dim).map(|(_, len)| len == r.len());
+        let ok = match lent.filter(|_| matches!(record, VectorRecord::Binary(..))) {
+            Some(v) => whole(v)?,
+            None => kept(read, VectorRecord::Binary(id, n, at), whole)?
+                .transpose()?
+                .unwrap_or(!many),
+        };
+        ok.then_some(()).ok_or_else(|| read.damaged(BINARY_CODES))?;
+        each(r)
+    };
+    match lent.filter(|_| matches!(record, VectorRecord::Block(..))) {
+        Some(v) => pair(&block(read, v, dim)?),
+        None => with_block(read, VectorRecord::Block(id, n, at), dim, &mut pair),
+    }
 }
 
 /// The step that packs the next groups: whole groups while they come to at most
 /// `STEP_SLOTS` slots, and one group at least. Within a group the slots are in the order of
 /// their rows' keys and a key comes once. Every block it writes comes with the record of its
-/// sketches, each taken from the centre of its slot's group.
+/// binary codes, each taken from the centroid of its slot's group.
 ///
 /// Reserved before it is taken: for each slot of the step's groups its bytes, its key, and
 /// the entries of the list the slots are sorted in and of the two that list is parted into;
-/// the lists of the block being written, and every block and record of sketches the step
+/// the lists of the block being written, and every block and record of binary codes the step
 /// puts.
 pub(super) fn pack(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
     let Phase::Pack { group } = ground.build.phase else {
@@ -149,9 +160,9 @@ pub(super) fn pack(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
     let len = slot_len(dimension);
     let each = len + size_of::<(u32, Key, u32)>() + size_of::<(Key, u32, u32)>();
     step.held.grow(total * each as u64 + BLOCK_BYTES as u64)?;
-    let centres = match build.groups {
+    let mut centroids = match build.groups {
         1 => Vec::new(),
-        groups => centres(
+        groups => centroids(
             read,
             vector,
             build.number,
@@ -168,10 +179,10 @@ pub(super) fn pack(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
     let held = &mut step.held;
     let from = VectorRecord::Assigned(vector, build.number, 0);
     read.vectors(from, &mut |record, given| {
-        let VectorRecord::Assigned(column, grouping, place) = record else {
+        let VectorRecord::Assigned(column, ivf, place) = record else {
             return Ok(false);
         };
-        if (column, grouping) != (vector, build.number) {
+        if (column, ivf) != (vector, build.number) {
             return Ok(false);
         }
         let (groups, []) = given.as_chunks::<2>() else {
@@ -193,12 +204,36 @@ pub(super) fn pack(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
                 let key = block.key(at);
                 held.grow(key.as_bytes().len() as u64)?;
                 slots.extend_from_slice(block.slot(at));
+                step.rows_read += 1;
                 found.push((to(at), key, found.len() as u32));
             }
             Ok(())
         })?;
         Ok(true)
     })?;
+    if build.groups > 1 {
+        step.held.grow(
+            8 * dimension as u64 * (u64::from(end - group) + 2 * u64::from(build.sum.is_empty())),
+        )?;
+        build.sum.resize(dimension, 0.0);
+        let mut sums = vec![0.0; (end - group) as usize * dimension];
+        for (to, _, at) in &found {
+            let slot = &slots[*at as usize * len..][..len];
+            let sum = &mut sums[(*to - group) as usize * dimension..][..dimension];
+            train::add(sum, slot);
+            train::add(&mut build.sum, slot);
+        }
+        for (sum, centroid) in sums.chunks(dimension).zip(
+            centroids[group as usize * dimension..end as usize * dimension].chunks_mut(dimension),
+        ) {
+            centroid.fill(0.0);
+            train::normalize(sum, centroid);
+        }
+        if end == build.groups {
+            step.held.grow(12 * dimension as u64)?;
+            step.mean = Some(train::mean(&build.sum, packed(&build).slots));
+        }
+    }
     found.sort_unstable();
     let parted = found.into_iter().map(|(to, key, at)| (key, (to, at)));
     let (keys, order): (Vec<Key>, Vec<(u32, u32)>) = parted.unzip();
@@ -210,18 +245,32 @@ pub(super) fn pack(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
         BlockWriter::new(dimension, None, &keys)
     } else {
         let last = VectorRecord::Block(vector, build.number, place.block);
-        let carried = kept(read, last, |last| {
-            let whole = BlockReader::new(last, dimension).is_whole();
-            whole.then(|| BlockWriter::new(dimension, Some(last), &keys))
-        })?;
-        carried.flatten().ok_or_else(|| read.damaged(BROKEN))?
+        let open = |b: &[u8]| {
+            block(read, b, dimension).map(|_| BlockWriter::new(dimension, Some(b), &keys))
+        };
+        kept(read, last, open)?.ok_or_else(|| read.damaged(BROKEN))??
+    };
+    let put = |step: &mut Step, build: &Build, block, writer| {
+        let centroid = |(block, slot): (u32, u32)| {
+            let place = Place { block, slot };
+            let group = build.starts.partition_point(|start| *start <= place) - 1;
+            &centroids[group * dimension..][..dimension]
+        };
+        let reference = (!centroids.is_empty()).then_some(centroid);
+        let sink = |record, value| {
+            step.puts.push((record, value));
+            Ok(())
+        };
+        let held = (&mut step.held, |_: &mut Reservation, _| {});
+        let reference = (dimension, reference);
+        put_block((vector, build.number, block), writer, held, reference, sink)
     };
     build.counts[group as usize..end as usize].fill(0);
     for (done, (key, (to, at))) in keys.iter().zip(&order).enumerate() {
         if left == 0 {
             // A block that was full before this step is left as it is.
             if !writer.is_empty() {
-                put_block(step, &build, place.block, writer, &centres, dimension)?;
+                put(step, &build, place.block, writer)?;
             }
             place = Place {
                 block: place.block + 1,
@@ -238,7 +287,7 @@ pub(super) fn pack(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
         place.slot += 1;
     }
     if !writer.is_empty() {
-        put_block(step, &build, place.block, writer, &centres, dimension)?;
+        put(step, &build, place.block, writer)?;
     }
     build.starts.resize(end as usize + 1, place);
 
@@ -251,14 +300,15 @@ pub(super) fn pack(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
     } else {
         Phase::Measure { done: 0, most: 0 }
     };
+    step.centroids = centroids;
     moved(ground, step, build);
     Ok(())
 }
 
 /// Makes question `number` of a build over `slots` slots in `query`, from the vectors that
-/// slots of the new grouping keep (scale times codes), brought to length one. An even
+/// slots of the new IVF keep (scale times codes), brought to length one. An even
 /// question is the middle of two: the slot at `number * slots / M`, with `M` the lesser of
-/// `MEASURED` and `slots`, and the one half the grouping further on, added. An odd question is
+/// `MEASURED` and `slots`, and the one half the IVF further on, added. An odd question is
 /// the first of those alone, a stored vector, whose nearest slot is itself: a search asks
 /// both kinds. A slot is found from the running sum of the groups' counts and the place
 /// where its group begins; no row is read.
@@ -270,6 +320,7 @@ fn question(
     query: &mut Vec<f32>,
 ) -> Result<()> {
     let build = &ground.build;
+    let mut sum = vec![0.0; ground.dimension];
     query.clear();
     query.resize(ground.dimension, 0.0);
     let first = u64::from(number) * slots / slots.min(u64::from(MEASURED));
@@ -287,31 +338,20 @@ fn question(
             with_block(ground.read, record, ground.dimension, &mut |block| {
                 at = place.checked_sub(block.len());
                 if at.is_none() {
-                    let slot = block.slot(place);
-                    let scale = f32::from_le_bytes([slot[0], slot[1], slot[2], slot[3]]);
-                    for (sum, code) in query.iter_mut().zip(&slot[SLOT_HEADER..]) {
-                        *sum += scale * f32::from(code.cast_signed());
-                    }
+                    train::add(&mut sum, block.slot(place));
                 }
                 Ok(())
             })?;
             block += 1;
         }
     }
-    let length = query
-        .iter()
-        .map(|number| number * number)
-        .sum::<f32>()
-        .sqrt();
-    if length > 0.0 {
-        query.iter_mut().for_each(|number| *number /= length);
-    }
+    train::normalize(&sum, query);
     Ok(())
 }
 
-/// The step that asks the new grouping the next of its questions (`build::MEASURED`) and
-/// keeps the largest gap any of them needed for its ten nearest: how far the centre of the
-/// furthest group holding one of them falls short of the best centre's product.
+/// The step that asks the new IVF the next of its questions (`build::MEASURED`) and
+/// keeps the largest gap any of them needed for its ten nearest: how far the centroid of the
+/// furthest group holding one of them falls short of the best centroid's product.
 pub(super) fn measure(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
     let Phase::Measure { mut done, mut most } = ground.build.phase else {
         unreachable!("a build that measures its gap is in that phase")
@@ -319,8 +359,8 @@ pub(super) fn measure(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
     let (read, vector, dimension) = (ground.read, step.work.vector, ground.dimension);
     let mut build = copy(ground, step)?;
     let grouped = packed(&build);
-    let grouping = grouping_of(&build, step, (0, 1, 0))?;
-    step.held.grow(4 * dimension as u64)?;
+    let ivf = ivf_of(&build, step, (0, 1, 0))?;
+    step.held.grow(12 * dimension as u64)?;
     let mut query = Vec::with_capacity(dimension);
     let questions = grouped.slots.min(u64::from(MEASURED));
     let fitting = (STEP_COMPARISONS / grouped.slots).max(1);
@@ -330,7 +370,7 @@ pub(super) fn measure(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
         let taken = step.held.bytes();
         step.held.grow(80)?;
         let held = &mut step.held;
-        let (gap, places) = gap_needed(read, vector, grouped, &grouping, &query, held)?;
+        let (gap, places) = gap_needed(read, vector, grouped, &ivf, &query, held)?;
         most = most.max(gap);
         build.tens.extend(places);
         step.held.shrink(step.held.bytes() - taken);
@@ -353,9 +393,9 @@ pub(super) fn measure(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
 
 /// The step that asks the next of the same questions again, of the groups inside the gap
 /// alone, keeps the most groups any of them had inside, and counts for each width how many of
-/// the question's ten the sketches kept: both the sketch a slot has from its group's centre
+/// the question's ten the binary codes kept: both the binary code a slot has from its group's centroid
 /// and the one a tail block would keep of it, from the partition's mean, so that the one
-/// width serves a search of the grouping and of its tail. When the last is asked, the width
+/// width serves a search of the IVF and of its tail. When the last is asked, the width
 /// is the least that kept 99 in 100 of all the neighbours asked for, and 0 when none did.
 pub(super) fn width(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
     let Phase::Width {
@@ -371,25 +411,20 @@ pub(super) fn width(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
     let (read, vector, dimension) = (ground.read, step.work.vector, ground.dimension);
     let build = copy(ground, step)?;
     let grouped = packed(&build);
-    let grouping = grouping_of(&build, step, (gap, 1, 0))?;
-    step.held.grow(4 * dimension as u64)?;
+    let ivf = ivf_of(&build, step, (gap, 1, 0))?;
+    step.held.grow(12 * dimension as u64)?;
     let mut query = Vec::with_capacity(dimension);
-    let mean = mean(
-        read,
-        vector,
-        ground.partition.number,
-        dimension,
-        &mut step.held,
-    )?;
+    let mean = mean(read, vector, build.number, dimension, &mut step.held)?;
     let questions = grouped.slots.min(u64::from(MEASURED)) as u32;
     let each = build.tens.len() / questions as usize;
     let (first, mut estimated) = (done, 0);
     while done < questions {
         question(ground, vector, grouped.slots, done, &mut query)?;
-        // The sketches the question has estimated: the slots of the groups inside the gap.
+        // The binary codes the question has estimated: the slots of the groups inside the gap.
         let taken = step.held.bytes();
         let inside: u64 = {
-            let groups = nearest(read, vector, grouped, &query, &mut step.held)?;
+            let mut groups = nearest(read, vector, grouped, &query, &mut step.held, None)?;
+            groups.retain(|(group, _)| ivf.nonempty(*group));
             let short = |product: f32| f64::from(groups[0].1 - product) * 10_000.0;
             let inside = groups
                 .iter()
@@ -406,7 +441,7 @@ pub(super) fn width(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
         let wanted = &build.tens[done as usize * each..][..each];
         let held = &mut step.held;
         let both = (query.as_slice(), mean.as_slice());
-        let (more, inside) = kept_by_width(read, vector, grouped, &grouping, both, wanted, held)?;
+        let (more, inside) = kept_by_width(read, vector, grouped, &ivf, both, wanted, held)?;
         step.held.shrink(step.held.bytes() - taken);
         asked += each as u32;
         keeps
@@ -435,9 +470,9 @@ pub(super) fn width(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
     Ok(())
 }
 
-/// The last step: writes the grouping's record and has the partition's record name it, and
-/// removes what it replaces: the grouping the build read, the tail blocks it read with their
-/// sketches, and the records of the build: all of them, or all but its own when some slot
+/// The last step: writes the IVF's record and has the partition's record name it, and
+/// removes what it replaces: the IVF the build read, the tail blocks it read with their
+/// binary codes, and the records of the build: all of them, or all but its own when some slot
 /// it read was stale, which then stays for [`sweep`].
 pub(super) fn switch(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
     let Phase::Switch { gap, probes, width } = ground.build.phase else {
@@ -446,26 +481,26 @@ pub(super) fn switch(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
     let (vector, dimension) = (step.work.vector, ground.dimension);
     let number = ground.partition.number;
     let mut build = copy(ground, step)?;
-    let grouping = grouping_of(&build, step, (gap, probes, width))?;
-    // The grouping's record, and the list of what is removed: at most a record, the centres
-    // and two records a block of the grouping the build read, two a tail block, and the
+    let ivf = ivf_of(&build, step, (gap, probes, width))?;
+    // The IVF's record, and the list of what is removed: at most a record, the centroids
+    // and two records a block of the IVF the build read, two a tail block, and the
     // build's own with one for each block it read.
     let removed = 3 * u64::from(build.blocks()) + build.from.map_or(0, |from| from.groups.into());
     let listed = (removed + 2) * size_of::<VectorRecord<'_>>() as u64;
     step.held
         .grow(12 + 8 * build.starts.len() as u64 + listed)?;
-    let record = VectorRecord::Grouping(vector, build.number);
-    step.puts.push((record, grouping.encode()));
+    let record = VectorRecord::Ivf(vector, build.number);
+    step.puts.push((record, ivf.encode()));
     step.switch = Some(packed(&build));
     if let Some(from) = build.from {
         step.removes.extend(records_of(vector, from, dimension));
     }
     for block in build.tail.0..build.tail.1 {
-        let sketch = VectorRecord::Sketch(vector, number, block);
+        let code = VectorRecord::Binary(vector, number, block);
         step.removes
-            .extend([VectorRecord::Block(vector, number, block), sketch]);
+            .extend([VectorRecord::Block(vector, number, block), code]);
     }
-    // The centres, blocks and sketches the build wrote are the grouping's now.
+    // The centroids, blocks and binary codes the build wrote are the IVF's now.
     let written = build.written(vector, number, dimension);
     step.removes.extend(written.filter(|record| match record {
         VectorRecord::Assigned(..) => true,
@@ -473,6 +508,7 @@ pub(super) fn switch(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
         _ => false,
     }));
     if build.stale {
+        build.from = None;
         build.tens.clear();
         build.phase = Phase::Sweep;
         moved(ground, step, build);
@@ -480,14 +516,11 @@ pub(super) fn switch(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
     Ok(())
 }
 
-/// A step after the switch: removes up to 4,096 of the partition's `Left` records whose value
-/// is below the build's `upto`. The build applied each of them to every slot it read, and no
-/// slot left can be stale by one; a record of `upto` itself may have been written after the
-/// build read its slot, and stays for the next build. When none is left the step removes the
-/// build's record.
+/// After the switch, removes up to 4,096 deletions through the source commit, inclusive.
+/// Newer deletions stay for the next build. When none is left, removes the build record.
 pub(super) fn sweep(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
     let (vector, number) = (step.work.vector, ground.partition.number);
-    let upto = ground.build.upto;
+    let cutoff = ground.partition.building.map_or(0, |(_, source)| source);
     let first = Key::from_values(&[], &[])?;
     let (held, left) = (&mut step.held, &mut step.left);
     let from = VectorRecord::Left(vector, number, &first);
@@ -498,10 +531,11 @@ pub(super) fn sweep(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
         if (column, partition) != (vector, number) {
             return Ok(false);
         }
-        if left_at(ground, value)? < upto {
-            room(left, SWEPT, held)?;
+        let [(_, fence), _] = left_at(ground.read, &ground.partition, value)?;
+        if fence <= cutoff {
+            held.room(left, SWEPT)?;
             held.grow(key.as_bytes().len() as u64)?;
-            left.push(key.clone());
+            left.push((key.clone(), fence));
         }
         Ok(left.len() < SWEPT)
     })?;
@@ -514,21 +548,22 @@ pub(super) fn sweep(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
     Ok(())
 }
 
-/// The records of a grouping, for a commit that removes it: its record, its centres, its
-/// blocks and their sketches.
+/// Every record owned by an IVF.
 pub(super) fn records_of(
     vector: VectorId,
     grouped: Grouped,
     dimension: usize,
 ) -> impl Iterator<Item = VectorRecord<'static>> {
     let Grouped { number, blocks, .. } = grouped;
-    let centres = grouped
+    let centroids = grouped
         .groups
-        .div_ceil(centres_to_a_record(dimension) as u32);
-    std::iter::once(VectorRecord::Grouping(vector, number))
-        .chain((0..centres).map(move |place| VectorRecord::Centres(vector, number, place)))
+        .div_ceil(centroids_per_record(dimension) as u32)
+        * u32::from(grouped.groups > 1);
+    std::iter::once(VectorRecord::Ivf(vector, number))
+        .chain((grouped.groups > 1).then_some(VectorRecord::Mean(vector, number)))
+        .chain((0..centroids).map(move |place| VectorRecord::Centroids(vector, number, place)))
         .chain((0..blocks).flat_map(move |block| {
-            let sketch = VectorRecord::Sketch(vector, number, block);
-            [VectorRecord::Block(vector, number, block), sketch]
+            let code = VectorRecord::Binary(vector, number, block);
+            [VectorRecord::Block(vector, number, block), code]
         }))
 }

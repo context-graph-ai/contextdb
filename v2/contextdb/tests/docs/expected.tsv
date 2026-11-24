@@ -14,7 +14,6 @@ docs/why-contextdb.md	5	page	*=refused	a syntax outline or a clause on its own, 
 docs/why-contextdb.md	6	page	*=TableNotFound	the page declares no such table before this block
 docs/query-language.md	4	page	*=refused	a syntax outline or a clause on its own, not a statement
 docs/query-language.md	5	page	*=TableNotFound	the page declares no such table before this block
-docs/query-language.md	6	later	*=refused	a later version reads triggers and the disk, maintenance, cache and compaction settings
 docs/query-language.md	7	page	*=TableNotFound	the page declares no such table before this block
 docs/query-language.md	9	page	*=TableNotFound	the page declares no such table before this block
 docs/query-language.md	10	page	*=refused	a syntax outline or a clause on its own, not a statement
@@ -27,9 +26,8 @@ docs/query-language.md	17	page	*=TableNotFound	the page declares no such table b
 docs/query-language.md	18	changed	1=refused	ORDER BY takes any expression, so the kind shown is gone; the page declares no readings table and UPPER is no function of this version
 docs/query-language.md	20	page	*=TableNotFound	the page declares no such table before this block
 docs/query-language.md	21	page	3=refused	the block shows two endings of one transaction, and the second has none to end
-docs/query-language.md	22	later	1=refused; 5=refused; 6=refused; 7=refused; 8=refused; 9=refused; 10=refused	a later version reads triggers and the disk, maintenance, cache and compaction settings; a later version reads sync, tenant policy and delivery statements
-docs/query-language.md	23	later	*=refused	a later version reads triggers and the disk, maintenance, cache and compaction settings
-docs/query-language.md	24	later	*=refused	a later version reads triggers and the disk, maintenance, cache and compaction settings
+docs/query-language.md	22	later	1=refused	a later version reads sync policy; disk limits and maintenance polling are supported
+docs/query-language.md	24	changed	1=refused; 2=refused; 3=refused	compaction accepts individual START_RATIO and STOP_RATIO settings and SHOW, not MIN_INTERVAL, MAX_SWEEPS or a grouped DEFAULT
 docs/query-language.md	25	later	1=refused	a later version reads the vector index options and SHOW VECTOR_INDEXES / SHOW VECTOR_PARTITIONS
 docs/query-language.md	26	later	1=refused	a later version reads the vector index options and SHOW VECTOR_INDEXES / SHOW VECTOR_PARTITIONS
 docs/query-language.md	27	page	2=TableNotFound	the page declares no such table before this block

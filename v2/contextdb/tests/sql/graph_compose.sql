@@ -22,7 +22,7 @@ VALUES (1, '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-0000
        (7, '00000000-0000-0000-0000-000000000012', '00000000-0000-0000-0000-000000000001', 'EXTRACTED_FROM'),
        (8, '00000000-0000-0000-0000-000000000015', '00000000-0000-0000-0000-000000000002', 'EXTRACTED_FROM');
 ----
-rows affected: 8
+rows affected: 8  (read 0, compared 0)
 
 INSERT INTO tasks (id, status)
 VALUES ('00000000-0000-0000-0000-000000000001', 'active'),
@@ -30,7 +30,7 @@ VALUES ('00000000-0000-0000-0000-000000000001', 'active'),
        ('00000000-0000-0000-0000-000000000003', 'done'),
        ('00000000-0000-0000-0000-000000000005', 'active');
 ----
-rows affected: 4
+rows affected: 4  (read 0, compared 0)
 
 # Items 12, 14 and 15 hold the vector that is searched for; 13 holds another. Item 15 is on no
 # RELATES_TO edge, and item 14 is deprecated.
@@ -40,10 +40,11 @@ VALUES ('00000000-0000-0000-0000-000000000012', 'near', FALSE, [1.0, 0.0]),
        ('00000000-0000-0000-0000-000000000014', 'retired', TRUE, [1.0, 0.0]),
        ('00000000-0000-0000-0000-000000000015', 'outside', FALSE, [1.0, 0.0]);
 ----
-rows affected: 4
+rows affected: 4  (read 0, compared 0)
 
 # The tasks that task 1 depends on, joined to their rows: task 3 is not active, and task 5 is
-# active but no dependency of task 1.
+# active but no dependency of task 1. The walk reads its 2 edges and each task it reaches is read
+# by its key (reads 2 + 2).
 WITH deps AS (
   SELECT b_id FROM GRAPH_TABLE(
     edges MATCH (a)-[:DEPENDS_ON]->{1,3}(b)
@@ -55,11 +56,12 @@ SELECT t.id, t.status FROM tasks t
 INNER JOIN deps ON t.id = deps.b_id
 WHERE t.status = 'active';
 ----
-id | status
+id | status  (read 4, compared 0)
 00000000-0000-0000-0000-000000000002 | active
 
 # The graph first, the search after: the nearest items among those a RELATES_TO walk reaches.
-# Item 15 is as near as item 12 and is in no answer, because no walk reaches it.
+# Item 15 is as near as item 12 and is in no answer, because no walk reaches it. The walks read
+# the 8 edges and each of the 3 items reached is read by its key (reads 8 + 3).
 WITH neighborhood AS (
   SELECT b_id FROM GRAPH_TABLE(
     edges MATCH (a)-[:RELATES_TO]->{1,2}(b)
@@ -75,7 +77,7 @@ SELECT id, name FROM candidates
 ORDER BY embedding <=> [1.0, 0.0]
 LIMIT 5;
 ----
-id | name
+id | name  (read 11, compared 0)
 00000000-0000-0000-0000-000000000012 | near
 00000000-0000-0000-0000-000000000013 | far
 
@@ -89,9 +91,16 @@ SELECT a_id, b_id FROM GRAPH_TABLE(
   COLUMNS (a.id AS a_id, b.id AS b_id)
 ) ORDER BY a_id;
 ----
-a_id | b_id
+a_id | b_id  (read 10, compared 4)
 00000000-0000-0000-0000-000000000012 | 00000000-0000-0000-0000-000000000001
 00000000-0000-0000-0000-000000000015 | 00000000-0000-0000-0000-000000000002
+
+# A WITH name joined to an edge table reads its start row and its one edge, never all three.
+WITH start AS (SELECT id FROM tasks WHERE id = '00000000-0000-0000-0000-000000000001')
+SELECT e.target_id FROM start s JOIN edges e ON e.source_id = s.id WHERE e.edge_type = 'DEPENDS_ON';
+----
+target_id  (read 2, compared 0)
+00000000-0000-0000-0000-000000000002
 
 # A graph pattern is joined through a CTE. Written straight into a join it is not read.
 SELECT r.b_id, t.status FROM GRAPH_TABLE(
@@ -99,3 +108,9 @@ SELECT r.b_id, t.status FROM GRAPH_TABLE(
 ) AS r JOIN tasks t ON t.id = r.b_id;
 ----
 error: ParseError
+
+WITH start AS (SELECT id FROM tasks WHERE id = '00000000-0000-0000-0000-000000000001')
+SELECT e.target_id FROM start s JOIN edges e ON e.source_id = s.id WHERE e.edge_type = 'DEPENDS_ON';
+----
+target_id  (read 2, compared 0)
+00000000-0000-0000-0000-000000000002

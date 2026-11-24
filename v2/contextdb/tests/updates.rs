@@ -163,10 +163,10 @@ fn fits(outcome: contextdb::Result<contextdb::QueryResult>, what: &str) -> conte
 }
 
 #[test]
-fn an_update_and_a_delete_of_40_000_rows_hold_one_batch_beside_what_they_stage() {
-    // Forty batches of a thousand rows: an eighth of what the statement stages is room for
-    // five batches and for no more than an eighth of a second copy of the matched rows.
-    const ROWS: i64 = 40_000;
+fn an_update_and_a_delete_hold_one_batch_beside_what_they_stage() {
+    // Sixteen batches of a thousand rows: an eighth of what the statement stages is room for
+    // two batches and for no more than an eighth of a second copy of the matched rows.
+    const ROWS: i64 = 16_000;
     const ROOMY: usize = 512 * MIB;
     let folder = support::folder("many-rows-one-batch");
     let mut options = DatabaseOpenOptions::default();
@@ -197,25 +197,37 @@ fn an_update_and_a_delete_of_40_000_rows_hold_one_batch_beside_what_they_stage()
     // the statement has returned, and rolls back.
     let staged_by = |sql: &str| -> usize {
         let tx = db.transaction().expect("begin");
-        let idle = db.memory_used();
+        let idle = support::used(&db);
         let changed = fits(tx.execute(sql, &params! {}), sql);
         assert_eq!(changed.rows_affected(), ROWS as u64, "{sql}");
-        let staged = db.memory_used() - idle;
+        // Separate the fixed transaction workspace from the staged row data.
+        let staged = support::used(&db) - idle - redb::WriteTransaction::DRAIN_BYTES;
         tx.rollback();
         staged
     };
     // Sets a limit with room for what the statement stages and an eighth of that again: one
-    // batch of a thousand rows is a fortieth of the rows and fits in the eighth, and a second
-    // copy of the 40,000 matched rows does not fit at all.
+    // batch of a thousand rows is a sixteenth of the rows and fits in the eighth, and a second
+    // copy of the 16,000 matched rows does not fit at all.
     let limit_for = |staged: usize| {
         assert!(
             staged > ROWS as usize * 8,
             "a statement over {ROWS} rows staged {staged} bytes"
         );
-        let limit = db.memory_used() + staged + staged / 8;
+        let limit = support::used(&db) + support::limit_commit_bytes() + staged + staged / 8;
         db.set_memory_limit(Some(limit)).expect("set the limit");
     };
 
+    let saved = support::rows(&db, "SELECT * FROM small ORDER BY id");
+    db.set_memory_limit(Some(
+        support::used(&db) + support::limit_work_bytes() + (32 << 10),
+    ))
+    .unwrap();
+    assert!(matches!(
+        db.execute("UPDATE small SET n = n + 1", &params! {}),
+        Err(contextdb::Error::MemoryBudgetExceeded { .. })
+    ));
+    db.set_memory_limit(Some(ROOMY)).unwrap();
+    assert_eq!(support::rows(&db, "SELECT * FROM small ORDER BY id"), saved);
     let update = "UPDATE small SET n = n + 1 WHERE tag <> 'none'";
     limit_for(staged_by(update));
     let changed = fits(db.execute(update, &params! {}), update);

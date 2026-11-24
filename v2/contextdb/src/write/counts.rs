@@ -7,12 +7,12 @@
 
 use std::collections::HashMap;
 
-use super::{Given, Rules, pick, split};
+use super::{Given, Rules, split};
 use crate::memory::Budget;
 use crate::query::Reader;
-use crate::schema::Catalog;
+use crate::schema::{Catalog, Table};
 use crate::store::{ChangeSet, CountId};
-use crate::types::{Result, SortDirection, TxId, Value};
+use crate::types::{Result, SortDirection, Value};
 
 impl Rules<'_> {
     /// Stages what one row means for every count its table keeps: one more under the values
@@ -25,9 +25,12 @@ impl Rules<'_> {
         was: Option<&[Value]>,
         row: Option<&[Value]>,
     ) -> Result<()> {
-        for (at, (columns, _)) in self.counts.iter().enumerate() {
+        for (at, count) in self.table.rules.counts.iter().enumerate() {
+            let columns = self.table.count_columns(count);
             if let (Some(was), Some(row)) = (was, row)
-                && columns.iter().all(|&column| was[column] == row[column])
+                && columns
+                    .iter()
+                    .all(|&(column, _)| was[column] == row[column])
             {
                 continue;
             }
@@ -43,10 +46,11 @@ impl Rules<'_> {
     /// Adds `by` to the count at this place among the table's counts, under the values `row`
     /// has in the count's columns.
     fn add(&self, changes: &mut ChangeSet, at: usize, row: &[Value], by: i64) -> Result<()> {
-        let (columns, ways) = &self.counts[at];
+        let columns = self.table.count_columns(&self.table.rules.counts[at]);
+        let ways: Vec<_> = columns.iter().map(|c| c.1).collect();
         // The count's list as declared.
         let listed = || {
-            let named = columns.iter().zip(ways).map(|(&at, way)| {
+            let named = columns.iter().map(|&(at, way)| {
                 let name = self.table.meta.columns[at].name.clone();
                 match way {
                     SortDirection::Asc => name,
@@ -55,7 +59,8 @@ impl Rules<'_> {
             });
             named.collect::<Vec<_>>().join(", ")
         };
-        let key = self.identity(listed, &pick(columns, row), ways)?;
+        let values: Vec<_> = columns.iter().map(|&(at, _)| row[at].clone()).collect();
+        let key = self.identity(listed, &values, &ways)?;
         changes.add_kept(self.table.rules.counts[at].id, key, by)
     }
 }
@@ -66,37 +71,32 @@ impl Rules<'_> {
 /// staged change, and counts that do not fit the memory limit are refused there.
 pub(crate) fn fill_kept_count(
     counts: &[CountId],
+    table: &Table,
     catalog: &Catalog,
     changes: &mut ChangeSet,
     budget: &Budget,
 ) -> Result<()> {
     let (params, reader) = (HashMap::new(), Reader::admin());
-    let given = Given {
-        params: &params,
-        catalog,
-        budget,
-        reader: &reader,
-        now: 0,
-        number: TxId(0),
-    };
-    for table in catalog.tables() {
-        let kept = table.rules.counts.iter().enumerate();
-        let made = kept.filter(|(_, count)| counts.contains(&count.id));
-        let made: Vec<usize> = made.map(|(at, _)| at).collect();
-        if made.is_empty() {
-            continue;
-        }
-        let rules = Rules::of(table, &given)?;
-        let mut needed = vec![false; table.meta.columns.len()];
-        for &column in made.iter().flat_map(|&at| &rules.counts[at].0) {
-            needed[column] = true;
-        }
-        let asked = rules.asked(None, &params, &[], &needed, &reader);
-        rules.each(&asked, changes, |changes, _, cells| {
-            let row = split(cells).0;
-            made.iter()
-                .try_for_each(|&at| rules.add(changes, at, &row, 1))
-        })?;
+    let kept = crate::query::Kept::new(budget.passing("expression evaluation")?);
+    let given = Given::admin(&params, catalog, budget, &reader, &kept);
+    let kept = table.rules.counts.iter().enumerate();
+    let made = kept.filter(|(_, count)| counts.contains(&count.id));
+    let made: Vec<usize> = made.map(|(at, _)| at).collect();
+    if made.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    let rules = Rules::of(table, &given)?;
+    let mut needed = vec![false; table.meta.columns.len()];
+    for &(column, _) in made
+        .iter()
+        .flat_map(|&at| table.count_columns(&table.rules.counts[at]))
+    {
+        needed[column] = true;
+    }
+    let asked = rules.asked(None, &params, &[], &needed, &reader);
+    rules.each(&asked, changes, |changes, _, cells| {
+        let row = split(cells).0;
+        made.iter()
+            .try_for_each(|&at| rules.add(changes, at, &row, 1))
+    })
 }

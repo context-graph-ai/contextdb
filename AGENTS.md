@@ -1,5 +1,10 @@
 # contextdb — Agent Rules
 
+For the independent contextdb 2 workspace under `v2/`, use
+[`v2/AGENTS.md`](v2/AGENTS.md) and its check commands. The crate map, recipes and
+nine-command gate below describe the published engine under `crates/`. Licence, commit
+policy and shared contribution discipline apply to both workspaces.
+
 Two different jobs bring an agent here. Pick one; you do not need the other half.
 
 - **Use contextdb** — drive the database from the CLI or embed it as a Rust library. Go to

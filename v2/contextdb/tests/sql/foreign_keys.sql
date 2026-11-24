@@ -14,12 +14,12 @@ INSERT INTO projects (id, code, title) VALUES (1, 'alpha', 'first'), (2, 'beta',
 # A row whose parents are there, by the key and by the unique column.
 INSERT INTO tasks (id, project_id, project_code) VALUES (1, 1, 'alpha'), (2, 2, NULL);
 ----
-rows affected: 2
+rows affected: 2  (read 0, compared 0)
 
 # A reference that is NULL names no parent and is not checked.
 INSERT INTO tasks (id, project_id, project_code) VALUES (3, NULL, NULL);
 ----
-rows affected: 1
+rows affected: 1  (read 0, compared 0)
 
 # No such parent, by either reference.
 INSERT INTO tasks (id, project_id) VALUES (4, 404);
@@ -42,11 +42,11 @@ error: ForeignKeyViolation
 
 UPDATE tasks SET project_code = NULL WHERE id = 1;
 ----
-rows affected: 1
+rows affected: 1  (read 1, compared 0)
 
 SELECT id, project_id, project_code FROM tasks ORDER BY id;
 ----
-id | project_id | project_code
+id | project_id | project_code  (read 3, compared 0)
 1 | 1 | NULL
 2 | 2 | NULL
 3 | NULL | NULL
@@ -63,23 +63,23 @@ error: ForeignKeyViolation
 
 UPDATE projects SET title = 'renamed' WHERE id = 1;
 ----
-rows affected: 1
+rows affected: 1  (read 1, compared 0)
 
 # No row names 'alpha' or 'beta' any more, so the unique column they were named by is free to
 # change.
 UPDATE projects SET code = 'alpha-2' WHERE id = 1;
 ----
-rows affected: 1
+rows affected: 1  (read 1, compared 0)
 
 # Once nothing names it, the parent goes.
 DELETE FROM tasks WHERE id = 1;
 DELETE FROM projects WHERE id = 1;
 ----
-rows affected: 1
+rows affected: 1  (read 1, compared 0)
 
 SELECT id, code, title FROM projects ORDER BY id;
 ----
-id | code | title
+id | code | title  (read 1, compared 0)
 2 | beta | second
 
 # A reference of two columns to a parent whose key is those two columns in that order.
@@ -98,7 +98,7 @@ CREATE TABLE samples (
 INSERT INTO windows (machine, slot, label) VALUES ('m1', 1, 'a'), ('m1', 2, 'b'), ('m2', 1, 'c');
 INSERT INTO samples (id, machine, slot) VALUES (1, 'm1', 1), (2, 'm2', 1);
 ----
-rows affected: 2
+rows affected: 2  (read 0, compared 0)
 
 # Each column has a parent of its own, and the pair has none.
 INSERT INTO samples (id, machine, slot) VALUES (3, 'm2', 2);
@@ -108,7 +108,7 @@ error: ForeignKeyViolation
 # A reference with a NULL in any of its columns is not whole and is not checked.
 INSERT INTO samples (id, machine, slot) VALUES (4, 'm9', NULL), (5, NULL, 9);
 ----
-rows affected: 2
+rows affected: 2  (read 0, compared 0)
 
 DELETE FROM windows WHERE machine = 'm1' AND slot = 1;
 ----
@@ -116,7 +116,7 @@ error: ForeignKeyViolation
 
 DELETE FROM windows WHERE machine = 'm1' AND slot = 2;
 ----
-rows affected: 1
+rows affected: 1  (read 1, compared 0)
 
 UPDATE windows SET slot = 7 WHERE machine = 'm2';
 ----
@@ -124,7 +124,7 @@ error: ForeignKeyViolation
 
 SELECT machine, slot FROM windows ORDER BY machine, slot;
 ----
-machine | slot
+machine | slot  (read 2, compared 0)
 m1 | 1
 m2 | 1
 
@@ -192,7 +192,7 @@ error: ColumnInIndex
 
 SELECT id, tag, body FROM notes WHERE tag = 'b';
 ----
-id | tag | body
+id | tag | body  (read 1, compared 0)
 2 | b | y
 
 ALTER TABLE notes DROP COLUMN tag CASCADE;
@@ -202,7 +202,7 @@ error: ColumnNotFound
 
 SELECT id, body FROM notes ORDER BY id;
 ----
-id | body
+id | body  (read 2, compared 0)
 1 | x
 2 | y
 
@@ -223,7 +223,7 @@ INSERT INTO tree (id, parent) VALUES (1, NULL), (2, 1);
 ALTER TABLE tree RENAME COLUMN parent TO up;
 INSERT INTO tree (id, up) VALUES (3, 2);
 ----
-rows affected: 1
+rows affected: 1  (read 0, compared 0)
 
 INSERT INTO tree (id, up) VALUES (4, 404);
 ----
@@ -240,7 +240,7 @@ INSERT INTO n (id, code) VALUES (1, 'a');
 ALTER TABLE n RENAME COLUMN code TO tag;
 INSERT INTO n (id, tag, parent) VALUES (2, 'b', 'a');
 ----
-rows affected: 1
+rows affected: 1  (read 0, compared 0)
 
 INSERT INTO n (id, tag, parent) VALUES (3, 'c', 'zz');
 ----
@@ -266,11 +266,11 @@ error: ForeignKeyViolation
 
 INSERT INTO profiles (person_id, bio) VALUES (1, 'first');
 ----
-rows affected: 1
+rows affected: 1  (read 0, compared 0)
 
 SELECT person_id, bio FROM profiles;
 ----
-person_id | bio
+person_id | bio  (read 1, compared 0)
 1 | first
 
 # A table that references itself: a part names the part it belongs to.
@@ -282,11 +282,11 @@ error: ForeignKeyViolation
 
 INSERT INTO parts (id, parent_id) VALUES (2, 1);
 ----
-rows affected: 1
+rows affected: 1  (read 0, compared 0)
 
 SELECT id, parent_id FROM parts ORDER BY id;
 ----
-id | parent_id
+id | parent_id  (read 2, compared 0)
 1 | NULL
 2 | 1
 
@@ -297,7 +297,7 @@ CREATE TABLE long_children (id INTEGER PRIMARY KEY, parent_name TEXT REFERENCES 
 INSERT INTO long_parents (id, name) VALUES (1, 'ppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppaxxxxxxxxxxxxxxxxxxx'), (2, 'ppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppbxxxxxxxxxxxxxxxxxxx');
 INSERT INTO long_children (id, parent_name) VALUES (1, 'ppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppaxxxxxxxxxxxxxxxxxxx');
 ----
-rows affected: 1
+rows affected: 1  (read 0, compared 0)
 
 INSERT INTO long_children (id, parent_name) VALUES (2, 'ppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppcxxxxxxxxxxxxxxxxxxx');
 ----
@@ -309,4 +309,4 @@ error: ForeignKeyViolation
 
 DELETE FROM long_parents WHERE id = 2;
 ----
-rows affected: 1
+rows affected: 1  (read 1, compared 0)

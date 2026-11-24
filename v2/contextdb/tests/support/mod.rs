@@ -8,24 +8,26 @@
 // Each test program uses a part of this module; the rest would be reported as never used.
 #![allow(dead_code)]
 
+mod process;
+pub mod records;
+pub mod report;
+pub use process::*;
+pub use report::*;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
-use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Write};
+use std::fs;
 use std::ops::RangeInclusive;
-use std::os::fd::OwnedFd;
-use std::os::unix::fs::FileExt;
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
-use std::sync::Arc;
+use std::sync::atomic::Ordering::SeqCst;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use contextdb::{
-    ContextId, Database, DatabaseOpenOptions, Error, QueryResult, ReadSession, ReadSessionOptions,
-    ScopeLabel, StorageBackend, Transaction, Uuid, Value, WrapStorage, params,
+    Clock, ContextId, Database, DatabaseOpenOptions, Error, Maintenance, Principal, QueryResult,
+    ReadLimits, ReadProgress, ReadProgressObserver, ReadSession, ReadSessionOptions, ScopeLabel,
+    StorageBackend, Transaction, Uuid, Value, WrapStorage, params,
 };
 
 // ---- folders and opening ----
@@ -63,8 +65,9 @@ pub fn open(folder: &Path) -> Database {
 }
 
 /// Opens a store for writing. Every test opens its stores here, so that an option every test
-/// needs is set in this one place.
-pub fn open_with(folder: &Path, options: DatabaseOpenOptions) -> contextdb::Result<Database> {
+/// needs is set in this one place: maintenance runs only in the cycles a test calls.
+pub fn open_with(folder: &Path, mut options: DatabaseOpenOptions) -> contextdb::Result<Database> {
+    options.maintenance = contextdb::Maintenance::Caller;
     Database::open_with_options(folder, options)
 }
 
@@ -79,6 +82,18 @@ pub fn reopen(db: Database, folder: &Path) -> Database {
     open(folder)
 }
 
+pub mod opening;
+
+/// The storage library's bounded freed-page workspace.
+pub fn limit_commit_bytes() -> usize {
+    redb::WriteTransaction::DRAIN_BYTES
+}
+
+/// Spare for changing a limit and observing it, beside the data room a test specifies.
+pub fn limit_work_bytes() -> usize {
+    limit_commit_bytes().max(statement_text_bytes("SHOW MEMORY_LIMIT"))
+}
+
 /// Opens a store for writing under a memory limit of this many bytes. It must open.
 pub fn open_limited(folder: &Path, limit: usize) -> Database {
     let mut options = DatabaseOpenOptions::default();
@@ -88,13 +103,76 @@ pub fn open_limited(folder: &Path, limit: usize) -> Database {
     })
 }
 
-/// Opens a store for reading, under a memory limit when one is given. It must open.
+/// Opens a roomy reader under the given memory cap, or 512 MiB for `None`. It must open.
 pub fn open_reader(folder: &Path, limit: Option<usize>) -> ReadSession {
-    let mut options = ReadSessionOptions::default();
-    options.memory_limit = limit;
+    let options = reader_options(limit);
     ReadSession::open_with_options(folder, options).unwrap_or_else(|error| {
         panic!("a reader under a limit of {limit:?} was refused: {error:?}")
     })
+}
+
+/// Roomy limits; `None` selects 512 MiB, not the shipped default. A given cap stays exact.
+pub fn reader_options(limit: Option<usize>) -> ReadSessionOptions {
+    let mut options = ReadSessionOptions::default();
+    options.limits.result_rows = u64::MAX;
+    options.limits.result_bytes = u64::MAX;
+    options.limits.work = u64::MAX;
+    options.limits.active_ms = u64::MAX;
+    options.limits.memory = limit.unwrap_or(512 << 20) as u64;
+    options
+}
+pub fn read_session(
+    db: &Database,
+    path: &Path,
+    file: bool,
+    limits: ReadLimits,
+) -> contextdb::Result<ReadSession> {
+    if file {
+        ReadSession::open(path, limits)
+    } else {
+        db.read_session(limits)
+    }
+}
+/// What the statement record holds for one form of a statement once it has run: a line of
+/// 144 bytes (the form's text at 16, seven counts at 8 each, the unused-index note at 40 and
+/// the line's own charge at 32) and the text of the form, constants as `?`.
+pub fn form_charge(form: &str) -> usize {
+    144 + form.len()
+}
+/// A statement's form: its text with each number and each quoted text written in it as `?`.
+pub fn form_of(sql: &str) -> String {
+    let mut form = String::new();
+    let (mut digits, mut quoted) = (false, false);
+    for c in sql.chars() {
+        if c == '\'' {
+            if !quoted {
+                form.push('?');
+            }
+            quoted = !quoted;
+        } else if quoted {
+        } else if c.is_ascii_digit() {
+            if !digits {
+                form.push('?');
+            }
+            digits = true;
+        } else {
+            digits = false;
+            form.push(c);
+        }
+    }
+    form
+}
+pub fn used(db: &Database) -> usize {
+    db.memory_used().unwrap()
+}
+pub fn limit(db: &Database) -> Option<usize> {
+    db.memory_limit().unwrap()
+}
+pub fn names(db: &Database) -> Vec<String> {
+    db.table_names().unwrap().to_vec()
+}
+pub fn watermark(db: &Database) -> contextdb::TxId {
+    db.committed_watermark().unwrap()
 }
 
 // ---- statements ----
@@ -138,6 +216,26 @@ pub fn run(on: &impl Run, sql: &str) -> QueryResult {
     }
 }
 
+/// Parsing plus planning's one copy (M5), measured through the parse refusal on an empty
+/// reader with no spare bytes. The reader is shared only by fixtures in this test process.
+pub fn statement_text_bytes(sql: &str) -> usize {
+    static READER: std::sync::OnceLock<ReadSession> = std::sync::OnceLock::new();
+    let reader = READER.get_or_init(|| {
+        let folder = folder(&format!("statement-charge-{}", std::process::id()));
+        close(open(&folder));
+        let used = opening::reader_charge(&folder, Some(32 << 20));
+        open_reader(&folder, Some(used))
+    });
+    match reader.execute(sql, &params! {}) {
+        Err(Error::MemoryBudgetExceeded {
+            operation: "SQL parsing",
+            requested_bytes,
+            ..
+        }) => 2 * usize::try_from(requested_bytes).expect("a statement's charge fits usize"),
+        other => panic!("text admission with no spare bytes gave {other:?}"),
+    }
+}
+
 /// The rows a statement returns.
 pub fn rows(on: &impl Run, sql: &str) -> Vec<Vec<Value>> {
     run(on, sql).rows().to_vec()
@@ -176,6 +274,46 @@ pub fn memory_shown(on: &impl Run, column: &str) -> Value {
     }
 }
 
+/// Asserts that `limit` is the default a handle with no limit declared takes (M4): a quarter of
+/// the memory the process may use, the smallest of `MemTotal` and every cgroup `memory.max`
+/// from its own group up to the root, 2 GiB where that is unknown, never below a writer's floor
+/// on a store under 4 GiB, 10 MiB and 768 KiB.
+#[track_caller]
+pub fn assert_default_limit(limit: Option<usize>, when: &str) {
+    let read = |path: &str| fs::read_to_string(path).unwrap_or_default();
+    let number = |text: &str| {
+        text.trim()
+            .trim_end_matches("kB")
+            .trim()
+            .parse::<usize>()
+            .ok()
+    };
+    let meminfo = read("/proc/meminfo");
+    let total = meminfo
+        .lines()
+        .find_map(|line| number(line.strip_prefix("MemTotal:")?));
+    let cgroup = read("/proc/self/cgroup");
+    let group = cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .unwrap_or("");
+    let groups = Path::new(group)
+        .ancestors()
+        .map(|at| at.to_string_lossy().into_owned());
+    let maxes = groups.filter_map(|at| number(&read(&format!("/sys/fs/cgroup{at}/memory.max"))));
+    let allowed = total.map(|kib| kib * 1024).into_iter().chain(maxes).min();
+    if cfg!(target_os = "linux") {
+        let quarter = allowed.map_or(2 << 30, |bytes| bytes / 4);
+        assert_eq!(
+            limit,
+            Some(quarter.max((10 << 20) + (768 << 10))),
+            "{when}: the default"
+        );
+    } else {
+        assert!(limit.is_some(), "{when}: the default holds, never none");
+    }
+}
+
 /// The bytes `SHOW MEMORY_LIMIT` reports as used.
 pub fn memory_used(on: &impl Run) -> usize {
     match memory_shown(on, "used") {
@@ -199,6 +337,7 @@ pub fn ids(on: &impl Run, sql: &str) -> Vec<i64> {
 pub fn printed(db: &Database, table: &str) -> String {
     db.declaration(table)
         .unwrap_or_else(|error| panic!("the declaration of {table} was refused: {error:?}"))
+        .to_string()
 }
 
 /// Asserts that what these tables are printed back as declares the same tables in an empty
@@ -215,7 +354,8 @@ pub fn assert_roundtrips(prefix: &str, db: &Database, tables: &[&str]) -> Vec<St
     for (table, text) in tables.iter().zip(&texts) {
         let declared = again.declaration(table).expect("the declaration");
         assert_eq!(
-            &declared, text,
+            declared.as_str(),
+            text.as_str(),
             "{prefix}: {table} declared from its printed text"
         );
     }
@@ -270,6 +410,41 @@ pub fn label_set(names: &[&str]) -> BTreeSet<ScopeLabel> {
     names.iter().map(|name| ScopeLabel::new(*name)).collect()
 }
 
+/// A handle narrowed to these scope labels.
+pub fn with_labels(db: &Database, names: &[&str]) -> Database {
+    db.scoped_with_constraints(None, Some(label_set(names)), None)
+}
+
+/// A handle that names this principal and nothing else.
+pub fn named(db: &Database, principal: Principal) -> Database {
+    db.scoped_with_constraints(None, None, Some(principal))
+}
+
+pub fn agent(name: &str) -> Principal {
+    Principal::Agent(name.to_owned())
+}
+
+pub fn human(name: &str) -> Principal {
+    Principal::Human(name.to_owned())
+}
+
+/// The documented grant table.
+pub const GRANTS: &str = "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, \
+                          principal_id TEXT, acl_id UUID)";
+
+/// Grants a principal one access-control id. `number` makes the grant row's own key.
+pub fn grant(db: &Database, number: u128, kind: &str, name: &str, acl_id: Uuid) {
+    let values = params! {
+        "id" => Uuid::from_u128(0x0060_0000 + number), "kind" => kind, "name" => name,
+        "acl" => acl_id,
+    };
+    let sql = "INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) \
+               VALUES ($id, $kind, $name, $acl)";
+    if let Err(error) = db.execute(sql, &values) {
+        panic!("granting {acl_id} to {kind} {name} was refused: {error:?}");
+    }
+}
+
 // ---- the table most tests use ----
 
 /// Row `n` of this table is `(n, "row-000000n", n % 10)`: see [`row`].
@@ -286,6 +461,19 @@ pub const SCAN: &str = "SELECT id, name, tag FROM t ORDER BY id";
 pub fn declare(db: &Database) {
     run(db, TABLE);
     run(db, INDEX);
+}
+
+/// [`declare`] keeping no old versions (a table that declares no history keeps them); a synced
+/// `CURRENT ONLY` table keeps the latest write.
+pub fn declare_current_only(db: &Database) {
+    let current_only = format!("{TABLE} HISTORY CURRENT ONLY SYNC CONFLICT KEEP LATEST");
+    run(db, &current_only);
+    run(db, INDEX);
+}
+
+/// The threads of this process, as Linux lists them; 0 on a system that has no such list.
+pub fn threads() -> usize {
+    std::fs::read_dir("/proc/self/task").map_or(0, |tasks| tasks.count())
 }
 
 /// Row number `n`, as it is stored and as it must come back.
@@ -893,7 +1081,7 @@ pub fn text(value: &str) -> Value {
 /// Runs maintenance cycles until nothing is left for one to do, and returns how many vectors
 /// the cycles sealed and packed between them. Nothing else in the tests seals or groups.
 pub fn seal_all(db: &Database) -> u64 {
-    upkeep(db).1
+    maintenance(db).1
 }
 
 /// One maintenance cycle, which must not be refused.
@@ -904,18 +1092,22 @@ pub fn cycle(db: &Database) -> contextdb::VectorMaintenanceReport {
     }
 }
 
-/// Runs maintenance cycles as a host does: while a vector is left, or a partition that is
-/// not stalled. Returns how many cycles it ran, the last included, and the vectors they
-/// reported done. A store that never comes to rest fails the test.
-pub fn upkeep(db: &Database) -> (u64, u64) {
-    let mut done = 0;
+/// Runs maintenance cycles as a host does: while the report says work remains.
+/// Returns the cycles through vector completion (the last included) and the vectors
+/// reported done; later cycles finish the other work. A store that never rests fails.
+pub fn maintenance(db: &Database) -> (u64, u64) {
+    let (mut done, mut vector_cycles) = (0, None);
     for ran in 1..=100_000_u64 {
-        let report = cycle(db);
-        done += report.maintenance_vectors_done;
-        if report.maintenance_vectors_remaining == 0
-            && report.remaining_partitions <= report.stalled_partitions
+        let report = db.run_maintenance_cycle().expect("a maintenance cycle");
+        let vector = report.vector;
+        done += count(vector.maintenance_vectors_done);
+        if count(vector.maintenance_vectors_remaining) == 0
+            && count(vector.remaining_partitions) <= count(vector.stalled_partitions)
         {
-            return (ran, done);
+            vector_cycles.get_or_insert(ran);
+        }
+        if report.work_remaining == Some(false) || report.compaction_waiting_on.is_some() {
+            return (vector_cycles.unwrap_or(ran), done);
         }
     }
     panic!("100,000 maintenance cycles left work to do");
@@ -972,7 +1164,7 @@ pub fn built(name: &str, dimension: usize, clauses: &str, rows: i64) -> (PathBuf
     let db = open(&folder);
     declare_docs(&db, dimension, clauses);
     load_docs(&db, 1..=rows, "a", |n| gathered(n, dimension));
-    upkeep(&db);
+    maintenance(&db);
     (folder, db)
 }
 
@@ -1132,84 +1324,11 @@ pub fn counting_bytes_read() -> (WrapStorage, Arc<AtomicU64>) {
     (door, bytes)
 }
 
-// ---- the storage door ----
-
-/// One call the engine makes on its data file, as a test's storage door sees it.
-pub enum Call<'a> {
-    /// These bytes were just read at this offset. Changing them changes what the engine is
-    /// given, not the file.
-    Read(u64, &'a mut [u8]),
-    /// These bytes are about to be written at this offset.
-    Write(u64, &'a [u8]),
-    /// The file is about to be forced to disk.
-    Sync,
-}
-
-/// A storage door that keeps the data file as it is and shows `watch` every read, write and
-/// sync. A test counts the calls, stops at one, or changes what a read returned.
-pub fn storage(watch: impl Fn(Call<'_>) + Send + Sync + 'static) -> WrapStorage {
-    failing_storage(move |call| {
-        watch(call);
-        Ok(())
-    })
-}
-
-/// A storage door like [`storage`] whose `watch` may also make a call fail. The error it
-/// returns is what the engine gets from that read, write or sync; a write or a sync it fails
-/// never reaches the file.
-pub fn failing_storage(
-    watch: impl Fn(Call<'_>) -> io::Result<()> + Send + Sync + 'static,
-) -> WrapStorage {
-    let watch: Arc<dyn Fn(Call<'_>) -> io::Result<()> + Send + Sync> = Arc::new(watch);
-    Arc::new(move |file| {
-        Ok(Box::new(Watched {
-            file,
-            watch: watch.clone(),
-        }) as Box<dyn StorageBackend>)
-    })
-}
-
-struct Watched {
-    file: File,
-    watch: Arc<dyn Fn(Call<'_>) -> io::Result<()> + Send + Sync>,
-}
-
-impl fmt::Debug for Watched {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "a watched {:?}", self.file)
-    }
-}
-
-impl StorageBackend for Watched {
-    fn len(&self) -> io::Result<u64> {
-        Ok(self.file.metadata()?.len())
-    }
-
-    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
-        self.file.read_exact_at(out, offset)?;
-        (self.watch)(Call::Read(offset, out))
-    }
-
-    fn set_len(&self, len: u64) -> io::Result<()> {
-        self.file.set_len(len)
-    }
-
-    fn sync_data(&self) -> io::Result<()> {
-        (self.watch)(Call::Sync)?;
-        self.file.sync_data()
-    }
-
-    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
-        (self.watch)(Call::Write(offset, data))?;
-        self.file.write_all_at(data, offset)
-    }
-}
-
 /// The child's store opened for reading through [`pausing_at_read`]'s door, with its flag and
 /// count.
 pub fn reader_pausing(role: &Role) -> (ReadSession, Arc<AtomicBool>, Arc<AtomicU64>) {
     let (door, searching, reads) = pausing_at_read(role.number("pause_at"));
-    let mut options = ReadSessionOptions::default();
+    let mut options = reader_options(None);
     options.storage = Some(door);
     let reader =
         ReadSession::open_with_options(&role.folder, options).expect("open the store for reading");
@@ -1238,249 +1357,118 @@ pub fn pausing_at_read(pause_at: u64) -> (WrapStorage, Arc<AtomicBool>, Arc<Atom
     (door, counting, reads)
 }
 
-// ---- a second process: the parent's side ----
-
-/// A second process: this test program started again to run one test in a role. It announces
-/// what it has done in lines that start with `@ `, and is told what to do next in lines on its
-/// standard input. When the value is dropped the process is killed.
-pub struct Child {
-    process: std::process::Child,
-    lines: Option<Receiver<String>>,
-    announced: Vec<String>,
-    status: Option<ExitStatus>,
+/// Starts the child `role` stopped halfway through the storage reads of its statement, once it
+/// says so. Where halfway is comes from a run of the same role to its end, `pause_at=0`: the
+/// store is the same for both, so both make the same reads. Gives that run's lines and the child.
+pub fn stopped_halfway(test: &str, role: &str, folder: &Path) -> (Vec<String>, Child) {
+    let lines = Child::start(test, &format!("{role} pause_at=0"), folder).end();
+    let reads = last_number(&lines, "reads").expect("the child announces its reads");
+    assert!(
+        reads > 1,
+        "{role} made {reads} storage reads: no halfway inside it"
+    );
+    let halfway = format!("{role} pause_at={}", reads.div_ceil(2));
+    let mut child = Child::start(test, &halfway, folder);
+    child.expect("reading");
+    (lines, child)
 }
-
-impl Child {
-    /// Starts the child. `test` is the name of the calling test function, which must begin with
-    /// `if let Some(role) = support::role() { return child(role); }`. `role` is the role's name,
-    /// then any settings as `key=number` words.
-    pub fn start(test: &str, role: &str, folder: &Path) -> Child {
-        Child::started(test, role, folder, Stdio::inherit())
+/// A controllable clock, shared by retention and maintenance tests.
+pub struct At(pub Arc<AtomicU64>);
+impl contextdb::Clock for At {
+    fn now(&self) -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(self.0.load(Ordering::SeqCst))
     }
-
-    /// [`Child::start`] for a child that is handed an open file, which it keeps open for as
-    /// long as it runs: the file is its standard error, the one channel the roles do not use.
-    pub fn start_holding(test: &str, role: &str, folder: &Path, held: OwnedFd) -> Child {
-        Child::started(test, role, folder, Stdio::from(held))
+}
+pub struct Millis(pub Arc<AtomicU64>);
+impl Clock for Millis {
+    fn now(&self) -> SystemTime {
+        UNIX_EPOCH + Duration::from_millis(self.0.load(SeqCst))
     }
-
-    fn started(test: &str, role: &str, folder: &Path, stderr: Stdio) -> Child {
-        let process = Command::new(std::env::current_exe().expect("the path of this test program"))
-            .args(["--exact", test, "--nocapture"])
-            .env("CONTEXTDB_TEST_ROLE", role)
-            .env("CONTEXTDB_TEST_FOLDER", folder)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(stderr)
-            .spawn()
-            .expect("start this test program a second time");
-        Child {
-            process,
-            lines: None,
-            announced: Vec::new(),
-            status: None,
+}
+#[derive(Default)]
+pub struct Observer {
+    pub samples: Mutex<Vec<[u64; 4]>>,
+    pub now: Arc<AtomicU64>,
+    pub advance: AtomicU64,
+    pub cancel: AtomicBool,
+    pub session: Mutex<Weak<ReadSession>>,
+}
+impl Observer {
+    pub fn new(now: Arc<AtomicU64>, advance: u64, cancel: bool) -> Arc<Self> {
+        Arc::new(Self {
+            now,
+            advance: AtomicU64::new(advance),
+            cancel: AtomicBool::new(cancel),
+            ..Self::default()
+        })
+    }
+}
+impl ReadProgressObserver for Observer {
+    fn progress(&self, p: ReadProgress) {
+        let sample = [p.rows, p.bytes, p.work, p.active_ms];
+        self.samples.lock().unwrap().push(sample);
+        self.now.fetch_max(self.advance.load(SeqCst), SeqCst);
+        if self.cancel.swap(false, SeqCst) {
+            self.session.lock().unwrap().upgrade().unwrap().cancel();
         }
     }
-
-    /// The child's process id.
-    pub fn id(&self) -> u32 {
-        self.process.id()
+}
+#[derive(Default)]
+pub struct Bytes(pub Mutex<u64>);
+impl ReadProgressObserver for Bytes {
+    fn progress(&self, p: ReadProgress) {
+        *self.0.lock().unwrap() = p.bytes;
     }
-
-    /// The next line the child announced, or `None` once it has ended.
-    ///
-    /// This is the one function in the tests that waits. It gives up after 20 seconds and fails
-    /// with every line the child announced and how it ended.
-    pub fn line(&mut self) -> Option<String> {
-        if self.lines.is_none() {
-            let pipe = self
-                .process
-                .stdout
-                .take()
-                .expect("the child's standard output");
-            let (sender, receiver) = mpsc::channel();
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "the one thread in the tests: it moves lines from the child's pipe to a \
-                          channel so that the wait below can give up; nothing a test asserts \
-                          depends on when it runs"
-            )]
-            std::thread::spawn(move || {
-                for line in BufReader::new(pipe).lines().map_while(Result::ok) {
-                    if sender.send(line).is_err() {
-                        break;
-                    }
-                }
-            });
-            self.lines = Some(receiver);
-        }
-        loop {
-            let received = self
-                .lines
-                .as_ref()
-                .expect("set above")
-                .recv_timeout(Duration::from_secs(20));
-            match received {
-                Ok(line) => {
-                    // Everything else on the pipe is the test harness talking.
-                    if let Some(said) = line.strip_prefix("@ ") {
-                        self.announced.push(said.to_owned());
-                        return Some(said.to_owned());
-                    }
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    self.status = Some(self.process.wait().expect("wait for the child"));
-                    return None;
-                }
-                Err(RecvTimeoutError::Timeout) => self.fail("announced nothing for 20 seconds"),
-            }
-        }
+    fn completed(&self, p: ReadProgress) {
+        self.progress(p);
     }
-
-    /// Waits for the child to announce exactly this line next.
-    pub fn expect(&mut self, wanted: &str) {
-        let line = self.line();
-        if line.as_deref() != Some(wanted) {
-            self.fail(&format!("was to announce {wanted:?} and gave {line:?}"));
+}
+impl Clock for Observer {
+    fn now(&self) -> SystemTime {
+        if self.cancel.load(SeqCst) {
+            self.session.lock().unwrap().upgrade().unwrap().cancel();
         }
+        UNIX_EPOCH + Duration::from_millis(self.now.fetch_add(self.advance.load(SeqCst), SeqCst))
     }
-
-    /// Waits for the child to announce `point`, and returns the lines it announced before it.
-    pub fn until(&mut self, point: &str) -> Vec<String> {
-        let mut before = Vec::new();
-        loop {
-            match self.line() {
-                Some(line) if line == point => return before,
-                Some(line) => before.push(line),
-                None => self.fail(&format!("ended before it announced {point:?}")),
-            }
-        }
+}
+pub fn delivery_queue(path: &Path, bytes: usize, count: i64) -> Database {
+    let db = open(path);
+    for sql in [
+        "CREATE TABLE queued(id INTEGER PRIMARY KEY, body TEXT) \
+         HISTORY CURRENT ONLY SYNC CONFLICT KEEP LATEST",
+        "CREATE EVENT TYPE added WHEN INSERT ON queued",
+        "CREATE SINK outgoing TYPE callback",
+        "CREATE ROUTE notify EVENT added TO outgoing",
+    ] {
+        run(&db, sql);
     }
-
-    /// Writes one line to the child's standard input.
-    pub fn tell(&mut self, line: &str) {
-        let pipe = self
-            .process
-            .stdin
-            .as_mut()
-            .expect("the child's standard input");
-        if writeln!(pipe, "{line}")
-            .and_then(|()| pipe.flush())
-            .is_err()
-        {
-            self.fail(&format!("was gone when it was told {line:?}"));
-        }
-    }
-
-    /// Kills the child where it stands. It must still be running: a child that is to be killed
-    /// has announced a point and is waiting there.
-    ///
-    /// The child's standard input stays open until the child is gone. Waiting for a process
-    /// closes the input this side holds for it, and a kill has only been sent when it returns:
-    /// a child that read the end of its input before the kill reached it would leave the
-    /// point by itself.
-    pub fn kill(&mut self) {
-        let input = self.process.stdin.take();
-        self.process.kill().expect("kill the child");
-        let status = self.process.wait().expect("wait for the child");
-        drop(input);
-        if status.signal().is_none() {
-            self.fail("had already ended by itself when it was to be killed");
-        }
-    }
-
-    /// Closes the child's standard input and waits for it to end by itself, which it must do
-    /// without a failure. Returns every line it announced.
-    pub fn end(&mut self) -> Vec<String> {
-        drop(self.process.stdin.take());
-        while self.line().is_some() {}
-        if !self.status.is_some_and(|status| status.success()) {
-            self.fail("did not end well");
-        }
-        self.announced.clone()
-    }
-
-    fn fail(&mut self, what: &str) -> ! {
-        let _ = self.process.kill();
-        let status = self.process.wait();
-        panic!(
-            "the child {what}\nit had announced: {:#?}\nit ended with: {status:?}",
-            self.announced
+    for id in 1..=count {
+        let body = "x".repeat(if id == 1 { bytes } else { 8 });
+        db.execute(
+            "INSERT INTO queued VALUES ($id,$body)",
+            &params! {"id"=>id,"body"=>body},
         )
+        .unwrap();
     }
+    db
 }
 
-impl Drop for Child {
-    fn drop(&mut self) {
-        // A failing test must not leave a process behind that holds its store.
-        let _ = self.process.kill();
-        let _ = self.process.wait();
-    }
-}
-
-/// The last number announced under `key`, in lines of the form `<key> <number>`.
-pub fn last_number(lines: &[String], key: &str) -> Option<u64> {
-    lines.iter().rev().find_map(|line| {
-        let (name, number) = line.split_once(' ')?;
-        if name == key {
-            number.parse().ok()
-        } else {
-            None
+/// The documented vector records from a public exported store.
+pub fn vector_records(folder: &Path) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+    let db = redb::Builder::new()
+        .open_read_only(folder.join("data"))
+        .unwrap();
+    let read = db.begin_read().unwrap();
+    let mut records = BTreeMap::new();
+    for name in ["vectors", "vector_blocks"] {
+        let table = read
+            .open_table(TableDefinition::<&[u8], &[u8]>::new(name))
+            .unwrap();
+        for entry in table.iter().unwrap() {
+            let (key, value) = entry.unwrap();
+            records.insert(key.value().to_vec(), value.value().to_vec());
         }
-    })
-}
-
-// ---- a second process: the child's side ----
-
-/// What a child was started as.
-pub struct Role {
-    pub name: String,
-    pub folder: PathBuf,
-    settings: Vec<String>,
-}
-
-impl Role {
-    /// The number of a setting given as `key=number`.
-    pub fn number(&self, key: &str) -> u64 {
-        self.settings
-            .iter()
-            .find_map(|setting| setting.strip_prefix(key)?.strip_prefix('=')?.parse().ok())
-            .unwrap_or_else(|| panic!("the role {} was not given {key}=<number>", self.name))
     }
-}
-
-/// The role this process was started in, or `None` in the process that runs the test itself.
-pub fn role() -> Option<Role> {
-    let words = std::env::var("CONTEXTDB_TEST_ROLE").ok()?;
-    let mut words = words.split_whitespace().map(str::to_owned);
-    Some(Role {
-        name: words.next().expect("a role has a name"),
-        settings: words.collect(),
-        folder: std::env::var_os("CONTEXTDB_TEST_FOLDER")
-            .expect("a child is given a folder")
-            .into(),
-    })
-}
-
-/// Announces one line to the parent.
-pub fn say(line: impl fmt::Display) {
-    println!("@ {line}");
-}
-
-/// Waits for the parent's next line. `None` when the parent has closed the pipe or is gone.
-pub fn hear() -> Option<String> {
-    let mut line = String::new();
-    match io::stdin().lock().read_line(&mut line) {
-        Ok(read) if read > 0 => Some(line.trim_end().to_owned()),
-        _ => None,
-    }
-}
-
-/// Announces a point and stays there until the parent kills this process. A kill therefore
-/// lands at a point the child named, never after an amount of time.
-pub fn wait_to_be_killed(point: &str) -> ! {
-    say(point);
-    hear();
-    // Reached only when the parent went away without killing.
-    std::process::exit(1)
+    records
 }

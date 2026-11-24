@@ -9,7 +9,7 @@ use super::{
     MAX_EXPR_NESTING, Pair, Rule, child, depth_error, direction, has, ident, number, select, string,
 };
 use crate::sql::ast::*;
-use crate::types::{Error, Result};
+use crate::types::{Error, Result, Value};
 
 pub(super) fn expr(pair: Pair<'_>) -> Result<Expr> {
     // `[NOT] comparison {AND | OR [NOT] comparison}`. AND binds tighter than OR: `all` gathers
@@ -64,7 +64,7 @@ fn depth_of(expr: &Expr) -> usize {
         expr,
         Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) | Expr::Subquery(_)
     );
-    let below = crate::sql::inside(expr).into_iter().map(depth_of);
+    let below = crate::sql::inside(expr).map(depth_of);
     below.max().unwrap_or(0) + usize::from(!leaf)
 }
 
@@ -251,8 +251,8 @@ pub(super) fn additive_expr(pair: Pair<'_>) -> Result<Expr> {
 /// written without a sign is, so whatever reads a literal reads it.
 fn negated(operand: Expr) -> Expr {
     match operand {
-        Expr::Literal(Literal::Integer(whole)) => Expr::Literal(Literal::Integer(-whole)),
-        Expr::Literal(Literal::Real(real)) => Expr::Literal(Literal::Real(-real)),
+        Expr::Literal(Value::Int64(whole)) => Expr::Literal(Value::Int64(-whole)),
+        Expr::Literal(Value::Float64(real)) => Expr::Literal(Value::Float64(-real)),
         operand => Expr::UnaryOp {
             op: UnaryOp::Neg,
             operand: Box::new(operand),
@@ -298,19 +298,16 @@ fn primary_expr(primary: Pair<'_>) -> Result<Expr> {
 fn literal(pair: &Pair<'_>) -> Result<Expr> {
     Ok(match pair.as_rule() {
         Rule::parameter => Expr::Parameter(pair.as_str()[1..].to_owned()),
-        Rule::null_lit => Expr::Literal(Literal::Null),
-        Rule::bool_lit => Expr::Literal(Literal::Bool(pair.as_str().eq_ignore_ascii_case("true"))),
-        Rule::float => Expr::Literal(Literal::Real(number(pair, "the number")?)),
-        Rule::integer => Expr::Literal(Literal::Integer(number(pair, "the whole number")?)),
-        Rule::string => Expr::Literal(Literal::Text(string(pair))),
-        // The one literal left: a vector.
+        Rule::null_lit => Expr::Literal(Value::Null),
+        Rule::bool_lit => Expr::Literal(Value::Bool(pair.as_str().eq_ignore_ascii_case("true"))),
+        Rule::float => Expr::Literal(Value::Float64(number(pair, "the number")?)),
+        Rule::integer => Expr::Literal(Value::Int64(number(pair, "the whole number")?)),
+        Rule::string => Expr::Literal(Value::Text(string(pair))),
+        // The one literal left: a vector, whose numbers the grammar has read.
         _ => {
-            let components = pair
-                .clone()
-                .into_inner()
-                .map(|component| number(&component, "the vector component"))
-                .collect::<Result<_>>()?;
-            Expr::Literal(Literal::Vector(components))
+            let numbers = pair.as_str()[1..pair.as_str().len() - 1].split(',');
+            let numbers = numbers.map(|n| n.trim().parse().expect("a number the grammar read"));
+            Expr::Literal(Value::Vector(numbers.collect()))
         }
     })
 }

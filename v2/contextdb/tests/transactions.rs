@@ -2,6 +2,7 @@
 //! survives a refused statement, and loses cleanly to a transaction that committed first.
 
 mod support;
+use support::count;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,7 +29,7 @@ fn a_transaction_sees_its_own_writes_and_a_dropped_or_rolled_back_one_leaves_not
     support::declare(&db);
     support::insert(&db, 1..=1);
     let before = written.load(Ordering::SeqCst);
-    let newest = db.committed_watermark();
+    let newest = support::watermark(&db);
 
     // Dropped: it saw its own rows, nobody else did, and nothing reached the file.
     {
@@ -45,7 +46,7 @@ fn a_transaction_sees_its_own_writes_and_a_dropped_or_rolled_back_one_leaves_not
         "a dropped transaction wrote to the file"
     );
     assert_eq!(
-        db.committed_watermark(),
+        support::watermark(&db),
         newest,
         "a dropped transaction moved the newest commit"
     );
@@ -63,7 +64,7 @@ fn a_transaction_sees_its_own_writes_and_a_dropped_or_rolled_back_one_leaves_not
         "a rollback wrote to the file"
     );
     assert_eq!(
-        db.committed_watermark(),
+        support::watermark(&db),
         newest,
         "a rollback moved the newest commit"
     );
@@ -79,7 +80,7 @@ fn a_transaction_sees_its_own_writes_and_a_dropped_or_rolled_back_one_leaves_not
         "an empty commit wrote to the file"
     );
     assert_eq!(
-        db.committed_watermark(),
+        support::watermark(&db),
         newest,
         "an empty commit moved the newest commit"
     );
@@ -91,18 +92,18 @@ fn a_transaction_sees_its_own_writes_and_a_dropped_or_rolled_back_one_leaves_not
         "a commit did not reach the file"
     );
     assert!(
-        db.committed_watermark() > newest,
+        support::watermark(&db) > newest,
         "a commit of rows did not move the newest commit"
     );
 
     // A statement that finds nothing to change is the same as no statement: run on its own, and
     // as the whole of a transaction that commits.
     let before = written.load(Ordering::SeqCst);
-    let newest = db.committed_watermark();
+    let newest = support::watermark(&db);
     let nothing = support::run(&db, "DELETE FROM t WHERE id = 404");
     assert_eq!(nothing.rows_affected(), 0);
     assert_eq!(
-        db.committed_watermark(),
+        support::watermark(&db),
         newest,
         "a DELETE that matched no row moved the newest commit"
     );
@@ -116,7 +117,7 @@ fn a_transaction_sees_its_own_writes_and_a_dropped_or_rolled_back_one_leaves_not
     tx.commit()
         .expect("commit a transaction that changed nothing");
     assert_eq!(
-        db.committed_watermark(),
+        support::watermark(&db),
         newest,
         "a transaction whose DELETE matched no row moved the newest commit"
     );
@@ -344,8 +345,9 @@ fn of_two_transactions_changing_one_row_the_first_commits_and_the_second_is_refu
 /// came first.
 fn assert_overtaken(commit: contextdb::Result<()>, what: &str) {
     match commit {
-        Err(Error::ConditionalUpdateConflict { count }) => {
-            assert_eq!(count, 1, "{what}: the number of rows overtaken");
+        Err(error @ Error::ConditionalUpdateConflict { count: 1 }) => {
+            let words = "conditional update conflict: 1 staged update(s) no longer matched at commit; read the rows again and retry";
+            assert_eq!(error.to_string(), words, "{what}");
         }
         other => panic!("{what} got {other:?}"),
     }
@@ -399,6 +401,16 @@ fn a_refused_statement_changes_nothing_and_leaves_the_transaction_usable() {
 
     let tx = db.transaction().expect("begin");
     support::insert(&tx, 2..=2);
+
+    // Erasure never stages in somebody else's transaction, including an empty selection.
+    for sql in ["PURGE FROM t WHERE id = 1", "PURGE FROM t WHERE id = 99"] {
+        let error = support::refusal(&tx, sql);
+        assert_eq!(format!("{error:?}"), "PurgeRequiresStandaloneExecution");
+        let words = "PURGE must run as a standalone statement: commit or roll back the transaction and run it alone";
+        assert_eq!(error.to_string(), words);
+        support::assert_rows_are(&tx, 1..=2);
+        support::assert_rows_are(&db, 1..=1);
+    }
 
     // A key that is taken, by a committed row and by a row of this transaction.
     for taken in [1, 2] {
@@ -544,7 +556,7 @@ fn a_transaction_that_declares_a_table_may_not_also_write_rows() {
     first.commit().expect("the first declaration commits");
     second.commit().expect("a table of another name commits");
     assert!(matches!(third.commit(), Err(Error::SchemaInvalid { .. })));
-    assert_eq!(db.table_names(), ["a", "b", "t"]);
+    assert_eq!(support::names(&db), ["a", "b", "t"]);
     let tx = db.transaction().expect("begin");
     support::insert(&tx, 2..=2);
     support::run(&db, "CREATE INDEX t_early ON t (name)");
@@ -556,6 +568,110 @@ fn a_transaction_that_declares_a_table_may_not_also_write_rows() {
     tx.commit().expect("commit the index");
     let named = "SELECT id FROM t WHERE name = 'row-0000002'";
     assert_eq!(support::rows(&db, named), [[Value::Int64(2)]]);
+    // A DROP ... IF EXISTS of a name that is not there declares nothing, so a row staged
+    // beside it is not overtaken.
+    let tx = db.transaction().expect("begin");
+    support::insert(&tx, 3..=3);
+    support::run(&db, "DROP ROUTE IF EXISTS gone");
+    tx.commit().expect("a drop of nothing overtakes no row");
+    support::assert_rows_are(&db, 1..=3);
+    support::run(&db, "CREATE TABLE u (id INTEGER PRIMARY KEY)");
+    let kinds = [
+        "EVENT TYPE {} WHEN INSERT ON u",
+        "TRIGGER {} ON u WHEN INSERT",
+    ]
+    .into_iter()
+    .chain(["SINK {} TYPE callback", "ROUTE {} EVENT a TO a"]);
+    for (n, kind) in (4..).zip(kinds) {
+        let ddl = |name: &str| format!("CREATE {}", kind.replace("{}", name));
+        let row = format!("INSERT INTO t (id, name, tag) VALUES ({n}, 'row-{n:07}', {n})");
+        for (first, second) in [(ddl("a"), row.clone()), (row, ddl("b"))] {
+            let tx = db.transaction().expect("begin");
+            support::run(&tx, &first);
+            let refused = support::refusal(&tx, &second);
+            assert!(matches!(refused, Error::MixedSchemaAndRowWrite), "{second}");
+            tx.commit().expect("the first statement commits alone");
+        }
+    }
+    support::assert_rows_are(&db, 1..=7);
+
+    // A table, its trigger and its event type with a sink, a route and a schedule are one
+    // declaration sequence, committed in either order the author writes them and kept after a
+    // reopen. All share one quoted name: a table and a declaration of each kind do not collide.
+    let folder = support::folder("declarations-with-events");
+    let db = support::open(&folder);
+    let q = |n: usize| format!("\"{n} Kind;/'\"");
+    let sequence = |n: usize| {
+        let q = q(n);
+        [
+            format!("CREATE TABLE {q} (id INTEGER PRIMARY KEY)"),
+            format!("CREATE SINK {q} TYPE callback"),
+            format!("CREATE TRIGGER {q} ON {q} WHEN INSERT"),
+            format!("CREATE EVENT TYPE {q} WHEN INSERT ON {q}"),
+            format!("CREATE ROUTE {q} EVENT {q} TO {q}"),
+            format!("CREATE SCHEDULE {q} EVERY '1 hour' TX (tidy)"),
+        ]
+    };
+    for (n, order) in [(1, [0, 1, 2, 3, 4, 5]), (2, [1, 5, 0, 3, 4, 2])] {
+        let tx = db.transaction().expect("begin");
+        for i in order {
+            support::run(&tx, &sequence(n)[i]);
+        }
+        tx.commit()
+            .expect("the declarations commit together, in the author's order");
+    }
+    let db = support::reopen(db, &folder);
+    // Each is still declared: another definition under its name is refused.
+    for n in [1, 2] {
+        let (q, other) = (q(n), q(3 - n));
+        for sql in [
+            format!("CREATE TABLE {q} (id TEXT PRIMARY KEY)"),
+            format!("CREATE SINK {q} TYPE webhook URL 'https://example.invalid'"),
+            format!("CREATE TRIGGER {q} ON {q} WHEN UPDATE"),
+            format!("CREATE EVENT TYPE {q} WHEN UPDATE ON {q}"),
+            format!("CREATE ROUTE {q} EVENT {other} TO {q}"),
+        ] {
+            let refusal = support::refusal(&db, &sql);
+            assert!(
+                matches!(refusal, Error::SchemaInvalid { .. }),
+                "after a reopen `{sql}` met no declaration of that name: {refusal:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_delete_of_thousands_of_rows_fits_the_default_budget() {
+    let db = support::open(&support::folder("big-delete"));
+    support::declare(&db);
+    support::insert_together(&db, 1..=4096);
+    support::run(&db, &format!("UPDATE t SET name = '{}'", "x".repeat(544)));
+    assert_eq!(support::run(&db, "DELETE FROM t").rows_affected(), 4096);
+}
+
+#[test]
+fn two_transactions_committed_at_once_each_commit_or_are_overtaken() {
+    let db = support::open(&support::folder("commit-at-once"));
+    support::declare(&db);
+    support::insert(&db, 1..=2);
+    let (db, start) = (&db, &std::sync::Barrier::new(2));
+    let commit = |id: i64| {
+        let tx = db.transaction().expect("begin");
+        support::run(&tx, &format!("UPDATE t SET tag = 7 WHERE id = {id}"));
+        start.wait();
+        tx.commit()
+    };
+    let outcomes = std::thread::scope(|scope| {
+        let spawned = [1, 2].map(|id| scope.spawn(move || commit(id)));
+        spawned.map(|thread| thread.join().unwrap())
+    });
+    let won = outcomes.iter().filter(|o| o.is_ok()).count() as i64;
+    let typed = |o: &Result<(), Error>| matches!(o, Err(Error::ConditionalUpdateConflict { .. }));
+    let all_typed = outcomes.iter().all(|o| o.is_ok() || typed(o));
+    assert!(all_typed, "each is a commit or a typed conflict");
+    assert!(won >= 1, "one writer wins");
+    let tagged = support::int(db, "SELECT COUNT(*) FROM t WHERE tag = 7");
+    assert_eq!(tagged, won, "an overtaken update is not kept");
 }
 
 #[test]
@@ -564,17 +680,21 @@ fn a_statement_commits_while_a_cycle_works_out_a_step() {
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
 
-    // 2,000 sealed vectors of 256 numbers in three blocks, and their build begun.
+    // 2,000 vectors of 256 numbers in three blocks, sealed by their commit and the one cycle
+    // that also begins their build.
     const DIMENSION: usize = 256;
     let folder = support::folder("commit-beside-a-step");
     let db = support::open(&folder);
     support::declare_docs(&db, DIMENSION, "INDEXING_THRESHOLD 1000");
     support::load_docs(&db, 1..=2000, "a", |n| support::gathered(n, DIMENSION));
     let report = support::cycle(&db);
+    let partition = support::the_partition(&db);
     assert_eq!(
-        (report.maintenance_vectors_done, report.remaining_partitions),
-        (2000, 1)
+        support::whole(&partition, "pending_tuples"),
+        0,
+        "all sealed"
     );
+    assert_eq!(count(report.remaining_partitions), 1, "a build to step");
     support::close(db);
 
     // The storage door holds the first read of 64 KiB or more made once it is armed: a block
@@ -597,7 +717,7 @@ fn a_statement_commits_while_a_cycle_works_out_a_step() {
         }
     }));
     let db = support::open_with(&folder, options).expect("open");
-    let before = db.committed_watermark();
+    let before = support::watermark(&db);
     armed.store(true, Ordering::SeqCst);
 
     let db = &db;
@@ -620,13 +740,23 @@ fn a_statement_commits_while_a_cycle_works_out_a_step() {
             let row = support::gathered(9001, DIMENSION);
             let outcome = support::insert_doc(db, 9001, "a", Some(row));
             said.send("insert").expect("the test listens");
-            outcome.map(|_| db.committed_watermark())
+            outcome.map(|_| support::watermark(db))
         });
         assert_eq!(
             heard.recv(),
             Ok("insert"),
             "the INSERT returned while the step was held"
         );
+        for sql in [
+            "SELECT COUNT(*) FROM docs",
+            "SHOW VECTOR_INDEXES",
+            "SHOW VECTOR_PARTITIONS",
+        ] {
+            assert!(
+                !support::rows(db, sql).is_empty(),
+                "{sql} answers beside the held step"
+            );
+        }
         let_go.send(()).expect("the held read listens");
         let inserted = insert.join().expect("the thread of the INSERT");
         (inserted, cycle.join().expect("the cycle's thread"))

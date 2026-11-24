@@ -14,7 +14,7 @@ VALUES (1, '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-0000
        (2, '00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000003', 'DEPENDS_ON'),
        (3, '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000003', 'DEPENDS_ON');
 ----
-rows affected: 3
+rows affected: 3  (read 0, compared 0)
 
 # Back to the start of the chain, over two edges and over one.
 INSERT INTO edges (id, source_id, target_id, edge_type)
@@ -23,7 +23,18 @@ VALUES (4, '00000000-0000-0000-0000-000000000003', '00000000-0000-0000-0000-0000
 error: CycleDetected
 
 INSERT INTO edges (id, source_id, target_id, edge_type)
+VALUES (40, '00000000-0000-0000-0000-000000000003', '00000000-0000-0000-0000-000000000001', 'DEPENDS_ON');
+----
+error: CycleDetected
+
+INSERT INTO edges (id, source_id, target_id, edge_type)
 VALUES (4, '00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 'DEPENDS_ON');
+----
+error: CycleDetected
+
+# Judged by its ends, not its id.
+INSERT INTO edges (id, source_id, target_id, edge_type)
+VALUES (40, '00000000-0000-0000-0000-000000000003', '00000000-0000-0000-0000-000000000001', 'DEPENDS_ON');
 ----
 error: CycleDetected
 
@@ -42,7 +53,7 @@ error: CycleDetected
 
 SELECT id FROM edges ORDER BY id;
 ----
-id
+id  (read 3, compared 0)
 1
 2
 3
@@ -52,7 +63,7 @@ id
 INSERT INTO edges (id, source_id, target_id, edge_type)
 VALUES (10, '00000000-0000-0000-0000-000000000003', '00000000-0000-0000-0000-000000000001', 'BASED_ON');
 ----
-rows affected: 1
+rows affected: 1  (read 2, compared 0)
 
 INSERT INTO edges (id, source_id, target_id, edge_type)
 VALUES (11, '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000003', 'BASED_ON');
@@ -65,7 +76,7 @@ VALUES (20, '00000000-0000-0000-0000-000000000003', '00000000-0000-0000-0000-000
        (21, '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000003', 'CITES'),
        (22, '00000000-0000-0000-0000-000000000004', '00000000-0000-0000-0000-000000000004', 'CITES');
 ----
-rows affected: 3
+rows affected: 3  (read 0, compared 0)
 
 # An UPDATE is held to the same rule: turning an edge round, and giving an edge a listed type.
 UPDATE edges SET source_id = '00000000-0000-0000-0000-000000000003', target_id = '00000000-0000-0000-0000-000000000001'
@@ -83,7 +94,7 @@ error: CycleDetected
 
 SELECT id, edge_type FROM edges ORDER BY id;
 ----
-id | edge_type
+id | edge_type  (read 7, compared 0)
 1 | DEPENDS_ON
 2 | DEPENDS_ON
 3 | DEPENDS_ON
@@ -95,12 +106,12 @@ id | edge_type
 # Once the edge that made the way round is gone, the edge back is no cycle.
 DELETE FROM edges WHERE id IN (2, 3);
 ----
-rows affected: 2
+rows affected: 2  (read 2, compared 0)
 
 INSERT INTO edges (id, source_id, target_id, edge_type)
 VALUES (4, '00000000-0000-0000-0000-000000000003', '00000000-0000-0000-0000-000000000001', 'DEPENDS_ON');
 ----
-rows affected: 1
+rows affected: 1  (read 2, compared 0)
 
 # 3 -> 1 -> 2 now: the edge 2 -> 3 that was deleted would close it.
 INSERT INTO edges (id, source_id, target_id, edge_type)
@@ -113,11 +124,11 @@ error: CycleDetected
 INSERT INTO edges (id, source_id, target_id, edge_type)
 VALUES (30, '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002', 'DEPENDS_ON');
 ----
-rows affected: 1
+rows affected: 1  (read 0, compared 0)
 
 SELECT id FROM edges WHERE edge_type = 'DEPENDS_ON' ORDER BY id;
 ----
-id
+id  (read 7, compared 0)
 1
 4
 30
@@ -148,7 +159,7 @@ VALUES (1, '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-0000
 UPDATE one_edge SET source_id = '00000000-0000-0000-0000-000000000002', target_id = '00000000-0000-0000-0000-000000000001'
 WHERE id = 1;
 ----
-rows affected: 1
+rows affected: 1  (read 1, compared 0)
 
 # The edge is now 2 -> 1, and the edge it was would close a cycle with it.
 INSERT INTO one_edge (id, source_id, target_id, edge_type)
@@ -158,7 +169,7 @@ error: CycleDetected
 
 SELECT id, source_id, target_id FROM one_edge;
 ----
-id | source_id | target_id
+id | source_id | target_id  (read 1, compared 0)
 1 | 00000000-0000-0000-0000-000000000002 | 00000000-0000-0000-0000-000000000001
 
 # A table of edges that is also IMMUTABLE takes an edge, and refuses the edge that would close a cycle.
@@ -171,7 +182,7 @@ CREATE TABLE fixed_edges (
 INSERT INTO fixed_edges (id, source_id, target_id, edge_type)
 VALUES (1, '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002', 'X');
 ----
-rows affected: 1
+rows affected: 1  (read 0, compared 0)
 
 INSERT INTO fixed_edges (id, source_id, target_id, edge_type)
 VALUES (2, '00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 'X');

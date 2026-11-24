@@ -56,3 +56,13 @@ fn a_limit_below_what_is_in_use_is_refused_and_the_old_one_stays() {
     drop(held);
     assert_eq!(budget.used(), baseline);
 }
+
+// M4: the default limit is a quarter of what the process may use, never below the door's floor,
+// and 2 GiB where that is unknown; a process allowed 32 MiB gets the floor, not 8 MiB.
+#[test]
+fn a_process_allowed_32_mib_gets_the_floor_as_its_default() {
+    let floor = (10 << 20) + (768 << 10);
+    assert_eq!(super::default_limit(Some(32 << 20), floor), floor);
+    assert_eq!(super::default_limit(None, floor), 2 << 30);
+    assert_eq!(super::default_limit(Some(64 << 30), floor), 16 << 30);
+}

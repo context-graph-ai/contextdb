@@ -1,6 +1,6 @@
 # SHOW VECTOR_INDEXES gives one row for each VECTOR column, in the order of table and column;
 # SHOW VECTOR_PARTITIONS one row for each partition, in the order of table, column and key
-# values. No maintenance cycle runs here, so every vector is pending, no block or grouping holds
+# values. No maintenance cycle runs here, so every vector is pending, no block or IVF holds
 # a byte, nothing is due, and INDEXED may be given every partition. Three columns: one with no
 # key and no vector, one with a key and three partitions (row 5 has no vector), and one that
 # keeps its vectors reduced to a byte a number.
@@ -18,15 +18,15 @@ INSERT INTO c_small (id, v) VALUES (1, [1.0, 0.0, 0.0, 0.0]), (2, [0.0, 1.0, 0.0
 
 SHOW VECTOR_INDEXES;
 ----
-table | column | dimension | quantization | vector_count | bytes | partition_key_columns | max_partitions | live_partitions | search_mode | declared_indexing_threshold | effective_indexing_threshold | declared_compaction_mode | declared_compaction_change_percent | declared_compaction_tombstone_percent | effective_compaction_mode | effective_compaction_change_percent | effective_compaction_tombstone_percent | pending_tuples | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | maintenance_state | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | unavailable_partitions | stalled_partitions | broad_route | recovery_action
-a_plain | v | 3 | F32 | 0 | 0 | [] | NULL | 0 | AUTO | NULL | 100000 | NULL | NULL | NULL | PERCENT | 20 | 10 | 0 | 0 | 0 | 0 | true | idle | 0 | 0 | 0 | 0 | 0 | fan_out | none
-b_parts | v | 2 | F32 | 4 | 0 | ["a","b"] | 256 | 3 | AUTO | NULL | 100000 | NULL | NULL | NULL | PERCENT | 20 | 10 | 4 | 0 | 0 | 0 | true | idle | 0 | 0 | 0 | 0 | 0 | fan_out | none
-c_small | v | 4 | SQ8 | 2 | 0 | [] | NULL | 1 | AUTO | NULL | 100000 | NULL | NULL | NULL | PERCENT | 20 | 10 | 2 | 0 | 0 | 0 | true | idle | 0 | 0 | 0 | 0 | 0 | fan_out | none
+table | column | dimension | quantization | vector_count | bytes | partition_key_columns | max_partitions | live_partitions | search_mode | declared_indexing_threshold | effective_indexing_threshold | declared_probes | declared_compaction_mode | declared_compaction_change_percent | declared_compaction_tombstone_percent | effective_compaction_mode | effective_compaction_change_percent | effective_compaction_tombstone_percent | pending_tuples | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | maintenance_state | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | unavailable_partitions | stalled_partitions | broad_route | recovery_action  (read 0, compared 0)
+a_plain | v | 3 | F32 | 0 | 0 | [] | NULL | 0 | AUTO | NULL | 100000 | NULL | NULL | NULL | NULL | PERCENT | 20 | 10 | 0 | 0 | 0 | 0 | true | idle | 0 | 0 | 0 | 0 | 0 | fan_out | none
+b_parts | v | 2 | F32 | 4 | 0 | ["a","b"] | 256 | 3 | AUTO | NULL | 100000 | NULL | NULL | NULL | NULL | PERCENT | 20 | 10 | 4 | 0 | 0 | 0 | true | idle | 0 | 0 | 0 | 0 | 0 | fan_out | none
+c_small | v | 4 | SQ8 | 2 | 0 | [] | NULL | 1 | AUTO | NULL | 100000 | NULL | NULL | NULL | NULL | PERCENT | 20 | 10 | 2 | 0 | 0 | 0 | true | idle | 0 | 0 | 0 | 0 | 0 | fan_out | none
 
 # A column with no key has one partition, there before its first vector.
 SHOW VECTOR_PARTITIONS;
 ----
-table | column | partition_key | live_rows | pending_tuples | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | availability_reason | maintenance_state | maintenance_reason | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | lists | probes | recovery_action
+table | column | partition_key | live_rows | pending_tuples | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | availability_reason | maintenance_state | maintenance_reason | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | lists | probes | recovery_action  (read 0, compared 0)
 a_plain | v | {} | 0 | 0 | 0 | 0 | 0 | true | none | idle | none | 0 | 0 | 0 | NULL | NULL | none
 b_parts | v | {"a":"x","b":1} | 2 | 2 | 0 | 0 | 0 | true | none | idle | none | 0 | 0 | 0 | NULL | NULL | none
 b_parts | v | {"a":"x","b":2} | 1 | 1 | 0 | 0 | 0 | true | none | idle | none | 0 | 0 | 0 | NULL | NULL | none
@@ -35,7 +35,7 @@ c_small | v | {} | 2 | 2 | 0 | 0 | 0 | true | none | idle | none | 0 | 0 | 0 | N
 
 SHOW VECTOR_PARTITIONS FOR b_parts.v;
 ----
-table | column | partition_key | live_rows | pending_tuples | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | availability_reason | maintenance_state | maintenance_reason | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | lists | probes | recovery_action
+table | column | partition_key | live_rows | pending_tuples | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | availability_reason | maintenance_state | maintenance_reason | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | lists | probes | recovery_action  (read 0, compared 0)
 b_parts | v | {"a":"x","b":1} | 2 | 2 | 0 | 0 | 0 | true | none | idle | none | 0 | 0 | 0 | NULL | NULL | none
 b_parts | v | {"a":"x","b":2} | 1 | 1 | 0 | 0 | 0 | true | none | idle | none | 0 | 0 | 0 | NULL | NULL | none
 b_parts | v | {"a":"y","b":1} | 1 | 1 | 0 | 0 | 0 | true | none | idle | none | 0 | 0 | 0 | NULL | NULL | none
@@ -43,13 +43,13 @@ b_parts | v | {"a":"y","b":1} | 1 | 1 | 0 | 0 | 0 | true | none | idle | none | 
 # LIMIT cuts the list with FOR or without; OFFSET, after LIMIT only, skips rows first.
 SHOW VECTOR_PARTITIONS LIMIT 2;
 ----
-table | column | partition_key | live_rows | pending_tuples | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | availability_reason | maintenance_state | maintenance_reason | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | lists | probes | recovery_action
+table | column | partition_key | live_rows | pending_tuples | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | availability_reason | maintenance_state | maintenance_reason | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | lists | probes | recovery_action  (read 0, compared 0)
 a_plain | v | {} | 0 | 0 | 0 | 0 | 0 | true | none | idle | none | 0 | 0 | 0 | NULL | NULL | none
 b_parts | v | {"a":"x","b":1} | 2 | 2 | 0 | 0 | 0 | true | none | idle | none | 0 | 0 | 0 | NULL | NULL | none
 
 SHOW VECTOR_PARTITIONS FOR b_parts.v LIMIT 2 OFFSET 1;
 ----
-table | column | partition_key | live_rows | pending_tuples | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | availability_reason | maintenance_state | maintenance_reason | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | lists | probes | recovery_action
+table | column | partition_key | live_rows | pending_tuples | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | availability_reason | maintenance_state | maintenance_reason | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | lists | probes | recovery_action  (read 0, compared 0)
 b_parts | v | {"a":"x","b":2} | 1 | 1 | 0 | 0 | 0 | true | none | idle | none | 0 | 0 | 0 | NULL | NULL | none
 b_parts | v | {"a":"y","b":1} | 1 | 1 | 0 | 0 | 0 | true | none | idle | none | 0 | 0 | 0 | NULL | NULL | none
 
@@ -75,3 +75,11 @@ error: ParseError
 SHOW VECTOR_INDEXES FOR b_parts.v;
 ----
 error: ParseError
+
+# A partition whose last vector is deleted is gone from the list, and a keyed column with no vector has none.
+CREATE TABLE d_keyed (id INTEGER PRIMARY KEY, a TEXT NOT NULL, v VECTOR(2) PARTITION_KEY (a));
+INSERT INTO d_keyed (id, a, v) VALUES (1, 'x', [1.0, 0.0]), (2, 'x', [0.0, 1.0]), (3, 'y', NULL);
+DELETE FROM d_keyed WHERE a = 'x';
+SHOW VECTOR_PARTITIONS FOR d_keyed.v;
+----
+* | * | * | * | * | * | * | * | * | * | * | * | * | * | * | * | * | *

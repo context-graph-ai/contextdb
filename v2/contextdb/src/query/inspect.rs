@@ -1,26 +1,24 @@
-//! Inspection of VECTOR columns: what `SHOW VECTOR_INDEXES` and `SHOW VECTOR_PARTITIONS` return
-//! and what explaining a statement says. All three read the vector part's small records and no
-//! block, no centre and no row, and none changes anything.
+//! One dispatcher for declared settings and table-driven reports.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use serde_json::json;
 
 use super::expression::EvalContext;
 use super::plan::{self, Given};
-use super::search::{Scope, Search, small};
+use super::search::{self, Scope, Search, small};
 use super::{QueryResult, Reader, Visible};
-use super::{subquery, table};
-use crate::memory::Budget;
+use super::{filter, subquery, table};
+use crate::memory::{Budget, Reservation};
 use crate::schema::{Catalog, Compaction, Quantization, Table, VectorColumn};
-use crate::sql::ast::BinOp;
+use crate::sql::ast::Show;
 use crate::sql::{Expr, Plan, not_supported};
 use crate::store::{Key, Read, VectorNumber};
 use crate::types::{Error, Result, Value, VectorIndexRef, VectorSearchMode};
 use crate::vector::{self, Inspected, Nearest, Route, State};
 
-const INDEX_FIELDS: [&str; 31] = [
+const INDEX_FIELDS: [&str; 32] = [
     "table",
     "column",
     "dimension",
@@ -33,6 +31,7 @@ const INDEX_FIELDS: [&str; 31] = [
     "search_mode",
     "declared_indexing_threshold",
     "effective_indexing_threshold",
+    "declared_probes",
     "declared_compaction_mode",
     "declared_compaction_change_percent",
     "declared_compaction_tombstone_percent",
@@ -54,7 +53,7 @@ const INDEX_FIELDS: [&str; 31] = [
     "recovery_action",
 ];
 
-const PARTITION_FIELDS: [&str; 18] = [
+const PART_FIELDS: [&str; 18] = [
     "table",
     "column",
     "partition_key",
@@ -75,52 +74,267 @@ const PARTITION_FIELDS: [&str; 18] = [
     "recovery_action",
 ];
 
-/// Answers `SHOW VECTOR_INDEXES` and `SHOW VECTOR_PARTITIONS`; `None` for any other plan.
-///
-/// `SHOW VECTOR_INDEXES` gives one row for each VECTOR column of the store, in the order of
-/// table name and column; `SHOW VECTOR_PARTITIONS` one row for each partition, of the column
-/// after `FOR` or of every column, in the order of table, column and key tuple, after `OFFSET`
-/// rows and at most `LIMIT`.
+const MEMORY_FIELDS: [&str; 5] = [
+    "limit",
+    "used",
+    "available",
+    "startup_ceiling",
+    "ceiling_refresh_failures",
+];
+const SHARE_FIELDS: [&str; 5] = [
+    "declared",
+    "default_percent",
+    "effective_percent",
+    "effective_bytes",
+    "budget_bytes",
+];
+const RUN_FIELDS: [&str; 9] = [
+    "statement",
+    "calls",
+    "rows",
+    "rows_examined",
+    "distance_evaluations",
+    "most_rows",
+    "most_rows_examined",
+    "most_distance_evaluations",
+    "unused_index",
+];
+const SIZE_FIELDS: [&str; 8] = [
+    "table",
+    "rows",
+    "large_values",
+    "indexes",
+    "vectors",
+    "blocks",
+    "versions",
+    "total",
+];
+
+pub(crate) struct Source<'a> {
+    catalog: &'a Catalog,
+    statements: Option<&'a crate::database::Statements>,
+    read: &'a dyn Read,
+    allowed: Option<&'a BTreeSet<String>>,
+    budget: &'a Budget,
+    held: &'a mut Reservation,
+    wait: &'a str,
+    limits: Option<&'a super::ReadLimits>,
+}
+pub(crate) type Push<'a> = &'a mut dyn FnMut(Vec<Value>) -> Result<()>;
+type Fill = fn(&Show, &mut Source<'_>, &mut dyn FnMut(Vec<Value>) -> Result<()>) -> Result<()>;
+pub(crate) const REPORTS: [(&str, &[&str], bool, bool, Fill); 5] = [
+    ("SHOW VECTOR_INDEXES", &INDEX_FIELDS, true, false, indexes),
+    ("SHOW VECTOR_PARTITIONS", &PART_FIELDS, true, true, parts),
+    ("SHOW CONTENT_SIZE", &SIZE_FIELDS, true, false, content),
+    ("SHOW STATEMENT_STATISTICS", &RUN_FIELDS, true, true, runs),
+    ("SHOW READ_CACHE_SHARE", &SHARE_FIELDS, false, false, share),
+];
+
 pub(super) fn show(
     plan: &Plan,
     catalog: &Catalog,
     read: &dyn Read,
-    budget: &Budget,
+    (budget, work, figures, parsing): (
+        &Budget,
+        Option<&super::Work<'_>>,
+        Option<&crate::database::Open>,
+        u64,
+    ),
+    allowed: Option<&BTreeSet<String>>,
 ) -> Result<Option<QueryResult>> {
     // The partitions read are held until their rows are made.
     let held = &mut budget.reserve(0, "query")?;
-    let (fields, rows) = match plan {
-        Plan::ShowVectorIndexes => {
-            let mut rows = Vec::new();
-            for (table, column) in columns(catalog, None)? {
-                let parts =
-                    vector::partitions(read, column, table.dimension(column), 0, None, held)?;
-                rows.push(index_row(table, column, &parts));
-            }
-            (&INDEX_FIELDS[..], rows)
+    let mut assembled = budget.reserve(0, "materialize_answer")?;
+    let setting = matches!(plan, Plan::ShowSetting(_));
+    let mut push = |row: Vec<Value>, rows: &mut Vec<Vec<Value>>| -> Result<()> {
+        super::result_row(&row, (!setting).then_some(&mut assembled), work)?;
+        if setting {
+            rows.push(row);
+            Ok(())
+        } else {
+            assembled.room(rows, usize::MAX)?;
+            rows.push(row);
+            Ok(())
         }
-        Plan::ShowVectorPartitions {
-            column,
-            limit,
-            offset,
-        } => {
-            let (mut skip, mut left, mut rows) = (*offset, *limit, Vec::new());
-            for (table, column) in columns(catalog, column.as_ref())? {
-                let n = table.dimension(column);
-                let parts = vector::partitions(read, column, n, skip, left, held)?;
-                // A column with no PARTITION_KEY always has its one partition.
-                let has = read.vector_number(VectorNumber::Partitions(column.id))?;
-                skip = skip.saturating_sub(has.max(u64::from(column.partition_key.is_empty())));
-                left = left.map(|left| left - parts.len() as u64);
-                let shown = parts.iter();
-                rows.extend(shown.map(|part| partition_row(table, column, part)));
+    };
+    let (fields, rows) = match plan {
+        Plan::ShowSetting(selected) => {
+            let current = figures.map(|open| open.settings()).transpose()?;
+            let (read, figures) = match current.as_ref() {
+                Some((view, figures)) => (view as &dyn Read, Some(*figures)),
+                None => (read, None),
+            };
+            use crate::settings::{Kind, SETTINGS, limit};
+            let (at, mut rows) = (selected.start, Vec::new());
+            let stored = read.setting(at)?;
+            let value = stored.unwrap_or(SETTINGS[at].2);
+            let bytes = |n: Option<u64>| n.map_or(text("none"), whole);
+            let fields = match SETTINGS[at].1 {
+                Kind::Bytes => {
+                    let handle = budget.handle();
+                    let memory = at == 0;
+                    let (limit, used, startup) = if memory {
+                        (
+                            handle.limit(),
+                            handle.used().saturating_sub(parsing),
+                            figures.map_or(handle.limit(), |f| f[0]),
+                        )
+                    } else {
+                        let disk = figures.map_or(limit(value), |f| f[2]);
+                        (
+                            disk,
+                            read.committed().file_bytes()?,
+                            figures.map_or(disk, |f| f[1]),
+                        )
+                    };
+                    let available = if !memory && limit.is_none() {
+                        Value::Null
+                    } else {
+                        bytes(limit.map(|n| n.saturating_sub(used)))
+                    };
+                    // A session opened with no option has no starting ceiling
+                    let startup = match startup {
+                        None if memory => Value::Null,
+                        startup => bytes(startup),
+                    };
+                    let mut row = vec![bytes(limit), whole(used), available, startup];
+                    if memory {
+                        row.push(whole(0));
+                    }
+                    push(row, &mut rows)?;
+                    &MEMORY_FIELDS[..if memory { 5 } else { 4 }]
+                }
+                Kind::Ratio(_) => {
+                    for i in selected.clone() {
+                        let n = read.setting(i)?;
+                        let value = n.unwrap_or(SETTINGS[i].2);
+                        let label = SETTINGS[i].0.rsplit(' ').next().unwrap();
+                        push(
+                            vec![
+                                text(&label.to_ascii_lowercase()),
+                                if matches!(SETTINGS[i].1, Kind::Seconds) {
+                                    whole(value)
+                                } else {
+                                    Value::Float64(f64::from_bits(value))
+                                },
+                                text(if n.is_some() { "declared" } else { "default" }),
+                            ],
+                            &mut rows,
+                        )?;
+                    }
+                    &["setting", "value", "source"][..]
+                }
+                Kind::Seconds | Kind::Count | Kind::Many => {
+                    let value = if matches!(SETTINGS[at].1, Kind::Count) && stored.is_none() {
+                        text("block")
+                    } else {
+                        whole(value)
+                    };
+                    push(vec![value], &mut rows)?;
+                    if matches!(SETTINGS[at].1, Kind::Seconds) {
+                        &["milliseconds"][..]
+                    } else {
+                        &["limit"][..]
+                    }
+                }
+            };
+            (fields, rows)
+        }
+
+        Plan::ShowReport(show) => {
+            let row = &REPORTS[show.report];
+            if !row.3 && (show.column.is_some() || show.limit.is_some() || show.offset != 0) {
+                return Err(Error::ParseError("this report accepts no options".into()));
             }
-            (&PARTITION_FIELDS[..], rows)
+            let mut rows = Vec::new();
+            let from = &mut Source {
+                catalog,
+                statements: work.and_then(|work| work.statements),
+                read,
+                allowed,
+                budget,
+                held,
+                limits: work
+                    .filter(|work| work.pages.is_some())
+                    .map(|work| work.limits),
+                wait: match figures.map(|open| open.maintenance) {
+                    Some(crate::Maintenance::Engine) => "wait for the engine's cycle",
+                    Some(_) => "run a maintenance cycle",
+                    None => "wait for the engine's cycle, or run one if you drive them",
+                },
+            };
+            (row.4)(show, from, &mut |row| push(row, &mut rows))?;
+            (row.1, rows)
         }
         _ => return Ok(None),
     };
     let fields = fields.iter().map(|name| (*name).to_owned()).collect();
-    Ok(Some(QueryResult::from_rows(fields, rows)))
+    let mut result = QueryResult::answer(fields, rows, assembled);
+    result.report =
+        matches!(plan, Plan::ShowReport(show) if REPORTS[show.report].0 != "SHOW CONTENT_SIZE");
+    Ok(Some(result))
+}
+
+fn indexes(_: &Show, from: &mut Source<'_>, push: Push<'_>) -> Result<()> {
+    let (read, held) = (from.read, &mut *from.held);
+    for (table, column) in columns(from.catalog, None, from.allowed)? {
+        let parts = vector::partitions(read, column, table.dimension(column), 0, None, held)?;
+        push(index_row(table, column, &parts, from.wait))?;
+    }
+    Ok(())
+}
+fn parts(show: &Show, from: &mut Source<'_>, push: Push<'_>) -> Result<()> {
+    let (read, held) = (from.read, &mut *from.held);
+    let (mut skip, mut left) = (show.offset, show.limit);
+    for (table, column) in columns(from.catalog, show.column.as_ref(), from.allowed)? {
+        let parts = vector::partitions(read, column, table.dimension(column), skip, left, held)?;
+        let has = read.vector_number(VectorNumber::Partitions(column.id))?;
+        skip = skip.saturating_sub(has.max(u64::from(column.partition_key.is_empty())));
+        left = left.map(|left| left - parts.len() as u64);
+        for part in &parts {
+            push(partition_row(table, column, part, from.wait))?;
+        }
+    }
+    Ok(())
+}
+fn share(_: &Show, from: &mut Source<'_>, push: Push<'_>) -> Result<()> {
+    let Some(l) = from.limits else {
+        return push(vec![Value::Null; 5]);
+    };
+    let (share, limit) = (l.cache_share, Some(l.memory));
+    let cache = |share| crate::store::cache_under(limit, share);
+    let percent = |bytes: u64| bytes * 100 / l.memory.max(1);
+    push(vec![
+        share.map_or(Value::Null, whole),
+        whole(percent(cache(None))),
+        whole(percent(cache(share))),
+        whole(cache(share)),
+        whole(l.memory),
+    ])
+}
+fn runs(show: &Show, from: &mut Source<'_>, push: Push<'_>) -> Result<()> {
+    from.statements.map_or(Ok(()), |kept| kept.rows(show, push))
+}
+fn content(_: &Show, from: &mut Source<'_>, push: Push<'_>) -> Result<()> {
+    let view = from.read.committed();
+    let report = crate::maintenance::verify(view, &Catalog::load(view, from.budget)?, from.budget)?;
+    for t in &report.tables {
+        let values = [
+            t.rows,
+            t.large_values,
+            t.indexes,
+            t.vectors,
+            t.blocks,
+            t.versions,
+        ];
+        push(
+            [text(&t.table)]
+                .into_iter()
+                .chain(values.into_iter().chain([values.iter().sum()]).map(whole))
+                .collect(),
+        )?;
+    }
+    Ok(())
 }
 
 /// The VECTOR column after `FOR`, or every VECTOR column in the order of table name and
@@ -128,6 +342,7 @@ pub(super) fn show(
 fn columns<'a>(
     catalog: &'a Catalog,
     named: Option<&(String, String)>,
+    allowed: Option<&BTreeSet<String>>,
 ) -> Result<Vec<(&'a Table, &'a VectorColumn)>> {
     if let Some((table, column)) = named {
         let table = catalog
@@ -144,7 +359,11 @@ fn columns<'a>(
         )]);
     }
     let mut found = Vec::new();
-    for table in catalog.tables() {
+    for table in catalog
+        .tables()
+        .into_iter()
+        .filter(|table| allowed.is_none_or(|names| names.contains(&table.name)))
+    {
         let mut vectors: Vec<_> = table.vectors.iter().map(|column| (table, column)).collect();
         vectors.sort_by(|left, right| left.1.column.cmp(&right.1.column));
         found.extend(vectors);
@@ -178,10 +397,10 @@ fn state_name(state: State) -> &'static str {
 }
 
 /// What brings a partition, or a column, out of this state.
-fn recovery(state: State) -> &'static str {
+fn recovery(state: State, wait: &str) -> &str {
     match state {
         State::Idle => "none",
-        State::Pending | State::Building => "run a maintenance cycle",
+        State::Pending | State::Building => wait,
         State::Stalled => "raise the memory limit",
     }
 }
@@ -214,7 +433,7 @@ fn key_object(column: &VectorColumn, tuple: &Key) -> String {
 }
 
 /// The row of `SHOW VECTOR_INDEXES` for one column, from all its partitions.
-fn index_row(table: &Table, column: &VectorColumn, parts: &[Inspected]) -> Vec<Value> {
+fn index_row(table: &Table, column: &VectorColumn, parts: &[Inspected], wait: &str) -> Vec<Value> {
     let sum = |of: fn(&Inspected) -> u64| parts.iter().map(of).sum::<u64>();
     let count = |of: fn(&Inspected) -> bool| parts.iter().filter(|part| of(part)).count() as u64;
     let optional = |number: Option<u64>| number.map_or(Value::Null, whole);
@@ -246,6 +465,7 @@ fn index_row(table: &Table, column: &VectorColumn, parts: &[Inspected]) -> Vec<V
         text(mode_name(column.mode())),
         optional(column.indexing_threshold),
         whole(column.index_at()),
+        optional(column.probes.map(u64::from)),
         declared,
         percent(change),
         percent(tombstone),
@@ -264,23 +484,23 @@ fn index_row(table: &Table, column: &VectorColumn, parts: &[Inspected]) -> Vec<V
         whole(unavailable),
         whole(count(|part| part.state == State::Stalled)),
         text("fan_out"),
-        text(recovery(state)),
+        text(recovery(state, wait)),
     ]
 }
 
 /// The row of `SHOW VECTOR_PARTITIONS` for one partition of a column.
-fn partition_row(table: &Table, column: &VectorColumn, part: &Inspected) -> Vec<Value> {
-    // Why the grouping is due or being built: the slots rows have left behind, when they
+fn partition_row(table: &Table, column: &VectorColumn, part: &Inspected, wait: &str) -> Vec<Value> {
+    // Why the IVF is due or being built: the slots rows have left behind, when they
     // alone are enough; else what has changed since.
     let reason = match part.state {
-        _ if part.damage.is_some() => "damaged",
+        _ if part.damage => "damaged",
         State::Idle => "none",
         State::Stalled => "memory_limit",
         _ if part.groups == 0 => "unindexed",
         _ if part.left_behind => "tombstones",
         _ => "changes",
     };
-    let grouping = |number: u32| match part.groups {
+    let ivf = |number: u32| match part.groups {
         0 => Value::Null,
         _ => whole(u64::from(number)),
     };
@@ -300,9 +520,9 @@ fn partition_row(table: &Table, column: &VectorColumn, part: &Inspected) -> Vec<
         whole(part.total),
         whole(part.done),
         whole(part.total - part.done),
-        grouping(part.groups),
-        grouping(part.probes),
-        text(recovery(part.state)),
+        ivf(part.groups),
+        ivf(part.probes),
+        text(recovery(part.state, wait)),
     ]
 }
 
@@ -321,12 +541,21 @@ pub(crate) fn explain(
     read: &dyn Read,
     reader: &Reader,
     budget: &Budget,
-    now: i64,
-) -> Result<String> {
+    (now, work, parsing): (i64, Option<&super::Work<'_>>, u64),
+) -> Result<crate::Owned<String>> {
+    let named = subquery::tables_read(plan, Some(catalog), None)?;
+    let bytes: u64 = named
+        .iter()
+        .filter_map(|n| catalog.table(n))
+        .map(|t| t.heap)
+        .sum();
+    let held = RefCell::new(budget.reserve(3 * (parsing + bytes), "explanation")?);
     let said = RefCell::new(Vec::new());
-    let mut ctx = EvalContext::new(params, now);
-    (ctx.said, ctx.explained) = (Some(&said), Some(plan));
+    let kept = super::Kept::new(budget.passing("expression evaluation")?);
+    let mut ctx = EvalContext::new(params, now, &kept);
+    (ctx.said, ctx.explained, ctx.held) = (Some(&said), Some(plan), Some(&held));
     let given = Given {
+        allowed: work.and_then(|work| work.limits.tables.as_ref()),
         params,
         catalog,
         read,
@@ -334,6 +563,7 @@ pub(crate) fn explain(
         budget,
         ctx,
         evaluations: &Cell::default(),
+        examined: None,
         named: None,
         bound: None,
     };
@@ -361,7 +591,11 @@ pub(crate) fn explain(
     if said.is_empty() {
         return Err(not_supported("explaining this statement"));
     }
-    Ok(said.join("\n"))
+    let mut held = held.into_inner();
+    let text = said.join("\n");
+    drop(said);
+    held.shrink(held.bytes().saturating_sub(text.capacity() as u64));
+    Ok(crate::Owned::charged(text, held))
 }
 
 /// Says the path the rows of the table `name` that pass `filter` are read by, with no index
@@ -381,7 +615,8 @@ pub(super) fn searched(search: &Search) -> Result<String> {
     let (table, vector, select, given) = (search.table, search.vector, search.select, search.given);
     let further = usize::from(select.order_by.len() > 1);
     let k = search.most.saturating_add(further);
-    let (filter, mode, reader) = (&select.filter, &select.use_vector, given.reader);
+    let (mode, reader) = (&select.use_vector, given.reader);
+    let (bound, filter) = search::bound(select, &given.ctx);
     let mode = mode.unwrap_or_else(|| vector.mode());
     let scope = Scope::new(table, vector, given);
     // A narrowed handle is told nothing the state of the index decides: no partition is planned.
@@ -391,13 +626,21 @@ pub(super) fn searched(search: &Search) -> Result<String> {
         format!("effective_indexing_threshold: {}", vector.index_at()),
         format!("partition_key_columns: {}", key_columns(vector)),
     ];
-    let keys = scope.keys(filter.as_ref())?;
+    if let Some(n) = vector.probes {
+        lines.push(format!("effective_probes: {n} (declared)"));
+    }
+    if let Some((most, equal)) = bound {
+        let op = if equal { "<=" } else { "<" };
+        lines.push(format!("distance_bound: {op} {most}"));
+    }
+    let keys = scope.keys(filter.as_ref())?.0;
     let every = scope.unbound.take().pop();
     // The list is let go with the text made from it; a reader with no partition plans none.
     let mut reservation = given.budget.reserve(0, "query")?;
     let planned = match &keys {
         Some(scope) if !narrowed => {
             let nearest = Nearest {
+                count: None,
                 table: table.id,
                 vector: vector.id,
                 column: vector,
@@ -408,12 +651,21 @@ pub(super) fn searched(search: &Search) -> Result<String> {
                 // Whether rows are turned away is known only when the search runs.
                 filtered: false,
                 ranked: false,
+                bound: None,
             };
             vector::plan(&nearest, given.read, &mut reservation)?
         }
         _ => Vec::new(),
     };
 
+    let names = vector.partition_key.iter().map(String::len).sum::<usize>();
+    let fixed = 128 * vector.partition_key.len() + 6 * (64 + size_of::<String>());
+    let bytes = planned
+        .iter()
+        .map(|p| 3 * (6 * (p.tuple.as_bytes().len() + names) + fixed) as u64)
+        .sum();
+    let held = given.ctx.held.expect("explanation reservation");
+    held.borrow_mut().grow(bytes)?;
     let indexed = mode == VectorSearchMode::Indexed;
     let allowed: u64 = planned.iter().map(|partition| partition.live).sum();
     // AUTO over fewer vectors than the column's size is EXACT, as the search settles it.
@@ -435,7 +687,7 @@ pub(super) fn searched(search: &Search) -> Result<String> {
             Route::Exact => "exact",
             Route::Indexed => "indexed",
         };
-        let grouping = |number: u32| match partition.groups {
+        let ivf = |number: u32| match partition.groups {
             0 => "none".to_owned(),
             _ => number.to_string(),
         };
@@ -443,8 +695,8 @@ pub(super) fn searched(search: &Search) -> Result<String> {
         lines.extend([
             format!("partition: {key}"),
             format!("  route: {route}"),
-            format!("  lists: {}", grouping(partition.groups)),
-            format!("  probes: {}", grouping(partition.probes)),
+            format!("  lists: {}", ivf(partition.groups)),
+            format!("  probes: {}", ivf(partition.probes)),
             format!("  live_rows: {}", partition.live),
             format!("  unindexed_rows: {}", partition.tail + partition.pending),
         ]);
@@ -465,17 +717,18 @@ pub(super) fn searched(search: &Search) -> Result<String> {
             let few = source.few(&source.choose(&[], &[])?, small(&planned, k))?;
             lines.push(format!("small_set: {}", if few { "yes" } else { "no" }));
         }
-        // For a filter no index serves: the index that would, by the columns it gives a value
-        // then the one it gives a range.
-        let mut terms = Vec::new();
-        table::collect(table, &table.scope(), filter, &given.ctx, &mut terms)?;
-        terms.sort_by_key(|term| term.op != BinOp::Eq);
-        let ranged = terms.iter().position(|term| term.op != BinOp::Eq);
-        let wanted = terms[..ranged.map_or(terms.len(), |at| at + 1)].iter();
-        let mut wanted: Vec<&str> = (wanted.filter_map(|term| table.meta.columns.get(term.column)))
-            .map(|column| column.name.as_str())
-            .collect();
-        wanted.dedup();
+        // For a filter of one case no index serves: the index that would, by the columns the
+        // case gives values then one it gives a range.
+        let (columns, cases) = (&table.meta.columns, &source.facts()?.cases);
+        let case = cases.iter().flatten().filter(|_| cases.len() == 1);
+        let (values, ranges): (Vec<_>, Vec<_>) = case
+            .filter(|(at, _)| *at < columns.len())
+            .partition(|(_, fact)| matches!(fact, filter::Fact::Among { .. }));
+        let wanted = values
+            .iter()
+            .chain(ranges.first())
+            .map(|(at, _)| &columns[*at].name);
+        let wanted: Vec<&str> = wanted.map(String::as_str).collect();
         if path.is_none() && !wanted.is_empty() {
             let (name, list) = (&table.name, wanted.join(", "));
             let index = format!("{name}_{}_idx", wanted.join("_"));

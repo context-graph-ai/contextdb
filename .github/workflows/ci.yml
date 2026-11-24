@@ -3,10 +3,10 @@ name: CI
 on:
   push:
     branches: [dev, main]
-    paths-ignore: ['v2/**', '.github/workflows/check.yml']
+    paths-ignore: ['v2/**', '.github/workflows/check.yml', 'docs/performance/**', 'scripts/ci-local.py']
   pull_request:
     branches: [dev, main]
-    paths-ignore: ['v2/**', '.github/workflows/check.yml']
+    paths-ignore: ['v2/**', '.github/workflows/check.yml', 'docs/performance/**', 'scripts/ci-local.py']
   workflow_dispatch:
 
 permissions:

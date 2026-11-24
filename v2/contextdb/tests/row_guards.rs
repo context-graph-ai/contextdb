@@ -225,7 +225,7 @@ fn a_commit_is_refused_when_a_guarded_value_was_changed_meanwhile_and_writes_not
 #[test]
 fn a_guard_taken_after_a_declaration_refuses_the_commit_when_its_value_was_changed_meanwhile() {
     let db = store_of_leases("guard-after-declaration");
-    let before = db.table_names();
+    let before = support::names(&db);
     let tx = db.transaction().expect("begin");
     support::run(
         &tx,
@@ -243,7 +243,7 @@ fn a_guard_taken_after_a_declaration_refuses_the_commit_when_its_value_was_chang
         "a commit of a declaration over a guarded value that changed",
     );
     // Nothing the transaction declared is stored.
-    assert_eq!(db.table_names(), before);
+    assert_eq!(support::names(&db), before);
     assert!(matches!(
         support::refusal(&db, "SELECT COUNT(*) FROM audits"),
         Error::TableNotFound(table) if table == "audits"
@@ -304,7 +304,7 @@ fn a_guard_taken_after_a_declaration_refuses_the_commit_when_its_value_was_chang
 fn a_guarded_row_is_not_a_changed_row() {
     let db = store_of_leases("guard-is-no-write");
     let before = support::rows(&db, ALL_LEASES);
-    let watermark = db.committed_watermark();
+    let watermark = support::watermark(&db);
 
     // A transaction that only guards commits and writes nothing.
     let tx = db.transaction().expect("begin");
@@ -312,7 +312,7 @@ fn a_guarded_row_is_not_a_changed_row() {
     tx.commit().expect("commit a transaction that only guarded");
     assert_eq!(support::rows(&db, ALL_LEASES), before);
     assert_eq!(
-        db.committed_watermark(),
+        support::watermark(&db),
         watermark,
         "a transaction that only guarded made a commit"
     );

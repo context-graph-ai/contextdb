@@ -1,4 +1,4 @@
-//! vector: the blocks of a VECTOR column, their groupings and sketches, search over them,
+//! vector: the blocks of a VECTOR column, their IVFs and binary codes, search over them,
 //! and its partitions.
 //!
 //! It never decides which rows a reader may see: `query` tells it, row by row, and a row is in
@@ -17,31 +17,31 @@
 //! the rows whose range can still reach the answer. The rows it returns are the ones a
 //! comparison of every stored vector returns.
 //!
-//! A partition that has grown is given a grouping: its slots sorted around centres, and for
-//! every slot a sketch of one bit a number. A search that may leave vectors out ranks the
-//! centres, estimates the sketches of the nearest groups and of the tail, and screens the
+//! A partition that has grown is given an IVF: its slots sorted around centroids, and for
+//! every slot a binary code of one bit a number. A search that may leave vectors out ranks the
+//! centroids, estimates the binary codes of the nearest groups and of the tail, and screens the
 //! one-byte copies of only the slots whose estimate can still reach the answer.
 
+mod binary;
 mod block;
 mod build;
 mod directory;
-mod grouping;
 mod inspect;
+mod ivf;
 mod pack;
 mod seal;
 mod search;
-mod sketch;
 mod slot;
-mod stage;
 mod tally;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod train;
+mod unindexed;
 
-pub(crate) use build::{prepare, remaining, stage_refusal, stage_step, waiting};
-pub(crate) use inspect::{Inspected, State, partitions};
-pub(crate) use seal::{Sealed, seal};
+pub(crate) use build::{prepare, progress, stage_refusal, stage_step, unindexed_work};
+pub(crate) use inspect::{Inspected, State, owners, partitions, verify_record};
+pub(crate) use seal::seal;
 pub(crate) use search::{Nearest, Planned, Route, plan, search};
 pub(crate) use slot::{Reduced, distance};
-pub(crate) use stage::stage;
 pub(crate) use tally::Tally;
+pub(crate) use unindexed::{Committed, Totals, erase, track_unindexed};

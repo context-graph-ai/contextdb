@@ -10,32 +10,37 @@ pub use crate::types::{
 #[derive(Debug, Clone)]
 pub enum Statement {
     CreateTable(CreateTable),
+    DeclareEvent(EventDeclaration),
+    DropEvent {
+        kind: crate::types::Kind,
+        name: String,
+        if_exists: bool,
+        table: Option<String>,
+    },
     CreateIndex(CreateIndex),
     AlterTable(AlterTable),
     DropTable(DropTable),
     DropIndex(DropIndex),
     Insert(Insert),
     Delete(Delete),
+    Purge(Vec<Delete>),
     Update(Update),
     Select(Select),
-    SetMemoryLimit(SetMemoryLimitValue),
-    ShowMemoryLimit,
-    ShowVectorIndexes,
+    SetSetting(usize, u64),
+    ShowSetting(std::ops::Range<usize>),
     /// `EXPLAIN <statement>`: the statement's path, as rows, without running it.
     Explain(Box<Statement>),
-    ShowVectorPartitions {
-        /// The table and column after `FOR`.
-        column: Option<(String, String)>,
-        limit: Option<u64>,
-        /// Zero when OFFSET was not written.
-        offset: u64,
-    },
+    ShowReport(Show),
+    /// `RESET STATEMENT_STATISTICS`: empties the record of statements.
+    ResetStatements,
 }
 
 #[derive(Debug, Clone)]
-pub enum SetMemoryLimitValue {
-    Bytes(usize),
-    None,
+pub struct Show {
+    pub report: usize,
+    pub column: Option<(String, String)>,
+    pub limit: Option<u64>,
+    pub offset: u64,
 }
 
 /// One SELECT as it was written. ORDER BY and what follows it are over the whole statement:
@@ -44,6 +49,8 @@ pub enum SetMemoryLimitValue {
 pub struct Select {
     /// The SELECTs named by WITH, in written order.
     pub with: Vec<(String, Select)>,
+    /// Positional output names of a derived relation.
+    pub column_aliases: Vec<String>,
     pub distinct: bool,
     /// `SELECT *` is one column named `*`.
     pub columns: Vec<SelectColumn>,
@@ -171,7 +178,7 @@ pub struct OrderByItem {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Column(ColumnRef),
-    Literal(Literal),
+    Literal(crate::types::Value),
     Parameter(String),
     BinaryOp {
         left: Box<Expr>,
@@ -263,16 +270,6 @@ pub struct ColumnRef {
     pub column: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum Literal {
-    Null,
-    Bool(bool),
-    Integer(i64),
-    Real(f64),
-    Text(String),
-    Vector(Vec<f32>),
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Eq,
@@ -356,8 +353,9 @@ pub struct TableOptions {
 }
 
 /// `REFERENCES table (column, ...)`, with its `ON STATE` rule when one was written.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reference {
+    pub follows_parent_purge: bool,
     pub table: String,
     pub columns: Vec<String>,
     pub on_state: Option<Propagation>,
@@ -365,7 +363,7 @@ pub struct Reference {
 
 /// `ON STATE on_state PROPAGATE SET set [MAX DEPTH n] [ABORT ON FAILURE]`, and the same four
 /// things of a `PROPAGATE ON EDGE`. A state keeps the letters it was written in.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Propagation {
     pub on_state: String,
     pub set: String,
@@ -375,7 +373,7 @@ pub struct Propagation {
 
 /// `PROPAGATE ON EDGE edge_type direction STATE ... SET ...`. The edge type keeps the letters
 /// it was written in; the direction is INCOMING, OUTGOING or BOTH, in capitals.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgePropagation {
     pub edge_type: String,
     pub direction: String,
@@ -406,11 +404,13 @@ pub struct ColumnDef {
     /// The table and column of `ACL REFERENCES table (column)`.
     pub acl: Option<(String, String)>,
     pub rank_policy: Option<RankPolicy>,
+    pub expires: bool,
 }
 
-/// `SCOPE_LABEL (...)`, whose one list is for reading and writing alike and leaves `write`
-/// empty, or `SCOPE_LABEL_READ (...) WRITE (...)`.
-#[derive(Debug, Clone)]
+/// `SCOPE_LABEL (...)` stores its single write-only list in `read`, with `write = None`;
+/// it hides no rows on reads. `SCOPE_LABEL_READ (...) WRITE (...)` stores separate read
+/// and write allowlists in the corresponding fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeLabels {
     pub read: Vec<String>,
     pub write: Option<Vec<String>>,
@@ -438,6 +438,8 @@ pub struct VectorClauses {
     pub search_mode: Option<VectorSearchMode>,
     /// The number after `INDEXING_THRESHOLD`, kept as written for `schema` to judge.
     pub indexing_threshold: Option<String>,
+    /// The number after `PROBES`, kept as written for `schema` to judge.
+    pub probes: Option<String>,
     /// `COMPACTION NONE` or `COMPACTION (...)`, when it was written.
     pub compaction: Option<CompactionClause>,
     /// The text of `WITH (quantization = '...')`, kept as written for `schema` to judge.
@@ -506,6 +508,8 @@ pub enum AlterAction {
     },
     /// `ALTER COLUMN column SET INDEXING_THRESHOLD n`, the number kept as written; `None` is DEFAULT.
     SetIndexingThreshold(String, Option<String>),
+    /// `ALTER COLUMN column SET PROBES n`; `None` is DEFAULT.
+    SetProbes(String, Option<String>),
     /// `ALTER COLUMN column SET COMPACTION ...`; `None` is DEFAULT.
     SetCompaction(String, Option<CompactionClause>),
 }
@@ -519,6 +523,29 @@ pub struct DropTable {
 #[derive(Debug, Clone)]
 pub struct DropIndex {
     pub name: String,
-    pub table: String,
+    /// `None` when written without ON and, once resolved, when IF EXISTS found it on no table.
+    pub table: Option<String>,
     pub if_exists: bool,
+}
+
+/// A declaration's kind byte also separates its namespace in the schema store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventDeclaration {
+    Trigger(crate::types::TriggerDecl),
+    EventType(crate::types::EventTypeDecl),
+    Sink(crate::types::SinkDecl),
+    Route(crate::types::RouteDecl),
+    Schedule(crate::types::ScheduleDecl),
+}
+impl EventDeclaration {
+    pub(crate) fn identity(&self) -> (crate::types::Kind, &str) {
+        use crate::types::Kind;
+        match self {
+            Self::Trigger(d) => (Kind::Trigger, &d.name),
+            Self::EventType(d) => (Kind::EventType, &d.name),
+            Self::Sink(d) => (Kind::Sink, &d.name),
+            Self::Route(d) => (Kind::Route, &d.name),
+            Self::Schedule(d) => (Kind::Schedule, &d.name),
+        }
+    }
 }

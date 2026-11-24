@@ -118,6 +118,9 @@ transactional observation and cascade writes; they are not validation triggers.
 Use `STATE MACHINE`, `IMMUTABLE`, `DAG`, and `PROPAGATE` for engine-enforced
 invariants.
 
+The CLI registers no callbacks, so writes that fire a declared trigger return
+`EngineNotInitialized` naming that trigger; a host program must register the callback before those writes.
+
 A trigger handler only prepares database work inside the firing transaction.
 It runs before the engine's final validation of the complete write set, so it
 may insert a row that the triggering write depends on, such as a referenced
@@ -199,10 +202,12 @@ VALUES ($id, $data, $embedding)
 
 -- Multiple rows
 INSERT INTO items (id, name) VALUES ($id1, $name1), ($id2, $name2)
+-- Err(EngineNotInitialized { operation: "trigger callback missing: item_changed; register it with register_transactional_trigger_callback" })
 
 -- Upsert
 INSERT INTO items (id, name) VALUES ($id, $name)
 ON CONFLICT (id) DO UPDATE SET name = $name
+-- Err(EngineNotInitialized { operation: "trigger callback missing: item_changed; register it with register_transactional_trigger_callback" })
 ```
 
 ### UPDATE / DELETE
@@ -409,22 +414,21 @@ Size suffixes are binary. Both settings accept optional `=`, an unquoted or quot
 **2147483648 bytes**. CLI `--memory-limit 2G` uses the same value. The limit governs charged bytes,
 which are separate from whole-process RSS.
 
-`SET READ_CACHE_SHARE = <percent>` changes only the current `ReadSession`'s file page cache.
-The `=` is optional, as it is for SET MEMORY_LIMIT and SET DISK_LIMIT.
-An integer from 0 through 100 declares that percentage of the session memory budget after fixed
-source reservations. `SET READ_CACHE_SHARE = DEFAULT` restores the exact derived default,
-`(budget - fixed reservations) / 7`, displayed as default (14%). Zero disables the file cache.
-The change takes effect immediately without reopening the snapshot; an open cursor keeps its
-rows, snapshot, and funded pinned pages. An existing cursor also applies a later declaration on
-its next fetch after its writer exits. Cache inspection selects the current readable route after
-writer turnover; routing failures remain typed errors. Another session and a reopened session keep
-their own policy. These statements require no writable store and do not persist a store setting.
+`SET READ_CACHE_SHARE` is refused. The share is chosen when a reader opens, through `ReadLimits::cache_share`. `SHOW READ_CACHE_SHARE` reads the current session.
+An integer from 0 through 100 is that percentage of the session memory budget after fixed
+source reservations. `DEFAULT` is `(budget - fixed reservations) / 7`, displayed as default (14%). Zero disables the file cache.
+The share belongs to the session that was opened with it. An open cursor keeps its
+rows, snapshot, and funded pinned pages. Another session and a reopened session keep
+their own policy. The share is not a persisted store setting.
 
 ```sql
 SET READ_CACHE_SHARE = 40;
+-- refused
 SHOW READ_CACHE_SHARE;
 SET READ_CACHE_SHARE = 0;
+-- refused
 SET READ_CACHE_SHARE = DEFAULT;
+-- refused
 ```
 
 Range refusals use `Error::InvalidSetting { name, value, allowed }`; for this setting `name` is

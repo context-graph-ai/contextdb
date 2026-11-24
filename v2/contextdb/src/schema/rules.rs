@@ -3,6 +3,7 @@
 
 use super::Catalog;
 use super::check::{engine_index, invalid};
+use crate::memory::Budget;
 use crate::sql::ast;
 use crate::sql::plan::CreateTablePlan;
 use crate::store::CountId;
@@ -33,11 +34,14 @@ pub(crate) struct Rules {
     /// The column declared ACL, then the table and the column of grants it references.
     pub acl: Option<(usize, String, String)>,
     pub rank_policies: Vec<RankPolicy>,
+    pub expires_column: Option<usize>,
+    pub retain_since: Option<u32>,
 }
 
 /// One reference of a table to a parent's key or UNIQUE rule.
 #[derive(Debug, Clone)]
 pub(crate) struct Reference {
+    pub follows_parent_purge: bool,
     pub columns: Vec<usize>,
     pub parent: String,
     pub parent_columns: Vec<String>,
@@ -50,7 +54,8 @@ pub(crate) struct Reference {
 #[derive(Debug, Clone)]
 pub(crate) struct Count {
     pub id: CountId,
-    pub columns: Vec<(usize, SortDirection)>,
+    pub index: usize,
+    pub prefix: usize,
 }
 
 /// The RANK_POLICY of a VECTOR column.
@@ -83,7 +88,8 @@ pub(super) fn is_rule(index: &crate::types::IndexDecl) -> bool {
 pub(super) fn of(
     create: &CreateTablePlan,
     meta: &mut TableMeta,
-    catalog: &Catalog,
+    catalog: Option<&Catalog>,
+    budget: &Budget,
 ) -> Result<Rules> {
     let table = &create.name;
     let options = &create.options;
@@ -107,6 +113,11 @@ pub(super) fn of(
         "HISTORY CURRENT ONLY on a table that sends its rows out and keeps the first write: \
          another machine would take a newest value as the first, so write SYNC CONFLICT KEEP \
          LATEST or SYNC OFF"
+    } else if meta.retain.as_ref().is_some_and(|retain| retain.sync_safe)
+        && !meta.columns.iter().any(|column| column.primary_key)
+    {
+        "RETAIN ... SYNC SAFE without a PRIMARY KEY: declare a PRIMARY KEY so delivered rows \
+         have an identity"
     } else if meta.retain.as_ref().is_some_and(|retain| retain.sync_safe) && !delivers {
         "RETAIN ... SYNC SAFE waits for a delivery that SYNC OFF and SYNC PULL ONLY never make: \
          leave SYNC SAFE out, or choose a direction that delivers"
@@ -141,22 +152,18 @@ pub(super) fn of(
     let of_table = create.foreign_keys.iter();
     for (columns, written) in of_columns.chain(of_table.map(|(columns, to)| (columns.clone(), to)))
     {
-        // A table that references itself is checked against the declaration being made.
-        let parent = match catalog.table(&written.table) {
-            _ if written.table == *table => &*meta,
-            Some(parent) => &parent.meta,
+        // A self-reference is settled by this declaration; only other tables need a catalog.
+        let parent = match catalog.and_then(|catalog| catalog.table(&written.table)) {
+            _ if written.table == *table => Some(&*meta),
+            Some(parent) => Some(&parent.meta),
+            None if catalog.is_none() => None,
             None => return Err(Error::TableNotFound(written.table.clone())),
         };
         let covers = |index: &crate::types::IndexDecl| {
-            is_rule(index)
-                && index.columns.len() == columns.len()
-                && index
-                    .columns
-                    .iter()
-                    .map(|(name, _)| name)
-                    .eq(&written.columns)
+            let names = index.columns.iter().map(|(name, _)| name);
+            is_rule(index) && names.eq(&written.columns)
         };
-        if !parent.indexes.iter().any(covers) {
+        if parent.is_some_and(|parent| !parent.indexes.iter().any(covers)) {
             return Err(invalid(format!(
                 "table '{table}': REFERENCES {}({}) names columns that no PRIMARY KEY or \
                  UNIQUE rule covers in that order; reference a key, or declare the UNIQUE rule on the parent \
@@ -165,24 +172,24 @@ pub(super) fn of(
                 written.columns.join(", ")
             )));
         }
-        // A key matches only a value of its own type.
-        for (column, to) in columns.iter().zip(&written.columns) {
+        // A key matches only its own type, and REAL cannot be a key in any parent.
+        for (n, (column, to)) in columns.iter().zip(&written.columns).enumerate() {
             let at = position(table, meta, column)?;
-            let to = parent.columns.iter().find(|parent| parent.name == *to);
-            if to.is_some_and(|to| to.column_type != meta.columns[at].column_type) {
+            let target =
+                parent.and_then(|parent| parent.columns.iter().find(|parent| parent.name == *to));
+            if written.columns[..n].contains(to)
+                || meta.columns[at].column_type == ColumnType::Real
+                || target.is_some_and(|to| to.column_type != meta.columns[at].column_type)
+            {
                 return Err(invalid(format!(
-                    "table '{table}': '{column}' REFERENCES {}, a column of another type",
+                    "table '{table}': '{column}' REFERENCES {}, but its type or target columns cannot match a key",
                     written.table
                 )));
             }
         }
         let leads = |index: &crate::types::IndexDecl| {
-            index.columns.len() >= columns.len()
-                && index
-                    .columns
-                    .iter()
-                    .zip(&columns)
-                    .all(|((name, _), column)| name == column)
+            let names = index.columns.iter().map(|(name, _)| name);
+            names.take(columns.len()).eq(&columns)
         };
         let index = match meta.indexes.iter().position(leads) {
             Some(index) => index,
@@ -193,6 +200,7 @@ pub(super) fn of(
             }
         };
         rules.references.push(Reference {
+            follows_parent_purge: written.follows_parent_purge,
             columns: columns
                 .iter()
                 .map(|c| position(table, meta, c))
@@ -238,23 +246,44 @@ pub(super) fn of(
              target_id UUID and edge_type TEXT, or leave DAG out"
         )));
     }
-    rules.counts = counts(table, meta, &[], catalog)?;
 
     for (at, column) in create.columns.iter().enumerate() {
+        if column.expires {
+            if rules.expires_column.replace(at).is_some()
+                || meta.columns[at].column_type != ColumnType::Timestamp
+            {
+                return Err(invalid(format!(
+                    "table '{table}': declare one TIMESTAMP EXPIRES column"
+                )));
+            }
+            if meta.retain.is_some() {
+                let name = format!("__retain_{}", column.name);
+                engine_index(table, meta, name, vec![column.name.clone()], false)?;
+            }
+        }
         if column.immutable {
             rules.immutable_columns.push(at);
         }
+        let typed = |rule, wanted: ColumnType| match meta.columns[at].column_type == wanted {
+            true => Ok(()),
+            false => Err(invalid(format!(
+                "table '{table}': declare {rule} on a {wanted} column"
+            ))),
+        };
         if column.context_id {
+            typed("CONTEXT_ID", ColumnType::Uuid)?;
             rules.context_column = Some(at);
         }
         if let Some(labels) = &column.scope_labels {
+            typed("SCOPE_LABEL", ColumnType::Text)?;
             rules.scope_labels = Some((at, labels.clone()));
         }
         if let Some((grants, grant)) = &column.acl {
+            typed("ACL", ColumnType::Uuid)?;
             rules.acl = Some((at, grants.clone(), grant.clone()));
         }
         if let Some(policy) = &column.rank_policy {
-            let anchor = rank_policy(table, &column.name, policy, meta, catalog)?;
+            let anchor = rank_policy(table, &column.name, policy, meta, catalog, budget)?;
             rules.rank_policies.push(RankPolicy {
                 column: at,
                 anchor,
@@ -262,6 +291,12 @@ pub(super) fn of(
             });
         }
     }
+    rules.counts = counts(
+        table,
+        meta,
+        &[],
+        catalog.unwrap_or(&Catalog::empty(budget)?),
+    )?;
     Ok(rules)
 }
 
@@ -285,27 +320,23 @@ pub(super) fn counts(
     };
     let lists = match &meta.kept_counts {
         None | Some(KeptCounts::None) => return Ok(Vec::new()),
-        Some(KeptCounts::Lists(lists)) => lists.clone(),
+        Some(KeptCounts::Lists(lists)) => lists.iter().map(Vec::as_slice).collect(),
         Some(KeptCounts::AllPrefixes) => {
-            let mut all: Vec<Vec<(String, SortDirection)>> = Vec::new();
+            let mut all: Vec<&[(String, SortDirection)]> = Vec::new();
             for index in indexes() {
                 for length in 1..=index.columns.len() {
                     let list = &index.columns[..length];
-                    if !bounded(list) && !all.iter().any(|other| other == list) {
-                        all.push(list.to_vec());
+                    if !bounded(list) && !all.contains(&list) {
+                        all.push(list);
                     }
                 }
             }
             all
         }
     };
-    let numbered = catalog.numbered().flat_map(|other| &other.rules.counts);
-    let mut next = numbered
-        .chain(kept)
-        .map(|count| count.id.0 + 1)
-        .max()
-        .unwrap_or(0);
-    let mut found = Vec::new();
+    let given = kept.iter().map(|count| count.id.0 + 1);
+    let mut next = given.max().unwrap_or(0).max(catalog.numbers[2]);
+    let mut found = Vec::with_capacity(lists.len());
     for (at, list) in lists.iter().enumerate() {
         let names: Vec<&str> = list.iter().map(|(column, _)| column.as_str()).collect();
         let unled;
@@ -327,25 +358,29 @@ pub(super) fn counts(
         } else {
             ""
         };
-        let columns = list.iter().map(|(column, direction)| {
-            position(table, meta, column).map(|column| (column, *direction))
-        });
-        let columns: Vec<(usize, SortDirection)> = columns.collect::<Result<_>>()?;
+        list.iter()
+            .try_for_each(|(column, _)| position(table, meta, column).map(|_| ()))?;
         if !refused.is_empty() {
             return Err(invalid(format!(
                 "table '{table}': the MAINTAIN COUNT list ({}) {refused}",
                 names.join(", ")
             )));
         }
+        let index = meta
+            .indexes
+            .iter()
+            .position(|i| i.json_path.is_empty() && i.columns.starts_with(list))
+            .unwrap();
+        let prefix = list.len();
         let id = kept
             .iter()
-            .find(|count| count.columns == columns)
+            .find(|count| count.index == index && count.prefix == prefix)
             .map(|count| count.id);
         let id = id.unwrap_or_else(|| {
             next += 1;
             CountId(next - 1)
         });
-        found.push(Count { id, columns });
+        found.push(Count { id, index, prefix });
     }
     Ok(found)
 }
@@ -359,7 +394,8 @@ fn rank_policy(
     vector: &str,
     policy: &ast::RankPolicy,
     meta: &TableMeta,
-    catalog: &Catalog,
+    catalog: Option<&Catalog>,
+    budget: &Budget,
 ) -> Result<usize> {
     let refuse = |reason: String| Error::RankPolicyInvalid {
         index: VectorIndexRef {
@@ -369,34 +405,39 @@ fn rank_policy(
         reason,
     };
     let (joined, on) = (&policy.table, &policy.column);
-    let other = catalog.table(joined).map(|other| &other.meta);
-    let other = other.ok_or_else(|| refuse(format!("it joins the unknown table '{joined}'")))?;
-    let column = other.columns.iter().find(|column| column.name == *on);
-    let column = column.ok_or_else(|| refuse(format!("'{joined}' has no column '{on}'")))?;
+    let other = catalog
+        .and_then(|catalog| catalog.table(joined))
+        .map(|other| &other.meta);
+    if other.is_none() && (catalog.is_some() || joined == table) {
+        return Err(refuse(format!("it joins the unknown table '{joined}'")));
+    }
+    let column = other.and_then(|other| other.columns.iter().find(|column| column.name == *on));
+    if other.is_some() && column.is_none() {
+        return Err(refuse(format!("'{joined}' has no column '{on}'")));
+    }
     let leads = |index: &crate::types::IndexDecl| {
         index.json_path.is_empty() && index.columns.first().is_some_and(|(name, _)| name == on)
     };
-    if !other.indexes.iter().any(leads) {
+    if other.is_some_and(|other| !other.indexes.iter().any(leads)) {
         return Err(refuse(format!(
             "no index of '{joined}' leads with '{on}'; create one first"
         )));
     }
-    let has = |name: &String| meta.columns.iter().any(|column| column.name == *name);
-    let mut found: Vec<String> = Vec::new();
-    if column.primary_key {
-        let singular = joined.strip_suffix('s').unwrap_or(joined);
-        found.extend(
-            [format!("{singular}_id"), format!("{joined}_id")]
-                .into_iter()
-                .filter(has),
-        );
-        found.dedup();
+    let own = &meta.columns;
+    let singular = joined.strip_suffix('s').unwrap_or(joined);
+    let names = [format!("{singular}_id"), format!("{joined}_id")];
+    let has = |name: &String| own.iter().any(|column| column.name == *name);
+    let column_is_key = column.is_none_or(|column| column.primary_key);
+    let mut found: Vec<_> = names
+        .into_iter()
+        .filter(|name| column_is_key && has(name))
+        .collect();
+    found.dedup();
+    if found.is_empty() || (column.is_none() && found.len() != 1) {
+        found = Some(on.clone()).filter(has).into_iter().collect();
     }
     if found.is_empty() {
-        found.extend(Some(on.clone()).filter(has));
-    }
-    if found.is_empty() {
-        let key = meta.columns.iter().filter(|column| column.primary_key);
+        let key = own.iter().filter(|column| column.primary_key);
         found.extend(key.map(|column| column.name.clone()));
     }
     let [anchor] = &found[..] else {
@@ -407,19 +448,24 @@ fn rank_policy(
         )));
     };
 
-    let read = formula_reads(&policy.formula)
-        .map_err(|error| refuse(format!("its FORMULA is not a formula: {error}")))?;
+    let read = formula_reads(&policy.formula, budget).map_err(|error| match error {
+        Error::MemoryBudgetExceeded { .. } => error,
+        _ => refuse(format!("its FORMULA is not a formula: {error}")),
+    })?;
     for name in read.iter().filter(|name| *name != "vector_score") {
-        let named = meta.columns.iter().chain(&other.columns);
-        let mut named = named.filter(|column| column.name == *name);
-        let (Some(column), None) = (named.next(), named.next()) else {
+        let local = own.iter().find(|column| column.name == *name);
+        let remote =
+            other.and_then(|other| other.columns.iter().find(|column| column.name == *name));
+        let ambiguous = local.is_some() && (remote.is_some() || name == on);
+        if ambiguous || (local.is_none() && remote.is_none() && other.is_some()) {
             return Err(refuse(format!(
                 "its FORMULA reads '{name}', which is not a column of exactly one of '{table}' \
                  and '{joined}'"
             )));
-        };
+        }
         use ColumnType::{Boolean, Integer, Real};
-        if !matches!(column.column_type, Integer | Real | Boolean) {
+        let kind = local.or(remote).map(|column| column.column_type);
+        if !matches!(kind, None | Some(Integer | Real | Boolean)) {
             return Err(refuse(format!(
                 "its FORMULA reads '{name}', which is no numeric column"
             )));
@@ -430,7 +476,7 @@ fn rank_policy(
 
 /// The names a rank formula reads as `{name}`, `vector_score` among them, or the parser's
 /// refusal of a text that is not one.
-pub(super) fn formula_reads(formula: &str) -> Result<Vec<String>> {
+pub(super) fn formula_reads(formula: &str, budget: &Budget) -> Result<Vec<String>> {
     fn reads(expr: &ast::Expr, names: &mut Vec<String>) {
         match expr {
             ast::Expr::Column(column) => names.push(column.column.clone()),
@@ -439,6 +485,7 @@ pub(super) fn formula_reads(formula: &str) -> Result<Vec<String>> {
         }
     }
     let mut names = Vec::new();
-    reads(&crate::sql::formula(formula)?, &mut names);
+    let (formula, _held) = crate::sql::formula(formula, budget)?;
+    reads(&formula, &mut names);
     Ok(names)
 }

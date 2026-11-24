@@ -19,52 +19,46 @@ SELECT id FROM q ORDER BY v <=> [1.0, 0.0, 0.0] USE VECTOR INDEXED (candidates =
 ----
 error: PlanError
 
-# Triggers, events and their delivery, removal by age, and the store's own settings.
-CREATE TRIGGER on_note ON notes WHEN INSERT;
+SELECT id FROM q ORDER BY v <-> [1.0, 0.0, 0.0] LIMIT 1;
 ----
-error: PlanError
+error: PlanError | plan error: <-> is not supported in this version of the library
 
-DROP TRIGGER on_note;
-----
-error: PlanError
+# Erasure, removal by age, and the store's own settings.
+SET MEMORY_LIMIT 64M -- note
+;
 
-CREATE EVENT TYPE note_added WHEN INSERT ON notes;
-----
-error: PlanError
+SET MAINTENANCE_POLL_INTERVAL 5 /* note */ SECONDS;
 
-CREATE SINK audit;
+SET MEMORY_LIMIT '''NONE''';
 ----
-error: PlanError
+error: ParseError
 
-CREATE ROUTE note_added TO audit;
+# A real setting that is written wrongly is a syntax error (no value) or an invalid value (a bad one), never "not supported".
+SET MEMORY_LIMIT;
 ----
-error: PlanError
+error: ParseError
 
-DROP ROUTE note_added TO audit;
+SET MEMORY_LIMIT = ;
 ----
-error: PlanError
+error: ParseError
 
-CREATE SCHEDULE nightly;
+SET MEMORY_LIMIT foo;
 ----
-error: PlanError
+error: PlanError | plan error: SET MEMORY_LIMIT has an invalid value
 
-DROP SCHEDULE nightly;
+SET MEMORY_LIMIT 64m;
 ----
-error: PlanError
+error: PlanError | plan error: SET MEMORY_LIMIT has an invalid value
 
-PURGE FROM notes WHERE id = 1;
+SET DISK_LIMIT 1000;
 ----
-error: PlanError
+error: PlanError | plan error: SET DISK_LIMIT has an invalid value
+
+SET UNKNOWN_SETTING 1;
+----
+error: PlanError | plan error: SET UNKNOWN_SETTING is not supported in this version of the library
 
 DISCARD FROM notes WHERE id = 1;
-----
-error: PlanError
-
-SET DISK_LIMIT '1G';
-----
-error: PlanError
-
-SHOW DISK_LIMIT;
 ----
 error: PlanError
 
@@ -72,15 +66,7 @@ SET MAINTENANCE_POLL_INTERVAL 5;
 ----
 error: PlanError
 
-SET READ_CACHE_SHARE 50;
-----
-error: PlanError
-
 SET STORAGE_COMPACTION ON;
-----
-error: PlanError
-
-CREATE TABLE q (id INTEGER PRIMARY KEY, until TIMESTAMP EXPIRES);
 ----
 error: PlanError
 
@@ -95,19 +81,19 @@ error: PlanError
 
 SHOW TENANT TABLE POLICY;
 ----
-error: PlanError
+error: PlanError | plan error: SHOW TENANT is not supported in this version of the library
 
 SHOW SYNC BINDINGS;
 ----
-error: PlanError
+error: PlanError | plan error: SHOW SYNC is not supported in this version of the library
 
 SHOW SYNC_CONFLICT_POLICY;
 ----
-error: PlanError
+error: PlanError | plan error: SHOW SYNC_CONFLICT_POLICY is not supported in this version of the library
 
 SHOW DELIVERY OUTCOMES;
 ----
-error: PlanError
+error: PlanError | plan error: SHOW DELIVERY is not supported in this version of the library
 
 # What no version reads, each by its own kind where it has one.
 CREATE PROCEDURE tidy() AS 'DELETE FROM notes';

@@ -9,9 +9,9 @@ use super::sort::Sort;
 use super::subquery::{Pass, Then, Whole};
 use crate::memory::Reservation;
 use crate::sql::Expr;
-use crate::sql::ast::Literal;
 use crate::sql::plan::{ProjectColumn, SelectPlan};
-use crate::types::ColumnType::{Integer, Real};
+use crate::types::ColumnType::{self, Integer, Real};
+use crate::types::Value;
 use crate::types::{Error, Result};
 
 /// Puts the SELECTs of the UNION of `select` one after another, each read `depth` statements
@@ -30,14 +30,10 @@ pub(super) fn after<R>(
         let why = "the SELECTs of a UNION give the same number of columns, of types that match";
         Error::PlanError(why.to_owned())
     };
-    let meet = |left, right| {
-        let same = std::mem::discriminant(&left) == std::mem::discriminant(&right);
-        same || matches!((left, right), (Integer, Real) | (Real, Integer))
-    };
     // A column of NULL has no type of its own: the first SELECT that gives another types it.
     let null = |list: &[ProjectColumn], at: usize| {
         let expr = list.get(at).map(|column| &column.expr);
-        matches!(expr, Some(Expr::Literal(Literal::Null)))
+        matches!(expr, Some(Expr::Literal(Value::Null)))
     };
     let mut first = select.clone();
     (first.with, first.union, first.order_by) = (Vec::new(), Vec::new(), Vec::new());
@@ -62,15 +58,16 @@ pub(super) fn after<R>(
             if null(&arm.select.columns, at) {
             } else if !typed[at] {
                 (column.column_type, typed[at]) = (next.column_type, true);
-            } else if !meet(column.column_type, next.column_type) {
-                return Err(mismatch());
+            } else {
+                column.column_type =
+                    meet(column.column_type, next.column_type).ok_or_else(mismatch)?;
             }
         }
         sources.push(Box::new(arm) as Box<dyn Source>);
     }
     if let Some(last) = select.union.iter().rposition(|(all, _)| !all) {
         let rest = sources.split_off(last + 2);
-        let input = Box::new(Parts(std::mem::replace(&mut sources, rest)));
+        let input = Box::new(Parts(std::mem::replace(&mut sources, rest), &columns));
         sources.insert(0, Box::new(Distinct { input }));
     }
     let mut scope = Scope::of("", &columns);
@@ -84,7 +81,7 @@ pub(super) fn after<R>(
         reads(&key.expr, &scope, given.params, read)?;
     }
     let (limit, offset) = limits(select, given.params)?;
-    let mut input: Box<dyn Source + '_> = Box::new(Parts(sources));
+    let mut input: Box<dyn Source + '_> = Box::new(Parts(sources, &columns));
     if !select.order_by.is_empty() {
         input = Box::new(Sort {
             input,
@@ -102,8 +99,15 @@ pub(super) fn after<R>(
     then(&columns, &cut, pass)
 }
 
+/// The type values of two types share, as in Postgres: a REAL for a whole number and a REAL.
+pub(super) fn meet(left: ColumnType, right: ColumnType) -> Option<ColumnType> {
+    let real = matches!((left, right), (Integer, Real) | (Real, Integer));
+    let same = std::mem::discriminant(&left) == std::mem::discriminant(&right);
+    (same || real).then_some(if real { Real } else { left })
+}
+
 impl<S: Source + ?Sized> Source for &S {
-    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<u64> {
+    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<()> {
         (**self).rows(reservation, each)
     }
 }

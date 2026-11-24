@@ -1,209 +1,285 @@
-//! The contextdb program: a SQL shell for a store. `server` and the other names of commands
-//! that arrive with later versions are reserved and refused; they are not commands it has.
-//!
-//! It never does what the library cannot: every statement and every command goes through the
-//! public API of `contextdb`, and nothing here opens the store's files itself.
-
+//! SQL shell and operational commands, all through the library's public doors.
+mod commands;
 mod input;
+mod interrupt;
 mod output;
+mod progress;
 mod shell;
 #[cfg(test)]
 mod tests;
 
-use std::path::PathBuf;
-use std::process::ExitCode;
-
-use clap::Parser;
-use contextdb::{Database, DatabaseOpenOptions, ReadSession, ReadSessionOptions};
-
+use clap::{CommandFactory, Parser, Subcommand};
+use contextdb::{
+    Database, DatabaseOpenOptions, Maintenance, ReadLimits, ReadSession, ReadSessionOptions,
+};
 use output::Output;
-use shell::Store;
+use std::{
+    io::IsTerminal,
+    path::{Path, PathBuf},
+    process::ExitCode,
+    sync::Arc,
+};
 
-/// The exit status of a run in which the store could not be opened or closed, or a piped
-/// statement or shell command was refused.
-const EXIT_FAILED: u8 = 1;
-/// The exit status of a command line that asks for something the program cannot do. Nothing
-/// was opened. The argument parser exits with the same status for a line it cannot read.
-const EXIT_USAGE: u8 = 2;
-
-/// Commands that arrive with later versions. The word is theirs already, so a folder with one
-/// of these names is opened by writing it as a path.
-const LATER_COMMANDS: [&str; 6] = [
-    "server", "snapshot", "inspect", "diagnose", "reset", "purge",
-];
-
-/// What `--help` says after the options.
-const AFTER_HELP: &str = r#"INPUT:
-  Statements are read from standard input, each ending at its `;`. On a terminal the
-  shell prompts and edits lines; piped input gets no prompt.
-  A refused statement in piped input is reported on the error stream, the statements
-  after it still run, and the run exits 1.
-  With --write the store is held for writing until the input ends: other processes can
-  read it meanwhile, and a second --write is refused until then.
-  A transaction that BEGIN opened and no COMMIT ended before the input ended is rolled
-  back.
-
-EXIT STATUS:
-  0  every piped statement and command ran; a session at a terminal ends with 0
-     whatever was refused in it
-  1  a piped statement or command was refused, or the store could not be opened or
-     closed (a session at a terminal too)
-  2  the command line was refused; nothing was opened
-
-MEMORY:
-  --memory-limit is this session's ceiling, in bytes or with K, M or G; the store does
-  not remember it. Without it a --write session has the limit the store remembers and
-  a read session has none.
-  A session sets aside 1M and its page cache, sized when it starts: a quarter of its
-  limit and never less than 8M, which is also its size with no limit. So the smallest
-  limit that opens a store is 9M.
-  `SET MEMORY_LIMIT 512M;` (or NONE) declares the limit the store remembers; it needs
-  --write, and inside a transaction it still takes effect at once and ROLLBACK does not
-  undo it. The smallest limit a session takes is 1M plus its page cache plus what it
-  holds, which is 9M in a session started with no limit; a limit below it is refused.
-  To go below the page cache of a session started under a larger limit, start with the
-  smaller one, `--memory-limit 64M`, and then run `SET MEMORY_LIMIT 64M;`.
-  `SHOW MEMORY_LIMIT;` reports this session's limit and what is in use: with no limit,
-  `none` and 9437184 bytes used, the 1M and the 8M page cache.
-
-JSON (--json), one document a line:
-  a SELECT or any SHOW statement  {"result":{"columns":[...],"rows":[{...}]}}
-                                  a vector is an array of numbers, each at the full
-                                  precision of the stored 32-bit value, so a number
-                                  may print with more digits than were typed
-  any other statement             {"rows_affected":N}
-  .tables                         {"tables":{"items":[...]}}
-  .schema <table>                 {"schema":{"table":...,"ddl":...}}
-  .explain <sql>                  {"explain":{"lines":[...]}}
-  .help                           {"help":[...]}
-  a refusal                       {"error":{"class":...,"message":...,"detail":{"kind":...}}}
-                                  on the error stream; "detail" is left out when the
-                                  refusal is the shell's own (an unknown command, a
-                                  reserved name)
-  A command line the program cannot read is refused in plain text.
-
-RESERVED NAMES:
-  server, snapshot, inspect, diagnose, reset and purge are kept for commands of later
-  versions. A folder with one of these names is written as a path: ./server
-
-THE STORE:
-  The folder holds `data`, `lock` and `readers`; together they are the store. The
-  README of the contextdb library says what each is.
-
-EXAMPLES:
-  contextdb ./notes
-    Read a store that is there, also while another process writes it. Never creates a
-    store and never changes its data.
-
-  contextdb ./notes --write
-    Open the store for writing, creating it if it is missing.
-
-  echo "SELECT * FROM notes LIMIT 5;" | contextdb ./notes --json
-    Pipe statements in and read one JSON document per statement.
-
-  In the shell: .help
-    List the shell's commands."#;
-
-/// A SQL shell for a contextdb store.
 #[derive(Parser)]
 #[command(
     name = "contextdb",
     version,
-    override_usage = "contextdb [OPTIONS] <PATH>",
-    after_help = AFTER_HELP
+    after_help = "SQL ends at ;. .help lists shell commands. Refusals continue by default and fail piped runs.
+Read sessions create nothing. --write creates a missing store and waits for an existing writer.
+Read statements have no row or byte ceiling unless given; time defaults to 5,000 ms; read memory to 16 MiB.
+A piped writer defaults to caller-driven maintenance and runs one cycle before close.
+Exit: 0 success; 1 refused input or storage failure; 2 invalid arguments; 130 interrupted."
 )]
 struct Args {
-    /// The store's folder. A folder named like a command is written as a path: ./server
-    path: PathBuf,
-
-    /// Open the store for writing, creating it if it is missing. Without this the shell
-    /// only reads.
+    /// Store folder.
+    #[arg(env = "CONTEXTDB_DB_PATH")]
+    path: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Option<Command>,
+    /// Open for writing, creating a missing store.
     #[arg(long)]
     write: bool,
-
-    /// Machine output: one JSON document per statement or command on the output, and every
-    /// refusal as a JSON document on the error stream.
-    #[arg(long)]
+    /// One JSON document per answer; diagnostics go to stderr.
+    #[arg(long, global = true)]
     json: bool,
-
-    /// The most memory the session may use for data, in bytes or with K, M or G (64M, 4G).
-    #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+    #[arg(long, value_parser=contextdb::parse_size)]
     memory_limit: Option<usize>,
+    #[arg(long, value_parser=contextdb::parse_size, requires="write")]
+    disk_limit: Option<usize>,
+    /// engine or caller; requires --write.
+    #[arg(long, value_parser=maintenance, requires="write")]
+    maintenance: Option<Maintenance>,
+    #[arg(long, value_parser=clap::value_parser!(u64).range(1..), requires="write")]
+    maintenance_poll_ms: Option<u64>,
+    #[arg(long)]
+    stop_at_first_refusal: bool,
+    #[arg(long, value_parser=clap::value_parser!(u64).range(1..))]
+    read_result_rows: Option<u64>,
+    #[arg(long, value_parser=clap::value_parser!(u64).range(1..))]
+    read_result_bytes: Option<u64>,
+    #[arg(long, value_parser=clap::value_parser!(u64).range(1..))]
+    read_work: Option<u64>,
+    #[arg(long, value_parser=clap::value_parser!(u64).range(1..))]
+    read_active_ms: Option<u64>,
+    #[arg(long, value_parser=contextdb::parse_size)]
+    read_memory: Option<usize>,
+    #[arg(long, value_parser=clap::value_parser!(u64).range(0..=100))]
+    read_cache_share: Option<u64>,
+    #[arg(long, value_parser=clap::value_parser!(u64).range(1..))]
+    read_cursor_page_rows: Option<u64>,
+    #[arg(long, value_parser=clap::value_parser!(u64).range(1..))]
+    read_cursor_page_bytes: Option<u64>,
+    #[arg(long, value_parser=clap::value_parser!(u64).range(1..))]
+    read_cursor_idle_ms: Option<u64>,
+    #[arg(long, value_parser=clap::value_parser!(u64).range(1..))]
+    read_cursor_lifetime_ms: Option<u64>,
+    #[arg(long, default_value_t = 1000)]
+    read_hydration_notice_ms: u64,
 }
-
+#[derive(Subcommand)]
+enum Command {
+    /// Erase a table's rows in one commit.
+    Purge {
+        path: PathBuf,
+        #[arg(long)]
+        table: String,
+        #[arg(long, required = true)]
+        force: bool,
+    },
+    /// Export a committed snapshot.
+    Snapshot {
+        #[command(subcommand)]
+        command: Snapshot,
+    },
+    /// Inspect current values, also beside a live writer.
+    Inspect {
+        #[command(subcommand)]
+        command: Inspect,
+    },
+    /// Check every stored record without changing data.
+    Diagnose { path: PathBuf },
+    /// Recreate an existing store, destroying its data.
+    Reset {
+        path: PathBuf,
+        #[arg(long, required = true)]
+        force: bool,
+    },
+}
+#[derive(Subcommand)]
+enum Snapshot {
+    Export { path: PathBuf, artifact: PathBuf },
+}
+#[derive(Subcommand)]
+enum Inspect {
+    Key {
+        path: PathBuf,
+        #[arg(long)]
+        table: String,
+        #[arg(long)]
+        key_json: String,
+        #[arg(long)]
+        column: Vec<String>,
+    },
+    Blob {
+        path: PathBuf,
+        #[arg(long)]
+        hash: String,
+    },
+    SyncApplyState {
+        path: PathBuf,
+    },
+}
+fn maintenance(text: &str) -> Result<Maintenance, String> {
+    match text {
+        "engine" => Ok(Maintenance::Engine),
+        "caller" => Ok(Maintenance::Caller),
+        _ => Err("use engine or caller".into()),
+    }
+}
+impl Args {
+    fn limits(&self) -> ReadLimits {
+        let mut l = ReadLimits::default();
+        l.result_rows = self.read_result_rows.unwrap_or(u64::MAX);
+        l.result_bytes = self.read_result_bytes.unwrap_or(u64::MAX);
+        l.caller_checks_metadata = true;
+        l.work = self.read_work.unwrap_or(l.work);
+        l.active_ms = self.read_active_ms.unwrap_or(l.active_ms);
+        l.memory = self
+            .read_memory
+            .or(self.memory_limit)
+            .unwrap_or(l.memory as usize)
+            .min(self.memory_limit.unwrap_or(usize::MAX)) as u64;
+        l.cache_share = self.read_cache_share;
+        l.cursor_page_rows = self.read_cursor_page_rows.unwrap_or(l.cursor_page_rows);
+        l.cursor_page_bytes = self.read_cursor_page_bytes.unwrap_or(l.cursor_page_bytes);
+        l.cursor_idle_ms = self.read_cursor_idle_ms.unwrap_or(l.cursor_idle_ms);
+        l.cursor_lifetime_ms = self.read_cursor_lifetime_ms.unwrap_or(l.cursor_lifetime_ms);
+        l
+    }
+}
 fn main() -> ExitCode {
     let args = Args::parse();
-    let output = Output { json: args.json };
-
-    if let Some(command) = LATER_COMMANDS
-        .iter()
-        .find(|command| args.path.as_os_str() == **command)
-    {
-        output.refusal(
-            "usage",
-            &format!(
-                "`{command}` is a command, and this version does not have it yet; to open a \
-                 folder with that name write ./{command}"
-            ),
-        );
-        return ExitCode::from(EXIT_USAGE);
-    }
-
-    let store = match open(&args) {
-        Ok(store) => store,
-        Err(error) => {
-            output.error(&error);
-            return ExitCode::from(EXIT_FAILED);
-        }
+    let l = args.limits();
+    let snap = matches!(args.command, Some(Command::Snapshot { .. }));
+    let both = Some(l.memory as usize) == args.memory_limit;
+    let read = args.read_memory.is_some() || snap;
+    let flag = ["--read-memory", "--memory-limit and --read-memory"][usize::from(both)];
+    let output = Output {
+        json: args.json,
+        read: read.then_some((l.memory, flag)),
+        result: l.result_bytes,
     };
-    let mut succeeded = shell::run(&store, output);
-    if let Store::Write(db) = &store
-        && let Err(error) = db.close()
-    {
-        output.error(&error);
-        succeeded = false;
+    let invalid = l.memory == 0
+        || l.cursor_page_rows > l.result_rows
+        || l.cursor_page_bytes > l.result_bytes
+        || l.cursor_idle_ms > l.cursor_lifetime_ms;
+    if invalid {
+        Args::command()
+            .error(
+                clap::error::ErrorKind::ValueValidation,
+                "invalid read memory or cursor limit relationships",
+            )
+            .exit();
     }
-    if succeeded {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(EXIT_FAILED)
+    let path = args.path.as_ref();
+    if args.command.is_none() && path.as_ref().is_none_or(|p| p.as_os_str() == "server") {
+        eprintln!(
+            "give a store path; server arrives with sync in step 6 (use ./server for that folder)"
+        );
+        return ExitCode::from(2);
     }
+    let result = match &args.command {
+        Some(command) => commands::run(command, &args, output).map(|ok| u8::from(!ok)),
+        None => run(path.unwrap(), &args, output),
+    };
+    ExitCode::from(match result {
+        Ok(code) => code,
+        Err(error) => {
+            output.error(&error, None);
+            1
+        }
+    })
 }
-
-/// Opens the store the way the command line asked: for writing, or for reading only.
-fn open(args: &Args) -> contextdb::Result<Store> {
-    if args.write {
+fn run(path: &Path, args: &Args, output: Output) -> contextdb::Result<u8> {
+    let terminal = std::io::stdin().is_terminal();
+    let mode = args.maintenance.unwrap_or(if terminal {
+        Maintenance::Engine
+    } else {
+        Maintenance::Caller
+    });
+    let writer = if args.write {
         let mut options = DatabaseOpenOptions::default();
         options.memory_limit = args.memory_limit;
-        Database::open_with_options(&args.path, options).map(Store::Write)
-    } else {
-        let mut options = ReadSessionOptions::default();
-        options.memory_limit = args.memory_limit;
-        ReadSession::open_with_options(&args.path, options).map(Store::Read)
-    }
-}
-
-/// Reads a size in bytes: digits, then nothing, K, M or G as powers of 1024.
-fn parse_size(text: &str) -> Result<usize, String> {
-    let digits_end = text
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(text.len());
-    let (digits, suffix) = text.split_at(digits_end);
-    let number: usize = digits.parse().map_err(|_| {
-        format!("'{text}' is not a size: write digits, then K, M or G, or nothing for bytes")
-    })?;
-    let unit: usize = match suffix.to_ascii_uppercase().as_str() {
-        "" => 1,
-        "K" => 1 << 10,
-        "M" => 1 << 20,
-        "G" => 1 << 30,
-        other => {
-            return Err(format!(
-                "unknown size suffix '{other}': use K, M or G, or no suffix for bytes"
-            ));
+        options.disk_limit = args.disk_limit.map(|n| n as u64);
+        options.maintenance = mode;
+        let db = open(path, options, output)?;
+        if db.created()? {
+            output.notice(
+                "created",
+                &format!("created a new store at {}", path.display()),
+            );
         }
+        if let Some(n) = args.maintenance_poll_ms {
+            db.execute(
+                &format!("SET MAINTENANCE_POLL_INTERVAL '{n} milliseconds'"),
+                &Default::default(),
+            )?;
+        }
+        Some(db)
+    } else {
+        None
     };
-    number
-        .checked_mul(unit)
-        .ok_or_else(|| format!("'{text}' is too large"))
+    let observer = Arc::new(progress::Progress {
+        output,
+        threshold: args.read_hydration_notice_ms,
+        next: std::sync::atomic::AtomicU64::new(args.read_hydration_notice_ms),
+    });
+    let reader = Arc::new(match &writer {
+        Some(db) => db.read_session_with_progress(args.limits(), observer)?,
+        None => {
+            let mut options = ReadSessionOptions::default();
+            options.limits = args.limits();
+            options.observer = Some(observer);
+            ReadSession::open_with_options(path, options)?
+        }
+    });
+    interrupt::install().expect("installing the Ctrl-C handler");
+    let store = shell::Store {
+        reader,
+        writer,
+        mode,
+    };
+    let (ok, interrupted) = shell::run(&store, output, args.stop_at_first_refusal, terminal);
+    let cycled = finish(store, terminal, output)?;
+    Ok(if interrupted {
+        130
+    } else {
+        u8::from(!(ok && cycled))
+    })
+}
+/// The run's end, however it ended: a piped caller-driven writer's closing cycle, whether it
+/// succeeded, and the close, whose failure is the run's.
+fn finish(store: shell::Store, terminal: bool, output: Output) -> contextdb::Result<bool> {
+    drop(store.reader);
+    let Some(db) = store.writer else {
+        return Ok(true);
+    };
+    let cycle = || {
+        db.run_maintenance_cycle()
+            .map_err(|e| output.error(&e, None))
+    };
+    let cycled = terminal || store.mode != Maintenance::Caller || cycle().is_ok();
+    db.close().map(|()| cycled)
+}
+fn open(path: &Path, mut options: DatabaseOpenOptions, out: Output) -> contextdb::Result<Database> {
+    options.deadline = Some(std::time::UNIX_EPOCH);
+    match Database::open_with_options(path, options.clone()) {
+        Err(contextdb::Error::DatabaseLocked { path }) => {
+            let waiting = format!("waiting for the writer that holds {}", path.display());
+            out.notice("waiting", &waiting);
+            options.deadline = None;
+            Database::open_with_options(path, options)
+        }
+        opened => opened,
+    }
 }

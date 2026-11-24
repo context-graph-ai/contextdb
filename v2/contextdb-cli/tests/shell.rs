@@ -3,7 +3,11 @@
 //!
 //! Each test has its own folder under the build's temporary folder, left behind for inspection.
 
-use std::io::{ErrorKind, Write};
+#[path = "../../contextdb/tests/support/opening.rs"]
+pub mod opening;
+
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::os::unix::fs::PermissionsExt as Mode;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -47,14 +51,7 @@ fn shell(dir: &Path, args: &[&str], input: impl AsRef<[u8]>) -> Run {
 
 /// [`shell`], with the program's output closed before it writes when `closed` is set.
 fn shell_to(dir: &Path, args: &[&str], input: impl AsRef<[u8]>, closed: bool) -> Run {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_contextdb"))
-        .args(args)
-        .current_dir(dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = piped(dir, args);
     if closed {
         drop(child.stdout.take());
     }
@@ -75,6 +72,28 @@ fn shell_to(dir: &Path, args: &[&str], input: impl AsRef<[u8]>, closed: bool) ->
         run.stderr
     );
     run
+}
+
+/// Starts `contextdb` in `dir` with these arguments, its three streams piped to this test.
+fn piped(dir: &Path, args: &[&str]) -> std::process::Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_contextdb"));
+    let command = command.args(args).current_dir(dir).stdin(Stdio::piped());
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// Sends `child` the signal Ctrl-C sends, through the shell's own kill, which every Unix has; a
+/// slim container has no kill program. Whether the signal was sent.
+fn interrupt(child: &std::process::Child) -> bool {
+    let kill = format!("kill -INT {}", child.id());
+    Command::new("sh")
+        .args(["-c", &kill])
+        .status()
+        .unwrap()
+        .success()
 }
 
 /// A path as a command-line argument.
@@ -224,6 +243,32 @@ fn reading_a_missing_store_is_refused_and_creates_nothing() {
         );
     }
     assert_eq!(listing(&dir), ["broken"], "a refused read creates nothing");
+    let key = r#"inspect key store --table notes --key-json {"column":"id","value":{"Int64":1}}"#;
+    for (args, code) in [
+        ("diagnose store", 1),
+        ("snapshot export store copy", 1),
+        (key, 1),
+        ("purge store --table notes --force", 1),
+        ("reset store --force", 1),
+        ("purge store --table notes", 2),
+        ("reset store", 2),
+        ("store --write --read-result-rows 0", 2),
+        ("store --write --read-result-bytes 0", 2),
+        ("store --write --read-work 0", 2),
+        ("store --write --read-active-ms 0", 2),
+        ("store --write --read-memory 0", 2),
+        ("store --write --read-cursor-page-rows 0", 2),
+        ("store --write --read-cursor-page-bytes 0", 2),
+        ("store --write --read-cursor-idle-ms 0", 2),
+        ("store --write --read-cursor-lifetime-ms 0", 2),
+        ("store --disk-limit 1G", 2),
+        ("store --maintenance caller", 2),
+        ("store --maintenance-poll-ms 1", 2),
+    ] {
+        let args: Vec<_> = args.split_whitespace().collect();
+        assert_eq!(shell(&dir, &args, "").code, Some(code));
+        assert_eq!(listing(&dir), ["broken"]);
+    }
 }
 
 #[test]
@@ -233,6 +278,7 @@ fn write_creates_a_missing_store() {
 
     let insert = "INSERT INTO notes (id, body) VALUES (1, 'first');\n";
     let run = run_write(&dir, &store, format!("{CREATE_NOTES}{insert}"));
+    assert_eq!(run.stderr.matches("created a new store at").count(), 1);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert_eq!(run.errors(), Vec::<&str>::new());
     assert!(
@@ -253,8 +299,206 @@ fn write_creates_a_missing_store() {
     // On a store that is there, --write opens it and keeps what it holds.
     let insert = "INSERT INTO notes (id, body) VALUES (2, 'second');\n";
     let run = run_write(&dir, &store, format!("{insert}{SELECT_NOTES}"));
+    assert!(!run.stderr.contains("created a new store at"));
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert!(run.stdout.contains(TWO_NOTES), "{}", run.stdout);
+    let events = "CREATE EVENT TYPE changed WHEN UPDATE ON notes;\nCREATE SINK audit TYPE callback;\nCREATE ROUTE r EVENT changed TO audit;\nUPDATE notes SET body = 'changed' WHERE id = 2;\nUPDATE notes SET body = 'second' WHERE id = 2;\n";
+    assert_eq!(run_write(&dir, &store, events).code, Some(0));
+    let mut writer = Some(Database::open(&store).unwrap());
+    let inspect = r#"inspect key store --table notes --key-json {"column":"id","value":{"Int64":1}} --column body --json"#;
+    let read = "store --json";
+    let write = "store --write --json --maintenance caller";
+    let engine = "store --write --json --maintenance engine";
+    let cursor = "store --json --read-cursor-page-rows 1";
+    let fetch = ".cursor open SELECT id FROM notes ORDER BY id\n.cursor fetch 2\n.cursor close extra\n.cursor fetch 1\n.cursor close\n";
+    let close = ".cursor open SELECT id FROM notes\n.cursor close\n";
+    let text = "store --read-cursor-page-rows 1";
+    let open = ".cursor open SELECT id, body FROM notes ORDER BY id\n";
+    let pages = format!("{open}.cursor fetch\n.cursor fetch\n");
+    let trace = ".trace on\nSELECT 1;\n.trace off\n";
+    let cycle = ".maintenance run\n.maintenance status\n";
+    let transaction = "BEGIN;\n.cursor open SELECT id FROM notes\nROLLBACK;\n";
+    let callback = "\"callback_registered\":null";
+    let count = "SELECT COUNT(*) AS n FROM notes;\n";
+    let row_limit = "store --json --read-result-rows 1 --read-cursor-page-rows 1";
+    let statement = "\"statement\":\"SELECT id, body FROM notes ORDER BY id\"";
+    let remedy = "\"remedy_command\":\".cursor open SELECT id, body FROM notes ORDER BY id\"";
+    let limited = "store --json --read-result-rows 2 --read-cursor-page-rows 1";
+    let on = ".cursor open SELECT id FROM notes ORDER BY id\n.cursor fetch 3\n.cursor fetch 2\n";
+    let memory = "store --json --memory-limit 64M --read-memory 16M";
+    let alter = |c: &str| format!("ALTER TABLE d ALTER COLUMN v SET {c};\n");
+    let make = format!(
+        "CREATE TABLE d (id INTEGER PRIMARY KEY, v VECTOR(2));\n{}",
+        alter("IVF (LISTS = 1)")
+    );
+    let probed =
+        alter("PROBES 2") + "EXPLAIN SELECT id FROM d ORDER BY v <=> [1.0, 0.0] LIMIT 1;\n";
+    let purged = "rows_affected=2";
+    let bytes = "store --json --read-result-bytes 1 --read-cursor-page-bytes 1";
+    let shown = "SHOW READ_CACHE_SHARE;";
+    let [share0, share50] = [0, 50].map(|n| format!("store --json --read-cache-share {n}"));
+    for (args, input, fragment, code) in [
+        ("diagnose store", "", "notes", 0),
+        (inspect, "", "\"body\":\"first\"", 0),
+        ("snapshot export store copy", "", "snapshot", 0),
+        ("copy --json", SELECT_NOTES, "\"body\":\"second\"", 0),
+        (read, ".events status\n", callback, 0),
+        (read, ".events status\n", "\"queued\":2", 0),
+        (read, ".verify\n", "notes", 0),
+        (read, ".help vector\n.help propagate\n", "VECTOR(<n>)", 0),
+        (read, "SELECT 1\n.tables\n;\n", "error", 1),
+        (read, "\\trace on\n\\sync status\n", "error", 1),
+        (read, "\\? \n\\dt\n\\d notes\n\\q\n", "notes", 0),
+        (write, "\\? \n\\dt\n\\d notes\n\\q\n", "notes", 0),
+        (read, "SELEC 1;\n", "error", 1),
+        (read, ".nope\n.tables;\n", "error", 1),
+        (
+            read,
+            ".nope\n",
+            "\"class\":\"usage\",\"detail\":{\"kind\":\"unknown_command\"",
+            1,
+        ),
+        (read, "INSERT INTO notes (id) VALUES (9);\n", "error", 1),
+        ("missing --json", "", "error", 1),
+        ("store --nope", "", "--nope", 2),
+        (read, trace, "rows_examined", 0),
+        ("store", trace, "Trace is on.", 0),
+        ("store", trace, "Trace is off.", 0),
+        (cursor, fetch, "\"id\":2", 1),
+        (cursor, close, "\"closed\":true", 0),
+        (text, pages.as_str(), "has_more: true", 0),
+        (text, pages.as_str(), "has_more: false", 0),
+        (text, open, "first", 0),
+        (row_limit, SELECT_NOTES, "--read-result-rows", 1),
+        (row_limit, SELECT_NOTES, "\"class\":\"io\"", 1),
+        (row_limit, SELECT_NOTES, "\"line\":1", 1),
+        (
+            row_limit,
+            ".cursor fetch\n",
+            "\"class\":\"io\",\"detail\":{\"kind\":\"cursor_not_found\"",
+            1,
+        ),
+        (
+            row_limit,
+            SELECT_NOTES,
+            "\"kind\":\"read_limit_exceeded\"",
+            1,
+        ),
+        (row_limit, SELECT_NOTES, statement, 1),
+        (row_limit, SELECT_NOTES, remedy, 1),
+        (limited, on, "\"remedy_command\":\".cursor fetch 2\"", 1),
+        (limited, on, "\"has_more\":false", 1),
+        ("store --json --read-work 1", SELECT_NOTES, "--read-work", 1),
+        (bytes, ".tables\n", "\"required_bytes\":", 1),
+        (bytes, ".events status\n", "\"required_bytes\":", 1),
+        (memory, "SHOW MEMORY_LIMIT;\n", "16777216", 0),
+        (&share0, shown, "\"effective_bytes\":0", 0),
+        (&share50, shown, "\"effective_percent\":50", 0),
+        ("store --read-cache-share 101", "", "100", 2),
+        ("store", "SET READ_CACHE_SHARE 10;", "READ_CACHE_SHARE", 1),
+        (write, ".maintenance status\n", "caller", 0),
+        (write, cycle, "work_remaining", 0),
+        (write, cycle, "versions_removed", 0),
+        (write, make.as_str(), "write PROBES n", 1),
+        (
+            write,
+            alter("SEARCH (TARGET_ACCURACY = 95)").as_str(),
+            "write PROBES n",
+            1,
+        ),
+        (
+            write,
+            alter("PROBES 0").as_str(),
+            "PROBES takes a whole number of 1 or more, or DEFAULT",
+            1,
+        ),
+        (write, probed.as_str(), "(declared)", 0),
+        (write, ".maintenance compact\n", "compaction_free_ratio", 0),
+        (
+            write,
+            ".maintenance compact 1\n",
+            "compaction_free_ratio",
+            0,
+        ),
+        (write, ".maintenance run\n", "\"page_slack_ratio\":null", 0),
+        (write, ".maintenance run\n", "versions_removed", 0),
+        (
+            "store --write --maintenance caller",
+            ".maintenance run\n",
+            "unknown",
+            0,
+        ),
+        (
+            write,
+            "SET STORAGE_COMPACTION MAX_SWEEPS 1;\n",
+            "MAX_SWEEPS",
+            1,
+        ),
+        (engine, ".maintenance status\n", "engine", 0),
+        (write, transaction, "transaction", 1),
+        ("purge store --table notes --force", "", purged, 0),
+        (read, count, "\"n\":0", 0),
+        ("reset store --force", "", "reset", 0),
+        ("store", ".tables\n", "", 0),
+    ] {
+        if args == write
+            && let Some(writer) = writer.take()
+        {
+            writer.close().unwrap();
+        }
+        let args: Vec<_> = args.split_whitespace().collect();
+        let run = shell(&dir, &args, input);
+        assert_eq!(run.code, Some(code), "{}", run.stderr);
+        // A refusal is a sentence for a person, never a debug dump.
+        for dump in [
+            "Some(",
+            "ParseError",
+            "ReadOnlySession",
+            "StoreMissing",
+            "::",
+        ] {
+            assert!(!run.stderr.contains(dump), "{dump}: {}", run.stderr);
+        }
+        let printed = format!("{}{}", run.stdout, run.stderr);
+        assert!(printed.contains(fragment), "{printed}");
+        assert!(!fragment.is_empty() || run.stdout.is_empty());
+    }
+    let named = Command::new(env!("CARGO_BIN_EXE_contextdb"))
+        .env("CONTEXTDB_DB_PATH", "store")
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert_eq!(named.status.code(), Some(0), "the variable names the store");
+}
+
+#[test]
+fn purge_table_names_one_table_and_nothing_else() {
+    let dir = folder("purge-table-names-one-table");
+    let store = dir.join("store");
+    let setup = "CREATE TABLE other (id INTEGER PRIMARY KEY);\nINSERT INTO other (id) VALUES (1);\nINSERT INTO notes (id, body) VALUES (1, 'a'), (2, 'b');\n";
+    run_write(&dir, &store, format!("{CREATE_NOTES}{setup}"));
+    // --table is one table's name: a list or a WHERE is refused and purges nothing.
+    for table in ["notes, other", "notes WHERE id = 1"] {
+        let run = shell(
+            &dir,
+            &["purge", arg(&store), "--table", table, "--force"],
+            "",
+        );
+        assert_ne!(
+            run.code,
+            Some(0),
+            "--table {table:?} is not one table name: {}",
+            run.stdout
+        );
+        let count =
+            "SELECT (SELECT COUNT(*) FROM notes) AS n, (SELECT COUNT(*) FROM other) AS o;\n";
+        let run = run_read(&dir, &store, count);
+        assert!(
+            run.stdout.contains('2') && run.stdout.contains('1'),
+            "a refused purge removes no row: {}",
+            run.stdout
+        );
+    }
 }
 
 #[test]
@@ -424,10 +668,18 @@ SELECT COUNT(*) AS n FROM notes;
         assert!(!stream.contains("session"), "{stream}");
     }
     assert_eq!(run.code, Some(1));
+    let args = [arg(&store), "--write", "--stop-at-first-refusal"];
+    let stopped = shell(&dir, &args, input);
+    assert_eq!(stopped.code, Some(1));
+    assert!(stopped.stdout.is_empty());
+    assert!(stopped.stderr.contains("line 1"));
 
     // A run in which every statement succeeded exits 0 and prints its results and nothing else.
     let run = run_read(&dir, &store, SELECT_NOTES);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.stdout, TWO_NOTES);
+    // At the end of piped input a last statement with no `;` is run, as psql runs it.
+    let run = run_read(&dir, &store, SELECT_NOTES.trim_end().trim_end_matches(';'));
     assert_eq!(run.stdout, TWO_NOTES);
 
     // Output that nobody reads any more ends the session quietly: no crash report, and the
@@ -473,7 +725,7 @@ SELECT COUNT(*) AS n FROM notes;
         assert!(
             run.errors()
                 .iter()
-                .any(|error| error.contains(&format!("line {line}"))),
+                .any(|error| error.contains(&format!("line {line} of the input is not text"))),
             "the refusal must name the line that cannot be decoded, line {line}: {}",
             run.stderr
         );
@@ -497,13 +749,16 @@ SELECT zeta, id, alpha FROM notes ORDER BY id;
 SELECT * FROM notes WHERE id = 404;
 SELECT nope FROM notes;
 .tables
+CREATE TABLE jobs (id INTEGER PRIMARY KEY, st TEXT NOT NULL) STATE MACHINE (st: active -> [done]);
+INSERT INTO jobs (id, st) VALUES (1, 'active');
+UPDATE jobs SET st = 'draft' WHERE id = 1;
 ";
     let run = shell(&dir, &[arg(&store), "--write", "--json"], input);
 
     // One document per statement that gave a result, in the order they were given. `columns`
     // is the order the statement or the table declared, which the keys of a row cannot carry.
     let results = documents(&run.stdout);
-    assert_eq!(results.len(), 5, "{}", run.stdout);
+    assert_eq!(results.len(), 7, "{}", run.stdout);
     assert_eq!(results[0], json!({"rows_affected": 0}));
     assert_eq!(results[1], json!({"rows_affected": 2}));
     assert_eq!(
@@ -537,8 +792,11 @@ SELECT nope FROM notes;
         .into_iter()
         .filter(|document| document.get("error").is_some())
         .collect();
-    assert_eq!(refusals.len(), 1, "{}", run.stderr);
+    assert_eq!(refusals.len(), 2, "{}", run.stderr);
     assert_eq!(refusals[0]["error"]["class"], "sql");
+    assert_eq!(refusals[1]["error"]["class"], "sql");
+    let said = refusals[1]["error"]["message"].as_str().unwrap();
+    assert!(said.ends_with(": active -> draft"), "{said}");
     assert!(refusals[0]["error"]["message"].is_string());
     assert_eq!(run.code, Some(1));
 }
@@ -627,15 +885,6 @@ fn a_read_shell_answers_while_a_writer_holds_the_store() {
     let search = "SELECT id, embedding <=> [1.0, 0.0, 0.0] AS distance FROM passages \
                   ORDER BY distance LIMIT 2;\n";
 
-    // The store really is held: a second writer is refused, naming this process.
-    let second = run_write(&dir, &store, SELECT_NOTES);
-    assert_eq!(second.code, Some(1), "{}", second.stderr);
-    assert!(
-        second.stderr.contains(&std::process::id().to_string()),
-        "{}",
-        second.stderr
-    );
-
     // A read shell needs nothing from the writer and answers.
     let run = run_read(&dir, &store, SELECT_NOTES);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
@@ -669,7 +918,64 @@ fn a_read_shell_answers_while_a_writer_holds_the_store() {
         run.stdout
     );
 
+    // A write shell started beside this writer says what it waits for, then waits: when this
+    // writer lets go, its write goes in and it exits cleanly.
+    let mut waiting = piped(&dir, &[arg(&store), "--write", "--json"]);
+    let insert = b"INSERT INTO notes (id, body) VALUES (3, 'third');\n";
+    waiting.stdin.take().unwrap().write_all(insert).unwrap();
+    let mut stderr = BufReader::new(waiting.stderr.take().unwrap());
+    let mut said = String::new();
+    stderr.read_line(&mut said).unwrap();
+    let notice: Json = serde_json::from_str(&said).unwrap_or_default();
+    let waits = format!("waiting for the writer that holds {}", store.display());
+    assert_eq!(notice["notice"]["class"], "io", "a notice has a class");
+    assert_eq!(
+        notice["notice"]["message"], waits,
+        "under --json the waiting line is a notice document"
+    );
     writer.close().unwrap();
+    let output = waiting.wait_with_output().unwrap();
+    stderr.read_to_string(&mut said).unwrap();
+    assert!(output.status.success(), "{said}");
+    let run = run_json(&dir, &store, "SELECT id FROM notes ORDER BY id;\n");
+    assert_eq!(
+        documents(&run.stdout)[0]["result"]["rows"],
+        json!([{"id": 1}, {"id": 2}, {"id": 3}]),
+        "the waiting shell's write went in once the writer let go"
+    );
+    let mut reader = piped(&dir, &[arg(&store), "--json"]);
+    let mut input = reader.stdin.take().unwrap();
+    let mut output = BufReader::new(reader.stdout.take().unwrap());
+    let mut owner = Some(Database::open(&store).unwrap());
+    for online in [true, false, true] {
+        if !online {
+            owner.take().unwrap().close().unwrap();
+        }
+        if online && owner.is_none() {
+            owner = Some(Database::open(&store).unwrap());
+        }
+        input
+            .write_all(b"SELECT COUNT(*) AS n FROM notes;\n")
+            .unwrap();
+        let mut line = String::new();
+        assert!(output.read_line(&mut line).unwrap() > 0);
+        assert_eq!(documents(&line)[0]["result"]["rows"], json!([{"n":3}]));
+    }
+    assert!(interrupt(&reader), "the signal is sent");
+    let done = reader.wait_with_output().unwrap();
+    assert_eq!(done.status.code(), Some(130));
+    let notices = String::from_utf8(done.stderr).unwrap();
+    assert_eq!(
+        notices
+            .lines()
+            .filter(|line| line.contains("writer"))
+            .count(),
+        2
+    );
+    assert!(notices.contains("commit"));
+    let run = run_json(&dir, &store, "SELECT COUNT(*) AS n FROM notes;\n");
+    let results = documents(&run.stdout);
+    assert_eq!(results[0]["result"]["rows"], json!([{"n":3}]));
 }
 
 #[test]
@@ -686,6 +992,7 @@ BEGIN;
 INSERT INTO notes (id, body) VALUES (3, 'third');
 DELETE FROM notes WHERE id = 1;
 SELECT id FROM notes ORDER BY id;
+WITH n AS (SELECT id FROM notes) SELECT id FROM n ORDER BY id;
 ROLLBACK;
 SELECT id, body FROM notes ORDER BY id;
 ";
@@ -693,12 +1000,13 @@ SELECT id, body FROM notes ORDER BY id;
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert_eq!(run.errors(), Vec::<&str>::new());
 
-    // Inside the second transaction its own changes are read; after ROLLBACK they are gone and
-    // what the first one committed is there.
+    // Inside the second transaction its own changes are read, by a WITH as by a SELECT (M6);
+    // after ROLLBACK they are gone and what the first one committed is there.
     let inside = "+----+\n| id |\n+----+\n| 2  |\n| 3  |\n+----+\n(2 rows)\n";
+    assert_eq!(run.stdout.matches(inside).count(), 2, "{}", run.stdout);
     let seen_inside = run
         .stdout
-        .find(inside)
+        .rfind(inside)
         .expect("a transaction reads its own changes");
     let seen_after = run
         .stdout
@@ -796,6 +1104,54 @@ CREATE TABLE notes (
             run.stderr
         );
     }
+    // A program reads the declared contract as fields, beside the ddl.
+    let json = documents(&run_json(&dir, &store, ".schema notes\n").stdout);
+    let (schema, columns) = (&json[0]["schema"], &json[0]["schema"]["columns"]);
+    let all = "table columns primary_key indexes immutable dag_edge_types propagate ddl";
+    let no = "state_machine retain history sync_direction conflict_policy";
+    let cols = "name type nullable primary_key unique default immutable expires";
+    let has = |v: &Json, ks: &str| ks.split(' ').filter(|k| v.get(k).is_some()).count();
+    let seen = (has(schema, all), has(schema, no), has(&columns[0], cols));
+    assert_eq!(seen, (8, 0, 8), "{schema}");
+    assert_eq!(columns[0]["primary_key"], true, "{schema}");
+    assert_eq!(columns[1]["nullable"], false, "{schema}");
+    assert_eq!(columns[4]["unique"], true, "{schema}");
+    // A table that follows its parent's PURGE prints it back.
+    let ddl = "CREATE TABLE kids (id INTEGER PRIMARY KEY, n INTEGER REFERENCES notes(id) FOLLOWS PARENT PURGE);\n";
+    run_write(&dir, &store, ddl);
+    let kids = run_read(&dir, &store, ".schema kids\n").stdout;
+    assert!(kids.contains("FOLLOWS PARENT PURGE"), "{kids}");
+    let s = arg(&store);
+    let at = |n: u64, flags: &str, input: &str| {
+        let args = format!("{s} --read-result-bytes {n} --read-cursor-page-bytes 1 {flags}");
+        shell(&dir, &args.split_whitespace().collect::<Vec<_>>(), input)
+    };
+    for (flags, input) in [
+        ("", ".schema notes\n"),
+        ("--json", ".schema notes\n"),
+        ("--json --write", ".maintenance status\n"),
+        ("", ".tables\n"),
+    ] {
+        let whole = at(u64::MAX, flags, input).stdout;
+        let n = whole.len() as u64;
+        assert_eq!(at(n, flags, input).stdout, whole, "{input}: whole");
+        let short = at(n - 1, flags, input);
+        let io = flags.is_empty() || short.stderr.contains("\"class\":\"io\"");
+        let named = short.stderr.contains(&format!("result_bytes >= {n}"));
+        assert!(io && named && short.stdout.is_empty(), "{}", short.stderr);
+        if flags == "--json" {
+            let setting = format!("effective result_bytes >= {n}");
+            let detail = json!({"kind": "read_limit_exceeded", "limit": "result_bytes",
+                "value": n - 1, "required_bytes": n, "required_setting": setting});
+            let error = documents(&short.stderr).remove(0);
+            assert_eq!(error["error"]["detail"], detail, "cli.md:281-284");
+        }
+    }
+    let tail = "SELEC 1;\n.tables\nINSERT INTO notes (id, title) VALUES (9, 'x');\n";
+    let run = at(1, "--write", tail);
+    let error = run_write(&dir, &store, "SELEC 1;\n").stderr;
+    let ack = run.stdout == "ok (rows_affected=1)\n";
+    assert!(ack && run.stderr.starts_with(&error), "{}", run.stderr);
 }
 
 #[test]
@@ -804,24 +1160,33 @@ fn the_memory_limit_option_is_the_sessions_ceiling() {
     let store = dir.join("store");
 
     // The option is the ceiling the session reports, in bytes, with K, M and G as powers of
-    // 1024; without it there is none.
+    // 1024; without it a writer is under the default, a quarter of the machine's memory.
     let limit = |args: &[&str]| {
         let run = shell(&dir, args, "SHOW MEMORY_LIMIT;\n");
         assert_eq!(run.code, Some(0), "{}", run.stderr);
         documents(&run.stdout)[0]["result"]["rows"][0]["limit"].clone()
     };
-    assert_eq!(limit(&[arg(&store), "--write", "--json"]), json!("none"));
-    // With no limit a session counts 9 MiB as used before any statement: 1 MiB and a page
-    // cache of 8 MiB. A read shell with no limit counts the same.
-    for args in [
-        &[arg(&store), "--write", "--json"][..],
-        &[arg(&store), "--json"],
+    let default = limit(&[arg(&store), "--write", "--json"]);
+    assert!(
+        default.is_u64(),
+        "a writer with no limit declared shows the default, not {default}"
+    );
+    // A writer with no limit counts the opening charge. A read shell with no limit counts the
+    // reader's floor.
+    for (args, writer) in [
+        (&[arg(&store), "--write", "--json"][..], true),
+        (&[arg(&store), "--json"], false),
     ] {
         let run = shell(&dir, args, "SHOW MEMORY_LIMIT;\n");
         assert_eq!(run.code, Some(0), "{}", run.stderr);
+        let expected = if writer {
+            opening::opening_charge(&store, None)
+        } else {
+            11_018_240
+        };
         assert_eq!(
             documents(&run.stdout)[0]["result"]["rows"][0]["used"],
-            json!(9_437_184_u64),
+            json!(expected),
             "used with no limit"
         );
     }
@@ -829,6 +1194,7 @@ fn the_memory_limit_option_is_the_sessions_ceiling() {
         ("65536K", 67_108_864_u64),
         ("64M", 67_108_864),
         ("1G", 1_073_741_824),
+        ("2G", 2_147_483_648),
     ] {
         let args = [arg(&store), "--write", "--json", "--memory-limit", size];
         assert_eq!(limit(&args), json!(bytes), "--memory-limit {size}");
@@ -892,6 +1258,7 @@ fn the_memory_limit_option_is_the_sessions_ceiling() {
     let statements = "SELECT id, body FROM blobs ORDER BY id;\nSELECT COUNT(*) AS n FROM blobs;\n";
     for mode in [&[][..], &["--write"][..]] {
         let mut args = vec![arg(&big), "--json", "--memory-limit", "16M"];
+        args.extend(["--read-result-bytes", "1073741824"]);
         args.extend_from_slice(mode);
         let run = shell(&dir, &args, statements);
         assert_eq!(run.code, Some(1), "{mode:?}: {}", run.stderr);
@@ -906,6 +1273,11 @@ fn the_memory_limit_option_is_the_sessions_ceiling() {
             error["detail"]["kind"], "memory_budget_exceeded",
             "{mode:?}: {error}"
         );
+        let said = error["message"].as_str().unwrap();
+        assert!(
+            said.ends_with("; raise it with --memory-limit"),
+            "{mode:?}: {said}"
+        );
         for number in ["requested_bytes", "available_bytes", "budget_limit_bytes"] {
             assert!(
                 error["detail"][number].is_u64(),
@@ -918,6 +1290,15 @@ fn the_memory_limit_option_is_the_sessions_ceiling() {
             "{mode:?}"
         );
     }
+    let run = shell(&dir, &[arg(&big), "--json", "--write"], statements);
+    assert!(
+        run.code == Some(1)
+            && run.stderr.contains("memory_budget_exceeded")
+            && run.stderr.contains("16777216"),
+        "a write shell has the default limits: stdout {} stderr {}",
+        run.stdout,
+        run.stderr
+    );
 }
 
 #[test]
@@ -1061,7 +1442,7 @@ fn an_indexed_search_runs_through_the_program() {
         );
     }
 
-    // Two vectors outside any grouping under INDEXING_THRESHOLD 1: the index is behind its writes,
+    // Two vectors outside any IVF under INDEXING_THRESHOLD 1: the index is behind its writes,
     // and INDEXED is refused by name rather than answered as an exact scan.
     let behind = dir.join("behind");
     let made = run_write(
@@ -1101,7 +1482,7 @@ VALUES (1, 'a', [1.0, 0.0, 0.0]), (2, 'a', [0.0, 1.0, 0.0]), (3, 'b', [-1.0, 0.0
 const INDEX_FIELDS: &str = "\
 table column dimension quantization vector_count bytes partition_key_columns \
 max_partitions live_partitions search_mode declared_indexing_threshold \
-effective_indexing_threshold declared_compaction_mode \
+effective_indexing_threshold declared_probes declared_compaction_mode \
 declared_compaction_change_percent declared_compaction_tombstone_percent \
 effective_compaction_mode effective_compaction_change_percent \
 effective_compaction_tombstone_percent pending_tuples tombstones \
@@ -1191,9 +1572,9 @@ fn explain_prints_how_each_partition_is_searched() {
     let made = run_write(&dir, &store, KINDS);
     assert_eq!(made.code, Some(0), "{}", made.stderr);
 
-    // Four vectors in two partitions, far below the 100,000 from which AUTO uses a grouping,
+    // Four vectors in two partitions, far below the 100,000 from which AUTO uses an IVF,
     // so the search asked for under AUTO is the exact one, and none grouped. A line ending in
-    // `*` is checked by its name alone: with no grouping the partition has no count of groups
+    // `*` is checked by its name alone: with no IVF the partition has no count of groups
     // to print.
     let lines = [
         "requested_mode: AUTO",
@@ -1353,5 +1734,338 @@ fn a_cell_70000_characters_wide_is_printed_without_a_panic() {
     assert!(
         run.stdout.contains("(1 row)"),
         "no count of rows is printed"
+    );
+}
+
+/// A closed store of `rows` notes at `dir/name`.
+fn notes_store(dir: &Path, name: &str, rows: u32) -> PathBuf {
+    let store = dir.join(name);
+    let mut sql = format!("{CREATE_NOTES}BEGIN;\n");
+    for id in 1..=rows {
+        sql += &format!("INSERT INTO notes (id, body) VALUES ({id}, 'row {id}');\n");
+    }
+    assert_eq!(run_write(dir, &store, sql + "COMMIT;\n").code, Some(0));
+    store
+}
+
+/// Every file of a store folder with its bytes.
+fn files(store: &Path) -> Vec<(String, Vec<u8>)> {
+    let read = |name: String| (std::fs::read(store.join(&name)).unwrap_or_default(), name);
+    listing(store)
+        .into_iter()
+        .map(read)
+        .map(|(b, n)| (n, b))
+        .collect()
+}
+
+#[test]
+fn diagnose_changes_nothing_and_a_reset_is_advised_only_for_a_damaged_store() {
+    let dir = folder("diagnose-and-damage");
+    let store = notes_store(&dir, "store", 300);
+    let kept = files(&store);
+    let key = r#"{"column":"id","value":{"Int64":1}}"#;
+    let healthy = [
+        vec!["diagnose", "store"],
+        vec![
+            "inspect",
+            "key",
+            "store",
+            "--table",
+            "nope",
+            "--key-json",
+            key,
+        ],
+        vec!["store"],
+    ];
+    for args in healthy {
+        let run = shell(&dir, &args, "SELECT * FROM nope;\n");
+        let said = run.stdout + &run.stderr;
+        assert!(
+            !said.contains("reset"),
+            "{args:?} told a healthy store to reset: {said}"
+        );
+    }
+    assert!(files(&store) == kept, "diagnose and reads change no byte");
+
+    // One byte of one stored row is damaged: the problem is named, with the way on.
+    let mut data = std::fs::read(store.join("data")).unwrap();
+    let row = data.windows(7).position(|w| w == b"row 150").unwrap();
+    data[row] ^= 0xFF;
+    std::fs::write(store.join("data"), &data).unwrap();
+    let kept = files(&store);
+    for args in [vec!["diagnose", arg(&store)], vec![arg(&store)]] {
+        let run = shell(&dir, &args, SELECT_NOTES);
+        let said = run.stderr;
+        assert_eq!(run.code, Some(1), "{args:?}: {said}");
+        assert!(
+            said.contains("corrupt") && !said.contains("reads cleanly"),
+            "{said}"
+        );
+        let diagnose = said.find("contextdb diagnose");
+        assert!(
+            diagnose.is_some() && diagnose < said.find("contextdb reset"),
+            "damage names diagnose, then reset: {said}"
+        );
+    }
+    assert!(
+        files(&store) == kept,
+        "a read of a damaged store changes no byte"
+    );
+}
+
+#[test]
+fn every_command_help_lists_its_arguments_and_matches_the_usage_a_wrong_call_prints() {
+    let dir = folder("help-matches-usage");
+    let (path, force) = ("<PATH>", "--force");
+    for (command, listed) in [
+        (vec!["purge"], vec![path, "--table", force]),
+        (vec!["reset"], vec![path, force]),
+        (vec!["diagnose"], vec![path]),
+        (vec!["snapshot", "export"], vec![path, "<ARTIFACT>"]),
+        (
+            vec!["inspect", "key"],
+            vec![path, "--table", "--key-json", "--column"],
+        ),
+        (vec!["inspect", "blob"], vec![path, "--hash"]),
+        (vec!["inspect", "sync-apply-state"], vec![path]),
+    ] {
+        let help = shell(&dir, &[&command[..], &["--help"]].concat(), "").stdout;
+        assert!(
+            listed
+                .iter()
+                .all(|w| help.lines().any(|l| l.trim().starts_with(w))),
+            "{command:?} describes {listed:?} (a usage line is not that):\n{help}"
+        );
+        let usage = help.lines().find(|l| l.starts_with("Usage:")).unwrap();
+        let usage = usage.replace(" [OPTIONS]", "");
+        let wrong = shell(&dir, &command, "");
+        assert!(
+            wrong.code == Some(2) && wrong.stderr.contains(&usage),
+            "{usage}:\n{}",
+            wrong.stderr
+        );
+    }
+    let top = shell(&dir, &["--help"], "").stdout;
+    for word in [
+        "purge",
+        "snapshot",
+        "inspect",
+        "diagnose",
+        "reset",
+        "--write",
+        "--read-work",
+    ] {
+        assert!(
+            top.contains(word),
+            "the program's --help lists {word}:\n{top}"
+        );
+    }
+}
+
+#[test]
+fn compact_runs_to_the_end_and_stops_for_a_reader() {
+    let dir = folder("compact-to-the-end");
+    let store = dir.join("store");
+    let row = |i| format!("INSERT INTO notes VALUES ({i}, '{}');\n", "x".repeat(6000));
+    let sql = (1..=1000).map(row).collect::<String>();
+    let free = format!("{CREATE_NOTES}BEGIN;\n{sql}COMMIT;\nDELETE FROM notes WHERE id < 501;\n");
+    run_write(&dir, &store, free);
+    let cycle = |input: &str| {
+        let run = shell(&dir, &[arg(&store), "--write", "--json"], input);
+        documents(&run.stdout).pop().unwrap()["maintenance_cycle"].clone()
+    };
+    let held = cycle(".cursor open SELECT id FROM notes\n.maintenance compact\n");
+    assert_eq!(
+        held["compaction_waiting_on"], "Readers",
+        "an open cursor keeps its view: stop"
+    );
+    let one = cycle(".maintenance compact 1\n");
+    assert!(one["compacted_pages"].as_u64() <= Some(256) && one["work_remaining"] == true);
+    let all = cycle(".maintenance compact\n");
+    // The one step already moved what was pending. A later compact has nothing left.
+    assert!(
+        all["compacted_pages"].as_u64() == Some(0) && all["work_remaining"] == false,
+        "compact report {all}"
+    );
+}
+
+#[test]
+fn inspect_key_values_may_come_in_any_order_and_the_versions_say_if_more_exist() {
+    let dir = folder("inspect-key-order");
+    let store = dir.join("store");
+    let make = "CREATE TABLE p (a INT, b INT, body TEXT, PRIMARY KEY (a, b));\n";
+    run_write(
+        &dir,
+        &store,
+        format!(
+            "{make}INSERT INTO p VALUES (1, 2, 'first');\nUPDATE p SET body = 'second' WHERE a = 1;\n"
+        ),
+    );
+    let key = |(c, v): (&str, i32), (r, w): (&str, i32)| {
+        let json = format!(
+            r#"{{"column":"{c}","value":{{"Int64":{v}}},"rest":[["{r}",{{"Int64":{w}}}]]}}"#
+        );
+        shell(
+            &dir,
+            &[
+                "inspect",
+                "key",
+                arg(&store),
+                "--table",
+                "p",
+                "--key-json",
+                &json,
+            ],
+            "",
+        )
+        .stdout
+    };
+    let (in_order, swapped) = (key(("a", 1), ("b", 2)), key(("b", 2), ("a", 1)));
+    assert_eq!(
+        in_order, swapped,
+        "values named out of key order read the same row"
+    );
+    let upper = key(("A", 1), ("B", 2));
+    assert_eq!(
+        in_order, upper,
+        "a key named in upper case reads the row and its versions"
+    );
+    for want in ["replaced_by_commit", "first", "second", "has_more: false"] {
+        assert!(
+            in_order.contains(want),
+            "the row and its versions are printed with {want}: {in_order}"
+        );
+    }
+}
+
+#[test]
+fn inspect_key_reads_one_row_whatever_the_stores_size() {
+    let dir = folder("inspect-reads-one-row");
+    let key = r#"{"column":"id","value":{"Int64":5}}"#;
+    for rows in [10, 2000] {
+        let store = notes_store(&dir, &format!("rows-{rows}"), rows);
+        // One row read is all the work the session may do; reading the table would exceed it.
+        let read = ["--read-work", "1", "inspect", "key", arg(&store)];
+        let inspect = &[&read[..], &["--table", "notes", "--key-json", key]].concat();
+        let mode = |m| std::fs::set_permissions(store.join("readers"), Mode::from_mode(m)).unwrap();
+        mode(0o555);
+        let run = shell(&dir, inspect, "");
+        assert!(
+            run.code == Some(0) && run.stdout.contains("row 5"),
+            "a store folder that cannot be written is read: {rows}: {}",
+            run.stderr
+        );
+        mode(0o755);
+        let _writer = Database::open(&store).unwrap();
+        mode(0o555);
+        let held = format!("a writer holds the store at {}", store.display());
+        let refused = shell(&dir, inspect, "").stderr;
+        assert!(refused.contains(&held), "{refused}");
+        mode(0o755);
+        let scan = shell(
+            &dir,
+            &["--read-work", "1", arg(&store)],
+            "SELECT * FROM notes;\n",
+        );
+        assert_eq!(
+            scan.code,
+            Some(1),
+            "reading the table exceeds the limit: {}",
+            scan.stderr
+        );
+    }
+}
+
+#[test]
+fn a_cursor_session_prints_and_refuses_by_its_documented_contract() {
+    let dir = folder("a-cursor-session");
+    let store = notes_store(&dir, "store", 2);
+    let args = [arg(&store), "--json", "--read-cursor-page-rows", "1"];
+    let open = ".cursor open SELECT id FROM notes ORDER BY id\n";
+    let after = ".cursor fetch\n.cursor close\n.cursor fetch\n.cursor open INSERT INTO notes VALUES (3, 'x')\n.cursor open EXPLAIN SELECT 1\n";
+    let run = shell(&dir, &args, format!("{open}{open}{after}"));
+    let first = run.stdout.matches("\"id\":1").count();
+    assert_eq!(
+        first, 1,
+        "a second open is refused, so the cursor keeps its place"
+    );
+    let kinds = "cursor_not_found write_requires_flag cursor_invalid_statement cursor_already_open";
+    for kind in kinds.split_whitespace() {
+        let said = run.stderr.contains(&format!("\"kind\":\"{kind}\""));
+        assert!(said, "{kind} is the kind of a refusal: {}", run.stderr);
+    }
+    let usage = "\"class\":\"usage\",\"detail\":{\"kind\":\"cursor_invalid_statement\"";
+    assert!(
+        run.stderr.contains(usage),
+        "a statement no cursor reads is misuse: {}",
+        run.stderr
+    );
+}
+
+/// A piped writing shell idle on its input closes the store on Ctrl-C and exits 130 (section 7).
+/// What tells a closed store from one left open: the next run's first write lands at once, where
+/// after an exit with the store open it is refused while free space is being found.
+#[test]
+fn an_interrupt_while_a_piped_writing_shell_waits_closes_the_store() {
+    let dir = folder("interrupt-idle-writer");
+    let store = dir.join("store");
+    assert_eq!(run_write(&dir, &store, CREATE_NOTES).code, Some(0));
+    let mut writer = piped(&dir, &[arg(&store), "--write", "--json"]);
+    let (mut input, mut line) = (writer.stdin.take().unwrap(), String::new());
+    let mut output = BufReader::new(writer.stdout.take().unwrap());
+    input
+        .write_all(b"INSERT INTO notes (id, body) VALUES (1, 'a');\n")
+        .unwrap();
+    let answered = output.read_line(&mut line).unwrap() > 0;
+    let exit = (answered, interrupt(&writer), writer.wait().unwrap().code());
+    let said = "the shell answered, waited on its input, and exits 130 on the interrupt";
+    assert_eq!(exit, (true, true, Some(130)), "{said}");
+    let args = [arg(&store), "--write", "--disk-limit", "32M"];
+    let next = shell(
+        &dir,
+        &args,
+        "INSERT INTO notes (id, body) VALUES (2, 'b');\n",
+    );
+    let said = "the store was closed: the next run's first write lands at once";
+    assert_eq!(next.code, Some(0), "{said}: {}", next.stderr);
+}
+
+/// M6: with no transaction open a writing shell sends SELECT, WITH and a SHOW that is not a
+/// setting to its read session and everything else to the writer, before either charges it.
+/// Its reads have no row ceiling.
+#[test]
+fn a_writing_shell_sends_each_statement_to_the_session_that_answers_it() {
+    let dir = folder("which-session");
+    let store = dir.join("store");
+    let rows: Vec<String> = (1000..=1500).map(|n| format!("({n}, 'n')")).collect();
+    let input = format!(
+        "{CREATE_NOTES}SET MEMORY_LIMIT 64M;\nSHOW MEMORY_LIMIT;\n\
+         WITH n AS (SELECT id FROM notes) SELECT id FROM n;\nSHOW MEMORY_LIMIT;\n\
+         INSERT INTO notes (id, body) VALUES (1, '{}');\n\
+         INSERT INTO notes (id, body) VALUES {};\n\
+         SELECT id FROM notes WHERE id >= 1000;\n",
+        "x".repeat(6 << 20),
+        rows.join(", ")
+    );
+    let run = shell(&dir, &[arg(&store), "--write", "--json"], input);
+    assert!(run.code == Some(0), "6 MiB is the writer's: {}", run.stderr);
+    let results: Vec<Json> = documents(&run.stdout)
+        .iter()
+        .filter_map(|document| Some(document.get("result")?["rows"].clone()))
+        .collect();
+    assert_eq!(
+        results[0][0]["limit"],
+        json!(64 << 20),
+        "SHOW reads what SET set"
+    );
+    let (before, after) = (&results[0][0]["used"], &results[2][0]["used"]);
+    assert_eq!(
+        after, before,
+        "a WITH is the reader's, not charged to the writer"
+    );
+    assert_eq!(
+        results[3].as_array().map(Vec::len),
+        Some(501),
+        "all 501 rows print"
     );
 }

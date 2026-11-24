@@ -2,22 +2,24 @@
 //! write.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 use super::expression::{EvalContext, reads};
 use super::table::Source;
-use crate::memory::Reservation;
+use crate::memory::{Passing, Reservation};
 use crate::schema::{Catalog, Table};
 use crate::sql::Expr;
-use crate::sql::ast::{BinOp, ColumnRef, Literal};
+use crate::sql::ast::{BinOp, ColumnRef};
 use crate::store::Read;
 use crate::types::{ContextId, Error, Principal, Result, ScopeLabel, Uuid, Value};
 
 /// Who is asking. Each rule a reader declares narrows what it is shown; `None` declares
 /// nothing for that rule.
+#[derive(Clone)]
 pub(crate) struct Reader {
-    pub contexts: Option<BTreeSet<ContextId>>,
-    pub scope_labels: Option<BTreeSet<ScopeLabel>>,
-    pub principal: Option<Principal>,
+    pub contexts: Option<Arc<BTreeSet<ContextId>>>,
+    pub scope_labels: Option<Arc<BTreeSet<ScopeLabel>>>,
+    pub principal: Option<Arc<Principal>>,
 }
 
 impl Reader {
@@ -44,6 +46,7 @@ const ROOM: u64 = 64 * 1024;
 
 /// The filter of one table for one reader, made for one statement.
 pub(crate) struct Visible<'a> {
+    pub(super) cover: Passing,
     table: &'a Table,
     reader: &'a Reader,
     /// The table's access column and the grants its rows are asked for; `None` when no row is
@@ -76,11 +79,12 @@ impl<'a> Visible<'a> {
         reader: &'a Reader,
         reservation: &'a mut Reservation,
     ) -> Result<Visible<'a>> {
+        let cover = reservation.passing();
         let mut acl = None;
         if let Some((column, from, access)) = &table.rules.acl
             && !reader.is_admin()
         {
-            let (kind, name) = match &reader.principal {
+            let (kind, name) = match reader.principal.as_deref() {
                 Some(Principal::Agent(name)) => ("Agent", name.as_str()),
                 Some(Principal::Human(name)) => ("Human", name.as_str()),
                 Some(Principal::System) | None => {
@@ -106,7 +110,7 @@ impl<'a> Visible<'a> {
             let parameter = |name: &str| Expr::Parameter(name.to_owned());
             let of_kind = column_is(
                 "principal_kind",
-                Expr::Literal(Literal::Text(kind.to_owned())),
+                Expr::Literal(Value::Text(kind.to_owned())),
             );
             let of_name = column_is("principal_id", parameter("name"));
             let filter = both(column_is(access, parameter("id")), both(of_kind, of_name));
@@ -137,7 +141,12 @@ impl<'a> Visible<'a> {
             };
             acl = Some((*column, grants));
         }
-        Ok(Visible { table, reader, acl })
+        Ok(Visible {
+            table,
+            reader,
+            acl,
+            cover,
+        })
     }
 
     /// Marks the columns of a row that the filter reads.
@@ -157,23 +166,38 @@ impl<'a> Visible<'a> {
     /// `None` for a row the reader may see, and otherwise the refusal of the rule that hides
     /// it.
     pub(crate) fn hidden(&mut self, row: &[Value], read: &dyn Read) -> Result<Option<Error>> {
-        self.refusal(row, read, false)
+        self.refusal(|column| row.get(column), read, false)
     }
 
     /// Refuses a new or changed row the reader may not write.
     pub(crate) fn may_write(&mut self, row: &[Value], read: &dyn Read) -> Result<()> {
-        self.refusal(row, read, true)?.map_or(Ok(()), Err)
+        self.refusal(|column| row.get(column), read, true)?
+            .map_or(Ok(()), Err)
     }
 
     /// The refusal of the first rule that keeps the reader from `row`, whose values are in
     /// column order: its Context, then its label, then its grant.
-    fn refusal(&mut self, row: &[Value], read: &dyn Read, write: bool) -> Result<Option<Error>> {
+    pub(crate) fn sees<'v>(
+        &mut self,
+        read: &dyn Read,
+        value: impl Fn(usize) -> Option<&'v Value>,
+    ) -> Result<bool> {
+        self.refusal(value, read, false)
+            .map(|refusal| refusal.is_none())
+    }
+
+    fn refusal<'v>(
+        &mut self,
+        value: impl Fn(usize) -> Option<&'v Value>,
+        read: &dyn Read,
+        write: bool,
+    ) -> Result<Option<Error>> {
         let (table, reader) = (self.table, self.reader);
-        if let Some(refusal) = outside(table, reader, write, |column| row.get(column)) {
+        if let Some(refusal) = outside(table, reader, write, &value) {
             return Ok(Some(refusal));
         }
         if let Some((column, grants)) = &mut self.acl {
-            let held = match (row.get(*column), grants) {
+            let held = match (value(*column), grants) {
                 (Some(Value::Uuid(id)), Some(grants)) => grants.holds(*id, reader, read)?,
                 _ => false,
             };
@@ -243,11 +267,13 @@ impl Grants<'_> {
     fn find(&mut self, id: Uuid, reader: &Reader, read: &dyn Read) -> Result<bool> {
         self.params.insert("id".to_owned(), Value::Uuid(id));
         let seen = Visible {
+            cover: self.reservation.passing(),
             table: self.table,
             reader,
             acl: None,
         };
-        let ctx = EvalContext::new(&self.params, 0);
+        let kept = super::Kept::new(self.reservation.passing());
+        let ctx = EvalContext::new(&self.params, 0, &kept);
         let source = Source::new(self.table, Some(&self.filter), &ctx, read, seen)
             .reading(self.filtered.clone(), &self.filtered);
         let mut path = source.choose(&[], &[])?;

@@ -4,26 +4,30 @@
 //! column is not one: no public call writes such a store, so the last tests here write one
 //! through the store itself.
 
+#[path = "../../tests/support/report.rs"]
+pub(crate) mod report;
+use report::count;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use super::binary::{Codes, Estimate, WIDEST, code_len, write_code};
 use super::block::{BLOCK_BYTES, BlockReader, BlockWriter, takes};
-use super::build::{Build, Phase};
+use super::build::{Build, Phase, unindexed_work};
 use super::directory::{Grouped, Partition, partition};
-use super::grouping::{
-    Grouping, Place, centres, centres_to_a_record, mean, nearest as nearest_groups, put_centres,
+use super::ivf::{
+    Ivf, Place, centroids, centroids_per_record, mean, nearest as nearest_groups, put_centroids,
     put_mean,
 };
 use super::seal::seal;
-use super::sketch::{Estimate, Sketches, WIDEST, sketch_len, write_sketch};
 use super::slot::{Screen, distance, slot_len, write_slot};
-use super::stage::stage;
-use super::train::{Mean, Round, first_centres, groups_for, nearest, product, sampled};
-use crate::Database;
-use crate::memory::Budget;
+use super::train::{Mean, Round, first_centroids, groups_for, nearest, product, sampled};
+use super::unindexed::track_unindexed;
+use crate::memory::{Budget, Reservation};
 use crate::schema::Catalog;
-use crate::store::{Cell, ChangeSet, Key, Read, Store, TableId, VectorId, VectorRecord, View};
+use crate::store::{Cell, ChangeSet, Key, Read, Store, VectorId, VectorRecord, View};
 use crate::types::{Error, Value};
+use crate::{Database, DatabaseOpenOptions, Maintenance, StorageBackend, WrapStorage};
 
 /// A fixed scatter of numbers: a xorshift that starts from a seed.
 struct Fixed(u64);
@@ -228,181 +232,7 @@ fn a_block_reads_back_every_slot_and_key_and_stays_within_its_bytes() {
     assert_eq!(takes(DIMENSION, 4, &[long]).0, 1);
 }
 
-#[test]
-fn a_pending_record_of_a_row_with_no_vector_is_reported_as_damage() {
-    // Which of three pending rows is left with no vector: the first, which a cycle reads to
-    // find the partition, and a later one, which it reads to write a slot.
-    for damaged in [1_i64, 2] {
-        let folder = fresh(&format!("pending-without-vector-{damaged}"));
-        // A sound store: three rows of one partition, each with a vector and each waiting on
-        // the pending list.
-        let db = Database::open(&folder).expect("open a fresh store");
-        for sql in [
-            "CREATE TABLE docs (id INTEGER PRIMARY KEY, v VECTOR(4))",
-            "INSERT INTO docs (id, v) VALUES (1, [1.0, 0.0, 0.0, 0.0]), \
-             (2, [0.0, 1.0, 0.0, 0.0]), (3, [0.0, 0.0, 1.0, 0.0])",
-        ] {
-            db.execute(sql, &HashMap::new()).expect(sql);
-        }
-        db.close().expect("close");
-
-        // The damage: one row is written again with no vector by the store alone. The vector
-        // part is not asked what that means, so the row's pending record stays.
-        let budget = Budget::new(None).expect("a budget");
-        let store = Store::open_for_writing(&folder, &budget, None).expect("open the store");
-        let view = store.view().expect("the newest commit");
-        let catalog = Catalog::load(&view).expect("the tables");
-        let table = catalog.table("docs").expect("the table").id;
-        let mut changes = ChangeSet::new(view, &budget).expect("a change set");
-        let key = Key::from_values(&[Value::Int64(damaged)], &[]).expect("a key");
-        let row = vec![Cell::Here(Value::Int64(damaged)), Cell::Here(Value::Null)];
-        changes
-            .put_row(table, key, row, Vec::new(), false)
-            .expect("stage");
-        store.commit(changes).expect("commit the damage");
-
-        // A cycle over it is told the store is damaged, by name and naming the folder. It
-        // does not panic, and it leaves nothing staged and nothing counted.
-        let view = store.view().expect("the newest commit");
-        let mut changes = ChangeSet::new(view, &budget).expect("a change set");
-        let counted = budget.used();
-        match seal(&mut changes, &catalog, &budget, 4096) {
-            Err(Error::StoreCorrupted { path, .. }) => assert_eq!(path, folder),
-            other => panic!(
-                "with no vector in row {damaged}, which has a pending record, a cycle gave \
-                 {other:?}"
-            ),
-        }
-        assert!(changes.is_empty(), "the refused cycle left records staged");
-        assert_eq!(budget.used(), counted, "memory counted after the refusal");
-        drop(changes);
-        drop(store);
-        std::fs::remove_dir_all(&folder).expect("remove the test's folder");
-    }
-}
-
-/// What a test of a wrongly named VECTOR column works on: the folder of its store, the store,
-/// its budget, and the number of the table `docs`.
-type Misnamed = (PathBuf, Store, Budget, TableId);
-
-/// A store whose schema record names, as the VECTOR column of `docs`, the column `named`.
-///
-/// The store is written sound through the public calls: `docs` with the key `id`, an INTEGER
-/// column `n` and the VECTOR column `v`, and three rows, each with a vector waiting on the
-/// pending list. Then the store alone writes the table's schema record again with one byte
-/// changed: the name of the column the record's VECTOR entry is for. No declaration writes such
-/// a record.
-fn a_vector_entry_named(test: &str, named: u8) -> Misnamed {
-    let folder = fresh(test);
-    let db = Database::open(&folder).expect("open a fresh store");
-    for sql in [
-        "CREATE TABLE docs (id INTEGER PRIMARY KEY, n INTEGER, v VECTOR(4))",
-        "INSERT INTO docs (id, n, v) VALUES (1, 10, [1.0, 0.0, 0.0, 0.0]), \
-         (2, 20, [0.0, 1.0, 0.0, 0.0]), (3, 30, [0.0, 0.0, 1.0, 0.0])",
-    ] {
-        db.execute(sql, &HashMap::new()).expect(sql);
-    }
-    db.close().expect("close");
-
-    let budget = Budget::new(None).expect("a budget");
-    let store = Store::open_for_writing(&folder, &budget, None).expect("open the store");
-    let view = store.view().expect("the newest commit");
-    let table = Catalog::load(&view).expect("the tables");
-    let table = table.table("docs").expect("the table").id;
-    let mut records = view.schema_records().expect("the schema records");
-    let mut record = records.pop().expect("the record of the one table");
-    assert!(records.is_empty(), "one table has one schema record");
-    // The one VECTOR entry of the record holds its column's name, a text of one byte, and then
-    // six bytes: a list of no PARTITION_KEY columns, no MAX_PARTITIONS, no SEARCH_MODE. The
-    // column `v` is named once more in the record, among the table's columns, and there its
-    // type follows the name, which is no zero byte.
-    let entry = [1, 0, 0, 0, b'v', 0, 0, 0, 0, 0, 0];
-    let found: Vec<usize> = (0..record.len())
-        .filter(|at| record[*at..].starts_with(&entry))
-        .collect();
-    assert_eq!(found.len(), 1, "the record's one VECTOR entry for `v`");
-    let name = found[0] + 4;
-    record[name] = named;
-    let mut changes = ChangeSet::new(view, &budget).expect("a change set");
-    changes.put_schema("docs", record).expect("stage");
-    store.commit(changes).expect("commit the damage");
-    (folder, store, budget, table)
-}
-
-/// Asserts that a call over such a store told the store's damage, by name and naming the
-/// folder. `what` says which call.
-fn told_as_damage<T: std::fmt::Debug>(given: crate::types::Result<T>, folder: &Path, what: &str) {
-    match given {
-        Err(Error::StoreCorrupted { path, .. }) => assert_eq!(path, folder, "{what}"),
-        other => panic!("{what} gave {other:?}"),
-    }
-}
-
-/// A commit that puts a fourth row with a vector into `docs` reaches the vector part, which is
-/// asked what the row means for the column. Damage may be told when the tables are read or
-/// when the vector part is asked; either way it is damage, and nothing panics.
-fn a_write_is_reported_as_damage(test: &str, named: u8, what: &str) {
-    let (folder, store, budget, table) = a_vector_entry_named(test, named);
-    let view = store.view().expect("the newest commit");
-    let mut changes = ChangeSet::new(view.clone(), &budget).expect("a change set");
-    let key = Key::from_values(&[Value::Int64(4)], &[]).expect("a key");
-    let numbers = Value::Vector(vec![0.0, 0.0, 0.0, 1.0]);
-    let row = [Value::Int64(4), Value::Int64(40), numbers]
-        .map(Cell::Here)
-        .to_vec();
-    changes
-        .put_row(table, key, row, Vec::new(), true)
-        .expect("stage");
-    let staged = Catalog::load(&view).and_then(|catalog| stage(&mut changes, &catalog, &budget));
-    told_as_damage(staged, &folder, what);
-    drop(changes);
-    drop((view, store));
-    std::fs::remove_dir_all(&folder).expect("remove the test's folder");
-}
-
-/// A sealing cycle over the three pending vectors of `docs`. Damage may be told when the
-/// tables are read or by the cycle; either way it is damage, nothing panics, and the cycle
-/// leaves nothing staged and nothing counted.
-fn a_cycle_is_reported_as_damage(test: &str, named: u8, what: &str) {
-    let (folder, store, budget, _) = a_vector_entry_named(test, named);
-    let view = store.view().expect("the newest commit");
-    let mut changes = ChangeSet::new(view.clone(), &budget).expect("a change set");
-    let counted = budget.used();
-    let sealed =
-        Catalog::load(&view).and_then(|catalog| seal(&mut changes, &catalog, &budget, 4096));
-    told_as_damage(sealed, &folder, what);
-    assert!(changes.is_empty(), "the refused cycle left records staged");
-    assert_eq!(budget.used(), counted, "memory counted after the refusal");
-    drop(changes);
-    drop((view, store));
-    std::fs::remove_dir_all(&folder).expect("remove the test's folder");
-}
-
-#[test]
-fn a_write_to_a_vector_column_that_is_no_column_of_its_table_is_reported_as_damage() {
-    let what = "a commit of a row, with a VECTOR entry for the column `w`, which `docs` has not,";
-    a_write_is_reported_as_damage("vector-entry-no-column-write", b'w', what);
-}
-
-#[test]
-fn a_cycle_over_a_vector_column_that_is_no_column_of_its_table_is_reported_as_damage() {
-    let what = "a cycle, with a VECTOR entry for the column `w`, which `docs` has not,";
-    a_cycle_is_reported_as_damage("vector-entry-no-column-cycle", b'w', what);
-}
-
-#[test]
-fn a_write_to_a_vector_column_that_is_not_of_the_vector_type_is_reported_as_damage() {
-    let what = "a commit of a row, with a VECTOR entry for the INTEGER column `n`,";
-    a_write_is_reported_as_damage("vector-entry-not-vector-write", b'n', what);
-}
-
-#[test]
-fn a_cycle_over_a_vector_column_that_is_not_of_the_vector_type_is_reported_as_damage() {
-    let what = "a cycle, with a VECTOR entry for the INTEGER column `n`,";
-    a_cycle_is_reported_as_damage("vector-entry-not-vector-cycle", b'n', what);
-}
-
-// ---- the records of a grouping ----
+// ---- the records of an IVF ----
 
 /// The column every record of the tests below is kept for.
 const COLUMN: VectorId = VectorId(3);
@@ -411,7 +241,8 @@ const COLUMN: VectorId = VectorId(3);
 fn a_store(test: &str) -> (PathBuf, Store, Budget) {
     let folder = fresh(test);
     let budget = Budget::new(None).expect("a budget");
-    let store = Store::open_for_writing(&folder, &budget, None).expect("open a fresh store");
+    let store = Store::open_for_writing(&folder, &budget, &DatabaseOpenOptions::default())
+        .expect("open a fresh store");
     (folder, store, budget)
 }
 
@@ -435,7 +266,8 @@ fn unit(vector: &[f32]) -> Vec<f32> {
         .iter()
         .map(|x| f64::from(*x).powi(2))
         .sum::<f64>()
-        .sqrt();
+        .sqrt()
+        .max(f64::MIN_POSITIVE);
     vector
         .iter()
         .map(|x| (f64::from(*x) / length) as f32)
@@ -475,70 +307,33 @@ fn close_to(found: &[f32], wanted: &[f32], what: &str) {
     }
 }
 
-/// A partition with every field set: three tail blocks from the third on, a grouping of 17
-/// groups in force, another being built, and a mean.
+/// A partition with every field set: three tail blocks from the third on, an IVF of 17
+/// groups in force, another being built, and 23 outside slots assigned.
 fn a_partition() -> Partition {
     Partition {
         number: 7,
         live: 300,
+        unindexed: 0,
+        pending_bytes: 0,
+        tail_room: 0,
         blocks: 6,
         first: 2,
         closed: 4,
         slots: 500,
         sealed: 9000,
-        grouping: Some(Grouped {
+        ivf: Some(Grouped {
             number: 9,
             blocks: 3,
             groups: 17,
             slots: 290,
             upto: 8500,
         }),
-        building: Some(11),
-        mean: true,
+        building: Some((11, 0)),
+        assigned: 23,
     }
 }
 
-#[test]
-fn a_partition_entry_that_disagrees_with_itself_is_damage() {
-    let (folder, store, budget) = a_store("partition-damage");
-    let good = a_partition().encode();
-    let flags = |flags: u8| {
-        let mut record = good.clone();
-        record[40] = flags;
-        record
-    };
-    let cases = [
-        ("of sixteen bytes", good[..16].to_vec()),
-        ("one byte longer", [good.as_slice(), &[0]].concat()),
-        ("with a flag above the three", flags(15)),
-        (
-            "whose tail holds more slots than were ever sealed",
-            with(&good, 32, 499),
-        ),
-        ("with a grouping of 17 groups and no mean", flags(3)),
-        (
-            "whose first tail block is after its closed one",
-            with(&good, 16, 5),
-        ),
-        ("whose closed block is after its last", with(&good, 20, 7)),
-        ("with a grouping of no group", with(&good, 49, 0)),
-    ];
-    let tuple = key(1);
-    for (what, record) in cases {
-        let view = put(
-            &store,
-            &budget,
-            VectorRecord::Partition(COLUMN, &tuple),
-            record,
-        );
-        let what = format!("a partition entry {what}");
-        told_as_damage(partition(&view, COLUMN, &tuple), &folder, &what);
-    }
-    drop(store);
-    std::fs::remove_dir_all(&folder).expect("remove the test's folder");
-}
-
-/// What a partition entry says of the grouping of the next tests, and that grouping: three
+/// What a partition entry says of the IVF of the next tests, and that IVF: three
 /// groups in two blocks.
 const GROUPED: Grouped = Grouped {
     number: 9,
@@ -548,9 +343,9 @@ const GROUPED: Grouped = Grouped {
     upto: 500,
 };
 
-fn a_grouping() -> Grouping {
+fn an_ivf() -> Ivf {
     let place = |block, slot| Place { block, slot };
-    Grouping {
+    Ivf {
         gap: 780,
         probes: 2,
         width: 4,
@@ -559,59 +354,25 @@ fn a_grouping() -> Grouping {
 }
 
 #[test]
-fn a_grouping_that_disagrees_with_its_partition_is_damage() {
-    let (folder, store, budget) = a_store("grouping-damage");
-    let good = a_grouping().encode();
-    let view = store.view().expect("a view");
-    let read = Grouping::read(&view, COLUMN, GROUPED);
-    told_as_damage(read, &folder, "a grouping with no record");
-    drop(view);
-    let cases = [
-        (
-            "of the places of two groups",
-            good[..good.len() - 8].to_vec(),
-        ),
-        ("with a gap above 20,000", with(&good, 0, 20_001)),
-        ("with a width of one quarter", with(&good, 4, 1)),
-        ("with a width above sixteen quarters", with(&good, 4, 17)),
-        ("that scans no group", with(&good, 8, 0)),
-        ("that scans more groups than it has", with(&good, 8, 4)),
-        ("that does not begin at the first slot", with(&good, 16, 1)),
-        (
-            "with a place before the one ahead of it",
-            with(&with(&good, 28, 0), 32, 100),
-        ),
-        ("that ends past its blocks", with(&good, 36, 5)),
-    ];
-    for (what, record) in cases {
-        let view = put(&store, &budget, VectorRecord::Grouping(COLUMN, 9), record);
-        let what = format!("a grouping {what}");
-        told_as_damage(Grouping::read(&view, COLUMN, GROUPED), &folder, &what);
-    }
-    drop(store);
-    std::fs::remove_dir_all(&folder).expect("remove the test's folder");
-}
-
-#[test]
-fn centres_read_back_in_records_of_a_block() {
+fn centroids_read_back_in_records_of_a_block() {
     const DIMENSION: usize = 16;
     const GROUPS: u32 = 5000;
-    assert_eq!(centres_to_a_record(768), 85);
-    assert_eq!(centres_to_a_record(DIMENSION), 4095);
+    assert_eq!(centroids_per_record(768), 85);
+    assert_eq!(centroids_per_record(DIMENSION), 4095);
     let all: Vec<f32> = (0..u64::from(GROUPS))
         .flat_map(|group| unit(&vector(group, DIMENSION)))
         .collect();
-    let (folder, store, budget) = a_store("centres");
+    let (folder, store, budget) = a_store("centroids");
     let mut changes = ChangeSet::new(store.view().expect("a view"), &budget).expect("begin");
-    put_centres(&mut changes, COLUMN, 9, DIMENSION, &all).expect("stage the centres");
+    put_centroids(&mut changes, COLUMN, 9, DIMENSION, &all).expect("stage the centroids");
     store.commit(changes).expect("commit");
 
     // One full record and the rest in the next.
     let view = store.view().expect("the newest commit");
     let mut records = Vec::new();
-    let from = VectorRecord::Centres(COLUMN, 9, 0);
+    let from = VectorRecord::Centroids(COLUMN, 9, 0);
     view.vectors(from, &mut |record, value| match record {
-        VectorRecord::Centres(COLUMN, 9, place) => {
+        VectorRecord::Centroids(COLUMN, 9, place) => {
             records.push((place, value.len()));
             Ok(true)
         }
@@ -621,18 +382,18 @@ fn centres_read_back_in_records_of_a_block() {
     assert_eq!(records, [(0, 4095 * 64), (1, 905 * 64)]);
 
     let mut held = budget.reserve(0, "query").expect("a reservation");
-    let read = centres(&view, COLUMN, 9, GROUPS, DIMENSION, &mut held).expect("read the centres");
-    assert!(read == all, "the centres read back");
+    let read = centroids(&view, COLUMN, 9, GROUPS, DIMENSION, &mut held).expect("read centroids");
+    assert!(read == all, "the centroids read back");
     assert_eq!(held.bytes(), 4 * DIMENSION as u64 * u64::from(GROUPS));
 
-    // Ranked for the vector that is centre 1,234: that group first, then by product, groups
+    // Ranked for the vector that is centroid 1,234: that group first, then by product, groups
     // of one product in the order of their numbers.
     let grouped = Grouped {
         groups: GROUPS,
         ..GROUPED
     };
     let asked = &all[1234 * DIMENSION..1235 * DIMENSION];
-    let ranked = nearest_groups(&view, COLUMN, grouped, asked, &mut held).expect("rank");
+    let ranked = nearest_groups(&view, COLUMN, grouped, asked, &mut held, None).expect("rank");
     assert_eq!(ranked.len(), GROUPS as usize);
     assert_eq!(ranked[0].0, 1234);
     for pair in ranked.windows(2) {
@@ -644,102 +405,7 @@ fn centres_read_back_in_records_of_a_block() {
     std::fs::remove_dir_all(&folder).expect("remove the test's folder");
 }
 
-#[test]
-fn centres_that_do_not_come_to_their_groups_are_damage() {
-    const DIMENSION: usize = 16;
-    let (folder, store, budget) = a_store("centres-damage");
-    let three: Vec<f32> = (0..3)
-        .flat_map(|group| unit(&vector(group, DIMENSION)))
-        .collect();
-    let bytes: Vec<u8> = three
-        .iter()
-        .flat_map(|number| number.to_le_bytes())
-        .collect();
-    let mut not_finite = bytes.clone();
-    not_finite[4..8].copy_from_slice(&f32::NAN.to_le_bytes());
-    // Each under a number of its own, read as the centres of this many groups.
-    let cases = [
-        ("three centres for a grouping of four", 20, 4, bytes.clone()),
-        (
-            "a record that is no whole number of centres",
-            21,
-            3,
-            bytes[..bytes.len() - 1].to_vec(),
-        ),
-        (
-            "a centre with a number that is not finite",
-            22,
-            3,
-            not_finite,
-        ),
-        ("no record", 23, 3, Vec::new()),
-    ];
-    for (what, number, groups, record) in cases {
-        let view = if record.is_empty() {
-            store.view().expect("a view")
-        } else {
-            put(
-                &store,
-                &budget,
-                VectorRecord::Centres(COLUMN, number, 0),
-                record,
-            )
-        };
-        let mut held = budget.reserve(0, "query").expect("a reservation");
-        let read = centres(&view, COLUMN, number, groups, DIMENSION, &mut held);
-        told_as_damage(read, &folder, what);
-    }
-    drop(store);
-    std::fs::remove_dir_all(&folder).expect("remove the test's folder");
-}
-
-#[test]
-fn a_mean_reads_back_and_one_of_another_length_is_damage() {
-    const DIMENSION: usize = 16;
-    let (folder, store, budget) = a_store("mean");
-    let kept = vector(77, DIMENSION);
-    let mut changes = ChangeSet::new(store.view().expect("a view"), &budget).expect("begin");
-    put_mean(&mut changes, COLUMN, 7, &kept).expect("stage the mean");
-    store.commit(changes).expect("commit");
-    let view = store.view().expect("the newest commit");
-    let mut held = budget.reserve(0, "query").expect("a reservation");
-    let read = mean(&view, COLUMN, 7, DIMENSION, &mut held).expect("read the mean");
-    assert!(read == kept, "the mean read back");
-    drop(view);
-
-    let bytes: Vec<u8> = kept
-        .iter()
-        .flat_map(|number| number.to_le_bytes())
-        .collect();
-    let mut not_finite = bytes.clone();
-    not_finite[..4].copy_from_slice(&f32::INFINITY.to_le_bytes());
-    let cases = [
-        (
-            "a mean of fifteen numbers",
-            8,
-            bytes[..bytes.len() - 4].to_vec(),
-        ),
-        ("a mean with a number that is not finite", 9, not_finite),
-        ("a mean with no record", 10, Vec::new()),
-    ];
-    for (what, number, record) in cases {
-        let view = if record.is_empty() {
-            store.view().expect("a view")
-        } else {
-            put(&store, &budget, VectorRecord::Mean(COLUMN, number), record)
-        };
-        told_as_damage(
-            mean(&view, COLUMN, number, DIMENSION, &mut held),
-            &folder,
-            what,
-        );
-    }
-    drop(held);
-    drop(store);
-    std::fs::remove_dir_all(&folder).expect("remove the test's folder");
-}
-
-// ---- finding centres ----
+// ---- finding centroids ----
 
 #[test]
 fn the_groups_of_a_partition_follow_the_square_root() {
@@ -760,13 +426,13 @@ fn the_groups_of_a_partition_follow_the_square_root() {
 }
 
 #[test]
-fn the_first_centres_are_the_same_for_the_same_numbers() {
-    let first = first_centres(1000, 10);
-    assert_eq!(first, first_centres(1000, 10));
+fn the_first_centroids_are_the_same_for_the_same_numbers() {
+    let first = first_centroids(1000, 10);
+    assert_eq!(first, first_centroids(1000, 10));
     assert_eq!(first.len(), 10);
     assert!(first.windows(2).all(|pair| pair[0] < pair[1]), "{first:?}");
     assert!(first[9] < 1000, "{first:?}");
-    assert_eq!(first_centres(10, 10), (0..10).collect::<Vec<u64>>());
+    assert_eq!(first_centroids(10, 10), (0..10).collect::<Vec<u64>>());
     // The sample: every slot of a small partition, and 64 a group evenly spread of a large.
     assert_eq!(
         sampled(10, 1).collect::<Vec<u64>>(),
@@ -778,7 +444,7 @@ fn the_first_centres_are_the_same_for_the_same_numbers() {
 }
 
 #[test]
-fn a_round_moves_each_centre_to_its_slots() {
+fn a_round_moves_each_centroid_to_its_slots() {
     const DIMENSION: usize = 4;
     let budget = Budget::new(None).expect("a budget");
     let mut held = budget.reserve(0, "maintenance").expect("a reservation");
@@ -790,7 +456,7 @@ fn a_round_moves_each_centre_to_its_slots() {
         slot_of(&[1.0, -0.2, 0.0, 0.0]),
     ];
     let near_second = slot_of(&[0.0, 1.0, 0.5, 0.0]);
-    // The nearest centre is the one with the greatest product, the lower number of two alike.
+    // The nearest centroid is the one with the greatest product, the lower number of two alike.
     assert_eq!(nearest(&found, DIMENSION, &near_first[0]).0, 0);
     let (group, greatest) = nearest(&found, DIMENSION, &near_second);
     assert_eq!(group, 1);
@@ -810,15 +476,15 @@ fn a_round_moves_each_centre_to_its_slots() {
         round.take(&found, slot);
     }
     round.finish(&mut found);
-    // Each centre that drew a slot is the direction of its slots' sum; the third drew none.
-    close_to(&found[..4], &[1.0, 0.0, 0.0, 0.0], "the first centre");
-    close_to(&found[4..8], &[0.0, 0.894, 0.447, 0.0], "the second centre");
+    // Each centroid that drew a slot is the direction of its slots' sum; the third drew none.
+    close_to(&found[..4], &[1.0, 0.0, 0.0, 0.0], "the first centroid");
+    close_to(&found[4..8], &[0.0, 0.894, 0.447, 0.0], "second centroid");
     assert_eq!(found[8..], [0.0, 0.0, 1.0, 0.0]);
-    for centre in found.chunks(DIMENSION) {
-        let length: f32 = centre.iter().map(|x| x * x).sum();
+    for centroid in found.chunks(DIMENSION) {
+        let length: f32 = centroid.iter().map(|x| x * x).sum();
         assert!(
             (length - 1.0).abs() < 1e-5,
-            "a centre of squared length {length:e}"
+            "a centroid of squared length {length:e}"
         );
     }
 
@@ -843,6 +509,9 @@ fn a_build(phase: Phase) -> Build {
         slots: 2000,
         upto: 2000,
         stale: false,
+        reusing: false,
+        outside: 0,
+        sum: Vec::new(),
         groups: 45,
         phase,
         counts: vec![0; 45],
@@ -864,41 +533,10 @@ fn given() -> (Vec<u32>, Vec<Place>) {
     (counts, starts)
 }
 
-#[test]
-fn a_build_whose_cursor_is_past_its_blocks_is_damage() {
-    let (counts, _) = given();
-    let whole = a_build(Phase::Train { round: 3 }).encode();
-    let cases = [
-        (
-            "a build that gives groups from a block it does not read",
-            a_build(Phase::Assign { next: 5 }).encode(),
-        ),
-        (
-            "a build that packs a group it does not have",
-            Build {
-                counts,
-                ..a_build(Phase::Pack { group: 46 })
-            }
-            .encode(),
-        ),
-        (
-            "a build's record cut short",
-            whole[..whole.len() - 1].to_vec(),
-        ),
-    ];
-    let (folder, store, budget) = a_store("build-damage");
-    for (what, record) in cases {
-        let view = put(&store, &budget, VectorRecord::Build(COLUMN, 7), record);
-        told_as_damage(Build::read(&view, COLUMN, 7), &folder, what);
-    }
-    drop(store);
-    std::fs::remove_dir_all(&folder).expect("remove the test's folder");
-}
-
-// ---- sketches ----
+// ---- binary codes ----
 
 #[test]
-fn a_sketch_holds_the_signs_and_the_factor_of_its_slot() {
+fn a_code_holds_the_signs_and_the_factor_of_its_slot() {
     // Sixteen numbers worked out by hand. The slot keeps an eighth of each code; the
     // reference is a half for the first eight numbers and zero for the rest.
     let codes = [8, -8, 4, -4, 2, -2, 1, -1, 0, 0, 8, 8, -8, -8, 4, 4];
@@ -907,23 +545,23 @@ fn a_sketch_holds_the_signs_and_the_factor_of_its_slot() {
     // The differences are 0.5, -1.5, 0, -1, -0.25, -0.75, -0.375, -0.625, then 0, 0, 1, 1,
     // -1, -1, 0.5, 0.5: bits 0 and 2 of the first byte, and all but bits 4 and 5 of the
     // second. Their squares come to 9.15625 and their sizes to 10: the factor is 30,003.
-    assert_eq!(sketch_len(16), 4);
-    let mut sketch = [0xAA_u8; 4];
-    write_sketch(&slot, &reference, &mut sketch);
-    assert_eq!(sketch, [0b0000_0101, 0b1100_1111, 0x33, 0x75]);
+    assert_eq!(code_len(16), 4);
+    let mut code = [0xAA_u8; 4];
+    write_code(&slot, &reference, &mut code);
+    assert_eq!(code, [0b0000_0101, 0b1100_1111, 0x33, 0x75]);
 
     // No difference at all: every bit, and a factor of zero.
-    write_sketch(&slot, &kept_by(&slot), &mut sketch);
-    assert_eq!(sketch, [0xFF, 0xFF, 0, 0]);
+    write_code(&slot, &kept_by(&slot), &mut code);
+    assert_eq!(code, [0xFF, 0xFF, 0, 0]);
 
     // Twelve numbers: the four bits past them stay zero. Differences of one give a factor
     // of 32,768, and differences of two one that is held to 65,535.
-    assert_eq!(sketch_len(12), 4);
+    assert_eq!(code_len(12), 4);
     for (code, factor) in [(8_i8, 32_768_u16), (16, u16::MAX)] {
-        let mut sketch = [0xAA_u8; 4];
-        write_sketch(&hand_slot(0.125, &[code; 12]), &[0.0; 12], &mut sketch);
+        let mut binary = [0xAA_u8; 4];
+        write_code(&hand_slot(0.125, &[code; 12]), &[0.0; 12], &mut binary);
         let [low, high] = factor.to_le_bytes();
-        assert_eq!(sketch, [0xFF, 0x0F, low, high]);
+        assert_eq!(binary, [0xFF, 0x0F, low, high]);
     }
 }
 
@@ -932,19 +570,19 @@ fn asked_unit(query: &[f32]) -> Vec<f32> {
     unit(query)
 }
 
-/// The record of the sketches of these slots, each from this reference.
+/// The record of the binary codes of these slots, each from this reference.
 fn record_of(slots: &[Vec<u8>], reference: &[f32]) -> Vec<u8> {
     let mut record = (slots.len() as u32).to_le_bytes().to_vec();
     for slot in slots {
-        let mut sketch = vec![0_u8; sketch_len(reference.len())];
-        write_sketch(slot, reference, &mut sketch);
-        record.extend(sketch);
+        let mut code = vec![0_u8; code_len(reference.len())];
+        write_code(slot, reference, &mut code);
+        record.extend(code);
     }
     record
 }
 
 #[test]
-fn a_sketch_estimates_a_product_within_its_factor() {
+fn a_code_estimates_a_product_within_its_factor() {
     const DIMENSION: usize = 16;
     for pair in 0..20_u64 {
         let slot = slot_of(&vector(3 * pair, DIMENSION));
@@ -966,10 +604,10 @@ fn a_sketch_estimates_a_product_within_its_factor() {
         let record = record_of(std::slice::from_ref(&slot), &reference);
         let factor = f64::from(u16::from_le_bytes([record[6], record[7]])) / 32_768.0;
         let mut ranges = Vec::new();
-        let sketches = Sketches::new(&record, DIMENSION);
-        Estimate::new(&query).ranges(&sketches, 0..1, base, WIDEST, &mut ranges);
+        let codes = Codes::new(&record, DIMENSION);
+        Estimate::new(&query).ranges(&codes, 0..1, base, WIDEST, &mut ranges);
         let [(low, high)] = ranges[..] else {
-            panic!("pair {pair}: {} ranges for one sketch", ranges.len())
+            panic!("pair {pair}: {} ranges for one code", ranges.len())
         };
         // At the widest, a range is four factors to each side of the estimate.
         let (low, high) = (f64::from(low), f64::from(high));
@@ -985,8 +623,8 @@ fn a_sketch_estimates_a_product_within_its_factor() {
 }
 
 #[test]
-fn the_ranges_of_a_run_of_sketches_are_those_of_the_plain_arithmetic() {
-    // A hundred numbers: a sketch's second word is completed with zeros.
+fn the_ranges_of_a_run_of_codes_are_those_of_the_plain_arithmetic() {
+    // A hundred numbers: a binary code's second word is completed with zeros.
     const DIMENSION: usize = 100;
     const WIDTH: u8 = 6;
     let reference: Vec<f32> = vector(500, DIMENSION).iter().map(|x| 0.1 * x).collect();
@@ -997,12 +635,12 @@ fn the_ranges_of_a_run_of_sketches_are_those_of_the_plain_arithmetic() {
     let query = vector(700, DIMENSION);
     let base = 0.125_f32;
     let mut ranges = Vec::new();
-    let sketches = Sketches::new(&record, DIMENSION);
-    Estimate::new(&query).ranges(&sketches, 3..37, base, WIDTH, &mut ranges);
+    let codes = Codes::new(&record, DIMENSION);
+    Estimate::new(&query).ranges(&codes, 3..37, base, WIDTH, &mut ranges);
     assert_eq!(ranges.len(), 34);
 
     // The same worked out bit by bit: the search's vector at length one in whole steps of a
-    // seventh of its largest number, and for each sketch the steps under its set bits.
+    // seventh of its largest number, and for each binary code the steps under its set bits.
     let asked = asked_unit(&query);
     let step = asked.iter().fold(0.0_f32, |most, x| most.max(x.abs())) / 7.0;
     let steps: Vec<i32> = asked
@@ -1011,19 +649,19 @@ fn the_ranges_of_a_run_of_sketches_are_those_of_the_plain_arithmetic() {
         .collect();
     let sum: i32 = steps.iter().sum();
     for (place, (low, high)) in (3..37).zip(ranges) {
-        let sketch = sketches.at(place);
-        let set = |at: usize| sketch[at / 8] >> (at % 8) & 1 == 1;
+        let code = codes.at(place);
+        let set = |at: usize| code[at / 8] >> (at % 8) & 1 == 1;
         let under: i32 = (0..DIMENSION)
             .filter(|at| set(*at))
             .map(|at| steps[at])
             .sum();
-        let factor = f32::from(u16::from_le_bytes([sketch[13], sketch[14]])) / 32_768.0;
+        let factor = f32::from(u16::from_le_bytes([code[13], code[14]])) / 32_768.0;
         let estimate = base + factor * step * (2 * under - sum) as f32;
         let wide = f32::from(WIDTH) / 4.0 * factor;
         for (found, wanted) in [(low, estimate - wide), (high, estimate + wide)] {
             assert!(
                 (found - wanted).abs() <= 1e-5 * wanted.abs().max(1.0),
-                "sketch {place}: {found:e} where the plain arithmetic gives {wanted:e}"
+                "code {place}: {found:e} where the plain arithmetic gives {wanted:e}"
             );
         }
     }
@@ -1041,7 +679,7 @@ fn gathered(n: u64) -> Vec<f32> {
     (0..BUILT).map(|at| lifted(at) + 0.05 * moved[at]).collect()
 }
 
-fn fresh(test: &str) -> PathBuf {
+pub(crate) fn fresh(test: &str) -> PathBuf {
     let folder = std::env::temp_dir().join(format!("contextdb-{test}-{}", std::process::id()));
     if folder.exists() {
         std::fs::remove_dir_all(&folder).expect("clear the folder an earlier run left");
@@ -1061,35 +699,112 @@ fn insert_gathered(db: &Database, ids: std::ops::RangeInclusive<u64>) {
     tx.commit().expect("commit");
 }
 
-/// An open store whose `docs.v` holds 2,000 vectors in a column that is at its size, after
-/// this many maintenance cycles: sixteen build its grouping of 45 groups.
-fn a_store_with_vectors(test: &str, cycles: usize) -> (PathBuf, Database) {
-    let folder = fresh(test);
-    let db = Database::open(&folder).expect("open a fresh store");
-    let table = "CREATE TABLE docs (id INTEGER PRIMARY KEY, v VECTOR(16) INDEXING_THRESHOLD 1000)";
-    db.execute(table, &HashMap::new()).expect(table);
-    insert_gathered(&db, 1..=2000);
-    for _ in 0..cycles {
-        db.run_maintenance_cycle().expect("a maintenance cycle");
-    }
+/// Opens the store in a folder with every maintenance cycle left to the test.
+fn opened(folder: &Path) -> Database {
+    let options = crate::DatabaseOpenOptions {
+        maintenance: crate::Maintenance::Caller,
+        ..Default::default()
+    };
+    Database::open_with_options(folder, options).expect("open the store")
+}
+
+/// Whether the one partition, with its build's phase (`None` with no build), is as wanted.
+type Reached = fn(&Partition, Option<Phase>) -> bool;
+
+/// The IVF of 45 groups is in force and no build is under way.
+const IN_FORCE: Reached = |entry, phase| entry.ivf.is_some() && phase.is_none();
+
+/// A 2,000-vector store advanced to the requested maintenance state.
+fn a_store_with_vectors(test: &str, reached: Reached) -> (PathBuf, Database) {
+    let (folder, db) = vectors_for_damage(test, 2000);
+    let db = advance_to(&folder, db, reached);
     (folder, db)
 }
 
+fn vectors_for_damage(test: &str, count: u64) -> (PathBuf, Database) {
+    let folder = fresh(test);
+    let db = opened(&folder);
+    let threshold = if count == 0 {
+        String::new()
+    } else {
+        format!(" INDEXING_THRESHOLD {}", count.min(1000))
+    };
+    let table =
+        format!("CREATE TABLE docs (id INTEGER PRIMARY KEY, n INTEGER, v VECTOR(16){threshold})");
+    db.execute(&table, &HashMap::new()).expect("declare");
+    insert_gathered(&db, 1..=count);
+    (folder, db)
+}
+
+fn advance_to(folder: &Path, mut db: Database, reached: Reached) -> Database {
+    for cycle in 1..=40 {
+        db.run_maintenance_cycle().expect("a maintenance cycle");
+        let (store, budget, column, entry) = beneath(folder, db);
+        let view = store.view().expect("the newest commit");
+        let held = &mut budget.reserve(0, "query").expect("a reservation");
+        let build = Build::read(&view, column, entry.number, BUILT, held).expect("read the build");
+        let now = reached(&entry, build.map(|build| build.phase));
+        drop((view, store));
+        db = opened(folder);
+        if now {
+            return db;
+        }
+        assert!(cycle < 40, "40 cycles and the partition is at {entry:?}");
+    }
+    unreachable!("the loop returns or fails")
+}
+
+// Extends the centroid record roundtrip to records written by first builds and rebuilds.
+#[test]
+fn every_build_renews_the_mean_and_each_centroid_from_its_members() {
+    let (folder, mut db) = a_store_with_vectors("member-means", IN_FORCE);
+    for last in [2000, 2400] {
+        insert_gathered(&db, 2001..=last);
+        for _ in 0..20 {
+            db.run_maintenance_cycle().expect("finish the build");
+        }
+        let (store, budget, column, entry) = beneath(&folder, db);
+        let view = store.view().expect("a view");
+        let g = entry.ivf.expect("an IVF");
+        assert_eq!((g.blocks, g.slots), (1, last));
+        let held = &mut budget.reserve(0, "query").expect("a reservation");
+        let centroids = centroids(&view, column, g.number, g.groups, BUILT, held).expect("centres");
+        let shape = Ivf::read(&view, column, g, held).expect("group boundaries");
+        let (_, bytes) = first_record(&view, VectorRecord::Block(column, g.number, 0));
+        let block = BlockReader::new(&bytes, BUILT);
+        let mut average = |from, to| {
+            let mut sum = Mean::new(BUILT, held).expect("a sum");
+            for n in from..to {
+                sum.take(block.slot(n));
+            }
+            sum.finish()
+        };
+        let at = |p: Place| p.block as usize * block.len() + p.slot as usize;
+        for (places, found) in shape.starts.windows(2).zip(centroids.chunks(BUILT)) {
+            let wanted = unit(&average(at(places[0]), at(places[1])));
+            assert!(found.iter().zip(wanted).all(|(a, b)| (a - b).abs() < 1e-6));
+        }
+        let wanted = average(0, block.len());
+        let found = mean(&view, column, g.number, BUILT, held).expect("the IVF's mean");
+        assert!(found.iter().zip(wanted).all(|(a, b)| (a - b).abs() < 1e-6));
+        drop((view, store));
+        db = opened(&folder);
+    }
+}
 /// The first record of the kind of `from` that the column of `from` keeps, with its value.
 fn first_record(view: &View, from: VectorRecord<'static>) -> (VectorRecord<'static>, Vec<u8>) {
     let mut found = None;
     view.vectors(from, &mut |record, value| {
-        found = Some(match record {
-            VectorRecord::Grouping(column, number) => VectorRecord::Grouping(column, number),
-            VectorRecord::Sketch(column, under, block) => {
-                VectorRecord::Sketch(column, under, block)
-            }
-            VectorRecord::Assigned(column, number, place) => {
-                VectorRecord::Assigned(column, number, place)
-            }
+        let record = match record {
+            VectorRecord::Block(c, n, at) => VectorRecord::Block(c, n, at),
+            VectorRecord::Ivf(c, n) => VectorRecord::Ivf(c, n),
+            VectorRecord::Mean(c, n) => VectorRecord::Mean(c, n),
+            VectorRecord::Centroids(c, n, at) => VectorRecord::Centroids(c, n, at),
+            VectorRecord::Binary(c, n, at) => VectorRecord::Binary(c, n, at),
+            VectorRecord::Assigned(c, n, at) => VectorRecord::Assigned(c, n, at),
             other => panic!("looked for {from:?} and the next record is {other:?}"),
-        })
-        .map(|record| (record, value.to_vec()));
+        };
+        found = Some((record, value.to_vec()));
         Ok(false)
     })
     .expect("read the records");
@@ -1109,19 +824,16 @@ fn damaged(
     from: fn(VectorId) -> VectorRecord<'static>,
     damage: fn(&mut Vec<u8>),
 ) -> Database {
-    db.close().expect("close");
-    drop(db);
-    let budget = Budget::new(None).expect("a budget");
-    let store = Store::open_for_writing(folder, &budget, None).expect("open the store");
+    // So that the check's word on the damaged store is the damage's, not a store it never passes.
+    db.verify().expect("the check passes the sound built store");
+    let (store, budget, column, _) = beneath(folder, db);
     let view = store.view().expect("the newest commit");
-    let catalog = Catalog::load(&view).expect("the tables");
-    let column = catalog.table("docs").expect("the table").vectors[0].id;
     let (record, mut value) = first_record(&view, from(column));
     damage(&mut value);
     drop(view);
     put(&store, &budget, record, value);
     drop(store);
-    Database::open(folder).expect("open the damaged store")
+    opened(folder)
 }
 
 /// The ids a search of ten returns under this mode.
@@ -1133,221 +845,34 @@ fn ten(db: &Database, mode: &str) -> crate::types::Result<Vec<Value>> {
     Ok(result.rows().iter().map(|row| row[0].clone()).collect())
 }
 
-/// Damages the index of a built store and asserts what its searches then give: INDEXED the
-/// store's damage error, AUTO and EXACT the same ten rows.
-fn a_damaged_index_refuses_indexed_and_auto_answers_exactly(
-    test: &str,
-    from: fn(VectorId) -> VectorRecord<'static>,
-    damage: fn(&mut Vec<u8>),
-    what: &str,
-) {
-    let (folder, db) = a_store_with_vectors(test, 16);
-    assert_eq!(ten(&db, "INDEXED").expect("the built store").len(), 10);
-    let db = damaged(&folder, db, from, damage);
-    told_as_damage(ten(&db, "INDEXED"), &folder, what);
-    let exact = ten(&db, "EXACT").expect("EXACT reads no record of the index");
-    assert_eq!(exact.len(), 10);
-    match ten(&db, "AUTO") {
-        Ok(auto) => assert_eq!(auto, exact, "AUTO over {what}"),
-        Err(error) => panic!("AUTO over {what} gave {error:?}"),
-    }
-    db.close().expect("close");
-    drop(db);
-    std::fs::remove_dir_all(&folder).expect("remove the test's folder");
-}
-
-#[test]
-fn a_sketch_record_that_does_not_match_its_block_is_damage() {
-    // The record of the one block's sketches, holding one sketch fewer than the block has
-    // slots, and saying so.
-    a_damaged_index_refuses_indexed_and_auto_answers_exactly(
-        "sketch-count",
-        |column| VectorRecord::Sketch(column, 0, 0),
-        |record| {
-            let count = u32::from_le_bytes(std::array::from_fn(|at| record[at])) - 1;
-            record[..4].copy_from_slice(&count.to_le_bytes());
-            record.truncate(record.len() - sketch_len(BUILT));
-        },
-        "a record of sketches whose count is not its block's",
-    );
-}
-
-#[test]
-fn auto_answers_exactly_where_a_grouping_is_damaged() {
-    a_damaged_index_refuses_indexed_and_auto_answers_exactly(
-        "grouping-gap",
-        |column| VectorRecord::Grouping(column, 0),
-        |record| record[..4].copy_from_slice(&20_001_u32.to_le_bytes()),
-        "a grouping whose gap is above 20,000",
-    );
-}
-
-#[test]
-fn assigned_groups_that_do_not_match_their_block_are_damage() {
-    // Twelve cycles: sealed and begun, ten rounds, and every slot given its group.
-    let (folder, db) = a_store_with_vectors("assigned-count", 12);
-    let db = damaged(
-        &folder,
-        db,
-        |column| VectorRecord::Assigned(column, 0, 0),
-        |record| record.extend([0, 0]),
-    );
-    told_as_damage(
-        db.run_maintenance_cycle(),
-        &folder,
-        "a cycle that packs from the groups of one slot more than the block has",
-    );
-    db.close().expect("close");
-    drop(db);
-    std::fs::remove_dir_all(&folder).expect("remove the test's folder");
-}
-
 /// Closes the store and opens it as these tests write to it: the store, its budget, the
 /// column of `docs.v` and the entry of its one partition.
 fn beneath(folder: &Path, db: Database) -> (Store, Budget, VectorId, Partition) {
     db.close().expect("close");
     drop(db);
     let budget = Budget::new(None).expect("a budget");
-    let store = Store::open_for_writing(folder, &budget, None).expect("open the store");
+    let store = Store::open_for_writing(folder, &budget, &DatabaseOpenOptions::default())
+        .expect("open the store");
     let view = store.view().expect("the newest commit");
-    let catalog = Catalog::load(&view).expect("the tables");
-    let column = catalog.table("docs").expect("the table").vectors[0].id;
+    let catalog = Catalog::load(&view, &budget).expect("the tables");
+    let declared = &catalog.table("docs").expect("the table").vectors[0];
+    let column = declared.id;
     let none = Key::from_values(&[], &[]).expect("the key of no values");
-    let entry = partition(&view, column, &none).expect("read the partition");
+    let entry = partition(&view, declared, &none).expect("read the partition");
     drop(view);
     (store, budget, column, entry.expect("the one partition"))
 }
 
 /// The build the one partition of a store is making, read as [`beneath`] opens the store.
-fn build_under_way(store: &Store, column: VectorId, entry: &Partition) -> Build {
+fn build_under_way(
+    store: &Store,
+    column: VectorId,
+    entry: &Partition,
+    held: &mut Reservation,
+) -> Build {
     let view = store.view().expect("the newest commit");
-    let build = Build::read(&view, column, entry.number).expect("read the build");
+    let build = Build::read(&view, column, entry.number, BUILT, held).expect("read the build");
     build.expect("a build under way")
-}
-
-/// Puts this record of a build in place of the partition's, opens the store, and asserts that
-/// the next cycle tells the damage.
-fn a_cycle_over_this_build_is_damage(test: &str, cycles: usize, damage: fn(Build) -> Build) {
-    let (folder, db) = a_store_with_vectors(test, cycles);
-    let (store, budget, column, entry) = beneath(&folder, db);
-    let build = damage(build_under_way(&store, column, &entry));
-    let record = VectorRecord::Build(column, entry.number);
-    put(&store, &budget, record, build.encode());
-    drop(store);
-    let db = Database::open(&folder).expect("open the damaged store");
-    told_as_damage(db.run_maintenance_cycle(), &folder, test);
-    db.close().expect("close");
-    drop(db);
-    std::fs::remove_dir_all(&folder).expect("remove the test's folder");
-}
-
-#[test]
-fn a_build_of_more_groups_than_slots_is_damage() {
-    // One cycle: sealed and begun. The record then says 2,001 groups for its 2,000 slots.
-    a_cycle_over_this_build_is_damage("build-more-groups-than-slots", 1, |build| {
-        assert_eq!((build.slots, build.groups), (2000, 45));
-        Build {
-            groups: 2001,
-            counts: vec![0; 2001],
-            ..build
-        }
-    });
-}
-
-#[test]
-fn a_packed_build_whose_groups_begin_out_of_order_is_damage() {
-    // Thirteen cycles: every group is packed and its beginning recorded. The second group
-    // then begins after the third.
-    a_cycle_over_this_build_is_damage("build-starts-out-of-order", 13, |mut build| {
-        assert_eq!(build.starts.len(), 46);
-        assert!(build.starts[1] < build.starts[2], "{:?}", build.starts);
-        build.starts.swap(1, 2);
-        build
-    });
-}
-
-#[test]
-fn assigned_groups_of_an_odd_length_are_damage() {
-    // Twelve cycles: sealed and begun, ten rounds, and every slot given its group in two
-    // bytes. The record then ends half way through a slot's.
-    let (folder, db) = a_store_with_vectors("assigned-odd", 12);
-    let db = damaged(
-        &folder,
-        db,
-        |column| VectorRecord::Assigned(column, 0, 0),
-        |record| record.push(0),
-    );
-    told_as_damage(
-        db.run_maintenance_cycle(),
-        &folder,
-        "a cycle that packs from groups recorded in an odd number of bytes",
-    );
-    db.close().expect("close");
-    drop(db);
-    std::fs::remove_dir_all(&folder).expect("remove the test's folder");
-}
-
-/// A store whose grouping is being built again from slots one of which its row has left, so
-/// that the partition keeps one `Left` record. Once the build has reached `sweeping` (or at
-/// once, for `false`) that record's value is made `bytes` long, and the cycles that follow
-/// must tell the damage: the build reads the record for the slot's key before it gives the
-/// slot a group, and the steps after the switch read it to remove it.
-fn a_left_record_of_this_length_is_damage(test: &str, sweeping: bool, bytes: usize) {
-    let (folder, mut db) = a_store_with_vectors(test, 16);
-    insert_gathered(&db, 2001..=2400);
-    let changed = crate::params! { "v" => gathered(50_000) };
-    db.execute("UPDATE docs SET v = $v WHERE id = 5", &changed)
-        .expect("change a vector");
-    db.run_maintenance_cycle().expect("the cycle that begins");
-    let none = Key::from_values(&[], &[]).expect("the key of no values");
-    for cycle in 0.. {
-        let (store, budget, column, entry) = beneath(&folder, db);
-        let phase = build_under_way(&store, column, &entry).phase;
-        if sweeping && phase != Phase::Sweep {
-            assert!(cycle < 40, "40 cycles and the build is at {phase:?}");
-            drop(store);
-            db = Database::open(&folder).expect("open");
-            db.run_maintenance_cycle().expect("a cycle of the build");
-            continue;
-        }
-        let view = store.view().expect("the newest commit");
-        let mut left = None;
-        view.vectors(
-            VectorRecord::Left(column, entry.number, &none),
-            &mut |record, value| {
-                if let VectorRecord::Left(_, _, key) = record {
-                    left = Some((key.clone(), value.to_vec()));
-                }
-                Ok(false)
-            },
-        )
-        .expect("read the records");
-        drop(view);
-        let (key, mut value) = left.expect("a record of the row that left its slot");
-        assert_eq!(value.len(), 8);
-        value.resize(bytes, 0);
-        put(
-            &store,
-            &budget,
-            VectorRecord::Left(column, entry.number, &key),
-            value,
-        );
-        drop(store);
-        db = Database::open(&folder).expect("open the damaged store");
-        break;
-    }
-    let told = (0..40).find_map(|_| db.run_maintenance_cycle().err());
-    told_as_damage(told.map_or(Ok(()), Err), &folder, test);
-    db.close().expect("close");
-    drop(db);
-    std::fs::remove_dir_all(&folder).expect("remove the test's folder");
-}
-
-#[test]
-fn a_left_record_that_is_not_eight_bytes_is_damage() {
-    a_left_record_of_this_length_is_damage("left-short-while-building", false, 7);
-    a_left_record_of_this_length_is_damage("left-short-while-sweeping", true, 7);
-    a_left_record_of_this_length_is_damage("left-long-while-sweeping", true, 9);
 }
 
 /// How many records of the kind of `from` the column of `from` keeps, from `from` on.
@@ -1356,11 +881,11 @@ fn records_from(view: &View, from: VectorRecord<'_>) -> usize {
         VectorRecord::Partition(column, _)
         | VectorRecord::Pending(column, ..)
         | VectorRecord::Block(column, ..)
-        | VectorRecord::Grouping(column, _)
-        | VectorRecord::Centres(column, ..)
+        | VectorRecord::Ivf(column, _)
+        | VectorRecord::Centroids(column, ..)
         | VectorRecord::Build(column, _)
         | VectorRecord::Assigned(column, ..)
-        | VectorRecord::Sketch(column, ..)
+        | VectorRecord::Binary(column, ..)
         | VectorRecord::Mean(column, _)
         | VectorRecord::Left(column, ..) => column,
     };
@@ -1376,72 +901,686 @@ fn records_from(view: &View, from: VectorRecord<'_>) -> usize {
 }
 
 #[test]
-fn a_partition_that_empties_leaves_no_record_of_its_grouping_or_its_build() {
-    // A grouping in force; then a fifth more vectors sealed into its tail, a row that left
-    // its slot, and the regrouping those make due begun.
-    let (folder, db) = a_store_with_vectors("emptied-partition", 16);
-    insert_gathered(&db, 2001..=2400);
-    let changed = crate::params! { "v" => gathered(50_000) };
-    db.execute("UPDATE docs SET v = $v WHERE id = 5", &changed)
-        .expect("change a vector");
-    db.run_maintenance_cycle().expect("a maintenance cycle");
-    // Every kind of record the column may keep, and how many of each it keeps at a moment.
-    let counts = |folder: &Path| -> Vec<usize> {
-        let budget = Budget::new(None).expect("a budget");
-        let store = Store::open_for_writing(folder, &budget, None).expect("open the store");
-        let view = store.view().expect("the newest commit");
-        let catalog = Catalog::load(&view).expect("the tables");
-        let column = catalog.table("docs").expect("the table").vectors[0].id;
-        let none = Key::from_values(&[], &[]).expect("the key of no values");
-        let kinds = [
-            VectorRecord::Partition(column, &none),
-            VectorRecord::Pending(column, 0, &none),
-            VectorRecord::Block(column, 0, 0),
-            VectorRecord::Grouping(column, 0),
-            VectorRecord::Centres(column, 0, 0),
-            VectorRecord::Build(column, 0),
-            VectorRecord::Assigned(column, 0, 0),
-            VectorRecord::Sketch(column, 0, 0),
-            VectorRecord::Mean(column, 0),
-            VectorRecord::Left(column, 0, &none),
-        ];
-        kinds.map(|from| records_from(&view, from)).to_vec()
-    };
-    db.close().expect("close");
-    drop(db);
-    let before = counts(&folder);
-    for (kind, count) in [
-        "partition",
-        "pending",
-        "block",
-        "grouping",
-        "centres",
-        "build",
-    ]
-    .iter()
-    .zip(&before)
-    {
-        // Nothing is pending after the cycle; of every other kind there is a record to lose.
-        assert_eq!(
-            *count == 0,
-            *kind == "pending",
-            "{kind} records before: {before:?}"
+fn a_partition_that_empties_leaves_no_record_of_its_ivf_or_its_build() {
+    for later in [false, true] {
+        // An IVF in force; then more vectors sealed into its tail, a row that left
+        // its slot, and the regrouping those make due begun.
+        let (folder, mut db) =
+            a_store_with_vectors(&format!("emptied-partition-{later}"), IN_FORCE);
+        insert_gathered(&db, 2001..=5000);
+        let changed = crate::params! { "v" => gathered(50_000) };
+        db.execute("UPDATE docs SET v = $v WHERE id = 5", &changed)
+            .expect("change a vector");
+        // A cycle advances builds before it seals what commits left (K1): the first seals the
+        // new rows, the second begins the regrouping it made due.
+        db.run_maintenance_cycle().expect("a maintenance cycle");
+        db.run_maintenance_cycle().expect("a maintenance cycle");
+        if later {
+            db = advance_to(&folder, db, |_, p| {
+                matches!(p, Some(Phase::Train { round: 1 }))
+            });
+            db.execute("DELETE FROM docs WHERE id = 5", &HashMap::new())
+                .unwrap();
+        }
+        // Every kind of record the column may keep, and how many of each it keeps at a moment.
+        let counts = |folder: &Path| -> Vec<usize> {
+            let budget = Budget::new(None).expect("a budget");
+            let store = Store::open_for_writing(folder, &budget, &DatabaseOpenOptions::default())
+                .expect("open the store");
+            let view = store.view().expect("the newest commit");
+            let catalog = Catalog::load(&view, &budget).expect("the tables");
+            let column = catalog.table("docs").expect("the table").vectors[0].id;
+            let none = Key::from_values(&[], &[]).expect("the key of no values");
+            let kinds = [
+                VectorRecord::Partition(column, &none),
+                VectorRecord::Pending(column, 0, &none),
+                VectorRecord::Block(column, 0, 0),
+                VectorRecord::Ivf(column, 0),
+                VectorRecord::Centroids(column, 0, 0),
+                VectorRecord::Build(column, 0),
+                VectorRecord::Assigned(column, 0, 0),
+                VectorRecord::Binary(column, 0, 0),
+                VectorRecord::Mean(column, 0),
+                VectorRecord::Left(column, 0, &none),
+            ];
+            kinds.map(|from| records_from(&view, from)).to_vec()
+        };
+        db.close().expect("close");
+        drop(db);
+        let before = counts(&folder);
+        for (kind, count) in before[..6].iter().enumerate() {
+            assert_eq!(
+                *count == 0,
+                kind == 1,
+                "kind {kind} records before: {before:?}"
+            );
+        }
+        assert!(
+            before[7] > 0 && before[8] == 1 && before[9] == 1,
+            "{before:?}"
         );
-    }
-    assert!(
-        before[7] > 0 && before[8] == 1 && before[9] == 1,
-        "{before:?}"
-    );
 
-    let db = Database::open(&folder).expect("open");
-    db.execute("DELETE FROM docs WHERE id > 0", &HashMap::new())
-        .expect("delete every row");
-    db.close().expect("close");
-    drop(db);
-    assert_eq!(
-        counts(&folder),
-        [0; 10],
-        "records left by the emptied partition"
+        let db = opened(&folder);
+        db.execute("DELETE FROM docs WHERE id > 0", &HashMap::new())
+            .expect("delete every row");
+        db.close().expect("close");
+        drop(db);
+        let after = counts(&folder);
+        assert_eq!(after, [0; 10], "records left by the emptied partition");
+        std::fs::remove_dir_all(&folder).expect("remove the test's folder");
+    }
+}
+
+/// Corruption retrains under the same limit; centroid I/O must escape without a commit.
+#[test]
+fn a_damaged_ivf_is_rebuilt_by_the_cycles_under_the_same_limit() {
+    let (folder, db) = a_store_with_vectors("rebuilt-ivf", IN_FORCE);
+    let wide = |record: &mut Vec<u8>| record[..4].copy_from_slice(&20_001_u32.to_le_bytes());
+    let in_force = |column| VectorRecord::Ivf(column, 0);
+    let db = damaged(&folder, db, in_force, wide);
+    let exact = ten(&db, "EXACT").expect("EXACT reads no record of the index");
+    let auto = ten(&db, "AUTO").expect("AUTO answers over a damaged IVF");
+    assert!(auto == exact, "AUTO {auto:?}, EXACT {exact:?}");
+    for ran in 1..=100 {
+        let cycle = db.run_maintenance_cycle().expect("a cycle").vector;
+        assert!(count(cycle.stalled_partitions) == 0, "cycle {ran} stalled");
+        if count(cycle.maintenance_vectors_remaining) + count(cycle.remaining_partitions) == 0 {
+            break;
+        }
+        assert!(ran < 100, "100 cycles left the damaged IVF unbuilt");
+    }
+    let indexed = ten(&db, "INDEXED").expect("the rebuilt IVF answers USE VECTOR INDEXED");
+    assert_eq!(indexed.len(), exact.len(), "the rebuilt IVF's answer");
+    let durable = db
+        .execute("SELECT id FROM docs", &crate::params! {})
+        .unwrap();
+    let durable: Vec<_> = durable.rows().iter().map(|row| &row[0]).collect();
+    assert!(
+        indexed.iter().all(|id| durable.contains(&id)),
+        "durable ids"
     );
+    insert_gathered(&db, 2001..=2400);
+    let (store, budget, column, entry) = beneath(&folder, db);
+    let ivf = entry.ivf.unwrap();
+    assert!(ivf.groups > 1);
+    let held = &mut budget.reserve(0, "query").expect("a reservation");
+    Ivf::read(&store.view().unwrap(), column, ivf, held).unwrap();
+    assert_eq!(
+        ivf.slots + entry.slots + u64::from(entry.unindexed),
+        entry.live
+    );
+    assert!(entry.assigned + entry.slots < u64::from(ivf.groups).pow(2));
+    let from = VectorRecord::Centroids(column, ivf.number, 0);
+    let (record, centres) = first_record(&store.view().unwrap(), from);
+    drop(store);
+    let saved = std::fs::read(folder.join("data")).unwrap();
+    let fault = report::Fault::new("reuse-centroid-sentinel");
+    let options = || fault.options(Default::default());
+    let db = Database::open_with_options(&folder, options()).unwrap();
+    fault.clear();
+    db.run_maintenance_cycle().unwrap();
+    fault.identify(&centres);
+    drop(db);
+    for io_failure in [false, true] {
+        std::fs::write(folder.join("data"), &saved).unwrap();
+        if !io_failure {
+            let store =
+                Store::open_for_writing(&folder, &budget, &DatabaseOpenOptions::default()).unwrap();
+            let mut bad = centres.clone();
+            bad[..4].copy_from_slice(&f32::NAN.to_le_bytes());
+            put(&store, &budget, record, bad);
+        }
+        let mut db = Database::open_with_options(&folder, options()).unwrap();
+        let answer = ten(&db, "EXACT").unwrap();
+        if io_failure {
+            db = fault.refuse_cycle(db, || {
+                Database::open_with_options(&folder, options()).unwrap()
+            });
+            let sql = "SHOW VECTOR_PARTITIONS";
+            let shown = db.execute(sql, &HashMap::new()).unwrap();
+            assert_eq!(shown.rows()[0][10], Value::Text("pending".into()));
+            db.run_maintenance_cycle().unwrap();
+        } else {
+            db.run_maintenance_cycle().unwrap();
+            let (store, budget, column, entry) = beneath(&folder, db);
+            let held = &mut budget.reserve(0, "query").expect("a reservation");
+            let build = build_under_way(&store, column, &entry, held);
+            assert!(matches!(build.phase, Phase::Train { round: 0 }) && !build.reusing);
+            drop(store);
+            db = opened(&folder);
+        }
+        assert_eq!(ten(&db, "EXACT").unwrap(), answer);
+        db.run_maintenance_cycle().unwrap();
+        db.close().unwrap();
+    }
     std::fs::remove_dir_all(&folder).expect("remove the test's folder");
+}
+
+// ---- damaged records ----
+
+/// Damage that no public call writes: a standalone record, a pending row without its vector,
+/// a schema naming the wrong column, or one record changed in a saved maintenance state.
+type RecordFrom = fn(VectorId) -> VectorRecord<'static>;
+enum Damage {
+    Alone(Kind, Vec<u8>),
+    Tuple,
+    NoVector(i64),
+    Named(u8),
+    Built(&'static str, RecordFrom, fn(&mut Vec<u8>)),
+    Building(&'static str, fn(Build) -> Build),
+    Place(&'static str, RecordFrom, Option<u32>),
+    Left(&'static str, usize),
+}
+
+/// The record a [`Damage::Alone`] is, and for centroids how many groups it is read as.
+#[derive(Clone, Copy)]
+enum Kind {
+    Partition,
+    Ivf,
+    Centroids(u32),
+    Mean,
+    Build,
+}
+
+/// Sound stores saved once, with one vector except where binary codes and two nonempty
+/// groups need three. Each damaged case gets its own copy of a closed data file.
+fn damage_stores() -> HashMap<&'static str, Vec<u8>> {
+    let mut saved = HashMap::new();
+    for count in [0, 1, 3, 2000] {
+        let states: &[&str] = match count {
+            0 => &["pending", "later-pending"],
+            1 => &["begun", "assigned", "left-building", "left-sweeping"],
+            3 => &["packed", "width", "switch", "built"],
+            _ => &["training"],
+        };
+        let (folder, mut db) = vectors_for_damage(&format!("damage-source-{count}"), count);
+        for (at, &name) in states.iter().enumerate() {
+            if count == 0 {
+                insert_gathered(&db, at as u64 + 1..=at as u64 + 1);
+            } else {
+                if name == "left-building" {
+                    db = advance_to(&folder, db, IN_FORCE);
+                    db.execute(
+                        "UPDATE docs SET v = $v WHERE id = 1",
+                        &crate::params! { "v" => gathered(50_000) },
+                    )
+                    .expect("leave one stale slot");
+                }
+                let reached: Reached = match name {
+                    "begun" | "left-building" => {
+                        |_, p| matches!(p, Some(Phase::Assign { next: 0 }))
+                    }
+                    "training" => |_, p| matches!(p, Some(Phase::Train { round: 1 })),
+                    "assigned" => |_, p| matches!(p, Some(Phase::Pack { group: 0 })),
+                    "packed" => |_, p| matches!(p, Some(Phase::Measure { done: 0, .. })),
+                    "width" => |_, p| matches!(p, Some(Phase::Width { .. })),
+                    "switch" => |_, p| matches!(p, Some(Phase::Switch { .. })),
+                    "left-sweeping" => |_, p| p == Some(Phase::Sweep),
+                    _ => IN_FORCE,
+                };
+                db = advance_to(&folder, db, reached);
+            }
+            if name == "assigned" || name == "built" {
+                db.verify().expect("the check passes the sound built store");
+            }
+            if name == "built" {
+                assert_eq!(ten(&db, "INDEXED").expect("the built store").len(), 3);
+            }
+            db.close().expect("close");
+            drop(db);
+            let bytes = std::fs::read(folder.join("data")).expect("save the state");
+            saved.insert(name, bytes);
+            db = opened(&folder);
+        }
+        db.close().expect("close");
+        std::fs::remove_dir_all(folder).expect("remove the source");
+    }
+    saved
+}
+
+/// Runs a step, checking that a refusal leaves no staged records or memory charge.
+fn staged(store: &Store, budget: &Budget, stage: StageWith) -> crate::types::Result<()> {
+    let view = store.view().expect("the newest commit");
+    let mut changes = ChangeSet::new(view.clone(), budget).expect("a change set");
+    let counted = budget.used();
+    let given =
+        Catalog::load(&view, budget).and_then(|catalog| stage(&mut changes, &catalog, budget));
+    assert!(
+        given.is_ok() || changes.is_empty(),
+        "the refusal left records staged"
+    );
+    // A refusal before any write holds nothing; after its first write this transaction
+    // retains exactly the drain workspace, including when its staged records rewind.
+    let held = budget.used() - counted;
+    assert!(
+        given.is_ok() || [0, redb::WriteTransaction::DRAIN_BYTES as u64].contains(&held),
+        "memory counted after the refusal beyond the transaction's drain workspace"
+    );
+    drop(changes);
+    assert_eq!(
+        budget.used(),
+        counted,
+        "abort releases the transaction's workspace"
+    );
+    given
+}
+
+type StageWith<'a> = &'a dyn Fn(&mut ChangeSet, &Catalog, &Budget) -> crate::types::Result<()>;
+
+type Paths = Vec<(&'static str, crate::types::Result<()>)>;
+
+/// Each path's answer after changing one record in its own copy of a sound store.
+fn met(test: &str, damage: Damage, saved: &HashMap<&str, Vec<u8>>) -> (PathBuf, Paths) {
+    let state = match &damage {
+        Damage::Alone(..) => None,
+        Damage::Tuple => Some("built"),
+        Damage::NoVector(2) => Some("later-pending"),
+        Damage::NoVector(_) | Damage::Named(_) => Some("pending"),
+        Damage::Built(state, ..)
+        | Damage::Building(state, _)
+        | Damage::Left(state, _)
+        | Damage::Place(state, ..) => Some(*state),
+    };
+    let folder = fresh(test);
+    if let Some(state) = state {
+        std::fs::create_dir(&folder).expect("a case's folder");
+        std::fs::write(folder.join("data"), &saved[state]).expect("copy the sound state");
+    }
+    let budget = Budget::new(None).expect("a budget");
+    let store =
+        Store::open_for_writing(&folder, &budget, &DatabaseOpenOptions::default()).expect("open");
+    let view = store.view().expect("the newest commit");
+    let catalog = Catalog::load(&view, &budget).expect("tables");
+    let cycle: StageWith =
+        &|changes, catalog, budget| seal(changes, catalog, budget, 4096).map(drop);
+    let given = match damage {
+        Damage::Tuple => {
+            let declared = &catalog.table("docs").unwrap().vectors[0];
+            let empty = Key::from_values(&[], &[]).unwrap();
+            let extra = key(1);
+            let p = partition(&view, declared, &empty).unwrap().unwrap();
+            let record = VectorRecord::Partition(declared.id, &extra);
+            put(&store, &budget, record, p.encode());
+            vec![]
+        }
+        Damage::Alone(kind, bytes) => {
+            let (tuple, number) = (key(1), GROUPED.number);
+            let record = match kind {
+                Kind::Partition => VectorRecord::Partition(COLUMN, &tuple),
+                Kind::Ivf => VectorRecord::Ivf(COLUMN, number),
+                Kind::Centroids(_) => VectorRecord::Centroids(COLUMN, number, 0),
+                Kind::Mean => VectorRecord::Mean(COLUMN, number),
+                Kind::Build => VectorRecord::Build(COLUMN, number),
+            };
+            if !bytes.is_empty() {
+                put(&store, &budget, record, bytes);
+            }
+            let view = store.view().expect("the newest commit");
+            let held = &mut budget.reserve(0, "query").expect("a reservation");
+            let declared = crate::schema::VectorColumn {
+                id: COLUMN,
+                column: "v".into(),
+                partition_key: vec!["ctx".into()],
+                max_partitions: None,
+                search_mode: None,
+                indexing_threshold: None,
+                probes: None,
+                compaction: None,
+                quantization: Default::default(),
+            };
+            let read = match kind {
+                Kind::Partition => partition(&view, &declared, &tuple).map(drop),
+                Kind::Ivf => Ivf::read(&view, COLUMN, GROUPED, held).map(drop),
+                Kind::Centroids(groups) => {
+                    centroids(&view, COLUMN, number, groups, 16, held).map(drop)
+                }
+                Kind::Mean => mean(&view, COLUMN, number, 16, held).map(drop),
+                Kind::Build => Build::read(&view, COLUMN, number, BUILT, held).map(drop),
+            };
+            vec![("its reader", read)]
+        }
+        Damage::NoVector(id) => {
+            let table = catalog.table("docs").expect("docs").id;
+            let mut changes = ChangeSet::new(view, &budget).expect("begin");
+            let key = Key::from_values(&[Value::Int64(id)], &[]).expect("a key");
+            let row = [Value::Int64(id), Value::Null, Value::Null]
+                .map(Cell::Here)
+                .to_vec();
+            changes
+                .put_row(table, key, row, Vec::new(), false)
+                .expect("stage");
+            store.commit(changes).expect("commit the damage");
+            vec![("a cycle", staged(&store, &budget, cycle))]
+        }
+        Damage::Named(column) => {
+            let table = catalog.table("docs").expect("docs").id;
+            let mut record = None;
+            view.each_schema(|bytes| {
+                if record.is_none() {
+                    record = Some(bytes.to_vec());
+                }
+                Ok(())
+            })
+            .expect("the schema records");
+            let mut record = record.expect("the table's record");
+            // The VECTOR entry names `v`, followed by six zero bytes for its undeclared policies.
+            // The column declaration also names `v`, but is followed by its nonzero type.
+            let entry = [1, 0, 0, 0, b'v', 0, 0, 0, 0, 0, 0];
+            let found = (0..record.len()).filter(|at| record[*at..].starts_with(&entry));
+            let [at] = found.collect::<Vec<_>>()[..] else {
+                panic!("one VECTOR entry for `v`")
+            };
+            record[at + 4] = column;
+            let mut changes = ChangeSet::new(view, &budget).expect("a change set");
+            changes.put_schema("docs", record).expect("stage");
+            store.commit(changes).expect("commit the damage");
+            let write: StageWith = &|changes, catalog, budget| {
+                let key = Key::from_values(&[Value::Int64(2)], &[]).expect("a key");
+                let (id, n) = (Value::Int64(2), Value::Int64(20));
+                let row = [id, n, Value::Vector(gathered(2))];
+                changes.put_row(table, key, row.map(Cell::Here).to_vec(), Vec::new(), true)?;
+                let totals = super::Totals::load(changes.base(), catalog)?;
+                track_unindexed(changes, catalog, budget, &totals).map(drop)
+            };
+            vec![
+                ("a write", staged(&store, &budget, write)),
+                ("a cycle", staged(&store, &budget, cycle)),
+            ]
+        }
+        damage => {
+            let declared = &catalog.table("docs").expect("docs").vectors[0];
+            let column = declared.id;
+            let none = Key::from_values(&[], &[]).expect("the partition key");
+            let entry = partition(&view, declared, &none)
+                .expect("read the partition")
+                .expect("one partition");
+            let left = matches!(damage, Damage::Left(..));
+            let mut check_only = matches!(&damage, Damage::Built(_, from, _) if matches!(from(column), VectorRecord::Block(..)));
+            match damage {
+                Damage::Built(_, from, change) => {
+                    let (record, mut value) = first_record(&view, from(column));
+                    check_only |= matches!(record, VectorRecord::Mean(..));
+                    change(&mut value);
+                    put(&store, &budget, record, value);
+                }
+                Damage::Place(_, from, place) => {
+                    let (record, value) = first_record(&view, from(column));
+                    let mut changes = ChangeSet::new(store.view().unwrap(), &budget).unwrap();
+                    changes.delete_vector(record).unwrap();
+                    if let VectorRecord::Block(v, n, at) = record {
+                        changes
+                            .delete_vector(VectorRecord::Binary(v, n, at))
+                            .unwrap();
+                    }
+                    check_only |=
+                        matches!(record, VectorRecord::Block(..) | VectorRecord::Mean(..));
+                    if let Some(at) = place {
+                        let moved = match record {
+                            VectorRecord::Binary(v, n, _) => VectorRecord::Binary(v, n, at),
+                            VectorRecord::Assigned(v, n, _) => VectorRecord::Assigned(v, n, at),
+                            _ => unreachable!(),
+                        };
+                        changes.put_vector(moved, value).unwrap();
+                    }
+                    store.commit(changes).unwrap();
+                }
+                Damage::Building(_, change) => {
+                    let held = &mut budget.reserve(0, "query").expect("a reservation");
+                    let original = if state == Some("built") {
+                        a_build(Phase::Train { round: 0 })
+                    } else {
+                        build_under_way(&store, column, &entry, held)
+                    };
+                    let build = change(original);
+                    check_only |= Some(build.number) != entry.building.map(|(number, _)| number);
+                    put(
+                        &store,
+                        &budget,
+                        VectorRecord::Build(column, entry.number),
+                        build.encode(),
+                    );
+                }
+                Damage::Left(_, bytes) => {
+                    let key = Key::from_values(&[Value::Int64(1)], &[]).expect("the stale row");
+                    let record = VectorRecord::Left(column, entry.number, &key);
+                    put(&store, &budget, record, vec![0; bytes]);
+                }
+                _ => unreachable!(),
+            };
+            drop((view, store));
+            if check_only {
+                return (folder, Vec::new());
+            }
+            let mut db = opened(&folder);
+            let given = if state == Some("built") {
+                let exact = ten(&db, "EXACT").expect("EXACT reads no record of the index");
+                let auto = ten(&db, "AUTO").expect("AUTO answers over a damaged index");
+                assert!(
+                    exact.len() == 3 && auto == exact,
+                    "AUTO {auto:?}, EXACT {exact:?}"
+                );
+                db.close().expect("close");
+                db = opened(&folder);
+                ("a search USE VECTOR INDEXED", ten(&db, "INDEXED").map(drop))
+            } else {
+                let (path, cycles) = if left {
+                    ("the cycles that follow", 40)
+                } else {
+                    ("a cycle", 1)
+                };
+                let told = (0..cycles).find_map(|_| db.run_maintenance_cycle().err());
+                (path, told.map_or(Ok(()), Err))
+            };
+            db.close().expect("close");
+            vec![given]
+        }
+    };
+    (folder, given)
+}
+
+#[test]
+fn every_damaged_vector_record_is_told_as_damage_by_each_path_that_meets_it() {
+    use {Damage::*, Kind::Centroids as Groups};
+    let (e, g) = (a_partition().encode(), an_ivf().encode());
+    let flags = |flags: u8| [&e[..40], &[flags], &e[41..]].concat();
+    let back = with(&g, 28, 0);
+    let bytes = |numbers: Vec<f32>| numbers.into_iter().flat_map(f32::to_le_bytes).collect();
+    let c: Vec<u8> = bytes((0..3).flat_map(|group| unit(&vector(group, 16))).collect());
+    let m: Vec<u8> = bytes(vector(77, 16));
+    let not_finite = |bytes: &[u8], at: usize, n: f32| {
+        [&bytes[..at], &n.to_le_bytes(), &bytes[at + 4..]].concat()
+    };
+    let (entry, ivf) = (|b| Alone(Kind::Partition, b), |b| Alone(Kind::Ivf, b));
+    let (means, builds) = (|b| Alone(Kind::Mean, b), |b| Alone(Kind::Build, b));
+    let assign = a_build(Phase::Assign { next: 5 }).encode();
+    let mut pack = a_build(Phase::Pack { group: 46 });
+    pack.counts = given().0;
+    let train = a_build(Phase::Train { round: 3 }).encode();
+    let binary = |column| VectorRecord::Binary(column, 0, 0);
+    let in_force = |column| VectorRecord::Ivf(column, 0);
+    let assigned = |column| VectorRecord::Assigned(column, 0, 0);
+    // One binary code fewer than the block has slots, and the record saying so.
+    let fewer = |record: &mut Vec<u8>| {
+        let count = u32::from_le_bytes(std::array::from_fn(|at| record[at])) - 1;
+        record[..4].copy_from_slice(&count.to_le_bytes());
+        record.truncate(record.len() - code_len(BUILT));
+    };
+    let wide = |record: &mut Vec<u8>| record[..4].copy_from_slice(&20_001_u32.to_le_bytes());
+    // Every slot is given its group in two bytes.
+    let two = |record: &mut Vec<u8>| record.extend([0, 0]);
+    let one = |record: &mut Vec<u8>| record.push(0);
+    // The build as it begins.
+    let groups = |mut build: Build| {
+        assert_eq!((build.slots, build.groups), (1, 1));
+        (build.groups, build.counts) = (2, vec![0; 2]);
+        build
+    };
+    // The build once it has packed every group and recorded where each begins.
+    let swapped = |mut build: Build| {
+        assert!(build.starts.len() == 3 && build.starts[1] < build.starts[2]);
+        build.starts.swap(1, 2);
+        build
+    };
+    let block = |v| VectorRecord::Block(v, 0, 0);
+    let framing = |b: &mut Vec<u8>| b[..4].fill(255);
+    let orphan = |b: &mut Vec<u8>| *b.last_mut().unwrap() = 127;
+    let past_build = Place("assigned", assigned, Some(u32::MAX));
+    let no_centroids = Place("training", |v| VectorRecord::Centroids(v, 0, 0), None);
+    let wrong_build = Building("begun", |mut b| {
+        b.number += 1;
+        b
+    });
+    let overflow = |record: &mut Vec<u8>| {
+        let q = unit(&gathered(40_003));
+        let c: Vec<_> = q.iter().map(|x| f32::MAX.copysign(*x)).collect();
+        assert!(c.iter().chain(&q).all(|x| x.is_finite()));
+        assert!(q.iter().map(|x| x.abs()).sum::<f32>() > 1.0);
+        assert!(
+            !c.iter()
+                .zip(&q)
+                .map(|(x, y)| x * y)
+                .sum::<f32>()
+                .is_finite()
+        );
+        for (bytes, n) in record.chunks_exact_mut(4).zip(c.iter().cycle()) {
+            bytes.copy_from_slice(&n.to_le_bytes());
+        }
+    };
+    let bad_product = Built("built", |v| VectorRecord::Centroids(v, 0, 0), overflow);
+    let extra_sum = |mut b: Build| {
+        b.sum.push(0.0);
+        b
+    };
+    let saved = damage_stores();
+    let mut rows = vec![
+        ("partition tuple has an extra cell", Tuple),
+        (
+            "missing grouped block and codes",
+            Place("built", block, None),
+        ),
+        ("stray build on idle partition", Building("built", |b| b)),
+        ("finite centroid product overflows", bad_product),
+        ("entry of 16 bytes", entry(e[..16].to_vec())),
+        ("entry a byte longer", entry([&e[..], &[0]].concat())),
+        ("entry, a flag above three", entry(flags(15))),
+        ("entry, tail past sealed", entry(with(&e, 32, 499))),
+        ("entry, first block past closed", entry(with(&e, 16, 5))),
+        ("entry, closed block past last", entry(with(&e, 20, 7))),
+        ("entry, IVF of no group", entry(with(&e, 49, 0))),
+        ("no IVF", ivf(Vec::new())),
+        ("IVF, two groups' places", ivf(g[..g.len() - 8].to_vec())),
+        ("IVF, gap above 20,000", ivf(with(&g, 0, 20_001))),
+        ("IVF, width a quarter", ivf(with(&g, 4, 1))),
+        ("IVF, width past 16", ivf(with(&g, 4, 17))),
+        ("IVF, scans no group", ivf(with(&g, 8, 0))),
+        ("IVF, scans past groups", ivf(with(&g, 8, 4))),
+        ("IVF, not from slot 0", ivf(with(&g, 16, 1))),
+        ("IVF, a place going back", ivf(with(&back, 32, 100))),
+        ("IVF, ends past blocks", ivf(with(&g, 36, 5))),
+        ("three centroids, four groups", Alone(Groups(4), c.clone())),
+        (
+            "centroids, part of one",
+            Alone(Groups(3), c[..c.len() - 1].to_vec()),
+        ),
+        (
+            "centroid not finite",
+            Alone(Groups(3), not_finite(&c, 4, f32::NAN)),
+        ),
+        ("no centroids", Alone(Groups(3), Vec::new())),
+        ("mean of fifteen numbers", means(m[..m.len() - 4].to_vec())),
+        ("mean not finite", means(not_finite(&m, 0, f32::INFINITY))),
+        ("no mean", means(Vec::new())),
+        ("build assigning past blocks", builds(assign)),
+        ("build packing a missing group", builds(pack.encode())),
+        ("build cut short", builds(train[..train.len() - 1].to_vec())),
+        // The first, which a cycle reads to find the partition, and one it reads for a slot.
+        ("first pending row, no vector", NoVector(1)),
+        ("later pending row, no vector", NoVector(2)),
+        ("VECTOR entry of no column", Named(b'w')),
+        ("VECTOR entry of an INTEGER", Named(b'n')),
+        (
+            "codes fewer than the block's",
+            Built("built", binary, fewer),
+        ),
+        (
+            "code cut short",
+            Built("built", binary, |b| b.truncate(b.len() - 1)),
+        ),
+        ("code count", Built("built", binary, |b| b[..4].fill(255))),
+        ("missing codes", Place("built", binary, None)),
+        ("codes out of order", Place("built", binary, Some(1))),
+        ("assigned beyond build", past_build),
+        ("later training lacks centroids", no_centroids),
+        ("build identity", wrong_build),
+        ("block framing", Built("built", block, framing)),
+        ("block orphan slot", Built("built", block, orphan)),
+        ("build sum dimension", Building("begun", extra_sum)),
+        ("packed sum dimension", Building("packed", extra_sum)),
+        ("a built IVF too wide", Built("built", in_force, wide)),
+        ("assigned, a slot more", Built("assigned", assigned, two)),
+        ("assigned, odd bytes", Built("assigned", assigned, one)),
+        ("build, more groups than slots", Building("begun", groups)),
+        ("build, groups out of order", Building("packed", swapped)),
+        ("left of 15 bytes, building", Left("left-building", 15)),
+        ("left of 15 bytes, sweeping", Left("left-sweeping", 15)),
+        ("left of 17 bytes, sweeping", Left("left-sweeping", 17)),
+    ];
+    for (state, name) in [
+        ("packed", "Measure build mean"),
+        ("width", "Width build mean"),
+        ("switch", "Switch build mean"),
+    ] {
+        let build_mean = |v| VectorRecord::Mean(v, 0);
+        rows.extend([
+            (name, Built(state, build_mean, |b| b.truncate(1))),
+            (name, Place(state, build_mean, None)),
+        ]);
+    }
+    let mut failures = Vec::new();
+    for (at, (what, damage)) in rows.into_iter().enumerate() {
+        // A record never written leaves an empty store, which is sound: its reader alone meets it.
+        let query_only = matches!(&damage, Built(_, from, _) if matches!(from(COLUMN), VectorRecord::Centroids(..)));
+        let unwritten = matches!(&damage, Alone(_, bytes) if bytes.is_empty());
+        let (folder, mut given) = met(&format!("vector-damage-{at}"), damage, &saved);
+        if !unwritten && !query_only {
+            let check = Database::open(&folder).and_then(|db| db.verify());
+            given.push(("the whole-store check", check.map(drop)));
+        }
+        for (path, given) in given {
+            if !matches!(&given, Err(Error::StoreCorrupted { path, .. }) if *path == folder) {
+                failures.push(format!("{what}, met by {path}: {given:?}"));
+            }
+        }
+        std::fs::remove_dir_all(&folder).expect("remove the test's folder");
+    }
+
+    assert!(failures.is_empty(), "{failures:#?}");
+
+    // A mean as it is put reads back.
+    let (folder, store, budget) = a_store("mean");
+    let mut changes = ChangeSet::new(store.view().expect("a view"), &budget).expect("begin");
+    put_mean(&mut changes, COLUMN, 7, &vector(77, 16)).expect("stage the mean");
+    store.commit(changes).expect("commit");
+    let held = &mut budget.reserve(0, "query").expect("a reservation");
+    let read = mean(&store.view().expect("a view"), COLUMN, 7, 16, held);
+    assert_eq!(read.expect("read the mean"), vector(77, 16));
+    std::fs::remove_dir_all(&folder).expect("remove the test's folder");
+}
+
+#[test]
+fn the_work_list_puts_a_partition_never_built_before_those_with_an_ivf() {
+    let (f, b) = (fresh("work-order"), Budget::new(None).unwrap());
+    let (db, p) = (opened(&f), crate::params! { "v" => gathered(1) });
+    let run = |s| drop(db.execute(s, &p).unwrap());
+    run("CREATE TABLE d (id INT PRIMARY KEY, c INT NOT NULL, \
+         v VECTOR(16) PARTITION_KEY (c) INDEXING_THRESHOLD 4)");
+    run("INSERT INTO d VALUES (1,1,$v),(2,1,$v),(3,2,$v),(4,2,$v)");
+    while db.run_maintenance_cycle().unwrap().work_remaining == Some(true) {}
+    run("INSERT INTO d VALUES (5,1,$v),(6,2,$v),(7,4,$v)");
+    db.close().unwrap();
+    let s = Store::open_for_writing(&f, &b, &Default::default()).unwrap();
+    let (v, h) = (s.view().unwrap(), &mut b.reserve(0, "q").unwrap());
+    let w = unindexed_work(&v, &Catalog::load(&v, &b).unwrap(), h, &Default::default()).unwrap();
+    let got: Vec<_> = w.iter().map(|w| &w.tuple).collect();
+    assert_eq!(got, [&key(4), &key(1), &key(2)]);
 }

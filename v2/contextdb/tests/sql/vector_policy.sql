@@ -18,13 +18,13 @@ CREATE TABLE f_whole (
 
 SHOW VECTOR_INDEXES;
 ----
-table | column | dimension | quantization | vector_count | bytes | partition_key_columns | max_partitions | live_partitions | search_mode | declared_indexing_threshold | effective_indexing_threshold | declared_compaction_mode | declared_compaction_change_percent | declared_compaction_tombstone_percent | effective_compaction_mode | effective_compaction_change_percent | effective_compaction_tombstone_percent | pending_tuples | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | maintenance_state | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | unavailable_partitions | stalled_partitions | broad_route | recovery_action
-a_reduced | v | 3 | SQ8 | 0 | 0 | [] | NULL | 0 | AUTO | NULL | 100000 | NULL | NULL | NULL | PERCENT | 20 | 10 | 0 | 0 | 0 | 0 | true | idle | 0 | 0 | 0 | 0 | 0 | fan_out | none
-b_sized | v | 3 | F32 | 0 | 0 | [] | NULL | 0 | AUTO | 5000 | 5000 | NULL | NULL | NULL | PERCENT | 20 | 10 | 0 | 0 | 0 | 0 | true | idle | 0 | 0 | 0 | 0 | 0 | fan_out | none
-c_both | v | 3 | F32 | 0 | 0 | [] | NULL | 0 | AUTO | NULL | 100000 | PERCENT | 25 | 5 | PERCENT | 25 | 5 | 0 | 0 | 0 | 0 | true | idle | 0 | 0 | 0 | 0 | 0 | fan_out | none
-d_change | v | 3 | F32 | 0 | 0 | [] | NULL | 0 | AUTO | NULL | 100000 | PERCENT | 25 | NULL | PERCENT | 25 | 10 | 0 | 0 | 0 | 0 | true | idle | 0 | 0 | 0 | 0 | 0 | fan_out | none
-e_never | v | 3 | F32 | 0 | 0 | [] | NULL | 0 | AUTO | NULL | 100000 | NONE | NULL | NULL | NONE | NULL | NULL | 0 | 0 | 0 | 0 | true | idle | 0 | 0 | 0 | 0 | 0 | fan_out | none
-f_whole | v | 3 | SQ8 | 0 | 0 | ["tenant"] | 4 | 0 | EXACT | 5000 | 5000 | PERCENT | 25 | 5 | PERCENT | 25 | 5 | 0 | 0 | 0 | 0 | true | idle | 0 | 0 | 0 | 0 | 0 | fan_out | none
+table | column | dimension | quantization | vector_count | bytes | partition_key_columns | max_partitions | live_partitions | search_mode | declared_indexing_threshold | effective_indexing_threshold | declared_probes | declared_compaction_mode | declared_compaction_change_percent | declared_compaction_tombstone_percent | effective_compaction_mode | effective_compaction_change_percent | effective_compaction_tombstone_percent | pending_tuples | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | maintenance_state | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | unavailable_partitions | stalled_partitions | broad_route | recovery_action  (read 0, compared 0)
+a_reduced | v | 3 | SQ8 | 0 | 0 | [] | NULL | 0 | AUTO | NULL | 100000 | NULL | NULL | NULL | NULL | PERCENT | 20 | 10 | 0 | 0 | 0 | 0 | true | idle | 0 | 0 | 0 | 0 | 0 | fan_out | none
+b_sized | v | 3 | F32 | 0 | 0 | [] | NULL | 0 | AUTO | 5000 | 5000 | NULL | NULL | NULL | NULL | PERCENT | 20 | 10 | 0 | 0 | 0 | 0 | true | idle | 0 | 0 | 0 | 0 | 0 | fan_out | none
+c_both | v | 3 | F32 | 0 | 0 | [] | NULL | 0 | AUTO | NULL | 100000 | NULL | PERCENT | 25 | 5 | PERCENT | 25 | 5 | 0 | 0 | 0 | 0 | true | idle | 0 | 0 | 0 | 0 | 0 | fan_out | none
+d_change | v | 3 | F32 | 0 | 0 | [] | NULL | 0 | AUTO | NULL | 100000 | NULL | PERCENT | 25 | NULL | PERCENT | 25 | 10 | 0 | 0 | 0 | 0 | true | idle | 0 | 0 | 0 | 0 | 0 | fan_out | none
+e_never | v | 3 | F32 | 0 | 0 | [] | NULL | 0 | AUTO | NULL | 100000 | NULL | NONE | NULL | NULL | NONE | NULL | NULL | 0 | 0 | 0 | 0 | true | idle | 0 | 0 | 0 | 0 | 0 | fan_out | none
+f_whole | v | 3 | SQ8 | 0 | 0 | ["tenant"] | 4 | 0 | EXACT | 5000 | 5000 | NULL | PERCENT | 25 | 5 | PERCENT | 25 | 5 | 0 | 0 | 0 | 0 | true | idle | 0 | 0 | 0 | 0 | 0 | fan_out | none
 
 # SQ4 is read by a later version: refused by name, not as a syntax error.
 CREATE TABLE docs (id INTEGER PRIMARY KEY, v VECTOR(3) WITH (quantization = 'SQ4'));

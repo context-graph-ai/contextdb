@@ -47,7 +47,8 @@ fn told_apart(n: i64, dimension: usize) -> Option<Vec<f32>> {
 
 #[test]
 fn exact_search_returns_the_true_nearest_vectors() {
-    for (dimension, rows) in [(3, 5000_i64), (16, 300), (33, 300), (384, 300), (768, 300)] {
+    // 81 retains every special row through 80; 4,098 also crosses the 4,096-vector seal bound.
+    for (dimension, rows) in [(3, 4098_i64), (16, 81), (33, 81), (384, 81), (768, 81)] {
         let folder = support::folder(&format!("exact-nearest-{dimension}"));
         let db = support::open(&folder);
         support::declare_docs(&db, dimension, "");
@@ -103,12 +104,13 @@ fn exact_search_returns_the_true_nearest_vectors() {
             assert!(zeros.iter().all(|near| near.distance == 1.0));
 
             for (number, query) in queries.iter().enumerate() {
+                let wanted = plain.nearest(|_| true, query, usize::MAX);
                 // One row, ten, and more than the table holds.
                 for k in [1, 10, rows as usize + 50] {
-                    let wanted = plain.nearest(|_| true, query, k);
                     let sql = support::nearest_sql("docs", "v", None, k);
                     let what = format!("dimension {dimension}, {state}, query {number}, k {k}");
-                    support::assert_nearest(&on, &sql, query, &wanted, &what);
+                    let wanted = &wanted[..k.min(wanted.len())];
+                    support::assert_nearest(&on, &sql, query, wanted, &what);
                 }
             }
         };
@@ -116,7 +118,7 @@ fn exact_search_returns_the_true_nearest_vectors() {
         through(&db, "unsealed");
         let first = db.run_maintenance_cycle().expect("the first cycle").vector;
         assert_eq!(
-            first.maintenance_vectors_done,
+            support::count(first.maintenance_vectors_done),
             (rows as u64 - 1).min(4096),
             "dimension {dimension}: vectors the first cycle sealed"
         );
@@ -552,10 +554,7 @@ fn a_row_is_in_an_answer_once_after_its_vector_changes() {
     }
     // After the next cycle two slots of row 7 are in blocks: the first and the newest.
     assert_eq!(
-        db.run_maintenance_cycle()
-            .expect("a cycle")
-            .vector
-            .maintenance_vectors_done,
+        support::count(support::cycle(&db).maintenance_vectors_done),
         1
     );
     once(&db, &had, "two slots of the row in blocks");
@@ -899,4 +898,29 @@ fn a_row_two_entries_lead_to_is_in_the_answer_once_and_pushes_no_row_out() {
     assert_eq!(support::seal_all(&db), 1);
     let (answer, _) = nearest_ten(&db, "two slots of row 50 in the block");
     assert_eq!(answer, [50, 1, 2, 3, 4, 5, 6, 7, 8, 20]);
+}
+
+#[test]
+fn a_row_excluded_from_search_stays_out_after_a_reopen_and_for_a_reader_and_stays_a_row() {
+    let folder = support::folder("excluded-reopen");
+    let db = support::open(&folder);
+    for sql in [
+        "CREATE TABLE sources (id INTEGER PRIMARY KEY, status TEXT NOT NULL) STATE MACHINE (status: active -> [archived])",
+        "CREATE TABLE claims (id INTEGER PRIMARY KEY, status TEXT NOT NULL, source_id INTEGER REFERENCES sources(id) ON STATE archived PROPAGATE SET superseded, v VECTOR(2)) STATE MACHINE (status: active -> [invalidated, superseded], invalidated -> [active], superseded -> [active]) PROPAGATE ON STATE invalidated EXCLUDE VECTOR PROPAGATE ON STATE superseded EXCLUDE VECTOR",
+        "INSERT INTO sources VALUES (1, 'active')",
+        "INSERT INTO claims VALUES (1, 'active', 1, [1.0, 0.0]), (2, 'active', 1, [0.9, 0.1]), (3, 'active', NULL, [0.5, 0.5]), (4, 'active', NULL, [-1.0, 0.0])",
+        "UPDATE claims SET status = 'invalidated' WHERE id = 3",
+        "UPDATE sources SET status = 'archived' WHERE id = 1",
+    ] {
+        support::run(&db, sql);
+    }
+    let search = "SELECT id FROM claims ORDER BY v <=> [1.0, 0.0] LIMIT 10";
+    let (db, reader) = (
+        support::reopen(db, &folder),
+        support::open_reader(&folder, None),
+    );
+    let only = [vec![Value::Int64(4)]];
+    assert_eq!(support::rows(&db, search), only, "after a reopen");
+    assert_eq!(support::rows(&reader, search), only, "for a reader");
+    assert_eq!(support::rows(&db, "SELECT id FROM claims").len(), 4);
 }

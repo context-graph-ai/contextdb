@@ -19,7 +19,7 @@ use crate::types::{ColumnType, Error, Result, SortDirection, TxId, Uuid, Value};
 const PAST: u8 = 0xFF;
 
 /// The bytes from the first, which a span includes, to the second, which it does not.
-pub(super) type Span = (Vec<u8>, Vec<u8>);
+pub(crate) type Span = (Vec<u8>, Vec<u8>);
 
 /// The form [`Key::from_values`] gives, where `room` is `usize::MAX`: every value whole.
 ///
@@ -82,6 +82,21 @@ pub(super) fn encode(
     Ok((key, first_cut))
 }
 
+pub(crate) fn encoded_len(values: &[Value]) -> usize {
+    values
+        .iter()
+        .map(|value| match value {
+            Value::Null => 1,
+            Value::Bool(_) => 2,
+            Value::Uuid(_) => 17,
+            Value::Text(t) => t
+                .len()
+                .saturating_add(t.bytes().filter(|&b| b == 0).count() + 3),
+            _ => 9,
+        })
+        .fold(0, usize::saturating_add)
+}
+
 /// The bytes the form of a cut text ends with: its mark and its digest.
 const CUT_BYTES: usize = 2 + 16;
 
@@ -129,7 +144,9 @@ fn real(number: f64) -> [u8; 8] {
 pub(super) fn decode(mut key: &[u8]) -> Option<Vec<Value>> {
     let whole = |bytes: [u8; 8]| i64::from_be_bytes(bytes) ^ i64::MIN;
     let mut values = Vec::new();
-    while let Some([tag]) = take(&mut key) {
+    while !key.is_empty() {
+        let mut key = cell(&mut key)?;
+        let [tag] = take(&mut key)?;
         values.push(match tag {
             0xFE => Value::Null,
             1 => Value::Bool(take::<1>(&mut key)? != [0]),
@@ -144,18 +161,8 @@ pub(super) fn decode(mut key: &[u8]) -> Option<Vec<Value>> {
                 Value::Float64(f64::from_bits(bits))
             }
             4 => {
-                let mut text = Vec::new();
-                loop {
-                    match take(&mut key)? {
-                        [0] => match take(&mut key)? {
-                            [0] => break,
-                            [0xFF] => text.push(0),
-                            _ => return None,
-                        },
-                        [byte] => text.push(byte),
-                    }
-                }
-                Value::Text(String::from_utf8(text).ok()?)
+                let bytes = key[..key.len() - 2].iter().filter(|&&byte| byte != 0xFF);
+                Value::Text(String::from_utf8(bytes.copied().collect()).ok()?)
             }
             5 => Value::Uuid(Uuid::from_bytes(take(&mut key)?)),
             6 => Value::Timestamp(whole(take(&mut key)?)),
@@ -164,6 +171,44 @@ pub(super) fn decode(mut key: &[u8]) -> Option<Vec<Value>> {
         });
     }
     Some(values)
+}
+
+/// One complete ascending cell, validating text without allocating decoded values.
+pub(super) fn cell<'a>(key: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let start = *key;
+    let size = match take::<1>(key)?[0] {
+        0xFE => 0,
+        1 => 1,
+        2 | 3 | 6 | 7 => 8,
+        5 => 16,
+        4 => loop {
+            let end = key.iter().position(|byte| *byte == 0)?;
+            std::str::from_utf8(&key[..end]).ok()?;
+            *key = &key[end + 1..];
+            match take(key)? {
+                [0] => break 0,
+                [0xFF] => {}
+                _ => return None,
+            }
+        },
+        _ => return None,
+    };
+    *key = key.get(size..)?;
+    Some(&start[..start.len() - key.len()])
+}
+
+/// Where the first `n` cells of a key end; `None` past its end or at a cut text. A cell for
+/// which `turned` is true has its bytes turned, as a descending column's are.
+pub(crate) fn cells_end(key: &[u8], turned: impl Fn(usize) -> bool, n: usize) -> Option<usize> {
+    let mut rest = key;
+    for at in 0..n {
+        let flipped = turned(at).then(|| rest.iter().map(|byte| !byte).collect::<Vec<_>>());
+        let mut of = flipped.as_deref().unwrap_or(rest);
+        let size = of.len();
+        cell(&mut of)?;
+        rest = &rest[size - of.len()..];
+    }
+    Some(key.len() - rest.len())
 }
 
 /// The next bytes of a key, `None` when it is cut short.
@@ -175,7 +220,7 @@ fn take<const N: usize>(key: &mut &[u8]) -> Option<[u8; N]> {
 
 /// The span of keys between two bounds. A bound stands for every key that begins with it: an
 /// included bound takes them all in, an excluded bound leaves them all out.
-pub(super) fn span(from: Bound<&Key>, to: Bound<&Key>) -> Span {
+pub(crate) fn span(from: Bound<&Key>, to: Bound<&Key>) -> Span {
     let past = |key: &Key| [key.0.as_slice(), &[PAST]].concat();
     let start = match from {
         Bound::Unbounded => Vec::new(),
@@ -202,19 +247,19 @@ pub(super) fn stored(id: u32, key: &[u8]) -> Vec<u8> {
 pub(super) const BLOCK: u8 = 0;
 const PARTITION: u8 = 1;
 pub(super) const PENDING: u8 = 2;
-const GROUPING: u8 = 3;
-/// The first byte of the stored key of a record of centres, which is kept with the blocks.
-pub(super) const CENTRES: u8 = 4;
+const IVF: u8 = 3;
+/// The first byte of the stored key of a record of centroids, which is kept with the blocks.
+pub(super) const CENTROIDS: u8 = 4;
 const BUILD: u8 = 5;
 const ASSIGNED: u8 = 6;
-/// The first byte of the stored key of a record of sketches, which is kept with the blocks.
-pub(super) const SKETCH: u8 = 7;
+/// The first byte of the stored key of a record of binary codes, which is kept with the blocks.
+pub(super) const BINARY: u8 = 7;
 const MEAN: u8 = 8;
 pub(super) const LEFT: u8 = 9;
 
 /// True for the kinds of record that are kept in the table of blocks.
 pub(super) fn with_blocks(kind: u8) -> bool {
-    kind == BLOCK || kind == CENTRES || kind == SKETCH
+    kind == BLOCK || kind == CENTROIDS || kind == BINARY
 }
 
 /// A record of the vector part as the data file keys it: one byte for its kind, the column,
@@ -235,25 +280,25 @@ pub(super) fn vector(record: VectorRecord<'_>) -> Vec<u8> {
             let numbers = [number(column.0), number(partition)];
             [&[PENDING][..], numbers.as_flattened(), &row.0].concat()
         }
-        VectorRecord::Grouping(column, grouping) => {
-            let numbers = [number(column.0), number(grouping)];
-            [&[GROUPING][..], numbers.as_flattened()].concat()
+        VectorRecord::Ivf(column, ivf) => {
+            let numbers = [number(column.0), number(ivf)];
+            [&[IVF][..], numbers.as_flattened()].concat()
         }
-        VectorRecord::Centres(column, grouping, place) => {
-            let numbers = [number(column.0), number(grouping), number(place)];
-            [&[CENTRES][..], numbers.as_flattened()].concat()
+        VectorRecord::Centroids(column, ivf, place) => {
+            let numbers = [number(column.0), number(ivf), number(place)];
+            [&[CENTROIDS][..], numbers.as_flattened()].concat()
         }
         VectorRecord::Build(column, partition) => {
             let numbers = [number(column.0), number(partition)];
             [&[BUILD][..], numbers.as_flattened()].concat()
         }
-        VectorRecord::Assigned(column, grouping, place) => {
-            let numbers = [number(column.0), number(grouping), number(place)];
+        VectorRecord::Assigned(column, ivf, place) => {
+            let numbers = [number(column.0), number(ivf), number(place)];
             [&[ASSIGNED][..], numbers.as_flattened()].concat()
         }
-        VectorRecord::Sketch(column, under, block) => {
+        VectorRecord::Binary(column, under, block) => {
             let numbers = [number(column.0), number(under), number(block)];
-            [&[SKETCH][..], numbers.as_flattened()].concat()
+            [&[BINARY][..], numbers.as_flattened()].concat()
         }
         VectorRecord::Mean(column, partition) => {
             let numbers = [number(column.0), number(partition)];
@@ -283,11 +328,11 @@ pub(super) fn vector_of<'a>(stored: &[u8], key: &'a mut Key) -> Option<VectorRec
             key.0.extend_from_slice(&stored[9..]);
             VectorRecord::Pending(column, partition, key)
         }
-        GROUPING => VectorRecord::Grouping(column, number(5)?),
-        CENTRES => VectorRecord::Centres(column, number(5)?, number(9)?),
+        IVF => VectorRecord::Ivf(column, number(5)?),
+        CENTROIDS => VectorRecord::Centroids(column, number(5)?, number(9)?),
         BUILD => VectorRecord::Build(column, number(5)?),
         ASSIGNED => VectorRecord::Assigned(column, number(5)?, number(9)?),
-        SKETCH => VectorRecord::Sketch(column, number(5)?, number(9)?),
+        BINARY => VectorRecord::Binary(column, number(5)?, number(9)?),
         MEAN => VectorRecord::Mean(column, number(5)?),
         LEFT => {
             let partition = number(5)?;

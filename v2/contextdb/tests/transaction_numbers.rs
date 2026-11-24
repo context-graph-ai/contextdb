@@ -32,7 +32,7 @@ fn a_txid_column_holds_its_transactions_number_and_a_commit_is_never_numbered_be
     let db = support::open(&folder);
     support::run(&db, LEDGER);
     support::run(&db, "CREATE INDEX ledger_at ON ledger (at)");
-    let newest = db.committed_watermark();
+    let newest = support::watermark(&db);
 
     // A transaction has its number from the moment it begins, above every commit there is.
     let tx = db.transaction().expect("begin");
@@ -49,7 +49,7 @@ fn a_txid_column_holds_its_transactions_number_and_a_commit_is_never_numbered_be
     assert_eq!(stamp_of(&tx, 1), Value::TxId(first));
     tx.commit().expect("commit");
     // No other commit came between: the commit carries the transaction's number.
-    assert_eq!(db.committed_watermark(), first);
+    assert_eq!(support::watermark(&db), first);
     assert_eq!(stamp_of(&db, 1), Value::TxId(first));
     assert_eq!(stamp_of(&db, 2), Value::TxId(newest));
     assert_eq!(stamp_of(&db, 3), Value::Null);
@@ -63,9 +63,9 @@ fn a_txid_column_holds_its_transactions_number_and_a_commit_is_never_numbered_be
     stamp(&slow, 4, slow_id).expect("stamp in the slow transaction");
     stamp(&quick, 5, quick_id).expect("stamp in the quick transaction");
     quick.commit().expect("commit the quick transaction");
-    assert_eq!(db.committed_watermark(), quick_id);
+    assert_eq!(support::watermark(&db), quick_id);
     slow.commit().expect("commit the slow transaction");
-    let overtaken = db.committed_watermark();
+    let overtaken = support::watermark(&db);
     assert_eq!(
         overtaken,
         TxId(quick_id.0 + 1),
@@ -80,12 +80,17 @@ fn a_txid_column_holds_its_transactions_number_and_a_commit_is_never_numbered_be
     let unused_id = unused.id();
     assert!(unused_id > overtaken);
     unused.rollback();
+    let seen = contextdb::ReadSession::open(&folder, contextdb::ReadLimits::default()).unwrap();
+    assert_eq!(
+        [support::watermark(&db), seen.committed_watermark().unwrap()],
+        [overtaken; 2]
+    );
     let next = db.transaction().expect("begin");
     assert!(next.id() > unused_id);
     stamp(&next, 6, next.id()).expect("stamp");
     let next_id = next.id();
     next.commit().expect("commit");
-    assert_eq!(db.committed_watermark(), next_id);
+    assert_eq!(support::watermark(&db), next_id);
 
     // A stamp is found by its value through the index, and kept across a reopen.
     let stamped = |on: &Database, at: TxId| {
@@ -95,6 +100,7 @@ fn a_txid_column_holds_its_transactions_number_and_a_commit_is_never_numbered_be
         )
         .expect("find rows by their stamp")
     };
+    assert!(stamped(&db, unused_id).rows().is_empty(), "unused number");
     let found = stamped(&db, slow_id);
     assert_eq!(found.rows(), [[Value::Int64(4)]]);
     assert_eq!(found.rows_examined(), 1);
@@ -156,7 +162,7 @@ fn a_stamp_above_the_transactions_own_number_and_a_stamp_written_as_a_number_are
         Err(Error::TxIdOutOfRange { value, .. }) => assert_eq!(value, u64::MAX),
         other => panic!("a stamp of the largest number on the writer gave {other:?}"),
     }
-    stamp(&db, 4, db.committed_watermark()).expect("stamp with the newest commit's number");
+    stamp(&db, 4, support::watermark(&db)).expect("stamp with the newest commit's number");
     assert_eq!(support::int(&db, "SELECT COUNT(*) FROM ledger"), 2);
 }
 

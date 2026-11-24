@@ -10,10 +10,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::{Catalog, Table, render};
-use crate::Database;
 use crate::memory::Budget;
 use crate::store::{ChangeSet, Store};
 use crate::types::{Error, Result};
+use crate::{Database, DatabaseOpenOptions};
 
 /// An empty folder for one test's store.
 fn folder(test: &str) -> PathBuf {
@@ -25,9 +25,14 @@ fn folder(test: &str) -> PathBuf {
     folder
 }
 
-/// Runs statements on the store in a folder, each of which must be accepted.
+/// Runs statements on the store in a folder, each of which must be accepted, with no
+/// maintenance cycle beside them.
 fn declare(folder: &Path, statements: &[&str]) {
-    let db = Database::open(folder).expect("open the store");
+    let options = crate::DatabaseOpenOptions {
+        maintenance: crate::Maintenance::Caller,
+        ..Default::default()
+    };
+    let db = Database::open_with_options(folder, options).expect("open the store");
     for sql in statements {
         if let Err(error) = db.execute(sql, &HashMap::new()) {
             panic!("{sql}\nwas refused: {error:?}");
@@ -39,9 +44,10 @@ fn declare(folder: &Path, statements: &[&str]) {
 /// The tables of the store in a folder, as `schema` reads them from its newest commit.
 fn load(folder: &Path) -> Result<Catalog> {
     let budget = Budget::new(None).expect("a budget");
-    let store = Store::open_for_writing(folder, &budget, None).expect("open the store");
+    let store = Store::open_for_writing(folder, &budget, &DatabaseOpenOptions::default())
+        .expect("open the store");
     let view = store.view().expect("the newest commit");
-    Catalog::load(&view)
+    Catalog::load(&view, &budget)
 }
 
 /// One table of the store in a folder.
@@ -51,11 +57,11 @@ fn table(folder: &Path, name: &str) -> Table {
     table.unwrap_or_else(|| panic!("no table {name}")).clone()
 }
 
-/// A store with two tables, the second of which declares rules of many kinds, so that its
-/// schema record holds most of the parts a record may have. Gives back the store and that
-/// table's record, as it is stored.
-fn store_with_every_rule(test: &str) -> (Rules, Vec<u8>) {
-    let folder = folder(test);
+#[test]
+fn every_damaged_schema_record_is_told_as_damage_or_read_as_tables_that_print() {
+    // The second table declares rules of many kinds, so that its schema record holds most of
+    // the parts a record may have.
+    let folder = folder("damaged");
     declare(
         &folder,
         &[
@@ -80,130 +86,148 @@ fn store_with_every_rule(test: &str) -> (Rules, Vec<u8>) {
         ],
     );
     let budget = Budget::new(None).expect("a budget");
-    let store = Store::open_for_writing(&folder, &budget, None).expect("open the store");
-    let view = store.view().expect("the newest commit");
+    let store = Store::open_for_writing(&folder, &budget, &DatabaseOpenOptions::default())
+        .expect("open the store");
     // The records come in the order of their tables' names.
-    let mut records = view.schema_records().expect("the schema records");
-    assert_eq!(records.len(), 2, "two tables have two schema records");
-    let record = records.pop().expect("the record of the second table");
+    let record = {
+        let view = store.view().expect("a view");
+        let (mut at, mut record) = (0, Vec::new());
+        view.each_schema(|bytes| {
+            if at == 1 {
+                record = bytes.to_vec();
+            }
+            at += 1;
+            Ok(())
+        })
+        .expect("the records");
+        record
+    };
     assert!(record.len() > 200, "a record of {} bytes", record.len());
-    (
-        Rules {
-            folder,
-            budget,
-            store,
-        },
-        record,
-    )
-}
-
-/// The store of [`store_with_every_rule`], held open by the store part alone.
-struct Rules {
-    folder: PathBuf,
-    budget: Budget,
-    store: Store,
-}
-
-impl Rules {
-    /// What `schema` reads once the store alone has written `record` as the schema record of
-    /// the table `z_rules`.
-    fn load_with(&self, record: Vec<u8>) -> Result<Catalog> {
-        let view = self.store.view().expect("the newest commit");
-        let mut changes = ChangeSet::new(view, &self.budget).expect("a change set");
+    // What `schema` reads once the store alone has written this record for `z_rules`.
+    let load_with = |record: Vec<u8>| {
+        let mut changes = ChangeSet::new(store.view().expect("a view"), &budget).expect("begin");
         changes.put_schema("z_rules", record).expect("stage");
-        self.store.commit(changes).expect("commit the record");
-        Catalog::load(&self.store.view().expect("the newest commit"))
-    }
-
-    /// Lets go of the store and removes its folder.
-    fn remove(self) {
-        let Rules { folder, store, .. } = self;
-        drop(store);
-        std::fs::remove_dir_all(&folder).expect("remove the test's folder");
-    }
-}
-
-/// Asserts that reading the tables told the store's damage, by name and naming the folder.
-fn assert_damage(read: Result<Catalog>, folder: &Path, what: &str) {
-    match read {
-        Err(Error::StoreCorrupted { path, reason }) => {
-            assert_eq!(path, folder, "{what}");
-            assert!(!reason.is_empty(), "{what}");
-        }
-        Err(other) => panic!("{what} was read as {other:?}"),
-        Ok(_) => panic!("{what} was read as a table"),
-    }
-}
-
-#[test]
-fn a_schema_record_cut_short_anywhere_is_damage() {
-    let (rules, record) = store_with_every_rule("record-cut-short");
-    // Every length from nothing to one byte short of the whole: each ends inside a number, a
-    // text or a list that says it is longer than what is left.
-    for length in 0..record.len() {
-        let what = format!(
-            "a schema record cut to {length} of its {} bytes",
-            record.len()
-        );
-        assert_damage(
-            rules.load_with(record[..length].to_vec()),
-            &rules.folder,
-            &what,
-        );
-    }
-    rules.remove();
-}
-
-#[test]
-fn a_schema_record_of_an_unknown_version_is_damage() {
-    let (rules, record) = store_with_every_rule("record-unknown-version");
-    // A record begins with one byte that says which version of the record follows.
-    for version in [record[0].wrapping_add(1), 0xFF] {
-        let mut changed = record.clone();
-        changed[0] = version;
-        let what = format!("a schema record that begins with the version byte {version}");
-        assert_damage(rules.load_with(changed), &rules.folder, &what);
-    }
-    rules.remove();
-}
-
-#[test]
-fn a_schema_record_with_one_byte_changed_is_a_whole_table_or_damage_and_never_a_panic() {
-    let (rules, record) = store_with_every_rule("record-byte-changed");
-    // Each byte in turn becomes 255: as part of a length it points past the record's end, as
-    // the byte that says which kind follows it names no kind, and as the number of a column
-    // it names no column of the table. Inside a name or a text it may leave a record that
-    // still agrees with itself, and that record is read as tables that can be printed.
-    let (mut damaged, mut read) = (0, 0);
-    for position in 0..record.len() {
-        if record[position] == 0xFF {
-            continue;
-        }
-        let mut changed = record.clone();
-        changed[position] = 0xFF;
-        match rules.load_with(changed) {
-            Err(Error::StoreCorrupted { path, .. }) => {
-                assert_eq!(path, rules.folder, "byte {position}");
-                damaged += 1;
-            }
-            Err(other) => panic!("with byte {position} changed the record was read as {other:?}"),
-            Ok(catalog) => {
-                for table in catalog.tables() {
+        store.commit(changes).expect("commit the record");
+        Catalog::load(&store.view().expect("the newest commit"), &budget)
+    };
+    let byte = |at: usize, to: u8| [&record[..at], &[to], &record[at + 1..]].concat();
+    // The one place `from` stands in the record, its last byte made `to`.
+    let last = |from: &[u8], to: u8| {
+        let found: Vec<_> = record.windows(from.len()).map(|at| at == from).collect();
+        let at = found.iter().position(|at| *at).expect("in it");
+        assert!(!found[at + 1..].contains(&true), "{from:?} twice");
+        byte(at + from.len() - 1, to)
+    };
+    // Each fault, whether every record it makes is damage, and the records. A record begins
+    // with the byte of its version. A byte made 255 is a length past the record's end, a kind
+    // byte that names no kind or a column number that names no column; inside a name or a
+    // text it may leave a record that still agrees with itself, read as tables that print.
+    // ColumnDefault literals never hold decoded JSON/vector values; missing cells may.
+    let marker = b"doc\x04\0\0\0\0\x01\0\0\x01\x01\x04";
+    let default = record
+        .windows(marker.len())
+        .position(|bytes| bytes == marker)
+        .expect("doc default")
+        + marker.len()
+        - 1;
+    let illegal = [
+        [&[7][..], &7_u64.to_le_bytes(), br#"{"x":0}"#].concat(),
+        [&[8][..], &4_u64.to_le_bytes(), &1_f32.to_le_bytes()].concat(),
+        [
+            &[0x88][..],
+            &1_u64.to_le_bytes(),
+            &1_f32.to_le_bytes(),
+            &[1],
+        ]
+        .concat(),
+    ];
+    let forbidden = illegal
+        .iter()
+        .map(|value| {
+            [
+                &record[..default],
+                value.as_slice(),
+                &record[default + 11..],
+            ]
+            .concat()
+        })
+        .collect();
+    let rows: [(&str, bool, Vec<Vec<u8>>); 6] = [
+        (
+            "with a JSON or vector ColumnDefault literal",
+            true,
+            forbidden,
+        ),
+        (
+            "cut short",
+            true,
+            (0..record.len()).map(|n| record[..n].to_vec()).collect(),
+        ),
+        (
+            "of another version",
+            true,
+            vec![byte(0, record[0] + 1), byte(0, 0xFF)],
+        ),
+        (
+            "with a byte made 255",
+            false,
+            (0..record.len()).map(|at| byte(at, 0xFF)).collect(),
+        ),
+        // A name a vector's tally or a change of state would look its column up by, its last
+        // letter made x.
+        (
+            "naming in its PARTITION_KEY or STATE MACHINE a column it lacks",
+            true,
+            vec![
+                last(b"v\x01\0\0\0\x0a\0\0\0context_id", b'x'),
+                last(b"\0\x01\x06\0\0\0status", b'x'),
+            ],
+        ),
+        // The text 'open' made a TIMESTAMP of the same eight bytes: no literal a DEFAULT takes.
+        (
+            "with a DEFAULT of no literal",
+            true,
+            vec![last(b"status\x02\0\0\0\0\0\0\0\x01\x01\x04", 6)],
+        ),
+    ];
+    for (what, always, records) in rows {
+        let mut damaged = 0;
+        for (at, changed) in records.into_iter().enumerate() {
+            match load_with(changed) {
+                Err(Error::StoreCorrupted { path, reason }) => {
                     assert!(
-                        render(table).starts_with("CREATE TABLE "),
-                        "byte {position}"
+                        path == folder && !reason.is_empty(),
+                        "{what} ({at}): {reason}"
                     );
+                    damaged += 1;
                 }
-                read += 1;
+                Err(other) => panic!("a record {what} ({at}) was read as {other:?}"),
+                Ok(catalog) => {
+                    assert!(!always, "a record {what} ({at}) was read as tables");
+                    for table in catalog.tables() {
+                        assert!(
+                            render::declaration(table).starts_with("CREATE TABLE "),
+                            "{what} ({at})"
+                        );
+                    }
+                }
             }
         }
+        // A record holds lengths, kinds and column numbers, so some of the changes are damage.
+        assert!(damaged > 0, "no record {what} was damage");
     }
-    // A record holds lengths, kinds and column numbers, so some of the changes are damage.
-    assert!(
-        damaged > 0,
-        "of the changed records none was damage and {read} were read as tables"
-    );
-    rules.remove();
+    let view = store.view().unwrap();
+    for bytes in [&[1, 255][..], &[0, 1][..]] {
+        let mut held = budget
+            .reserve(0, "schema damage fixture")
+            .expect("a reservation");
+        let mut cover = budget.passing("schema damage fixture").expect("a cover");
+        let decoded = super::record::decode_event(bytes, &view, &mut held, &mut cover);
+        assert!(matches!(decoded, Err(Error::StoreCorrupted { .. })));
+    }
+    drop(view);
+    drop(store);
+    std::fs::remove_dir_all(&folder).expect("remove the test's folder");
 }
 
 #[test]
@@ -217,6 +241,7 @@ fn the_index_clauses_of_a_vector_column_give_the_numbers_in_force() {
         max_partitions: None,
         search_mode: None,
         indexing_threshold,
+        probes: None,
         compaction,
         quantization,
     };
@@ -264,35 +289,42 @@ fn dropping_a_vector_column_leaves_no_record_of_any_kind_for_it() {
     let folder = folder("drop-vector-records");
     declare(
         &folder,
-        &["CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR(4) INDEXING_THRESHOLD 1000)"],
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR(4) INDEXING_THRESHOLD 1000)",
+            "INSERT INTO t (id, v) VALUES (1, [1.0, 0.0, 0.0, 0.0])",
+        ],
     );
+    let table_id = table(&folder, "t").id;
     let id = table(&folder, "t").vectors[0].id;
     // One record of every kind the vector part keeps for the column, as sealing and building
-    // an index leave them; each is both staged and the place the check scans from.
+    // an index leave them; each is the place the check scans from. The row's insert wrote the
+    // partition record as the engine encodes it, which every open reads; the rest are staged.
     let (tuple, row) = (Key::from_bytes(&[]), Key::from_bytes(&[1]));
     let records = [
         Partition(id, &tuple),
         Pending(id, 1, &row),
         Block(id, 1, 0),
-        Grouping(id, 2),
-        Centres(id, 2, 0),
+        Ivf(id, 2),
+        Centroids(id, 2, 0),
         Build(id, 1),
         Assigned(id, 2, 0),
-        Sketch(id, 1, 0),
+        Binary(id, 1, 0),
         Mean(id, 1),
         Left(id, 1, &row),
     ];
     let budget = Budget::new(None).expect("a budget");
     {
-        let store = Store::open_for_writing(&folder, &budget, None).expect("open the store");
+        let store = Store::open_for_writing(&folder, &budget, &DatabaseOpenOptions::default())
+            .expect("open the store");
         let mut changes = ChangeSet::new(store.view().expect("a view"), &budget).expect("begin");
-        for record in records {
-            changes.put_vector(record, vec![0; 8]).expect("stage");
+        for record in &records[1..] {
+            changes.put_vector(*record, vec![0; 8]).expect("stage");
         }
         store.commit(changes).expect("commit the records");
     }
     declare(&folder, &["ALTER TABLE t DROP COLUMN v"]);
-    let store = Store::open_for_writing(&folder, &budget, None).expect("open the store");
+    let store = Store::open_for_writing(&folder, &budget, &DatabaseOpenOptions::default())
+        .expect("open the store");
     let view = store.view().expect("the newest commit");
     let mut left = Vec::new();
     for start in records {
@@ -313,5 +345,31 @@ fn dropping_a_vector_column_leaves_no_record_of_any_kind_for_it() {
         "a dropped column keeps nothing in the vector part, yet these records remain: {left:?}"
     );
     drop((view, store));
+    // Removing a declaration retires its number, even after close and reopen.
+    declare(&folder, &["DROP TABLE t"]);
+    declare(&folder, &["CREATE TABLE next (id INTEGER PRIMARY KEY)"]);
+    assert_ne!(
+        table(&folder, "next").id,
+        table_id,
+        "a dropped table's number is never reused"
+    );
     std::fs::remove_dir_all(&folder).expect("remove the test's folder");
+}
+
+#[test]
+fn all_prefixes_keeps_a_list_that_two_indexes_share_once() {
+    let folder = folder("prefix-lists");
+    declare(
+        &folder,
+        &[
+            "CREATE TABLE r (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER, \
+             UNIQUE (a, b, id)) MAINTAIN COUNT ALL PREFIXES",
+            "CREATE INDEX r_by_ac ON r (a, c)",
+        ],
+    );
+    assert_eq!(
+        table(&folder, "r").rules.counts.len(),
+        3,
+        "(a) once, (a, b), (a, c)"
+    );
 }

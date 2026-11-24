@@ -118,6 +118,7 @@ pub(super) fn create_table(pair: Pair<'_>) -> Result<CreateTable> {
                 distinct("PRIMARY KEY", &table.primary_key)?;
             }
             Rule::foreign_key => {
+                let follows_parent_purge = has(&part, Rule::follows_parent_purge);
                 let parent = first_ident(part.clone());
                 let mut lists = part
                     .into_inner()
@@ -132,6 +133,7 @@ pub(super) fn create_table(pair: Pair<'_>) -> Result<CreateTable> {
                     )));
                 }
                 let reference = Reference {
+                    follows_parent_purge,
                     table: parent,
                     columns,
                     on_state: None,
@@ -286,6 +288,7 @@ pub(super) fn column_def(pair: Pair<'_>) -> Result<ColumnDef> {
                     Rule::max_partitions => vector.max_partitions = signed(clause),
                     Rule::search_mode => vector.search_mode = Some(search_mode(&clause)),
                     Rule::indexing_threshold => vector.indexing_threshold = signed(clause),
+                    Rule::probes => vector.probes = signed(clause),
                     // The one clause left: COMPACTION.
                     _ => vector.compaction = Some(compaction(clause)),
                 }
@@ -315,9 +318,14 @@ pub(super) fn column_def(pair: Pair<'_>) -> Result<ColumnDef> {
         scope_labels: None,
         acl: None,
         rank_policy: None,
+        expires: false,
     };
     for constraint in parts {
         match constraint.as_rule() {
+            Rule::expires => {
+                once(column.expires, "EXPIRES")?;
+                column.expires = true;
+            }
             Rule::not_null => {
                 once(!column.nullable, "NOT NULL")?;
                 column.nullable = false;
@@ -335,6 +343,7 @@ pub(super) fn column_def(pair: Pair<'_>) -> Result<ColumnDef> {
                 once(column.references.is_some(), "REFERENCES")?;
                 let [table, parent] = two_idents(constraint.clone());
                 column.references = Some(Reference {
+                    follows_parent_purge: has(&constraint, Rule::follows_parent_purge),
                     table,
                     columns: vec![parent],
                     on_state: child(constraint, Rule::propagation)
@@ -404,4 +413,122 @@ pub(super) fn create_index(pair: Pair<'_>) -> CreateIndex {
         }
     }
     index
+}
+
+/// The carried event forms use the same decoded identifiers and strings as tables.
+pub(super) fn event_declaration(pair: Pair<'_>) -> Result<Statement> {
+    use crate::types::*;
+    use EventDeclaration::*;
+    let mut names = idents(pair.clone()).into_iter();
+    let name = names.next().expect("a declaration name");
+    let get = |rule| child(pair.clone(), rule).expect("a grammar clause");
+    let event = || match get(Rule::event_trigger)
+        .as_str()
+        .to_ascii_uppercase()
+        .as_str()
+    {
+        "INSERT" => EventTypeTrigger::Insert,
+        "UPDATE" => EventTypeTrigger::Update,
+        _ => EventTypeTrigger::Delete,
+    };
+    let declaration = match pair.as_rule() {
+        Rule::create_trigger_stmt => Trigger(TriggerDecl {
+            name,
+            table: names.next().expect("a table"),
+            including_sync: has(&pair, Rule::including_sync_clause),
+            event: match event() {
+                EventTypeTrigger::Insert => TriggerEvent::Insert,
+                EventTypeTrigger::Update => TriggerEvent::Update,
+                _ => return Err(Error::TriggerEventUnsupported),
+            },
+        }),
+        Rule::create_event_type_stmt => EventType(EventTypeDecl {
+            name,
+            table: names.next().expect("a table"),
+            event: event(),
+        }),
+        Rule::create_sink_stmt => Sink(SinkDecl {
+            name,
+            sink_type: if get(Rule::sink_type)
+                .as_str()
+                .eq_ignore_ascii_case("callback")
+            {
+                SinkType::Callback
+            } else {
+                SinkType::Webhook
+            },
+            url: child(pair.clone(), Rule::sink_url_clause).map(|p| string(&first(p))),
+        }),
+        Rule::create_route_stmt => Route(RouteDecl {
+            name,
+            event_type: names.next().expect("an event type"),
+            sink: names.next().expect("a sink"),
+            where_in: child(pair.clone(), Rule::route_where_clause).map(|p| RouteWhereIn {
+                column: first_ident(p.clone()),
+                values: strings(child(p, Rule::labels).expect("labels")),
+            }),
+        }),
+        Rule::create_schedule_stmt => {
+            let text = string(&get(Rule::string));
+            let words: Vec<_> = text.split_whitespace().collect();
+            let multiplier = match words.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
+                Some("millisecond" | "milliseconds") => 1,
+                Some("second" | "seconds") => 1000,
+                Some("minute" | "minutes") => 60_000,
+                Some("hour" | "hours") => 3_600_000,
+                _ => 0,
+            };
+            let every_ms = words
+                .first()
+                .and_then(|s| s.parse::<u64>().ok())
+                .and_then(|n| n.checked_mul(multiplier))
+                .filter(|n| *n > 0 && words.len() == 2)
+                .ok_or_else(|| {
+                    Error::PlanError(format!(
+                        "invalid schedule interval: {}",
+                        crate::types::excerpt(&text)
+                    ))
+                })?;
+            let policy = child(pair.clone(), Rule::missed_tick_clause);
+            let missed_tick_policy = policy
+                .clone()
+                .map(|p| string(&first(p)).trim().to_ascii_lowercase())
+                .unwrap_or_else(|| "skip-and-audit".into());
+            let missed_tick_policy = match missed_tick_policy.as_str() {
+                "skip-and-audit" => MissedTickPolicy::SkipAndAudit,
+                "catch-up" => MissedTickPolicy::CatchUp,
+                "fail-loud" => MissedTickPolicy::FailLoud,
+                _ => {
+                    return Err(Error::PlanError(format!(
+                        "invalid missed tick policy: {}",
+                        crate::types::excerpt(&missed_tick_policy)
+                    )));
+                }
+            };
+            let catch_up_within_seconds = policy
+                .and_then(|p| child(p, Rule::integer))
+                .map(|p| number(&p, "catch-up seconds"))
+                .transpose()?;
+            Schedule(ScheduleDecl {
+                name,
+                every_ms,
+                callback: names.next().expect("a callback"),
+                missed_tick_policy,
+                catch_up_within_seconds,
+            })
+        }
+        rule => {
+            return Ok(Statement::DropEvent {
+                name,
+                if_exists: has(&pair, Rule::if_exists),
+                table: child(pair.clone(), Rule::on_table).map(first_ident),
+                kind: match rule {
+                    Rule::drop_trigger_stmt => Kind::Trigger,
+                    Rule::drop_route_stmt => Kind::Route,
+                    _ => Kind::Schedule,
+                },
+            });
+        }
+    };
+    Ok(Statement::DeclareEvent(declaration))
 }

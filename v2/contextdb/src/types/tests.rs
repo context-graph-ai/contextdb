@@ -3,15 +3,14 @@ use std::path::PathBuf;
 use super::Error;
 
 #[test]
-fn a_locked_store_names_the_holder_the_path_and_how_to_read() {
+fn a_locked_store_names_the_holder_and_the_path() {
     let refusal = Error::DatabaseLocked {
-        holder_pid: 3_138_758,
         path: PathBuf::from("./hub"),
     };
     assert_eq!(
         refusal.to_string(),
-        "another session holds this store for writing: process 3138758 holds ./hub; open a \
-         read session to read it"
+        "a writer holds the store at ./hub; open a read session to read",
+        "the refusal names a writer, no process, and the store, and what a reader does instead"
     );
 }
 

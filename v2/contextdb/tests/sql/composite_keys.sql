@@ -26,7 +26,7 @@ INSERT INTO metric_windows (machine_id, sensor_id, metric, window_start, value) 
 INSERT INTO metric_windows (machine_id, sensor_id, metric, window_start, value) VALUES ('m1', 's1', 'load', 10, 6);
 SELECT COUNT(*) AS n FROM metric_windows;
 ----
-n
+n  (read 0, compared 0)
 6
 
 # Every column of the key is a column of every row.
@@ -37,12 +37,12 @@ error: ColumnNotNullable
 # The whole key names one row; its leading columns name the rows that share them, in key order.
 SELECT value FROM metric_windows WHERE machine_id = 'm1' AND sensor_id = 's1' AND metric = 'temp' AND window_start = 20;
 ----
-value
+value  (read 1, compared 0)
 2
 
 SELECT sensor_id, metric, window_start, value FROM metric_windows WHERE machine_id = 'm1' ORDER BY sensor_id, metric, window_start;
 ----
-sensor_id | metric | window_start | value
+sensor_id | metric | window_start | value  (read 5, compared 0)
 s1 | load | 10 | 6
 s1 | temp | 10 | 1
 s1 | temp | 20 | 2
@@ -51,7 +51,7 @@ s2 | temp | 10 | 3
 
 SELECT machine_id, value FROM metric_windows WHERE sensor_id = 's1' AND window_start = 10 ORDER BY machine_id, value;
 ----
-machine_id | value
+machine_id | value  (read 6, compared 0)
 m1 | 1
 m1 | 6
 m2 | 4
@@ -59,11 +59,11 @@ m2 | 4
 # An UPDATE and a DELETE reach a row by its whole key, and change that row alone.
 UPDATE metric_windows SET value = 20 WHERE machine_id = 'm1' AND sensor_id = 's1' AND metric = 'temp' AND window_start = 20;
 ----
-rows affected: 1
+rows affected: 1  (read 1, compared 0)
 
 DELETE FROM metric_windows WHERE machine_id = 'm1' AND sensor_id = 's1' AND metric = 'load' AND window_start = 10;
 ----
-rows affected: 1
+rows affected: 1  (read 1, compared 0)
 
 # A column of the key may be assigned: the row moves to the new tuple, unless a row is there.
 UPDATE metric_windows SET window_start = 20 WHERE machine_id = 'm1' AND sensor_id = 's1' AND metric = 'temp' AND window_start = 10;
@@ -72,11 +72,11 @@ error: UniqueViolation
 
 UPDATE metric_windows SET window_start = 40 WHERE machine_id = 'm1' AND sensor_id = 's1' AND metric = 'temp' AND window_start = 10;
 ----
-rows affected: 1
+rows affected: 1  (read 1, compared 0)
 
 SELECT machine_id, sensor_id, metric, window_start, value FROM metric_windows ORDER BY machine_id, sensor_id, metric, window_start;
 ----
-machine_id | sensor_id | metric | window_start | value
+machine_id | sensor_id | metric | window_start | value  (read 5, compared 0)
 m1 | s1 | temp | 20 | 20
 m1 | s1 | temp | 30 | 5
 m1 | s1 | temp | 40 | 1
@@ -91,30 +91,30 @@ INSERT INTO stream_events (stream_id, ordinal, body) VALUES
   ('c', 3, 'c3'), ('c', 4, 'c4');
 SELECT ordinal, body FROM stream_events WHERE stream_id = 'b' AND ordinal > 2 ORDER BY ordinal ASC LIMIT 2;
 ----
-ordinal | body
+ordinal | body  (read 2, compared 0)
 3 | b3
 4 | b4
 
 SELECT ordinal, body FROM stream_events WHERE stream_id = 'b' AND ordinal > 4 ORDER BY ordinal ASC LIMIT 2;
 ----
-ordinal | body
+ordinal | body  (read 1, compared 0)
 5 | b5
 
 SELECT ordinal, body FROM stream_events WHERE stream_id = 'b' AND ordinal > 5 ORDER BY ordinal ASC LIMIT 2;
 ----
-ordinal | body
+ordinal | body  (read 0, compared 0)
 
 # A write that meets its own key changes that row and adds none.
 INSERT INTO stream_events (stream_id, ordinal, body) VALUES ('b', 5, 'again')
 ON CONFLICT (stream_id, ordinal) DO UPDATE SET body = 'b5 again';
 SELECT COUNT(*) AS n FROM stream_events WHERE stream_id = 'b';
 ----
-n
+n  (read 5, compared 0)
 5
 
 SELECT body FROM stream_events WHERE stream_id = 'b' AND ordinal = 5;
 ----
-body
+body  (read 1, compared 0)
 b5 again
 
 # A key written as an element of the table may name one column.
@@ -126,7 +126,7 @@ error: UniqueViolation
 
 SELECT a, b FROM one_key WHERE a = 1;
 ----
-a | b
+a | b  (read 1, compared 0)
 1 | x
 
 # A key names columns the table has, each once, of a type whose values are equal or not and
@@ -171,21 +171,30 @@ CREATE TABLE readings (
 CREATE INDEX windows_by_value ON metric_windows (value DESC, machine_id);
 SELECT machine_id, value FROM metric_windows WHERE value = 20;
 ----
-machine_id | value
+machine_id | value  (read 1, compared 0)
 m1 | 20
 
 # The names the engine gives the indexes it makes are kept for it.
 CREATE INDEX __fk_readings ON readings (machine_id);
 ----
-error: ReservedIndexName
+error: ReservedIndexName | reserved index name: readings.__fk_readings uses reserved prefix `__fk_`
 
 CREATE INDEX __pk_machine_id ON metric_windows (machine_id);
 ----
-error: ReservedIndexName
+error: ReservedIndexName | reserved index name: metric_windows.__pk_machine_id uses reserved prefix `__pk_`
 
 CREATE INDEX __unique_note ON readings (note);
 ----
-error: ReservedIndexName
+error: ReservedIndexName | reserved index name: readings.__unique_note uses reserved prefix `__unique_`
+
+CREATE TABLE typed (i INTEGER, t TEXT, u UUID, at TIMESTAMP, x TXID, b BOOLEAN, r REAL);
+CREATE INDEX typed_i ON typed (i);
+CREATE INDEX typed_t ON typed (t);
+CREATE INDEX typed_u ON typed (u);
+CREATE INDEX typed_at ON typed (at);
+CREATE INDEX typed_x ON typed (x);
+CREATE INDEX typed_b ON typed (b);
+CREATE INDEX typed_r ON typed (r);
 
 # A partition key takes a column of any type whose values are equal or not and nothing
 # between: UUID, TEXT, INTEGER, BOOLEAN, TIMESTAMP and TXID.
@@ -209,7 +218,7 @@ error: VectorPartitionLimitExceeded
 
 SELECT id FROM partitioned WHERE b = TRUE ORDER BY v <=> [0.0, 1.0] LIMIT 5;
 ----
-id
+id  (read 5, compared 2)
 2
 1
 
@@ -229,5 +238,5 @@ error: ColumnTypeMismatch
 INSERT INTO stamped (id) VALUES (1);
 SELECT id, made_at FROM stamped;
 ----
-id | made_at
+id | made_at  (read 1, compared 0)
 1 | NULL

@@ -11,7 +11,7 @@ pub use super::ast::{
     EdgeDirection, EdgeStep, FromItem, GraphTable, NodePattern, OrderByItem as SortKey,
     Select as SelectPlan, SelectColumn as ProjectColumn,
 };
-use super::ast::{Expr, SetMemoryLimitValue, Statement};
+use super::ast::{Expr, Statement};
 
 /// What a planned statement does to the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,9 +20,8 @@ pub(crate) enum Effect {
     Declares,
     /// Adds, changes or removes rows.
     WritesRows,
-    /// Changes a setting the store keeps. There is one: the memory limit, set to this many
-    /// bytes, or to no limit for `None`.
-    Sets(Option<u64>),
+    /// Changes one declared setting in its own commit.
+    Sets(usize, u64),
     /// Changes nothing that is stored.
     Reads,
 }
@@ -36,19 +35,19 @@ impl Statement {
             | Statement::CreateIndex(_)
             | Statement::AlterTable(_)
             | Statement::DropTable(_)
-            | Statement::DropIndex(_) => Effect::Declares,
-            Statement::Insert(_) | Statement::Delete(_) | Statement::Update(_) => {
-                Effect::WritesRows
-            }
-            Statement::SetMemoryLimit(SetMemoryLimitValue::Bytes(bytes)) => {
-                Effect::Sets(Some(*bytes as u64))
-            }
-            Statement::SetMemoryLimit(SetMemoryLimitValue::None) => Effect::Sets(None),
+            | Statement::DropIndex(_)
+            | Statement::DeclareEvent(_)
+            | Statement::DropEvent { .. } => Effect::Declares,
+            Statement::Insert(_)
+            | Statement::Delete(_)
+            | Statement::Update(_)
+            | Statement::Purge(_) => Effect::WritesRows,
+            Statement::SetSetting(at, n) => Effect::Sets(*at, *n),
             Statement::Select(_)
-            | Statement::ShowMemoryLimit
-            | Statement::ShowVectorIndexes
+            | Statement::ShowSetting(_)
             | Statement::Explain(_)
-            | Statement::ShowVectorPartitions { .. } => Effect::Reads,
+            | Statement::ShowReport(_)
+            | Statement::ResetStatements => Effect::Reads,
         }
     }
 
@@ -56,14 +55,19 @@ impl Statement {
     /// declares, sets or reads holds for every Context, label and principal at once.
     pub(crate) fn admin_only(&self) -> Option<&'static str> {
         Some(match self {
+            Statement::DeclareEvent(event) => event.identity().0.words().1,
+            Statement::DropEvent { kind, .. } => kind.words().2,
             Statement::CreateTable(_) => "CREATE TABLE",
             Statement::CreateIndex(_) => "CREATE INDEX",
             Statement::AlterTable(_) => "ALTER TABLE",
             Statement::DropTable(_) => "DROP TABLE",
             Statement::DropIndex(_) => "DROP INDEX",
-            Statement::SetMemoryLimit(_) => "SET MEMORY_LIMIT",
-            Statement::ShowVectorIndexes => "SHOW VECTOR_INDEXES",
-            Statement::ShowVectorPartitions { .. } => "SHOW VECTOR_PARTITIONS",
+            Statement::SetSetting(at, _) => crate::settings::SETTINGS[*at].0,
+            Statement::ResetStatements => "RESET STATEMENT_STATISTICS",
+            Statement::ShowReport(show) => {
+                let (name, _, admin, _, _) = crate::query::REPORTS[show.report];
+                return admin.then_some(name);
+            }
             _ => return None,
         })
     }

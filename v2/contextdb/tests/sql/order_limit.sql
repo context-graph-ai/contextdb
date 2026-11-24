@@ -6,7 +6,7 @@ VALUES (1, 'b', 30, 1.5), (2, 'a', NULL, 0.5), (3, 'a', 10, NULL), (4, 'c', 20, 
 
 SELECT id, points FROM scores ORDER BY points, id;
 ----
-id | points
+id | points  (read 5, compared 0)
 3 | 10
 4 | 20
 5 | 20
@@ -15,7 +15,7 @@ id | points
 
 SELECT id, points FROM scores ORDER BY points DESC, id;
 ----
-id | points
+id | points  (read 5, compared 0)
 2 | NULL
 1 | 30
 4 | 20
@@ -24,7 +24,7 @@ id | points
 
 SELECT id, team FROM scores ORDER BY team DESC, id DESC;
 ----
-id | team
+id | team  (read 5, compared 0)
 5 | NULL
 4 | c
 1 | b
@@ -33,7 +33,7 @@ id | team
 
 SELECT id, pace FROM scores ORDER BY pace ASC;
 ----
-id | pace
+id | pace  (read 5, compared 0)
 4 | -2.0
 2 | 0.5
 1 | 1.5
@@ -44,7 +44,7 @@ id | pace
 # NULL, sorts where the value given for it belongs and not where a NULL does.
 SELECT id, points FROM scores ORDER BY COALESCE(points, 0), id;
 ----
-id | points
+id | points  (read 5, compared 0)
 2 | NULL
 3 | 10
 4 | 20
@@ -53,7 +53,7 @@ id | points
 
 SELECT id, points FROM scores ORDER BY COALESCE(points, 25) DESC, id;
 ----
-id | points
+id | points  (read 5, compared 0)
 1 | 30
 2 | NULL
 4 | 20
@@ -63,22 +63,22 @@ id | points
 # LIMIT stands on its own and keeps the first rows of the order asked for.
 SELECT id FROM scores ORDER BY id LIMIT 2;
 ----
-id
+id  (read 2, compared 0)
 1
 2
 
 SELECT id FROM scores ORDER BY id DESC LIMIT 1;
 ----
-id
+id  (read 1, compared 0)
 5
 
 SELECT id FROM scores ORDER BY id LIMIT 0;
 ----
-id
+id  (read 0, compared 0)
 
 SELECT id FROM scores ORDER BY id LIMIT 100;
 ----
-id
+id  (read 5, compared 0)
 1
 2
 3
@@ -91,7 +91,7 @@ CREATE INDEX scores_by_points ON scores (points DESC, id ASC);
 
 SELECT id, points FROM scores ORDER BY points DESC, id ASC;
 ----
-id | points
+id | points  (read 5, compared 0)
 2 | NULL
 1 | 30
 4 | 20
@@ -100,21 +100,21 @@ id | points
 
 SELECT id, points FROM scores ORDER BY points DESC, id ASC LIMIT 3;
 ----
-id | points
+id | points  (read 3, compared 0)
 2 | NULL
 1 | 30
 4 | 20
 
 SELECT id, points FROM scores WHERE points >= 20 ORDER BY points DESC, id ASC;
 ----
-id | points
+id | points  (read 3, compared 0)
 1 | 30
 4 | 20
 5 | 20
 
 SELECT id, points FROM scores ORDER BY points ASC, id ASC;
 ----
-id | points
+id | points  (read 5, compared 0)
 3 | 10
 4 | 20
 5 | 20
@@ -129,7 +129,7 @@ INSERT INTO shelf (id, slot) VALUES (9, 2), (3, 1), (7, 2), (1, 2), (5, 1), (8, 
 
 SELECT id, slot FROM shelf WHERE slot >= 1;
 ----
-id | slot
+id | slot  (read 6, compared 0)
 3 | 1
 5 | 1
 1 | 2

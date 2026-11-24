@@ -13,14 +13,10 @@ impl ChangeSet {
     /// Stages a change to one record of a kept count.
     pub(crate) fn add_kept(&mut self, count: CountId, key: Key, delta: i64) -> Result<()> {
         let bytes = self.counted(&key, 0)?;
-        *self
-            .kept
-            .entry(count.0)
-            .or_default()
-            .entry(key.clone())
-            .or_default() += delta;
-        self.calls.push((Undo::Kept(count.0, key, delta), bytes));
-        Ok(())
+        let counts = self.kept.entry(count.0).or_default();
+        let before = counts.get(&key).copied();
+        *counts.entry(key.clone()).or_default() += delta;
+        self.remember((Undo::Kept(count.0, key, before), bytes))
     }
 }
 
@@ -37,17 +33,18 @@ pub(super) fn kept<'a>(
     span: &Span,
 ) -> Result<KeptIter<'a>> {
     let stored = changes.base.moment.kept(count.0, span)?;
-    let staged = staged_in(&changes.kept, count.0, span.clone());
+    let staged = staged_in(&changes.kept, count.0, span.clone(), false);
     let laid = |before: Option<u64>, change: &i64| {
-        Some(before.unwrap_or(0).saturating_add_signed(*change)).filter(|&count| count != 0)
+        Ok(Some(before.unwrap_or(0).saturating_add_signed(*change)).filter(|&count| count != 0))
     };
-    Ok(overlay(stored, staged, laid))
+    Ok(overlay(stored, staged, false, laid))
 }
 
 /// Writes a commit's changes to the kept counts.
 pub(super) fn write(
     staged: &Staged<i64>,
     counts: &mut Table<'_, &'static [u8], &'static [u8]>,
+    write: &redb::WriteTransaction,
 ) -> Stored<()> {
     for (count, staged) in staged {
         for (key, change) in staged {
@@ -58,8 +55,9 @@ pub(super) fn write(
             };
             match before.saturating_add_signed(*change) {
                 0 => drop(counts.remove(key.as_slice())?),
-                count => drop(counts.insert(key.as_slice(), count.to_le_bytes().as_slice())?),
+                count => counts.insert_discard(key.as_slice(), count.to_le_bytes().as_slice())?,
             }
+            super::disk::checkpoint(write)?;
         }
     }
     Ok(())

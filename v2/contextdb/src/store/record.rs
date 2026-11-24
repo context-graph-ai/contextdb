@@ -18,11 +18,13 @@
 //! beside it: the tag `0x88`, the count of its numbers as a `u64`, the scale as an `f32` and
 //! one signed byte a number. It reads back as each code times the scale.
 
+use std::io::Write;
+
 use lz4_flex::block::{compress_into, decompress_into, get_maximum_output_size};
 
 use super::disk::{Stored, unsound};
-use super::{Beside, Cell, Compact};
-use crate::memory::Reservation;
+use super::{Beside, Cell, Compact, Row};
+use crate::memory::{Passing, Reservation};
 use crate::types::{self, TxId, Uuid, Value};
 
 /// A text, JSON or vector value that takes more bytes than this is kept beside its row.
@@ -50,6 +52,7 @@ const JSON: u8 = 7;
 const VECTOR: u8 = 8;
 const TXID: u8 = 9;
 const BESIDE: u8 = 10;
+pub(super) const WRITTEN: u8 = 11;
 /// A vector as a scale and one signed byte a number.
 const REDUCED: u8 = 0x88;
 /// The first byte of a row's record that is stored as one block.
@@ -62,16 +65,46 @@ const REDUCED_FRONT: u64 = 13;
 /// record's other form in its place, keeps it, and answers with its place. The row's cell
 /// holds the length of what was kept. A cell that `compact` names is written as its scale and
 /// codes.
-pub(super) fn encode_row<E>(
+pub(super) fn encode_row<E: From<types::Error>>(
     values: &[Value],
     compact: &[Compact],
+    (written, left): (Option<u32>, &[(usize, Beside)]),
+    cover: &mut Passing,
     mut beside: impl FnMut(&mut Vec<u8>) -> Result<u64, E>,
 ) -> Result<Vec<u8>, E> {
-    let mut row = Vec::new();
-    // The record of one value that can be large, so that a large one never passes through
-    // the row.
-    let mut record = Vec::new();
+    let width = |at, value: &Value| {
+        compact.iter().find(|c| c.at == at).map_or_else(
+            || {
+                let mut n = Length(0);
+                put_value(&mut n, value);
+                n.0
+            },
+            |c| REDUCED_FRONT as usize + c.codes.len(),
+        )
+    };
+    let (size, largest) = values.iter().enumerate().fold(
+        (5 * usize::from(written.is_some()), 0),
+        |(size, largest), (at, value)| {
+            let len = width(at, value);
+            let kept = left.iter().any(|(slot, _)| *slot == at);
+            (
+                size + if kept || len > BESIDE_FROM { 17 } else { len },
+                largest.max(if kept { 0 } else { len }),
+            )
+        },
+    );
+    cover.cover((size + largest) as u64)?;
+    let mut row = Vec::with_capacity(size);
+    if let Some(written) = written {
+        put(&mut row, WRITTEN, &written.to_le_bytes());
+    }
+    let mut record = Vec::with_capacity(largest);
     for (at, value) in values.iter().enumerate() {
+        if let Some((_, kept)) = left.iter().find(|(slot, _)| *slot == at) {
+            put(&mut row, BESIDE, &kept.bytes.to_le_bytes());
+            row.extend(kept.place.to_le_bytes());
+            continue;
+        }
         if !matches!(value, Value::Text(_) | Value::Json(_) | Value::Vector(_)) {
             put_value(&mut row, value);
             continue;
@@ -96,6 +129,37 @@ pub(super) fn encode_row<E>(
         }
     }
     Ok(row)
+}
+
+/// Delivery framing: opaque identity, then an inline body or the same address a row keeps.
+pub(crate) fn delivery_parts(bytes: &[u8]) -> Stored<(&[u8], &[u8], Option<Beside>)> {
+    let (length, bytes) = bytes.split_first_chunk::<4>().ok_or_else(unsound)?;
+    let (identity, mut body) = bytes
+        .split_at_checked(u32::from_le_bytes(*length) as usize)
+        .ok_or_else(unsound)?;
+    if !matches!(body.first(), Some(&NULL | &BESIDE)) {
+        return Err(unsound());
+    }
+    let kept = skip_cell(&mut body).ok_or_else(unsound)?;
+    if kept.is_some() && !body.is_empty() {
+        return Err(unsound());
+    }
+    Ok((identity, body, kept))
+}
+
+pub(super) fn keep_delivery(
+    bytes: &mut Vec<u8>,
+    save: impl FnOnce(&[u8]) -> Stored<u64>,
+) -> Stored<()> {
+    let (identity, body, _) = delivery_parts(bytes)?;
+    if body.len() > BESIDE_FROM {
+        let (at, length, place) = (4 + identity.len(), body.len() as u64, save(body)?);
+        bytes.truncate(at);
+        bytes.push(BESIDE);
+        bytes.extend(length.to_le_bytes());
+        bytes.extend(place.to_le_bytes());
+    }
+    Ok(())
 }
 
 /// Puts the compressed form of a large value's plain record in its place, when the value is
@@ -141,131 +205,176 @@ fn squeeze(record: &mut Vec<u8>, from: usize, front: &[u8], reservation: &mut Re
     room as u64
 }
 
-fn put_value(out: &mut Vec<u8>, value: &Value) {
+struct Length(usize);
+impl Write for Length {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 += bytes.len();
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn put_value(out: &mut impl Write, value: &Value) {
     match value {
-        Value::Null => out.push(NULL),
-        Value::Bool(flag) => out.extend([BOOL, u8::from(*flag)]),
+        Value::Null => out.write_all(&[NULL]).unwrap(),
+        Value::Bool(flag) => out.write_all(&[BOOL, u8::from(*flag)]).unwrap(),
         Value::Int64(number) => put(out, INT64, &number.to_le_bytes()),
         Value::Float64(number) => put(out, FLOAT64, &number.to_bits().to_le_bytes()),
         Value::Text(text) => put_long(out, TEXT, text.as_bytes()),
         Value::Uuid(id) => put(out, UUID, id.as_bytes()),
         Value::Timestamp(millis) => put(out, TIMESTAMP, &millis.to_le_bytes()),
         Value::Json(json) => {
-            let text = serde_json::to_vec(json).expect("a JSON value always writes as text");
-            put_long(out, JSON, &text);
+            let mut len = Length(0);
+            serde_json::to_writer(&mut len, json).expect("a JSON value writes as text");
+            put(out, JSON, &(len.0 as u64).to_le_bytes());
+            serde_json::to_writer(out, json).expect("a JSON value writes as text");
         }
         Value::Vector(numbers) => {
             put(out, VECTOR, &(4 * numbers.len() as u64).to_le_bytes());
             for number in numbers {
-                out.extend(number.to_le_bytes());
+                out.write_all(&number.to_le_bytes()).unwrap();
             }
         }
         Value::TxId(id) => put(out, TXID, &id.0.to_le_bytes()),
     }
 }
 
-fn put(out: &mut Vec<u8>, tag: u8, bytes: &[u8]) {
-    out.push(tag);
-    out.extend(bytes);
+/// Serialized size, measured by the same encoder without allocating another value.
+pub(crate) fn value_len(value: &Value) -> usize {
+    let mut count = Length(0);
+    put_value(&mut count, value);
+    count.0
+}
+pub(crate) fn put_text(out: &mut Vec<u8>, text: &str) {
+    put_long(out, TEXT, text.as_bytes());
 }
 
-fn put_long(out: &mut Vec<u8>, tag: u8, bytes: &[u8]) {
+fn put(out: &mut impl Write, tag: u8, bytes: &[u8]) {
+    out.write_all(&[tag]).unwrap();
+    out.write_all(bytes).unwrap();
+}
+
+fn put_long(out: &mut impl Write, tag: u8, bytes: &[u8]) {
     put(out, tag, &(bytes.len() as u64).to_le_bytes());
-    out.extend(bytes);
+    out.write_all(bytes).unwrap();
 }
 
 /// A stored row's record as it was written, the one way a stored row is read; a block that does
-/// not decode to its length is damage. Like a plain row, it is not counted against the limit.
-pub(super) fn plain(row: &[u8]) -> Stored<std::borrow::Cow<'_, [u8]>> {
+/// not decode to its length is damage. Its buffer is admitted before expansion.
+pub(super) fn plain<'a>(row: &'a [u8], cover: &mut Passing) -> Stored<std::borrow::Cow<'a, [u8]>> {
     let Some(([PACKED, len @ ..], block)) = row.split_first_chunk::<5>() else {
         return Ok(row.into());
     };
-    let plain = unpack(&[], block, u32::from_le_bytes(*len).into(), |_| Ok(()));
-    Ok(plain.ok().flatten().ok_or_else(unsound)?.into())
-}
-
-/// Reads a row back from its plain record. The bytes are a row this module wrote: the storage
-/// library checks every page it reads, and `plain` every block, so nothing else reaches here.
-pub(super) fn decode_row(mut row: &[u8]) -> Vec<Cell> {
-    let mut cells = Vec::new();
-    while !row.is_empty() {
-        let tag = take(&mut row, 1)[0];
-        cells.push(if tag == BESIDE {
-            Cell::Beside(Beside {
-                bytes: u64::from_le_bytes(take_array(&mut row)),
-                place: u64::from_le_bytes(take_array(&mut row)),
-            })
-        } else {
-            Cell::Here(take_value(tag, &mut row))
-        });
+    let len = u64::from(u32::from_le_bytes(*len));
+    if !(256..=COMPRESS_TO as u64).contains(&len) {
+        return Err(unsound());
     }
-    cells
+    Ok(unpack(&[], block, len, |bytes| cover.cover(bytes))?
+        .ok_or_else(unsound)?
+        .into())
 }
 
-/// Steps over the first cell of a stored row without making its value, and answers with the
-/// large value the cell keeps beside the row, when it keeps one.
-fn skip_cell(row: &mut &[u8]) -> Option<Beside> {
-    let width = match take(row, 1)[0] {
-        NULL => 0,
-        BOOL => 1,
-        UUID => 16,
-        TEXT | JSON | VECTOR => u64::from_le_bytes(take_array(row)) as usize,
-        REDUCED => u64::from_le_bytes(take_array(row)) as usize + 4,
-        BESIDE => {
-            return Some(Beside {
-                bytes: u64::from_le_bytes(take_array(row)),
-                place: u64::from_le_bytes(take_array(row)),
-            });
-        }
-        _ => 8,
+/// Reads cells only after their lengths, tags and payloads have been checked.
+pub(super) fn decode_record(row: &[u8], cover: &mut Passing) -> Stored<Row> {
+    let row = plain(row, cover)?;
+    let (written, cells) = match row.split_first_chunk::<5>() {
+        Some(([WRITTEN, s @ ..], rest)) => (Some(u32::from_le_bytes(*s)), rest),
+        _ => (None, row.as_ref()),
     };
-    take(row, width);
-    None
-}
-
-/// The bytes of a stored row from its cell at `slot` on: none for a row with no cell there,
-/// which was written before the column was added.
-fn from_cell(mut row: &[u8], slot: usize) -> &[u8] {
-    for _ in 0..slot {
-        if !row.is_empty() {
-            skip_cell(&mut row);
-        }
-    }
-    row
-}
-
-/// The large values a row's plain record keeps beside it. None of the row's values is made.
-pub(super) fn besides(mut row: &[u8]) -> impl Iterator<Item = Beside> {
-    std::iter::from_fn(move || {
-        while !row.is_empty() {
-            if let Some(kept) = skip_cell(&mut row) {
-                return Some(kept);
-            }
-        }
-        None
+    let (count, bytes) = super::most(cells).ok_or_else(unsound)?;
+    let bytes = bytes + row.len() as u64 * u64::from(matches!(row, std::borrow::Cow::Owned(_)));
+    cover.cover(bytes)?;
+    Ok(Row {
+        cells: decode_row(cells, count)?,
+        written,
+        bytes,
     })
 }
 
-/// A row's plain record without its cell at `slot`, and the large value that cell kept beside
-/// the row. `None` for a row with no cell there.
-pub(super) fn without_cell(row: &[u8], slot: usize) -> Option<(Vec<u8>, Option<Beside>)> {
-    let mut rest = from_cell(row, slot);
-    let start = row.len() - rest.len();
-    if rest.is_empty() {
-        return None;
+pub(super) fn decode_row(mut row: &[u8], count: usize) -> Stored<Vec<Cell>> {
+    let mut cells = Vec::with_capacity(count);
+    while !row.is_empty() {
+        let tag = take(&mut row, 1).ok_or_else(unsound)?[0];
+        let cell = if tag == BESIDE {
+            Cell::Beside(Beside {
+                bytes: u64::from_le_bytes(take_array(&mut row).ok_or_else(unsound)?),
+                place: u64::from_le_bytes(take_array(&mut row).ok_or_else(unsound)?),
+            })
+        } else {
+            Cell::Here(take_value(tag, &mut row).ok_or_else(unsound)?)
+        };
+        cells.push(cell);
     }
-    let kept = skip_cell(&mut rest);
-    Some(([&row[..start], rest].concat(), kept))
+    Ok(cells)
 }
 
-/// Says again, in a row just written, where each large value that was left where it is is
-/// kept. `left` names them by cell, and NULL was written in the cell of each.
-pub(super) fn leave(row: &mut Vec<u8>, left: &[(usize, Beside)]) {
-    for (slot, kept) in left {
-        let at = row.len() - from_cell(row, *slot).len();
-        let place = [kept.bytes.to_le_bytes(), kept.place.to_le_bytes()];
-        row.splice(at..=at, [&[BESIDE][..], place.as_flattened()].concat());
+/// Walks the framing without allocating, bounding the cells and their decoded heap together.
+pub(crate) fn most(mut row: &[u8]) -> Option<(usize, u64)> {
+    let (mut count, mut bytes) = (0, size_of::<Row>() as u64);
+    while !row.is_empty() {
+        let cell = row;
+        skip_cell(&mut row)?;
+        let cell = &cell[..cell.len() - row.len()];
+        let heap = match cell[0] {
+            TEXT | VECTOR => (cell.len() - FRONT) as u64,
+            JSON => 2 * types::json_bytes(&cell[FRONT..]) + (cell.len() - FRONT) as u64,
+            REDUCED => 4 * (cell.len() - REDUCED_FRONT as usize) as u64,
+            _ => 0,
+        };
+        bytes += size_of::<Cell>() as u64 + heap;
+        count += 1;
     }
+    Some((count, bytes))
+}
+
+/// Steps over one checked cell, returning its external value's address if present.
+fn skip_cell(row: &mut &[u8]) -> Option<Option<Beside>> {
+    let tag = take(row, 1)?[0];
+    let width = match tag {
+        NULL => 0,
+        BOOL => 1,
+        WRITTEN => 4,
+        UUID => 16,
+        TEXT | JSON | VECTOR => usize::try_from(u64::from_le_bytes(take_array(row)?)).ok()?,
+        REDUCED => usize::try_from(u64::from_le_bytes(take_array(row)?))
+            .ok()?
+            .checked_add(4)?,
+        BESIDE => {
+            return Some(Some(Beside {
+                bytes: u64::from_le_bytes(take_array(row)?),
+                place: u64::from_le_bytes(take_array(row)?),
+            }));
+        }
+        INT64 | FLOAT64 | TIMESTAMP | TXID => 8,
+        _ => return None,
+    };
+    take(row, width)?;
+    Some(None)
+}
+
+fn from_cell(mut row: &[u8], slot: usize) -> Stored<&[u8]> {
+    if row.first() == Some(&WRITTEN) {
+        skip_cell(&mut row).ok_or_else(unsound)?;
+    }
+    for _ in 0..slot {
+        if !row.is_empty() {
+            skip_cell(&mut row).ok_or_else(unsound)?;
+        }
+    }
+    Ok(row)
+}
+
+/// A row without one cell, and the external value removed with it.
+pub(super) fn without_cell(row: &[u8], slot: usize) -> Stored<Option<(Vec<u8>, Option<Beside>)>> {
+    let mut rest = from_cell(row, slot)?;
+    let start = row.len() - rest.len();
+    if rest.is_empty() {
+        return Ok(None);
+    }
+    let kept = skip_cell(&mut rest).ok_or_else(unsound)?;
+    Ok(Some(([&row[..start], rest].concat(), kept)))
 }
 
 /// Makes a large value from its stored record, in either form. `reservation` already holds
@@ -288,7 +397,7 @@ pub(super) fn load(
         return Ok(Err("a large value is shorter than its tag and length"));
     };
     if front[0] == REDUCED {
-        let count = u64::from_le_bytes(take_array(&mut &front[1..]));
+        let count = u64::from_le_bytes(front[1..].try_into().expect("a checked front"));
         if (stored.len() as u64).checked_sub(REDUCED_FRONT) != Some(count) {
             return Ok(Err("a reduced vector gives a length its bytes are not"));
         }
@@ -296,10 +405,10 @@ pub(super) fn load(
         reservation.grow(4 * count)?;
         let value = decode_value(&stored);
         reservation.shrink(REDUCED_FRONT - FRONT as u64 + count);
-        return Ok(Ok(value));
+        return Ok(value.ok_or("a reduced vector is not a value"));
     }
     if front[0] & COMPRESSED != 0 {
-        let len = u64::from_le_bytes(take_array(&mut &front[1..]));
+        let len = u64::from_le_bytes(front[1..].try_into().expect("a checked front"));
         let grow = |bytes| reservation.grow(bytes);
         let Some(mut plain) = unpack(front, &stored[FRONT..], len, grow)? else {
             return Ok(Err(
@@ -310,7 +419,7 @@ pub(super) fn load(
         reservation.shrink(stored.len() as u64);
         stored = plain;
     }
-    let len = u64::from_le_bytes(take_array(&mut &stored[1..]));
+    let len = u64::from_le_bytes(stored[1..FRONT].try_into().expect("a checked front"));
     if len != (stored.len() - FRONT) as u64 {
         return Ok(Err("a large value gives a length its bytes are not"));
     }
@@ -319,17 +428,14 @@ pub(super) fn load(
         let text = String::from_utf8(stored).map(Value::Text);
         return Ok(text.map_err(|_| "a large text is not text"));
     }
-    if stored[0] == JSON {
-        // The tree is counted at the most its text can make before it is made, and is held
-        // by the reservation as long as the value is.
-        reservation.grow(types::json_bytes(&stored[FRONT..]))?;
-        let json = serde_json::from_slice(&stored[FRONT..]).map(Value::Json);
-        return Ok(json.map_err(|_| "a large JSON value is not JSON"));
-    }
-    let twice = stored.len() as u64;
-    reservation.grow(twice)?;
-    let value = (stored[0] == VECTOR).then(|| decode_value(&stored));
-    reservation.shrink(twice);
+    let bytes = stored.len() as u64;
+    let value = if matches!(stored[0], JSON | VECTOR) {
+        read_value(&mut stored.as_slice(), reservation)?
+    } else {
+        None
+    };
+    drop(stored);
+    reservation.shrink(bytes);
     Ok(value.ok_or("a large value is not text, JSON or a vector"))
 }
 
@@ -351,62 +457,109 @@ fn unpack(
     Ok((decoded.ok() == Some(len as usize)).then_some(plain))
 }
 
-/// Reads one value back from its plain record.
-pub(super) fn decode_value(bytes: &[u8]) -> Value {
-    take_value(bytes[0], &mut &bytes[1..])
+/// Reads one complete standalone value.
+pub(super) fn decode_value(mut bytes: &[u8]) -> Option<Value> {
+    let tag = take(&mut bytes, 1)?[0];
+    take_value(tag, &mut bytes).filter(|_| bytes.is_empty())
 }
 
-fn take_value(tag: u8, bytes: &mut &[u8]) -> Value {
-    match tag {
+pub(crate) fn read_value(
+    bytes: &mut &[u8],
+    held: &mut Reservation,
+) -> types::Result<Option<Value>> {
+    if bytes.first() == Some(&REDUCED) {
+        return Ok(None);
+    }
+    let before = held.bytes();
+    let value = read_cell(bytes, |cell, _| {
+        // The encoded buffer and Value slot are already held by this caller.
+        held.grow(match cell[0] {
+            JSON => types::json_bytes(&cell[FRONT..]),
+            TEXT | VECTOR => (cell.len() - FRONT) as u64,
+            _ => 0,
+        })
+    })?;
+    if let Some(value) = &value {
+        held.shrink(held.bytes() - before - types::heap_bytes(value));
+    }
+    Ok(value)
+}
+
+/// The shared value codec used by rows and stored declarations.
+pub(crate) fn value_prefix(bytes: &mut &[u8], cover: &mut Passing) -> types::Result<Option<Value>> {
+    read_cell(bytes, |_, bound| cover.cover(bound))
+}
+
+fn read_cell(
+    bytes: &mut &[u8],
+    admit: impl FnOnce(&[u8], u64) -> types::Result<()>,
+) -> types::Result<Option<Value>> {
+    let cell = *bytes;
+    let mut rest = cell;
+    if skip_cell(&mut rest).is_none() {
+        return Ok(None);
+    }
+    let cell = &cell[..cell.len() - rest.len()];
+    let Some((_, bound)) = most(cell) else {
+        return Ok(None);
+    };
+    admit(cell, bound)?;
+    let tag = take(bytes, 1).expect("a checked cell")[0];
+    Ok(take_value(tag, bytes))
+}
+
+fn take_value(tag: u8, bytes: &mut &[u8]) -> Option<Value> {
+    Some(match tag {
         NULL => Value::Null,
-        BOOL => Value::Bool(take(bytes, 1)[0] != 0),
-        INT64 => Value::Int64(i64::from_le_bytes(take_array(bytes))),
-        FLOAT64 => Value::Float64(f64::from_bits(u64::from_le_bytes(take_array(bytes)))),
-        TEXT => {
-            let text = String::from_utf8(take_long(bytes).to_vec());
-            Value::Text(text.expect("stored text was written from a string"))
-        }
-        UUID => Value::Uuid(Uuid::from_bytes(take_array(bytes))),
-        TIMESTAMP => Value::Timestamp(i64::from_le_bytes(take_array(bytes))),
-        JSON => {
-            let json = serde_json::from_slice(take_long(bytes));
-            Value::Json(json.expect("stored JSON was written from a JSON value"))
-        }
+        BOOL => match take(bytes, 1)?[0] {
+            0 => Value::Bool(false),
+            1 => Value::Bool(true),
+            _ => return None,
+        },
+        INT64 => Value::Int64(i64::from_le_bytes(take_array(bytes)?)),
+        FLOAT64 => Value::Float64(f64::from_le_bytes(take_array(bytes)?)),
+        TEXT => Value::Text(std::str::from_utf8(take_long(bytes)?).ok()?.to_owned()),
+        UUID => Value::Uuid(Uuid::from_bytes(take_array(bytes)?)),
+        TIMESTAMP => Value::Timestamp(i64::from_le_bytes(take_array(bytes)?)),
+        JSON => Value::Json(serde_json::from_slice(take_long(bytes)?).ok()?),
         VECTOR => {
-            let numbers = take_long(bytes).chunks_exact(4);
+            let numbers = take_long(bytes)?;
+            if !numbers.len().is_multiple_of(4) {
+                return None;
+            }
             Value::Vector(
                 numbers
-                    .map(|number| f32::from_le_bytes(std::array::from_fn(|at| number[at])))
+                    .chunks_exact(4)
+                    .map(|n| f32::from_le_bytes(n.try_into().expect("four bytes")))
                     .collect(),
             )
         }
         REDUCED => {
-            let count = u64::from_le_bytes(take_array(bytes));
-            let scale = f32::from_le_bytes(take_array(bytes));
-            let codes = take(bytes, count as usize).iter();
+            let count = usize::try_from(u64::from_le_bytes(take_array(bytes)?)).ok()?;
+            let scale = f32::from_le_bytes(take_array(bytes)?);
             Value::Vector(
-                codes
-                    .map(|code| scale * f32::from(code.cast_signed()))
+                take(bytes, count)?
+                    .iter()
+                    .map(|c| scale * f32::from(c.cast_signed()))
                     .collect(),
             )
         }
-        // TXID, the one tag of a value that is left.
-        _ => Value::TxId(TxId(u64::from_le_bytes(take_array(bytes)))),
-    }
+        TXID => Value::TxId(TxId(u64::from_le_bytes(take_array(bytes)?))),
+        _ => return None,
+    })
 }
 
-fn take<'a>(bytes: &mut &'a [u8], count: usize) -> &'a [u8] {
-    let (taken, rest) = bytes.split_at(count);
+fn take<'a>(bytes: &mut &'a [u8], count: usize) -> Option<&'a [u8]> {
+    let (taken, rest) = bytes.split_at_checked(count)?;
     *bytes = rest;
-    taken
+    Some(taken)
 }
 
-fn take_array<const N: usize>(bytes: &mut &[u8]) -> [u8; N] {
-    let taken = take(bytes, N);
-    std::array::from_fn(|at| taken[at])
+fn take_array<const N: usize>(bytes: &mut &[u8]) -> Option<[u8; N]> {
+    take(bytes, N)?.try_into().ok()
 }
 
-fn take_long<'a>(bytes: &mut &'a [u8]) -> &'a [u8] {
-    let count = u64::from_le_bytes(take_array(bytes));
-    take(bytes, count as usize)
+fn take_long<'a>(bytes: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let count = usize::try_from(u64::from_le_bytes(take_array(bytes)?)).ok()?;
+    take(bytes, count)
 }

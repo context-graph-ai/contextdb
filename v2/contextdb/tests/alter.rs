@@ -219,7 +219,8 @@ fn an_added_vector_column_is_null_on_older_rows_and_no_search_returns_them() {
         "INSERT INTO docs (id, ctx, body) VALUES (1, 'a', 'x'), (2, 'a', 'x'), (3, 'a', 'x'), \
          (4, 'b', 'x'), (5, 'b', 'x'), (6, 'b', 'x')",
     );
-    let column = "v VECTOR(4) PARTITION_KEY (ctx) MAX_PARTITIONS 4 SEARCH_MODE EXACT";
+    let column = "v VECTOR(4) PARTITION_KEY (ctx) MAX_PARTITIONS 4 SEARCH_MODE EXACT \
+         INDEXING_THRESHOLD 5000 COMPACTION NONE";
     support::run(&db, &format!("ALTER TABLE docs ADD COLUMN {column}"));
     assert!(
         says(&printed(&db, "docs"), column),
@@ -365,7 +366,7 @@ fn a_dropped_table_leaves_no_record() {
     assert!(held >= PUT_IN, "the filled store is {held} bytes long");
     let dropped = support::run(&db, "DROP TABLE one");
     assert_eq!(dropped.rows_affected(), 0);
-    assert!(db.table_names().is_empty());
+    assert!(support::names(&db).is_empty());
     let after_drop = data_file(&folder);
     declare("two");
     fill(&db, "two", "body", true, ROWS);
@@ -381,8 +382,8 @@ fn a_dropped_table_leaves_no_record() {
     // and open; and a table declared under its name starts empty, with none of its indexes.
     let db = support::open(&folder);
     let reader = support::open_reader(&folder, None);
-    assert_eq!(db.table_names(), ["two"]);
-    assert_eq!(reader.table_names().expect("a reader's tables"), ["two"]);
+    assert_eq!(support::names(&db), ["two"]);
+    assert_eq!(*reader.table_names().expect("a reader's tables"), ["two"]);
     let missing = |error: Error, what: &str| {
         assert!(
             matches!(&error, Error::TableNotFound(name) if name == "one"),
@@ -469,14 +470,14 @@ type State = (
 /// Everything a refused statement must leave as it was: each table's declaration, the rows,
 /// and the number of the newest commit.
 fn state(db: &Database) -> State {
-    let names = db.table_names();
+    let names = support::names(db);
     let declared = names.iter().map(|table| printed(db, table)).collect();
     let rows = support::rows(
         db,
         "SELECT id, a, b, kind, tenant, parent_id, v FROM t ORDER BY id",
     );
     let parents = support::rows(db, "SELECT id, name FROM parents ORDER BY id");
-    (declared, rows, parents, db.committed_watermark())
+    (declared, rows, parents, support::watermark(db))
 }
 
 /// What a refused ALTER or DROP must come as.
@@ -526,7 +527,7 @@ impl Refused {
                 },
             ) => {
                 table == of
-                    && policy == "effective_confidence"
+                    && policy == "effective_confidence on ranked.embedding"
                     && named.is_none_or(|named| column == named)
             }
             _ => false,
@@ -616,6 +617,10 @@ fn each_dependent_refusal_names_what_depends_and_changes_nothing() {
     for (sql, refused) in &cases {
         let error = support::refusal(&db, sql);
         assert!(refused.is(&error), "{sql}\nwas refused as {error:?}");
+        if matches!(refused, Refused::Ranked(..)) {
+            // A refusal says how the policy goes: there is no statement that drops one.
+            assert!(error.to_string().ends_with("table that declares it"));
+        }
         assert!(
             state(&db) == before,
             "{sql}\nwas refused and changed the store"
@@ -627,6 +632,7 @@ fn each_dependent_refusal_names_what_depends_and_changes_nothing() {
     let before = state(&db);
     let error = support::refusal(&db, "ALTER TABLE t SET HISTORY CURRENT ONLY");
     assert!(Refused::Invalid.is(&error), "{error:?}");
+    assert!(format!("{error}").contains("SYNC CONFLICT KEEP LATEST"));
     assert!(state(&db) == before);
 
     // An index and a column that are not there, by name.
@@ -662,6 +668,45 @@ fn each_dependent_refusal_names_what_depends_and_changes_nothing() {
 
 #[test]
 fn an_altered_table_is_printed_as_what_it_now_declares() {
+    // Live declarations and a reopened catalog must fit the same working allowance.
+    for reopen in [true, false] {
+        let folder = support::folder(&format!("catalog-create-alter-{reopen}"));
+        let mut db = support::open(&folder);
+        let default = "x".repeat(2048);
+        for id in 0..40 {
+            support::run(
+                &db,
+                &format!(
+                    "CREATE TABLE t{id} (id INTEGER PRIMARY KEY, body TEXT DEFAULT '{default}')"
+                ),
+            );
+        }
+        let cap = support::opening::opening_charge(&folder, None) + 2 * 1024 * 1024;
+        if reopen {
+            support::close(db);
+            db = support::open_limited(&folder, cap);
+        } else {
+            db.set_memory_limit(Some(cap))
+                .expect("the live catalog fits the reopen allowance");
+        }
+        support::run(
+            &db,
+            "CREATE TABLE added (id INTEGER PRIMARY KEY, body TEXT)",
+        );
+        assert_eq!(
+            support::used(&db),
+            support::opening::opening_charge(&folder, None),
+            "CREATE retains the same heap as reopen"
+        );
+        support::run(&db, "ALTER TABLE added ADD COLUMN extra TEXT DEFAULT 'new'");
+        assert_eq!(
+            support::used(&db),
+            support::opening::opening_charge(&folder, None),
+            "ALTER retains the same heap as reopen"
+        );
+        assert!(printed(&db, "added").contains("extra TEXT DEFAULT 'new'"));
+        support::close(db);
+    }
     let folder = support::folder("altered-printed");
     let db = support::open(&folder);
     for sql in [
@@ -676,6 +721,35 @@ fn an_altered_table_is_printed_as_what_it_now_declares() {
     ] {
         support::run(&db, sql);
     }
+    // Repeated renames must release their dependent-record working allowance each time.
+    let child = format!(
+        "CREATE TABLE dependent (id INTEGER PRIMARY KEY, parent TEXT REFERENCES parents(code), \
+         body TEXT DEFAULT '{}')",
+        "x".repeat(16 * 1024)
+    );
+    support::run(&db, &child);
+    let cap = support::opening::opening_charge(&folder, None) + 2 * 1024 * 1024;
+    db.set_memory_limit(Some(cap))
+        .expect("room for the dependent declaration once");
+    for (from, to) in [
+        ("code", "renamed"),
+        ("renamed", "code"),
+        ("code", "renamed"),
+        ("renamed", "code"),
+    ] {
+        support::run(
+            &db,
+            &format!("ALTER TABLE parents RENAME COLUMN {from} TO {to}"),
+        );
+        let declaration = printed(&db, "dependent");
+        assert!(
+            says(&declaration, &format!("REFERENCES parents ({to})")),
+            "{declaration}"
+        );
+    }
+    db.set_memory_limit(Some(256 << 20))
+        .expect("restore room for round trips");
+    support::run(&db, "DROP TABLE dependent");
     // Each ALTER, what the table's declaration says after it, and what it no longer says.
     let steps: &[(&str, &[&str], &[&str])] = &[
         (
@@ -838,10 +912,22 @@ fn an_altered_table_is_printed_as_what_it_now_declares() {
 #[test]
 fn a_renamed_vector_column_keeps_its_declaration_and_its_vectors() {
     let folder = support::folder("renamed-vector-column");
-    let db = support::open(&folder);
+    // Pages written through the storage door, so an ALTER is seen to write no vector record.
+    let written = Arc::new(AtomicU64::new(0));
+    let mut options = DatabaseOpenOptions::default();
+    options.storage = Some(support::storage({
+        let written = written.clone();
+        move |call| {
+            if let Call::Write(at, bytes) = call {
+                let pages = (at % 4096 + bytes.len() as u64).div_ceil(4096);
+                written.fetch_add(pages, Ordering::SeqCst);
+            }
+        }
+    }));
+    let db = support::open_with(&folder, options).unwrap();
     support::run(
         &db,
-        "CREATE TABLE docs (id INTEGER PRIMARY KEY, ctx TEXT NOT NULL, \
+        "CREATE TABLE docs (id INTEGER PRIMARY KEY, ctx TEXT NOT NULL, note TEXT, \
          v VECTOR(4) PARTITION_KEY (ctx) MAX_PARTITIONS 3 SEARCH_MODE EXACT)",
     );
     let insert_under = |db: &Database, column: &str, id: i64, ctx: &str| {
@@ -851,7 +937,7 @@ fn a_renamed_vector_column_keeps_its_declaration_and_its_vectors() {
         )
     };
     let insert = |db: &Database, id: i64, ctx: &str| insert_under(db, "v", id, ctx);
-    // Twenty vectors in blocks and five still waiting, in two partitions.
+    // Twenty vectors in blocks and five still unindexed, in two partitions.
     for id in 1..=20 {
         insert(&db, id, if id % 2 == 0 { "a" } else { "b" }).expect("a row with a vector");
     }
@@ -870,8 +956,26 @@ fn a_renamed_vector_column_keeps_its_declaration_and_its_vectors() {
     let of_a = nearest(&db, "v", "WHERE ctx = 'a'").expect("a search");
     assert_eq!((whole.len(), of_a.len()), (10, 10));
 
-    support::run(&db, "ALTER TABLE docs RENAME COLUMN v TO embedding");
-    // The same answers under the new name, from the blocks and from the waiting vectors, and
+    let size =
+        |db: &Database| support::whole(&support::shown(db, "SHOW VECTOR_INDEXES")[0], "bytes");
+    let before = size(&db);
+    let pages = |sql: &str| {
+        written.store(0, Ordering::SeqCst);
+        support::run(&db, sql);
+        written.load(Ordering::SeqCst)
+    };
+    let of_text = pages("ALTER TABLE docs RENAME COLUMN note TO memo");
+    let renamed = pages("ALTER TABLE docs RENAME COLUMN v TO embedding");
+    let used = support::used(&db);
+    let mode = pages("ALTER TABLE docs ALTER COLUMN embedding SET SEARCH_MODE AUTO");
+    assert!(
+        size(&db) == before && support::used(&db) == used,
+        "nothing is rewritten"
+    );
+    // An ALTER of only a vector column's declaration writes no vector record: the pages of a
+    // text column's rename, the table's own record (design 8.3).
+    assert_eq!([renamed, mode], [of_text; 2], "pages written");
+    // The same answers under the new name, from the blocks and from the unindexed vectors, and
     // none under the old one.
     assert_eq!(nearest(&db, "embedding", "").expect("a search"), whole);
     assert_eq!(
@@ -880,12 +984,12 @@ fn a_renamed_vector_column_keeps_its_declaration_and_its_vectors() {
     );
     assert!(nearest(&db, "v", "").is_err());
     let text = printed(&db, "docs");
-    let clauses = "embedding VECTOR(4) PARTITION_KEY (ctx) MAX_PARTITIONS 3 SEARCH_MODE EXACT";
+    let clauses = "embedding VECTOR(4) PARTITION_KEY (ctx) MAX_PARTITIONS 3 SEARCH_MODE AUTO";
     assert!(
         says(&text, clauses) && !says(&text, "v VECTOR(4)"),
         "{text}"
     );
-    // The waiting vectors are the same five: the rename sealed nothing and lost nothing.
+    // The unindexed vectors are the same five: the rename sealed nothing and lost nothing.
     assert_eq!(support::seal_all(&db), 5);
     assert_eq!(nearest(&db, "embedding", "").expect("a search"), whole);
     // The limit on partitions still counts the two the column had.
@@ -948,7 +1052,7 @@ fn an_alter_or_a_drop_in_a_transaction_takes_hold_when_it_commits() {
     support::run(&tx, "DROP TABLE gone");
     tx.rollback();
     assert_eq!(printed(&db, "t"), before);
-    assert_eq!(db.table_names(), ["gone", "t"]);
+    assert_eq!(support::names(&db), ["gone", "t"]);
     assert!(matches!(
         support::refusal(&db, "SELECT c FROM t"),
         Error::ColumnNotFound { .. }
@@ -963,10 +1067,10 @@ fn an_alter_or_a_drop_in_a_transaction_takes_hold_when_it_commits() {
     ));
     support::run(&tx, "DROP TABLE gone");
     // Until it commits, nobody else sees either.
-    assert_eq!(db.table_names(), ["gone", "t"]);
+    assert_eq!(support::names(&db), ["gone", "t"]);
     assert_eq!(printed(&db, "t"), before);
     tx.commit().expect("commit the two declarations");
-    assert_eq!(db.table_names(), ["t"]);
+    assert_eq!(support::names(&db), ["t"]);
     assert_eq!(
         support::rows(&db, "SELECT id, a, c FROM t"),
         [[Value::Int64(1), support::text("x"), support::text("new")]]
@@ -993,7 +1097,6 @@ fn a_vector_column_far_larger_than_the_memory_limit_is_dropped_under_it() {
     const VECTORS: i64 = 10_000;
     const HELD: u64 = VECTORS as u64 * DIMENSION as u64 * 4;
     const KIB: usize = 1 << 10;
-    const MIB: usize = 1 << 20;
     // 10,000 vectors of 64 numbers, 2,560,000 bytes of them, in four partitions, all sealed, are
     // dropped under a memory limit. Their room is free for reuse, so as many bytes of large text
     // written afterwards (3,200,000, more than were dropped) do not grow the data file.
@@ -1010,9 +1113,17 @@ fn a_vector_column_far_larger_than_the_memory_limit_is_dropped_under_it() {
     assert_eq!(support::seal_all(&db), VECTORS as u64);
     support::close(db);
     let held = data_file(&folder);
-    // 9 MiB is what a store needs to open at all. The 192 KiB above it are less than
+    // What a store needs to open at all, and 192 KiB above it: less than
     // a tenth of the vectors, which is 256,000 bytes.
-    let db = support::open_limited(&folder, 9 * MIB + 192 * KIB);
+    let room = 192 * KIB + support::limit_commit_bytes();
+    assert!(
+        room < VECTORS as usize * DIMENSION * 4,
+        "no room to hold all vectors"
+    );
+    let db = support::open_limited(
+        &folder,
+        support::opening::opening_charge(&folder, None) + room,
+    );
     let sql = "ALTER TABLE docs DROP COLUMN v";
     if let Err(error) = db.execute(sql, &params! {}) {
         panic!("{sql}\nof {VECTORS} vectors was refused under the limit: {error:?}");

@@ -23,13 +23,13 @@ VALUES (1, 'active', 1), (2, 'active', 1), (3, 'active', 2), (4, 'active', 3);
 # The statement says how many rows it named, not how many followed.
 UPDATE projects SET status = 'archived' WHERE id = 1;
 ----
-rows affected: 1
+rows affected: 1  (read 5, compared 0)
 
 # Task 1 followed its project. Task 2 was superseded, a state that lists no next state, and is
 # left as it is. Tasks 3 and 4 name another project and none.
 SELECT id, status FROM tasks ORDER BY id;
 ----
-id | status
+id | status  (read 4, compared 0)
 1 | invalidated
 2 | superseded
 3 | active
@@ -39,7 +39,7 @@ id | status
 # step of task 2 did not move, because task 2 did not.
 SELECT id, status FROM steps ORDER BY id;
 ----
-id | status
+id | status  (read 4, compared 0)
 1 | invalidated
 2 | invalidated
 3 | active
@@ -48,11 +48,11 @@ id | status
 # A task that is moved by its own statement is followed the same way.
 UPDATE tasks SET status = 'invalidated' WHERE id = 3;
 ----
-rows affected: 1
+rows affected: 1  (read 2, compared 0)
 
 SELECT id, status FROM steps ORDER BY id;
 ----
-id | status
+id | status  (read 4, compared 0)
 1 | invalidated
 2 | invalidated
 3 | active
@@ -63,7 +63,7 @@ UPDATE tasks SET status = 'superseded' WHERE id = 4;
 INSERT INTO steps (id, status, task_id) VALUES (5, 'active', 4);
 SELECT id, status FROM steps WHERE id = 5;
 ----
-id | status
+id | status  (read 1, compared 0)
 5 | active
 
 # ABORT ON FAILURE: one row that cannot follow refuses the statement, and the row that was to
@@ -82,13 +82,13 @@ error: PropagationAborted
 
 SELECT id, status FROM projects WHERE id >= 3 ORDER BY id;
 ----
-id | status
+id | status  (read 2, compared 0)
 3 | active
 4 | active
 
 SELECT id, status FROM strict_tasks ORDER BY id;
 ----
-id | status
+id | status  (read 3, compared 0)
 1 | active
 2 | superseded
 3 | active
@@ -96,11 +96,11 @@ id | status
 # Where every row can follow, the statement stands.
 UPDATE projects SET status = 'archived' WHERE id = 4;
 ----
-rows affected: 1
+rows affected: 1  (read 2, compared 0)
 
 SELECT id, status FROM strict_tasks ORDER BY id;
 ----
-id | status
+id | status  (read 3, compared 0)
 1 | active
 2 | superseded
 3 | invalidated
@@ -131,12 +131,12 @@ VALUES (1, '00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-0000
        (4, '00000000-0000-0000-0000-000000000005', '00000000-0000-0000-0000-000000000001', 'MENTIONS');
 UPDATE claims SET status = 'invalidated' WHERE id = '00000000-0000-0000-0000-000000000001';
 ----
-rows affected: 1
+rows affected: 1  (read 6, compared 0)
 
 # Claim 4 is cited by claim 1, which is the other way along the edge, and stays.
 SELECT id, status FROM claims ORDER BY id;
 ----
-id | status
+id | status  (read 5, compared 0)
 00000000-0000-0000-0000-000000000001 | invalidated
 00000000-0000-0000-0000-000000000002 | invalidated
 00000000-0000-0000-0000-000000000003 | invalidated
@@ -161,7 +161,7 @@ VALUES (11, '00000000-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000
 UPDATE pumps SET status = 'stopped' WHERE id = '00000000-0000-0000-0000-000000000011';
 SELECT id, status FROM pumps WHERE id <> '00000000-0000-0000-0000-000000000013' ORDER BY id;
 ----
-id | status
+id | status  (read 4, compared 0)
 00000000-0000-0000-0000-000000000011 | stopped
 00000000-0000-0000-0000-000000000012 | stopped
 00000000-0000-0000-0000-000000000014 | running
@@ -181,7 +181,7 @@ VALUES (21, '00000000-0000-0000-0000-000000000021', '00000000-0000-0000-0000-000
 UPDATE peers SET status = 'down' WHERE id = '00000000-0000-0000-0000-000000000021';
 SELECT id, status FROM peers ORDER BY id;
 ----
-id | status
+id | status  (read 4, compared 0)
 00000000-0000-0000-0000-000000000021 | down
 00000000-0000-0000-0000-000000000022 | down
 00000000-0000-0000-0000-000000000023 | down
@@ -204,11 +204,11 @@ error: PropagationAborted
 
 UPDATE grants SET status = 'revoked' WHERE id = '00000000-0000-0000-0000-000000000033';
 ----
-rows affected: 1
+rows affected: 1  (read 1, compared 0)
 
 SELECT id, status FROM grants ORDER BY id;
 ----
-id | status
+id | status  (read 3, compared 0)
 00000000-0000-0000-0000-000000000031 | live
 00000000-0000-0000-0000-000000000032 | released
 00000000-0000-0000-0000-000000000033 | revoked
@@ -225,11 +225,11 @@ INSERT INTO edges (id, source_id, target_id, edge_type)
 VALUES (111, '00000000-0000-0000-0000-000000000111', '00000000-0000-0000-0000-000000000112', 'CITES_FIRM'), (112, '00000000-0000-0000-0000-000000000112', '00000000-0000-0000-0000-000000000113', 'CITES_FIRM'), (113, '00000000-0000-0000-0000-000000000113', '00000000-0000-0000-0000-000000000111', 'CITES_FIRM'), (114, '00000000-0000-0000-0000-000000000999', '00000000-0000-0000-0000-000000000111', 'CITES_FIRM');
 UPDATE ring_firm SET status = 'invalidated' WHERE id = '00000000-0000-0000-0000-000000000111';
 ----
-rows affected: 1
+rows affected: 1  (read 8, compared 0)
 
 SELECT id, status FROM ring_firm ORDER BY id;
 ----
-id | status
+id | status  (read 4, compared 0)
 00000000-0000-0000-0000-000000000111 | invalidated
 00000000-0000-0000-0000-000000000112 | invalidated
 00000000-0000-0000-0000-000000000113 | invalidated
@@ -246,11 +246,11 @@ INSERT INTO edges (id, source_id, target_id, edge_type)
 VALUES (301, '00000000-0000-0000-0000-000000000201', '00000000-0000-0000-0000-000000000202', 'FEEDS'), (302, '00000000-0000-0000-0000-000000000202', '00000000-0000-0000-0000-000000000203', 'FEEDS'), (303, '00000000-0000-0000-0000-000000000203', '00000000-0000-0000-0000-000000000204', 'FEEDS'), (304, '00000000-0000-0000-0000-000000000204', '00000000-0000-0000-0000-000000000205', 'FEEDS'), (305, '00000000-0000-0000-0000-000000000205', '00000000-0000-0000-0000-000000000206', 'FEEDS'), (306, '00000000-0000-0000-0000-000000000206', '00000000-0000-0000-0000-000000000207', 'FEEDS'), (307, '00000000-0000-0000-0000-000000000207', '00000000-0000-0000-0000-000000000208', 'FEEDS'), (308, '00000000-0000-0000-0000-000000000208', '00000000-0000-0000-0000-000000000209', 'FEEDS'), (309, '00000000-0000-0000-0000-000000000209', '00000000-0000-0000-0000-00000000020a', 'FEEDS'), (310, '00000000-0000-0000-0000-00000000020a', '00000000-0000-0000-0000-00000000020b', 'FEEDS'), (311, '00000000-0000-0000-0000-00000000020b', '00000000-0000-0000-0000-00000000020c', 'FEEDS');
 UPDATE chain_nodes SET status = 'stopped' WHERE id = '00000000-0000-0000-0000-000000000201';
 ----
-rows affected: 1
+rows affected: 1  (read 21, compared 0)
 
 SELECT id, status FROM chain_nodes ORDER BY id;
 ----
-id | status
+id | status  (read 12, compared 0)
 00000000-0000-0000-0000-000000000201 | stopped
 00000000-0000-0000-0000-000000000202 | stopped
 00000000-0000-0000-0000-000000000203 | stopped
@@ -270,7 +270,7 @@ INSERT INTO fk_chain (id, status, prev) VALUES (1, 'open', NULL), (2, 'open', 1)
 UPDATE fk_chain SET status = 'closed' WHERE id = 1;
 SELECT id, status FROM fk_chain WHERE id IN (5, 11, 12) ORDER BY id;
 ----
-id | status
+id | status  (read 3, compared 0)
 5 | closed
 11 | closed
 12 | open
@@ -280,7 +280,7 @@ INSERT INTO tasks (id, status, project_id) VALUES (5, 'active', 2), (6, 'active'
 INSERT INTO projects (id, status) VALUES (2, 'active') ON CONFLICT (id) DO UPDATE SET status = 'archived';
 SELECT id, status FROM tasks WHERE id >= 5 ORDER BY id;
 ----
-id | status
+id | status  (read 2, compared 0)
 5 | invalidated
 6 | active
 

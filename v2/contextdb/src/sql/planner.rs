@@ -4,9 +4,9 @@
 //! chooses no index, no join order and no search: a SELECT's plan says what was written, and
 //! `query` decides how to answer it.
 
-use super::ast::{BinOp, Expr, Literal, OrderByItem, Select, SortDirection::Asc, Statement};
+use super::ast::{BinOp, Expr, OrderByItem, Select, SortDirection::Asc, Statement};
 use super::{not_carried, not_supported};
-use crate::types::{Error, Result};
+use crate::types::{Error, Result, Value};
 
 /// The functions that work one value out of many rows, in the order `query` names them.
 pub(crate) const AGGREGATES: [&str; 5] = ["count", "sum", "min", "max", "avg"];
@@ -25,6 +25,10 @@ pub(super) fn stands(statement: &Statement) -> Result<()> {
             let (_, written) = statement.written().expect("an UPDATE or DELETE");
             written.into_iter().try_for_each(in_a_write)
         }
+        Statement::Purge(selections) => selections
+            .iter()
+            .flat_map(|s| &s.where_clause)
+            .try_for_each(in_a_write),
         Statement::Select(select) => select_stands(select),
         Statement::Explain(statement) => stands(statement),
         _ => Ok(()),
@@ -80,7 +84,7 @@ fn calls_stand(expr: &Expr, grouped: bool) -> Result<()> {
             "{name} stands only in a select list, in ORDER BY or, for an aggregate, in HAVING"
         )));
     }
-    let mut inner = inside(expr).into_iter();
+    let mut inner = inside(expr);
     inner.try_for_each(|inner| calls_stand(inner, grouped))
 }
 
@@ -88,34 +92,27 @@ fn calls_stand(expr: &Expr, grouped: bool) -> Result<()> {
 /// `mut`, as `&mut` references. A SELECT inside an expression is a statement of its own.
 macro_rules! inside {
     ($name:ident, $iter:ident $(, $mut:tt)?) => {
-        pub(crate) fn $name(expr: &$($mut)? Expr) -> Vec<&$($mut)? Expr> {
-            match expr {
-                Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) | Expr::Subquery(_) => {
-                    Vec::new()
-                }
-                Expr::BinaryOp { left, right, .. }
-                | Expr::Distance { left, right }
+        pub(crate) fn $name(expr: &$($mut)? Expr) -> impl Iterator<Item = &$($mut)? Expr> {
+            let (one, many, order) = match expr {
+                Expr::BinaryOp { left, right, .. } | Expr::Distance { left, right }
                 | Expr::Like { expr: left, pattern: right, .. }
-                | Expr::Field { json: left, key: right, .. } => {
-                    vec![&$($mut)? **left, &$($mut)? **right]
-                }
-                Expr::UnaryOp { operand: inner, .. }
-                | Expr::IsNull { expr: inner, .. }
-                | Expr::InSubquery { expr: inner, .. } => vec![&$($mut)? **inner],
-                Expr::FunctionCall { args: items, .. } | Expr::Row(items) => {
-                    items.$iter().collect()
-                }
-                Expr::InList { expr, list, .. } => {
-                    std::iter::once(&$($mut)? **expr).chain(list).collect()
-                }
-                Expr::Between { expr, low, high, .. } => {
-                    vec![&$($mut)? **expr, &$($mut)? **low, &$($mut)? **high]
-                }
-                Expr::RowNumber { partition_by, order_by } => {
-                    let order = order_by.$iter().map(|key| &$($mut)? key.expr);
-                    partition_by.$iter().chain(order).collect()
-                }
-            }
+                | Expr::Field { json: left, key: right, .. } =>
+                    ([Some(& $($mut)? **left), Some(& $($mut)? **right), None], & $($mut)? [][..], & $($mut)? [][..]),
+                Expr::UnaryOp { operand, .. } | Expr::IsNull { expr: operand, .. }
+                | Expr::InSubquery { expr: operand, .. } =>
+                    ([Some(& $($mut)? **operand), None, None], & $($mut)? [][..], & $($mut)? [][..]),
+                Expr::FunctionCall { args, .. } | Expr::Row(args) =>
+                    ([None, None, None], & $($mut)? args[..], & $($mut)? [][..]),
+                Expr::InList { expr, list, .. } =>
+                    ([Some(& $($mut)? **expr), None, None], & $($mut)? list[..], & $($mut)? [][..]),
+                Expr::Between { expr, low, high, .. } =>
+                    ([Some(& $($mut)? **expr), Some(& $($mut)? **low), Some(& $($mut)? **high)], & $($mut)? [][..], & $($mut)? [][..]),
+                Expr::RowNumber { partition_by, order_by } =>
+                    ([None, None, None], & $($mut)? partition_by[..], & $($mut)? order_by[..]),
+                Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) | Expr::Subquery(_) =>
+                    ([None, None, None], & $($mut)? [][..], & $($mut)? [][..]),
+            };
+            one.into_iter().flatten().chain(many.$iter()).chain(order.$iter().map(|key| & $($mut)? key.expr))
         }
     };
 }
@@ -126,7 +123,7 @@ inside!(inside_mut, iter_mut, mut);
 /// a write does not carry. Refused here, the statement is refused whatever its table holds.
 fn in_a_write(expr: &Expr) -> Result<()> {
     fn distance(expr: &Expr) -> bool {
-        matches!(expr, Expr::Distance { .. }) || inside(expr).into_iter().any(distance)
+        matches!(expr, Expr::Distance { .. }) || inside(expr).any(distance)
     }
     forms_stand(expr)?;
     match distance(expr) {
@@ -162,11 +159,11 @@ fn forms_stand(expr: &Expr) -> Result<()> {
             let instead = "a scalar subquery supplies another row's vector";
             return Err(not_carried(&format!("{name}(...) beside <=>"), instead));
         }
-        _ => return inside(expr).into_iter().try_for_each(forms_stand),
+        _ => return inside(expr).try_for_each(forms_stand),
     };
     // A quoted text that is no JSON, compared with a JSON field.
     let word = |one: &Expr, other: &Expr| match (one, other) {
-        (Expr::Field { as_text: false, .. }, Expr::Literal(Literal::Text(text))) => {
+        (Expr::Field { as_text: false, .. }, Expr::Literal(Value::Text(text))) => {
             let json = serde_json::from_str::<serde_json::Value>(text);
             json.is_err().then(|| text.clone())
         }

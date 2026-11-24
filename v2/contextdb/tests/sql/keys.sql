@@ -33,7 +33,7 @@ error: UniqueViolation
 INSERT INTO people (id, email, name, family, given, born)
 VALUES (4, 'byron@example.com', 'Byron', 'Lovelace', 'Ada', 1816);
 ----
-rows affected: 1
+rows affected: 1  (read 0, compared 0)
 
 # A NULL in any column of a rule takes the row out of that rule: these two are alike in every
 # column a rule names.
@@ -69,7 +69,7 @@ error: UniqueViolation
 # Every refusal left the rows as they were, and the key finds its one row.
 SELECT id, email, name, family, given, born FROM people ORDER BY id;
 ----
-id | email | name | family | given | born
+id | email | name | family | given | born  (read 4, compared 0)
 1 | ada@example.com | Ada | Lovelace | Ada | 1815
 4 | byron@example.com | Byron | Lovelace | Ada | 1816
 5 | NULL | Five | Lovelace | NULL | 1815
@@ -77,7 +77,7 @@ id | email | name | family | given | born
 
 SELECT id, name FROM people WHERE id = 4;
 ----
-id | name
+id | name  (read 1, compared 0)
 4 | Byron
 
 # UNIQUE written as a rule of the table may name one column.
@@ -89,7 +89,7 @@ error: UniqueViolation
 
 SELECT id, code FROM codes ORDER BY id;
 ----
-id | code
+id | code  (read 1, compared 0)
 1 | a
 
 # Two rules of one table stay two rules whatever their columns are called: here one is on the
@@ -107,6 +107,6 @@ error: UniqueViolation
 INSERT INTO pairs (id, a, b, a_b) VALUES (4, 1, 3, 20);
 SELECT id, a, b, a_b FROM pairs ORDER BY id;
 ----
-id | a | b | a_b
+id | a | b | a_b  (read 2, compared 0)
 1 | 1 | 2 | 10
 4 | 1 | 3 | 20

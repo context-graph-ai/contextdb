@@ -27,7 +27,13 @@
 # memory limit that `index_reader_limit` prints unless the line's name says another, and each
 # group of such lines opens with a line ending in `_session` that says both. NUMBERS_LARGE=1
 # adds five million generated sightings, which takes the better part of an hour and is run
-# once for a landing.
+# once for a landing; NUMBERS_FIND_LARGE=1 adds ten and twenty million, longer still, whose
+# lines `sightings_10000000_find_...` and `sightings_20000000_find_...` end in the p95 of a find.
+#
+# IMPORT=<dump folder> takes the import of its first 100,008 passages on a 6 GiB machine
+# (the lines `import_100008_...`: statements refused, wall time, the most `memory_used` showed
+# and the most the process held), and IMPORT_OLD_WALL=<seconds> is the wall time of the same
+# import on the old engine at contextdb 56dccfdc, printed beside it.
 set -u
 cd "$(dirname "$0")/.." || exit 1
 scratch=$(mktemp -d) || exit 1
@@ -83,6 +89,14 @@ for what in readme million vectors; do
   rm -rf -- "$scratch/$what"
 done
 
+# A flat open of an 8 GiB store, and the camera day: 500 sightings a second for 86,400 seconds,
+# each turnover's store size and the last over the first (sustained writing reads its early
+# against late line from this run).
+example measure -- opens 8GiB "$scratch/opens" || echo "opens_measurements unavailable -"
+rm -rf -- "$scratch/opens"
+example measure -- camera 500 86400 "$scratch/camera" || echo "camera_measurements unavailable -"
+rm -rf -- "$scratch/camera"
+
 # Text files, one row a line: what was put in beside what the store takes.
 if [ -n "${SESSIONS:-}" ]; then
   IFS=: read -r corpus list count <<< "$SESSIONS"
@@ -94,14 +108,36 @@ else
 fi
 
 # Similarity search under each mode on generated vectors: a million of the index pilot's, then
-# a million sightings; and five million sightings when asked.
+# a million sightings; and five million sightings when asked, each large store also asked the
+# find with a bound on the distance before it is removed.
 example measure -- index "$scratch/index" || echo "index_measurements unavailable -"
 rm -rf -- "$scratch/index"
+# Recall of one, several and all partitions: a million sightings over 1, 8 and 64 Contexts.
+for contexts in 1 8 64; do
+  example measure -- sightings 1000000 --contexts "$contexts" "$scratch/contexts" ||
+    echo "sightings_contexts_${contexts}_measurements unavailable -"
+  rm -rf -- "$scratch/contexts"
+done
 if [ "${NUMBERS_LARGE:-}" = 1 ]; then
   example measure -- sightings 5000000 "$scratch/index" ||
     echo "sightings_5000000_measurements unavailable -"
+  example measure -- bound 5000000 "$scratch/index/built" ||
+    echo "sightings_5000000_bound_measurements unavailable -"
   rm -rf -- "$scratch/index"
 fi
+
+if [ "${NUMBERS_FIND_LARGE:-}" = 1 ]; then
+  for rows in 10000000 20000000; do
+    example measure -- sightings "$rows" "$scratch/index" ||
+      echo "sightings_${rows}_measurements unavailable -"
+    example measure -- bound "$rows" "$scratch/index/built" ||
+      echo "sightings_${rows}_bound_measurements unavailable -"
+    rm -rf -- "$scratch/index"
+  done
+fi
+# The lines `synthetic_1000000_store_size_after_build` and `synthetic_1000000_store_size` are
+# the million vectors' size once the index is built and again after the maintenance that
+# follows it, the second at or under the first.
 
 # Search passages: load, seal, build the index, search through SQL under each mode, and the
 # answers beside the recorded ones. First 10,000 passages of one partition of the second
@@ -126,6 +162,28 @@ passages() {
 passages passages_measurements "${PASSAGES:-}" sq8
 passages passages_large_measurements "${PASSAGES_LARGE:-}" sq8,tail
 passages passages_larger_measurements "${PASSAGES_LARGER:-}" tail
+
+# The import of the first 100,008 passages of a dump under a 6 GiB machine's memory, 500 to a
+# commit and a cycle after each, run under that much memory where systemd can limit it.
+if [ -n "${IMPORT:-}" ]; then
+  exe=$(cargo build --quiet --release --locked --manifest-path v2/Cargo.toml -p contextdb \
+    --example passages --message-format=json | grep -o '"executable":"[^"]*/passages"' | tail -n 1 | cut -d '"' -f 4)
+  limit=()
+  command -v systemd-run > /dev/null && limit=(systemd-run --user --scope --quiet -p MemoryMax=6G -p MemorySwapMax=0)
+  if [ -n "$exe" ]; then
+    "${limit[@]}" "$exe" import "$IMPORT" 100008 "$scratch/import" find || echo "import_100008_measurements unavailable -"
+  else
+    echo "import_100008_measurements unavailable -"
+  fi
+  rm -rf -- "$scratch/import"
+  if [ -n "${IMPORT_OLD_WALL:-}" ]; then
+    echo "import_100008_old_engine_wall $IMPORT_OLD_WALL s"
+  else
+    echo "import_100008_old_engine_wall unavailable -"
+  fi
+else
+  echo "import_100008_measurements unavailable -"
+fi
 
 # Context Graph's declarations and statements (the head of contextdb/examples/queries.rs):
 # its declarations; the second dump in its passages table; the anchors of every session file
@@ -163,9 +221,9 @@ else
   echo "cg_branch_measurements unavailable -"
 fi
 
-# From a fresh clone to a green `cargo test`: nothing built before.
+# From a fresh clone to a green `cargo nextest run` and the doc tests: nothing built before.
 start=$SECONDS
-if CARGO_TARGET_DIR="$scratch/fresh" cargo test --manifest-path v2/Cargo.toml --workspace --locked > "$scratch/fresh.log" 2>&1; then
+if CARGO_TARGET_DIR="$scratch/fresh" cargo nextest run --manifest-path v2/Cargo.toml --workspace --locked > "$scratch/fresh.log" 2>&1 && CARGO_TARGET_DIR="$scratch/fresh" cargo test --manifest-path v2/Cargo.toml --workspace --locked --doc >> "$scratch/fresh.log" 2>&1; then
   echo "fresh_clone_to_green_test $(minutes $((SECONDS - start))) min"
 else
   echo "fresh_clone_to_green_test unavailable -"

@@ -1,13 +1,22 @@
 //! Loads a dump of search passages into stores and measures searches on them under each mode,
 //! printing one number per line as `name value unit`.
 //!
-//! The program is called in three ways:
+//! The program is called in four ways:
 //!
 //! - `passages <dump folder> <answers folder> <folder> [sq8][,tail]`: every passage of the
 //!   dump, declared as Context Graph declares its table. Lines `passages_<count>_...`.
 //! - `passages single <dump folder> <folder>`: the first 10,000 passages, in dump order, of
 //!   the dump's (Context, generation) pair of index 1, in a table whose vector column also
 //!   declares `INDEXING_THRESHOLD 1000`. Lines `single_<count>_...`.
+//! - `passages import <dump folder> <count> <folder>`: the first `count` passages of the dump
+//!   in Context Graph's table under `SET MEMORY_LIMIT 1536M` (a quarter of a 6 GiB machine),
+//!   500 to a commit with a maintenance cycle after each, then cycles until nothing remains.
+//!   Lines `import_<count>_...`: wall time, the most `memory_used` showed (sampled every
+//!   millisecond), the most the operating system saw the process hold, and the statements
+//!   refused for memory.
+//!   With `find` after the folder, another thread searches the store as the import goes, all
+//!   of its pairs under AUTO, and the same searches are timed again once it is idle.
+//!   Then the closed store's size beside the bytes held.
 //! - `passages first single|store <dump folder> <store folder>`: what the program starts
 //!   itself as, to open a built store in a new process and run one search.
 //!
@@ -25,7 +34,7 @@
 //! and every read session opened under 1 GiB unless a line's name says another limit:
 //!
 //! 1. `sealed`: a store whose column declares `INDEXING_THRESHOLD 1000000000`, so that no partition
-//!    is ever grouped. One search of every question with every vector still waiting; cycles
+//!    is ever grouped. One search of every question with every vector still unindexed; cycles
 //!    until nothing waits; its size; EXACT in each scope (`exact_before`).
 //! 2. `built`: the store as its case declares it. Cycles until nothing remains; what
 //!    inspection says of the index; its size; in a new process, opening it and one search;
@@ -67,7 +76,7 @@ use contextdb::serde_json::Value as Json;
 use contextdb::{Database, Uuid, Value, params};
 use support::{
     AUTO, Asked, EXACT, Fallible, INDEXED, READER_LIMIT, Values, against, ask, counted, line,
-    mebibytes, ratio, seconds, selected, session, setting, timed, times, work,
+    mebibytes, peak_resident_bytes, ratio, seconds, session, setting, spread, timed, times,
 };
 
 #[global_allocator]
@@ -303,6 +312,88 @@ fn load(db: &Database, dump: &Dump, places: &[usize]) -> Fallible<u64> {
     Ok(held)
 }
 
+/// The import of the first `count` passages: 500 to a commit and a cycle after each, then
+/// the cycles that remain, under a memory limit of 1,536 MiB. A statement refused for memory
+/// stops the program after printing its count.
+fn import(dump: &Dump, count: usize, folder: &Path, find: bool) -> Fallible<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{RecvTimeoutError, channel};
+    support::must_be_empty(folder);
+    std::fs::create_dir_all(folder)?;
+    let store = folder.join("import");
+    let db = create(&store, "", "")?;
+    db.execute("SET MEMORY_LIMIT 1536M", &params! {})?;
+    let places: Vec<usize> = (0..count.min(dump.passages.len())).collect();
+    let name = |what: &str| format!("import_{}_{what}", places.len());
+    let pairs = dump.active(&(0..dump.contexts.len()).collect::<Vec<_>>());
+    let questions = dump.questions.iter().filter(|_| find);
+    let searches: Vec<_> = questions.map(|q| statement(&pairs, &[], AUTO, q)).collect();
+    let (stop, stopped) = channel::<()>();
+    let peak = AtomicUsize::new(0);
+    let (database, peaked) = (&db, &peak);
+    let (finished, wall) = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            loop {
+                if let Ok(used) = database.memory_used() {
+                    peaked.fetch_max(used, Ordering::Relaxed);
+                }
+                let wait = std::time::Duration::from_millis(1);
+                if stopped.recv_timeout(wait) != Err(RecvTimeoutError::Timeout) {
+                    break;
+                }
+            }
+        });
+        let result = timed(|| {
+            support::during(&store, &searches, || -> Fallible<u64> {
+                let mut held = 0;
+                for chunk in places.chunks(PER_COMMIT) {
+                    held += load(&db, dump, chunk)?;
+                    db.run_maintenance_cycle()?;
+                }
+                support::maintenance(&db)?;
+                Ok(held)
+            })
+        });
+        drop(stop);
+        result
+    });
+    let (finished, searched) = finished?;
+    let refused = u64::from(matches!(
+        finished
+            .as_ref()
+            .err()
+            .and_then(|e| e.downcast_ref::<contextdb::Error>()),
+        Some(contextdb::Error::MemoryBudgetExceeded { .. })
+    ));
+    line(&name("refused"), refused, "statements");
+    line(&name("wall"), seconds(wall), "s");
+    line(
+        &name("memory_used_peak"),
+        mebibytes(peak.load(Ordering::Relaxed) as u64),
+        "MiB",
+    );
+    if let Some(bytes) = peak_resident_bytes() {
+        line(&name("resident_peak"), mebibytes(bytes), "MiB");
+    }
+    let held = finished?;
+    if find {
+        spread(&name("find_during"), &searched);
+        let reader = session(&store, READER_LIMIT)?;
+        let mut idle = Vec::new();
+        for (sql, values) in &searches {
+            let (found, time) = timed(|| reader.execute(sql, values));
+            found?;
+            idle.push(time);
+        }
+        spread(&name("find_idle"), &idle);
+    }
+    db.close()?;
+    let bytes = support::bytes_on_disk(&store)?;
+    line(&name("store_size"), mebibytes(bytes), "MiB");
+    line(&name("size_over_held"), ratio(bytes, held), "x");
+    Ok(())
+}
+
 /// Context Graph's search statement for these pairs, with its values: `tail` is what follows
 /// `ORDER BY distance`, and `among`, when it holds any, adds the condition that the passage's
 /// id lies in one of these ranges, at or after a range's first id and before its second.
@@ -344,21 +435,6 @@ fn statement(
          ORDER BY distance{tail}"
     );
     (sql, values)
-}
-
-/// The key tuples of these pairs as the store writes them: for each of the two ids the tag
-/// of a UUID and its bytes.
-fn tuples(pairs: &[(Uuid, Uuid)]) -> Vec<Vec<u8>> {
-    let tuple = |(context, generation): &(Uuid, Uuid)| {
-        [
-            &[5][..],
-            &context.as_bytes()[..],
-            &[5],
-            &generation.as_bytes()[..],
-        ]
-        .concat()
-    };
-    pairs.iter().map(tuple).collect()
 }
 
 /// Compares a scope's answers with the recorded ones: how many questions have the same ten
@@ -460,11 +536,11 @@ fn hundredth(case: &Case<'_>) -> Option<(Ranges, usize, usize)> {
 }
 
 /// The second store, declared as the case says, and every line taken on it.
-fn built(case: &Case<'_>, folder: &Path, held: u64, sealed: u64) -> Fallible<()> {
+fn built(case: &Case<'_>, folder: &Path, held: u64) -> Fallible<()> {
     let (dump, store) = (case.dump, folder.join("built"));
     let db = create(&store, "", case.declared)?;
     load(&db, dump, &case.loaded)?;
-    let parts = support::built(&case.prefix, &db, &store, (held, sealed, DIMENSIONS))?;
+    support::built(&case.prefix, &db, &store, held)?;
     let kind = if case.answers.is_some() {
         "store"
     } else {
@@ -483,14 +559,12 @@ fn built(case: &Case<'_>, folder: &Path, held: u64, sealed: u64) -> Fallible<()>
     let mut asked = Vec::new();
     for (scope, pairs) in &case.scopes {
         let find = |tail: &str, question: &[f32]| statement(pairs, &[], tail, question);
-        let parts = selected(&parts, &tuples(pairs));
-        let how = (ROUNDS, &parts[..]);
         asked.push(support::modes(
             &case.find(scope),
             &reader,
             &find,
             &dump.questions,
-            how,
+            ROUNDS,
         )?);
     }
     if let Some(answers) = case.answers {
@@ -598,16 +672,14 @@ fn tail(case: &Case<'_>, store: &Path) -> Fallible<()> {
     }
     let db = create(store, "", case.declared)?;
     load(&db, dump, &first)?;
-    support::upkeep(&db)?;
+    support::maintenance(&db)?;
     load(&db, dump, &last)?;
-    let cycles = support::upkeep(&db)?;
+    let cycles = support::maintenance(&db)?;
     db.close()?;
     line(&case.name("tail_passages"), last.len(), "passages");
     line(&case.name("tail_cycles"), cycles, "cycles");
 
-    let parts = support::parts(store, DIMENSIONS)?;
     let (scope, pairs) = case.widest();
-    let parts = selected(&parts, &tuples(pairs));
     let find = |tail: &str, question: &[f32]| statement(pairs, &[], tail, question);
     let reader = session(store, READER_LIMIT)?;
     let asked = ask(&reader, &find, &[EXACT, INDEXED], &dump.questions, ROUNDS)?;
@@ -626,7 +698,6 @@ fn tail(case: &Case<'_>, store: &Path) -> Fallible<()> {
     times(&name, &asked[1]);
     counted(&name, &asked[1]);
     against(&name, &asked[1], &asked[0]);
-    work(&name, &asked[1], &parts, &dump.questions);
     let name = format!("{scope_find}_own_tail_found");
     support::own(&name, &reader, &find, &dump.stored(&last, 100)?)
 }
@@ -637,7 +708,7 @@ fn reduced(case: &Case<'_>, store: &Path, sealed: u64, exact: &[Asked]) -> Falli
     let dump = case.dump;
     let db = create(store, " WITH (quantization = 'SQ8')", NEVER_GROUPED)?;
     load(&db, dump, &case.loaded)?;
-    support::upkeep(&db)?;
+    support::maintenance(&db)?;
     db.close()?;
     let reader = session(store, READER_LIMIT)?;
     let mut compared = Vec::new();
@@ -701,7 +772,7 @@ fn measure(case: &Case<'_>, folder: &Path, extras: &str) -> Fallible<()> {
         line(&case.name("indexing_threshold"), 1000, "vectors");
     }
     let (held, sealed_bytes, exact) = sealed(case, &folder.join("sealed"))?;
-    built(case, folder, held, sealed_bytes)?;
+    built(case, folder, held)?;
     if extras.split(',').any(|extra| extra == "sq8") {
         reduced(case, &folder.join("sq8"), sealed_bytes, &exact)?;
     }
@@ -727,6 +798,15 @@ fn main() -> Fallible<()> {
             let search = statement(pairs, &[], AUTO, &dump.questions[0]);
             support::first(Path::new(store), (&case.name("open"), &first), &search)
         }
+        ["import", dump, count, folder] | ["import", dump, count, folder, "find"] => {
+            let dump = read_dump(Path::new(dump))?;
+            import(
+                &dump,
+                count.parse()?,
+                Path::new(folder),
+                arguments.len() == 5,
+            )
+        }
         ["single", dump, folder] => {
             let dump = read_dump(Path::new(dump))?;
             measure(&Case::single(&dump), Path::new(folder), "")
@@ -739,7 +819,8 @@ fn main() -> Fallible<()> {
         _ => {
             eprintln!(
                 "usage: passages <dump folder> <answers folder> <folder> [sq8][,tail]\n       \
-                 passages single <dump folder> <folder>"
+                 passages single <dump folder> <folder>\n       \
+                 passages import <dump folder> <count> <folder> [find]"
             );
             std::process::exit(2);
         }

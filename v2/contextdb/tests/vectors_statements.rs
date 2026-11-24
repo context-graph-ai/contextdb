@@ -7,8 +7,8 @@ mod support;
 use std::sync::{Arc, Mutex};
 
 use contextdb::{
-    Database, Error, ReadSession, ReadSessionOptions, Value, VectorIndexRef,
-    VectorPartitionDeclarationIssue, VectorPolicyDeclarationIssue, params,
+    Database, Error, ReadSession, Value, VectorIndexRef, VectorPartitionDeclarationIssue,
+    VectorPolicyDeclarationIssue, params,
 };
 
 use support::{Call, Near, Run};
@@ -126,8 +126,8 @@ fn vector_search_mode_routes_each_request() {
                 };
                 // USE VECTOR overrides the column's mode: each of the three answers on every
                 // table. No column here holds the 100,000 vectors from which AUTO uses a
-                // grouping, so AUTO and EXACT are one search: the same rows for the same
-                // counted work. And no partition has a grouping, so INDEXED searches it whole
+                // IVF, so AUTO and EXACT are one search: the same rows for the same
+                // counted work. And no partition has an IVF, so INDEXED searches it whole
                 // and returns the same rows.
                 let exact = answer("USE VECTOR EXACT");
                 assert_eq!(
@@ -192,7 +192,7 @@ fn indexed_search_is_refused_at_every_door() {
     fill(&tx, "small", 1..=300);
     tx.commit().expect("commit");
     // Two thousand pending rows in each of three partitions: twice the vectors a column of
-    // these clauses may have outside a grouping, so the index is behind its writes.
+    // these clauses may have outside an IVF, so the index is behind its writes.
     for table in ["plain", "indexed"] {
         let tx = db.transaction().expect("begin");
         fill(&tx, table, 1..=6000);
@@ -229,7 +229,7 @@ fn indexed_search_is_refused_at_every_door() {
         search_sql("empty", None, "USE VECTOR INDEXED", 5),
     ];
     let before = (
-        db.committed_watermark(),
+        support::watermark(&db),
         support::int(&db, "SELECT COUNT(*) FROM indexed"),
     );
     let reader = support::open_reader(&folder, None);
@@ -240,7 +240,7 @@ fn indexed_search_is_refused_at_every_door() {
         refused_as_indexed(support::search(&tx, sql, &query), table, sql);
         refused_as_indexed(support::search(&reader, sql, &query), table, sql);
     }
-    // A partition with no grouping and fewer vectors outside one than twice INDEXING_THRESHOLD is
+    // A partition with no IVF and fewer vectors outside one than twice INDEXING_THRESHOLD is
     // the index's one-group case: INDEXED answers it, and its answer and its work are EXACT's.
     let small = support::stored(&db, "SELECT id, ctx, tag, v FROM small");
     type Scope = (Option<&'static str>, fn(&[Value]) -> bool);
@@ -280,7 +280,7 @@ fn indexed_search_is_refused_at_every_door() {
     tx.rollback();
     assert_eq!(
         (
-            db.committed_watermark(),
+            support::watermark(&db),
             support::int(&db, "SELECT COUNT(*) FROM indexed")
         ),
         before
@@ -302,7 +302,7 @@ fn indexed_search_is_refused_at_every_door() {
     type Reads = Vec<(u64, u64)>;
     let reads_of = |sql: &str| -> (Reads, contextdb::Result<contextdb::QueryResult>) {
         let reads = Arc::new(Mutex::new(Reads::new()));
-        let mut options = ReadSessionOptions::default();
+        let mut options = support::reader_options(None);
         options.storage = Some(support::storage({
             let reads = reads.clone();
             move |call| {
@@ -355,6 +355,15 @@ fn indexed_search_is_refused_at_every_door() {
         exact_reads.len(),
         of_rows.len()
     );
+    // Back to the default route, AUTO answers where INDEXED refused.
+    let db = support::open(&folder);
+    support::run(
+        &db,
+        "ALTER TABLE indexed ALTER COLUMN v SET SEARCH_MODE AUTO",
+    );
+    let sql = search_sql("indexed", None, "", 5);
+    let restored = support::search(&db, &sql, &query).expect("AUTO answers");
+    assert_eq!(restored.rows().len(), 5, "the column INDEXED refused");
 }
 
 #[test]
@@ -383,7 +392,7 @@ fn the_largest_indexing_threshold_is_declared_and_served() {
     };
     served("twenty pending rows");
     let report = db.run_maintenance_cycle().expect("a maintenance cycle");
-    assert_eq!(report.vector.maintenance_vectors_done, 20);
+    assert_eq!(support::count(report.vector.maintenance_vectors_done), 20);
     served("twenty sealed rows");
 }
 
@@ -420,7 +429,7 @@ fn vector_query_errors_are_typed() {
     let reader = support::open_reader(&folder, None);
     let state = |db: &Database| {
         let rows = support::rows(db, "SELECT id, ctx, r, v, w FROM docs ORDER BY id");
-        (rows, db.committed_watermark())
+        (rows, support::watermark(db))
     };
     let before = state(&db);
 
@@ -685,7 +694,7 @@ fn words(declaration: &str, column: &str) -> Vec<String> {
 fn vector_column_declarations_are_checked_stored_and_printed_back() {
     let folder = support::folder("vector-declarations");
     let db = support::open(&folder);
-    let fresh = db.committed_watermark();
+    let fresh = support::watermark(&db);
 
     // Each clause that cannot stand, by its kind, naming the column; and no table declared.
     use VectorPartitionDeclarationIssue as Issue;
@@ -763,7 +772,7 @@ fn vector_column_declarations_are_checked_stored_and_printed_back() {
             }
             other => panic!("{sql}\nwas refused as {other:?}"),
         }
-        assert!(db.table_names().is_empty(), "{sql}\ndeclared a table");
+        assert!(support::names(&db).is_empty(), "{sql}\ndeclared a table");
     }
     for vector_column in [
         "v VECTOR(0)",
@@ -781,10 +790,10 @@ fn vector_column_declarations_are_checked_stored_and_printed_back() {
             }
             other => panic!("{sql}\nwas refused as {other:?}"),
         }
-        assert!(db.table_names().is_empty(), "{sql}\ndeclared a table");
+        assert!(support::names(&db).is_empty(), "{sql}\ndeclared a table");
     }
     assert_eq!(
-        db.committed_watermark(),
+        support::watermark(&db),
         fresh,
         "a refused declaration committed"
     );
@@ -873,7 +882,7 @@ fn vector_column_declarations_are_checked_stored_and_printed_back() {
         ),
         "{wrong}"
     );
-    assert!(db.table_names().is_empty());
+    assert!(support::names(&db).is_empty());
 
     let columns: Vec<String> = standing
         .iter()
@@ -938,14 +947,17 @@ fn vector_column_declarations_are_checked_stored_and_printed_back() {
     support::close(db);
     let db = support::open(&folder);
     assert_eq!(
-        db.declaration("t").expect("the declaration"),
-        printed,
+        db.declaration("t").expect("the declaration").as_str(),
+        printed.as_str(),
         "after reopen"
     );
     let reader = support::open_reader(&folder, None);
     assert_eq!(
-        reader.declaration("t").expect("a reader's declaration"),
-        printed
+        reader
+            .declaration("t")
+            .expect("a reader's declaration")
+            .as_str(),
+        printed.as_str()
     );
 
     // The printed text declares the same table in a new store.
@@ -955,8 +967,8 @@ fn vector_column_declarations_are_checked_stored_and_printed_back() {
         support::run(&again, statement);
     }
     assert_eq!(
-        again.declaration("t").expect("the declaration"),
-        printed,
+        again.declaration("t").expect("the declaration").as_str(),
+        printed.as_str(),
         "declared again"
     );
     check(
@@ -1112,7 +1124,7 @@ fn a_distance_in_the_where_of_a_write_is_refused_on_a_table_with_no_row() {
                 "INSERT INTO docs (id, r, v) VALUES (1, 0.25, [1.0, 0.0, 0.0, 0.0])",
             );
         }
-        let position = db.committed_watermark();
+        let position = support::watermark(&db);
         let tx = db.transaction().expect("begin");
         for sql in writes {
             let doors = [
@@ -1137,7 +1149,7 @@ fn a_distance_in_the_where_of_a_write_is_refused_on_a_table_with_no_row() {
         // The transaction is as usable as before, and nothing was written.
         assert_eq!(support::int(&tx, "SELECT COUNT(*) FROM docs"), rows);
         tx.rollback();
-        assert_eq!(db.committed_watermark(), position, "with {rows} rows");
+        assert_eq!(support::watermark(&db), position, "with {rows} rows");
         assert_eq!(support::int(&db, "SELECT COUNT(*) FROM docs"), rows);
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
@@ -1217,8 +1229,8 @@ fn a_filtered_search_reads_its_index_range_and_a_ranked_one_asks_every_vector() 
         "SELECT id FROM docs WHERE tag = 7 ORDER BY v <=> $q USE VECTOR INDEXED LIMIT 3".into(),
     );
     assert_eq!(by_index.distance_evaluations(), 4, "the rows of the tag");
-    // Ten tags are 40 of 200 rows: not few, so the index buys nothing and costs nothing; four
-    // rows of a range are few.
+    // Ten tags are 40 of 200 rows: not few, so the index saves reads, not distance evaluations;
+    // four rows of a range are few.
     let many = |table: &str| {
         ask(format!(
             "SELECT id FROM {table} WHERE tag IN (10, 11, 12, 13, 14, 15, 16, 17, 18, 19) \
@@ -1232,7 +1244,7 @@ fn a_filtered_search_reads_its_index_range_and_a_ranked_one_asks_every_vector() 
         bare.distance_evaluations(),
         "many rows are not walked"
     );
-    assert_eq!(indexed.rows_examined(), bare.rows_examined(), "nor read");
+    assert!(indexed.rows_examined() < bare.rows_examined());
     // A rank policy: EXACT asks every allowed vector, and each of the 40 candidates is one
     // lookup of its joined row (counted as a row examined).
     support::run(
@@ -1373,9 +1385,15 @@ fn the_index_clauses_are_read_checked_and_printed_back() {
     // text declares the same table in a new store.
     support::close(db);
     let db = support::open(&folder);
-    assert_eq!(db.declaration("t").expect("the declaration"), printed);
+    assert_eq!(
+        db.declaration("t").expect("the declaration").as_str(),
+        printed.as_str()
+    );
     let reader = support::open_reader(&folder, None);
-    assert_eq!(reader.declaration("t").expect("a reader's"), printed);
+    assert_eq!(
+        reader.declaration("t").expect("a reader's").as_str(),
+        printed.as_str()
+    );
     support::assert_roundtrips("index-clauses", &db, &["t"]);
 }
 
@@ -1383,7 +1401,7 @@ fn the_index_clauses_are_read_checked_and_printed_back() {
 fn the_index_clauses_are_refused_by_kind() {
     let folder = support::folder("index-clauses-refused");
     let db = support::open(&folder);
-    let fresh = db.committed_watermark();
+    let fresh = support::watermark(&db);
     use VectorPolicyDeclarationIssue as Issue;
     let quantization = Issue::InvalidMember {
         member: "quantization",
@@ -1452,8 +1470,8 @@ fn the_index_clauses_are_refused_by_kind() {
         format!(
             "{name} (...) is not part of this library: the index sizes its own groups and measures \
              how far a search scans; for the true nearest rows write USE VECTOR EXACT or \
-             SEARCH_MODE EXACT, and to move the size from which AUTO uses the index write \
-             INDEXING_THRESHOLD"
+             SEARCH_MODE EXACT, to move the size from which AUTO uses the index write \
+             INDEXING_THRESHOLD, and to bound how far a search scans write PROBES n"
         )
     };
     for (declared, sentence) in [
@@ -1478,6 +1496,9 @@ fn the_index_clauses_are_refused_by_kind() {
             other => panic!("{sql}\nwas not refused by name: {other:?}"),
         }
     }
-    assert!(db.table_names().is_empty(), "a refused statement declared");
-    assert_eq!(db.committed_watermark(), fresh);
+    assert!(
+        support::names(&db).is_empty(),
+        "a refused statement declared"
+    );
+    assert_eq!(support::watermark(&db), fresh);
 }
