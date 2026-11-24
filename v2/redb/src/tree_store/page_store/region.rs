@@ -106,17 +106,24 @@ pub(super) struct Allocators {
 
 impl Allocators {
     pub(super) fn new(layout: DatabaseLayout) -> Self {
+        Self::with_taken(layout, false)
+    }
+
+    pub(super) fn with_taken(layout: DatabaseLayout, taken: bool) -> Self {
         let mut region_allocators = vec![];
         let initial_regions = max(INITIAL_REGIONS, layout.num_regions());
         let mut region_tracker = RegionTracker::new(initial_regions, MAX_MAX_PAGE_ORDER + 1);
         for i in 0..layout.num_regions() {
             let region_layout = layout.region_layout(i);
-            let allocator = BuddyAllocator::new(
+            let allocator = BuddyAllocator::with_taken(
                 region_layout.num_pages(),
                 layout.full_region_layout().num_pages(),
+                taken,
             );
             let max_order = allocator.get_max_order();
-            region_tracker.mark_free(max_order, i);
+            if !taken {
+                region_tracker.mark_free(max_order, i);
+            }
             region_allocators.push(allocator);
         }
 

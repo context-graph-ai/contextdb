@@ -91,13 +91,14 @@ struct State {
     unprocessed_freed_non_durable_commits: BTreeSet<TransactionId>,
 }
 
-// Answers with the oldest commit that is read by a reader this tracker cannot see
-pub(crate) type HeldCommitsCallback = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+// Answers with the oldest commit that is read by a reader this tracker cannot see; absent until
+// the engine gives it, and a commit keeps its bookkeeping pages for such readers only when present
+pub(crate) type HeldCommitsCallback = Option<Arc<dyn Fn() -> Option<u64> + Send + Sync>>;
 
 pub(crate) struct TransactionTracker {
     state: Mutex<State>,
     live_write_transaction_available: Condvar,
-    oldest_held: HeldCommitsCallback,
+    pub(crate) oldest_held: HeldCommitsCallback,
 }
 
 impl TransactionTracker {
@@ -303,7 +304,11 @@ impl TransactionTracker {
     // Includes the commits held by readers that only the held commits callback knows of
     pub(crate) fn oldest_live_read_transaction(&self) -> Option<TransactionId> {
         // Called without the lock, because the callback is the caller's code
-        let held = (self.oldest_held)().map(TransactionId::new);
+        let held = self
+            .oldest_held
+            .as_ref()
+            .and_then(|held| held())
+            .map(TransactionId::new);
         let live = self
             .state
             .lock()

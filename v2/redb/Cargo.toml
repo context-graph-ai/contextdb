@@ -41,10 +41,6 @@ name = "bincode_keys"
 path = "examples/bincode_keys.rs"
 
 [[example]]
-name = "derive_value_impl"
-path = "examples/derive_value_impl.rs"
-
-[[example]]
 name = "int_keys"
 path = "examples/int_keys.rs"
 
@@ -102,7 +98,7 @@ version = "3.5.0"
 version = "1.17.0"
 features = ["v4"]
 
-[target.'cfg(target_os = "wasi")'.dependencies.libc]
+[target.'cfg(any(unix, target_os = "wasi"))'.dependencies.libc]
 version = "0.2.174"
 
 [lints.clippy]

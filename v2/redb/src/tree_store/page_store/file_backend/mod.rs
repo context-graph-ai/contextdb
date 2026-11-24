@@ -1,3 +1,5 @@
+mod allocation;
+pub use allocation::set_len as set_file_len;
 #[cfg(any(windows, unix, target_os = "wasi"))]
 mod optimized;
 #[cfg(any(windows, unix, target_os = "wasi"))]

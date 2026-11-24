@@ -218,6 +218,18 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
         self.tree.insert(key.borrow(), value.borrow())
     }
 
+    /// Insert without returning or copying the old value.
+    pub fn insert_discard<'k, 'v>(
+        &mut self,
+        key: impl Borrow<K::SelfType<'k>>,
+        value: impl Borrow<V::SelfType<'v>>,
+    ) -> Result<()> {
+        self.tree.keep_old = false;
+        let result = self.insert(key, value).map(drop);
+        self.tree.keep_old = true;
+        result
+    }
+
     /// Removes the given key
     ///
     /// Returns the old value, if the key was present in the table

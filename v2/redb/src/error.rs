@@ -4,6 +4,16 @@ use std::fmt::{Display, Formatter};
 use std::sync::PoisonError;
 use std::{io, panic};
 
+/// A growth refused by a declared file-size ceiling, before the backend is changed.
+#[derive(Debug)]
+pub struct FileSizeLimit(pub u64, pub u64);
+impl Display for FileSizeLimit {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "file size {} reaches limit {}", self.0, self.1)
+    }
+}
+impl std::error::Error for FileSizeLimit {}
+
 /// General errors directly from the storage layer
 #[derive(Debug)]
 #[non_exhaustive]

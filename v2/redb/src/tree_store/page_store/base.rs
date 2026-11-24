@@ -1,9 +1,9 @@
+use super::bitmap::U64GroupedBitmap;
 use crate::tree_store::page_store::cached_file::WritablePage;
 use crate::tree_store::page_store::page_manager::MAX_MAX_PAGE_ORDER;
 use std::cmp::Ordering;
 #[cfg(debug_assertions)]
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
@@ -273,75 +273,117 @@ impl Drop for PageMut<'_> {
 
 #[derive(Copy, Clone)]
 pub(crate) enum PageHint {
+    Recovery,
     None,
     Clean,
 }
 
 pub(crate) enum PageTrackerPolicy {
     Ignore,
-    Track(HashSet<PageNumber>),
+    Track(Vec<U64GroupedBitmap>, usize, usize),
     Closed,
 }
 
 impl PageTrackerPolicy {
     pub(crate) fn new_tracking() -> Self {
-        PageTrackerPolicy::Track(HashSet::new())
+        Self::Track(Vec::new(), 0, 0)
+    }
+
+    pub(crate) fn counts(&self) -> (usize, usize) {
+        match self {
+            Self::Track(_, count, entries) => (*count, *entries),
+            _ => (0, 0),
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
+        self.counts().0 == 0
+    }
+
+    fn bit(page: PageNumber) -> u32 {
+        ((page.page_index * 2 + 1) << page.page_order) - 1
+    }
+
+    pub(crate) fn contains(&self, page: &PageNumber) -> bool {
+        matches!(self, Self::Track(maps, _, _) if maps.get(page.region as usize)
+            .is_some_and(|map| Self::bit(*page) < map.len() && map.get(Self::bit(*page))))
+    }
+
+    pub(crate) fn covers(&self, region: u32, index: u32) -> bool {
+        (0..=super::page_manager::MAX_MAX_PAGE_ORDER)
+            .any(|order| self.contains(&PageNumber::new(region, index >> order, order)))
+    }
+
+    pub(crate) fn insert(&mut self, page: PageNumber) -> bool {
         match self {
-            PageTrackerPolicy::Ignore | PageTrackerPolicy::Closed => true,
-            PageTrackerPolicy::Track(x) => x.is_empty(),
+            Self::Ignore => true,
+            Self::Closed => panic!("Page tracker is closed"),
+            Self::Track(maps, count, entries) => {
+                maps.resize_with(maps.len().max(page.region as usize + 1), || {
+                    U64GroupedBitmap::new_full(0, 0)
+                });
+                let map = &mut maps[page.region as usize];
+                let bit = Self::bit(page);
+                if bit >= map.len() {
+                    map.resize(bit + 1, false);
+                }
+                if map.get(bit) {
+                    return false;
+                }
+                map.set(bit);
+                *count += 1usize << page.page_order;
+                *entries += 1;
+                true
+            }
         }
     }
 
-    pub(super) fn remove(&mut self, page: PageNumber) {
+    pub(crate) fn remove(&mut self, page: PageNumber) -> bool {
+        let present = self.contains(&page);
         match self {
-            PageTrackerPolicy::Ignore => {}
-            PageTrackerPolicy::Track(x) => {
-                assert!(x.remove(&page));
+            Self::Ignore => return true,
+            Self::Closed => panic!("Page tracker is closed"),
+            Self::Track(maps, count, entries) if present => {
+                maps[page.region as usize].clear(Self::bit(page));
+                *count -= 1usize << page.page_order;
+                *entries -= 1;
             }
-            PageTrackerPolicy::Closed => {
-                panic!("Page tracker is closed");
-            }
+            Self::Track(..) => {}
         }
+        present
     }
 
-    pub(super) fn insert(&mut self, page: PageNumber) {
-        match self {
-            PageTrackerPolicy::Ignore => {}
-            PageTrackerPolicy::Track(x) => {
-                assert!(x.insert(page));
-            }
-            PageTrackerPolicy::Closed => {
-                panic!("Page tracker is closed");
-            }
-        }
+    pub(crate) fn iter(&self) -> impl Iterator<Item = PageNumber> + '_ {
+        let maps = match self {
+            Self::Track(maps, _, _) => maps.as_slice(),
+            _ => &[],
+        };
+        maps.iter().enumerate().flat_map(|(region, map)| {
+            (0..map.len()).filter(|&bit| map.get(bit)).map(move |bit| {
+                let order = bit.trailing_ones();
+                PageNumber::new(
+                    region.try_into().unwrap(),
+                    bit >> (order + 1),
+                    order.try_into().unwrap(),
+                )
+            })
+        })
     }
 
-    pub(crate) fn close(&mut self) -> HashSet<PageNumber> {
-        let old = mem::replace(self, PageTrackerPolicy::Closed);
-        match old {
-            PageTrackerPolicy::Ignore => HashSet::new(),
-            PageTrackerPolicy::Track(x) => x,
-            PageTrackerPolicy::Closed => {
-                panic!("Page tracker is closed");
-            }
-        }
+    pub(crate) fn close(&mut self) -> Self {
+        assert!(!matches!(self, Self::Closed), "Page tracker is closed");
+        mem::replace(self, Self::Closed)
     }
 
-    pub(crate) fn reset(&mut self) -> HashSet<PageNumber> {
-        if matches!(self, PageTrackerPolicy::Ignore) {
-            return HashSet::new();
-        }
-        let old = mem::replace(self, PageTrackerPolicy::Track(HashSet::new()));
-        match old {
-            PageTrackerPolicy::Ignore => HashSet::new(),
-            PageTrackerPolicy::Track(x) => x,
-            PageTrackerPolicy::Closed => {
-                panic!("Page tracker is closed");
-            }
-        }
+    pub(crate) fn reset(&mut self) -> Self {
+        let next = if matches!(self, Self::Ignore) {
+            Self::Ignore
+        } else {
+            Self::new_tracking()
+        };
+        let old = mem::replace(self, next);
+        assert!(!matches!(old, Self::Closed), "Page tracker is closed");
+        old
     }
 }
 

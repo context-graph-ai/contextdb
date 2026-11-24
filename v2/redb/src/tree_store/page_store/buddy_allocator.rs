@@ -35,6 +35,10 @@ pub(crate) struct BuddyAllocator {
 
 impl BuddyAllocator {
     pub(crate) fn new(num_pages: u32, max_page_capacity: u32) -> Self {
+        Self::with_taken(num_pages, max_page_capacity, false)
+    }
+
+    pub(crate) fn with_taken(num_pages: u32, max_page_capacity: u32, taken: bool) -> Self {
         let max_order = calculate_usable_order(max_page_capacity);
 
         let mut capacity_for_order = max_page_capacity;
@@ -55,7 +59,7 @@ impl BuddyAllocator {
         }
 
         // Mark the available pages, starting with the highest order
-        let mut accounted_pages = 0;
+        let mut accounted_pages = if taken { num_pages } else { 0 };
         for order in (0..=max_order).rev() {
             let order_size = 2u32.pow(order.into());
             while accounted_pages + order_size <= num_pages {

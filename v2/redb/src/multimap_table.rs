@@ -4,7 +4,7 @@ use crate::sealed::Sealed;
 use crate::table::{ReadableTableMetadata, TableStats};
 use crate::tree_store::{
     AllPageNumbersBtreeIter, BRANCH, BranchAccessor, BranchMutator, Btree, BtreeHeader, BtreeMut,
-    BtreeRangeIter, BtreeStats, Checksum, DEFERRED, LEAF, LeafAccessor, LeafMutator,
+    BtreeRangeIter, BtreeStats, Checksum, DEFERRED, LEAF, LeafAccessor, LeafMutator, Listed,
     MAX_PAIR_LENGTH, MAX_VALUE_LENGTH, Page, PageHint, PageNumber, PagePath, PageTrackerPolicy,
     RawBtree, RawLeafBuilder, TransactionalMemory, UntypedBtree, UntypedBtreeMut, btree_stats,
 };
@@ -180,50 +180,33 @@ pub(crate) fn verify_tree_and_subtree_checksums(
     value_size: Option<usize>,
     mem: Arc<TransactionalMemory>,
     hint: PageHint,
+    listed: Option<&Listed>,
 ) -> Result<bool> {
-    if let Some(header) = root {
-        if !RawBtree::new(
-            Some(header),
-            key_size,
-            DynamicCollection::<()>::fixed_width_with(value_size),
-            mem.clone(),
-            hint,
-        )
-        .verify_checksum()?
-        {
-            return Ok(false);
-        }
-
-        let table_pages_iter = AllPageNumbersBtreeIter::new(
-            header,
-            key_size,
-            DynamicCollection::<()>::fixed_width_with(value_size),
-            mem.clone(),
-            hint,
-        )?;
-        for table_page in table_pages_iter {
-            let page = mem.get_page(table_page?, hint)?;
-            let subtree_roots = parse_subtree_roots(&page, key_size, value_size);
-            for header in subtree_roots {
-                if !RawBtree::new(
-                    Some(header),
-                    value_size,
-                    <()>::fixed_width(),
-                    mem.clone(),
-                    hint,
-                )
-                .verify_checksum()?
-                {
-                    return Ok(false);
-                }
+    RawBtree::new(
+        root,
+        key_size,
+        DynamicCollection::<()>::fixed_width_with(value_size),
+        mem.clone(),
+        hint,
+    )
+    .verify_checksum(listed, &mut |page| {
+        for root in parse_subtree_roots(page, key_size, value_size) {
+            if !RawBtree::new(
+                Some(root),
+                value_size,
+                <()>::fixed_width(),
+                mem.clone(),
+                hint,
+            )
+            .verify_checksum(listed, &mut |_| Ok(true))?
+            {
+                return Ok(false);
             }
         }
-    }
-
-    Ok(true)
+        Ok(true)
+    })
 }
 
-// Relocate all subtrees to lower index pages, if possible
 pub(crate) fn relocate_subtrees(
     root: (PageNumber, Checksum),
     key_size: Option<usize>,
@@ -232,6 +215,11 @@ pub(crate) fn relocate_subtrees(
     freed_pages: Arc<Mutex<Vec<PageNumber>>>,
     relocation_map: &HashMap<PageNumber, PageNumber>,
 ) -> Result<(PageNumber, Checksum)> {
+    let mut new_page = if let Some(new_page_number) = relocation_map.get(&root.0) {
+        mem.get_page_mut(*new_page_number)?
+    } else {
+        return Ok(root);
+    };
     let old_page = mem.get_checked_page(
         root.0,
         root.1,
@@ -239,11 +227,6 @@ pub(crate) fn relocate_subtrees(
         UntypedDynamicCollection::fixed_width_with(value_size),
         PageHint::None,
     )?;
-    let mut new_page = if let Some(new_page_number) = relocation_map.get(&root.0) {
-        mem.get_page_mut(*new_page_number)?
-    } else {
-        return Ok(root);
-    };
     let new_page_number = new_page.get_page_number();
     new_page.memory_mut().copy_from_slice(old_page.memory());
 
@@ -429,10 +412,13 @@ impl UntypedMultiBtree {
         }
     }
 
-    // Applies visitor to pages in the tree
-    pub(crate) fn visit_all_pages<F>(&self, mut visitor: F) -> Result
+    pub(crate) fn visit_pages_from<F>(
+        &self,
+        from: &[u32],
+        mut visitor: F,
+    ) -> Result<Option<Vec<u32>>>
     where
-        F: FnMut(&PagePath) -> Result,
+        F: FnMut(&PagePath, &mut bool, Option<&[u8]>) -> Result<bool>,
     {
         let tree = UntypedBtree::new(
             self.root,
@@ -441,34 +427,38 @@ impl UntypedMultiBtree {
             self.key_width,
             UntypedDynamicCollection::fixed_width_with(self.value_width),
         );
-        tree.visit_all_pages(|path| {
-            visitor(path)?;
-            let page = self.mem.get_page(path.page_number(), self.hint)?;
-            match page.memory()[0] {
-                LEAF => {
-                    for header in parse_subtree_roots(&page, self.key_width, self.value_width) {
-                        let subtree = UntypedBtree::new(
-                            Some(header),
-                            self.mem.clone(),
-                            self.hint,
-                            self.value_width,
-                            <() as Value>::fixed_width(),
-                        );
-                        subtree.visit_all_pages(|subpath| {
-                            let full_path = path.with_subpath(subpath);
-                            visitor(&full_path)
-                        })?;
-                    }
+        tree.visit_pages_from(from, |path, read, page, position| {
+            let Some(page) = page else {
+                *read = true;
+                return Ok((!visitor(path, read, None)?).then(|| position.to_vec()));
+            };
+            let (&first, rest) = position.split_first().unwrap_or((&0, &[]));
+            for (i, header) in parse_subtree_roots(page, self.key_width, self.value_width)
+                .into_iter()
+                .enumerate()
+                .skip(first as usize)
+            {
+                let subtree = UntypedBtree::new(
+                    Some(header),
+                    self.mem.clone(),
+                    self.hint,
+                    self.value_width,
+                    <()>::fixed_width(),
+                );
+                let pos = if i == first as usize { rest } else { &[] };
+                let at = subtree.visit_pages_from(pos, |p, read, page, pos| {
+                    Ok(
+                        (!visitor(&path.with_subpath(p), read, page.map(|p| p.memory()))?)
+                            .then(|| pos.to_vec()),
+                    )
+                })?;
+                if let Some(mut at) = at {
+                    at.insert(0, u32::try_from(i).unwrap());
+                    return Ok(Some(at));
                 }
-                BRANCH => {
-                    // No-op. The tree.visit_pages() call will process this sub-tree
-                }
-                _ => unreachable!(),
             }
-            Ok(())
-        })?;
-
-        Ok(())
+            Ok(None)
+        })
     }
 }
 

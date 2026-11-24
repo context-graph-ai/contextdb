@@ -3,6 +3,7 @@ mod base;
 mod bitmap;
 mod buddy_allocator;
 mod cached_file;
+mod commit_pages;
 mod fast_hash;
 pub mod file_backend;
 mod header;
@@ -11,6 +12,7 @@ mod lru_cache;
 mod page_manager;
 mod region;
 mod savepoint;
+mod sweep;
 #[allow(clippy::pedantic, dead_code)]
 mod xxh3;
 
@@ -19,6 +21,7 @@ pub(crate) use backends::ReadOnlyBackend;
 pub(crate) use base::{
     MAX_PAIR_LENGTH, MAX_VALUE_LENGTH, Page, PageHint, PageNumber, PageTrackerPolicy,
 };
+pub(crate) use commit_pages::Listed;
 pub(crate) use header::PAGE_SIZE;
 pub(crate) use page_manager::{
     FILE_FORMAT_VERSION3, ShrinkPolicy, TransactionalMemory, xxh3_checksum,

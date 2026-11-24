@@ -55,6 +55,7 @@ struct InsertionResult<'a, V: Value + 'static> {
 
 pub(crate) struct MutateHelper<'a, 'b, K: Key, V: Value> {
     root: &'b mut Option<BtreeHeader>,
+    pub(crate) keep_old: bool,
     modify_uncommitted: bool,
     mem: Arc<TransactionalMemory>,
     freed: &'b mut Vec<PageNumber>,
@@ -73,6 +74,7 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
     ) -> Self {
         Self {
             root,
+            keep_old: true,
             modify_uncommitted: true,
             mem,
             freed,
@@ -93,6 +95,7 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
     ) -> Self {
         Self {
             root,
+            keep_old: true,
             modify_uncommitted: false,
             mem,
             freed,
@@ -341,7 +344,12 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                 {
                     let page_number = page.get_page_number();
                     let existing_value = if found {
-                        let copied_value = accessor.entry(position).unwrap().value().to_vec();
+                        // Discard calls drop this empty replacement marker inside the fork.
+                        let copied_value = if self.keep_old {
+                            accessor.entry(position).unwrap().value().to_vec()
+                        } else {
+                            Vec::new()
+                        };
                         Some(AccessGuard::with_owned_value(copied_value))
                     } else {
                         None

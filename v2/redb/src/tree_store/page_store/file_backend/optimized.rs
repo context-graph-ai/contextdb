@@ -82,7 +82,7 @@ impl StorageBackend for FileBackend {
     }
 
     fn set_len(&self, len: u64) -> Result<(), io::Error> {
-        self.file.set_len(len)
+        super::allocation::set_len(&self.file, len)
     }
 
     fn sync_data(&self) -> Result<(), io::Error> {

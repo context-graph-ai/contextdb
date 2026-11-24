@@ -7,7 +7,7 @@ use crate::tree_store::btree_iters::BtreeExtractIf;
 use crate::tree_store::btree_mutator::MutateHelper;
 use crate::tree_store::page_store::{Page, PageImpl, PageMut, TransactionalMemory};
 use crate::tree_store::{
-    AccessGuardMutInPlace, AllPageNumbersBtreeIter, BtreeRangeIter, PageHint, PageNumber,
+    AccessGuardMutInPlace, AllPageNumbersBtreeIter, BtreeRangeIter, Listed, PageHint, PageNumber,
     PageTrackerPolicy,
 };
 use crate::types::{Key, MutInPlaceValue, Value};
@@ -68,7 +68,7 @@ pub(crate) struct UntypedBtree {
     root: Option<BtreeHeader>,
     hint: PageHint,
     key_width: Option<usize>,
-    _value_width: Option<usize>,
+    value_width: Option<usize>,
 }
 
 impl UntypedBtree {
@@ -84,45 +84,134 @@ impl UntypedBtree {
             root,
             hint,
             key_width,
-            _value_width: value_width,
+            value_width,
         }
     }
 
-    // Applies visitor to pages in the tree
-    pub(crate) fn visit_all_pages<F>(&self, mut visitor: F) -> Result
-    where
-        F: FnMut(&PagePath) -> Result,
-    {
-        if let Some(page_number) = self.root.map(|x| x.root) {
-            self.visit_pages_helper(PagePath::new_root(page_number), &mut visitor)?;
+    pub(crate) fn release_pages(&self, mut release: impl FnMut(PageNumber)) -> Result {
+        if let Some(root) = self.root {
+            self.release_pages_at(root.root, 0, &mut None, &mut release)?;
         }
-
         Ok(())
     }
 
-    fn visit_pages_helper<F>(&self, path: PagePath, visitor: &mut F) -> Result
+    fn release_pages_at(
+        &self,
+        number: PageNumber,
+        depth: usize,
+        leaves: &mut Option<usize>,
+        release: &mut impl FnMut(PageNumber),
+    ) -> Result {
+        if *leaves != Some(depth) {
+            let page = self.mem.get_page(number, self.hint)?;
+            match page.memory()[0] {
+                LEAF => *leaves = Some(depth),
+                BRANCH => {
+                    let branch = BranchAccessor::new(&page, self.key_width);
+                    for i in 0..branch.count_children() {
+                        self.release_pages_at(
+                            branch.child_page(i).unwrap(),
+                            depth + 1,
+                            leaves,
+                            release,
+                        )?;
+                    }
+                }
+                _ => return Err(crate::StorageError::Corrupted("Invalid table node".into())),
+            }
+            drop(page);
+        }
+        release(number);
+        Ok(())
+    }
+
+    pub(crate) fn visit_all_pages<F>(&self, mut f: F) -> Result
     where
         F: FnMut(&PagePath) -> Result,
     {
-        visitor(&path)?;
-        let page = self.mem.get_page(path.page_number(), self.hint)?;
+        self.visit_pages_from(&[], |p, _, page, _| {
+            if page.is_none() {
+                f(p)?;
+            }
+            Ok(None)
+        })
+        .map(drop)
+    }
 
+    pub(crate) fn visit_pages_from<F>(&self, from: &[u32], mut f: F) -> Result<Option<Vec<u32>>>
+    where
+        F: FnMut(&PagePath, &mut bool, Option<&PageImpl>, &[u32]) -> Result<Option<Vec<u32>>>,
+    {
+        match self.root {
+            Some(root) => {
+                let path = PagePath::new_root(root.root);
+                self.visit_pages_helper(path, root.checksum, from, &mut None, &mut f)
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn visit_pages_helper<F>(
+        &self,
+        path: PagePath,
+        expected: Checksum,
+        from: &[u32],
+        leaves: &mut Option<usize>,
+        visitor: &mut F,
+    ) -> Result<Option<Vec<u32>>>
+    where
+        F: FnMut(&PagePath, &mut bool, Option<&PageImpl>, &[u32]) -> Result<Option<Vec<u32>>>,
+    {
+        let depth = path.parents().len();
+        let mut read = *leaves != Some(depth);
+        if let Some(at) = visitor(&path, &mut read, None, from)? {
+            return Ok(Some(at));
+        }
+        if !read {
+            return Ok(None);
+        }
+        let page = if matches!(self.hint, PageHint::Recovery) {
+            if path.parents().contains(&path.page_number()) {
+                return Err(crate::StorageError::Corrupted(
+                    "Cyclic recovery tree".into(),
+                ));
+            }
+            self.mem.get_checked_page(
+                path.page_number(),
+                expected,
+                self.key_width,
+                self.value_width,
+                PageHint::Clean,
+            )?
+        } else {
+            self.mem.get_page(path.page_number(), self.hint)?
+        };
         match page.memory()[0] {
             LEAF => {
-                // No-op
+                *leaves = Some(depth);
+                return visitor(&path, &mut false, Some(&page), from);
             }
             BRANCH => {
                 let accessor = BranchAccessor::new(&page, self.key_width);
-                for i in 0..accessor.count_children() {
-                    let child_page = accessor.child_page(i).unwrap();
-                    let child_path = path.with_child(child_page);
-                    self.visit_pages_helper(child_path, visitor)?;
+                let (&first, rest) = from.split_first().unwrap_or((&0, &[]));
+                for i in first as usize..accessor.count_children() {
+                    let from = if i == first as usize { rest } else { &[] };
+                    let child = path.with_child(accessor.child_page(i).unwrap());
+                    if let Some(mut at) = self.visit_pages_helper(
+                        child,
+                        accessor.child_checksum(i).unwrap(),
+                        from,
+                        leaves,
+                        visitor,
+                    )? {
+                        at.insert(0, u32::try_from(i).unwrap());
+                        return Ok(Some(at));
+                    }
                 }
             }
             _ => unreachable!(),
         }
-
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -178,10 +267,15 @@ impl UntypedBtreeMut {
 
     fn finalize_dirty_checksums_helper(&mut self, page_number: PageNumber) -> Result<Checksum> {
         assert!(self.mem.uncommitted(page_number));
+        // A leaf's checksum only reads it; taking it writable would write the page a second time.
+        let read = self.mem.get_page(page_number, PageHint::None)?;
+        if read.memory()[0] == LEAF {
+            return leaf_checksum(&read, self.key_width, self.value_width);
+        }
+        drop(read);
         let mut page = self.mem.get_page_mut(page_number)?;
 
         match page.memory()[0] {
-            LEAF => leaf_checksum(&page, self.key_width, self.value_width),
             BRANCH => {
                 let accessor = BranchAccessor::new(&page, self.key_width);
                 let mut new_children = vec![];
@@ -331,6 +425,7 @@ impl UntypedBtreeMut {
 }
 
 pub(crate) struct BtreeMut<'a, K: Key + 'static, V: Value + 'static> {
+    pub(crate) keep_old: bool,
     mem: Arc<TransactionalMemory>,
     transaction_guard: Arc<TransactionGuard>,
     root: Option<BtreeHeader>,
@@ -350,6 +445,7 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<'_, K, V> {
         allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
     ) -> Self {
         Self {
+            keep_old: true,
             mem,
             transaction_guard: guard,
             root,
@@ -386,13 +482,6 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<'_, K, V> {
         } else {
             Ok(None)
         }
-    }
-
-    pub(crate) fn visit_all_pages<F>(&self, visitor: F) -> Result
-    where
-        F: FnMut(&PagePath) -> Result,
-    {
-        self.read_tree()?.visit_all_pages(visitor)
     }
 
     pub(crate) fn get_root(&self) -> Option<BtreeHeader> {
@@ -441,6 +530,7 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<'_, K, V> {
             freed_pages.as_mut(),
             self.allocated_pages.clone(),
         );
+        operation.keep_old = self.keep_old;
         let (old_value, _) = operation.insert(key, value)?;
         Ok(old_value)
     }
@@ -727,6 +817,7 @@ impl<'a, K: Key + 'a, V: MutInPlaceValue + 'a> BtreeMut<'a, K, V> {
             freed_pages.as_mut(),
             self.allocated_pages.clone(),
         );
+        operation.keep_old = false;
         let (_, guard) = operation.insert(key, &V::from_bytes(&value))?;
         Ok(guard)
     }
@@ -775,11 +866,14 @@ impl RawBtree {
         Ok(self.root.map_or(0, |x| x.length))
     }
 
-    pub(crate) fn verify_checksum(&self) -> Result<bool> {
-        if let Some(header) = self.root {
-            self.verify_checksum_helper(header.root, header.checksum)
-        } else {
-            Ok(true)
+    pub(crate) fn verify_checksum(
+        &self,
+        listed: Option<&Listed>,
+        leaf: &mut dyn FnMut(&PageImpl) -> Result<bool>,
+    ) -> Result<bool> {
+        match self.root {
+            Some(root) => self.verify_checksum_helper(root.root, root.checksum, listed, leaf),
+            None => Ok(true),
         }
     }
 
@@ -787,40 +881,40 @@ impl RawBtree {
         &self,
         page_number: PageNumber,
         expected_checksum: Checksum,
+        listed: Option<&Listed>,
+        leaf: &mut dyn FnMut(&PageImpl) -> Result<bool>,
     ) -> Result<bool> {
-        let page = self.mem.get_page(page_number, self.hint)?;
-        let node_mem = page.memory();
-        Ok(match node_mem[0] {
-            LEAF => {
-                if let Ok(computed) =
-                    leaf_checksum(&page, self.fixed_key_size, self.fixed_value_size)
-                {
-                    expected_checksum == computed
-                } else {
-                    false
-                }
-            }
+        // With a list, a page it does not name was checked by an earlier commit
+        match listed.map(|listed| listed.first(page_number)) {
+            Some(None) => return Ok(true),
+            Some(Some(false)) => return Ok(false),
+            _ => {}
+        }
+        let page = self.mem.get_checked_page(
+            page_number,
+            expected_checksum,
+            self.fixed_key_size,
+            self.fixed_value_size,
+            self.hint,
+        )?;
+        match page.memory()[0] {
+            LEAF => leaf(&page),
             BRANCH => {
-                if let Ok(computed) = branch_checksum(&page, self.fixed_key_size) {
-                    if expected_checksum != computed {
-                        return Ok(false);
-                    }
-                } else {
-                    return Ok(false);
-                }
                 let accessor = BranchAccessor::new(&page, self.fixed_key_size);
                 for i in 0..accessor.count_children() {
                     if !self.verify_checksum_helper(
                         accessor.child_page(i).unwrap(),
                         accessor.child_checksum(i).unwrap(),
+                        listed,
+                        leaf,
                     )? {
                         return Ok(false);
                     }
                 }
-                true
+                Ok(true)
             }
-            _ => false,
-        })
+            _ => Ok(false),
+        }
     }
 }
 
@@ -874,17 +968,6 @@ impl<K: Key, V: Value> Btree<K, V> {
 
     pub(crate) fn get_root(&self) -> Option<BtreeHeader> {
         self.root
-    }
-
-    pub(crate) fn verify_checksum(&self) -> Result<bool> {
-        RawBtree::new(
-            self.get_root(),
-            K::fixed_width(),
-            V::fixed_width(),
-            self.mem.clone(),
-            self.hint,
-        )
-        .verify_checksum()
     }
 
     pub(crate) fn visit_all_pages<F>(&self, visitor: F) -> Result
