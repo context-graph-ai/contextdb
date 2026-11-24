@@ -7,54 +7,74 @@ VALUES (1, 7, 0.5, 'north'), (2, 6, 1.5, NULL), (3, NULL, NULL, 'east');
 # A SELECT needs no table. An expression with no name is called ?column?.
 SELECT 1 + 1;
 ----
-?column?
+?column?  (read 0, compared 0)
 2
 
 SELECT id, qty * 2 FROM sales WHERE id = 1;
 ----
-id | ?column?
+id | ?column?  (read 1, compared 0)
 1 | 14
 
 # An aggregate or a function with no name is called by its own, in lower case.
 SELECT COUNT(*), SUM(qty), MIN(qty), MAX(qty), AVG(qty) FROM sales;
 ----
-count | sum | min | max | avg
+count | sum | min | max | avg  (read 3, compared 0)
 3 | 13 | 6 | 7 | 6.5
 
 SELECT COALESCE(region, 'none') FROM sales ORDER BY id;
 ----
-coalesce
+coalesce  (read 3, compared 0)
 north
 none
 east
 
+SELECT COALESCE(NULL, NULL, 3), COALESCE(region, NULL, 'z') FROM sales WHERE id < 3 ORDER BY id;
+----
+coalesce | *
+3 | north
+3 | z
+
+# COALESCE of a whole number and a REAL is a REAL, whichever value it chooses.
+SELECT COALESCE(1, 1.5) / 2 AS h;
+----
+h  (read 0, compared 0)
+0.5
+
 # SUM of an INTEGER column is an INTEGER, and of a REAL column a REAL.
 SELECT SUM(qty) AS whole, SUM(price) AS part FROM sales;
 ----
-whole | part
+whole | part  (read 3, compared 0)
 13 | 2.0
 
 # A name after an expression or a table is its alias, with or without AS.
 SELECT x.qty total FROM sales x WHERE x.id = 1;
 ----
-total
+total  (read 1, compared 0)
 7
+
+SELECT qty limit FROM sales;
+----
+error: ParseError
+
+SELECT qty FROM sales order;
+----
+error: ParseError
 
 SELECT qty AS total FROM sales AS x WHERE x.id = 1;
 ----
-total
+total  (read 1, compared 0)
 7
 
 # Rows of values compare with = and <>, column by column: two rows differ when any column
 # does, whatever the others hold.
 SELECT id FROM sales WHERE (qty, region) = (7, 'north');
 ----
-id
+id  (read 3, compared 0)
 1
 
 SELECT id FROM sales WHERE (id, qty) <> (1, 7) ORDER BY id;
 ----
-id
+id  (read 3, compared 0)
 2
 3
 
@@ -78,13 +98,13 @@ CREATE TABLE own_ids (row_id TEXT NOT NULL);
 INSERT INTO own_ids VALUES ('k-99');
 SELECT * FROM own_ids;
 ----
-row_id
+row_id  (read 1, compared 0)
 k-99
 
 # Whole numbers stay whole, and a NULL operand gives NULL.
 SELECT 7 / 2 AS whole, 7 * 0.5 AS mixed, 1.5 - 1 AS real, NULL + 1 AS unknown;
 ----
-whole | mixed | real | unknown
+whole | mixed | real | unknown  (read 0, compared 0)
 3 | 3.5 | 0.5 | NULL
 
 # What does not fit a column, divides by zero or adds a number to text is refused, never wrapped.
@@ -111,13 +131,23 @@ error: PlanError
 # The high bound of a BETWEEN and the items of an IN list may be scalar subqueries.
 SELECT id FROM sales WHERE id BETWEEN 1 AND (SELECT MAX(qty) FROM sales) ORDER BY id;
 ----
-id
+id  (read 6, compared 0)
 1
 2
 3
 
 SELECT id FROM sales WHERE id IN (1, (SELECT MAX(id) FROM sales)) ORDER BY id;
 ----
-id
+id  (read 5, compared 0)
 1
 3
+
+SELECT 1 = 1 OR 7 / 0 = 1;
+----
+*
+true
+
+SELECT 1 = 2 AND 7 / 0 = 1;
+----
+*
+false

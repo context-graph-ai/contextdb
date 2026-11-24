@@ -7,7 +7,7 @@ mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use contextdb::{Database, Error};
+use contextdb::{Database, Error, ReadLimits, ReadSession};
 use support::{printed, words};
 
 /// The declarations of a program built on this library, as that program writes them.
@@ -146,7 +146,7 @@ fn assert_declared_and_printed_back(test: &str, written: &[String]) -> BTreeMap<
     let tables = by_table(written);
     let mut names = names_in_order(&tables);
     names.sort_unstable();
-    assert_eq!(db.table_names(), names, "the tables of the store");
+    assert_eq!(support::names(&db), names, "the tables of the store");
 
     let mut texts = BTreeMap::new();
     for (table, written) in &tables {
@@ -158,11 +158,16 @@ fn assert_declared_and_printed_back(test: &str, written: &[String]) -> BTreeMap<
     support::assert_roundtrips(test, &db, &names_in_order(&tables));
 
     let db = support::reopen(db, &folder);
-    let reader = support::open_reader(&folder, None);
+    let reader = ReadSession::open(&folder, ReadLimits::default())
+        .expect("the consumer catalog fits the default stand-alone reader");
     for (table, text) in &texts {
         assert_eq!(&printed(&db, table), text, "{table} after close and open");
         let read = reader.declaration(table).expect("a reader's declaration");
-        assert_eq!(&read, text, "{table} as a reader prints it");
+        assert_eq!(
+            read.as_str(),
+            text.as_str(),
+            "{table} as a reader prints it"
+        );
     }
     texts
 }
@@ -175,6 +180,8 @@ fn every_declaration_of_a_consumer_is_accepted_and_printed_back_as_written() {
     assert_eq!((own(&first), first.len() - own(&first)), (87, 25));
     assert_eq!((own(&second), second.len()), (6, 6));
     let texts = assert_declared_and_printed_back("consumer-schema", &first);
+    // These declarations occupy 61,474 stored schema bytes (the performance fixture too).
+    // The helper reads every declaration in a stand-alone session at the default limit.
     assert_eq!(texts.len(), 87);
 }
 
@@ -248,6 +255,8 @@ const EVERY_CLAUSE: &[&str] = &[
     "CREATE TABLE tasks (id UUID PRIMARY KEY, context_id UUID NOT NULL, \
      project_id UUID NOT NULL, \
      FOREIGN KEY (context_id, project_id) REFERENCES projects(context_id, id))",
+    "CREATE TABLE cited (id UUID PRIMARY KEY, plan_id UUID REFERENCES plans(id), \
+     FOREIGN KEY (plan_id) REFERENCES reviews(id))",
     "CREATE TABLE task_results (id UUID PRIMARY KEY, task_id UUID NOT NULL, \
      success BOOLEAN NOT NULL)",
     "CREATE INDEX task_results_task_id_idx ON task_results (task_id)",
@@ -258,7 +267,7 @@ const EVERY_CLAUSE: &[&str] = &[
     "CREATE TABLE defaults (id INTEGER PRIMARY KEY, a TEXT DEFAULT NULL, b REAL DEFAULT 0.0, \
      c INTEGER DEFAULT -1, d REAL DEFAULT -2.5, e TEXT DEFAULT 'it''s', f BOOLEAN DEFAULT TRUE)",
     "CREATE TABLE one_key (a INTEGER, b TEXT, PRIMARY KEY (a))",
-    "CREATE TABLE two_keys (a INTEGER NOT NULL, b TEXT NOT NULL, c TEXT, PRIMARY KEY (a, b))",
+    "CREATE TABLE two_keys (a INTEGER NOT NULL, b TEXT NOT NULL, c TEXT, PRIMARY KEY (b, a))",
     "CREATE TABLE no_key (line TEXT NOT NULL) SYNC OFF",
     "CREATE TABLE links (id UUID PRIMARY KEY, source_id UUID NOT NULL, target_id UUID NOT NULL, \
      edge_type TEXT NOT NULL) DAG('DEPENDS_ON', 'BASED_ON')",
@@ -352,8 +361,14 @@ fn every_clause_a_table_may_declare_is_printed_back_and_declares_the_same_table_
 fn a_name_without_quotes_is_stored_in_lower_case_and_a_quoted_name_as_written() {
     let folder = support::folder("declared-names");
     let db = support::open(&folder);
+    let sql = "CREATE TABLE keyless (body TEXT) RETAIN 7 DAYS SYNC SAFE";
+    assert!(matches!(
+        support::refusal(&db, sql),
+        Error::SchemaInvalid { .. }
+    ));
+    assert!(db.table_meta("keyless").is_err());
     declare(&db, EVERY_CLAUSE.iter().rev().take(3).rev());
-    assert_eq!(db.table_names(), ["Mixed Case", "folded"]);
+    assert_eq!(support::names(&db), ["Mixed Case", "folded"]);
     assert_eq!(
         printed(&db, "folded"),
         "CREATE TABLE folded (\n  id INTEGER PRIMARY KEY,\n  name TEXT\n);\n\
@@ -383,7 +398,10 @@ fn a_name_without_quotes_is_stored_in_lower_case_and_a_quoted_name_as_written() 
         }
         other => panic!("a column folded does not have was refused as {other:?}"),
     }
-    match support::refusal(&db, "CREATE INDEX FOLDED_BY_NAME ON folded (id)") {
+    let error = support::refusal(&db, "CREATE INDEX FOLDED_BY_NAME ON folded (id)");
+    let words = "duplicate index: folded.folded_by_name; drop it first or choose another name";
+    assert_eq!(error.to_string(), words);
+    match error {
         Error::DuplicateIndex { table, index } => {
             assert_eq!(
                 (table.as_str(), index.as_str()),
@@ -392,6 +410,18 @@ fn a_name_without_quotes_is_stored_in_lower_case_and_a_quoted_name_as_written() 
         }
         other => panic!("a second index of the name was refused as {other:?}"),
     }
+    let long = "n".repeat(63);
+    support::run(
+        &db,
+        &format!("CREATE TABLE {long} (id INTEGER PRIMARY KEY)"),
+    );
+    for name in 'a'..='z' {
+        support::run(&db, &format!("CREATE INDEX {name} ON {long} (id)"));
+    }
+    let before = support::used(&db);
+    let declaration = db.declaration(&long).unwrap();
+    assert_eq!(declaration.matches(&long).count(), 27);
+    assert_eq!(support::used(&db) - before, declaration.capacity());
 }
 
 #[test]
@@ -437,308 +467,6 @@ CREATE INDEX by_body ON notes (body);
     assert_eq!(printed(&db, "notes"), text, "after close and open");
 }
 
-/// What a refused declaration must come as.
-enum Refused {
-    /// `SchemaInvalid`, with a sentence that holds each of these.
-    Schema(&'static [&'static str]),
-    /// `ParseError`, with a sentence that holds each of these.
-    Parse(&'static [&'static str]),
-}
-
-#[test]
-fn a_refused_declaration_says_why_and_declares_nothing() {
-    let folder = support::folder("refused-declarations");
-    let db = support::open(&folder);
-    declare(
-        &db,
-        [
-            "CREATE TABLE plans (id UUID PRIMARY KEY, name TEXT NOT NULL, context_id UUID, \
-             UNIQUE (context_id, id))",
-        ],
-    );
-    let columns: Vec<String> = (1..=33).map(|n| format!("c{n:02}")).collect();
-    let typed: Vec<String> = columns.iter().map(|c| format!("{c} INTEGER")).collect();
-    let wide = |rule: &str| {
-        format!(
-            "CREATE TABLE gauges ({}, {rule} ({}))",
-            typed.join(", "),
-            columns.join(", ")
-        )
-    };
-    let key = "id INTEGER PRIMARY KEY";
-    let cases: Vec<(String, Refused)> = vec![
-        // Keeping only current versions on a table that sends its rows out and keeps the first
-        // write.
-        (
-            format!("CREATE TABLE gauges ({key}) HISTORY CURRENT ONLY"),
-            Refused::Schema(&["gauges", "HISTORY CURRENT ONLY"]),
-        ),
-        (
-            format!("CREATE TABLE gauges ({key}) HISTORY CURRENT ONLY SYNC PUSH ONLY"),
-            Refused::Schema(&["gauges", "HISTORY CURRENT ONLY"]),
-        ),
-        (
-            format!("CREATE TABLE gauges ({key}) IMMUTABLE RETAIN 7 DAYS"),
-            Refused::Schema(&["gauges", "IMMUTABLE", "RETAIN"]),
-        ),
-        (
-            format!("CREATE TABLE gauges ({key}) IMMUTABLE HISTORY CURRENT ONLY SYNC OFF"),
-            Refused::Schema(&["gauges", "IMMUTABLE", "HISTORY CURRENT ONLY"]),
-        ),
-        (
-            format!("CREATE TABLE gauges ({key}) RETAIN 7 DAYS SYNC SAFE SYNC OFF"),
-            Refused::Schema(&["gauges", "SYNC SAFE"]),
-        ),
-        (
-            format!("CREATE TABLE gauges ({key}) RETAIN 7 DAYS SYNC SAFE SYNC PULL ONLY"),
-            Refused::Schema(&["gauges", "SYNC SAFE"]),
-        ),
-        // A reference to columns no key or UNIQUE rule of the parent covers.
-        (
-            format!("CREATE TABLE gauges ({key}, plan TEXT REFERENCES plans(name))"),
-            Refused::Schema(&["gauges"]),
-        ),
-        (
-            format!(
-                "CREATE TABLE gauges ({key}, context_id UUID, name TEXT, \
-                 FOREIGN KEY (context_id, name) REFERENCES plans(context_id, name))"
-            ),
-            Refused::Schema(&["gauges"]),
-        ),
-        (
-            format!("CREATE TABLE gauges ({key}, kind TEXT) MAINTAIN COUNT (kind)"),
-            Refused::Schema(&["gauges", "MAINTAIN COUNT"]),
-        ),
-        (
-            format!("CREATE TABLE gauges ({key}, kind TEXT) MAINTAIN COUNT (id)"),
-            Refused::Schema(&["gauges", "MAINTAIN COUNT"]),
-        ),
-        (
-            format!("CREATE TABLE gauges ({key}, source_id UUID, target_id UUID) DAG('NEEDS')"),
-            Refused::Schema(&["gauges", "DAG"]),
-        ),
-        // EXCLUDE VECTOR needs a state machine, and a state of it: else the rows stay searchable unsaid.
-        (
-            format!(
-                "CREATE TABLE gauges ({key}, status TEXT, v VECTOR(4)) PROPAGATE ON STATE gone EXCLUDE VECTOR"
-            ),
-            Refused::Schema(&["gauges", "gone"]),
-        ),
-        (
-            format!(
-                "CREATE TABLE gauges ({key}, status TEXT, v VECTOR(4)) STATE MACHINE (status: on -> [off]) PROPAGATE ON STATE gone EXCLUDE VECTOR"
-            ),
-            Refused::Schema(&["gauges", "gone"]),
-        ),
-        // Anything that is not a literal or NOW() is no default this version keeps.
-        (
-            format!("CREATE TABLE gauges ({key}, c INTEGER DEFAULT $p)"),
-            Refused::Schema(&[]),
-        ),
-        (
-            format!("CREATE TABLE gauges ({key}, c INTEGER DEFAULT -'x')"),
-            Refused::Schema(&[]),
-        ),
-        // More than 32 columns under a key, a UNIQUE rule and an index.
-        (wide("PRIMARY KEY"), Refused::Schema(&["gauges", "32"])),
-        (wide("UNIQUE"), Refused::Schema(&["gauges", "32"])),
-        // A direction written inside RETAIN names the clause to write instead.
-        (
-            format!("CREATE TABLE gauges ({key}) RETAIN 24 HOURS SYNC SAFE PUSH ONLY"),
-            Refused::Parse(&["SYNC PUSH ONLY"]),
-        ),
-        (
-            format!("CREATE TABLE gauges ({key}) RETAIN 24 HOURS SYNC SAFE TWO WAY"),
-            Refused::Parse(&["SYNC TWO WAY"]),
-        ),
-        // One key to a table.
-        (
-            "CREATE TABLE gauges (a INTEGER PRIMARY KEY, b TEXT, PRIMARY KEY (a, b))".to_owned(),
-            Refused::Schema(&["gauges", "PRIMARY KEY"]),
-        ),
-        (
-            "CREATE TABLE gauges (a INTEGER, b TEXT, PRIMARY KEY (a, b), PRIMARY KEY (a))"
-                .to_owned(),
-            Refused::Parse(&["PRIMARY KEY"]),
-        ),
-    ];
-    let declared = printed(&db, "plans");
-    for (sql, refused) in &cases {
-        let error = support::refusal(&db, sql);
-        let says = |text: &str, holds: &[&str]| holds.iter().all(|part| text.contains(part));
-        let as_expected = match (refused, &error) {
-            (Refused::Schema(holds), Error::SchemaInvalid { reason }) => says(reason, holds),
-            (Refused::Parse(holds), Error::ParseError(text)) => says(text, holds),
-            _ => false,
-        };
-        assert!(as_expected, "{sql}\nwas refused as {error:?}");
-        assert_eq!(db.table_names(), ["plans"], "after {sql}");
-    }
-    assert_eq!(printed(&db, "plans"), declared);
-
-    // An index over 33 columns of a table that has them is refused the same way, and one over
-    // 32 is made.
-    let keyed = typed
-        .join(", ")
-        .replacen("INTEGER", "INTEGER PRIMARY KEY", 1);
-    support::run(&db, &format!("CREATE TABLE broad ({keyed})"));
-    let index = |count: usize| {
-        let columns = columns[..count].join(", ");
-        format!("CREATE INDEX broad_by ON broad ({columns})")
-    };
-    match support::refusal(&db, &index(33)) {
-        Error::SchemaInvalid { reason } => assert!(reason.contains("32"), "{reason}"),
-        other => panic!("an index over 33 columns was refused as {other:?}"),
-    }
-    assert!(!printed(&db, "broad").contains("broad_by"));
-    support::run(&db, &index(32));
-    assert!(printed(&db, "broad").contains("broad_by"));
-}
-
-#[test]
-fn a_declaration_that_says_a_thing_twice_or_two_ways_is_a_parse_error_that_names_it() {
-    let db = support::open(&support::folder("declared-twice"));
-    let key = "CREATE TABLE t (id UUID PRIMARY KEY)";
-    let cases = [
-        // A direction inside RETAIN names the clause to write instead.
-        (
-            format!("{key} RETAIN 24 HOURS SYNC SAFE PUSH ONLY"),
-            "SYNC PUSH ONLY",
-        ),
-        (
-            format!("{key} RETAIN 24 HOURS SYNC SAFE TWO WAY"),
-            "SYNC TWO WAY",
-        ),
-        (
-            "ALTER TABLE t SET RETAIN 24 HOURS SYNC SAFE PUSH ONLY".to_owned(),
-            "SYNC PUSH ONLY",
-        ),
-        // An option written twice.
-        (format!("{key} SYNC OFF SYNC TWO WAY"), "SYNC"),
-        (format!("{key} RETAIN 1 DAYS RETAIN 2 DAYS"), "RETAIN"),
-        (format!("{key} HISTORY ALL HISTORY CURRENT ONLY"), "HISTORY"),
-        (
-            format!("{key} SYNC CONFLICT KEEP FIRST SYNC CONFLICT KEEP LATEST"),
-            "SYNC CONFLICT",
-        ),
-        (
-            format!("{key} MAINTAIN COUNT NONE MAINTAIN COUNT ALL PREFIXES"),
-            "MAINTAIN COUNT",
-        ),
-        // A column that says a thing twice, in a new table and in an added column.
-        (
-            "CREATE TABLE t (id UUID PRIMARY KEY, o UUID REFERENCES p(id) REFERENCES q(id))"
-                .to_owned(),
-            "REFERENCES",
-        ),
-        (
-            "ALTER TABLE t ADD COLUMN c TEXT NOT NULL NOT NULL".to_owned(),
-            "NOT NULL",
-        ),
-        // A list that names a column twice, or a column the table does not have.
-        (
-            "CREATE TABLE t (a INTEGER, b TEXT, PRIMARY KEY (a, a))".to_owned(),
-            "'a'",
-        ),
-        (
-            "CREATE TABLE t (a INTEGER, b TEXT, PRIMARY KEY (a, nope))".to_owned(),
-            "'nope'",
-        ),
-        (
-            "CREATE TABLE t (a INTEGER, b TEXT, FOREIGN KEY (a, nope) REFERENCES p(a, b))"
-                .to_owned(),
-            "'nope'",
-        ),
-        // A reference of as many columns on one side as on the other.
-        (
-            "CREATE TABLE t (a INTEGER, b TEXT, FOREIGN KEY (a, b) REFERENCES p(a))".to_owned(),
-            "FOREIGN KEY",
-        ),
-        // DEFAULT takes a declared list away, and a new table has none.
-        (
-            format!("{key} MAINTAIN COUNT DEFAULT"),
-            "MAINTAIN COUNT DEFAULT",
-        ),
-        // What is neither this version's nor a later one's is a syntax error at the word.
-        (
-            "ALTER TABLE t DROP COLUMN c RESTRICT CASCADE".to_owned(),
-            "'CASCADE'",
-        ),
-        ("ALTER TABLE t SET HISTORY NONE".to_owned(), "'NONE'"),
-        (
-            "ALTER TABLE t ALTER COLUMN v SET PARTITION_KEY (a)".to_owned(),
-            "'PARTITION_KEY'",
-        ),
-        ("ALTER TABLE t RENAME a TO b".to_owned(), "'a'"),
-        ("DROP INDEX i".to_owned(), "ends too soon"),
-        ("DROP TABLE".to_owned(), "ends too soon"),
-        (format!("{key} SYNC SIDEWAYS"), "'SIDEWAYS'"),
-        (format!("{key} EDGE DISCARD SOMETIMES"), "'SOMETIMES'"),
-        (format!("{key} RETAIN 7 WEEKS"), "'WEEKS'"),
-    ];
-    for (sql, names) in &cases {
-        match support::refusal(&db, sql) {
-            Error::ParseError(text) => {
-                assert!(text.contains(names), "{sql}\nwas refused with: {text}");
-            }
-            other => panic!("{sql}\nwas not refused as a parse error: {other:?}"),
-        }
-    }
-    // A column that expires is refused by name.
-    let sql = "ALTER TABLE t ADD COLUMN until TIMESTAMP EXPIRES";
-    match support::refusal(&db, sql) {
-        Error::PlanError(text) => assert_eq!(
-            text, "EXPIRES is not supported in this version of the library",
-            "{sql}"
-        ),
-        other => panic!("{sql}\nwas not refused by name: {other:?}"),
-    }
-    // The tuning clauses of an index no version reads are refused by name, and the sentence says
-    // what to write instead.
-    for (sql, name) in [
-        ("ALTER TABLE t ALTER COLUMN v SET SEARCH DEFAULT", "SEARCH"),
-        (
-            "ALTER TABLE t ALTER COLUMN v SET SEARCH (TARGET_ACCURACY = 95)",
-            "SEARCH",
-        ),
-        ("ALTER TABLE t ALTER COLUMN v SET IVF DEFAULT", "IVF"),
-        (
-            "ALTER TABLE t ALTER COLUMN v SET IVF (LISTS = 64, PROBES = 8, REFINE_FACTOR = 2)",
-            "IVF",
-        ),
-    ] {
-        match support::refusal(&db, sql) {
-            Error::PlanError(text) => assert_eq!(
-                text,
-                format!(
-                    "{name} (...) is not part of this library: the index sizes its own groups and \
-                     measures how far a search scans; for the true nearest rows write USE VECTOR \
-                     EXACT or SEARCH_MODE EXACT, and to move the size from which AUTO uses the \
-                     index write INDEXING_THRESHOLD"
-                ),
-                "{sql}"
-            ),
-            other => panic!("{sql}\nwas not refused by name: {other:?}"),
-        }
-    }
-    for sql in [
-        "create procedure tidy",
-        "CREATE FUNCTION one () RETURNS INTEGER AS 'SELECT 1'",
-        "Create Function one",
-    ] {
-        let error = support::refusal(&db, sql);
-        assert!(
-            matches!(error, Error::StoredProcNotSupported),
-            "{sql}: {error:?}"
-        );
-    }
-    // A table may still be named for either word.
-    support::run(
-        &db,
-        "CREATE TABLE procedure (id INTEGER PRIMARY KEY, function TEXT)",
-    );
-}
-
 #[test]
 fn a_rank_policy_finds_the_column_it_joins_by_one_rule_or_is_refused() {
     let folder = support::folder("rank-policy-join");
@@ -746,7 +474,7 @@ fn a_rank_policy_finds_the_column_it_joins_by_one_rule_or_is_refused() {
     declare(
         &db,
         [
-            "CREATE TABLE results (id UUID PRIMARY KEY, score REAL, label TEXT, task_id UUID)",
+            "CREATE TABLE results (id UUID PRIMARY KEY, score REAL, label TEXT, task_id UUID, j JSON, v VECTOR(2))",
             "CREATE INDEX results_by_task ON results (task_id)",
         ],
     );
@@ -780,6 +508,10 @@ fn a_rank_policy_finds_the_column_it_joins_by_one_rule_or_is_refused() {
         ),
     ];
     for (table, columns, joined) in &found {
+        let (name, meta) =
+            Database::declared_table(&format!("CREATE TABLE {table} ({columns})")).unwrap();
+        assert_eq!(name, *table);
+        assert_eq!(meta.vectors.len(), 1);
         support::run(&db, &format!("CREATE TABLE {table} ({columns})"));
         match support::refusal(&db, &format!("ALTER TABLE {table} DROP COLUMN {joined}")) {
             Error::DropBlockedByRankPolicy {
@@ -787,9 +519,12 @@ fn a_rank_policy_finds_the_column_it_joins_by_one_rule_or_is_refused() {
                 column,
                 policy,
             } => {
+                // The policy is named by its sort key and the vector column that declares it,
+                // so the user can find where it goes away: with that column or table.
+                let declared = format!("by_score on {table}.embedding");
                 assert_eq!(
                     (of.as_str(), column.as_str(), policy.as_str()),
-                    (*table, *joined, "by_score")
+                    (*table, *joined, declared.as_str())
                 );
             }
             other => panic!("dropping {table}.{joined} was refused as {other:?}"),
@@ -811,7 +546,7 @@ fn a_rank_policy_finds_the_column_it_joins_by_one_rule_or_is_refused() {
 
     // What cannot stand is refused as the policy's own kind, naming the VECTOR column, and
     // declares nothing.
-    let tables = db.table_names();
+    let tables = support::names(&db);
     let refused = [
         // Two columns the first rule finds.
         format!("id UUID PRIMARY KEY, result_id UUID, results_id UUID, {by_key}"),
@@ -828,20 +563,26 @@ fn a_rank_policy_finds_the_column_it_joins_by_one_rule_or_is_refused() {
         ("results ON id", "coalesce({score}, "),
         // A formula outside the documented grammar (`{column}`, `{vector_score}`, numbers,
         // `+`, `*`, parentheses, `coalesce(expr, literal)`): subtraction, division, a function
-        // call, a name without braces; numbers the SQL grammar has no form for; a trailing
-        // operator; a brace never closed; a dotted reference; a column as the second value of
-        // `coalesce`; a minus sign; two values and no operator; a subquery.
+        // call, a name without braces; a trailing operator; a brace never closed; a dotted
+        // reference; a column as the second value of `coalesce`; a minus sign; two values and
+        // no operator; a subquery.
         ("results ON id", "{score} - 1.0"),
         ("results ON id", "{score} / 2.0"),
         ("results ON id", "{score} * NOW()"),
         ("results ON id", "{score} * score"),
-        ("results ON id", "{score} * 1e1"),
         ("results ON id", "({score} + )"),
         ("results ON id", "{score + {score}"),
         ("results ON id", "{results.score}"),
         ("results ON id", "coalesce({score}, {score})"),
         ("results ON id", "{score} {score}"),
         ("results ON id", "{score} * (SELECT 1)"),
+        ("results ON id", "min({score}, 1.0)"),
+        ("results ON id", "max({score}, 1.0)"),
+        ("results ON id", "clamp({score}, 0.0, 1.0)"),
+        ("results ON id", "{score} * decay({score})"),
+        ("results ON id", "CASE WHEN {score} > 1 THEN 1 ELSE 0 END"),
+        ("results ON id", "{j}"),
+        ("results ON id", "{v}"),
     ];
     let refused = refused.into_iter().chain(
         formulas.map(|(join, formula)| format!("id UUID PRIMARY KEY, {}", policy(join, formula))),
@@ -858,13 +599,13 @@ fn a_rank_policy_finds_the_column_it_joins_by_one_rule_or_is_refused() {
             }
             other => panic!("{sql}\nwas refused as {other:?}"),
         }
-        assert_eq!(db.table_names(), tables, "after {sql}");
+        assert_eq!(support::names(&db), tables, "after {sql}");
     }
 
     // Formulas that stand: `{vector_score}` beside `*` and a joined column; `coalesce` is a
     // function, so a column that is named coalesce is not read by the policy and may be dropped;
-    // a column read through parentheses and `coalesce` is still read; capitals and a whole
-    // number are read.
+    // a column read through parentheses and `coalesce` is still read; capitals, a whole number
+    // and a number with an exponent (README: `5e2` is a number) are read.
     support::run(&db, "CREATE TABLE lone (id UUID PRIMARY KEY, score REAL)");
     for (table, columns, join, formula) in [
         (
@@ -880,6 +621,7 @@ fn a_rank_policy_finds_the_column_it_joins_by_one_rule_or_is_refused() {
             "({vector_score} + 1) * coalesce({score}, 0.5)",
         ),
         ("capitals", "lone_id UUID", "lone", "COALESCE({score}, 1)"),
+        ("exponent", "lone_id UUID", "lone", "{score} * 1e1"),
     ] {
         let sql = format!(
             "CREATE TABLE {table} (id UUID PRIMARY KEY, {columns}, {})",

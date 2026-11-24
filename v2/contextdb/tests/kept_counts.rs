@@ -26,7 +26,7 @@ fn filters() -> Vec<String> {
 /// Asserts that every count of `events` equals the number of rows its filter returns, and
 /// returns the rows each count read, in the order of [`filters`]. The whole table's count is
 /// checked the same way.
-fn counts_agree(on: &impl Run, when: &str) -> Vec<u64> {
+fn counts_agree(on: &impl Run, when: &str) -> Vec<(u64, u64)> {
     let mut read = Vec::new();
     for filter in filters() {
         let rows = support::rows(on, &format!("SELECT id FROM events WHERE {filter}"));
@@ -37,7 +37,7 @@ fn counts_agree(on: &impl Run, when: &str) -> Vec<u64> {
             "{when}: COUNT(*) WHERE {filter}, beside the {} rows the filter returns",
             rows.len()
         );
-        read.push(count.rows_examined());
+        read.push((count.rows_examined(), rows.len() as u64));
     }
     let rows = support::rows(on, "SELECT id FROM events");
     assert_eq!(
@@ -48,11 +48,23 @@ fn counts_agree(on: &impl Run, when: &str) -> Vec<u64> {
     read
 }
 
-/// Asserts the same, and that no count read a row.
-fn counts_agree_and_read_nothing(db: &Database, when: &str) {
-    let read = counts_agree(db, when);
-    for (filter, rows) in filters().iter().zip(read) {
-        assert_eq!(rows, 0, "{when}: rows read by COUNT(*) WHERE {filter}");
+/// Asserts the same, and what each count read: a kept count is one stored number and reads
+/// nothing (`kept`); a count over an index range of a table that keeps none reads the entries it
+/// counts, one for each row it returns, and no row (section 12 item 9).
+fn counts_agree_and_read(on: &impl Run, when: &str, kept: bool) {
+    let read = counts_agree(on, when);
+    for (filter, (read, rows)) in filters().iter().zip(read) {
+        let wanted = if kept { 0 } else { rows };
+        assert_eq!(
+            read,
+            wanted,
+            "{when}: work of COUNT(*) WHERE {filter}: {} counts {rows} entries and reads no row",
+            if kept {
+                "a kept count reads none of them: it is one stored number, and it"
+            } else {
+                "the index range"
+            }
+        );
     }
 }
 
@@ -74,14 +86,14 @@ fn insert_events(on: &impl Run, numbers: impl IntoIterator<Item = i64>) {
 /// that do not, deletes, a refused statement, a rolled-back transaction and a transaction that
 /// another commit overtook, and asserts after each that every count is the number of rows and
 /// read none.
-fn counts_follow_every_write(db: &Database) {
-    counts_agree_and_read_nothing(db, "on the empty table");
+fn counts_follow_every_write(db: &Database, kept: bool) {
+    counts_agree_and_read(db, "on the empty table", kept);
     let tx = db.transaction().expect("begin");
     insert_events(&tx, 1..=600);
     // Inside the transaction that wrote the rows the counts are theirs already.
-    counts_agree(&tx, "inside the transaction that inserted");
+    counts_agree_and_read(&tx, "inside the transaction that inserted", kept);
     tx.commit().expect("commit the events");
-    counts_agree_and_read_nothing(db, "after inserts");
+    counts_agree_and_read(db, "after inserts", kept);
 
     // Rows move from one counted group to another, by either counted column and by both.
     support::run(db, "UPDATE events SET ctx = 0 WHERE id <= 50");
@@ -90,15 +102,15 @@ fn counts_follow_every_write(db: &Database) {
         "UPDATE events SET conn = 'a' WHERE ctx = 2 AND id > 500",
     );
     support::run(db, "UPDATE events SET ctx = 3, conn = 'b' WHERE id > 550");
-    counts_agree_and_read_nothing(db, "after updates of counted columns");
+    counts_agree_and_read(db, "after updates of counted columns", kept);
     // A change to a column no count is over, and a change of a row's key.
     support::run(db, "UPDATE events SET note = 'seen' WHERE ctx = 1");
     support::run(db, "UPDATE events SET id = id + 1000 WHERE id <= 20");
-    counts_agree_and_read_nothing(db, "after updates of other columns");
+    counts_agree_and_read(db, "after updates of other columns", kept);
 
     support::run(db, "DELETE FROM events WHERE ctx = 3 AND conn = 'a'");
     support::run(db, "DELETE FROM events WHERE id > 100 AND id <= 130");
-    counts_agree_and_read_nothing(db, "after deletes");
+    counts_agree_and_read(db, "after deletes", kept);
 
     // A statement that is refused at its last row counted none of its rows.
     let refusal = support::refusal(
@@ -114,16 +126,16 @@ fn counts_follow_every_write(db: &Database) {
         matches!(refusal, Error::ColumnNotNullable { .. }),
         "{refusal:?}"
     );
-    counts_agree_and_read_nothing(db, "after refused statements");
+    counts_agree_and_read(db, "after refused statements", kept);
 
     // A transaction that is rolled back counted nothing, whatever it had staged.
     let tx = db.transaction().expect("begin");
     insert_events(&tx, 3001..=3050);
     support::run(&tx, "DELETE FROM events WHERE ctx = 0");
     support::run(&tx, "UPDATE events SET ctx = 0 WHERE ctx = 2");
-    counts_agree(&tx, "inside the transaction that is rolled back");
+    counts_agree_and_read(&tx, "inside the transaction that is rolled back", kept);
     tx.rollback();
-    counts_agree_and_read_nothing(db, "after a rollback");
+    counts_agree_and_read(db, "after a rollback", kept);
 
     // Two transactions add to one group side by side: the group counts both.
     let tx = db.transaction().expect("begin");
@@ -132,7 +144,7 @@ fn counts_follow_every_write(db: &Database) {
     insert_events(db, [4009, 4013]);
     support::run(db, "DELETE FROM events WHERE id = 205");
     tx.commit().expect("commit beside another commit");
-    counts_agree_and_read_nothing(db, "after two commits side by side");
+    counts_agree_and_read(db, "after two commits side by side", kept);
 }
 
 #[test]
@@ -145,12 +157,12 @@ fn a_kept_count_is_the_number_of_rows_after_every_kind_of_write_and_reads_no_row
          note TEXT, UNIQUE (ctx, id), UNIQUE (ctx, conn, id)) \
          MAINTAIN COUNT (ctx), (ctx, conn)",
     );
-    counts_follow_every_write(&db);
+    counts_follow_every_write(&db, true);
 
     // The counts are in the store: they are the same after reopening, and still read no row.
     support::close(db);
     let db = support::open(&folder);
-    counts_agree_and_read_nothing(&db, "after reopening");
+    counts_agree_and_read(&db, "after reopening", true);
     // The filter that finds the rows reads them; the count beside it does not.
     let rows = support::run(&db, "SELECT id FROM events WHERE ctx = 1");
     assert!(rows.rows().len() > 100);
@@ -166,7 +178,7 @@ fn a_table_that_declares_no_count_counts_an_index_range_and_reads_no_row() {
          note TEXT)",
     );
     support::run(&db, "CREATE INDEX events_ctx_conn ON events (ctx, conn)");
-    counts_follow_every_write(&db);
+    counts_follow_every_write(&db, false);
 
     // A count whose filter the index does not pin has to read rows: by the index's second
     // column alone, and with a term over a column the index does not have.
@@ -216,21 +228,37 @@ fn a_new_set_of_counts_on_a_table_with_rows_is_installed_whole_or_not_at_all() {
         );
     }
     let declared = db.declaration("groups").expect("the declaration of groups");
-    let count_of = |tag: i64| {
+    // Before the counts are installed a count reads the entries it counts; once installed it is
+    // one stored number and reads none.
+    let count_of = |tag: i64, kept: bool| {
         let count = support::run(
             &db,
             &format!("SELECT COUNT(*) FROM groups WHERE tag = {tag}"),
         );
-        assert_eq!(count.rows_examined(), 0, "the count of tag {tag}");
-        match count.rows() {
+        let value = match count.rows() {
             [row] => row[0].clone(),
             rows => panic!("a count came back as {} rows", rows.len()),
-        }
+        };
+        let entries = match value {
+            Value::Int64(n) => n as u64,
+            ref other => panic!("a count is a number, not {other:?}"),
+        };
+        assert_eq!(
+            count.rows_examined(),
+            if kept { 0 } else { entries },
+            "the count of tag {tag} reads {}",
+            if kept {
+                "no entry: the number is stored"
+            } else {
+                "the entries it counts"
+            }
+        );
+        value
     };
 
     // With 64 KiB to spare, the 10,000 new counts do not fit: the statement is the memory
     // limit's refusal, the declaration is the one the table had, and its counts still answer.
-    let limit = db.memory_used() + (64 << 10);
+    let limit = support::used(&db) + support::limit_work_bytes() + (64 << 10);
     db.set_memory_limit(Some(limit)).expect("set the limit");
     match support::refusal(&db, "ALTER TABLE groups SET MAINTAIN COUNT (tag)") {
         Error::MemoryBudgetExceeded {
@@ -239,11 +267,13 @@ fn a_new_set_of_counts_on_a_table_with_rows_is_installed_whole_or_not_at_all() {
         other => panic!("counts that do not fit the limit were refused as {other:?}"),
     }
     assert_eq!(
-        db.declaration("groups").expect("the declaration of groups"),
-        declared
+        db.declaration("groups")
+            .expect("the declaration of groups")
+            .as_str(),
+        declared.as_str()
     );
-    assert_eq!(count_of(7), Value::Int64(1));
-    assert_eq!(count_of(ROWS), Value::Int64(0));
+    assert_eq!(count_of(7, false), Value::Int64(1));
+    assert_eq!(count_of(ROWS, false), Value::Int64(0));
 
     // With room, the same statement installs the counts, and they are right at once.
     db.set_memory_limit(Some(256 * MIB))
@@ -252,20 +282,23 @@ fn a_new_set_of_counts_on_a_table_with_rows_is_installed_whole_or_not_at_all() {
     let installed = db.declaration("groups").expect("the declaration of groups");
     assert!(
         installed.contains("MAINTAIN COUNT (tag)"),
-        "the declaration does not say MAINTAIN COUNT (tag):\n{installed}"
+        "the declaration does not say MAINTAIN COUNT (tag):\n{}",
+        installed.as_str()
     );
     support::run(&db, "UPDATE groups SET tag = 7 WHERE id < 10");
-    assert_eq!(count_of(7), Value::Int64(10));
-    assert_eq!(count_of(3), Value::Int64(0));
-    assert_eq!(count_of(ROWS - 1), Value::Int64(1));
+    assert_eq!(count_of(7, true), Value::Int64(10));
+    assert_eq!(count_of(3, true), Value::Int64(0));
+    assert_eq!(count_of(ROWS - 1, true), Value::Int64(1));
 
-    // Taking the counts away leaves the same answers, and the declaration it had before.
+    // Taking the counts away leaves the same answers, now read as the entries of `groups_tag`, and the declaration it had before.
     support::run(&db, "ALTER TABLE groups SET MAINTAIN COUNT DEFAULT");
     assert_eq!(
-        db.declaration("groups").expect("the declaration of groups"),
-        declared
+        db.declaration("groups")
+            .expect("the declaration of groups")
+            .as_str(),
+        declared.as_str()
     );
-    assert_eq!(count_of(7), Value::Int64(10));
+    assert_eq!(count_of(7, false), Value::Int64(10));
     support::close(db);
     let db = support::open(&folder);
     assert_eq!(
@@ -320,7 +353,10 @@ fn a_count_list_that_cannot_stand_is_refused_by_name_and_declares_nothing() {
         }
         other => panic!("a count over a column that is not there was refused as {other:?}"),
     }
-    assert_eq!(db.declaration("t").expect("the declaration of t"), declared);
+    assert_eq!(
+        db.declaration("t").expect("the declaration of t").as_str(),
+        declared.as_str()
+    );
 }
 
 /// Asserts that every count of `notes` equals the number of rows its filter returns: each

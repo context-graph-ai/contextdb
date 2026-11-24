@@ -554,7 +554,9 @@ class Box:
         with open(log, 'w') as lf:
             lf.write(f'$ cwd={cwd}\n--- script ---\n{run}\n--- output ---\n')
             lf.flush()
-            rc = subprocess.run(argv, cwd=cwd, stdout=lf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL).returncode
+            # Keep inherited build-host lock descriptors through nested admission; _box holds them while the service runs.
+            rc = subprocess.run(argv, cwd=cwd, stdout=lf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                close_fds=False).returncode
         end = time.time()
         stamp = files['start'].read_text().strip() if files['start'].exists() else ''
         secs = end - float(stamp) if stamp else 0.0
@@ -601,7 +603,7 @@ class LocalRun:
         self.a = a
         self.tree = Path(a.tree).resolve()
         self.sha = self.git('rev-parse', 'HEAD')
-        self.run_id = time.strftime('%Y%m%d%H%M%S')
+        self.run_id = time.strftime('%Y%m%d%H%M%S') + f'{os.getpid():07d}'
         self.work = Path(a.work).resolve() / self.run_id
         self.tmp = Path(a.tmp).resolve() / self.run_id
         self.out = Path(a.out).resolve() if a.out else self.work / 'report'

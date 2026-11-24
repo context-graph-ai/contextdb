@@ -142,8 +142,10 @@ fn an_immutable_refusal_names_the_table_or_the_column_and_changes_nothing() {
         log
     );
     assert_eq!(
-        db.declaration("tasks").expect("the declaration of tasks"),
-        declared
+        db.declaration("tasks")
+            .expect("the declaration of tasks")
+            .as_str(),
+        declared.as_str()
     );
 }
 
@@ -230,7 +232,11 @@ fn a_state_refusal_names_the_table_the_column_and_both_states() {
     let declared = db.declaration("jobs").expect("the declaration of jobs");
     let wanted = "STATE MACHINE (status: zeta -> [b, a], draft -> [active], \
                   active -> [superseded, archived])";
-    assert!(declared.contains(wanted), "not\n{wanted}\nbut\n{declared}");
+    assert!(
+        declared.contains(wanted),
+        "not\n{wanted}\nbut\n{}",
+        declared.as_str()
+    );
 }
 
 const PROJECTS: &str = "CREATE TABLE projects (id INTEGER PRIMARY KEY, title TEXT)";
@@ -474,6 +480,9 @@ const EDGES: &str = "CREATE TABLE edges (id INTEGER PRIMARY KEY, source_id UUID 
                      target_id UUID NOT NULL, edge_type TEXT NOT NULL) DAG('DEPENDS_ON')";
 
 /// Inserts the edge `id`, from node `source` to node `target`.
+const INSERT_EDGE: &str =
+    "INSERT INTO edges (id, source_id, target_id, edge_type) VALUES ($id, $source, $target, $type)";
+
 fn insert_edge(
     on: &impl Run,
     id: i64,
@@ -482,7 +491,7 @@ fn insert_edge(
     edge_type: &str,
 ) -> contextdb::Result<contextdb::QueryResult> {
     on.run(
-        "INSERT INTO edges (id, source_id, target_id, edge_type) VALUES ($id, $source, $target, $type)",
+        INSERT_EDGE,
         &params! {
             "id" => id, "source" => Uuid::from_u128(source), "target" => Uuid::from_u128(target),
             "type" => edge_type,
@@ -619,8 +628,14 @@ fn a_cycle_check_too_large_for_the_memory_limit_is_refused_by_the_limit_and_writ
     let count = || support::int(&db, "SELECT COUNT(*) FROM edges");
     assert_eq!(count(), FAN as i64);
 
-    db.set_memory_limit(Some(db.memory_used() + ROOM))
-        .expect("set the limit");
+    db.set_memory_limit(Some(
+        support::used(&db)
+            + support::limit_work_bytes()
+            + ROOM
+            + support::statement_text_bytes(INSERT_EDGE)
+            + 4 * (32 + 2 * "DEPENDS_ON".len()),
+    ))
+    .expect("set the limit");
     // The limit has room for an edge whose check goes nowhere.
     insert_edge(&db, 1, 500, 501, "DEPENDS_ON").expect("an edge between two new nodes");
     match insert_edge(&db, 2, 1, 2, "DEPENDS_ON") {
@@ -633,7 +648,8 @@ fn a_cycle_check_too_large_for_the_memory_limit_is_refused_by_the_limit_and_writ
     assert!(support::rows(&db, "SELECT id FROM edges WHERE id = 2").is_empty());
 
     // It was the limit that refused it: the edge closes no cycle, and is written without one.
-    db.set_memory_limit(None).expect("lift the limit");
+    db.set_memory_limit(Some(256 << 20))
+        .expect("lift the limit");
     insert_edge(&db, 2, 1, 2, "DEPENDS_ON").expect("the same edge with no limit");
     assert_eq!(count(), FAN as i64 + 2);
 }
@@ -655,8 +671,9 @@ fn a_table_another_table_references_is_not_dropped_until_the_reference_is_gone()
     }
     assert_eq!(
         db.declaration("projects")
-            .expect("the declaration of projects"),
-        declared
+            .expect("the declaration of projects")
+            .as_str(),
+        declared.as_str()
     );
     assert_eq!(
         support::rows(&db, "SELECT id FROM projects ORDER BY id"),

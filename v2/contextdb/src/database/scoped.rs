@@ -1,7 +1,7 @@
 //! Handles narrowed to the rows one reader may see and write.
 
 use std::collections::BTreeSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use super::{Database, locked};
 use crate::query::Reader;
@@ -24,10 +24,11 @@ impl Database {
         let held = &self.reader;
         Database {
             open: Mutex::new(locked(&self.open).clone()),
+            bound: self.bound.clone(),
             reader: Reader {
                 contexts: both(&held.contexts, contexts),
                 scope_labels: both(&held.scope_labels, scope_labels),
-                principal: held.principal.clone().or(principal),
+                principal: held.principal.clone().or_else(|| principal.map(Arc::new)),
             },
         }
     }
@@ -40,11 +41,14 @@ impl Database {
 
 /// What a handle that holds `held` is narrowed to when `asked` is asked of it.
 fn both<T: Ord + Clone>(
-    held: &Option<BTreeSet<T>>,
+    held: &Option<Arc<BTreeSet<T>>>,
     asked: Option<BTreeSet<T>>,
-) -> Option<BTreeSet<T>> {
+) -> Option<Arc<BTreeSet<T>>> {
     match (held, asked) {
-        (Some(held), Some(asked)) => Some(held.intersection(&asked).cloned().collect()),
-        (held, asked) => asked.or_else(|| held.clone()),
+        (Some(held), Some(mut asked)) => {
+            asked.retain(|value| held.contains(value));
+            Some(Arc::new(asked))
+        }
+        (held, asked) => asked.map(Arc::new).or_else(|| held.clone()),
     }
 }

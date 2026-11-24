@@ -72,7 +72,7 @@ fn numbered(expr: &mut Expr, found: &mut Option<Expr>) -> Result<()> {
         order_by,
     } = expr
     else {
-        let mut inner = inside_mut(expr).into_iter();
+        let mut inner = inside_mut(expr);
         return inner.try_for_each(|inner| numbered(inner, found));
     };
     let refused = |form: &str| {
@@ -111,7 +111,7 @@ pub(super) struct Numbered<'a> {
 }
 
 impl Source for Numbered<'_> {
-    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<u64> {
+    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<()> {
         let (window, ctx) = (&self.window, self.ctx);
         let scope = self.scope.clone().and(NUMBER, &window.number);
         let rows = Box::new(Numbers(self));
@@ -125,7 +125,7 @@ impl Source for Numbered<'_> {
 struct Numbers<'s, 'a>(&'s Numbered<'a>);
 
 impl Source for Numbers<'_, '_> {
-    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<u64> {
+    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<()> {
         let Numbered {
             input,
             scope,
@@ -145,14 +145,15 @@ impl Source for Numbers<'_, '_> {
         let partition = &window.keys[..window.partition];
         let cell = size_of::<Value>() as u64;
         let (mut before, mut held, mut number) = (Vec::new(), 0, 0);
-        let examined = input.rows(reservation, &mut |mut row, bytes, reservation| {
+        input.rows(reservation, &mut |mut row, bytes, reservation| {
             let most = partition.iter();
             let most = most.map(|key| most_bytes(&key.expr, scope, &row, ctx));
             let most = most.sum::<u64>();
-            reservation.grow(most + cell)?;
+            reservation.grow(most)?;
+            reservation.room(&mut row, usize::MAX)?;
             let values = partition
                 .iter()
-                .map(|key| eval(&key.expr, scope, &row, ctx))
+                .map(|key| eval(&key.expr, scope, &row, ctx).map(std::borrow::Cow::into_owned))
                 .collect::<Result<Vec<_>>>()?;
             let same = |(left, right)| sort_order(left, right) == Ordering::Equal;
             if number > 0 && values.iter().zip(&before).all(same) {
@@ -166,6 +167,6 @@ impl Source for Numbers<'_, '_> {
             each(row, bytes + cell, reservation)
         })?;
         reservation.shrink(held);
-        Ok(examined)
+        Ok(())
     }
 }

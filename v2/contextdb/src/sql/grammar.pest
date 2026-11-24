@@ -13,13 +13,15 @@ stmt = _{
     | drop_index_stmt
     | insert_stmt
     | delete_stmt
+    | purge_stmt
     | update_stmt
-    | set_memory_limit
-    | show_memory_limit
-    | show_vector_indexes
-    | show_vector_partitions
+    | set_setting
+    | show_setting
+    | reset_stmt
     | explain_stmt
     | select_stmt
+    | create_trigger_stmt | create_event_type_stmt | create_sink_stmt | create_route_stmt
+    | create_schedule_stmt | drop_trigger_stmt | drop_route_stmt | drop_schedule_stmt
     | !with_word ~ later
 }
 
@@ -33,15 +35,13 @@ later = { later_name ~ ANY* }
 later_name = @{
     (
         ^"SHOW" ~ SPACE+
-        ~ (^"TENANT" | ^"SYNC_CONFLICT_POLICY" | ^"SYNC" | ^"DELIVERY" | ^"DISK_LIMIT")
-        | ^"SET" ~ SPACE+
-        ~ (^"DISK_LIMIT" | ^"MAINTENANCE_POLL_INTERVAL" | ^"READ_CACHE_SHARE" | ^"STORAGE_COMPACTION")
-        | ^"CREATE" ~ SPACE+ ~ (^"TRIGGER" | ^"EVENT" | ^"SINK" | ^"ROUTE" | ^"SCHEDULE")
+        ~ (^"TENANT" | ^"SYNC" | ^"DELIVERY")
+        | ^"SET" ~ SPACE+ ~ !(setting_known ~ !ident_char) ~ identifier
         | ^"FOLLOWS"
-        | ^"DROP" ~ SPACE+ ~ (^"TRIGGER" | ^"ROUTE" | ^"SCHEDULE") | ^"WITH" | ^"BEGIN" | ^"COMMIT" | ^"ROLLBACK" | ^"PURGE" | ^"DISCARD"
+        | ^"WITH" | ^"BEGIN" | ^"COMMIT" | ^"ROLLBACK" | ^"DISCARD"
         | ^"DECLARE"
         | (^"NOT" ~ SPACE+)? ~ ^"ILIKE"
-        | ^"EXPIRES" | ^"SEARCH" | ^"IVF"
+        | ^"SEARCH" | ^"IVF"
     ) ~ !ident_char
     | "<->" | "<#>"
 }
@@ -53,17 +53,17 @@ subquery = @{ ^"SELECT" ~ !ident_char }
 // of the text unread.
 vector_options = { "(" }
 
-set_memory_limit = { ^"SET" ~ ^"MEMORY_LIMIT" ~ "="? ~ ("'" ~ memory_limit_value ~ "'" | memory_limit_value) }
-show_memory_limit = { ^"SHOW" ~ ^"MEMORY_LIMIT" }
-memory_limit_value = { ^"none" | size_with_unit }
-size_with_unit = @{ ASCII_DIGIT+ ~ ("G" | "M" | "K") }
+setting_known = _{ ^"MEMORY_LIMIT" | ^"DISK_LIMIT" | ^"MAINTENANCE_POLL_INTERVAL" | ^"UNINDEXED_VECTOR_LIMIT" | ^"STATEMENT_STATISTICS_LIMIT" }
+reset_stmt = { ^"RESET" ~ ^"STATEMENT_STATISTICS" ~ &(";" | EOI) }
+set_setting = { ^"SET" ~ setting_name ~ "="? ~ setting_value }
+show_setting = { ^"SHOW" ~ setting_name ~ (^"FOR" ~ identifier ~ "." ~ identifier)? ~ (limit_clause ~ offset_clause?)? ~ &(";" | EOI) }
+setting_name = @{ ^"STORAGE_COMPACTION" ~ (SPACE+ ~ identifier)? | identifier }
+setting_value = { setting_quoted | setting_word+ }
+setting_quoted = @{ "'" ~ (!"'" ~ ANY)* ~ "'" }
+setting_word = @{ (!(";" | "--" | "/*" | SPACE | EOI) ~ ANY)+ }
 
-show_vector_indexes = { ^"SHOW" ~ ^"VECTOR_INDEXES" }
 explain_stmt = { ^"EXPLAIN" ~ stmt }
-show_vector_partitions = {
-    ^"SHOW" ~ ^"VECTOR_PARTITIONS" ~ (^"FOR" ~ identifier ~ "." ~ identifier)?
-    ~ (limit_clause ~ offset_clause?)?
-}
+
 
 // ORDER BY and what follows it are over the whole statement: over every SELECT of a UNION.
 select_stmt = {
@@ -86,7 +86,9 @@ select_core = {
     ~ where_clause? ~ group_by_clause? ~ having_clause?
 }
 distinct = @{ ^"DISTINCT" ~ !ident_char }
-table_ref = { identifier ~ alias? }
+table_ref = { derived_table | identifier ~ alias? }
+derived_table = { lateral? ~ "(" ~ select_stmt ~ ")" ~ (alias ~ columns?)? }
+lateral = @{ ^"LATERAL" ~ !ident_char }
 // The rows a pattern matches over an edge table, which stands alone in FROM. A step with no
 // count is one hop; `+`, `*` and a count with no upper bound are read so that each is refused
 // by its own name.
@@ -148,7 +150,7 @@ if_not_exists = { ^"IF" ~ ^"NOT" ~ ^"EXISTS" }
 table_element = _{ column_def | unique_table_constraint | primary_key_columns | foreign_key }
 unique_table_constraint = { ^"UNIQUE" ~ "(" ~ identifier ~ ("," ~ identifier)* ~ ")" }
 primary_key_columns = { ^"PRIMARY" ~ ^"KEY" ~ columns }
-foreign_key = { ^"FOREIGN" ~ ^"KEY" ~ columns ~ ^"REFERENCES" ~ identifier ~ columns }
+foreign_key = { ^"FOREIGN" ~ ^"KEY" ~ columns ~ ^"REFERENCES" ~ identifier ~ columns ~ follows_parent_purge? }
 columns = { "(" ~ identifier ~ ("," ~ identifier)* ~ ")" }
 column_def = { identifier ~ data_type ~ column_constraint* }
 data_type = {
@@ -159,7 +161,7 @@ data_type = {
 vector_type = {
     ^"VECTOR" ~ "(" ~ integer ~ ")"
     ~ quantization? ~ partition_key? ~ max_partitions? ~ (^"SEARCH_MODE" ~ search_mode)?
-    ~ indexing_threshold? ~ compaction?
+    ~ indexing_threshold? ~ probes? ~ compaction?
     // WITH stands first or nowhere: after another clause it is no clause of a later version.
     ~ !(^"WITH" ~ !ident_char)
 }
@@ -167,6 +169,7 @@ quantization = { ^"WITH" ~ "(" ~ ^"quantization" ~ "=" ~ string ~ ")" }
 partition_key = { ^"PARTITION_KEY" ~ "(" ~ identifier ~ ("," ~ identifier)* ~ ")" }
 max_partitions = { ^"MAX_PARTITIONS" ~ signed }
 indexing_threshold = { ^"INDEXING_THRESHOLD" ~ signed }
+probes = { ^"PROBES" ~ signed }
 compaction = {
     ^"COMPACTION"
     ~ (
@@ -182,14 +185,16 @@ tombstone_percent = { ^"TOMBSTONE_PERCENT" ~ "=" ~ signed }
 signed = @{ "-"? ~ ASCII_DIGIT+ }
 column_constraint = _{
     not_null | nullable_marker | primary_key | unique | default_clause
-    | references | immutable | context_id | scope_labels | acl | rank_policy
+    | references | immutable | context_id | scope_labels | acl | rank_policy | expires
 }
+expires = { ^"EXPIRES" }
 not_null = { ^"NOT" ~ ^"NULL" }
 nullable_marker = { ^"NULL" }
 primary_key = { ^"PRIMARY" ~ ^"KEY" }
 unique = { ^"UNIQUE" }
 default_clause = { ^"DEFAULT" ~ expr }
-references = { ^"REFERENCES" ~ identifier ~ "(" ~ identifier ~ ")" ~ propagation? }
+references = { ^"REFERENCES" ~ identifier ~ "(" ~ identifier ~ ")" ~ follows_parent_purge? ~ propagation? }
+follows_parent_purge = { ^"FOLLOWS" ~ ^"PARENT" ~ ^"PURGE" }
 propagation = {
     ^"ON" ~ ^"STATE" ~ as_written ~ ^"PROPAGATE" ~ ^"SET" ~ as_written ~ max_depth? ~ abort_on_failure?
 }
@@ -200,7 +205,9 @@ abort_on_failure = { ^"ABORT" ~ ^"ON" ~ ^"FAILURE" }
 as_written = { quoted_ident | ident }
 immutable = { ^"IMMUTABLE" }
 context_id = { ^"CONTEXT_ID" }
-scope_labels = { ^"SCOPE_LABEL_READ" ~ labels ~ ^"WRITE" ~ labels | ^"SCOPE_LABEL" ~ labels }
+scope_labels = { ^"SCOPE_LABEL_READ" ~ scope_list ~ ^"WRITE" ~ scope_list | ^"SCOPE_LABEL" ~ scope_list }
+scope_list = _{ labels | empty_labels }
+empty_labels = { "(" ~ ")" }
 labels = { "(" ~ string ~ ("," ~ string)* ~ ")" }
 acl = { ^"ACL" ~ ^"REFERENCES" ~ identifier ~ "(" ~ identifier ~ ")" }
 rank_policy = {
@@ -268,18 +275,19 @@ rename_column = { ^"RENAME" ~ column_word ~ identifier ~ ^"TO" ~ identifier }
 alter_column = {
     ^"ALTER" ~ column_word ~ identifier ~ ^"SET"
     ~ (
-        ^"MAX_PARTITIONS" ~ signed | ^"SEARCH_MODE" ~ search_mode | indexing_threshold | compaction
-        | indexing_threshold_default | compaction_default | later
+        ^"MAX_PARTITIONS" ~ signed | ^"SEARCH_MODE" ~ search_mode | indexing_threshold | probes | compaction
+        | indexing_threshold_default | probes_default | compaction_default | later
     )
 }
 indexing_threshold_default = { ^"INDEXING_THRESHOLD" ~ ^"DEFAULT" }
+probes_default = { ^"PROBES" ~ ^"DEFAULT" }
 compaction_default = { ^"COMPACTION" ~ ^"DEFAULT" }
 // Whole words, so that a column whose name begins with one is still a column.
 column_word = @{ ^"COLUMN" ~ !ident_char }
 retain_word = @{ ^"RETAIN" ~ !ident_char }
 
 drop_table_stmt = { ^"DROP" ~ ^"TABLE" ~ if_exists? ~ identifier }
-drop_index_stmt = { ^"DROP" ~ ^"INDEX" ~ if_exists? ~ identifier ~ on_table }
+drop_index_stmt = { ^"DROP" ~ ^"INDEX" ~ if_exists? ~ identifier ~ on_table? }
 on_table = { ^"ON" ~ identifier }
 if_exists = { ^"IF" ~ ^"EXISTS" }
 
@@ -296,6 +304,8 @@ on_conflict = {
 values_row = { "(" ~ expr ~ ("," ~ expr)* ~ ")" }
 assignment = { identifier ~ "=" ~ expr }
 
+purge_stmt = { ^"PURGE" ~ ^"FROM" ~ purge_selection ~ ("," ~ purge_selection)* }
+purge_selection = { identifier ~ where_clause? }
 delete_stmt = { ^"DELETE" ~ ^"FROM" ~ identifier ~ where_clause? }
 update_stmt = { ^"UPDATE" ~ identifier ~ ^"SET" ~ assignment ~ ("," ~ assignment)* ~ where_clause? }
 
@@ -352,8 +362,9 @@ primary_expr = _{
 // both: a rule that read the first expression, failed and read it again would double the work
 // at every level of nesting.
 parenthesized = { "(" ~ expr ~ ("," ~ expr)* ~ ")" }
-vector_lit = { "[" ~ vector_component ~ ("," ~ vector_component)* ~ "]" }
-vector_component = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
+// A vector is one token, its numbers read from its text.
+vector_lit = @{ "[" ~ SPACE* ~ vector_component ~ (SPACE* ~ "," ~ SPACE* ~ vector_component)* ~ SPACE* ~ "]" }
+vector_component = _{ "-"? ~ (float | integer) }
 function_call = { as_written ~ "(" ~ (star | (expr ~ ("," ~ expr)*))? ~ ")" ~ over? }
 // The window of a function. Any function may be written before it: the builder refuses all but
 // the one this version has.
@@ -377,7 +388,9 @@ braced = { "{" ~ identifier ~ "}" }
 parameter = @{ "$" ~ ident }
 null_lit = { ^"NULL" }
 bool_lit = { ^"TRUE" | ^"FALSE" }
-float = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+// A number read as Postgres reads a decimal constant: `4.`, `.001`, `5e2`, `1.925e-3`.
+float = @{ (ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT* | "." ~ ASCII_DIGIT+) ~ exponent? | ASCII_DIGIT+ ~ exponent }
+exponent = _{ ^"e" ~ ("+" | "-")? ~ ASCII_DIGIT+ }
 integer = @{ ASCII_DIGIT+ }
 string = @{ "'" ~ ("''" | (!"'" ~ ANY))* ~ "'" }
 
@@ -385,3 +398,18 @@ ident_char = _{ ASCII_ALPHANUMERIC | "_" }
 ident = @{ (ASCII_ALPHA | "_") ~ ident_char* }
 quoted_ident = @{ "\"" ~ ("\"\"" | (!"\"" ~ ANY))* ~ "\"" }
 identifier = { quoted_ident | ident }
+
+create_trigger_stmt = { ^"CREATE" ~ ^"TRIGGER" ~ identifier ~ ^"ON" ~ identifier ~ ^"WHEN" ~ event_trigger ~ including_sync_clause? }
+including_sync_clause = { ^"INCLUDING" ~ ^"SYNC" }
+drop_trigger_stmt = { ^"DROP" ~ ^"TRIGGER" ~ if_exists? ~ identifier ~ on_table? }
+create_event_type_stmt = { ^"CREATE" ~ ^"EVENT" ~ ^"TYPE" ~ identifier ~ ^"WHEN" ~ event_trigger ~ ^"ON" ~ identifier }
+event_trigger = { ^"INSERT" | ^"UPDATE" | ^"DELETE" }
+create_sink_stmt = { ^"CREATE" ~ ^"SINK" ~ identifier ~ ^"TYPE" ~ sink_type ~ sink_url_clause? }
+sink_type = { ^"webhook" | ^"callback" }
+sink_url_clause = { ^"URL" ~ string }
+create_route_stmt = { ^"CREATE" ~ ^"ROUTE" ~ identifier ~ ^"EVENT" ~ identifier ~ ^"TO" ~ identifier ~ route_where_clause? }
+route_where_clause = { ^"WHERE" ~ identifier ~ ^"IN" ~ labels }
+drop_route_stmt = { ^"DROP" ~ ^"ROUTE" ~ if_exists? ~ identifier }
+create_schedule_stmt = { ^"CREATE" ~ ^"SCHEDULE" ~ identifier ~ ^"EVERY" ~ string ~ ^"TX" ~ "(" ~ identifier ~ ")" ~ missed_tick_clause? }
+missed_tick_clause = { ^"MISSED_TICK_POLICY" ~ string ~ (^"WITHIN" ~ integer ~ ^"SECONDS")? }
+drop_schedule_stmt = { ^"DROP" ~ ^"SCHEDULE" ~ if_exists? ~ identifier }

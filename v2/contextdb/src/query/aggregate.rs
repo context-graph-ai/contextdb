@@ -13,14 +13,14 @@ use super::counts::{names, undeclared, used};
 use super::expression::{
     Arithmetic, EvalContext, Scope, arithmetic, compare, eval, most_bytes, reads,
 };
+use super::filter::{self, Columns};
 use super::plan::{Each, Filter, Source, hand_on, listed};
 use super::row_overhead;
 use super::sort::Key;
-use super::table::collect;
 use super::visible::Reader;
 use crate::memory::Reservation;
 use crate::schema::Table;
-use crate::sql::ast::{BinOp, ColumnRef, Literal};
+use crate::sql::ast::ColumnRef;
 use crate::sql::plan::{ProjectColumn, SelectPlan, SortKey};
 use crate::sql::{AGGREGATES, Expr, inside_mut, not_supported};
 use crate::store::{self, CountId, Read};
@@ -115,8 +115,13 @@ impl Groups {
                 Expr::Column(column) => Some(scope.find(column)?.0),
                 _ => None,
             };
-            let lists = table.into_iter().flat_map(|table| &table.rules.counts);
-            let mut declared = lists.flat_map(|count| &count.columns);
+            let mut declared = table.into_iter().flat_map(|table| {
+                table
+                    .rules
+                    .counts
+                    .iter()
+                    .flat_map(move |c| table.count_columns(c))
+            });
             let declared = declared.find(|(column, _)| Some(*column) == at);
             let descending = declared.is_some_and(|(_, way)| *way == SortDirection::Desc);
             groups.descending.push(descending);
@@ -187,51 +192,39 @@ impl Groups {
             };
             grouped.push(scope.find(column)?.0);
         }
-        let mut terms = Vec::new();
-        if let Some(filter) = filter
-            && !collect(table, scope, filter, ctx, &mut terms)?
-        {
+        let reading = filter::read(
+            filter,
+            &Columns {
+                scope,
+                table: Some(table),
+            },
+            ctx,
+        )?;
+        let Some(case) = filter::pins(&reading) else {
             return Ok(None);
-        }
-        let mut staged = false;
-        read.staged(table.id, &mut |_| {
-            staged = true;
-            Ok(false)
-        })?;
+        };
         let say = |line: &dyn Fn() -> String| ctx.said.map(|said| said.borrow_mut().push(line()));
         // The one value the filter gives a column, when it gives it nothing else.
-        let given = |column: usize| {
-            let mut of = terms.iter().filter(|term| term.column == column);
-            match (of.next(), of.next()) {
-                (Some(term), None) if term.op == BinOp::Eq => match term.values.as_slice() {
-                    [value] if *value != Value::Null => Some(value.clone()),
-                    _ => None,
-                },
-                _ => None,
-            }
+        let given = |column: usize| match case.iter().find(|(at, _)| *at == column) {
+            Some((_, Some(value))) => Some((*value).clone()),
+            _ => None,
         };
         for count in &table.rules.counts {
-            let Some(given_for) = count.columns.len().checked_sub(grouped.len()) else {
+            let columns = table.count_columns(count);
+            let Some(given_for) = columns.len().checked_sub(grouped.len()) else {
                 continue;
             };
-            let (first, last) = count.columns.split_at(given_for);
+            let (first, last) = columns.split_at(given_for);
             let values: Option<Vec<Value>> = first.iter().map(|column| given(column.0)).collect();
             let places = grouped
                 .iter()
                 .map(|at| last.iter().position(|column| column.0 == *at));
             let places: Option<Vec<usize>> = places.collect();
             let places = places.filter(|places| (0..places.len()).all(|at| places.contains(&at)));
-            let ascending = count
-                .columns
-                .iter()
-                .all(|column| column.1 == SortDirection::Asc);
-            let pinned = terms
-                .iter()
-                .all(|term| first.iter().any(|column| column.0 == term.column));
-            if let (Some(values), Some(places), true, true, false) =
-                (values, places, ascending, pinned, staged)
-            {
-                say(&|| used(table, &count.columns));
+            let ascending = columns.iter().all(|column| column.1 == SortDirection::Asc);
+            let pinned = (case.iter()).all(|(at, _)| first.iter().any(|column| column.0 == *at));
+            if let (Some(values), Some(places), true, true) = (values, places, ascending, pinned) {
+                say(&|| used(table, columns));
                 return Ok(Some(Kept {
                     read,
                     count: count.id,
@@ -240,7 +233,7 @@ impl Groups {
                 }));
             }
         }
-        let wanted = terms.iter().map(|term| term.column).chain(grouped);
+        let wanted = case.iter().map(|(at, _)| *at).chain(grouped);
         say(&|| undeclared(table, &names(table, wanted.clone())));
         Ok(None)
     }
@@ -274,10 +267,10 @@ pub(super) fn typed(expr: &mut Expr) {
         _ => None,
     };
     *expr = match (function, &mut *expr) {
-        (Some(Function::Count), _) => Expr::Literal(Literal::Integer(0)),
-        (Some(Function::Avg), _) => Expr::Literal(Literal::Real(0.0)),
+        (Some(Function::Count), _) => Expr::Literal(Value::Int64(0)),
+        (Some(Function::Avg), _) => Expr::Literal(Value::Float64(0.0)),
         (Some(_), Expr::FunctionCall { args, .. }) if args.len() == 1 => args.remove(0),
-        (_, other) => return inside_mut(other).into_iter().for_each(typed),
+        (_, other) => return inside_mut(other).for_each(typed),
     };
 }
 
@@ -319,7 +312,7 @@ fn over_group(
             return Ok(());
         }
         (_, other) => {
-            let mut inner = inside_mut(other).into_iter();
+            let mut inner = inside_mut(other);
             let given = (scope, params);
             return inner
                 .try_for_each(|inner| over_group(inner, keys, calls, given, wanted, outside));
@@ -363,7 +356,7 @@ fn over_group(
                 name: name.to_owned(),
                 args,
             };
-            let real = |of| operator("__mul", vec![of, Expr::Literal(Literal::Real(1.0))]);
+            let real = |of| operator("__mul", vec![of, Expr::Literal(Value::Float64(1.0))]);
             let sum = call(Function::Sum, of.clone().map(real));
             operator("__div", vec![sum, call(Function::Count, of)])
         }
@@ -389,7 +382,7 @@ pub(super) struct Grouped<'a> {
 }
 
 impl Source for Grouped<'_> {
-    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<u64> {
+    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<()> {
         let groups = &self.groups;
         let (scope, ctx) = (Scope::of("", &groups.columns), self.ctx);
         let mut rows: Box<dyn Source + '_> = Box::new(Entries(self));
@@ -412,7 +405,7 @@ impl Source for Grouped<'_> {
 struct Entries<'s, 'a>(&'s Grouped<'a>);
 
 impl Source for Entries<'_, '_> {
-    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<u64> {
+    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<()> {
         let Grouped {
             input,
             scope,
@@ -427,9 +420,10 @@ impl Source for Entries<'_, '_> {
             calls.map(|_| Running::seen(seen)).collect()
         };
         // What a group holds before any least or greatest value: its row and its entry here.
-        let entry = row_overhead(groups.columns.len()) + size_of::<(Key<'_, ()>, Held)>() as u64;
+        let entry =
+            row_overhead(groups.columns.len()) + crate::memory::node::<(Key<'_, ()>, Held)>();
         let mut held: BTreeMap<Key<'_, ()>, Held> = BTreeMap::new();
-        let mut examined = 0;
+        reservation.grow(3 * crate::memory::node::<(Key<'_, ()>, Held)>())?;
         if let Some(kept) = kept {
             let damaged = || {
                 kept.read
@@ -455,14 +449,14 @@ impl Source for Entries<'_, '_> {
                 );
             }
         } else if counted.is_none() {
-            examined = input.rows(reservation, &mut |row, bytes, reservation| {
+            input.rows(reservation, &mut |row, bytes, reservation| {
                 let keys = groups.keys.iter();
                 let most = keys.map(|key| most_bytes(key, scope, &row, ctx));
                 let beside = entry + most.sum::<u64>();
                 reservation.grow(beside)?;
                 let keys = groups.keys.iter();
                 let values = keys
-                    .map(|key| eval(key, scope, &row, ctx))
+                    .map(|key| eval(key, scope, &row, ctx).map(std::borrow::Cow::into_owned))
                     .collect::<Result<Vec<_>>>()?;
                 let (running, _) = match held.entry(Key(values, &groups.descending, ())) {
                     Entry::Vacant(new) => new.insert((fresh(0), beside)),
@@ -493,7 +487,7 @@ impl Source for Entries<'_, '_> {
                 (row, bytes, 0)
             });
         hand_on(rows, reservation, each)?;
-        Ok(examined)
+        Ok(())
     }
 }
 
@@ -535,7 +529,7 @@ impl Running {
         if let Some(of) = &call.of {
             let most = most_bytes(of, scope, row, ctx);
             reservation.grow(most)?;
-            let value = eval(of, scope, row, ctx)?;
+            let value = eval(of, scope, row, ctx)?.into_owned();
             if value == Value::Null {
                 reservation.shrink(most);
                 return Ok(());

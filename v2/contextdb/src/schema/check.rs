@@ -1,7 +1,8 @@
 //! Checking a declaration: what CREATE TABLE and CREATE INDEX may say, and the table each gives.
 
 use super::{Catalog, Compaction, Quantization, RESERVED_PREFIXES, Table, VectorColumn, rules};
-use crate::sql::ast::{self, CompactionClause, Expr, Literal};
+use crate::memory::Budget;
+use crate::sql::ast::{self, CompactionClause, Expr};
 use crate::sql::not_carried;
 use crate::sql::plan::{CreateIndexPlan, CreateTablePlan};
 use crate::store::{IndexId, TableId, VectorId};
@@ -15,8 +16,12 @@ pub(super) fn invalid(reason: String) -> Error {
     Error::SchemaInvalid { reason }
 }
 
-/// The table a CREATE TABLE declares, numbered after the tables the catalog holds.
-pub(super) fn new_table(create: &CreateTablePlan, catalog: &Catalog) -> Result<Table> {
+/// Checks a table declaration; its identity is assigned when the declaration is staged.
+pub(super) fn new_table(
+    create: &CreateTablePlan,
+    catalog: Option<&Catalog>,
+    budget: &Budget,
+) -> Result<Table> {
     let table = &create.name;
     let mut columns: Vec<ColumnDef> = Vec::with_capacity(create.columns.len());
     for declared in &create.columns {
@@ -58,6 +63,7 @@ pub(super) fn new_table(create: &CreateTablePlan, catalog: &Catalog) -> Result<T
         sync: options.sync,
         conflict: options.conflict,
         kept_counts: options.kept_counts.clone(),
+        ..Default::default()
     };
     // The index behind the key, then behind each UNIQUE column, then behind each UNIQUE rule.
     // The key's index already keeps the key column unique.
@@ -75,13 +81,14 @@ pub(super) fn new_table(create: &CreateTablePlan, catalog: &Catalog) -> Result<T
         let name = format!("{prefix}{}", rule.join("_"));
         engine_index(table, &mut meta, name, rule, true)?;
     }
-    let rules = rules::of(create, &mut meta, catalog)?;
+    let rules = rules::of(create, &mut meta, catalog, budget)?;
+    let empty = Catalog::empty(budget)?;
+    let catalog = catalog.unwrap_or(&empty);
     let position = |name: &String| meta.columns.iter().position(|column| column.name == *name);
     let key: Vec<usize> = key.iter().filter_map(position).collect();
 
     // Each VECTOR column is numbered on from the highest number in the catalog, as indexes are.
-    let numbered = catalog.numbered().flat_map(|other| &other.vectors);
-    let next_vector = numbered.map(|vector| vector.id.0 + 1).max().unwrap_or(0);
+    let next_vector = catalog.numbers[0];
     let mut vectors = Vec::new();
     for declared in &create.columns {
         if matches!(declared.data_type, ColumnType::Vector(_)) {
@@ -90,13 +97,14 @@ pub(super) fn new_table(create: &CreateTablePlan, catalog: &Catalog) -> Result<T
         }
     }
 
-    let id = catalog.numbered().map(|other| other.id.0 + 1).max();
-    let index_ids = (next_index_id(catalog)..)
-        .take(meta.indexes.len())
+    let index_ids = (catalog.numbers[1]..)
+        .take(meta.indexes.len() + usize::from(meta.retain.is_some()))
         .map(IndexId)
         .collect();
     Ok(Table {
-        id: TableId(id.unwrap_or(0)),
+        id: TableId(0),
+        stored: 0,
+        heap: 0,
         name: table.clone(),
         index_ids,
         vectors,
@@ -186,6 +194,11 @@ fn vector_column(
             _ => return Err(policy(PolicyIssue::IndexingThresholdNotPositive)),
         },
     };
+    let probes = match declared.vector.probes.as_deref().map(str::parse::<u32>) {
+        Some(Ok(n @ 1..)) => Some(n),
+        None => None,
+        Some(_) => return Err(policy(PolicyIssue::ProbesNotPositive)),
+    };
     let percent = |written: &Option<String>| match written {
         None => Ok(None),
         Some(written) => match written.parse::<u8>() {
@@ -208,6 +221,7 @@ fn vector_column(
         max_partitions,
         search_mode: declared.vector.search_mode,
         indexing_threshold,
+        probes,
         compaction,
         quantization,
     })
@@ -287,17 +301,13 @@ pub(super) fn with_index(create: &CreateIndexPlan, catalog: &Catalog) -> Result<
             index: index.name,
         });
     }
+    table
+        .index_ids
+        .insert(table.meta.indexes.len(), IndexId(catalog.numbers[1]));
     table.meta.indexes.push(index);
-    table.index_ids.push(IndexId(next_index_id(catalog)));
     // A table that keeps a count for every beginning of every index keeps the new index's.
     table.rules.counts = rules::counts(&table.name, &table.meta, &table.rules.counts, catalog)?;
     Ok(table)
-}
-
-/// One past the highest index number in use.
-fn next_index_id(catalog: &Catalog) -> u32 {
-    let ids = catalog.numbered().flat_map(|table| &table.index_ids);
-    ids.map(|id| id.0 + 1).max().unwrap_or(0)
 }
 
 /// Refuses an index over a column the table does not have or whose type it cannot be over.
@@ -373,11 +383,11 @@ pub(super) fn default(expr: &Expr) -> Option<ColumnDefault> {
         {
             return Some(ColumnDefault::Now);
         }
-        Expr::Literal(Literal::Null) => Value::Null,
-        Expr::Literal(Literal::Bool(flag)) => Value::Bool(*flag),
-        Expr::Literal(Literal::Integer(whole)) => Value::Int64(*whole),
-        Expr::Literal(Literal::Real(real)) => Value::Float64(*real),
-        Expr::Literal(Literal::Text(words)) => Value::Text(words.clone()),
+        Expr::Literal(Value::Null) => Value::Null,
+        Expr::Literal(Value::Bool(flag)) => Value::Bool(*flag),
+        Expr::Literal(Value::Int64(whole)) => Value::Int64(*whole),
+        Expr::Literal(Value::Float64(real)) => Value::Float64(*real),
+        Expr::Literal(Value::Text(words)) => Value::Text(words.clone()),
         _ => return None,
     };
     Some(ColumnDefault::Literal(value))

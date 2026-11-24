@@ -1,18 +1,27 @@
 //! The expression evaluator, and how two values compare and sort.
 
-use std::cell::RefCell;
+use super::sets::List;
+use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
+use std::io::{Cursor, Write};
 
 use serde_json::{Number, Value as Json};
 
 use super::bind::bind;
+use crate::memory::{Passing, Reservation, node};
 use crate::schema::Table;
-use crate::sql::ast::{BinOp, ColumnRef, Literal, Select, UnaryOp};
+use crate::sql::ast::{BinOp, ColumnRef, Select, UnaryOp};
 use crate::sql::{Expr, Plan, not_supported};
 use crate::types::{
-    ColumnDef, ColumnType, Error, Result, Value, heap_bytes, timestamp_millis, vector_from_text,
+    ColumnDef, ColumnType, Error, Result, Value, heap_bytes, json_bytes, timestamp_millis,
+    vector_numbers,
 };
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;
 
 /// The columns an expression has in reach: for each table of the statement, in the order their
 /// values stand in a row, the name that qualifies its columns and the columns themselves.
@@ -47,6 +56,15 @@ impl<'a> Scope<'a> {
     /// `ColumnNotFound`, and so is a name qualified with anything but one of the tables: that
     /// refusal names the qualifier as it was written.
     pub(super) fn find(&self, column: &ColumnRef) -> Result<(usize, ColumnType)> {
+        let bare = self
+            .relations
+            .last()
+            .filter(|(q, _)| q.is_empty() && column.table.is_none());
+        if let Some((_, own)) = bare
+            && let Some(at) = own.iter().position(|c| c.name == column.column)
+        {
+            return Ok((self.columns().count() - own.len() + at, own[at].column_type));
+        }
         let mut before = 0;
         for (qualifier, columns) in &self.relations {
             let named = |declared: &ColumnDef| declared.name == column.column;
@@ -93,6 +111,64 @@ impl<'a> Scope<'a> {
     }
 }
 
+/// The statement's parsed comparison operands and simultaneously live computed values.
+pub(crate) struct Kept {
+    values: RefCell<Vec<(String, Json)>>,
+    bytes: Cell<u64>,
+    live: Cell<u64>,
+    cover: RefCell<Passing>,
+}
+impl Kept {
+    pub(crate) fn new(cover: Passing) -> Self {
+        Self {
+            values: RefCell::default(),
+            bytes: Cell::new(0),
+            live: Cell::new(0),
+            cover: RefCell::new(cover),
+        }
+    }
+    fn cover(&self, bytes: u64) -> Result<()> {
+        self.cover
+            .borrow_mut()
+            .cover(self.bytes.get() + self.live.get() + bytes)
+    }
+    pub(super) fn keep(&self, bytes: u64) -> Result<()> {
+        self.cover(bytes)?;
+        self.bytes.set(self.bytes.get() + bytes);
+        Ok(())
+    }
+    pub(super) fn with_json<T>(
+        &self,
+        expr: Option<&Expr>,
+        text: &str,
+        read: impl FnOnce(&Json) -> T,
+    ) -> Result<T> {
+        let Some(Expr::Literal(_) | Expr::Parameter(_)) = expr else {
+            return Err(Error::PlanError(
+                "cannot compare TEXT with JSON; cast the TEXT to JSON explicitly".to_owned(),
+            ));
+        };
+        let mut entries = self.values.borrow_mut();
+        let at = match entries.iter().position(|entry| entry.0 == text) {
+            Some(at) => at,
+            None => {
+                let bytes =
+                    json_bytes(text.as_bytes()) + text.len() as u64 + node::<(String, Json)>();
+                self.keep(bytes)?;
+                let value = serde_json::from_str(text).map_err(|_| {
+                    Error::PlanError(
+                        "TEXT beside JSON must contain valid JSON; use an explicit cast".to_owned(),
+                    )
+                })?;
+                let at = entries.len();
+                entries.push((text.to_owned(), value));
+                at
+            }
+        };
+        Ok(read(&entries[at].1))
+    }
+}
+
 /// What an expression is worked out with beside its row: the values the statement bound, the
 /// statement's one time in milliseconds, which `NOW()` answers with, and the values of the
 /// statement's subqueries, each worked out once before any row; and, when the statement is
@@ -100,39 +176,46 @@ impl<'a> Scope<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct EvalContext<'a> {
     pub(super) params: &'a HashMap<String, Value>,
+    pub(super) kept: &'a Kept,
     now: i64,
-    subqueries: &'a [(usize, Vec<Value>)],
+    subqueries: &'a [(usize, List)],
     pub(super) said: Option<&'a RefCell<Vec<String>>>,
+    pub(super) held: Option<&'a RefCell<Reservation>>,
     pub(super) explained: Option<&'a Plan>,
+    pub(super) sets: Option<super::SetContext<'a>>,
+    pub(super) membership: Option<usize>,
 }
 
 impl<'a> EvalContext<'a> {
-    pub(crate) fn new(params: &'a HashMap<String, Value>, now: i64) -> Self {
+    pub(crate) fn new(params: &'a HashMap<String, Value>, now: i64, kept: &'a Kept) -> Self {
         EvalContext {
             params,
+            kept,
             now,
             subqueries: &[],
             said: None,
+            held: None,
             explained: None,
+            sets: None,
+            membership: None,
         }
     }
 
-    /// The statement's one time in milliseconds.
-    pub(crate) fn now(&self) -> i64 {
-        self.now
+    pub(crate) fn with_sets(self, sets: Option<super::SetContext<'a>>) -> Self {
+        Self { sets, ..self }
     }
 
     /// The context of a statement whose subqueries gave these values, each under the place its
     /// text begins in the statement: one value for each row of each.
-    pub(crate) fn over(self, subqueries: &'a [(usize, Vec<Value>)]) -> Self {
+    pub(crate) fn over(self, subqueries: &'a [(usize, List)]) -> Self {
         EvalContext { subqueries, ..self }
     }
 
     /// The values of one subquery of the statement, found by its place, which every copy of
     /// it keeps.
-    pub(super) fn subquery(&self, query: &Select) -> Result<&'a [Value]> {
+    pub(super) fn subquery(&self, query: &Select) -> Result<&'a List> {
         let found = self.subqueries.iter().find(|(at, _)| *at == query.at.0);
-        found.map(|(_, values)| values.as_slice()).ok_or_else(|| {
+        found.map(|(_, values)| values).ok_or_else(|| {
             Error::PlanError("a subquery has values only where its statement runs it".to_owned())
         })
     }
@@ -146,45 +229,78 @@ impl<'a> EvalContext<'a> {
 ///
 /// A distance, `left <=> right`, is worked out from the two vectors as the vector part works it
 /// out, so a row's distance is the same number wherever it is written; NULL when either side is.
-pub(crate) fn eval(expr: &Expr, scope: &Scope, row: &[Value], ctx: &EvalContext) -> Result<Value> {
-    let value = |expr: &Expr| eval(expr, scope, row, ctx);
-    Ok(match expr {
+pub(crate) fn eval<'a>(
+    expr: &'a Expr,
+    scope: &Scope,
+    row: &'a [Value],
+    ctx: &EvalContext<'a>,
+) -> Result<Cow<'a, Value>> {
+    let live = ctx.kept.live.get();
+    let result = worked(expr, scope, row, ctx, false);
+    ctx.kept.live.set(live);
+    result
+}
+
+fn worked<'a>(
+    expr: &'a Expr,
+    scope: &Scope,
+    row: &'a [Value],
+    ctx: &EvalContext<'a>,
+    intermediate: bool,
+) -> Result<Cow<'a, Value>> {
+    let value = |expr: &'a Expr| {
+        let live = ctx.kept.live.get();
+        let value = worked(expr, scope, row, ctx, true);
+        ctx.kept.live.set(live);
+        let value = value?;
+        if let Cow::Owned(value) = &value {
+            ctx.kept.live.set(ctx.kept.live.get() + heap_bytes(value));
+        }
+        Ok(value)
+    };
+    Ok(Cow::Owned(match expr {
         Expr::Column(column) => {
             let (at, _) = scope.find(column)?;
-            let value = row.get(at).cloned();
-            value.ok_or_else(|| scope.missing(column))?
+            return row
+                .get(at)
+                .map(Cow::Borrowed)
+                .ok_or_else(|| scope.missing(column));
         }
-        Expr::Literal(literal) => match literal {
-            Literal::Null => Value::Null,
-            Literal::Bool(value) => Value::Bool(*value),
-            Literal::Integer(value) => Value::Int64(*value),
-            Literal::Real(value) => Value::Float64(*value),
-            Literal::Text(value) => Value::Text(value.clone()),
-            Literal::Vector(value) => Value::Vector(value.clone()),
-        },
-        Expr::Parameter(name) => ctx.params.get(name).cloned().ok_or_else(|| unbound(name))?,
+        Expr::Literal(value) => return Ok(Cow::Borrowed(value)),
+        Expr::Parameter(name) => {
+            return ctx
+                .params
+                .get(name)
+                .map(Cow::Borrowed)
+                .ok_or_else(|| unbound(name));
+        }
         Expr::BinaryOp { left, op, right } => {
             let holds: fn(Ordering) -> bool = match op {
                 BinOp::Eq | BinOp::Neq
                     if matches!((&**left, &**right), (Expr::Row(_), _) | (_, Expr::Row(_))) =>
                 {
-                    let equal = rows_equal(&side(left, value)?, &side(right, value)?);
-                    return Ok(equal.map_or(Value::Null, |equal| {
+                    let equal = rows_equal(
+                        &side(left, value)?,
+                        &side(right, value)?,
+                        (Some(left.sides()), Some(right.sides())),
+                        ctx,
+                    )?;
+                    return Ok(Cow::Owned(equal.map_or(Value::Null, |equal| {
                         Value::Bool(equal == (*op == BinOp::Eq))
-                    }));
+                    })));
                 }
                 BinOp::And | BinOp::Or => {
                     // The value that decides the answer alone: FALSE for AND, TRUE for OR.
                     let settles = *op == BinOp::Or;
-                    let left = truth(&value(left)?);
+                    let left = truth(&*value(left)?);
                     if left == Some(settles) {
-                        return Ok(Value::Bool(settles));
+                        return Ok(Cow::Owned(Value::Bool(settles)));
                     }
-                    return Ok(match (left, truth(&value(right)?)) {
+                    return Ok(Cow::Owned(match (left, truth(&*value(right)?)) {
                         (_, Some(right)) if right == settles => Value::Bool(settles),
                         (Some(_), Some(_)) => Value::Bool(!settles),
                         _ => Value::Null,
-                    });
+                    }));
                 }
                 BinOp::Eq => Ordering::is_eq,
                 BinOp::Neq => Ordering::is_ne,
@@ -193,11 +309,15 @@ pub(crate) fn eval(expr: &Expr, scope: &Scope, row: &[Value], ctx: &EvalContext)
                 BinOp::Gt => Ordering::is_gt,
                 BinOp::Gte => Ordering::is_ge,
             };
-            compare(&value(left)?, &value(right)?)
-                .map_or(Value::Null, |order| Value::Bool(holds(order)))
+            compared(
+                ctx,
+                (Some(left), &*value(left)?),
+                (Some(right), &*value(right)?),
+            )?
+            .map_or(Value::Null, |order| Value::Bool(holds(order)))
         }
-        Expr::UnaryOp { op, operand } => match (op, value(operand)?) {
-            (UnaryOp::Not, value) => truth(&value).map_or(Value::Null, |truth| Value::Bool(!truth)),
+        Expr::UnaryOp { op, operand } => match (op, value(operand)?.as_ref()) {
+            (UnaryOp::Not, value) => truth(value).map_or(Value::Null, |truth| Value::Bool(!truth)),
             (UnaryOp::Neg, Value::Null) => Value::Null,
             (UnaryOp::Neg, Value::Int64(value)) => {
                 Value::Int64(value.checked_neg().ok_or_else(out_of_range)?)
@@ -209,16 +329,21 @@ pub(crate) fn eval(expr: &Expr, scope: &Scope, row: &[Value], ctx: &EvalContext)
                 ));
             }
         },
-        Expr::IsNull { expr, negated } => Value::Bool((value(expr)? == Value::Null) != *negated),
+        Expr::IsNull { expr, negated } => Value::Bool((*value(expr)? == Value::Null) != *negated),
         Expr::FunctionCall { name, args } => match (scalar(name), args.as_slice()) {
             (Some(Scalar::Arithmetic(op)), [left, right]) => {
-                arithmetic(op, &value(left)?, &value(right)?)?
+                arithmetic(op, &*value(left)?, &*value(right)?)?
             }
             (Some(Scalar::Now), []) => Value::Timestamp(ctx.now),
             (Some(Scalar::Coalesce), args) => {
                 for arg in args {
                     let first = value(arg)?;
-                    if first != Value::Null {
+                    if let Value::Int64(whole) = *first
+                        && super::bind::kind(expr, scope, ctx.params)? == Some(ColumnType::Real)
+                    {
+                        return Ok(Cow::Owned(Value::Float64(whole as f64)));
+                    }
+                    if *first != Value::Null {
                         return Ok(first);
                     }
                 }
@@ -231,42 +356,56 @@ pub(crate) fn eval(expr: &Expr, scope: &Scope, row: &[Value], ctx: &EvalContext)
             list,
             negated,
         } => {
-            let items = list.iter().map(|item| side(item, value));
-            among(&side(expr, value)?, items, *negated)?
+            let items = list
+                .iter()
+                .map(|item| Ok((Some(item.sides()), side(item, value)?)));
+            among(&side(expr, value)?, items, *negated, expr.sides(), ctx)?
         }
         Expr::InSubquery {
             expr,
             query,
             negated,
-        } => {
-            let items = ctx.subquery(query)?.iter().map(std::slice::from_ref);
-            among(&[value(expr)?], items.map(Ok), *negated)?
-        }
+        } => match ctx.subquery(query)? {
+            List::Stored(s) => s.member(value(expr)?, *negated, expr.sides(), ctx)?,
+            List::Memory(items, _) => {
+                let items = items.iter().map(|v| Ok((None, [Cow::Borrowed(v)])));
+                among(&[value(expr)?], items, *negated, expr.sides(), ctx)?
+            }
+        },
         // A subquery that found no row is NULL.
-        Expr::Subquery(query) => ctx.subquery(query)?.first().cloned().unwrap_or(Value::Null),
+        Expr::Subquery(query) => {
+            return Ok(Cow::Borrowed(
+                ctx.subquery(query)?
+                    .small()?
+                    .first()
+                    .unwrap_or(&Value::Null),
+            ));
+        }
         Expr::Row(_) => {
             return Err(Error::PlanError(
                 "a row value, (a, b), stands only on either side of =, <> or IN".to_owned(),
             ));
         }
-        Expr::Distance { left, right } => match (numbers(value(left)?)?, numbers(value(right)?)?) {
-            (Some(left), Some(right)) if left.len() == right.len() => {
-                Value::Float64(crate::vector::distance(&left, &right))
+        Expr::Distance { left, right } => {
+            match (numbers(&*value(left)?)?, numbers(&*value(right)?)?) {
+                (Some(left), Some(right)) if left.clone().count() == right.clone().count() => {
+                    Value::Float64(crate::vector::distance(left, right))
+                }
+                (Some(_), Some(_)) => {
+                    return Err(Error::PlanError(
+                        "<=> needs two vectors of one length".to_owned(),
+                    ));
+                }
+                _ => Value::Null,
             }
-            (Some(_), Some(_)) => {
-                return Err(Error::PlanError(
-                    "<=> needs two vectors of one length".to_owned(),
-                ));
-            }
-            _ => Value::Null,
-        },
+        }
         Expr::Like {
             expr,
             pattern,
             negated,
-        } => match (value(expr)?, value(pattern)?) {
+        } => match (value(expr)?.as_ref(), value(pattern)?.as_ref()) {
             (Value::Text(text), Value::Text(pattern)) => {
-                Value::Bool(like(&text, &pattern) != *negated)
+                Value::Bool(like(text, pattern) != *negated)
             }
             _ => Value::Null,
         },
@@ -277,8 +416,10 @@ pub(crate) fn eval(expr: &Expr, scope: &Scope, row: &[Value], ctx: &EvalContext)
             negated,
         } => {
             let middle = value(expr)?;
-            let above = compare(&middle, &value(low)?).map(Ordering::is_ge);
-            let below = compare(&middle, &value(high)?).map(Ordering::is_le);
+            let above = compared(ctx, (Some(expr), &middle), (Some(low), &*value(low)?))?
+                .map(Ordering::is_ge);
+            let below = compared(ctx, (Some(expr), &middle), (Some(high), &*value(high)?))?
+                .map(Ordering::is_le);
             match (above, below) {
                 (Some(false), _) | (_, Some(false)) => Value::Bool(*negated),
                 (Some(true), Some(true)) => Value::Bool(!*negated),
@@ -286,20 +427,28 @@ pub(crate) fn eval(expr: &Expr, scope: &Scope, row: &[Value], ctx: &EvalContext)
             }
         }
         Expr::Field { json, key, as_text } => {
-            let field = match (value(json)?, value(key)?) {
-                (Value::Json(json), Value::Text(key)) => json.get(key.as_str()).cloned(),
-                (Value::Json(json), Value::Int64(place)) => {
-                    let place = usize::try_from(place).ok();
-                    place.and_then(|place| json.get(place).cloned())
+            let (json, key) = (value(json)?, value(key)?);
+            let field = match (json.as_ref(), key.as_ref()) {
+                (Value::Json(json), Value::Text(key)) => json.get(key.as_str()),
+                (Value::Json(json), Value::Int64(at)) => {
+                    usize::try_from(*at).ok().and_then(|at| json.get(at))
                 }
                 _ => None,
             };
             match field {
                 None => Value::Null,
-                Some(field) if !*as_text => Value::Json(field),
-                Some(serde_json::Value::Null) => Value::Null,
-                Some(serde_json::Value::String(text)) => Value::Text(text),
-                Some(field) => Value::Text(field.to_string()),
+                Some(Json::Null) if *as_text => Value::Null,
+                Some(field) => {
+                    if intermediate {
+                        ctx.kept
+                            .cover(heap_bytes(&json) * if *as_text { 18 } else { 1 })?;
+                    }
+                    match (field, as_text) {
+                        (Json::String(text), true) => Value::Text(text.clone()),
+                        (_, true) => Value::Text(field.to_string()),
+                        _ => Value::Json(field.clone()),
+                    }
+                }
             }
         }
         Expr::RowNumber { .. } => {
@@ -307,25 +456,27 @@ pub(crate) fn eval(expr: &Expr, scope: &Scope, row: &[Value], ctx: &EvalContext)
                 "ROW_NUMBER() has a value only for the rows its window numbered".to_owned(),
             ));
         }
-    })
+    }))
 }
 
 /// Whether `left` is among `items`: TRUE when one of them equals it, else unknown when any
 /// equality was.
-fn among<T: AsRef<[Value]>>(
-    left: &[Value],
-    items: impl Iterator<Item = Result<T>>,
+pub(super) fn among<'a, 'e, T: AsRef<[Cow<'a, Value>]>>(
+    left: &[Cow<'a, Value>],
+    items: impl Iterator<Item = Result<(Option<&'e [Expr]>, T)>>,
     negated: bool,
+    expr: &[Expr],
+    ctx: &EvalContext,
 ) -> Result<Value> {
     let mut found = Some(false);
     for item in items {
-        let item = item?;
+        let (other, item) = item?;
         if item.as_ref().len() != left.len() {
             return Err(Error::PlanError(
                 "a row value beside IN needs as many values as its partner".to_owned(),
             ));
         }
-        match rows_equal(left, item.as_ref()) {
+        match rows_equal(left, item.as_ref(), (Some(expr), other), ctx)? {
             Some(true) => return Ok(Value::Bool(!negated)),
             Some(false) => {}
             None => found = None,
@@ -379,61 +530,101 @@ pub(super) fn holds(expr: &Expr, is: fn(&Expr) -> bool) -> bool {
 
 /// The numbers of a side of `<=>`: a vector, or a text that spells one, such as '[1, 0]'; `None`
 /// for NULL. Anything else is refused.
-pub(super) fn numbers(value: Value) -> Result<Option<Vec<f32>>> {
-    let vector = match value {
+pub(super) fn numbers(value: &Value) -> Result<Option<impl Iterator<Item = f32> + Clone + '_>> {
+    let (vector, text) = match value {
         Value::Null => return Ok(None),
-        Value::Vector(vector) => Some(vector),
-        Value::Text(text) => vector_from_text(&text),
-        _ => None,
+        Value::Vector(vector) => (Some(vector.as_slice()), None),
+        Value::Text(text) => (None, vector_numbers(text)),
+        _ => (None, None),
     };
-    let refused = "<=> needs a vector on both sides: write [1.0, 0.0], its text '[1, 0]', or a \
-                   $name bound to a vector";
-    vector
-        .map(Some)
-        .ok_or_else(|| Error::PlanError(refused.to_owned()))
+    if vector.is_none()
+        && text
+            .as_ref()
+            .is_none_or(|it| it.clone().any(|n| n.is_none()))
+    {
+        return Err(Error::PlanError("<=> needs a vector on both sides: write [1.0, 0.0], its text '[1, 0]', or a $name bound to a vector".to_owned()));
+    }
+    Ok(Some(vector.into_iter().flatten().copied().chain(
+        text.into_iter().flatten().map(|n| n.unwrap_or_default()),
+    )))
 }
 
 /// The values of one side of IN: those of a row value, or the one value of anything else.
-fn side(expr: &Expr, value: impl Fn(&Expr) -> Result<Value>) -> Result<Vec<Value>> {
+fn side<'a>(
+    expr: &'a Expr,
+    value: impl Fn(&'a Expr) -> Result<Cow<'a, Value>>,
+) -> Result<Vec<Cow<'a, Value>>> {
     expr.sides().iter().map(value).collect()
 }
 
 /// Whether two row values of one length are equal, as standard SQL has it: FALSE as soon as one
 /// pair of columns is definitely different, whatever a NULL beside it holds; TRUE when every
 /// pair is equal; otherwise unknown. One value is a row of one column.
-fn rows_equal(left: &[Value], right: &[Value]) -> Option<bool> {
+fn rows_equal(
+    left: &[Cow<'_, Value>],
+    right: &[Cow<'_, Value>],
+    expr: (Option<&[Expr]>, Option<&[Expr]>),
+    ctx: &EvalContext,
+) -> Result<Option<bool>> {
     let mut equal = Some(true);
-    for (left, right) in left.iter().zip(right) {
-        match compare(left, right) {
+    for (at, (left, right)) in left.iter().zip(right).enumerate() {
+        match compared(
+            ctx,
+            (expr.0.and_then(|items| items.get(at)), left),
+            (expr.1.and_then(|items| items.get(at)), right),
+        )? {
             Some(Ordering::Equal) => {}
-            Some(_) => return Some(false),
+            Some(_) => return Ok(Some(false)),
             None => equal = None,
         }
     }
-    equal
+    Ok(equal)
+}
+
+fn compared(
+    ctx: &EvalContext,
+    left: (Option<&Expr>, &Value),
+    right: (Option<&Expr>, &Value),
+) -> Result<Option<Ordering>> {
+    let (tree, expr, text, reverse) = match (left, right) {
+        ((_, Value::Json(tree)), (expr, Value::Text(text))) => (tree, expr, text, false),
+        ((expr, Value::Text(text)), (_, Value::Json(tree))) => (tree, expr, text, true),
+        _ => return Ok(compare(left.1, right.1)),
+    };
+    ctx.kept.with_json(expr, text, |cached| {
+        Some(if reverse {
+            json(cached, tree)
+        } else {
+            json(tree, cached)
+        })
+    })
 }
 
 /// The most memory the value of an expression can take outside its own cell. It is known
 /// before the expression is worked out, so the memory is asked for before the value is made.
-pub(super) fn most_bytes(expr: &Expr, scope: &Scope, row: &[Value], ctx: &EvalContext) -> u64 {
+pub(crate) fn most_bytes(expr: &Expr, scope: &Scope, row: &[Value], ctx: &EvalContext) -> u64 {
     match expr {
         Expr::Column(column) => {
             let at = scope.find(column).ok();
             at.and_then(|(at, _)| row.get(at)).map_or(0, heap_bytes)
         }
-        Expr::Literal(Literal::Text(text)) => text.len() as u64,
-        Expr::Literal(Literal::Vector(vector)) => size_of_val(vector.as_slice()) as u64,
+        Expr::Literal(value) => heap_bytes(value),
         Expr::Parameter(name) => ctx.params.get(name).map_or(0, heap_bytes),
         Expr::FunctionCall { name, args } if matches!(scalar(name), Some(Scalar::Coalesce)) => {
             let each = args.iter().map(|arg| most_bytes(arg, scope, row, ctx));
             each.max().unwrap_or(0)
         }
         Expr::Subquery(query) => {
-            let first = ctx.subquery(query).ok().and_then(|found| found.first());
+            let first = ctx
+                .subquery(query)
+                .ok()
+                .and_then(|found| found.small().ok()?.first());
             first.map_or(0, heap_bytes)
         }
         // A field is no larger than the JSON value it is taken from.
-        Expr::Field { json, .. } => most_bytes(json, scope, row, ctx),
+        Expr::Field { json, as_text, .. } => {
+            most_bytes(json, scope, row, ctx).saturating_mul(if *as_text { 18 } else { 1 })
+        }
         // Everything else gives a number, a truth, a time or NULL.
         _ => 0,
     }
@@ -458,7 +649,7 @@ pub(super) fn mark(expr: &Expr, scope: &Scope, read: &mut [bool]) {
     {
         read[at] = true;
     }
-    let inner = crate::sql::inside(expr).into_iter();
+    let inner = crate::sql::inside(expr);
     inner.for_each(|inner| mark(inner, scope, read));
 }
 
@@ -468,7 +659,10 @@ pub(super) fn column_index(table: &Table, column: &ColumnRef) -> Result<usize> {
 }
 
 pub(super) fn unbound(name: &str) -> Error {
-    Error::PlanError(format!("no value is bound to ${name}"))
+    Error::PlanError(format!(
+        "no value is bound to ${}",
+        crate::types::excerpt(name)
+    ))
 }
 
 fn out_of_range() -> Error {
@@ -599,9 +793,16 @@ fn ordered(left: &Value, right: &Value) -> Option<Ordering> {
         (Value::Uuid(left), Value::Text(right)) => left.cmp(&right.parse().ok()?),
         (Value::Timestamp(left), Value::Text(right)) => left.cmp(&timestamp_millis(right)?),
         (Value::Json(left), Value::Json(right)) => json(left, right),
-        (Value::Json(left), Value::Text(right)) => json(left, &serde_json::from_str(right).ok()?),
         (Value::Vector(left), Value::Vector(right)) => left.partial_cmp(right)?,
-        (Value::Vector(left), Value::Text(right)) => left.partial_cmp(&vector_from_text(right)?)?,
+        (Value::Vector(left), Value::Text(right)) => {
+            let right = vector_numbers(right)?;
+            if right.clone().any(|n| n.is_none()) {
+                return None;
+            }
+            left.iter()
+                .copied()
+                .partial_cmp(right.map(|n| n.unwrap_or_default()))?
+        }
         _ => return None,
     })
 }
@@ -645,14 +846,38 @@ fn json(left: &Json, right: &Json) -> Ordering {
 /// the reverse, which puts NULL first. Two values that do not compare are the same only when
 /// they are equal; any others are told apart by how each is written, so two different values
 /// never sort as one.
-pub(super) fn sort_order(left: &Value, right: &Value) -> Ordering {
+pub(crate) fn sort_order(left: &Value, right: &Value) -> Ordering {
     match (left, right) {
         (Value::Null, Value::Null) => Ordering::Equal,
         (Value::Null, _) => Ordering::Greater,
         (_, Value::Null) => Ordering::Less,
         _ => compare(left, right).unwrap_or_else(|| match left == right {
             true => Ordering::Equal,
-            false => format!("{left:?}").cmp(&format!("{right:?}")),
+            false => spelling(left).cmp(spelling(right)),
         }),
     }
+}
+
+/// Full Debug spelling for vectors; other kinds differ within the bounded prefix.
+fn spelling(value: &Value) -> impl Iterator<Item = u8> + '_ {
+    let mut prefix = Cursor::new([0; 16]);
+    let _ = write!(prefix, "{value:?}");
+    let vector = match value {
+        Value::Vector(vector) => Some(vector),
+        _ => None,
+    };
+    let len = vector.map_or(prefix.position() as usize, |_| 8);
+    let tail = vector.into_iter().flat_map(|vector| {
+        vector
+            .iter()
+            .enumerate()
+            .flat_map(|(at, n)| {
+                let mut text = Cursor::new([0; 64]);
+                let _ = write!(text, "{}{n:?}", if at == 0 { "" } else { ", " });
+                let len = text.position() as usize;
+                text.into_inner().into_iter().take(len)
+            })
+            .chain([b']', b')'])
+    });
+    prefix.into_inner().into_iter().take(len).chain(tail)
 }

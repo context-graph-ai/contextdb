@@ -1,5 +1,9 @@
 # Contributing to contextdb
 
+Changes under `v2/` use [`v2/README.md`](v2/README.md) and
+[`v2/AGENTS.md`](v2/AGENTS.md), with pull requests targeting `dev`. The root-workspace
+commands and `crates/` layout below concern the published engine.
+
 ## Building
 
 ```bash

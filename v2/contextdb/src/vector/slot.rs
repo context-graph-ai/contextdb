@@ -16,6 +16,11 @@ pub(super) const SLOT_HEADER: usize = 8;
 /// vector of fewer than ten million numbers.
 const UP: f64 = 1.0 + 1e-9;
 
+/// The scale of a slot.
+pub(super) fn scale(slot: &[u8]) -> f32 {
+    f32::from_le_bytes([slot[0], slot[1], slot[2], slot[3]])
+}
+
 /// Bytes the slot of a vector of this dimension takes.
 pub(super) fn slot_len(dimension: usize) -> usize {
     SLOT_HEADER + dimension
@@ -28,10 +33,13 @@ pub(super) fn slot_len(dimension: usize) -> usize {
 /// Each number is widened to 64 bits before it is multiplied, and the three sums (the dot
 /// product and the two squared lengths) are added in the order of the numbers. The distance is
 /// `1 - dot / (|stored| * |query|)`, and 1 when either vector is all zeros.
-pub(crate) fn distance(stored: &[f32], query: &[f32]) -> f64 {
+pub(crate) fn distance<X: std::borrow::Borrow<f32>, Y: std::borrow::Borrow<f32>>(
+    stored: impl IntoIterator<Item = X>,
+    query: impl IntoIterator<Item = Y>,
+) -> f64 {
     let (mut dot, mut aa, mut bb) = (0.0_f64, 0.0_f64, 0.0_f64);
-    for (x, y) in stored.iter().zip(query) {
-        let (x, y) = (f64::from(*x), f64::from(*y));
+    for (x, y) in stored.into_iter().zip(query) {
+        let (x, y) = (f64::from(*x.borrow()), f64::from(*y.borrow()));
         dot += x * y;
         aa += x * x;
         bb += y * y;
@@ -189,7 +197,7 @@ impl Screen {
     /// A vector of zeros, stored or searched for, is at distance 1. Its codes or its `unit`
     /// are zeros, so the middle of the range is 0, and `drift` is above zero.
     pub(super) fn range(&self, slot: &[u8]) -> (f32, f32) {
-        let scale = f32::from_le_bytes([slot[0], slot[1], slot[2], slot[3]]);
+        let scale = scale(slot);
         let error = f32::from_le_bytes([slot[4], slot[5], slot[6], slot[7]]);
         let middle = f64::from(scale * product(&slot[SLOT_HEADER..], &self.unit));
         let half = f64::from(error) * self.length + f64::from(scale) * self.slack + self.drift;

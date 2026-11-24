@@ -7,14 +7,18 @@ CREATE TABLE tags (id INTEGER PRIMARY KEY, tag TEXT);
 INSERT INTO notes (id, tag, body) VALUES (1, 'a', 'first'), (2, 'b', 'second'), (3, 'a', 'third');
 INSERT INTO tags (id, tag) VALUES (1, 'a');
 
-# An index is dropped by its name and its table. The rows are as they were, and a filter the
-# index served is still answered.
+# By its name alone an index two tables declare is refused, under IF EXISTS too; with its table
+# it is dropped, the rows are as they were, and a filter the index served is still answered.
 CREATE INDEX by_tag ON notes (tag);
 CREATE INDEX by_tag ON tags (tag);
+DROP INDEX IF EXISTS by_tag;
+----
+error: PlanError | plan error: index name "by_tag" is ambiguous: tables notes, tags; write ON <table>
+
 DROP INDEX by_tag ON notes;
 SELECT id FROM notes WHERE tag = 'a' ORDER BY id;
 ----
-id
+id  (read 3, compared 0)
 1
 3
 
@@ -25,11 +29,15 @@ error: IndexNotFound
 
 DROP INDEX IF EXISTS by_tag ON notes;
 ----
-rows affected: 0
+rows affected: 0  (read 0, compared 0)
 
-DROP INDEX IF EXISTS by_tag ON notes;
+DROP INDEX IF EXISTS never_made;
 ----
-rows affected: 0
+rows affected: 0  (read 0, compared 0)
+
+DROP INDEX never_made;
+----
+error: IndexNotFound | index not found: never_made
 
 DROP INDEX never_made ON notes;
 ----
@@ -41,7 +49,7 @@ error: TableNotFound
 
 # The index of the same name on another table was not touched, and the name is free again on
 # this one.
-DROP INDEX by_tag ON tags;
+DROP INDEX by_tag;
 DROP INDEX by_tag ON tags;
 ----
 error: IndexNotFound
@@ -74,16 +82,16 @@ error: TableNotFound
 
 DROP TABLE IF EXISTS notes;
 ----
-rows affected: 0
+rows affected: 0  (read 0, compared 0)
 
 DROP TABLE IF EXISTS never_made;
 ----
-rows affected: 0
+rows affected: 0  (read 0, compared 0)
 
 # The other table is as it was.
 SELECT id, tag FROM tags ORDER BY id;
 ----
-id | tag
+id | tag  (read 1, compared 0)
 1 | a
 
 # The name is free: a table declared under it has none of the old columns, rows or indexes.
@@ -94,14 +102,14 @@ error: ColumnNotFound
 
 SELECT COUNT(*) AS n FROM notes;
 ----
-n
+n  (read 0, compared 0)
 0
 
 INSERT INTO notes (id, other) VALUES (1, 'new');
 CREATE INDEX by_body ON notes (other);
 SELECT id, other FROM notes ORDER BY id;
 ----
-id | other
+id | other  (read 1, compared 0)
 1 | new
 
 # A name folds in DROP as it does everywhere, and a quoted name is the letters as written.
@@ -130,7 +138,7 @@ error: SchemaInvalid
 
 SELECT id FROM parents;
 ----
-id
+id  (read 1, compared 0)
 1
 
 DROP TABLE children;
@@ -169,8 +177,18 @@ VALUES (1, '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-0000
 ALTER TABLE links DROP COLUMN edge_type;
 SELECT id, source_id, target_id FROM links;
 ----
-id | source_id | target_id
+id | source_id | target_id  (read 1, compared 0)
 1 | 00000000-0000-0000-0000-000000000001 | 00000000-0000-0000-0000-000000000002
+
+SELECT a_id FROM GRAPH_TABLE(links MATCH (a)-[]->(b) COLUMNS (a.id AS a_id));
+----
+error: PlanError | plan error: links holds no edges: a graph pattern needs a table with source_id UUID, target_id UUID and edge_type TEXT
+
+CREATE TABLE plain_edges (id INTEGER PRIMARY KEY, source_id UUID NOT NULL, target_id UUID NOT NULL, edge_type TEXT NOT NULL);
+ALTER TABLE plain_edges RENAME COLUMN target_id TO goal;
+SELECT a_id FROM GRAPH_TABLE(plain_edges MATCH (a)-[]->(b) COLUMNS (a.id AS a_id));
+----
+error: PlanError | plan error: plain_edges holds no edges: a graph pattern needs a table with source_id UUID, target_id UUID and edge_type TEXT
 
 # What a rank policy reads is not dropped while the policy stands: the table it joins, the
 # index it joins through, and the columns its formula and its join name.
@@ -225,7 +243,7 @@ ALTER TABLE docs ADD COLUMN v VECTOR(2) PARTITION_KEY (tenant) MAX_PARTITIONS 1;
 INSERT INTO docs (id, tenant, v) VALUES (2, 'south', [0.0, 1.0]);
 SELECT id FROM docs ORDER BY v <=> [1.0, 0.0] LIMIT 5;
 ----
-id
+id  (read 2, compared 1)
 2
 
 DROP TABLE docs;
@@ -233,5 +251,5 @@ CREATE TABLE docs (id INTEGER PRIMARY KEY, tenant TEXT NOT NULL, v VECTOR(2) PAR
 INSERT INTO docs (id, tenant, v) VALUES (7, 'east', [1.0, 0.0]);
 SELECT id FROM docs ORDER BY v <=> [1.0, 0.0] LIMIT 5;
 ----
-id
+id  (read 2, compared 1)
 7

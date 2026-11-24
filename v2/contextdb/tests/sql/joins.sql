@@ -11,7 +11,7 @@ INSERT INTO tags (id, item_id, label) VALUES (10, 1, 'x'), (11, 1, 'y'), (12, 2,
 SELECT items.id, tags.label FROM items INNER JOIN tags ON items.id = tags.item_id
 ORDER BY items.id, tags.label;
 ----
-id | label
+id | label  (read 6, compared 0)
 1 | x
 1 | y
 2 | x
@@ -20,7 +20,7 @@ id | label
 SELECT x.name, y.label FROM items x JOIN tags y ON x.id = y.item_id WHERE y.label = 'x'
 ORDER BY x.id;
 ----
-name | label
+name | label  (read 6, compared 0)
 a | x
 b | x
 
@@ -28,7 +28,7 @@ b | x
 SELECT i.id, t.label FROM items AS i LEFT JOIN tags AS t ON i.id = t.item_id
 ORDER BY i.id, t.label;
 ----
-id | label
+id | label  (read 6, compared 0)
 1 | x
 1 | y
 2 | x
@@ -37,7 +37,7 @@ id | label
 # CROSS JOIN gives the rows of an inner join whose condition always holds.
 SELECT i.id, t.id FROM items i CROSS JOIN tags t WHERE t.id >= 12 ORDER BY i.id, t.id;
 ----
-id | id
+id | id  (read 5, compared 0)
 1 | 12
 1 | 13
 2 | 12
@@ -47,7 +47,7 @@ id | id
 
 SELECT i.id, t.id FROM items i INNER JOIN tags t ON 1 = 1 WHERE t.id >= 12 ORDER BY i.id, t.id;
 ----
-id | id
+id | id  (read 5, compared 0)
 1 | 12
 1 | 13
 2 | 12
@@ -73,7 +73,7 @@ INSERT INTO notes (id, tag_id, note) VALUES (100, 10, 'n10'), (101, 12, 'n12');
 SELECT i.id, t.label, n.note FROM items AS i INNER JOIN tags AS t ON i.id = t.item_id
 LEFT JOIN notes n ON n.tag_id = t.id ORDER BY i.id, t.label;
 ----
-id | label | note
+id | label | note  (read 8, compared 0)
 1 | x | n10
 1 | y | NULL
 2 | x | n12
@@ -82,7 +82,7 @@ id | label | note
 select items.id, tags.label from items inner join tags on items.id = tags.item_id
 order by items.id, tags.label;
 ----
-id | label
+id | label  (read 6, compared 0)
 1 | x
 1 | y
 2 | x
@@ -100,14 +100,14 @@ error: PlanError
 SELECT i.id, t.label FROM items i JOIN tags t ON i.id = t.item_id
 WHERE i.id IN (SELECT item_id FROM tags WHERE label = 'y') ORDER BY t.label;
 ----
-id | label
+id | label  (read 7, compared 0)
 1 | x
 1 | y
 
 # A bare ORDER BY name that the select list gives is that column, not the first of that name.
 SELECT tags.id FROM items JOIN tags ON items.id = tags.item_id ORDER BY id DESC;
 ----
-id
+id  (read 6, compared 0)
 12
 11
 10
@@ -120,5 +120,5 @@ INSERT INTO ca (id, count) VALUES (1, 10);
 INSERT INTO cb (id, count) VALUES (1, 20);
 SELECT COUNT(*) FROM ca JOIN cb ON ca.id = cb.id ORDER BY count;
 ----
-count
+count  (read 2, compared 0)
 1

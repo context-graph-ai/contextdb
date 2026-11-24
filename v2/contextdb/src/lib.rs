@@ -1,30 +1,50 @@
 #![doc = include_str!("../README.md")]
 
 mod database;
+mod erase;
+mod events;
+mod maintenance;
 mod memory;
 mod query;
 mod read;
 mod schema;
+mod settings;
 mod sql;
 mod store;
 mod system;
 mod types;
-mod upkeep;
 mod vector;
 mod write;
 
-pub use database::{Database, DatabaseOpenOptions, Transaction};
+pub use database::{
+    CommitEvent, CommitSource, CorePlugin, Create, Database, DatabaseOpenOptions, DatabasePlugin,
+    EventBusStatus, EventTypeStatus, PluginHealth, QueryOutcome, RouteStatus, ScheduleStatus,
+    SinkMetrics, SinkStatus, SubscriptionMetrics, Transaction, WorkDone,
+};
+pub use events::{TriggerAuditEntry, TriggerAuditStatus};
+pub use maintenance::{
+    ContentSize, ExportReport, Maintenance, MaintenanceReport, VectorMaintenanceReport,
+    VerifyReport, WaitingOn,
+};
+pub use memory::Owned;
 pub use query::QueryResult;
-pub use read::{ReadSession, ReadSessionOptions};
-pub use store::{StorageBackend, WrapStorage};
+pub use read::{
+    Cursor, OwnerReadCancellation, OwnerRequestHandler, ReadLimits, ReadPhase, ReadProgress,
+    ReadProgressObserver, ReadSession, ReadSessionOptions, RowVersions, Snapshot, request_owner,
+};
+pub use settings::parse_size;
+pub use sql::ast::{EdgeDiscard, EdgePropagation, Propagation, Reference, ScopeLabels};
+pub use sql::read_session_answers;
+pub use store::{ChangeSet, StorageBackend, WrapStorage};
 pub use system::Clock;
 pub use types::{
-    ColumnDef, ColumnDefault, ColumnType, ConflictPolicy, ContextId, Error, History, IndexDecl,
-    KeptCounts, Principal, Result, Retain, RetainUnit, ScopeLabel, SortDirection, StateMachine,
-    SyncDirection, TableMeta, TxId, Uuid, Value, VectorIndexRef, VectorPartitionDeclarationIssue,
-    VectorPolicyDeclarationIssue,
+    ColumnDef, ColumnDefault, ColumnType, ConflictPolicy, ContextId, DeclaredEvents, Error,
+    EventTypeDecl, EventTypeTrigger, History, IndexDecl, KeptCounts, Principal, Quantization,
+    Result, Retain, RetainUnit, RouteDecl, RouteWhereIn, ScopeLabel, SinkDecl, SinkError,
+    SinkEvent, SinkType, SortDirection, StateMachine, SyncDirection, TableMeta, TriggerContext,
+    TriggerDecl, TriggerEvent, TxId, Uuid, Value, VectorIndexRef, VectorOptions,
+    VectorPartitionDeclarationIssue, VectorPolicyDeclarationIssue, VectorSearchMode,
 };
-pub use upkeep::{MaintenanceReport, VectorMaintenanceReport};
 
 /// The JSON package whose `Value` a [`Value::Json`] holds, so a host needs no copy of its own.
 pub use serde_json;

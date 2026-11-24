@@ -1,46 +1,19 @@
-//! Counted work of the statements that read more than one table or more than one row for an
-//! answer: each reads the stored rows its answer needs and holds only what it says it holds,
-//! whatever the size of the tables.
+//! Work of the statements that read more than one table or more than one row for an answer:
+//! each holds only what it says it holds, whatever the size of the tables. The rows each reads
+//! are counted in `tests/sql/query_work.sql`.
 
 mod support;
 
-use std::collections::BTreeSet;
-
-use contextdb::{
-    ContextId, Database, DatabaseOpenOptions, Error, Uuid, Value, params, serde_json::json,
-};
+use contextdb::{Database, DatabaseOpenOptions, Error, Value, params};
 
 const MIB: usize = 1 << 20;
 
-/// A store with the usual table `t` of a thousand rows and `owners`, one row for each row of
-/// `t`, reached from it through the index on `t_id`: owner `n` is `(5000 + n, n, "note-<n>")`.
-fn owned(name: &str) -> Database {
-    let db = support::open(&support::folder(name));
-    support::declare(&db);
-    support::run(
-        &db,
-        "CREATE TABLE owners (id INTEGER PRIMARY KEY, t_id INTEGER NOT NULL, note TEXT)",
-    );
-    support::run(&db, "CREATE INDEX owners_t ON owners (t_id)");
-    let tx = db.transaction().expect("begin");
-    support::insert(&tx, 1..=1000);
-    for n in 1..=1000_i64 {
-        tx.execute(
-            "INSERT INTO owners (id, t_id, note) VALUES ($id, $t, $note)",
-            &params! { "id" => 5000 + n, "t" => n, "note" => format!("note-{n}") },
-        )
-        .expect("insert an owner");
-    }
-    tx.commit().expect("commit");
-    db
-}
-
-/// A store under a limit of 16 MiB with these tables, each of 48 rows whose `body` is half a
-/// mebibyte of text that begins with the table's name and the row's number: 24 MiB a table,
-/// which the limit cannot hold, and every body different from every other.
+/// A store under a limit that leaves a statement 7 MiB, with these tables, each of 48 rows whose
+/// `body` is half a mebibyte of text that begins with the table's name and the row's number:
+/// 24 MiB a table, which the limit cannot hold, and every body different from every other.
 fn large(name: &str, tables: &[&str]) -> Database {
     let mut options = DatabaseOpenOptions::default();
-    options.memory_limit = Some(16 * MIB);
+    options.memory_limit = Some(support::opening::open_floor() + 7 * MIB);
     let db = support::open_with(&support::folder(name), options).expect("open under a limit");
     for table in tables {
         support::run(
@@ -70,124 +43,8 @@ fn head(db: &Database, sql: &str) -> String {
 }
 
 #[test]
-fn a_join_reads_one_right_row_for_each_left_row_through_an_index() {
-    let db = owned("join-through-an-index");
-    let joined = support::run(
-        &db,
-        "SELECT x.id, o.note FROM t x JOIN owners o ON o.t_id = x.id WHERE x.id <= 10",
-    );
-    let wanted: Vec<Vec<Value>> = (1..=10_i64)
-        .map(|n| vec![Value::Int64(n), Value::Text(format!("note-{n}"))])
-        .collect();
-    support::assert_same_rows(joined.rows(), &wanted, "the joined rows");
-    // Ten rows of `t` and the one owner of each. A scan of `owners` reads a thousand.
-    assert_eq!(joined.rows_examined(), 20);
-    let sql = "SELECT x.id, o.note FROM t x JOIN owners o ON o.t_id = x.id WHERE x.id <= 8 \
-               AND o.id IN (SELECT id FROM owners WHERE id <= 5007)";
-    let listed = support::run(&db, sql);
-    assert_eq!(listed.rows().len(), 7);
-    assert_eq!(listed.rows_examined(), 22, "the list is read once");
-    // Another indexed column of `owners` named by a list leaves the join on its index: the three
-    // names, the one row of `t`, and the one owner of it.
-    support::run(&db, "CREATE INDEX owners_note ON owners (note)");
-    let by_note = "SELECT x.id FROM t x JOIN owners o ON o.t_id = x.id WHERE x.id = 1 \
-                   AND o.note IN (SELECT note FROM owners WHERE id <= 5003)";
-    assert_eq!(support::run(&db, by_note).rows_examined(), 5);
-
-    // A left 7.0 is no key of an INTEGER column and a left TEXT of 300 bytes cuts an index: the
-    // join still reads the other index (`jr_b`, or `jr_btag` past tag 6), one left row and the
-    // rows of b = 3. Row 100 is under Context 2, which a handle of Context 1 does not see.
-    for sql in [
-        "CREATE TABLE jl (id INTEGER PRIMARY KEY, a REAL, b INTEGER, txt TEXT)",
-        "CREATE TABLE jr (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, txt TEXT, tag INTEGER, \
-         context_id UUID NOT NULL CONTEXT_ID)",
-        "CREATE INDEX jr_ab ON jr (a, b)",
-        "CREATE INDEX jr_b ON jr (b)",
-        "CREATE INDEX jr_txt ON jr (txt, tag)",
-        "CREATE INDEX jr_btag ON jr (b, tag)",
-    ] {
-        support::run(&db, sql);
-    }
-    let (long, ctx) = ("x".repeat(300), Uuid::from_u128);
-    support::run(&db, &format!("INSERT INTO jl VALUES (1, 7.0, 3, '{long}')"));
-    for (id, a, b, owner) in (1..=12_i64)
-        .map(|n| (n, n, n % 4, 1))
-        .chain([(100, 7, 3, 2)])
-    {
-        let row = format!("({id}, {a}, {b}, '{long}', {id}, '{}')", ctx(owner));
-        support::run(&db, &format!("INSERT INTO jr VALUES {row}"));
-    }
-    let seven = |n: i64| [Value::Int64(n)];
-    let narrowed = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx(1))]));
-    let by_a = "SELECT jr.id FROM jl JOIN jr ON jr.a = jl.a AND jr.b = jl.b";
-    let found = support::run(&db, by_a);
-    support::assert_same_rows(found.rows(), &[seven(7), seven(100)], "7.0 equals 7");
-    assert_eq!(found.rows_examined(), 1 + 4, "the left row, the 4 of b = 3");
-    assert_eq!(
-        support::rows(&narrowed, by_a),
-        [seven(7)],
-        "hidden is unmatched"
-    );
-    let by_txt = "SELECT jr.id FROM jl JOIN jr ON jr.txt = jl.txt AND jr.b = jl.b WHERE jr.tag > 6";
-    let found = support::run(&db, by_txt);
-    support::assert_same_rows(
-        found.rows(),
-        &[seven(7), seven(11), seven(100)],
-        "b = 3, tag > 6",
-    );
-    assert_eq!(found.rows_examined(), 1 + 3, "only the entries above tag 6");
-    // The reader's shape: 7.0 is no key of INTEGER, so the join walks `r_ab`, not `r_b`.
-    for sql in [
-        "CREATE TABLE rr (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
-        "CREATE INDEX r_ab ON rr (a, b)",
-        "CREATE INDEX r_b ON rr (b)",
-        "CREATE TABLE ll (id REAL, a INTEGER, b INTEGER)",
-        "INSERT INTO ll VALUES (7.0, 3, 5)",
-    ] {
-        support::run(&db, sql);
-    }
-    for id in 1..=501_i64 {
-        let a = if id == 7 { 3 } else { 0 };
-        support::run(&db, &format!("INSERT INTO rr VALUES ({id}, {a}, 5)"));
-    }
-    let shape = support::run(
-        &db,
-        "SELECT ll.a, rr.id FROM ll JOIN rr ON rr.id = ll.id AND rr.a = ll.a AND rr.b = ll.b \
-         WHERE rr.b = 5",
-    );
-    support::assert_same_rows(shape.rows(), &[[Value::Int64(3), Value::Int64(7)]], "row 7");
-    assert_eq!(
-        shape.rows_examined(),
-        1 + 1,
-        "the left row and the row of (3, 5)"
-    );
-    // By the whole key of `jr`, the rows of `b = 1` that pass the filter are not read: the left
-    // row and the one right row it names.
-    let by_key = support::run(
-        &db,
-        "SELECT jr.id FROM jl JOIN jr ON jr.id = jl.id WHERE jr.b = 1",
-    );
-    support::assert_same_rows(by_key.rows(), &[seven(1)], "the key names row 1");
-    assert_eq!(by_key.rows_examined(), 1 + 1, "not the 3 rows of b = 1");
-}
-
-#[test]
-fn a_cross_join_reads_its_right_side_once_as_an_inner_join_that_always_holds_does() {
-    let db = owned("cross-join-reads-once");
-    for join in ["CROSS JOIN owners o", "INNER JOIN owners o ON 1 = 1"] {
-        let counted = support::run(
-            &db,
-            &format!("SELECT COUNT(*) AS n FROM t x {join} WHERE x.id <= 3"),
-        );
-        assert_eq!(counted.rows(), [[Value::Int64(3000)]], "{join}");
-        // Three rows of `t`, and `owners` once: not once for each of the three.
-        assert_eq!(counted.rows_examined(), 1003, "{join}");
-    }
-}
-
-#[test]
 fn rows_that_pass_through_a_statement_are_not_held_by_it() {
-    // Two tables of 24 MiB under a limit of 16 MiB: each answer is right only if the bodies
+    // Two tables of 24 MiB under that limit: each answer is right only if the bodies
     // that pass through a WITH name, a UNION ALL, a sort or a grouping are not all held.
     let db = large("rows-pass-through", &["big", "more"]);
     for (sql, wanted) in [
@@ -213,6 +70,14 @@ fn rows_that_pass_through_a_statement_are_not_held_by_it() {
          SELECT COUNT(body) AS n FROM whole",
     );
     assert_eq!(rows, 96, "both tables pass through");
+    // A value the key cannot take does not make the join hold the whole right side's bodies.
+    let joined = "WITH l AS (SELECT 1.5 AS k UNION ALL SELECT id FROM more) \
+                  SELECT MAX(big.body) AS last FROM l JOIN big ON big.id = l.k";
+    assert_eq!(
+        head(&db, joined),
+        "big-48",
+        "each of more's ids finds its row of big"
+    );
     // A subquery's text is copied into every row it is shown in: 48 rows of half a mebibyte.
     assert_refused_by_the_memory_limit(
         &db,
@@ -267,155 +132,10 @@ fn the_values_of_rows_that_offset_skips_are_not_held() {
     }
 }
 
-#[test]
-fn row_number_reads_each_partition_to_its_bound_and_one_more() {
-    let db = support::open(&support::folder("row-number-reads-to-the-bound"));
-    support::run(
-        &db,
-        "CREATE TABLE sessions (id INTEGER PRIMARY KEY, ctx TEXT NOT NULL, at INTEGER NOT NULL)",
-    );
-    support::run(
-        &db,
-        "CREATE INDEX sessions_newest ON sessions (ctx ASC, at DESC, id ASC)",
-    );
-    // Session `n` is in the context `c<n % 3>` at the time `n`: three hundred in each.
-    let tx = db.transaction().expect("begin");
-    for n in 1..=900_i64 {
-        tx.execute(
-            "INSERT INTO sessions (id, ctx, at) VALUES ($id, $ctx, $at)",
-            &params! { "id" => n, "ctx" => format!("c{}", n % 3), "at" => n },
-        )
-        .expect("insert a session");
-    }
-    tx.commit().expect("commit");
-    let newest = support::run(
-        &db,
-        "WITH ranked AS ( \
-           SELECT ctx, id, ROW_NUMBER() OVER (PARTITION BY ctx ORDER BY at DESC, id ASC) AS r \
-           FROM sessions WHERE ctx IN ('c0', 'c1')) \
-         SELECT ctx, id, r FROM ranked \
-         WHERE (ctx = 'c0' AND r <= 2) OR (ctx = 'c1' AND r <= 1) ORDER BY ctx ASC, r ASC",
-    );
-    let row =
-        |ctx: &str, id: i64, r: i64| vec![support::text(ctx), Value::Int64(id), Value::Int64(r)];
-    assert_eq!(
-        newest.rows(),
-        [row("c0", 900, 1), row("c0", 897, 2), row("c1", 898, 1)]
-    );
-    // The three rows returned, and at most one more in each of the two partitions. Sorting the
-    // input reads the six hundred rows of the two contexts.
-    assert!(
-        (3..=5).contains(&newest.rows_examined()),
-        "{} rows were read",
-        newest.rows_examined()
-    );
-}
-
-#[test]
-fn limit_with_offset_over_an_ordered_index_reads_the_rows_it_skips_and_returns() {
-    let db = support::open(&support::folder("limit-offset-over-an-index"));
-    support::run(
-        &db,
-        "CREATE TABLE events (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, seq INTEGER NOT NULL)",
-    );
-    support::run(&db, support::EVENTS_INDEX);
-    // Event `n` is `(n, "k<n % 5>", n)`.
-    let tx = db.transaction().expect("begin");
-    for n in 1..=1000_i64 {
-        tx.execute(
-            "INSERT INTO events (id, kind, seq) VALUES ($id, $kind, $seq)",
-            &params! { "id" => n, "kind" => format!("k{}", n % 5), "seq" => n },
-        )
-        .expect("insert an event");
-    }
-    tx.commit().expect("commit");
-    let page = support::run(
-        &db,
-        "SELECT id FROM events WHERE kind = 'k1' ORDER BY seq DESC LIMIT 5 OFFSET 10",
-    );
-    // The newest of the kind is 996; ten are skipped.
-    let wanted = [946_i64, 941, 936, 931, 926].map(|n| [Value::Int64(n)]);
-    assert_eq!(page.rows(), wanted);
-    assert_eq!(page.rows_examined(), 15);
-}
-
-#[test]
-fn a_lookup_by_an_indexed_json_path_reads_the_rows_it_returns() {
-    let db = support::open(&support::folder("json-path-lookup"));
-    support::run(&db, "CREATE TABLE docs (id INTEGER PRIMARY KEY, doc JSON)");
-    support::run(&db, "CREATE INDEX docs_kind ON docs ((doc -> 'kind'))");
-    // Document `n` is `{"kind": "k<n % 100>", "n": n}`.
-    let tx = db.transaction().expect("begin");
-    for n in 1..=1000_i64 {
-        tx.execute(
-            "INSERT INTO docs (id, doc) VALUES ($id, $doc)",
-            &params! { "id" => n, "doc" => json!({ "kind": format!("k{}", n % 100), "n": n }) },
-        )
-        .expect("insert a document");
-    }
-    tx.commit().expect("commit");
-    let found = support::run(&db, "SELECT id FROM docs WHERE doc -> 'kind' = '\"k7\"'");
-    let wanted: Vec<Vec<Value>> = (0..10_i64)
-        .map(|n| vec![Value::Int64(n * 100 + 7)])
-        .collect();
-    support::assert_same_rows(found.rows(), &wanted, "the documents of the kind");
-    assert_eq!(found.rows_examined(), 10);
-}
-
-#[test]
-fn a_grouped_count_over_a_kept_count_reads_no_rows_and_gives_the_groups_the_rows_give() {
-    let db = support::open(&support::folder("grouped-count-over-a-kept-count"));
-    support::run(
-        &db,
-        "CREATE TABLE plain (id INTEGER PRIMARY KEY, ctx TEXT NOT NULL, conn TEXT NOT NULL)",
-    );
-    support::run(
-        &db,
-        "CREATE TABLE kept (id INTEGER PRIMARY KEY, ctx TEXT NOT NULL, conn TEXT NOT NULL, \
-         UNIQUE (ctx, conn, id)) MAINTAIN COUNT (ctx), (ctx, conn)",
-    );
-    // Row `n` of each is `(n, "c<n % 3>", "k<n % 4>")`: fifty rows for each pair.
-    let tx = db.transaction().expect("begin");
-    for n in 1..=600_i64 {
-        for table in ["plain", "kept"] {
-            tx.execute(
-                &format!("INSERT INTO {table} (id, ctx, conn) VALUES ($id, $ctx, $conn)"),
-                &params! { "id" => n, "ctx" => format!("c{}", n % 3), "conn" => format!("k{}", n % 4) },
-            )
-            .expect("insert a row");
-        }
-    }
-    tx.commit().expect("commit");
-    let group = |name: String, rows: i64| vec![Value::Text(name), Value::Int64(rows)];
-    for (grouped, wanted) in [
-        (
-            "SELECT ctx, COUNT(*) FROM {} GROUP BY ctx",
-            (0..3)
-                .map(|n| group(format!("c{n}"), 200))
-                .collect::<Vec<_>>(),
-        ),
-        (
-            "SELECT conn, COUNT(*) FROM {} WHERE ctx = 'c1' GROUP BY conn",
-            (0..4)
-                .map(|n| group(format!("k{n}"), 50))
-                .collect::<Vec<_>>(),
-        ),
-    ] {
-        let from_counts = support::run(&db, &grouped.replace("{}", "kept"));
-        let from_rows = support::run(&db, &grouped.replace("{}", "plain"));
-        // The same groups in the same order, the order of the grouping values.
-        assert_eq!(from_counts.rows(), wanted, "{grouped}");
-        assert_eq!(from_rows.rows(), wanted, "{grouped}");
-        // One kept record for each group and no row; without one, every row of the table.
-        assert_eq!(from_counts.rows_examined(), 0, "{grouped}");
-        assert_eq!(from_rows.rows_examined(), 600, "{grouped}");
-    }
-}
-
 /// A store whose table `t` is `(id INTEGER PRIMARY KEY, <column> TEXT)` with a row for each
 /// number from 1 to `rows`, its text given by `text`. The rows are loaded with no limit, about
-/// a mebibyte to a commit, and the store is then opened again under `limit`: of a limit, 9 MiB
-/// are set aside by the open and the rest is the room a statement has.
+/// a mebibyte to a commit, and the store is then opened again under `limit`: of a limit,
+/// `support::opening::open_floor()` is set aside by the open and the rest is the room a statement has.
 fn loaded(
     name: &str,
     limit: usize,
@@ -491,6 +211,8 @@ fn distinct_holds_one_entry_for_each_different_value() {
         padded(n, LEN)
     });
     assert_refused_by_the_memory_limit(&all, "SELECT DISTINCT c FROM t");
+    // The offset skips rows of the answer and not the entries the dedup has to hold.
+    assert_refused_by_the_memory_limit(&all, "SELECT DISTINCT c FROM t OFFSET 383");
 }
 
 #[test]
@@ -524,6 +246,26 @@ fn bound_limit_and_offset_answer_as_the_literals_and_refuse_what_is_not_a_count(
             }
         }
     }
+}
+
+#[test]
+fn a_parameter_nothing_binds_is_a_plan_error_naming_it_before_any_row_is_read() {
+    let db = support::open(&support::folder("unbound-parameter"));
+    support::declare(&db);
+    support::insert_together(&db, 1..=100);
+    let before = db.work_done().unwrap().rows_read;
+    match db.execute("SELECT id FROM t WHERE id > $floor", &params! {}) {
+        Err(Error::PlanError(text)) => assert!(
+            text.contains("floor"),
+            "the error must name the parameter: {text}"
+        ),
+        other => panic!("an unbound $floor was not a plan error: {other:?}"),
+    }
+    assert_eq!(
+        db.work_done().unwrap().rows_read,
+        before,
+        "refused before any row is read"
+    );
 }
 
 /// Runs `check` on a thread of 2 MiB, less than the main thread of a program has, over a store
@@ -577,8 +319,44 @@ fn nested_to_the_limit(db: &Database, open: &str, close: &str) -> Vec<String> {
 }
 
 #[test]
+fn a_grouped_nearest_search_is_answered_or_refused_on_a_small_stack() {
+    on_a_small_stack("grouped-nearest", |db| {
+        support::run(
+            db,
+            "CREATE TABLE p (id INTEGER, session INTEGER, v VECTOR(2))",
+        );
+        support::run(
+            db,
+            "INSERT INTO p VALUES (1, 1, [1.0, 0.0]), (2, 1, [0.0, 1.0]), (3, 2, [0.9, 0.1]), (4, 3, [-1.0, 0.0])",
+        );
+        let sql = "SELECT session FROM p GROUP BY session ORDER BY MIN(v <=> [1.0, 0.0]) LIMIT 2";
+        // Answered in the order of the nearest, or refused by a typed error; never a panic.
+        match db.execute(sql, &params! {}) {
+            Ok(answer) if answer.rows() == [[Value::Int64(1)], [Value::Int64(2)]] => vec![],
+            Ok(answer) => vec![format!("the nearest sessions were {:?}", answer.rows())],
+            Err(_) => vec![],
+        }
+    });
+}
+
+#[test]
 fn parentheses_and_not_nested_to_the_limit_are_read_and_one_past_it_is_refused_on_a_small_stack() {
     on_a_small_stack("long-parentheses", |db| {
+        for sql in [
+            "CREATE TABLE nodes (id UUID PRIMARY KEY)",
+            "CREATE TABLE edges (id INT PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+            "INSERT INTO nodes VALUES ('00000000-0000-0000-0000-000000000001'),('00000000-0000-0000-0000-000000000002'),('00000000-0000-0000-0000-000000000003'),('00000000-0000-0000-0000-000000000004'),('00000000-0000-0000-0000-000000000005')",
+            "INSERT INTO edges VALUES (1,'00000000-0000-0000-0000-000000000002','00000000-0000-0000-0000-000000000001','BASED_ON'),(2,'00000000-0000-0000-0000-000000000003','00000000-0000-0000-0000-000000000001','ABOUT'),(3,'00000000-0000-0000-0000-000000000002','00000000-0000-0000-0000-000000000004','SERVES'),(4,'00000000-0000-0000-0000-000000000003','00000000-0000-0000-0000-000000000005','SERVES')",
+        ] {
+            support::run(db, sql);
+        }
+        let graph = "WITH based AS (SELECT d_id FROM GRAPH_TABLE (edges MATCH (e)<-[:BASED_ON]-(d) WHERE e.id = '00000000-0000-0000-0000-000000000001' COLUMNS (d.id AS d_id))), about AS (SELECT d_id FROM GRAPH_TABLE (edges MATCH (e)<-[:ABOUT]-(d) WHERE e.id = '00000000-0000-0000-0000-000000000001' COLUMNS (d.id AS d_id))), served_by_based AS (SELECT i_id FROM GRAPH_TABLE (edges MATCH (d)-[:SERVES]->(i) WHERE d.id IN (SELECT d_id FROM based) COLUMNS (i.id AS i_id))), served_by_about AS (SELECT i_id FROM GRAPH_TABLE (edges MATCH (d)-[:SERVES]->(i) WHERE d.id IN (SELECT d_id FROM about) COLUMNS (i.id AS i_id))) SELECT id FROM nodes WHERE id IN (SELECT i_id FROM served_by_based) OR id IN (SELECT i_id FROM served_by_about) ORDER BY id";
+        let expected: Vec<_> = [4, 5]
+            .map(|n| vec![Value::Uuid(contextdb::Uuid::from_u128(n))])
+            .into();
+        assert_eq!(support::rows(db, graph), expected);
+        let ranked = "WITH ranked_sessions AS (SELECT id, tag, name, ROW_NUMBER() OVER (PARTITION BY tag ORDER BY id DESC, name ASC) AS session_rank FROM t WHERE tag IN (1,2) AND id IS NOT NULL) SELECT id FROM ranked_sessions WHERE (tag = 1 AND session_rank <= 2) OR (tag = 2 AND session_rank <= 3) ORDER BY tag, session_rank";
+        assert_eq!(support::ids(db, ranked), [1, 2]);
         let mut told = nested_to_the_limit(db, "(", ")");
         told.extend(nested_to_the_limit(db, "NOT ", ""));
         told

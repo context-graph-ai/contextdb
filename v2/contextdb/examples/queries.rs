@@ -131,7 +131,12 @@ fn declare(folder: &Path, texts: &[String]) -> Fallible<(Vec<bool>, Vec<bool>)> 
         let declared = statements(&printed)
             .iter()
             .all(|sql| again.execute(sql, &params! {}).is_ok());
-        same.push(declared && again.declaration(&table_of(sql)).ok() == Some(printed));
+        same.push(
+            declared
+                && again
+                    .declaration(&table_of(sql))
+                    .is_ok_and(|other| *other == *printed),
+        );
     }
     Ok((accepted, same))
 }
@@ -435,7 +440,7 @@ fn declared(dump_folder: &Path, answers: &Path, folder: &Path) -> Fallible<()> {
             }
         }
         tx.commit()?;
-        support::upkeep(&db)?;
+        support::maintenance(&db)?;
         Ok(held_bytes)
     });
     let held_bytes = held_bytes?;

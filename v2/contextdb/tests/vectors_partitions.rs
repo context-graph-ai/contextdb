@@ -7,7 +7,7 @@ mod support;
 
 use std::sync::atomic::Ordering;
 
-use contextdb::{Database, DatabaseOpenOptions, Error, ReadSession, Value, VectorIndexRef, params};
+use contextdb::{Database, DatabaseOpenOptions, Error, Value, VectorIndexRef, params};
 
 use support::{Child, Near, Run, near_ids as ids};
 
@@ -252,6 +252,10 @@ fn vector_partition_identity_is_typed_sql_equality() {
         }) => {}
         other => panic!("a sixth key tuple under MAX_PARTITIONS 5 got {other:?}"),
     }
+    let listed = support::shown(&db, "SHOW VECTOR_PARTITIONS");
+    let key = |row: &support::Shown| format!("{:?}", support::field(row, "partition_key"));
+    let keys: std::collections::HashSet<_> = listed.iter().map(key).collect();
+    assert!(keys.len() == 5 && listed.len() == 5, "a key per tuple");
 
     let queries = [
         support::vector(81_001, DIMENSION),
@@ -291,7 +295,7 @@ fn vector_partition_identity_is_typed_sql_equality() {
     };
     assert!(found_under(&db, "ab", "before the move"));
     assert!(!found_under(&db, "Ab", "before the move"));
-    let reader = ReadSession::open(&folder).expect("open the store for reading");
+    let reader = support::open_reader(&folder, None);
     let tx = db.transaction().expect("begin");
     support::run(&tx, "UPDATE notes SET ctx = 'Ab' WHERE id = 5");
     // Inside the transaction it is under the new key and not under the old.
@@ -358,7 +362,7 @@ fn state_of(db: &Database) -> (Vec<Vec<Value>>, contextdb::TxId, Vec<Vec<Near>>)
         support::assert_nearest(db, &sql, &query, &wanted, "the state of docs");
         answers.push(wanted);
     }
-    (rows, db.committed_watermark(), answers)
+    (rows, support::watermark(db), answers)
 }
 
 fn insert_one(on: &impl Run, id: i64, ctx: &str) -> contextdb::Result<()> {
@@ -543,6 +547,10 @@ fn vector_partition_limit_counts_and_refuses() {
     // column leaves the next cycle with nothing to do and the searches' counted work as it was.
     support::seal_all(&db);
     let sealed = state_of(&db);
+    let show = "SHOW VECTOR_PARTITIONS";
+    let snapshot = support::shown(&db, show);
+    let dead = snapshot.iter().map(|p| support::whole(p, "tombstones"));
+    assert!(dead.sum::<i64>() == 0, "a fresh load has none");
     let work = |db: &Database| -> Vec<u64> {
         let query = support::vector(82_001, 8);
         let filters = [None, Some("ctx = 'a'"), Some("ctx = 'n'")];
@@ -556,35 +564,36 @@ fn vector_partition_limit_counts_and_refuses() {
     let read_before = work(&db);
     let updated = support::run(&db, "UPDATE docs SET tag = tag + 100");
     assert_eq!(updated.rows_affected(), sealed.0.len() as u64);
-    let position = db.committed_watermark();
+    let position = support::watermark(&db);
     let cycle = db.run_maintenance_cycle().expect("a cycle").vector;
     assert_eq!(
         (
-            cycle.maintenance_vectors_done,
-            cycle.maintenance_vectors_remaining
+            support::count(cycle.maintenance_vectors_done),
+            support::count(cycle.maintenance_vectors_remaining)
         ),
         (0, 0),
         "a cycle after an UPDATE that changed no vector and no key"
     );
     assert_eq!(
-        db.committed_watermark(),
+        support::watermark(&db),
         position,
-        "a cycle with nothing to do"
+        "no vector work; compacting freed pages leaves the logical position alone"
     );
     assert_eq!(work(&db), read_before);
+    assert!(support::shown(&db, show) == snapshot, "no vector moved");
     assert!(state_of(&db).2 == sealed.2);
 
-    // The storage reads of one INSERT under an existing partition, from a cold cache, are the
-    // same with 8 partitions and with 512, within the depth of the file's tree: the insert
+    // The storage reads of one INSERT under an existing partition, after reopening, are the
+    // same with 32 partitions and with 2048, within the depth of the file's tree: the insert
     // finds its partition by its key and does not visit the others. The key tuples are long, so
-    // that 512 of them cannot sit in the one or two pages that 8 do.
-    let reads_of_one_insert = |partitions: i64| -> u64 {
+    // that 2048 of them cannot sit in the few pages that 32 do; 8 are fully cached by opening.
+    let reads_of_one_insert = |partitions: i64| -> (u64, u64) {
         let folder = support::folder(&format!("insert-reads-{partitions}-partitions"));
         let db = support::open(&folder);
         support::run(
             &db,
             "CREATE TABLE long_keys (id INTEGER PRIMARY KEY, ctx TEXT NOT NULL, \
-             v VECTOR(4) PARTITION_KEY (ctx) MAX_PARTITIONS 4096)",
+             v VECTOR(256) PARTITION_KEY (ctx) MAX_PARTITIONS 4096)",
         );
         let insert = "INSERT INTO long_keys (id, ctx, v) VALUES ($id, $ctx, $v)";
         let tx = db.transaction().expect("begin");
@@ -592,7 +601,7 @@ fn vector_partition_limit_counts_and_refuses() {
             let ctx = format!("{n:0>200}");
             tx.execute(
                 insert,
-                &params! { "id" => n, "ctx" => ctx, "v" => support::vector(n, 4) },
+                &params! { "id" => n, "ctx" => ctx, "v" => support::vector(n, 256) },
             )
             .unwrap_or_else(|error| panic!("partition {n} was refused: {error:?}"));
         }
@@ -609,20 +618,61 @@ fn vector_partition_limit_counts_and_refuses() {
             &params! {
                 "id" => partitions + 1,
                 "ctx" => format!("{:0>200}", 1),
-                "v" => support::vector(partitions + 1, 4),
+                "v" => support::vector(partitions + 1, 256),
             },
         )
         .expect("a row under an existing partition");
-        bytes.load(Ordering::SeqCst) - opened
+        (opened, bytes.load(Ordering::SeqCst) - opened)
     };
-    // The promise: the bytes read for one insert at 512 partitions are at most four times
-    // those at 8: a walk of the partition list reads 64 times as much, a lookup through a few
+    // The promise: the bytes read for one insert at 2048 partitions are at most four times
+    // those at 32: square-root growth reads eight times as much, while a lookup through a few
     // trees that each grow a level reads a few more pages.
-    let (few, most) = (reads_of_one_insert(8), reads_of_one_insert(512));
-    assert!(
-        most <= few * 4,
-        "one insert read {few} bytes of the file with 8 partitions and {most} with 512: its \
+    for (small, large) in [(8, 256), (32, 2048)] {
+        let ((open_few, few), (open_most, most)) =
+            (reads_of_one_insert(small), reads_of_one_insert(large));
+        assert!(
+            most <= few * 4,
+            "one insert read {few} bytes of the file with {small} partitions and {most} with {large}: its \
          reads grow with the number of partitions as a walk of the partition list does"
+        );
+        // Each partition holds one pending vector of 1 KiB or more: opening reads one record
+        // for each partition, and so grows by less than the bytes of the pending vectors added.
+        assert!(
+            open_most < open_few + (large - small) as u64 * 1024,
+            "opening reads no pending vector: {small}: {open_few}, {large}: {open_most}"
+        );
+    }
+}
+
+/// A commit of 16 vectors into a partition reads that partition's one record, however many rows
+/// wait in it unsealed: the bytes it reads from the file are the same after 100 waiting rows as
+/// after 3,000 but for a few pages of tree depth. No other test owns the rows a partition holds.
+#[test]
+fn a_commit_reads_its_partitions_record_not_the_rows_waiting_in_it() {
+    const DIMENSION: usize = 64;
+    let reads_of_a_commit = |waiting: i64| -> u64 {
+        let folder = support::folder(&format!("commit-reads-{waiting}-waiting"));
+        let db = support::open(&folder);
+        support::declare_docs(&db, DIMENSION, "PARTITION_KEY (ctx)");
+        support::load_docs(&db, 1..=waiting, "a", |n| support::vector(n, DIMENSION));
+        support::close(db);
+        let (storage, bytes) = support::counting_bytes_read();
+        let mut options = DatabaseOpenOptions::default();
+        options.storage = Some(storage);
+        let db = support::open_with(&folder, options).expect("open with a counting door");
+        let opened = bytes.load(Ordering::SeqCst);
+        let rows = waiting + 1..=waiting + 16;
+        support::load_docs(&db, rows, "a", |n| support::vector(n, DIMENSION));
+        let read = bytes.load(Ordering::SeqCst) - opened;
+        assert_eq!(support::int(&db, "SELECT COUNT(*) FROM docs"), waiting + 16);
+        read
+    };
+    let (few, many) = (reads_of_a_commit(100), reads_of_a_commit(3000));
+    assert!(
+        many <= few + 8 * 4096, // eight pages of depth
+        "a commit of 16 vectors read {few} bytes of the file with 100 rows waiting in its \
+         partition and {many} with 3,000: its reads grow with the rows waiting, as a walk of \
+         them does"
     );
 }
 
@@ -751,4 +801,29 @@ fn searcher(role: &support::Role) {
         support::say(line);
     }
     support::say("done");
+}
+
+#[test]
+fn an_indexed_search_over_one_several_or_all_partitions_returns_all_ten_of_exacts_rows() {
+    let (_, db) = support::built(
+        "recall-partitions",
+        32,
+        "PARTITION_KEY (ctx) INDEXING_THRESHOLD 1000",
+        0,
+    );
+    for (first, ctx) in [(1, "a"), (1251, "b"), (2501, "c")] {
+        support::load_docs(&db, first..=first + 1249, ctx, |n| support::vector(n, 32));
+    }
+    support::maintenance(&db);
+    // The work an index saves is the numbers script's to measure: at 1,250 vectors a partition
+    // with the threshold forced low is not a store a default would build.
+    for filter in [Some("ctx = 'a'"), Some("ctx IN ('a', 'b')"), None] {
+        for q in 0..100 {
+            let query = support::vector(100_000 + q, 32);
+            let [exact, indexed] = ["EXACT", "INDEXED"]
+                .map(|mode| support::answer(&db, &support::by_mode(filter, mode, 10), &query));
+            let [e, i] = [&exact, &indexed].map(|r| ids(&support::found(r, "recall")));
+            assert!(i == e, "{filter:?} question {q}: all ten of EXACT's rows");
+        }
+    }
 }

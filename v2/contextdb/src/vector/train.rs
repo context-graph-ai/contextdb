@@ -1,7 +1,7 @@
-//! Finding centres: the arithmetic of a build, over slots alone. Nothing here reads a store.
+//! Finding centroids: the arithmetic of a build, over slots alone. Nothing here reads a store.
 //!
 //! The vector a slot keeps is its codes times its scale, a vector of length one within the
-//! slot's rounding error. Centres are found from those, so a build reads blocks and no row.
+//! slot's rounding error. Centroids are found from those, so a build reads blocks and no row.
 
 use std::collections::BTreeMap;
 
@@ -12,10 +12,10 @@ use crate::types::Result;
 /// How many times a build goes over its sample.
 pub(super) const ROUNDS: u32 = 10;
 
-/// How many slots a build samples for each centre it looks for.
-pub(super) const SAMPLE_TO_A_CENTRE: u64 = 64;
+/// How many slots a build samples for each centroid it looks for.
+pub(super) const SAMPLE_TO_A_CENTROID: u64 = 64;
 
-/// Bytes a group that [`first_centres`] takes while it draws: an entry of its list of moved
+/// Bytes a group that [`first_centroids`] takes while it draws: an entry of its list of moved
 /// places and that entry's share of the list's nodes.
 pub(super) const DRAWN: u64 = 48;
 
@@ -28,17 +28,17 @@ pub(super) fn groups_for(slots: u64) -> u32 {
 /// Which of `slots` slots, counted from zero in the order the build reads them, a round
 /// samples: `min(slots, 64 * groups)` of them, evenly spread, ascending.
 pub(super) fn sampled(slots: u64, groups: u32) -> impl Iterator<Item = u64> {
-    let sample = slots.min(SAMPLE_TO_A_CENTRE * u64::from(groups));
+    let sample = slots.min(SAMPLE_TO_A_CENTROID * u64::from(groups));
     (0..sample).map(move |at| (u128::from(at) * u128::from(slots) / u128::from(sample)) as u64)
 }
 
-/// Which of the sampled slots, counted from zero, the first centres are taken from: `groups`
+/// Which of the sampled slots, counted from zero, the first centroids are taken from: `groups`
 /// different ones, ascending, the same for the same two numbers.
 ///
 /// The choice is the start of a shuffle of the sampled slots by one seeded sequence: for each
-/// centre in turn, the slot at its place changes places with one at or after it. Only the
+/// centroid in turn, the slot at its place changes places with one at or after it. Only the
 /// places that have changed are kept, never the whole sample.
-pub(super) fn first_centres(sampled: u64, groups: u32) -> Vec<u64> {
+pub(super) fn first_centroids(sampled: u64, groups: u32) -> Vec<u64> {
     let mut seeded: u64 = 0x5EED_C1A5_7E25 | 1;
     let mut moved = BTreeMap::new();
     let mut first = Vec::with_capacity(groups as usize);
@@ -54,22 +54,30 @@ pub(super) fn first_centres(sampled: u64, groups: u32) -> Vec<u64> {
     first
 }
 
-/// The scale of a slot.
-fn scale(slot: &[u8]) -> f32 {
-    f32::from_le_bytes([slot[0], slot[1], slot[2], slot[3]])
+/// The product of a centroid with the vector a slot keeps.
+pub(super) fn product(centroid: &[f32], slot: &[u8]) -> f32 {
+    slot::scale(slot) * slot::product(&slot[SLOT_HEADER..], centroid)
 }
 
-/// The product of a centre with the vector a slot keeps.
-pub(super) fn product(centre: &[f32], slot: &[u8]) -> f32 {
-    scale(slot) * slot::product(&slot[SLOT_HEADER..], centre)
+/// The centroid nearest the vector a slot keeps, by [`product`], and that product: the greatest,
+/// and of equal ones the centroid with the lowest number.
+pub(super) fn nearest(centroids: &[f32], dimension: usize, slot: &[u8]) -> (u32, f32) {
+    nearest_among(centroids, dimension, slot, None)
 }
 
-/// The centre nearest the vector a slot keeps, by [`product`], and that product: the greatest,
-/// and of equal ones the centre with the lowest number.
-pub(super) fn nearest(centres: &[f32], dimension: usize, slot: &[u8]) -> (u32, f32) {
+/// The nearest centre among eligible groups; no filter while training a new IVF.
+pub(super) fn nearest_among(
+    centroids: &[f32],
+    dimension: usize,
+    slot: &[u8],
+    eligible: Option<&dyn Fn(usize) -> bool>,
+) -> (u32, f32) {
     let mut best = (0, f32::NEG_INFINITY);
-    for (number, centre) in centres.chunks_exact(dimension).enumerate() {
-        let product = product(centre, slot);
+    for (number, centroid) in centroids.chunks_exact(dimension).enumerate() {
+        if eligible.is_some_and(|eligible| !eligible(number)) {
+            continue;
+        }
+        let product = product(centroid, slot);
         if product > best.1 {
             best = (number as u32, product);
         }
@@ -78,14 +86,14 @@ pub(super) fn nearest(centres: &[f32], dimension: usize, slot: &[u8]) -> (u32, f
 }
 
 /// Adds the vector a slot keeps, its scale times each code, to `sum`.
-fn add(sum: &mut [f64], slot: &[u8]) {
-    let scale = f64::from(scale(slot));
+pub(super) fn add(sum: &mut [f64], slot: &[u8]) {
+    let scale = f64::from(slot::scale(slot));
     for (sum, code) in sum.iter_mut().zip(&slot[SLOT_HEADER..]) {
         *sum += scale * f64::from(code.cast_signed());
     }
 }
 
-/// One round over the sample: the sum of the vectors that are nearest each centre.
+/// One round over the sample: the sum of the vectors that are nearest each centroid.
 pub(super) struct Round {
     sums: Vec<f64>,
     counts: Vec<u32>,
@@ -93,8 +101,8 @@ pub(super) struct Round {
 }
 
 impl Round {
-    /// A round for this many centres. `held` is grown by what the sums take: eight bytes a
-    /// number and four a centre.
+    /// A round for this many centroids. `held` is grown by what the sums take: eight bytes a
+    /// number and four a centroid.
     pub(super) fn new(groups: u32, dimension: usize, held: &mut Reservation) -> Result<Round> {
         let groups = groups as usize;
         held.grow((8 * dimension * groups + 4 * groups) as u64)?;
@@ -105,25 +113,22 @@ impl Round {
         })
     }
 
-    /// Adds the vector a slot keeps to the sum of the centre it is nearest.
-    pub(super) fn take(&mut self, centres: &[f32], slot: &[u8]) {
-        let (group, _) = nearest(centres, self.dimension, slot);
+    /// Adds the vector a slot keeps to the sum of the centroid it is nearest.
+    pub(super) fn take(&mut self, centroids: &[f32], slot: &[u8]) {
+        let (group, _) = nearest(centroids, self.dimension, slot);
         let at = group as usize * self.dimension;
         add(&mut self.sums[at..at + self.dimension], slot);
         self.counts[group as usize] += 1;
     }
 
-    /// Moves every centre to the direction of its sum, at length one. A centre that no
+    /// Moves every centroid to the direction of its sum, at length one. A centroid that no
     /// sampled slot was nearest, or whose sum has no direction, stays where it is.
-    pub(super) fn finish(self, centres: &mut [f32]) {
+    pub(super) fn finish(self, centroids: &mut [f32]) {
         let sums = self.sums.chunks_exact(self.dimension);
-        let centres = centres.chunks_exact_mut(self.dimension);
-        for ((sum, centre), count) in sums.zip(centres).zip(self.counts) {
-            let length = sum.iter().map(|x| x * x).sum::<f64>().sqrt();
-            if count > 0 && length > 0.0 {
-                for (number, sum) in centre.iter_mut().zip(sum) {
-                    *number = (sum / length) as f32;
-                }
+        let centroids = centroids.chunks_exact_mut(self.dimension);
+        for ((sum, centroid), count) in sums.zip(centroids).zip(self.counts) {
+            if count > 0 {
+                normalize(sum, centroid);
             }
         }
     }
@@ -155,7 +160,22 @@ impl Mean {
     /// The sum divided by the count, number by number; zeros when nothing was taken. The
     /// caller has taken its four bytes a number before it calls.
     pub(super) fn finish(self) -> Vec<f32> {
-        let count = self.count.max(1) as f64;
-        self.sum.iter().map(|sum| (sum / count) as f32).collect()
+        mean(&self.sum, self.count)
+    }
+}
+
+/// The mean of a persisted or accumulated sum; zeros when no slot was taken.
+pub(super) fn mean(sum: &[f64], count: u64) -> Vec<f32> {
+    let count = count.max(1) as f64;
+    sum.iter().map(|sum| (sum / count) as f32).collect()
+}
+
+/// The direction of a sum; a sum without direction leaves its centre unchanged.
+pub(super) fn normalize(sum: &[f64], centre: &mut [f32]) {
+    let length = sum.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if length > 0.0 {
+        for (number, sum) in centre.iter_mut().zip(sum) {
+            *number = (sum / length) as f32;
+        }
     }
 }

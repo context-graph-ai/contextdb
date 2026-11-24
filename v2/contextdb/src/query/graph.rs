@@ -7,7 +7,6 @@
 //! the reader may see its row and the nodes at both its ends. Every edge and every row that
 //! carries a node is read through the one table source, with the reader's filter in it.
 
-use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -15,24 +14,25 @@ use std::iter::once;
 use std::sync::LazyLock;
 
 use super::bind::bind;
-use super::expression::{EvalContext, Scope, eval, reads};
+use super::expression::{EvalContext, Scope, eval, mark, reads};
+use super::filter::{Columns, Fact, read};
 use super::plan::{self, Each, Given};
 use super::row_overhead;
-use super::table::{Source, as_key, equal, known};
+use super::table::{Source, equal};
 use super::visible::Visible;
 use crate::memory::Reservation;
 use crate::schema::Table;
 use crate::sql::Expr;
-use crate::sql::ast::{BinOp, ColumnRef};
+use crate::sql::ast::ColumnRef;
 use crate::sql::plan::{EdgeDirection, EdgeStep, GraphTable, NodePattern};
-use crate::types::{ColumnDef, ColumnType, Error, IndexDecl, Result, Uuid, Value};
+use crate::types::{ColumnDef, ColumnType, Error, IndexDecl, Result, Uuid, Value, heap_bytes};
 
 /// The columns that hold the two ends of an edge: where it leaves, then where it arrives.
 const ENDS: [&str; 2] = ["source_id", "target_id"];
 
 /// The bytes a walk is counted for each node it remembers: the node's id, and beside it the
 /// node's place among the nodes met and among those still to follow.
-const NODE: u64 = 16 + 24;
+const NODE: u64 = crate::memory::node::<(Uuid, Uuid, u32)>();
 
 /// What qualifies the columns of a pattern in a refusal: a pattern has no name of its own.
 const PATTERN: &str = "GRAPH_TABLE";
@@ -65,12 +65,16 @@ type Reached<'e> = dyn FnMut(Uuid, Uuid, u32, &mut Reservation) -> Result<bool> 
 /// What takes the edges at a node: the near end of one, then its far end.
 type Ends<'e> = dyn FnMut(Uuid, Uuid, &mut Reservation) -> Result<bool> + 'e;
 
+/// A table searched for a node's property: the places of its `id` and of the property.
+type Carried<'a> = (&'a Table, usize, usize);
+
 /// What takes the rows of one read.
 type Rows<'e> = dyn FnMut(&[Value], &mut Reservation) -> Result<bool> + 'e;
 
 /// One pattern over one table of edges, for one reader.
 pub(super) struct Graph<'a> {
     given: &'a Given<'a>,
+    _held: Reservation,
     edges: &'a Table,
     /// Where the columns of `ENDS` are in a row of `edges`, and where its `edge_type` is.
     ends: [usize; 2],
@@ -92,6 +96,8 @@ pub(super) struct Graph<'a> {
     /// principal that can hold one, each without that rule: a row of one that carries a node
     /// and that the reader's other rules let through is `PrincipalRequired`.
     closed: Vec<Table>,
+    /// Each node property COLUMNS names, read as `hidden` reads: its node among `named`, tables.
+    props: Vec<(usize, Vec<Carried<'a>>)>,
     /// The columns of a match before COLUMNS: `REACHED`, then the id of each node the
     /// pattern names, which are the nodes at these places in a match.
     scope: Scope<'a>,
@@ -101,8 +107,8 @@ pub(super) struct Graph<'a> {
     picks: Vec<usize>,
     /// Whether the reader may see each node met so far. Empty when no table can hide one.
     seen: RefCell<BTreeMap<Uuid, bool>>,
-    /// The stored rows read so far.
-    examined: Cell<u64>,
+    /// The matches the filter has passed: a node is handed on once one through it has.
+    passed: Cell<u64>,
 }
 
 impl<'a> Graph<'a> {
@@ -143,12 +149,14 @@ impl<'a> Graph<'a> {
                 )));
             }
         }
+        let bytes = catalog.table_count() * (size_of::<&Table>() + size_of::<Visible>());
+        let mut held = budget.reserve(bytes as u64, "graph planning")?;
         let mut seeing = budget.reserve(0, "query")?;
         let visible = Visible::new(edges, catalog, reader, &mut seeing)?;
 
-        let (mut nodes, mut closed) = (Vec::new(), Vec::new());
+        let (mut nodes, mut closed, mut searched) = (Vec::new(), Vec::new(), Vec::new());
         for table in catalog.tables() {
-            let Some(id) = column(table, "id", ColumnType::Uuid) else {
+            let Some((id, keyed)) = node_id(table) else {
                 continue;
             };
             let mut asked = vec![false; table.meta.columns.len()];
@@ -161,14 +169,17 @@ impl<'a> Graph<'a> {
                 Err(Error::PrincipalRequired { .. }) => true,
                 Err(other) => return Err(other),
             };
+            if keyed && !needs_principal && listed(given.allowed, &table.name) {
+                searched.push((table, id));
+            }
             if !needs_principal && !asked.contains(&true) {
                 continue;
             }
-            let leads = |index: &IndexDecl| {
-                let first = index.columns.first();
-                index.json_path.is_empty() && first.is_some_and(|(name, _)| name == "id")
-            };
-            if table.key.first() != Some(&id) && !table.meta.indexes.iter().any(leads) {
+            if !keyed {
+                if !listed(given.allowed, &table.name) {
+                    let message = "a graph pattern needs a node id key or index";
+                    return Err(Error::PlanError(message.to_owned()));
+                }
                 return Err(Error::PlanError(format!(
                     "a graph pattern asks {} which nodes this handle may see, and needs a key \
                      or an index that begins with its id",
@@ -176,6 +187,7 @@ impl<'a> Graph<'a> {
                 )));
             }
             if needs_principal {
+                held.grow(table.heap)?;
                 let mut open = table.clone();
                 open.rules.acl = None;
                 closed.push(open);
@@ -199,24 +211,45 @@ impl<'a> Graph<'a> {
         if let Some(filter) = filter {
             bind(filter, &scope, given.params)?;
         }
-        let mut picks = Vec::new();
-        let mut given_as = Vec::new();
+        let (mut picks, mut given_as, mut props) = (Vec::new(), Vec::new(), Vec::new());
         for column in &pattern.columns {
-            let Expr::Column(named) = &column.expr else {
+            let Expr::Column(wanted) = &column.expr else {
                 return Err(Error::PlanError(
                     "COLUMNS gives id, depth and the id of a node the pattern names, and works \
                      nothing out of them"
                         .to_owned(),
                 ));
             };
-            let (at, column_type) = scope.find(named).map_err(|_| {
-                let of = named.table.as_ref().map(|node| format!("{node}."));
-                let (of, column) = (of.unwrap_or_default(), &named.column);
-                Error::PlanError(format!("project column not found: {of}{column}"))
-            })?;
+            let (alias, name) = (wanted.table.as_deref(), &wanted.column);
+            let shown = alias.map_or(name.clone(), |node| format!("{node}.{name}"));
+            let missing = || Error::PlanError(format!("project column not found: {shown}"));
+            let node = named.iter().position(|(_, a)| Some(*a) == alias);
+            let carry: Vec<Carried> = (searched.iter())
+                .filter_map(|&(table, id)| Some((table, id, table.column(name).ok()?)))
+                .collect();
+            let typed = |&(table, _, at): &Carried| table.meta.columns[at].column_type;
+            let (at, column_type, nullable) = match (scope.find(wanted), node, carry.first()) {
+                (Ok((at, column_type)), ..) => (at, column_type, false),
+                (_, Some(node), Some(first)) => {
+                    let column_type = typed(first);
+                    if carry.iter().any(|carries| typed(carries) != column_type) {
+                        let them = carry.iter().map(|c| format!("{} {}", c.0.name, typed(c)));
+                        return Err(Error::PlanError(format!(
+                            "COLUMNS {shown} is read from the node's row, and the tables that \
+                             carry it give different types: {}; a join gives it",
+                            them.collect::<Vec<_>>().join(", ")
+                        )));
+                    }
+                    let at = REACHED.len() + named.len() + props.len();
+                    props.push((node, carry));
+                    (at, column_type, true)
+                }
+                _ => return Err(missing()),
+            };
             given_as.push(ColumnDef {
                 name: column.name(),
                 column_type,
+                nullable,
                 ..REACHED[0].clone()
             });
             picks.push(at);
@@ -225,7 +258,7 @@ impl<'a> Graph<'a> {
 
         let hop = matches!(pattern.steps.as_slice(), [step] if step.max == 1);
         let names = |node: &NodePattern| match (filter, &node.alias) {
-            (Some(filter), Some(alias)) => named_by(filter, alias, &given.ctx),
+            (Some(filter), Some(alias)) => named_by(filter, alias, &scope, &given.ctx),
             _ => Ok(None),
         };
         let mut starts = names(&pattern.start)?;
@@ -246,6 +279,7 @@ impl<'a> Graph<'a> {
         }
         let graph = Graph {
             given,
+            _held: held,
             edges,
             ends: [source, target],
             typed,
@@ -255,12 +289,13 @@ impl<'a> Graph<'a> {
             reversed,
             nodes,
             closed,
+            props,
             scope,
             named: named.into_iter().map(|(at, _)| at).collect(),
             filter,
             picks,
             seen: RefCell::new(BTreeMap::new()),
-            examined: Cell::new(0),
+            passed: Cell::new(0),
         };
         Ok((graph, gives))
     }
@@ -304,13 +339,14 @@ impl<'a> Graph<'a> {
         reservation: &mut Reservation,
         each: &mut Reached<'_>,
     ) -> Result<bool> {
-        // Every node met from each start, and whether it has been reached: a start is met
-        // before it is; and every node handed on.
-        let (mut met, mut told) = (BTreeMap::new(), BTreeSet::new());
+        // Every node met from each start at each depth up to the lower bound, and every node handed
+        // on. Met at the bound a level after the start met it, a node is not followed again.
+        let (mut met, mut told) = (BTreeSet::new(), BTreeSet::new());
         let mut frontier = Vec::new();
         for start in starts {
             reservation.grow(NODE)?;
-            met.insert((*start, *start), false);
+            met.insert((*start, *start, 0));
+            reservation.room(&mut frontier, usize::MAX)?;
             frontier.push((*start, *start));
         }
         let mut more = true;
@@ -318,22 +354,26 @@ impl<'a> Graph<'a> {
             let mut next = Vec::new();
             for (node, start) in frontier {
                 let reached: &mut Ends<'_> = &mut |_, far, reservation| {
-                    match met.get_mut(&(start, far)) {
-                        Some(true) => return Ok(true),
-                        // A start the walk has come back to: its edges are followed already.
-                        Some(reached) => *reached = true,
-                        None => {
-                            reservation.grow(NODE)?;
-                            met.insert((start, far), true);
-                            next.push((far, start));
-                        }
+                    let key = (start, far, depth.min(step.min));
+                    if met.contains(&key) {
+                        return Ok(true);
+                    }
+                    reservation.grow(NODE)?;
+                    met.insert(key);
+                    if depth != step.min || !met.contains(&(start, far, step.min - 1)) {
+                        reservation.room(&mut next, usize::MAX)?;
+                        next.push((far, start));
                     }
                     match depth < step.min || told.contains(&far) {
                         true => Ok(true),
                         false => {
-                            reservation.grow(NODE)?;
-                            told.insert(far);
-                            each(start, far, depth, reservation)
+                            let passed = self.passed.get();
+                            let more = each(start, far, depth, reservation)?;
+                            if self.passed.get() > passed {
+                                reservation.grow(NODE)?;
+                                told.insert(far);
+                            }
+                            Ok(more)
                         }
                     }
                 };
@@ -359,10 +399,17 @@ impl<'a> Graph<'a> {
         reservation: &mut Reservation,
         each: &mut Reached<'_>,
     ) -> Result<bool> {
-        if step.min > 1 {
+        // A filter that reads the first node or a depth past one may refuse the nearest start.
+        let mut read = vec![false; REACHED.len() + self.named.len()];
+        (self.filter).inspect(|filter| mark(filter, &self.scope, &mut read));
+        let first = self.named.first() == Some(&0) && read[REACHED.len()];
+        if step.min > 1 || first || read[1] && step.max > 1 {
             let mut starts = BTreeSet::new();
             self.edges(step, None, reservation, &mut |near, _, reservation| {
-                reservation.grow(NODE * u64::from(starts.insert(near)))?;
+                if !starts.contains(&near) {
+                    reservation.grow(NODE * if starts.is_empty() { 4 } else { 1 })?;
+                    starts.insert(near);
+                }
                 Ok(true)
             })?;
             let starts: Vec<Uuid> = starts.into_iter().collect();
@@ -463,7 +510,7 @@ impl<'a> Graph<'a> {
         }
         reservation.grow(NODE)?;
         match self.hidden(node, reservation)? {
-            Some(refusal) if named => Err(refusal),
+            Some(refusal) if named && disclosed(self.given.allowed, &refusal) => Err(refusal),
             hidden => {
                 self.seen.borrow_mut().insert(node, hidden.is_none());
                 Ok(hidden.is_none())
@@ -494,15 +541,18 @@ impl<'a> Graph<'a> {
                     | Error::ScopeLabelViolation { .. }
                     | Error::AclDenied { .. }),
                 ) => {
-                    // The row that hides the node was read.
-                    self.examined.set(self.examined.get() + 1);
-                    return Ok(Some(refusal));
+                    if disclosed(self.given.allowed, &refusal) {
+                        return Ok(Some(refusal));
+                    }
+                    continue;
                 }
                 read => read?,
             };
             if closed && carried {
                 let table = table.name.clone();
-                return Err(Error::PrincipalRequired { table });
+                if listed(self.given.allowed, &table) {
+                    return Err(Error::PrincipalRequired { table });
+                }
             }
         }
         Ok(None)
@@ -533,28 +583,55 @@ impl<'a> Graph<'a> {
             taken[*column] = true;
         }
         // What the reader's filter holds for this read is given back with it.
-        let (given, ctx) = (self.given, EvalContext::new(params, 0));
+        let (given, ctx) = (self.given, EvalContext::new(params, 0, self.given.ctx.kept));
         let mut seeing = given.budget.reserve(0, "query")?;
         let visible = Visible::new(table, given.catalog, given.reader, &mut seeing)?;
-        let source =
-            Source::new(table, filter, &ctx, given.read, visible).reading(filtered, &taken);
+        let count = listed(given.allowed, &table.name);
+        let source = Source::new(table, filter, &ctx, given.read, visible)
+            .counted(given.examined.filter(|_| count))
+            .reading(filtered, &taken);
         let mut path = source.choose(&[], &[])?;
         path.one = wanted.is_empty();
         let mut more = true;
-        let examined = source.walk(&path, reservation, |_, row, bytes, reservation| {
+        source.walk(&path, reservation, |_, row, bytes, reservation| {
             more = each(&row, reservation)?;
             reservation.shrink(bytes);
             Ok(more)
         })?;
-        self.examined.set(self.examined.get() + examined);
         Ok(more)
+    }
+}
+
+/// Where `table` keeps a node's `id UUID`, and whether its key or an index begins with it.
+pub(super) fn node_id(table: &Table) -> Option<(usize, bool)> {
+    let columns = &table.meta.columns;
+    let id = (columns.iter()).position(|c| c.name == "id" && c.column_type == ColumnType::Uuid)?;
+    let leads = |index: &IndexDecl| {
+        let first = index.columns.first();
+        index.json_path.is_empty() && first.is_some_and(|(name, _)| name == "id")
+    };
+    let keyed = table.key.first() == Some(&id) || table.meta.indexes.iter().any(leads);
+    Some((id, keyed))
+}
+
+fn listed(allowed: Option<&BTreeSet<String>>, table: &str) -> bool {
+    allowed.is_none_or(|names| names.contains(table))
+}
+
+fn disclosed(allowed: Option<&BTreeSet<String>>, error: &Error) -> bool {
+    match error {
+        Error::ContextScopeViolation { table }
+        | Error::ScopeLabelViolation { table }
+        | Error::AclDenied { table, .. }
+        | Error::PrincipalRequired { table } => listed(allowed, table),
+        _ => true,
     }
 }
 
 impl plan::Source for Graph<'_> {
     /// A row for every match the pattern's filter passes: what COLUMNS names. The one start an
     /// `=` names, when the reader may not see it, is the refusal of the rule that hides it.
-    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<u64> {
+    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<()> {
         let starts = self.starts.iter().flatten();
         for start in starts.clone() {
             reservation.grow(NODE)?;
@@ -567,12 +644,27 @@ impl plan::Source for Graph<'_> {
             ];
             row.extend(self.named.iter().map(|at| Value::Uuid(path[*at])));
             if let Some(filter) = self.filter
-                && eval(filter, &self.scope, &row, &self.given.ctx)? != Value::Bool(true)
+                && *eval(filter, &self.scope, &row, &self.given.ctx)? != Value::Bool(true)
             {
                 return Ok(true);
             }
+            self.passed.set(self.passed.get() + 1);
+            for (node, tables) in &self.props {
+                let (node, mut value) = (Value::Uuid(path[self.named[*node]]), Value::Null);
+                for &(table, id, at) in tables {
+                    let carries = equal(table, &[id], std::slice::from_ref(&node));
+                    let found: &mut Rows<'_> = &mut |found, _| {
+                        value = found[at].clone();
+                        Ok(false)
+                    };
+                    if !self.read(table, Some(&carries), &[at], reservation, found)? {
+                        break;
+                    }
+                }
+                row.push(value);
+            }
             row = self.picks.iter().map(|at| row[*at].clone()).collect();
-            let bytes = row_overhead(row.len());
+            let bytes = row_overhead(row.len()) + row.iter().map(heap_bytes).sum::<u64>();
             reservation.grow(bytes)?;
             each(row, bytes, reservation)
         };
@@ -602,62 +694,43 @@ impl plan::Source for Graph<'_> {
         }
         let seen = std::mem::take(&mut *self.seen.borrow_mut());
         reservation.shrink(NODE * (seen.len() + starts.count()) as u64);
-        Ok(self.examined.take())
+        Ok(())
     }
 }
 
-/// The nodes a filter names for the node of a pattern called `alias`, each once and in the
-/// order it names them, and whether they are the one an `=` names: the values of the first
-/// `alias.id = value` or `alias.id IN (...)` among the terms joined by AND at its top, a value
-/// or list a SELECT works out included, and of both sides of an OR that each name some. NULL
-/// names no node. `None` when it names none that way.
-fn named_by(filter: &Expr, alias: &str, ctx: &EvalContext) -> Result<Option<(Vec<Uuid>, bool)>> {
-    let id = |expr: &Expr| {
-        matches!(expr, Expr::Column(ColumnRef { table: Some(table), column })
-            if table == alias && column == "id")
+/// The nodes a filter names for the node of a pattern called `alias`, each once, and whether
+/// they are the one an `=` names: the values every case of the filter gives `alias.id`. `None`
+/// when a case gives it none.
+fn named_by(
+    filter: &Expr,
+    alias: &str,
+    scope: &Scope,
+    ctx: &EvalContext,
+) -> Result<Option<(Vec<Uuid>, bool)>> {
+    let id = ColumnRef {
+        table: Some(alias.to_owned()),
+        column: "id".to_owned(),
     };
-    let worked = |value: &Expr| eval(value, &Scope::default(), &[], ctx);
-    // A SELECT's values are read where they are held, never copied.
-    let (values, one): (Cow<[Value]>, bool) = match filter {
-        Expr::BinaryOp { left, op, right } => match op {
-            BinOp::And => {
-                let left = named_by(left, alias, ctx)?;
-                return left.map_or_else(|| named_by(right, alias, ctx), |left| Ok(Some(left)));
-            }
-            BinOp::Or => match (named_by(left, alias, ctx)?, named_by(right, alias, ctx)?) {
-                (Some((left, _)), Some((right, _))) => (
-                    Cow::Owned(left.into_iter().chain(right).map(Value::Uuid).collect()),
-                    false,
-                ),
-                _ => return Ok(None),
-            },
-            BinOp::Eq if id(left) && known(right, ctx) => (vec![worked(right)?].into(), true),
-            BinOp::Eq if id(right) && known(left, ctx) => (vec![worked(left)?].into(), true),
-            _ => return Ok(None),
-        },
-        Expr::InList {
-            expr,
-            list,
-            negated: false,
-        } if id(expr) && list.iter().all(|value| known(value, ctx)) => (
-            Cow::Owned(list.iter().map(worked).collect::<Result<_>>()?),
-            false,
-        ),
-        // The values of a SELECT after IN are worked out before the pattern is matched.
-        Expr::InSubquery {
-            expr,
-            query,
-            negated: false,
-        } if id(expr) => (ctx.subquery(query)?.into(), false),
-        _ => return Ok(None),
-    };
+    let at = scope.find(&id)?.0;
+    let reading = read(Some(filter), &Columns { scope, table: None }, ctx)?;
     let (mut nodes, mut once) = (Vec::new(), BTreeSet::new());
-    for value in values.iter().filter(|value| **value != Value::Null) {
-        // A value that is no node's id names no node, and the filter is asked of every match.
-        let Some(Value::Uuid(node)) = as_key(ColumnType::Uuid, value.clone()) else {
+    for case in &reading.cases {
+        let Some((_, Fact::Among { values, .. })) = case.iter().find(|(column, _)| *column == at)
+        else {
             return Ok(None);
         };
-        nodes.extend(once.insert(node).then_some(node));
+        let ids = values.iter().filter_map(|value| match value {
+            Value::Uuid(node) => Some(*node),
+            _ => None,
+        });
+        nodes.extend(ids.filter(|node| once.insert(*node)));
     }
+    // Every case names the same node by `=`.
+    let one = nodes.len() == 1
+        && (reading.cases.iter()).all(|case| {
+            case.iter().any(|(column, fact)| {
+                *column == at && matches!(fact, Fact::Among { one: true, .. })
+            })
+        });
     Ok(Some((nodes, one)))
 }

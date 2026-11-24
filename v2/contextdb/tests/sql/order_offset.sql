@@ -6,7 +6,7 @@ VALUES (1, 'a', NULL, 'm', 3), (2, 'b', 'k', 'z', 1), (3, 'c', NULL, 'b', 2), (4
 
 SELECT tag FROM readings ORDER BY COALESCE(pref, fallback);
 ----
-tag
+tag  (read 4, compared 0)
 c
 b
 a
@@ -14,16 +14,24 @@ d
 
 SELECT tag FROM readings ORDER BY score + 1 DESC, tag DESC;
 ----
-tag
+tag  (read 4, compared 0)
 a
 d
 c
 b
 
+SELECT tag FROM readings ORDER BY score / 2, score * 2 - id;
+----
+tag  (read 4, compared 0)
+b
+d
+c
+a
+
 # Any expression is a sort key: false sorts before true.
 SELECT tag FROM readings ORDER BY score = 2 DESC, tag;
 ----
-tag
+tag  (read 4, compared 0)
 c
 d
 a
@@ -31,7 +39,7 @@ b
 
 SELECT tag FROM readings ORDER BY tag LIKE '%d' DESC, score DESC, id;
 ----
-tag
+tag  (read 4, compared 0)
 d
 a
 c
@@ -40,27 +48,27 @@ b
 # Without OFFSET the answer starts at the first row.
 SELECT id FROM readings ORDER BY id LIMIT 2;
 ----
-id
+id  (read 2, compared 0)
 1
 2
 
 SELECT id FROM readings ORDER BY id LIMIT 2 OFFSET 1;
 ----
-id
+id  (read 3, compared 0)
 2
 3
 
 SELECT id FROM readings ORDER BY id DESC OFFSET 3;
 ----
-id
+id  (read 4, compared 0)
 1
 
 # An OFFSET past the last row is an empty answer.
 SELECT id FROM readings ORDER BY id LIMIT 2 OFFSET 4;
 ----
-id
+id  (read 4, compared 0)
 
 # A COUNT is one row, so an OFFSET past it leaves no row.
 SELECT COUNT(*) FROM readings OFFSET 1;
 ----
-count
+count  (read 0, compared 0)

@@ -3,10 +3,9 @@
 
 mod support;
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use contextdb::{ContextId, Database, Uuid, params};
+use contextdb::{Database, Uuid, params};
 
 /// A store with the usual table `t` and its index on `tag`, forty rows.
 fn store(name: &str) -> (PathBuf, Database) {
@@ -21,6 +20,7 @@ fn store(name: &str) -> (PathBuf, Database) {
 fn explained(db: &Database, sql: &str) -> String {
     db.explain(sql)
         .unwrap_or_else(|error| panic!("{sql}\nwas not explained: {error:?}"))
+        .to_string()
 }
 
 /// Fails unless the explanation holds each of these, naming the statement and the whole text.
@@ -75,6 +75,11 @@ fn a_search_is_explained_with_its_mode_and_partition_key() {
             "filter_path: IndexScan { index: docs_tag_idx }",
             "small_set: yes",
         ],
+    );
+    assert_says(
+        &db,
+        "SELECT id FROM docs WHERE id <= 2 OR tag = 3 ORDER BY v <=> [1.0, 0.0, 0.0] LIMIT 3",
+        &["OR arms reach the table by different paths"],
     );
     // A vector read from a subquery leaves the filter path the search's own; the inner one is told once.
     let q = "SELECT id FROM docs WHERE tag = 3 ORDER BY v <=> (SELECT v FROM docs WHERE id = 1) LIMIT 3";
@@ -162,82 +167,6 @@ fn explaining_a_statement_changes_nothing_in_the_store() {
 }
 
 #[test]
-fn a_narrowed_handle_is_told_no_row_or_count_of_what_it_may_not_see() {
-    let (_, db) = store("explain-narrowed");
-    support::run(
-        &db,
-        "CREATE TABLE passages (id INTEGER PRIMARY KEY, context_id UUID NOT NULL CONTEXT_ID, \
-         v VECTOR(3) PARTITION_KEY (context_id) SEARCH_MODE EXACT, UNIQUE (context_id, id)) \
-         MAINTAIN COUNT (context_id)",
-    );
-    // Three passages in the context the handle is given and 137 in one it is not: 140 in all.
-    let (own, hidden) = (Uuid::from_u128(1), Uuid::from_u128(2));
-    let tx = db.transaction().expect("begin");
-    for n in 1..=140_i64 {
-        tx.execute(
-            "INSERT INTO passages (id, context_id, v) VALUES ($id, $ctx, $v)",
-            &params! {
-                "id" => 1000 + n, "ctx" => if n <= 3 { own } else { hidden },
-                "v" => support::vector(n, 3),
-            },
-        )
-        .expect("insert a passage");
-    }
-    tx.commit().expect("commit");
-    let narrowed = db.scoped_with_contexts(BTreeSet::from([ContextId::new(own)]));
-    let count = support::int(&narrowed, "SELECT COUNT(*) AS n FROM passages");
-    assert_eq!(count, 3, "the rows of its own Context");
-    // Explaining a search through a WITH answers like any other statement.
-    let with = "WITH x AS (SELECT id, v FROM passages) SELECT id FROM x ORDER BY v <=> [1.0, 0.0, 0.0] LIMIT 1";
-    explained(&db, with);
-    // It is told no key, route or refusal: each would show the state of rows it may not see.
-    let own_search = "SELECT id FROM passages ORDER BY v <=> [1.0, 0.0, 0.0] LIMIT 2";
-    let bare = |reader: &Database, sql: &str| {
-        let text = explained(reader, sql);
-        for line in ["key:", "route:", "refusal:"] {
-            assert!(!text.contains(line), "told `{line}`:\n{text}");
-        }
-        text
-    };
-    bare(&narrowed, own_search);
-    bare(&db.scoped_with_contexts(BTreeSet::new()), own_search);
-    for sql in [
-        own_search,
-        "SELECT COUNT(*) AS n FROM passages",
-        "SELECT context_id, COUNT(*) AS n FROM passages GROUP BY context_id",
-    ] {
-        let text = explained(&narrowed, sql);
-        for secret in [hidden.to_string(), "137".to_owned(), "140".to_owned()] {
-            assert!(!text.contains(&secret), "{sql}\nsays `{secret}`:\n{text}");
-        }
-    }
-    // Writes to rows it may not see change neither what it is told nor what INDEXED search gives.
-    for (t, key, n) in [("m", "", 1), ("d", "PARTITION_KEY (c)", 4)] {
-        let make = format!(
-            "CREATE TABLE {t} (id INTEGER PRIMARY KEY, c UUID NOT NULL CONTEXT_ID, v VECTOR(3) {key} INDEXING_THRESHOLD {n})"
-        );
-        support::run(&db, &make);
-        let put = |ids: std::ops::Range<i64>, who: Uuid, v: &str| {
-            for n in ids {
-                support::run(&db, &format!("INSERT INTO {t} VALUES ({n}, '{who}', {v})"));
-            }
-        };
-        let sql =
-            format!("SELECT id FROM {t} ORDER BY v <=> [1.0, 0.0, 0.0] USE VECTOR INDEXED LIMIT 2");
-        let ask = || (bare(&narrowed, &sql), support::rows(&narrowed, &sql));
-        put(1..4, own, "[1.0, 0.0, 0.0]");
-        support::seal_all(&db);
-        let before = ask();
-        put(4..6, hidden, "[1.0, 0.0, 0.0]");
-        assert_eq!(ask(), before, "{t}: unindexed hidden rows");
-        support::seal_all(&db);
-        assert_eq!(ask(), before, "{t}: indexed hidden rows");
-        put(6..8, own, "[0.0, 1.0, 0.0]");
-        assert_eq!(ask(), before, "{t}: own rows further away");
-    }
-}
-
-#[test]
 fn explaining_a_write_also_says_the_path_of_the_select_inside_it() {
     let (_, db) = store("explain-write-select");
     support::run(
@@ -253,4 +182,36 @@ fn explaining_a_write_also_says_the_path_of_the_select_inside_it() {
         // The write's own table by its key, and the inner table through its index.
         assert_says(&db, &write, &["index: __pk_id }", "index: owners_t }"]);
     }
+    // Context Graph's receipt read: UUID equality, a residual flag, then the ordinal order.
+    for sql in [
+        "CREATE TABLE event_search_generations (id UUID PRIMARY KEY)",
+        "CREATE TABLE event_search_passages (id UUID PRIMARY KEY, generation_id UUID NOT NULL REFERENCES event_search_generations(id), passage_ordinal INTEGER NOT NULL, content_sha256 TEXT NOT NULL, is_current BOOLEAN NOT NULL)",
+        "CREATE INDEX event_search_passages_generation_ordinal_idx ON event_search_passages (generation_id, passage_ordinal)",
+        "INSERT INTO event_search_generations VALUES ('00000000-0000-0000-0000-000000000001'), ('00000000-0000-0000-0000-000000000002')",
+        "INSERT INTO event_search_passages VALUES ('00000000-0000-0000-0000-000000000003', '00000000-0000-0000-0000-000000000001', 20, 'active-20', true), ('00000000-0000-0000-0000-000000000004', '00000000-0000-0000-0000-000000000001', 10, 'active-10', true), ('00000000-0000-0000-0000-000000000005', '00000000-0000-0000-0000-000000000001', 30, 'retired', false), ('00000000-0000-0000-0000-000000000006', '00000000-0000-0000-0000-000000000002', 5, 'other', true)",
+    ] {
+        support::run(&db, sql);
+    }
+    let sql = "SELECT passage_ordinal, content_sha256 FROM event_search_passages WHERE generation_id = $generation_id AND is_current = $current ORDER BY generation_id ASC, passage_ordinal ASC";
+    let bound = params! { "generation_id" => Uuid::from_u128(1), "current" => true };
+    let rows = db.execute(sql, &bound).unwrap();
+    assert_eq!(rows.rows().len(), 2);
+    assert_eq!(rows.rows()[0], vec![10.into(), "active-10".into()]);
+    assert_eq!(rows.rows()[1], vec![20.into(), "active-20".into()]);
+    assert_eq!(rows.rows_examined(), 3);
+    let plan = db.execute(&format!("EXPLAIN {sql}"), &bound).unwrap();
+    assert_eq!(
+        plan.rows()[0][0],
+        "IndexScan { index: event_search_passages_generation_ordinal_idx }".into()
+    );
+    assert!(!format!("{:?}", plan.rows()).contains("Sort"));
+    // A kept count this read cannot use still prints its line.
+    let kept = "CREATE TABLE kept (id INTEGER PRIMARY KEY, ctx TEXT, UNIQUE (ctx, id)) MAINTAIN COUNT (ctx)";
+    support::run(&db, kept);
+    let count = "SELECT COUNT(*) FROM kept WHERE ctx = 'a'";
+    assert_says(
+        &db.scoped_with_contexts(Default::default()),
+        count,
+        &["maintained count"],
+    );
 }

@@ -26,9 +26,9 @@ env:
   # it, so a cleanup lowers it for good. Reaching one means a refactor first: a number is raised
   # only when a planned stage of the work ends, never inside a fix (v2/AGENTS.md). Neither size
   # ever passes 150,000 lines or 1,000 tests.
-  SHIPPED_LINES: 25000
-  TESTS: 400
-  TEST_LINES: 41000
+  SHIPPED_LINES: 38000
+  TESTS: 560
+  TEST_LINES: 59000
 
 jobs:
   lint:
@@ -38,6 +38,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: cargo fmt --manifest-path v2/Cargo.toml --all --check
       - run: cargo clippy --manifest-path v2/Cargo.toml --workspace --all-targets --locked -- -D warnings
+      - run: cargo fmt --manifest-path v2/redb/Cargo.toml --all --check
+      - run: cargo clippy --manifest-path v2/redb/Cargo.toml --all-targets --locked -- -D warnings
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --manifest-path v2/Cargo.toml --workspace --locked --no-deps
       - name: Shipped lines are at most the stated number and within 500 of it
         run: |
           lines=$(find v2/contextdb/src v2/contextdb-cli/src \( -name '*.rs' -o -name '*.pest' \) ! -name tests.rs -exec cat {} + | wc -l)
@@ -51,14 +54,22 @@ jobs:
         run: test -z "$(grep -rnE --include='*.rs' --exclude=tests.rs '_for_test|test[-_]seam|feature *= *"test' v2/contextdb/src v2/contextdb-cli/src)"
       - name: No ignored test
         run: test -z "$(grep -rn --include='*.rs' '#\[ignore' v2/contextdb v2/contextdb-cli)"
-      - name: Only the four allow attributes that v2/AGENTS.md names, and no expect attribute
-        run: test "$(grep -rnE --include='*.rs' '#!?\[ *(allow|expect) *\(' v2/contextdb v2/contextdb-cli | wc -l)" -eq 4
+      - name: Only the seven allow attributes that v2/AGENTS.md names, and no expect attribute
+        run: test "$(grep -rnE --include='*.rs' '#!?\[ *(allow|expect) *\(' v2/contextdb v2/contextdb-cli | wc -l)" -eq 7 && test -z "$(grep -rnE --include='*.rs' '#!?\[ *expect *\(' v2/contextdb v2/contextdb-cli)"
+      - name: No old name for the IVF index, its maintenance or its unindexed list
+        run: |
+          old=$(grep -rnIwiE --exclude-dir=target --exclude=aggregate.rs --exclude=group_by.sql --exclude=query-language.md 'upkeep|sketch|groupings?' v2 docs | grep -vE 'joins, grouping|unions, grouping|a sort or a grouping' || true)
+          old+=$(grep -rnE --include='*.rs' '(vector|unindexed|super)::(stage|waiting)\b' v2/contextdb/src || true)
+          old+=$(grep -rnE 'fn (stage|waiting)\(' v2/contextdb/src/vector || true)
+          old+=$(grep -nE '^\| `(stage|waiting)`' v2/AGENTS.md || true)
+          echo "$old"
+          test -z "$old"
 
   test:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
@@ -82,6 +93,19 @@ jobs:
           test "$TESTS" -le 1000
           test "$tests" -le "$TESTS"
           test "$tests" -gt "$((TESTS - 10))"
+      - name: Every named guard exists and each performance bar names its guard or its gap
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          export LC_ALL=C
+          { cargo nextest list --color never --manifest-path v2/Cargo.toml --workspace --locked --ignore-default-filter -T oneline | sed 's/.*[: ]//'; cargo test --color never --manifest-path v2/redb/Cargo.toml --locked --lib --tests -- --list | sed -n 's/: test$//p'; find v2/contextdb/tests/sql -name '*.sql' -exec basename {} .sql \;; } | sort -u > "$RUNNER_TEMP/listed-guards"
+          tick=$(printf '\140'); grep -hoE "${tick}[a-z][a-z0-9]*(_[a-z0-9]+){3,}${tick}" v2/AGENTS.md docs/performance/README.md | tr -d '\140' | sort -u > "$RUNNER_TEMP/named-guards"
+          comm -23 "$RUNNER_TEMP/named-guards" "$RUNNER_TEMP/listed-guards" > "$RUNNER_TEMP/missing-guards"
+          cat "$RUNNER_TEMP/missing-guards"
+          test ! -s "$RUNNER_TEMP/missing-guards"
+          grep -hoE "${tick}[^${tick}]+\.sql${tick}" v2/AGENTS.md docs/performance/README.md | tr -d '\140' | sort -u | while IFS= read -r path; do test -f "$path" || test -f "v2/$path" || test -f "v2/contextdb/tests/sql/$path"; done
+          awk -F'|' '/^\| \*\*/ {print $3}' docs/performance/README.md | grep -vi 'none yet' | grep -vE "${tick}([a-z][a-z0-9]*(_[a-z0-9]+){3,}|[^${tick}]+\.sql)${tick}" > "$RUNNER_TEMP/missing-bars" || true
+          cat "$RUNNER_TEMP/missing-bars"
+          test ! -s "$RUNNER_TEMP/missing-bars"
       - name: Test lines are at most the stated number and within 500 of it
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -97,3 +121,118 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: rustup toolchain install 1.89 --profile minimal
       - run: cargo +1.89 check --manifest-path v2/Cargo.toml --workspace --locked
+
+  release:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+        with:
+          tool: cargo-nextest@0.9.138
+      - run: sudo apt-get update && sudo apt-get install -y valgrind
+      - name: Compare the same consumer statements at base and head
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          base=$(git merge-base "$BASE_SHA" HEAD)
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/statement-target"
+          git worktree add --detach "$RUNNER_TEMP/base" "$base"
+          for tree in base head; do
+            tree_root="$PWD"
+            if test "$tree" = base; then tree_root="$RUNNER_TEMP/base"; fi
+            echo "$tree uses its own measurement program at $(git -C "$tree_root" rev-parse HEAD)"
+            awk -F'"' '/^fn statements\(/ {inside=1} inside && /^[[:space:]]*"/ && /[[:space:]]=>[[:space:]]/ {sub(/=>.*/, ""); for (i=2; i<=NF; i+=2) print $i} inside && /^}/ {exit}' "$tree_root/v2/contextdb/examples/measure.rs" | sort -u > "$RUNNER_TEMP/$tree-workloads"
+            if ! test -s "$RUNNER_TEMP/$tree-workloads"; then echo "$tree has no statement workloads"; continue; fi
+            RUSTFLAGS="--remap-path-prefix=$tree_root=/contextdb" cargo build --manifest-path "$tree_root/v2/Cargo.toml" --release --locked -p contextdb --example measure
+            cp "$CARGO_TARGET_DIR/release/examples/measure" "$RUNNER_TEMP/measure-$tree"
+            "$RUNNER_TEMP/measure-$tree" statements build "$RUNNER_TEMP/store-$tree"
+            while IFS= read -r which; do
+              repetitions=200; case "$which" in vector_purge_*|parent_expiry_*) repetitions=1;; esac
+              for n in 0 "$repetitions"; do
+                valgrind --tool=cachegrind --cache-sim=no --cachegrind-out-file="$RUNNER_TEMP/$tree-$which-$n.cg" "$RUNNER_TEMP/measure-$tree" statements "$which" "$RUNNER_TEMP/store-$tree" "$n"
+              done
+            done < "$RUNNER_TEMP/$tree-workloads"
+          done
+          comm -23 "$RUNNER_TEMP/base-workloads" "$RUNNER_TEMP/head-workloads" > "$RUNNER_TEMP/dropped-workloads"
+          if test -s "$RUNNER_TEMP/dropped-workloads"; then echo "Dropped workloads:"; cat "$RUNNER_TEMP/dropped-workloads"; exit 1; fi
+          git log --format=%B "$base..HEAD" > "$RUNNER_TEMP/cost-messages.txt"
+          failed=0
+          while IFS= read -r which; do
+            repetitions=200; case "$which" in vector_purge_*|parent_expiry_*) repetitions=1;; esac
+            head_count=$(sed -n 's/^summary: //p' "$RUNNER_TEMP/head-$which-0.cg" "$RUNNER_TEMP/head-$which-$repetitions.cg" | awk -v n="$repetitions" 'NR == 1 {zero=$1} NR == 2 {print ($1-zero)/n}')
+            printf '%s\n' "$head_count" > "$RUNNER_TEMP/$which.ir"
+            case "$which" in keyed_find) ceiling=180000 ;; json_filter) ceiling=2040000 ;; *) ceiling=0 ;; esac
+            if test "$ceiling" -gt 0; then awk -v count="$head_count" -v cap="$ceiling" 'BEGIN {exit !(count > 0 && count <= cap)}'; fi
+            if ! grep -Fxq "$which" "$RUNNER_TEMP/base-workloads"; then
+              awk -v count="$head_count" 'BEGIN {exit !(count > 0)}'
+              echo "$which: new workload, $head_count instructions per statement at head; no base figure"
+              continue
+            fi
+            counts=()
+            for tree in base head; do
+              counts+=("$(sed -n 's/^summary: //p' "$RUNNER_TEMP/$tree-$which-0.cg" "$RUNNER_TEMP/$tree-$which-$repetitions.cg" | awk -v n="$repetitions" 'NR == 1 {zero=$1} NR == 2 {print ($1-zero)/n}')")
+            done
+            change=$(awk -v base="${counts[0]}" -v head="${counts[1]}" 'BEGIN {if (base <= 0 || head <= 0) exit 1; printf "%.1f", 100*(head/base-1)}')
+            echo "$which: ${counts[1]} instructions per statement against ${counts[0]} at base ($change%, limit 2%)"
+            if awk -v base="${counts[0]}" -v head="${counts[1]}" 'BEGIN {exit !(head > base*1.02)}' && ! grep -qE "^cost: $which \\+$change% " "$RUNNER_TEMP/cost-messages.txt"; then failed=1; fi
+          done < "$RUNNER_TEMP/head-workloads"
+          for pair in vector_purge parent_expiry; do
+            awk 'NR == 1 {small=$1} NR == 2 {exit !(small > 0 && $1 > 0 && $1 <= 2.5*small)}' "$RUNNER_TEMP/${pair}_small.ir" "$RUNNER_TEMP/${pair}_large.ir"
+          done
+          test "$failed" -eq 0
+
+      - name: Recorded scale work, the million-row memory ceiling and consumer performance bars in release
+        run: |
+          CARGO_TARGET_DIR="$RUNNER_TEMP/statement-target" RUSTFLAGS="--remap-path-prefix=$PWD=/contextdb" cargo nextest run --manifest-path v2/Cargo.toml --locked --cargo-profile release --profile release --lib --test find_at_scale --test memory_ceiling --test performance_bars --test crash --test counted_work --test vectors_maintenance --test bound_find -E 'test(=a_hundred_thousand_sightings_are_found_with_the_recorded_work_recall_and_length) | test(=a_million_rows_load_and_scan_under_64_mib) | binary(=performance_bars) | test(=a_killed_open_reads_the_log_and_last_commit_pages) | (test(streaming::) - test(=streaming::a_bulk_update_is_written_through_as_it_matches)) | test(=removal_membership_agrees_with_the_in_memory_evaluator_for_every_kind) | test(=purge::a_purge_leaves_no_copy_in_either_commit_slot) | test(=a_kill_in_any_step_of_a_build_leaves_every_vector_found) | test(=store::tests::every_damaged_record_is_told_as_damage_by_each_path_that_meets_it) | test(=schema::tests::every_damaged_schema_record_is_told_as_damage_or_read_as_tables_that_print) | test(=a_bound_finds_what_is_stored_and_nothing_for_a_face_never_stored) | test(=a_bound_over_sightings_answers_rows_inside_it_however_asked_or_written)'
+          cargo test --manifest-path v2/redb/Cargo.toml --locked --release --test contextdb_changes committed_pages_read_and_release_within_their_allowance -- --exact
+
+  scale:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+        with:
+          tool: cargo-nextest@0.9.138
+      - run: cargo nextest run --manifest-path v2/Cargo.toml --locked --cargo-profile release --profile release --test find_at_scale -E 'test(=a_million_sightings_are_found_with_the_recorded_work_recall_and_length)'
+
+  mutations:
+    if: github.event_name == 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+        with:
+          tool: cargo-mutants@27.1.0,cargo-nextest@0.9.138
+      - name: Mutate the frozen diff since the last green night
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXTEST_PROFILE: mutants
+        run: |
+          base=$(gh run list --workflow check.yml --event schedule --status success -L 1 --json headSha --jq '.[0].headSha')
+          test -n "$base" && test "$base" != null
+          git cat-file -e "$base^{commit}"
+          git diff --relative=v2 "$base" "$GITHUB_SHA" -- v2/contextdb/src v2/contextdb-cli/src > "$RUNNER_TEMP/night.diff"
+          cargo mutants -d v2 --test-tool nextest --in-diff "$RUNNER_TEMP/night.diff" --shard ${{ matrix.shard }}/16 --list
+          cargo mutants -d v2 --test-tool nextest --in-diff "$RUNNER_TEMP/night.diff" --shard ${{ matrix.shard }}/16 --output "$RUNNER_TEMP/mutants" || test $? -eq 3
+      - name: Keep caught, missed and timed-out outcomes separately
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mutation-results-${{ matrix.shard }}
+          path: ${{ runner.temp }}/mutants

@@ -105,7 +105,9 @@ fn is_scanned_text(rel: &str) -> bool {
         || rel.starts_with("scripts/");
     let documentation =
         name.ends_with(".md") && (!rel.contains('/') || rel.split('/').count() == 3);
-    text && (code_scope || documentation)
+    // The lean engine's pages and local check runner, which this suite no longer runs on.
+    let lean = rel.starts_with("docs/performance/") || rel == "scripts/ci-local.py";
+    text && !lean && (code_scope || documentation)
 }
 
 #[test]

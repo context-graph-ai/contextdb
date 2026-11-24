@@ -1,8 +1,8 @@
-//! One vector as a sketch keeps it, and the range a search gets from a sketch.
+//! One vector as a binary code keeps it, and the range a search gets from a binary code.
 //!
-//! A sketch is one bit for each number of the vector, then two bytes. The vector is the one its
-//! slot keeps (the slot's codes times its scale), less a reference: the centre of its group for
-//! a slot of a grouping, the partition's mean for a slot of a tail block. Bit `i` is set when
+//! A binary code is one bit for each number of the vector, then two bytes. The vector is the one its
+//! slot keeps (the slot's codes times its scale), less a reference: the centroid of its group for
+//! a slot of an IVF, the partition's mean for a slot of a tail block. Bit `i` is set when
 //! number `i` of that difference is zero or more. The two bytes are a factor, low byte first:
 //! the squared length of the difference over the sum of the sizes of its numbers, times 32,768
 //! and rounded, held to 65,535; zero for a difference of all zeros.
@@ -10,27 +10,27 @@
 //! The product of the slot's vector with the unit vector `w` of a search is estimated as the
 //! product of the reference with `w`, plus the factor times the sum of `w`'s numbers, each
 //! taken with the sign its bit says. The estimate is not proven: how far it may be off is
-//! measured when a grouping is built, as a width in quarters of the factor, and a search keeps
+//! measured when an IVF is built, as a width in quarters of the factor, and a search keeps
 //! every slot whose estimate, widened by it, can still reach the answer.
 
 use super::block::BlockReader;
-use super::slot::{SLOT_HEADER, length};
+use super::slot::{SLOT_HEADER, length, scale};
 
-/// Bytes of a sketch after its bits.
-pub(super) const SKETCH_TAIL: usize = 2;
+/// Bytes of a binary code after its bits.
+pub(super) const BINARY_TAIL: usize = 2;
 
-/// Bytes the sketch of a vector of this dimension takes.
-pub(super) fn sketch_len(dimension: usize) -> usize {
-    dimension.div_ceil(8) + SKETCH_TAIL
+/// Bytes the binary code of a vector of this dimension takes.
+pub(super) fn code_len(dimension: usize) -> usize {
+    dimension.div_ceil(8) + BINARY_TAIL
 }
 
-/// The widest a sketch's estimate is ever taken to be, in quarters of its factor.
+/// The widest a binary code's estimate is ever taken to be, in quarters of its factor.
 pub(super) const WIDEST: u8 = 16;
 
-/// Writes the sketch of the vector a slot keeps, less `reference`, into `out`, which is
-/// `sketch_len` bytes long. `reference` is of the slot's dimension.
-pub(super) fn write_sketch(slot: &[u8], reference: &[f32], out: &mut [u8]) {
-    let scale = f32::from_le_bytes([slot[0], slot[1], slot[2], slot[3]]);
+/// Writes the binary code of the vector a slot keeps, less `reference`, into `out`, which is
+/// `code_len` bytes long. `reference` is of the slot's dimension.
+pub(super) fn write_code(slot: &[u8], reference: &[f32], out: &mut [u8]) {
+    let scale = scale(slot);
     let (bits, factor) = out.split_at_mut(reference.len().div_ceil(8));
     bits.fill(0);
     let (mut squares, mut sizes) = (0.0_f64, 0.0_f64);
@@ -46,52 +46,51 @@ pub(super) fn write_sketch(slot: &[u8], reference: &[f32], out: &mut [u8]) {
     factor.copy_from_slice(&kept.to_le_bytes());
 }
 
-/// The record of the sketches of a block: the block's count of slots as four bytes, low byte
-/// first, then one sketch for each of its slots in their order. `reference` answers the
+/// The record of the binary codes of a block: the block's count of slots as four bytes, low byte
+/// first, then one binary code for each of its slots in their order. `reference` answers the
 /// reference of the slot at a place of the block. The caller has reserved the record's bytes,
-/// four and `sketch_len` a slot, before it calls.
-pub(super) fn sketches_of<'a>(
-    block: &[u8],
+/// four and `code_len` a slot, before it calls.
+pub(super) fn codes_of<'a>(
+    block: &BlockReader<'_>,
     dimension: usize,
     reference: &mut dyn FnMut(usize) -> &'a [f32],
 ) -> Vec<u8> {
-    let block = BlockReader::new(block, dimension);
-    let mut record = vec![0; 4 + block.len() * sketch_len(dimension)];
-    let (count, sketches) = record.split_at_mut(4);
+    let mut record = vec![0; 4 + block.len() * code_len(dimension)];
+    let (count, codes) = record.split_at_mut(4);
     count.copy_from_slice(&(block.len() as u32).to_le_bytes());
-    let sketches = sketches.chunks_exact_mut(sketch_len(dimension));
-    for (place, sketch) in sketches.enumerate() {
-        write_sketch(block.slot(place), reference(place), sketch);
+    let codes = codes.chunks_exact_mut(code_len(dimension));
+    for (place, code) in codes.enumerate() {
+        write_code(block.slot(place), reference(place), code);
     }
     record
 }
 
-/// The sketch at a place of a record of sketches. A record whose length is not four bytes and
-/// `count` sketches of this dimension is not whole: the store is told so by the caller.
-pub(super) struct Sketches<'a> {
+/// The binary code at a place of a record of binary codes. A record whose length is not four bytes and
+/// `count` binary codes of this dimension is not whole: the store is told so by the caller.
+pub(super) struct Codes<'a> {
     bytes: &'a [u8],
     dimension: usize,
 }
 
-impl<'a> Sketches<'a> {
-    pub(super) fn new(bytes: &'a [u8], dimension: usize) -> Sketches<'a> {
-        Sketches { bytes, dimension }
+impl<'a> Codes<'a> {
+    pub(super) fn new(bytes: &'a [u8], dimension: usize) -> Codes<'a> {
+        Codes { bytes, dimension }
     }
 
-    /// True when the record holds `count` sketches and nothing else.
+    /// True when the record holds `count` binary codes and nothing else.
     pub(super) fn is_whole(&self, count: usize) -> bool {
-        self.bytes.len() == 4 + count * sketch_len(self.dimension)
+        self.bytes.len() == 4 + count * code_len(self.dimension)
             && self.bytes[..4] == (count as u32).to_le_bytes()
     }
 
-    /// The sketch at this place, counted from zero.
+    /// The binary code at this place, counted from zero.
     pub(super) fn at(&self, place: usize) -> &'a [u8] {
-        let len = sketch_len(self.dimension);
+        let len = code_len(self.dimension);
         &self.bytes[4 + place * len..][..len]
     }
 }
 
-/// What a search works out once from its vector and then uses for every sketch it estimates:
+/// What a search works out once from its vector and then uses for every binary code it estimates:
 /// the vector at length one with each number brought to one of sixteen whole steps from -8 to
 /// 7, as four planes of bits, the size of a step, and the sum of the numbers.
 pub(super) struct Estimate {
@@ -133,11 +132,11 @@ impl Estimate {
         }
     }
 
-    /// The ranges the sketches at `places` of one record give for the similarity of their
+    /// The ranges the binary codes at `places` of one record give for the similarity of their
     /// slots' vectors, pushed onto `out` in order: each `(low, high)` around `base`, the
-    /// product of the sketches' reference with the search's unit vector, plus the factor
+    /// product of the binary codes' reference with the search's unit vector, plus the factor
     /// times the signed sum, and `width` quarters of the factor wide on each side. The sum is
-    /// taken by counting the bits a sketch shares with each plane: the planes count one, two
+    /// taken by counting the bits a binary code shares with each plane: the planes count one, two
     /// and four steps, and the fourth takes eight away.
     ///
     /// This is the loop a search spends its time in, and it has two arms over one body. On an
@@ -148,10 +147,10 @@ impl Estimate {
     /// call of the library, sound because the processor was asked first. Both arms give the
     /// same ranges to the bit, and nothing outside this function knows which ran. `out` never
     /// grows past the slots of one block: the search has reserved eight bytes for each slot
-    /// of the largest block before its first sketch.
+    /// of the largest block before its first binary code.
     pub(super) fn ranges(
         &self,
-        sketches: &Sketches<'_>,
+        codes: &Codes<'_>,
         places: std::ops::Range<usize>,
         base: f32,
         width: u8,
@@ -162,11 +161,11 @@ impl Estimate {
             if std::arch::is_x86_feature_detected!("popcnt") {
                 // SAFETY: the processor was asked on the line before and has the instruction
                 // this body is compiled for.
-                unsafe { self.counted(sketches, places, base, width, out) };
+                unsafe { self.counted(codes, places, base, width, out) };
                 return;
             }
         }
-        self.each(sketches, places, base, width, out);
+        self.each(codes, places, base, width, out);
     }
 
     /// The body of [`Estimate::ranges`] compiled for the bit-count instruction.
@@ -174,21 +173,21 @@ impl Estimate {
     #[target_feature(enable = "popcnt")]
     fn counted(
         &self,
-        sketches: &Sketches<'_>,
+        codes: &Codes<'_>,
         places: std::ops::Range<usize>,
         base: f32,
         width: u8,
         out: &mut Vec<(f32, f32)>,
     ) {
-        self.each(sketches, places, base, width, out);
+        self.each(codes, places, base, width, out);
     }
 
-    /// The body of [`Estimate::ranges`]. A sketch's bits are read as words, low byte first,
+    /// The body of [`Estimate::ranges`]. A binary code's bits are read as words, low byte first,
     /// and the last word is completed with zeros.
     #[inline(always)]
     fn each(
         &self,
-        sketches: &Sketches<'_>,
+        codes: &Codes<'_>,
         places: std::ops::Range<usize>,
         base: f32,
         width: u8,
@@ -196,7 +195,7 @@ impl Estimate {
     ) {
         let (planes, _) = self.planes.as_chunks::<4>();
         for place in places {
-            let (bits, factor) = sketches.at(place).split_at(sketches.dimension.div_ceil(8));
+            let (bits, factor) = codes.at(place).split_at(codes.dimension.div_ceil(8));
             let (words, rest) = bits.as_chunks::<8>();
             let mut last = [0_u8; 8];
             last[..rest.len()].copy_from_slice(rest);

@@ -6,7 +6,7 @@
 use std::cell::Cell;
 use std::cmp::Ordering;
 
-use super::expression::{EvalContext, Scope, compare, eval, mark, reads};
+use super::expression::{EvalContext, Scope, compare, eval, holds, mark, reads};
 use super::plan::{self, Cut, Each, Given, Rows, Source};
 use super::row_overhead;
 use super::subquery::Named;
@@ -14,11 +14,11 @@ use super::table::{self, as_key};
 use super::visible::Visible;
 use crate::memory::Reservation;
 use crate::schema::Table;
-use crate::sql::ast::{BinOp, Literal};
+use crate::sql::ast::BinOp;
 use crate::sql::plan::{FromItem, SelectPlan, SortKey};
 use crate::sql::{Expr, not_supported};
 use crate::types::heap_bytes;
-use crate::types::{ColumnDef, Error, Result, Value};
+use crate::types::{ColumnDef, ColumnType, Error, Result, Value};
 
 /// What FROM gives a SELECT: the joined rows, their columns, and what of WHERE is still to be
 /// applied to them.
@@ -61,7 +61,7 @@ pub(super) struct Held<'c> {
 /// them. `None` for a FROM `plan::one` answers alone: nothing, a pattern, or one stored table.
 pub(super) fn held<'c>(select: &'c SelectPlan, given: &Given<'c>) -> Result<Option<Held<'c>>> {
     let items = select.from.iter();
-    let mut relations = Vec::new();
+    let (mut relations, mut seeing) = (Vec::new(), Vec::new());
     for item in items.chain(select.joins.iter().map(|join| &join.item)) {
         let FromItem::Table { name, alias } = item else {
             return match select.joins.is_empty() {
@@ -73,7 +73,7 @@ pub(super) fn held<'c>(select: &'c SelectPlan, given: &Given<'c>) -> Result<Opti
         let mut before = relations
             .iter()
             .map(|relation: &Relation| relation.qualifier);
-        if before.any(|before| before == *qualifier) {
+        if !qualifier.is_empty() && before.any(|before| before == *qualifier) {
             let refused = format!("table name \"{qualifier}\" specified more than once");
             return Err(Error::PlanError(refused));
         }
@@ -84,10 +84,14 @@ pub(super) fn held<'c>(select: &'c SelectPlan, given: &Given<'c>) -> Result<Opti
                 Of::Table(table.ok_or_else(|| Error::TableNotFound(name.clone()))?)
             }
         };
-        let columns = match of {
-            Of::Named(named) => &named.columns,
-            Of::Table(table) => &table.meta.columns,
+        // A relation's columns are listed, and their names copied, as the statement is planned.
+        let (columns, heap) = match of {
+            Of::Named(named) => (&named.columns, 0),
+            Of::Table(table) => (&table.meta.columns, table.heap),
         };
+        let bytes = |c: &ColumnDef| c.name.len() as u64 + 32;
+        let names = columns.iter().map(bytes).sum::<u64>();
+        seeing.push(given.budget.reserve(heap + names, "query")?);
         relations.push(Relation {
             qualifier,
             columns,
@@ -118,22 +122,23 @@ pub(super) fn held<'c>(select: &'c SelectPlan, given: &Given<'c>) -> Result<Opti
     for part in parts {
         let mut read = vec![false; scope.columns().count()];
         reads(part, &scope, given.params, &mut read)?;
-        // The relation that holds every column the part reads. Its table source applies the
-        // part unless the relation is the right side of a LEFT JOIN, whose unmatched rows
-        // WHERE sees as NULL.
-        let mut start = 0;
-        let home = relations.iter().position(|relation| {
+        // The relation that holds every column the part reads, or the first that can take a part
+        // that reads none. Its table source applies the part unless it is the right side of a
+        // LEFT JOIN, whose unmatched rows WHERE sees as NULL.
+        let stored = |at: usize| matches!(relations[at].of, Of::Table(_));
+        let takes = |at: usize| stored(at) && (at == 0 || !select.joins[at - 1].left_outer);
+        let (mut start, none) = (0, !read.contains(&true));
+        let home = relations.iter().enumerate().position(|(at, relation)| {
             let here = start..start + relation.columns.len();
             start = here.end;
             let elsewhere = read
                 .iter()
                 .enumerate()
                 .any(|(at, read)| *read && !here.contains(&at));
-            !elsewhere && read[here].contains(&true)
+            !elsewhere && read[here].contains(&true) || none && takes(at)
         });
-        let stored = |at: &usize| matches!(relations[*at].of, Of::Table(_));
-        match home.filter(stored) {
-            Some(at) if at == 0 || !select.joins[at - 1].left_outer => {
+        match home.filter(|at| takes(*at)) {
+            Some(at) => {
                 (filtered.iter_mut().zip(&read)).for_each(|(filtered, read)| *filtered |= read);
                 filters[at] = Some(match filters[at].take() {
                     None => part.clone(),
@@ -147,9 +152,8 @@ pub(super) fn held<'c>(select: &'c SelectPlan, given: &Given<'c>) -> Result<Opti
             _ => rest = true,
         }
     }
-    let seeing = relations.iter().map(|_| given.budget.reserve(0, "query"));
     Ok(Some(Held {
-        seeing: seeing.collect::<Result<_>>()?,
+        seeing,
         read: (filtered, wanted(select, &scope)),
         relations,
         filters,
@@ -190,13 +194,14 @@ pub(super) fn from<'a, 'c: 'a>(
     depth: usize,
 ) -> Result<From<'a>> {
     let (relations, filters, rest) = (&held.relations, &held.filters, held.rest);
-    let (mut scope, mut rows) = (Scope::default(), None::<Box<dyn Source + 'a>>);
+    let (mut scope, mut rows) = (Scope::default(), None::<Side<'a>>);
     scope.checked = true;
     let sides = relations.iter().zip(filters).zip(&mut held.seeing);
     for (at, ((relation, filter), seeing)) in sides.enumerate() {
         let start = scope.columns().count();
         let width = relation.columns.len();
         scope = scope.and(relation.qualifier, relation.columns);
+        seeing.grow(((at + 1) * size_of::<(&str, &[ColumnDef])>()) as u64)?;
         let right = match relation.of {
             Of::Table(table) => {
                 let (filtered, wanted) = (&held.read.0[start..], &held.read.1[start..]);
@@ -204,7 +209,7 @@ pub(super) fn from<'a, 'c: 'a>(
                 let table =
                     table::Source::new(table, filter.as_ref(), &given.ctx, given.read, visible);
                 // What the statement reads of a joined row is settled above the join.
-                let table = table.named(relation.qualifier);
+                let table = table.named(relation.qualifier).counted(given.examined);
                 Side::Table(Box::new(table.reading(filtered[..width].to_vec(), wanted)))
             }
             // A statement that reads nothing but the name hands its WHERE to the name.
@@ -218,7 +223,7 @@ pub(super) fn from<'a, 'c: 'a>(
             if let Side::Table(table) = &right {
                 table.say(&[], &[], &[])?;
             }
-            rows = Some(Box::new(right));
+            rows = Some(right);
             continue;
         };
         let join = &select.joins[at - 1];
@@ -246,7 +251,18 @@ pub(super) fn from<'a, 'c: 'a>(
         if let Side::Table(table) = &right {
             table.say(&pins.iter().map(|pin| pin.0).collect::<Vec<_>>(), &[], &[])?;
         }
-        rows = Some(Box::new(Join {
+        // Keep the written scope, but let a WITH output pin a stored-first INNER join.
+        let (left, right, pins, width, swapped): (Box<dyn Source>, _, _, _, _) = match (left, right)
+        {
+            (Side::Table(table), right @ Side::Named(..))
+                if !join.left_outer && !pins.is_empty() =>
+            {
+                let pins = pins.into_iter().map(|(a, b)| (b, a)).collect();
+                (Box::new(right), Side::Table(table), pins, start, true)
+            }
+            (left, right) => (Box::new(left), right, pins, width, false),
+        };
+        rows = Some(Side::Joined(Box::new(Join {
             left,
             right,
             on: join.on.as_ref(),
@@ -255,11 +271,12 @@ pub(super) fn from<'a, 'c: 'a>(
             width,
             pins,
             ctx: &given.ctx,
-        }));
+            swapped,
+        })));
     }
     let filter = select.filter.as_ref().filter(|_| rest);
     let from = rows.map(|rows| From {
-        rows,
+        rows: Box::new(rows),
         scope,
         filter,
     });
@@ -268,13 +285,15 @@ pub(super) fn from<'a, 'c: 'a>(
 
 /// One relation as a join reads it: a stored table through its source, or a WITH name.
 enum Side<'a> {
+    Joined(Box<Join<'a>>),
     Table(Box<table::Source<'a>>),
     Named(&'a Named<'a>, &'a Given<'a>, Option<&'a Expr>, usize),
 }
 
 impl Source for Side<'_> {
-    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<u64> {
+    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<()> {
         match self {
+            Side::Joined(join) => join.rows(reservation, each),
             Side::Table(table) => {
                 let path = table.choose(&[], &[])?;
                 table.walk(&path, reservation, |_, row, bytes, reservation| {
@@ -305,23 +324,26 @@ struct Join<'a> {
     /// its partner stands in a left row.
     pins: Vec<(usize, usize)>,
     ctx: &'a EvalContext<'a>,
+    swapped: bool,
 }
 
 impl Source for Join<'_> {
-    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<u64> {
+    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<()> {
         // How many leading columns the right table's own filter gives its best path. A path
-        // serves the join when a left row's values give it more, or its whole key.
+        // serves the join when a left row's values give it more, or its whole key; the right
+        // side is held only when no path would.
         let served = match &self.right {
             Side::Table(table) if !self.pins.is_empty() => {
-                Some((table, table.choose(&[], &[])?.pinned))
+                let own = table.choose(&[], &[])?.pinned;
+                let any: Vec<_> = (self.pins.iter()).map(|pin| (pin.0, None)).collect();
+                let path = table.given(&any, &[], &[])?;
+                path.serves(own).then_some((table, own))
             }
             _ => None,
         };
         let mut kept: Option<Vec<Vec<Value>>> = None;
-        let (mut read, mut held) = (0, 0);
-        let room = size_of::<Vec<Value>>() as u64;
-        let left = self
-            .left
+        let mut held = 0;
+        self.left
             .rows(reservation, &mut |left, took, reservation| {
                 let (matched, mut more) = (Cell::new(false), true);
                 let mut pair =
@@ -330,9 +352,14 @@ impl Source for Join<'_> {
                         let bytes = row_overhead(left.len() + right.len())
                             + values.map(heap_bytes).sum::<u64>();
                         reservation.grow(bytes)?;
-                        let row = [left.as_slice(), right].concat();
+                        let row = if self.swapped {
+                            [right, left.as_slice()]
+                        } else {
+                            [left.as_slice(), right]
+                        }
+                        .concat();
                         if let Some(on) = on
-                            && eval(on, &self.scope, &row, self.ctx)? != Value::Bool(true)
+                            && *eval(on, &self.scope, &row, self.ctx)? != Value::Bool(true)
                         {
                             reservation.shrink(bytes);
                             return Ok(true);
@@ -343,33 +370,35 @@ impl Source for Join<'_> {
                 let given: Vec<(usize, Option<&Value>)> = (self.pins.iter())
                     .map(|&(column, at)| (column, Some(&left[at])))
                     .collect();
-                let path = match served {
-                    Some((table, own)) if kept.is_none() => {
-                        let path = table.given(&given, &[], &[])?;
-                        path.serves(own).then_some((table, path))
-                    }
-                    _ => None,
-                };
                 // Nothing equals NULL: such a left row has no partner, and reads none.
                 if given.iter().all(|(_, value)| *value != Some(&Value::Null)) {
-                    if let Some((table, path)) = path {
-                        read +=
-                            table.walk(&path, reservation, |_, right, bytes, reservation| {
+                    if let Some((table, own)) = served {
+                        let mut paired =
+                            |right: Vec<Value>, bytes, reservation: &mut Reservation| {
                                 more = pair(&right, self.on, reservation)?;
                                 reservation.shrink(bytes);
                                 Ok(more)
-                            })?;
+                            };
+                        // A value no path takes reads the right side through, holding none of it.
+                        let path = table.given(&given, &[], &[])?;
+                        match path.serves(own) {
+                            true => {
+                                table.walk(&path, reservation, |_, right, bytes, reservation| {
+                                    paired(right, bytes, reservation)
+                                })?
+                            }
+                            false => self.right.rows(reservation, &mut paired)?,
+                        }
                     } else {
                         if kept.is_none() {
                             let mut rows = Vec::new();
-                            read +=
-                                self.right
-                                    .rows(reservation, &mut |row, bytes, reservation| {
-                                        reservation.grow(room)?;
-                                        held += bytes + room;
-                                        rows.push(row);
-                                        Ok(true)
-                                    })?;
+                            self.right
+                                .rows(reservation, &mut |row, bytes, reservation| {
+                                    reservation.room(&mut rows, usize::MAX)?;
+                                    held += bytes;
+                                    rows.push(row);
+                                    Ok(true)
+                                })?;
                             kept = Some(rows);
                         }
                         for right in kept.iter().flatten() {
@@ -387,7 +416,7 @@ impl Source for Join<'_> {
                 Ok(more)
             })?;
         reservation.shrink(held);
-        Ok(left + read)
+        Ok(())
     }
 }
 
@@ -421,11 +450,12 @@ pub(super) fn firsts<'c>(
     let mut windows = select
         .columns
         .iter()
-        .filter_map(|column| match &column.expr {
+        .enumerate()
+        .filter_map(|(at, column)| match &column.expr {
             Expr::RowNumber {
                 partition_by,
                 order_by,
-            } => Some((column, partition_by.as_slice(), order_by.as_slice())),
+            } => Some((at, partition_by.as_slice(), order_by.as_slice())),
             _ => None,
         });
     let (Some((numbered, [Expr::Column(partition)], order)), None, false, Some(table)) = (
@@ -440,14 +470,16 @@ pub(super) fn firsts<'c>(
         return Ok(None);
     };
     // The names the reading statement knows the number and the partition's column by.
-    let number = numbered.name();
-    let listed = select.columns.iter().find_map(|column| match &column.expr {
-        Expr::Column(named) if named.column == partition.column => Some(column.name()),
-        _ => None,
-    });
+    let listed = select.columns.iter().position(
+        |column| matches!(&column.expr, Expr::Column(named) if named.column == partition.column),
+    );
     let Some(listed) = listed else {
         return Ok(None);
     };
+    let [listed, number] = [listed, numbered].map(|at| match select.column_aliases.get(at) {
+        Some(alias) => alias.clone(),
+        None => select.columns[at].name(),
+    });
 
     // `bound` is one or more alternatives joined by OR, each of parts joined by AND.
     let mut alternatives = Vec::new();
@@ -469,14 +501,16 @@ pub(super) fn firsts<'c>(
         };
         let (
             Some(value @ (Expr::Literal(_) | Expr::Parameter(_))),
-            Some(Expr::Literal(Literal::Integer(most))),
+            Some(Expr::Literal(Value::Int64(most))),
         ) = (beside(&listed, BinOp::Eq), beside(&number, BinOp::Lte))
         else {
             return Ok(None);
         };
         let most = usize::try_from(*most).unwrap_or(0);
         // A partition is one value of its column's type, however it is written.
-        let Some(key) = as_key(kind, eval(value, &Scope::default(), &[], &given.ctx)?) else {
+        let key = eval(value, &Scope::default(), &[], &given.ctx)?;
+        given.ctx.kept.keep(heap_bytes(&key))?;
+        let Some(key) = as_key(kind, key.into_owned()) else {
             return Ok(None);
         };
         let same =
@@ -486,7 +520,17 @@ pub(super) fn firsts<'c>(
             None => asked.push((key, value, most)),
         }
     }
+    // Use the general window path beyond 64 copies or for a filter with a SELECT.
+    let inner = select.filter.as_ref();
+    let selects = |e: &Expr| matches!(e, Expr::Subquery(_) | Expr::InSubquery { .. });
+    if asked.len() > 64 || inner.is_some_and(|inner| holds(inner, selects)) {
+        return Ok(None);
+    }
+    let named = partition.column.len() + partition.table.as_ref().map_or(0, String::len);
+    let width = 32 * table.meta.columns.len() + 3 * size_of::<Expr>() + named;
     let parts = asked.into_iter().map(|(_, value, most)| {
+        let copy = width as u64 + copied(value) + inner.map_or(0, copied);
+        let held = given.budget.reserve(copy, "query")?;
         // The partition's value first: it is the one value the path reads the column at.
         let mut filter = Expr::BinaryOp {
             left: Box::new(Expr::Column(partition.clone())),
@@ -500,7 +544,7 @@ pub(super) fn firsts<'c>(
                 right: Box::new(inner.clone()),
             };
         }
-        Ok((filter, most, given.budget.reserve(0, "query")?))
+        Ok((filter, most, held))
     });
     Ok(Some(Firsts {
         table,
@@ -509,6 +553,17 @@ pub(super) fn firsts<'c>(
         wanted: wanted(select, &Scope::of(qualifier, &table.meta.columns)),
         parts: parts.collect::<Result<_>>()?,
     }))
+}
+
+/// What a copy of `expr` holds: its nodes, and the names and values written in them.
+fn copied(expr: &Expr) -> u64 {
+    let text = match expr {
+        Expr::Literal(value) => heap_bytes(value),
+        Expr::Parameter(name) | Expr::FunctionCall { name, .. } => name.len() as u64,
+        Expr::Column(c) => (c.column.len() + c.table.as_ref().map_or(0, String::len)) as u64,
+        _ => 0,
+    };
+    text + size_of::<Expr>() as u64 + crate::sql::inside(expr).map(copied).sum::<u64>()
 }
 
 /// The rows `firsts` asks for: of each partition, the first rows in the window's order, read
@@ -527,6 +582,7 @@ pub(super) fn first<'a, 'c: 'a>(
         reads(filter, &scope, given.params, &mut filtered)?;
         let visible = Visible::new(table, given.catalog, given.reader, seeing)?;
         let table = table::Source::new(table, Some(filter), &given.ctx, given.read, visible);
+        let table = table.counted(given.examined);
         let table = table.named(qualifier).reading(filtered, &firsts.wanted);
         let path = table.choose(order, &[])?;
         if !path.in_order {
@@ -540,27 +596,35 @@ pub(super) fn first<'a, 'c: 'a>(
         }));
     }
     Ok(Some(From {
-        rows: Box::new(Parts(parts)),
+        rows: Box::new(Parts(parts, &[])),
         scope,
         filter: None,
     }))
 }
 
-/// The rows of one source after another's. Holds nothing.
-pub(super) struct Parts<'a>(pub(super) Vec<Box<dyn Source + 'a>>);
+/// The rows of one source after another's, whole numbers REALs in the REAL columns given.
+pub(super) struct Parts<'a>(
+    pub(super) Vec<Box<dyn Source + 'a>>,
+    pub(super) &'a [ColumnDef],
+);
 
 impl Source for Parts<'_> {
-    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<u64> {
-        let (mut read, mut more) = (0, true);
+    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<()> {
+        let mut more = true;
         for part in &self.0 {
             if !more {
                 break;
             }
-            read += part.rows(reservation, &mut |row, bytes, reservation| {
+            part.rows(reservation, &mut |mut row, bytes, reservation| {
+                for (value, column) in row.iter_mut().zip(self.1) {
+                    if let (Value::Int64(whole), ColumnType::Real) = (&*value, column.column_type) {
+                        *value = Value::Float64(*whole as f64);
+                    }
+                }
                 more = each(row, bytes, reservation)?;
                 Ok(more)
             })?;
         }
-        Ok(read)
+        Ok(())
     }
 }

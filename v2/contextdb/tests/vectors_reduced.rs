@@ -6,7 +6,7 @@ mod support;
 
 use std::fs;
 
-use contextdb::Value;
+use contextdb::{Error, Value};
 
 const DIMENSION: usize = 16;
 const REDUCED: &str = "WITH (quantization = 'SQ8')";
@@ -85,6 +85,48 @@ fn a_reduced_column_keeps_the_nearest_one_byte_vector() {
 }
 
 #[test]
+fn a_reduced_value_that_would_expand_past_the_limit_is_refused_by_name() {
+    // 250,000 numbers are kept in 250,000 bytes and expand to 1,000,000. A limit 1 MiB beyond
+    // what an open sets aside: the kept bytes fit, the kept and the expanded bytes together do
+    // not.
+    for numbers in [250_000, 300_000] {
+        let folder = support::folder(&format!("reduced-over-limit-{numbers}"));
+        let db = support::open(&folder);
+        support::declare_docs(&db, numbers, &format!("{REDUCED} PARTITION_KEY (ctx)"));
+        support::load_docs(&db, 1..=1, "a", |n| written(n, numbers));
+        let query = "SELECT id FROM docs WHERE ctx = 'b' ORDER BY v <=> $v LIMIT 1";
+        let q = contextdb::params! { "v" => kept(&db, 1) };
+        assert_eq!(
+            support::whole(&support::the_partition(&db), "pending_tuples"),
+            i64::from(numbers == 250_000)
+        );
+        support::run(&db, "UPDATE docs SET ctx = 'b' WHERE id = 1");
+        assert_eq!(
+            support::whole(&support::the_partition(&db), "pending_tuples"),
+            i64::from(numbers == 250_000)
+        );
+        assert_eq!(
+            db.execute(query, &q).unwrap().rows(),
+            &[vec![Value::Int64(1)]]
+        );
+        db.set_memory_limit(Some(support::opening::open_floor() + (1 << 20)))
+            .expect("1 MiB beyond what an open sets aside");
+        match support::refusal(&db, "SELECT v FROM docs WHERE id = 1") {
+            Error::MemoryBudgetExceeded { .. } => {}
+            other => panic!("a value that expands past the limit was refused as {other:?}"),
+        }
+        support::run(&db, "SET MEMORY_LIMIT 256M");
+        assert_eq!(kept(&db, 1).len(), numbers, "the same read under no limit");
+        support::close(db);
+        let room = support::opening::reader_charge(&folder, None) + (1 << 20);
+        let reader = support::open_reader(&folder, Some(room));
+        assert_eq!(support::ids(&reader, "SELECT id FROM docs"), [1]);
+        let error = support::refusal(&reader, "SELECT v FROM docs");
+        assert!(matches!(error, Error::MemoryBudgetExceeded { .. }));
+    }
+}
+
+#[test]
 fn exact_on_a_reduced_column_ranks_by_the_kept_vectors() {
     let folder = support::folder("reduced-exact");
     let db = support::open(&folder);
@@ -111,7 +153,7 @@ fn a_reduced_column_is_grouped_and_searched_as_any_other() {
     let clauses = format!("{REDUCED} SEARCH_MODE INDEXED");
     let (_, db) = support::built("reduced-grouped", DIMENSION, &clauses, 0);
     support::load_docs(&db, 1..=2000, "a", |n| support::gathered(n, DIMENSION));
-    assert_eq!(support::upkeep(&db).0, 16, "the cycles of a build of 2,000");
+    support::maintenance(&db);
     let index = support::shown(&db, "SHOW VECTOR_INDEXES").remove(0);
     assert_eq!(support::word(&index, "quantization"), "SQ8");
     assert_eq!(

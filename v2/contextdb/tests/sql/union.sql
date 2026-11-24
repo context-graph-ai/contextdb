@@ -8,7 +8,7 @@ INSERT INTO b (id, v) VALUES (1, 'y'), (2, 'z');
 # UNION ALL keeps every row, and the result's columns are named by the first SELECT.
 SELECT v FROM a UNION ALL SELECT v FROM b ORDER BY v;
 ----
-v
+v  (read 5, compared 0)
 x
 y
 y
@@ -18,7 +18,7 @@ z
 # UNION keeps one of each, whichever SELECT it came from.
 SELECT v FROM a UNION SELECT v FROM b ORDER BY v;
 ----
-v
+v  (read 5, compared 0)
 x
 y
 z
@@ -26,13 +26,13 @@ z
 # ORDER BY names a column as the first SELECT names it, even when the others call it by another name.
 SELECT 2 AS n UNION SELECT 1 ORDER BY n;
 ----
-n
+n  (read 0, compared 0)
 1
 2
 
 SELECT v AS w FROM a UNION SELECT v FROM b ORDER BY w;
 ----
-w
+w  (read 5, compared 0)
 x
 y
 z
@@ -40,25 +40,25 @@ z
 # ORDER BY, LIMIT and OFFSET are over the whole.
 SELECT id, v FROM a UNION ALL SELECT id, v FROM b ORDER BY v DESC, id LIMIT 2;
 ----
-id | v
+id | v  (read 5, compared 0)
 2 | z
 1 | y
 
 SELECT v FROM a UNION SELECT v FROM b ORDER BY v LIMIT 1 OFFSET 1;
 ----
-v
+v  (read 5, compared 0)
 y
 
 # A UNION stands wherever a SELECT may.
 WITH whole AS (SELECT v FROM a UNION ALL SELECT v FROM b)
 SELECT COUNT(*) AS n FROM whole;
 ----
-n
+n  (read 5, compared 0)
 5
 
 SELECT id FROM a WHERE v IN (SELECT v FROM b UNION SELECT v FROM a WHERE id = 1) ORDER BY id;
 ----
-id
+id  (read 6, compared 0)
 1
 2
 3
@@ -79,7 +79,7 @@ error: PlanError
 # keeps all it adds. ORDER BY, LIMIT and OFFSET are over the whole.
 SELECT v FROM a UNION SELECT v FROM b UNION ALL SELECT v FROM a ORDER BY v LIMIT 3 OFFSET 1;
 ----
-v
+v  (read 8, compared 0)
 x
 y
 y
@@ -87,7 +87,7 @@ y
 # A NULL beside a number is one column of the number's type: NULL goes last going up.
 SELECT NULL AS n UNION SELECT 1 ORDER BY n;
 ----
-n
+n  (read 0, compared 0)
 1
 NULL
 
@@ -120,7 +120,7 @@ error: PlanError
 # A SELECT that stands for a value has the type of its column: a whole number here.
 SELECT (SELECT 2) AS x UNION ALL SELECT 1 AS x ORDER BY x LIMIT 1;
 ----
-x
+x  (read 0, compared 0)
 1
 
 # A quoted literal beside a TIMESTAMP column is text, and text does not meet a timestamp.
@@ -131,19 +131,24 @@ error: PlanError
 # An aggregate's type is its own: COUNT(*) + 1 is a whole number and meets one.
 SELECT COUNT(*) + 1 AS x FROM a UNION ALL SELECT 1 ORDER BY x;
 ----
-x
+x  (read 0, compared 0)
 1
 4
 
-# A whole number and a REAL are the same only when they have the same exact value, so a UNION
-# gives the same rows however its arms stand. 2^53 is a REAL and a whole number;
-# 2^53 + 1 is a whole number no REAL holds. (Postgres reads 9007199254740992.0 as NUMERIC: exact.)
-SELECT 9007199254740992.0 AS x UNION SELECT 9007199254740992 AS x UNION SELECT 9007199254740993 AS x ORDER BY x;
+# A column of a whole number and a REAL is a REAL, and each arm's rows are REALs before
+# duplicates are removed: 2^53 + 1 is 2^53 as a REAL, so the two arms give one row.
+SELECT 9007199254740993 AS x UNION SELECT 9007199254740992.0 AS x;
 ----
-x
-*
-9007199254740993
+x  (read 0, compared 0)
+9007199254740992.0
+
+# Every row of such a column is a REAL, the whole number's included.
+WITH u AS (SELECT 1 AS a UNION ALL SELECT 1.5) SELECT a / 2 AS h FROM u ORDER BY h;
+----
+h  (read 0, compared 0)
+0.5
+0.75
 
 SELECT 1 AS one WHERE 9007199254740993 = 9007199254740992.0;
 ----
-one
+one  (read 0, compared 0)

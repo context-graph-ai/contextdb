@@ -136,6 +136,12 @@ fn a_pinned_single_hop_reads_the_nodes_degree_in_rows() {
     let into = support::run(&db, &from(1, "(a)<-[:E]-(b)"));
     assert_eq!(into.rows(), reached(&[(5, 1), (6, 1)]));
     assert_eq!(into.rows_examined(), 2, "rows read for two edges in");
+    // A cycle after a delete leaves the degree the live edges and the store sound.
+    support::run(&db, "DELETE FROM edges WHERE id = 500");
+    support::cycle(&db);
+    let out = support::run(&db, &from(1, "(a)-[:E]->(b)"));
+    assert_eq!(out.rows(), reached(&[(3, 1), (4, 1)]));
+    db.verify().expect("no edge counted that is gone");
 }
 
 #[test]
@@ -157,9 +163,11 @@ fn a_walk_whose_visited_set_is_over_the_limit_is_refused_and_one_that_fits_is_an
     tx.commit().expect("commit the edges");
 
     // 64 KiB of room: the 8,001 nodes of the wide walk take more than 300 KiB to remember.
-    let limit = db.memory_used() + (64 << 10);
-    db.set_memory_limit(Some(limit)).expect("set the limit");
     let wide = from(1, "(a)-[:E]->{2,2}(b)");
+    let limit = support::used(&db) + support::statement_text_bytes(&wide) + (64 << 10);
+    support::close(db);
+    let folder = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("graph-walk-memory");
+    let db = support::open_limited(&folder, limit);
     match db.execute(&wide, &params! {}) {
         Err(Error::MemoryBudgetExceeded { .. }) => {}
         other => panic!("a walk over 8,001 nodes in 64 KiB got {other:?}"),
@@ -169,7 +177,7 @@ fn a_walk_whose_visited_set_is_over_the_limit_is_refused_and_one_that_fits_is_an
         reached(&[(4, 2)]),
         "a walk over five nodes under the same limit"
     );
-    db.set_memory_limit(None).expect("lift the limit");
+    let db = support::reopen(db, &folder); // the open's own limit is gone
     assert_eq!(support::rows(&db, &wide), reached(&[(2, 2)]));
 }
 
@@ -286,6 +294,27 @@ fn a_handle_narrowed_to_a_context_is_shown_the_graph_without_what_it_may_not_see
     an_edge_whose_row_is_visible_and_whose_target_is_hidden_is_not_reported(&narrowed);
     a_walk_does_not_pass_through_a_hidden_node_to_a_visible_one_behind_it(&db, &narrowed);
     a_hidden_node_reached_on_the_way_is_left_out_with_no_error(&db, &narrowed);
+    // What is left matches as it would in a store that holds only the Context 1 nodes and edges.
+    let clean = store("graph-context-one-only", &[EDGES, THINGS]);
+    let nodes = [1, 3, 4, 5, 7].map(|n| format!("('{}', '{}')", node(n), context(1)));
+    support::run(
+        &clean,
+        &format!("INSERT INTO things VALUES {}", nodes.join(",")),
+    );
+    for (id, source, target) in [(3, 1, 4), (4, 4, 5), (6, 1, 6), (8, 4, 1)] {
+        edge(&clean, id, source, target, 1);
+    }
+    let walks = [from(1, "(a)-[:E]->(b)"), from(1, "(a)-[:E]->{1,3}(b)")];
+    for sql in walks
+        .into_iter()
+        .chain([from(5, "(a)<-[:E]-{1,2}(b)"), pattern("(a)-[:E]->(b)", "")])
+    {
+        assert_eq!(
+            support::rows(&narrowed, &sql),
+            support::rows(&clean, &sql),
+            "{sql}"
+        );
+    }
 }
 
 /// Over [`partly_hidden`], read through a handle narrowed to Context 1.
@@ -597,5 +626,35 @@ fn a_pattern_that_meets_a_row_needing_a_grant_is_refused_unless_another_rule_hid
             Error::ContextScopeViolation { .. }
         ),
         "a start named that the Context rule hides is that rule's refusal"
+    );
+}
+
+#[test]
+fn a_cursor_on_a_walk_keeps_the_graph_it_opened_on_while_the_writer_changes_it() {
+    let db = partly_hidden("graph-cursor");
+    let mut options = support::reader_options(None);
+    options.contexts = Some(support::context_set(&[1]));
+    let folder = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("graph-cursor");
+    let reader = contextdb::ReadSession::open_with_options(&folder, options).unwrap();
+    let walk = from(1, "(a)-[:E]->{1,3}(b)");
+    let page = std::num::NonZeroUsize::new(2);
+    let opened = support::rows(&in_contexts(&db, &[1]), &walk);
+    let mut cursor = reader.open_cursor(&walk, &params! {}).unwrap();
+    let mut seen = cursor.fetch(page).unwrap().rows().to_vec();
+    edge(&db, 10, 1, 5, 1);
+    support::run(&db, "DELETE FROM edges WHERE id = 3");
+    while cursor.has_more() {
+        seen.extend(cursor.fetch(page).unwrap().rows().to_vec());
+    }
+    assert_eq!(seen, opened, "a cursor reads the graph as of its open");
+    assert!(
+        seen.iter().all(|r| r[0] != Value::Uuid(node(2))),
+        "node 2 hidden"
+    );
+    let mut later = reader.open_cursor(&walk, &params! {}).unwrap();
+    assert_ne!(
+        later.fetch(None).unwrap().rows(),
+        opened,
+        "a later cursor differs"
     );
 }

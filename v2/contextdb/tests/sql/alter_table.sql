@@ -13,7 +13,7 @@ ALTER TABLE t ADD d INTEGER DEFAULT 7;
 ALTER TABLE t ADD COLUMN e TEXT NOT NULL DEFAULT 'none';
 SELECT id, a, b, c, d, e FROM t ORDER BY id;
 ----
-id | a | b | c | d | e
+id | a | b | c | d | e  (read 2, compared 0)
 1 | one | 10 | NULL | 7 | none
 2 | two | 20 | NULL | 7 | none
 
@@ -22,14 +22,14 @@ INSERT INTO t (id, a) VALUES (3, 'three');
 UPDATE t SET c = 'set' WHERE id = 1;
 SELECT id, c, d, e FROM t ORDER BY id;
 ----
-id | c | d | e
+id | c | d | e  (read 3, compared 0)
 1 | set | 7 | none
 2 | NULL | 7 | none
 3 | NULL | 7 | none
 
 SELECT id FROM t WHERE d = 7 AND c IS NULL ORDER BY id;
 ----
-id
+id  (read 3, compared 0)
 2
 3
 
@@ -71,7 +71,7 @@ error: ColumnNotFound
 
 SELECT id, a, c, e FROM t ORDER BY id;
 ----
-id | a | c | e
+id | a | c | e  (read 3, compared 0)
 1 | one | set | none
 2 | two | NULL | none
 3 | three | NULL | none
@@ -89,13 +89,13 @@ error: ColumnInIndex
 
 SELECT id, c FROM t WHERE c = 'set';
 ----
-id | c
+id | c  (read 1, compared 0)
 1 | set
 
 CREATE INDEX t_by_c_late ON t (a, c);
 ALTER TABLE t DROP COLUMN c CASCADE;
 ----
-dropped_indexes
+dropped_indexes  (read 0, compared 0)
 t_by_c
 t_by_c_late
 
@@ -103,10 +103,14 @@ DROP INDEX t_by_c ON t;
 ----
 error: IndexNotFound
 
+DROP INDEX t_by_c_late ON t;
+----
+error: IndexNotFound
+
 ALTER TABLE t ADD COLUMN spare TEXT;
 ALTER TABLE t DROP COLUMN spare CASCADE;
 ----
-rows affected: 0
+rows affected: 0  (read 0, compared 0)
 
 SELECT c FROM t;
 ----
@@ -116,7 +120,7 @@ error: ColumnNotFound
 ALTER TABLE t ADD COLUMN c TEXT;
 SELECT id, c FROM t ORDER BY id;
 ----
-id | c
+id | c  (read 3, compared 0)
 1 | NULL
 2 | NULL
 3 | NULL
@@ -130,7 +134,7 @@ error: ColumnNotFound
 
 SELECT id, title FROM t WHERE title = 'two';
 ----
-id | title
+id | title  (read 1, compared 0)
 2 | two
 
 ALTER TABLE t DROP COLUMN title;
@@ -160,7 +164,7 @@ error: SchemaInvalid
 
 SELECT id, title, c, e, slug FROM t ORDER BY id;
 ----
-id | title | c | e | slug
+id | title | c | e | slug  (read 3, compared 0)
 1 | one | NULL | none | first
 2 | two | NULL | none | NULL
 3 | three | NULL | none | NULL
@@ -201,6 +205,14 @@ ALTER TABLE docs RENAME COLUMN tenant TO owner;
 ----
 error: VectorPartitionKeyInUse
 
+ALTER TABLE docs ALTER COLUMN tenant SET DATA TYPE INTEGER;
+----
+error: ParseError
+
+ALTER TABLE docs ALTER COLUMN tenant SET NOT NULL;
+----
+error: ParseError
+
 ALTER TABLE docs ALTER COLUMN v SET PARTITION_KEY (id);
 ----
 error: ParseError
@@ -230,64 +242,74 @@ ALTER TABLE docs ALTER COLUMN loose SET MAX_PARTITIONS 4;
 error: InvalidVectorPartitionDeclaration
 
 # The column's search mode is changed, and the next search runs in it. A column too small to
-# have a grouping has nothing for INDEXED to choose among, and INDEXED searches it as EXACT does.
+# have an IVF has nothing for INDEXED to choose among, and INDEXED searches it as EXACT does.
 SELECT id FROM docs ORDER BY v <=> [1.0, 0.0, 0.0] LIMIT 1;
 ----
-id
+id  (read 3, compared 2)
 1
 
 ALTER TABLE docs ALTER COLUMN v SET SEARCH_MODE EXACT;
 SELECT id FROM docs ORDER BY v <=> [1.0, 0.0, 0.0] LIMIT 1;
 ----
-id
+id  (read 3, compared 2)
 1
 
 ALTER TABLE docs ALTER COLUMN v SET SEARCH_MODE INDEXED;
 SELECT id FROM docs ORDER BY v <=> [1.0, 0.0, 0.0] LIMIT 1;
 ----
-id
+id  (read 3, compared 2)
 1
 
 ALTER TABLE docs ALTER COLUMN v SET SEARCH_MODE AUTO;
 SELECT id FROM docs ORDER BY v <=> [0.0, 1.0, 0.0] LIMIT 1;
 ----
-id
+id  (read 3, compared 2)
 2
 
 ALTER TABLE docs ALTER COLUMN nope SET SEARCH_MODE EXACT;
 ----
 error: ColumnNotFound
 
-# The thresholds of the search index are changed online, and the next search and upkeep cycle
+# The thresholds of the search index are changed online, and the next search and maintenance cycle
 # read them: the declaration says what was written and what is in force, and DEFAULT takes the
 # declaration away.
+ALTER TABLE docs ALTER COLUMN v SET PROBES 2;
 ALTER TABLE docs ALTER COLUMN v SET INDEXING_THRESHOLD 5000;
 ALTER TABLE docs ALTER COLUMN v SET COMPACTION (CHANGE_PERCENT = 30, TOMBSTONE_PERCENT = 5);
 SHOW VECTOR_INDEXES;
 ----
-table | column | dimension | quantization | vector_count | bytes | partition_key_columns | max_partitions | live_partitions | search_mode | declared_indexing_threshold | effective_indexing_threshold | declared_compaction_mode | declared_compaction_change_percent | declared_compaction_tombstone_percent | effective_compaction_mode | effective_compaction_change_percent | effective_compaction_tombstone_percent | pending_tuples | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | maintenance_state | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | unavailable_partitions | stalled_partitions | broad_route | recovery_action
-docs | loose | * | * | * | * | * | * | * | * | NULL | 100000 | NULL | NULL | NULL | PERCENT | 20 | 10 | * | * | * | * | * | * | * | * | * | * | * | * | *
-docs | v | * | * | * | * | * | * | * | * | 5000 | 5000 | PERCENT | 30 | 5 | PERCENT | 30 | 5 | * | * | * | * | * | * | * | * | * | * | * | * | *
+table | column | dimension | quantization | vector_count | bytes | partition_key_columns | max_partitions | live_partitions | search_mode | declared_indexing_threshold | effective_indexing_threshold | declared_probes | declared_compaction_mode | declared_compaction_change_percent | declared_compaction_tombstone_percent | effective_compaction_mode | effective_compaction_change_percent | effective_compaction_tombstone_percent | pending_tuples | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | maintenance_state | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | unavailable_partitions | stalled_partitions | broad_route | recovery_action  (read 0, compared 0)
+docs | loose | * | * | * | * | * | * | * | * | NULL | 100000 | NULL | NULL | NULL | NULL | PERCENT | 20 | 10 | * | * | * | * | * | * | * | * | * | * | * | * | *
+docs | v | * | * | * | * | * | * | * | * | 5000 | 5000 | 2 | PERCENT | 30 | 5 | PERCENT | 30 | 5 | * | * | * | * | * | * | * | * | * | * | * | * | *
 
 ALTER TABLE docs ALTER COLUMN v SET INDEXING_THRESHOLD DEFAULT;
+ALTER TABLE docs ALTER COLUMN v SET PROBES DEFAULT;
 ALTER TABLE docs ALTER COLUMN v SET COMPACTION NONE;
 SHOW VECTOR_INDEXES;
 ----
-table | column | dimension | quantization | vector_count | bytes | partition_key_columns | max_partitions | live_partitions | search_mode | declared_indexing_threshold | effective_indexing_threshold | declared_compaction_mode | declared_compaction_change_percent | declared_compaction_tombstone_percent | effective_compaction_mode | effective_compaction_change_percent | effective_compaction_tombstone_percent | pending_tuples | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | maintenance_state | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | unavailable_partitions | stalled_partitions | broad_route | recovery_action
-docs | loose | * | * | * | * | * | * | * | * | NULL | 100000 | NULL | NULL | NULL | PERCENT | 20 | 10 | * | * | * | * | * | * | * | * | * | * | * | * | *
-docs | v | * | * | * | * | * | * | * | * | NULL | 100000 | NONE | NULL | NULL | NONE | NULL | NULL | * | * | * | * | * | * | * | * | * | * | * | * | *
+table | column | dimension | quantization | vector_count | bytes | partition_key_columns | max_partitions | live_partitions | search_mode | declared_indexing_threshold | effective_indexing_threshold | declared_probes | declared_compaction_mode | declared_compaction_change_percent | declared_compaction_tombstone_percent | effective_compaction_mode | effective_compaction_change_percent | effective_compaction_tombstone_percent | pending_tuples | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | maintenance_state | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | unavailable_partitions | stalled_partitions | broad_route | recovery_action  (read 0, compared 0)
+docs | loose | * | * | * | * | * | * | * | * | NULL | 100000 | NULL | NULL | NULL | NULL | PERCENT | 20 | 10 | * | * | * | * | * | * | * | * | * | * | * | * | *
+docs | v | * | * | * | * | * | * | * | * | NULL | 100000 | NULL | NONE | NULL | NULL | NONE | NULL | NULL | * | * | * | * | * | * | * | * | * | * | * | * | *
 
 ALTER TABLE docs ALTER COLUMN v SET COMPACTION DEFAULT;
 SHOW VECTOR_INDEXES;
 ----
-table | column | dimension | quantization | vector_count | bytes | partition_key_columns | max_partitions | live_partitions | search_mode | declared_indexing_threshold | effective_indexing_threshold | declared_compaction_mode | declared_compaction_change_percent | declared_compaction_tombstone_percent | effective_compaction_mode | effective_compaction_change_percent | effective_compaction_tombstone_percent | pending_tuples | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | maintenance_state | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | unavailable_partitions | stalled_partitions | broad_route | recovery_action
-docs | loose | * | * | * | * | * | * | * | * | NULL | 100000 | NULL | NULL | NULL | PERCENT | 20 | 10 | * | * | * | * | * | * | * | * | * | * | * | * | *
-docs | v | * | * | * | * | * | * | * | * | NULL | 100000 | NULL | NULL | NULL | PERCENT | 20 | 10 | * | * | * | * | * | * | * | * | * | * | * | * | *
+table | column | dimension | quantization | vector_count | bytes | partition_key_columns | max_partitions | live_partitions | search_mode | declared_indexing_threshold | effective_indexing_threshold | declared_probes | declared_compaction_mode | declared_compaction_change_percent | declared_compaction_tombstone_percent | effective_compaction_mode | effective_compaction_change_percent | effective_compaction_tombstone_percent | pending_tuples | tombstones | durable_vector_bytes | durable_index_bytes | indexed_available | maintenance_state | maintenance_vectors_total | maintenance_vectors_done | maintenance_vectors_remaining | unavailable_partitions | stalled_partitions | broad_route | recovery_action  (read 0, compared 0)
+docs | loose | * | * | * | * | * | * | * | * | NULL | 100000 | NULL | NULL | NULL | NULL | PERCENT | 20 | 10 | * | * | * | * | * | * | * | * | * | * | * | * | *
+docs | v | * | * | * | * | * | * | * | * | NULL | 100000 | NULL | NULL | NULL | NULL | PERCENT | 20 | 10 | * | * | * | * | * | * | * | * | * | * | * | * | *
 
 # A value CREATE TABLE refuses is refused here, and the declaration stays as it was.
+CREATE TABLE p0 (id INTEGER PRIMARY KEY, v VECTOR(2) PROBES 0);
+----
+error: InvalidVectorPolicyDeclaration
+
 ALTER TABLE docs ALTER COLUMN v SET INDEXING_THRESHOLD 0;
 ----
 error: InvalidVectorPolicyDeclaration
+
+ALTER TABLE docs ALTER COLUMN v SET RANK_POLICY (JOIN results ON id, FORMULA '1.0', SORT_KEY s);
+----
+error: ParseError
 
 ALTER TABLE docs ALTER COLUMN v SET COMPACTION (CHANGE_PERCENT = 101);
 ----
@@ -309,23 +331,23 @@ INSERT INTO passages (id, tenant, body) VALUES (1, 'north', 'old');
 ALTER TABLE passages ADD COLUMN v VECTOR(2) PARTITION_KEY (tenant) MAX_PARTITIONS 2 SEARCH_MODE EXACT;
 SELECT id, v FROM passages ORDER BY id;
 ----
-id | v
+id | v  (read 1, compared 0)
 1 | NULL
 
 SELECT id FROM passages ORDER BY v <=> [1.0, 0.0] LIMIT 5;
 ----
-id
+id  (read 0, compared 0)
 
 INSERT INTO passages (id, tenant, body, v) VALUES (2, 'north', 'new', [1.0, 0.0]);
 SELECT id FROM passages ORDER BY v <=> [1.0, 0.0] LIMIT 5;
 ----
-id
+id  (read 2, compared 1)
 2
 
 UPDATE passages SET v = [0.0, 1.0] WHERE id = 1;
 SELECT id FROM passages ORDER BY v <=> [0.0, 1.0] LIMIT 5;
 ----
-id
+id  (read 4, compared 2)
 1
 2
 
@@ -335,6 +357,10 @@ INSERT INTO passages (id, tenant, body, v) VALUES (4, 'east', 'new', [1.0, 0.0])
 error: VectorPartitionLimitExceeded
 
 # An added VECTOR column is refused what a declared one is.
+ALTER TABLE passages ADD COLUMN w VECTOR(2) NOT NULL;
+----
+error: SchemaInvalid
+
 ALTER TABLE passages ADD COLUMN w VECTOR(2) PARTITION_KEY (body);
 ----
 error: InvalidVectorPartitionDeclaration
@@ -402,7 +428,7 @@ error: SchemaInvalid
 
 SELECT id, body FROM scratch;
 ----
-id | body
+id | body  (read 1, compared 0)
 1 | kept
 
 # An IMMUTABLE table takes neither RETAIN nor HISTORY CURRENT ONLY later.
@@ -429,13 +455,13 @@ INSERT INTO events (id, context_id, connector_id) VALUES (1, 1, 'a'), (2, 1, 'a'
 ALTER TABLE events SET MAINTAIN COUNT (context_id);
 SELECT COUNT(*) AS n FROM events WHERE context_id = 1;
 ----
-n
+n  (read 0, compared 0)
 3
 
 ALTER TABLE events SET MAINTAIN COUNT (context_id), (context_id, connector_id);
 SELECT COUNT(*) AS n FROM events WHERE context_id = 1 AND connector_id = 'a';
 ----
-n
+n  (read 0, compared 0)
 2
 
 ALTER TABLE events SET MAINTAIN COUNT ALL PREFIXES;
@@ -443,7 +469,7 @@ ALTER TABLE events SET MAINTAIN COUNT NONE;
 ALTER TABLE events SET MAINTAIN COUNT DEFAULT;
 SELECT COUNT(*) AS n FROM events WHERE context_id = 1;
 ----
-n
+n  (read 3, compared 0)
 3
 
 ALTER TABLE events SET MAINTAIN COUNT (connector_id);
@@ -462,5 +488,9 @@ ALTER TABLE words DROP COLUMN retain;
 INSERT INTO words (id, sync, history) VALUES (1, 'a', 'b');
 SELECT id, sync, history FROM words;
 ----
-id | sync | history
+id | sync | history  (read 1, compared 0)
 1 | a | b
+
+ALTER TABLE passages ADD COLUMN w VECTOR(2) NOT NULL;
+----
+error: SchemaInvalid

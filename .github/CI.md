@@ -621,3 +621,67 @@ variable, workflow input, or job output. Manual integration needs no artifact.
 
 Every ignored test in the source tree must match
 one registered path, test name and reason; conditional ignores are included.
+
+## The packages under v2
+
+`check.yml` runs on every pull request and every push to `dev` and `main`, and on
+its nightly schedule or manual dispatch. Its Linux test leg checks the invariant
+table in `v2/AGENTS.md` and the performance table against the workspace runner,
+the storage library's own test list and the SQL scripts. Each performance row
+names a runnable guard or says “none yet”; every backticked SQL path must exist.
+
+The default debug run excludes `performance_bars.rs`; the existing pull-request release job
+runs its import-write, season and reader-page-reuse checks alongside the scale and memory tests.
+The release job also selects `a_killed_open_reads_the_log_and_last_commit_pages` from the
+`crash` target; the default profile excludes that exact test and the release profile includes it.
+The same routing applies to the standalone `DELETE` membership comparison from `counted_work`
+and `purge::a_purge_leaves_no_copy_in_either_commit_slot` from `crash`.
+These routes use `v2/.config/nextest.toml`; their timeout limits are unchanged.
+
+The lint job checks formatting and clippy for both the workspace and the separate
+`v2/redb` manifest, and builds workspace documentation with warnings denied. It
+permits exactly the six allow attributes listed in `v2/AGENTS.md`, including the
+one sleep in `system::pause` between tries of a wait the caller bounded.
+Tests run on Linux x86-64, macOS and Linux ARM (`ubuntu-24.04-arm`). The old
+engine's `ci.yml` ignores changes confined to `v2/`, `check.yml`,
+`docs/performance/` and `scripts/ci-local.py`; any other changed path still starts
+it. A change confined to performance documentation starts Check only; a change
+to `crates/contextdb-core/src/lib.rs` starts both workflows.
+
+On every pull request the release job uses each revision's own measurement program,
+printing its revision and statement workload names. Workloads present at both the
+merge base and head are compared; new workloads print their head figure without a
+base comparison, while removing a base workload fails. Both builds use the same
+compiler and target directory, and separate stores loaded outside Cachegrind. Instructions
+per statement are `(I200 - I0) / 200`. Growth above 2% fails unless a commit
+in the pull request range records `cost: <statement> +<measured percentage>% <reason>`.
+The job prints each count; hosted durations remain job output, not a timing gate.
+
+Both compilation roots are remapped to `/contextdb` with `--remap-path-prefix`,
+so an identical tree builds the same binary at base and head.
+
+Scheduled Check runs freeze the head and the last successful scheduled Check's
+head before starting sixteen mutation shards. Each shard lists and tests its slice
+of that immutable source diff with cargo-mutants and the `mutants` nextest
+profile. Nextest imposes no termination count; cargo-mutants owns mutant
+timeouts and reports them separately from caught and missed changes. Every shard
+retains its outcome files, and an unreviewed surviving mutant fails the night.
+There are currently no neutral exclusions in `v2/.cargo/mutants.toml`.
+
+The largest historical diff listed 1,313 mutants (at most 83 per shard across
+sixteen jobs). Each job has a 180-minute limit, allowing two minutes per mutant
+and ten minutes of setup with room below the six-hour hosted cap. Missed and
+timed-out mutants also have separate artifacts. Actual shard minutes and
+outcomes are established by the scheduled run.
+
+The release job also runs the 100,000-sighting recorded-work case and the
+million-row memory ceiling. A separate Linux `scale` job runs the million-sighting
+case on scheduled and manual runs. The `release` nextest profile selects these
+three tests, allows six 300-second periods, and retries nothing; the default
+profile excludes them. The existing nightly debug memory test remains. If the
+first hosted release job exceeds fifteen minutes, move the release memory case
+back to nightly first, then the 100,000-sighting case, as the performance design
+requires. The duration is reported by the runner and is not a test assertion.
+
+The documented-test comparison collects test lists with terminal colors disabled,
+so colored CI output cannot become part of a test name.

@@ -14,7 +14,7 @@ VALUES (6, 'y', [0.0, 2.0]),
 
 SELECT id, v <=> [1.0, 0.0] AS distance FROM passages ORDER BY distance USE VECTOR INDEXED LIMIT 5;
 ----
-id | distance
+id | distance  (read 11, compared 6)
 1 | 0.0
 3 | 0.0
 5 | *
@@ -23,7 +23,7 @@ id | distance
 
 SELECT id, v <=> [1.0, 0.0] AS distance FROM passages ORDER BY distance USE VECTOR AUTO LIMIT 5;
 ----
-id | distance
+id | distance  (read 11, compared 6)
 1 | 0.0
 3 | 0.0
 5 | *
@@ -32,7 +32,7 @@ id | distance
 
 SELECT id, v <=> [1.0, 0.0] AS distance FROM passages ORDER BY distance USE VECTOR EXACT LIMIT 5;
 ----
-id | distance
+id | distance  (read 11, compared 6)
 1 | 0.0
 3 | 0.0
 5 | *
@@ -42,7 +42,7 @@ id | distance
 # One partition named, and a LIMIT above what it holds: every row of it that has a vector.
 SELECT id, v <=> [1.0, 0.0] AS distance FROM passages WHERE a = 'x' ORDER BY distance USE VECTOR INDEXED LIMIT 5;
 ----
-id | distance
+id | distance  (read 6, compared 3)
 1 | 0.0
 2 | 1.0
 4 | 2.0
@@ -50,21 +50,21 @@ id | distance
 # Key values no row has select nothing and refuse nothing.
 SELECT id FROM passages WHERE a = 'z' ORDER BY v <=> [1.0, 0.0] USE VECTOR INDEXED LIMIT 5;
 ----
-id
+id  (read 0, compared 0)
 
 # A column declared SEARCH_MODE INDEXED answers with no USE VECTOR, and as EXACT does.
 CREATE TABLE declared (id INTEGER PRIMARY KEY, v VECTOR(2) SEARCH_MODE INDEXED);
 INSERT INTO declared (id, v) VALUES (1, [0.0, 1.0]), (2, [1.0, 0.0]), (3, [-1.0, 0.0]);
 SELECT id, v <=> [1.0, 0.0] AS distance FROM declared ORDER BY distance LIMIT 3;
 ----
-id | distance
+id | distance  (read 6, compared 3)
 2 | 0.0
 1 | 1.0
 3 | 2.0
 
 SELECT id, v <=> [1.0, 0.0] AS distance FROM declared ORDER BY distance USE VECTOR EXACT LIMIT 3;
 ----
-id | distance
+id | distance  (read 6, compared 3)
 2 | 0.0
 1 | 1.0
 3 | 2.0

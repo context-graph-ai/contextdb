@@ -10,14 +10,15 @@
 mod support;
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 
 use contextdb::serde_json;
-use contextdb::{Database, Error, Value, params};
+use contextdb::{Database, DatabaseOpenOptions, Error, Value, params};
 
 use support::{Child, Kind, Run, data_file};
 
 const KIB: usize = 1 << 10;
-const MIB: usize = 1 << 20;
 
 /// The longest text or JSON value the store compresses: 1 MiB. One byte more is stored as it
 /// is, whatever it holds.
@@ -126,6 +127,7 @@ fn body(id: i64, changes: usize) -> String {
 /// The meta of row `id`, of the same size as its body: of the kind that shrinks in the rows
 /// with an odd id and of the kind that does not in the others, so every size has both.
 fn meta(id: i64) -> serde_json::Value {
+    let id = if id == 15 { 13 } else { id };
     support::large_json(id % 2 == 1, id, shape(id).1)
 }
 
@@ -229,12 +231,14 @@ fn large_text_and_json_come_back_byte_for_byte() {
         ((Kind::Repeating, 4000), (Kind::Scattered, 4000))
     );
     let held = |id: i64| {
-        let before = db.memory_used();
+        let before = support::used(&db);
         let result = db.execute("SELECT * FROM docs WHERE id = $id", &params! { "id" => id });
         let rows = result.as_ref().map_or(0, |result| result.rows().len());
         assert_eq!(rows, 1, "row {id} was not returned once");
-        db.memory_used() - before
+        support::used(&db) - before
     };
+    // The first run of the form adds the record's line, once; the figure is of a run after it.
+    let _ = held(13);
     let (compressed, plain) = (held(13), held(15));
     assert!(
         compressed > 4000,
@@ -341,9 +345,8 @@ fn a_text_longer_than_one_mebibyte_and_a_vector_are_stored_as_they_are() {
 
     // One byte over the longest value that is compressed, and a good deal over.
     for len in [LONGEST_COMPRESSED + 1, OVER] {
-        // A limit that fits the value once and not twice: the 9 MiB an open sets aside, the
+        // A limit that fits the value once and not twice: what an open sets aside, the
         // value's stored record of 9 + len bytes, and the margin.
-        let once = 9 * MIB + 9 + len + MARGIN;
         let folder = support::folder(&format!("longer-than-one-mebibyte-{len}"));
         let body = support::large_text(Kind::Repeating, 1, len);
         let db = support::open(&folder);
@@ -360,10 +363,12 @@ fn a_text_longer_than_one_mebibyte_and_a_vector_are_stored_as_they_are() {
 
         // It reads back under a limit that fits it once. `SELECT *` hands the row over as it
         // was read; a select list that names the column works its value out as a copy.
+        let once = support::opening::reader_charge(&folder, None) + 9 + len + MARGIN;
         let reader = support::open_reader(&folder, Some(once));
+        drop(reader.table_names().expect("admit the reader catalog"));
         assert_eq!(
             support::memory_used(&reader),
-            9 * MIB,
+            support::opening::reader_charge(&folder, None),
             "set aside by the open"
         );
         match answered(&reader, "SELECT * FROM notes WHERE id = $id", 1) {
@@ -380,8 +385,9 @@ fn a_text_longer_than_one_mebibyte_and_a_vector_are_stored_as_they_are() {
         }
         assert_eq!(
             support::memory_used(&reader),
-            9 * MIB,
-            "memory in use once the row is dropped"
+            support::opening::reader_charge(&folder, None)
+                + support::form_charge("SELECT * FROM notes WHERE id = $id"),
+            "memory in use once the row is dropped: the open's and the record's line"
         );
     }
 
@@ -389,9 +395,52 @@ fn a_text_longer_than_one_mebibyte_and_a_vector_are_stored_as_they_are() {
     // short to hold it as it is. It reads back equal all the same.
     let folder = support::folder("exactly-one-mebibyte");
     let body = support::large_text(Kind::Repeating, 1, LONGEST_COMPRESSED);
-    let db = support::open(&folder);
+    let calls = Arc::new(AtomicU64::new(0));
+    let mut options = DatabaseOpenOptions::default();
+    options.storage = Some(support::storage({
+        let calls = calls.clone();
+        move |call| {
+            if matches!(call, support::Call::Write(..) | support::Call::Sync) {
+                calls.fetch_add(1, SeqCst);
+            }
+        }
+    }));
+    let db = support::open_with(&folder, options).unwrap();
+    // Not about the interval: MIN_INTERVAL 0 keeps a pass starting at once (design 4, S4).
+    support::run(&db, "SET STORAGE_COMPACTION MIN_INTERVAL 0 SECONDS");
     support::run(&db, NOTES);
     insert_note(&db, 1, &body);
+    let position = support::watermark(&db);
+    let mut previous = data_file(&folder);
+    // The pass runs until it reports its end of work; the file never grows on the way.
+    for step in 0.. {
+        assert!(step < 1000, "no end of work in 1,000 cycles");
+        let report = db.run_maintenance_cycle().unwrap();
+        assert!(support::count(report.compacted_pages) <= 256);
+        let length = data_file(&folder);
+        assert!(
+            length <= previous,
+            "cycle {step} grew {previous} -> {length}"
+        );
+        assert_eq!(support::watermark(&db), position);
+        previous = length;
+        if report.work_remaining == Some(false) {
+            break;
+        }
+    }
+    // Each later cycle makes no physical or logical commit.
+    let idle = (previous, position);
+    for _ in 0..3 {
+        let began = calls.load(SeqCst);
+        let report = db.run_maintenance_cycle().unwrap();
+        assert_eq!(report.compacted_pages, Some(0));
+        assert_eq!(
+            calls.load(SeqCst),
+            began,
+            "idle maintenance writes and syncs nothing"
+        );
+        assert_eq!((data_file(&folder), support::watermark(&db)), idle);
+    }
     support::close(db);
     let length = data_file(&folder);
     assert!(
@@ -404,6 +453,42 @@ fn a_text_longer_than_one_mebibyte_and_a_vector_are_stored_as_they_are() {
         1,
         &body,
         "exactly 1 MiB",
+    );
+
+    // A standalone vector load already funds its stored and decoded copies.
+    let folder = support::folder("vector-two-copies");
+    let db = support::open(&folder);
+    const WIDE: usize = 65_536;
+    support::run(
+        &db,
+        &format!("CREATE TABLE wide (id INTEGER PRIMARY KEY, v VECTOR({WIDE}))"),
+    );
+    let vector = vec![0.5_f32; WIDE];
+    db.execute(
+        "INSERT INTO wide (id, v) VALUES (1, $v)",
+        &params! { "v" => vector.clone() },
+    )
+    .expect("store the standalone vector");
+    support::close(db);
+    let sql = "SELECT * FROM wide WHERE id = 1";
+    let cap = support::opening::opening_charge(&folder, None)
+        + support::statement_text_bytes(sql)
+        + 2 * (9 + 4 * WIDE)
+        + 4096;
+    let reader = support::open_reader(&folder, Some(cap));
+    assert_eq!(
+        support::rows(&reader, sql),
+        [[Value::Int64(1), Value::Vector(vector)]]
+    );
+    // A reader with room for the row but not for the vector answers around it and refuses it.
+    let room = support::opening::opening_charge(&folder, None) + (64 << 10);
+    let tight = support::open_reader(&folder, Some(room));
+    assert_eq!(support::int(&tight, "SELECT COUNT(*) FROM wide"), 1);
+    assert_eq!(support::ids(&tight, "SELECT id FROM wide"), [1]);
+    let refused = support::refusal(&tight, "SELECT v FROM wide");
+    assert!(
+        matches!(refused, Error::MemoryBudgetExceeded { .. }),
+        "{refused:?}"
     );
 
     // A vector is never compressed, whatever it holds. A thousand vectors of 1,024 equal
@@ -452,6 +537,9 @@ fn store_of_one_large_note(folder: &Path, body: &str) {
     support::run(&db, NOTES);
     insert_note(&db, 1, body);
     insert_note(&db, 2, "small");
+    for _ in 0..3 {
+        db.run_maintenance_cycle().unwrap();
+    }
     support::close(db);
 }
 
@@ -459,13 +547,12 @@ fn store_of_one_large_note(folder: &Path, body: &str) {
 fn a_compressed_value_too_large_for_the_limit_is_refused() {
     // The largest value the store compresses: 1 MiB of one sentence repeated.
     const LEN: usize = LONGEST_COMPRESSED;
-    // The limit: the 9 MiB an open sets aside and 64 KiB. Reading the value asks for its
+    // The limit: what an open sets aside and 64 KiB. Reading the value asks for its
     // stored record first, which for this text is a little over 4 KiB (an LZ4 block is never
     // under a 255th of what it decodes to) and has room sixteen times over; then for 9 + LEN
     // bytes, the value's real size, before any of its bytes is produced, and that is sixteen
     // times what is left. So the select is refused after the stored bytes are in hand.
     const ROOM: usize = 64 * KIB;
-    const LIMIT: usize = 9 * MIB + ROOM;
     const { assert!(9 + LEN.div_ceil(255) < ROOM / 2 && ROOM < 9 + LEN) };
 
     let folder = support::folder("compressed-over-the-limit");
@@ -480,12 +567,12 @@ fn a_compressed_value_too_large_for_the_limit_is_refused() {
     );
 
     // Through a reader with the limit, then through a writer with it.
-    let refused = |on: &dyn Run, door: &str| {
-        let before = support::memory_used(&on);
-        assert_eq!(before, 9 * MIB, "{door}: set aside by the open");
-        // Asked twice: the first refusal left nothing counted, so the second is the same.
+    let refused = |on: &dyn Run, door: &str, opened: usize| {
+        let (before, limit) = (support::memory_used(&on), opened + ROOM);
+        assert_eq!(before, opened, "{door}: set aside by the open");
+        // Asked three times: the first refusal adds the form's line to the record, once; the refusal after it left nothing more counted, so the next is the same.
         let mut refusals = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..3 {
             match answered(&on, "SELECT body FROM notes WHERE id = $id", 1) {
                 Err(Error::MemoryBudgetExceeded {
                     operation,
@@ -494,8 +581,8 @@ fn a_compressed_value_too_large_for_the_limit_is_refused() {
                     budget_limit_bytes,
                     ..
                 }) => {
-                    assert_eq!(operation, "query", "{door}");
-                    assert_eq!(budget_limit_bytes, LIMIT as u64, "{door}");
+                    assert_eq!(operation, "materialize_answer", "{door}");
+                    assert_eq!(budget_limit_bytes, limit as u64, "{door}");
                     refusals.push((requested_bytes, available_bytes));
                 }
                 Err(other) => panic!("{door}: the select was refused as {other:?}"),
@@ -503,12 +590,12 @@ fn a_compressed_value_too_large_for_the_limit_is_refused() {
             }
             assert_eq!(
                 support::memory_used(&on),
-                before,
-                "{door}: memory in use after the refusal"
+                before + support::form_charge("SELECT body FROM notes WHERE id = $id"),
+                "{door}: memory in use after the refusal: the open's, and the record's line"
             );
         }
         assert_eq!(
-            refusals[0], refusals[1],
+            refusals[1], refusals[2],
             "{door}: a refused read left memory counted"
         );
         // What was refused is the room for the value's real bytes, and by then the statement
@@ -530,22 +617,34 @@ fn a_compressed_value_too_large_for_the_limit_is_refused() {
         assert_eq!(support::int(&on, "SELECT COUNT(*) FROM notes"), 2, "{door}");
         assert_eq!(
             support::memory_used(&on),
-            before,
-            "{door}: memory in use at the end"
+            before
+                + support::form_charge("SELECT body FROM notes WHERE id = $id")
+                + support::form_charge("SELECT COUNT(*) FROM notes"),
+            "{door}: memory in use at the end: the record's line for each of the two forms run"
         );
     };
-    refused(&support::open_reader(&folder, Some(LIMIT)), "a reader");
-    let db = support::open_limited(&folder, LIMIT);
-    refused(&db, "the writer");
-    assert_eq!(db.memory_used(), 9 * MIB);
+    let read = support::opening::reader_charge(&folder, None);
+    let reader = support::open_reader(&folder, Some(read + ROOM));
+    drop(reader.table_names().expect("admit the reader catalog"));
+    refused(&reader, "a reader", read);
+    drop(reader);
+    let write = support::opening::opening_charge(&folder, None);
+    let db = support::open_limited(&folder, write + ROOM);
+    refused(&db, "the writer", write);
+    assert_eq!(
+        support::used(&db),
+        write
+            + support::form_charge("SELECT body FROM notes WHERE id = $id")
+            + support::form_charge("SELECT COUNT(*) FROM notes")
+    );
     support::close(db);
 
-    // The store is unharmed: a reader with no limit returns the value byte for byte.
+    // The store is unharmed: a reader under 512 MiB returns the value byte for byte.
     assert_note_is(
         &support::open_reader(&folder, None),
         1,
         &body,
-        "under no limit",
+        "under 512 MiB",
     );
 }
 
@@ -555,10 +654,14 @@ fn a_commit_with_no_room_to_compress_is_written_plain() {
     // What the compressor works in for a value of LEN bytes: 20 bytes more than 1.1 times
     // the value. The commit asks the budget for it and, refused, writes the value as it is.
     const BUFFER: usize = LEN + LEN / 10 + 20;
-    // The room the limit leaves at the commit: enough for whatever else a commit takes, and
-    // less than half of the compressor's buffer.
-    const ROOM: usize = 512 * KIB;
-    const { assert!(BUFFER == 1_153_453 && ROOM + KIB < BUFFER / 2) };
+    // One encoded copy fits beside the freed-page workspace, but the compressor's second
+    // buffer does not. The encoded row has its count, scalar id and text header.
+    let room = LEN + 2 + 9 + 9 + (512 * KIB).max(support::limit_commit_bytes());
+    assert!(
+        room - LEN - 20 < BUFFER,
+        "no room for the compressor beside the encoded copy"
+    );
+    assert_eq!(BUFFER, 1_153_453);
     let body = support::large_text(Kind::Repeating, 1, LEN);
 
     // With no room. The row is staged under no limit; then the limit is set, through the
@@ -568,13 +671,13 @@ fn a_commit_with_no_room_to_compress_is_written_plain() {
     support::run(&db, NOTES);
     let tx = db.transaction().expect("begin");
     insert_note(&tx, 1, &body);
-    let kib = db.memory_used().div_ceil(KIB) + ROOM / KIB;
+    let kib = (support::used(&db) + room).div_ceil(KIB);
     support::run(&tx, &format!("SET MEMORY_LIMIT '{kib}K'"));
-    assert_eq!(db.memory_limit(), Some(kib * KIB), "the limit was taken");
-    let free = kib * KIB - db.memory_used();
+    assert_eq!(support::limit(&db), Some(kib * KIB), "the limit was taken");
+    let free = kib * KIB - support::used(&db);
     assert!(
-        (ROOM..ROOM + KIB).contains(&free),
-        "{free} bytes are free at the commit, where {ROOM} were to be"
+        (room..room + KIB).contains(&free),
+        "{free} bytes are free at the commit, where {room} were to be"
     );
     // Compression never refuses a commit that would be written without it.
     if let Err(error) = tx.commit() {
@@ -588,8 +691,7 @@ fn a_commit_with_no_room_to_compress_is_written_plain() {
         "the data file is {length} bytes long: too short to hold a text of {LEN} bytes as it \
          is, so it was compressed in a buffer the budget had no room for"
     );
-    // Read by a reader, which has no limit: the store remembers the one set above for its
-    // next writer.
+    // Read under 512 MiB; the store remembers its declared limit for the next writer.
     let reader = support::open_reader(&folder, None);
     assert_note_is(&reader, 1, &body, "written with no room to compress");
 
@@ -600,6 +702,9 @@ fn a_commit_with_no_room_to_compress_is_written_plain() {
     let tx = db.transaction().expect("begin");
     insert_note(&tx, 1, &body);
     tx.commit().expect("commit under no limit");
+    for _ in 0..3 {
+        db.run_maintenance_cycle().unwrap();
+    }
     support::close(db);
     let length = data_file(&folder);
     assert!(
@@ -623,9 +728,8 @@ fn a_large_text_selected_by_name_is_held_once() {
     // the stored bytes of a compressed value, and well under what a second copy would need.
     const MARGIN: usize = 256 * KIB;
     const { assert!(LEN < LONGEST_COMPRESSED && MARGIN < LEN / 2 && LEN / 255 < MARGIN / 2) };
-    // A limit that fits the value once and not twice: the 9 MiB an open sets aside, the
+    // A limit that fits the value once and not twice: what an open sets aside, the
     // value's record of 9 + LEN bytes, and the margin.
-    let once = 9 * MIB + 9 + LEN + MARGIN;
 
     // Stored as it is (scattered text does not shrink) and stored compressed (one sentence
     // repeated shrinks to a few kilobytes): the statement holds the value once either way.
@@ -643,10 +747,12 @@ fn a_large_text_selected_by_name_is_held_once() {
             "the data file of a {kind:?} text of {LEN} bytes is {length} bytes long"
         );
 
+        let once = support::opening::reader_charge(&folder, None) + 9 + LEN + MARGIN;
         let reader = support::open_reader(&folder, Some(once));
+        drop(reader.table_names().expect("admit the reader catalog"));
         assert_eq!(
             support::memory_used(&reader),
-            9 * MIB,
+            support::opening::reader_charge(&folder, None),
             "set aside by the open"
         );
         // The select list names the column. The value is one text, whichever way the
@@ -666,8 +772,9 @@ fn a_large_text_selected_by_name_is_held_once() {
         }
         assert_eq!(
             support::memory_used(&reader),
-            9 * MIB,
-            "memory in use once the row is dropped"
+            support::opening::reader_charge(&folder, None)
+                + support::form_charge("SELECT body FROM notes WHERE id = $id"),
+            "memory in use once the row is dropped: the open's and the record's line"
         );
         // The small row beside it answers too, and the count.
         assert_note_is(&reader, 2, "small", "under the same limit");

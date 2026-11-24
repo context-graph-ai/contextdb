@@ -18,6 +18,7 @@ use crate::types::{ColumnDef, Error, Result, Value};
 /// A rank policy ready to rank rows.
 pub(super) struct Rank<'a> {
     formula: Expr,
+    _formula: Reservation,
     /// The columns of the table, then those of the joined table, then `vector_score`.
     scope: Scope<'a>,
     /// The joined table's rows the reader may see, read for what the formula reads of them.
@@ -52,7 +53,7 @@ impl<'a> Rank<'a> {
         };
         let scope = Scope::of(&table.name, &table.meta.columns);
         let scope = scope.and(&joined.name, &joined.meta.columns).and("", score);
-        let formula = crate::sql::formula(&policy.formula)?;
+        let (formula, held) = crate::sql::formula(&policy.formula, given.budget)?;
         let mut every = vec![false; scope.columns().count()];
         reads(&formula, &scope, given.params, &mut every)?;
         // The joined column is read: a row found through a digest is checked against it.
@@ -64,9 +65,12 @@ impl<'a> Rank<'a> {
         let width = joined.meta.columns.len();
         let visible = Visible::new(joined, catalog, given.reader, seeing)?;
         let lookup = Source::new(joined, None, &given.ctx, given.read, visible);
-        let lookup = lookup.reading(vec![false; width], rest);
+        let lookup = lookup
+            .counted(given.examined)
+            .reading(vec![false; width], rest);
         Ok(Rank {
             formula,
+            _formula: held,
             scope,
             lookup,
             width,
@@ -76,8 +80,8 @@ impl<'a> Rank<'a> {
     }
 
     /// The rank of a row at `distance` as an answer is put in order going up: its negation, so
-    /// that highest rank comes first and a NULL rank after every other; and how many stored
-    /// rows the lookup of the joined row read. That row is the one of lowest key among those
+    /// that highest rank comes first and a NULL rank after every other. The joined row is of
+    /// lowest key among those
     /// the reader may see; with none, its columns are NULL. A BOOLEAN is 1 or 0.
     pub(super) fn order(
         &self,
@@ -85,14 +89,12 @@ impl<'a> Rank<'a> {
         distance: f64,
         given: &Given,
         reservation: &mut Reservation,
-    ) -> Result<(Value, u64)> {
+    ) -> Result<Value> {
         let (mut lowest, mut joined) = (None, vec![Value::Null; self.width]);
         let path = (self.lookup).given(&[(self.on, Some(&row[self.anchor]))], &[], &[])?;
         // A value that is no key of the joined column, NULL among them, finds no row.
-        let read = match path.pinned {
-            0 => 0,
-            _ => self
-                .lookup
+        if path.pinned > 0 {
+            self.lookup
                 .walk(&path, reservation, |key, values, bytes, reservation| {
                     reservation.shrink(bytes);
                     // An index entry of a long text stands for every text with its digest.
@@ -102,8 +104,8 @@ impl<'a> Rank<'a> {
                         (lowest, joined) = (Some(key), values);
                     }
                     Ok(true)
-                })?,
-        };
+                })?;
+        }
         let values = row.iter().cloned().chain(joined);
         let values = values.chain([Value::Float64(1.0 - distance)]);
         let values: Vec<Value> = values
@@ -112,11 +114,12 @@ impl<'a> Rank<'a> {
                 value => value,
             })
             .collect();
-        let order = match eval(&self.formula, &self.scope, &values, &given.ctx)? {
-            Value::Int64(rank) => Value::Float64(-(rank as f64)),
+        let order = match eval(&self.formula, &self.scope, &values, &given.ctx)?.as_ref() {
+            Value::Int64(i64::MIN) => Value::Float64(2f64.powi(63)),
+            Value::Int64(rank) => Value::Int64(-rank),
             Value::Float64(rank) => Value::Float64(-rank),
             _ => Value::Null,
         };
-        Ok((order, read))
+        Ok(order)
     }
 }

@@ -13,6 +13,8 @@ Rules:
 - **A speed or size promise names the test that guards it by counting work**, or says "none yet".
 - **Name the machine** (processor, cores, memory) and say whether it is a user's machine.
 - Never paste hostnames, user names, absolute paths or secrets.
+- A comparison names both exact revisions and uses the same fixtures and resource limits.
+- An unmeasured landing cell stays `measured at landing`; it is not a measured figure.
 
 ## Promise
 
@@ -24,7 +26,10 @@ Rules:
 - Date: `<YYYY-MM-DD>`; revision measured: `<full SHA>`
 - Program and command: `<exact command, local paths replaced by placeholders>`
 - Data: `<what it holds, rows or vectors, dimension, bytes>`
-- Passes and statistic: `<number of passes; p50, p95>`; threads: `<n>`; memory limit: `<bytes>`
+- Passes and statistic: `<number of passes; median, p50, p95, or instruction count>`; threads: `<n>`
+- Resources: `<engine memory limit; enforced process memory; available cores>`
+- Storage: `<filesystem; temporary-store class without a private path; warm/cold cache conditions>`
+- Comparison: `<full baseline SHA; full candidate SHA; same fixtures and limits; or not applicable>`
 - Machine: `<processor, cores, memory>`; operating system: `<...>`; user's machine: `<yes | no>`
 - Settings that can change the result: `<cargo features, environment, search mode>`
 

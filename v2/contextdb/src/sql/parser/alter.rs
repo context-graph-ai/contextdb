@@ -34,6 +34,8 @@ pub(super) fn alter_table(pair: Pair<'_>) -> Result<AlterTable> {
                 },
                 Rule::indexing_threshold => AlterAction::SetIndexingThreshold(column, signed(set)),
                 Rule::indexing_threshold_default => AlterAction::SetIndexingThreshold(column, None),
+                Rule::probes => AlterAction::SetProbes(column, signed(set)),
+                Rule::probes_default => AlterAction::SetProbes(column, None),
                 Rule::compaction => AlterAction::SetCompaction(column, Some(compaction(set))),
                 Rule::compaction_default => AlterAction::SetCompaction(column, None),
                 // The one clause left: SEARCH_MODE.

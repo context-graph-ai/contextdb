@@ -1,144 +1,192 @@
-//! The shell: reads lines, gathers them into statements, runs each against the store and
-//! prints what it gave.
-
-use std::collections::HashMap;
-use std::io::{self, BufRead, IsTerminal};
-use std::ops::ControlFlow;
-
-use contextdb::{Database, Error, QueryResult, ReadSession, Result, Transaction};
+//! Statement collection and dispatch; the library owns reads, cursors and transactions.
+use crate::input::{Scan, scan};
+use crate::interrupt;
+use crate::output::{Json, Output, json};
+use contextdb::{
+    Cursor, Database, Error, Maintenance, QueryResult, ReadSession, Result, Transaction,
+};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
-
-use crate::input::{Scan, scan};
-use crate::output::Output;
-
-/// The store as this run opened it.
-pub enum Store {
-    Read(ReadSession),
-    Write(Database),
+use std::collections::HashMap;
+use std::io::{self, Write};
+use std::ops::ControlFlow;
+use std::sync::{Arc, atomic::Ordering::SeqCst};
+pub struct Store {
+    pub reader: Arc<ReadSession>,
+    pub writer: Option<Database>,
+    pub mode: Maintenance,
 }
-
-const HELP: [&str; 8] = [
-    "<statement>;        Run a SQL statement. It may span lines and ends at its `;`.",
-    "BEGIN; ... COMMIT;  Run statements as one transaction; ROLLBACK; undoes them, except SET MEMORY_LIMIT. Needs --write.",
-    ".tables   \\dt       List the tables.",
-    ".schema <table>   \\d <table>   Show a table's declaration as SQL.",
+const HELP: &[&str] = &[
+    "<statement>; Run SQL; BEGIN; COMMIT; ROLLBACK; need --write.",
+    ".tables \\dt   .schema <table> \\d <table>",
     ".explain <sql>      Show the path a statement would take, without running it.",
-    "SHOW VECTOR_INDEXES; SHOW VECTOR_PARTITIONS;   Describe the VECTOR columns and their partitions.",
-    ".help     \\?        Show this list.",
-    ".quit     \\q        End the session.",
+    ".cursor open <sql> | fetch [rows] | close",
+    ".events status   .maintenance run | status (needs --write)",
+    "SHOW VECTOR_INDEXES; SHOW VECTOR_PARTITIONS; Describe vectors.",
+    "SHOW STATEMENT_STATISTICS; RESET STATEMENT_STATISTICS; Count the work of statements.",
+    ".verify   .trace on | off   .help [vector | propagate] \\?   .quit \\q",
 ];
-
-struct Shell<'a> {
+const VECTOR_HELP: &[&str] = &[
+    "<column> VECTOR(<n>) [WITH (quantization = 'f32'|'sq8'|'sq4')] [PARTITION_KEY (<column>, ...)]",
+    "  [MAX_PARTITIONS <n>] [SEARCH_MODE AUTO|EXACT|INDEXED] [INDEXING_THRESHOLD <n>]",
+    "SELECT ... ORDER BY <column> <=> [0.1, 0.2] LIMIT <n> [USE VECTOR AUTO|EXACT|INDEXED]",
+    "SHOW VECTOR_INDEXES; SHOW VECTOR_PARTITIONS;",
+];
+const PROPAGATE_HELP: &[&str] = &[
+    "<column> REFERENCES <table>(<column>) ON STATE <state> PROPAGATE SET <state> [MAX DEPTH <n>] [ABORT ON FAILURE]",
+    "PROPAGATE ON EDGE <type> INCOMING|OUTGOING|BOTH STATE <state> SET <state> [MAX DEPTH <n>] [ABORT ON FAILURE]",
+    "PROPAGATE ON STATE <state> EXCLUDE VECTOR",
+];
+pub struct Shell<'a> {
     store: &'a Store,
+    terminal: bool,
+    pub interrupted: bool,
     output: Output,
-    /// The transaction `BEGIN` opened, until `COMMIT` or `ROLLBACK`.
     transaction: Option<Transaction<'a>>,
-    /// Lines of a statement whose `;` has not come yet.
     pending: String,
-    /// Whether anything was refused.
     refused: bool,
+    failed: bool,
+    stop: bool,
+    line: u64,
+    start: u64,
+    cursor: Option<Cursor>,
+    trace: bool,
+    writer: Option<bool>,
 }
-
-/// Runs the shell over the standard input until it ends or `.quit`.
-///
-/// Returns whether the run succeeded. A piped run succeeds only when every statement and every
-/// shell command did; a session at a terminal showed each refusal as it happened and always
-/// succeeds.
-pub fn run(store: &Store, output: Output) -> bool {
-    let mut shell = Shell {
-        store,
-        output,
-        transaction: None,
-        pending: String::new(),
-        refused: false,
-    };
-    if std::io::stdin().is_terminal() {
-        shell.at_a_terminal();
-        return true;
+pub fn succeeded(terminal: bool, refused: bool, failed: bool) -> bool {
+    !failed && (terminal || !refused)
+}
+pub fn banner(writer: bool) -> &'static str {
+    if writer {
+        "write session — mutations are enabled"
+    } else {
+        "read-only session — pass --write to mutate"
     }
-    for (at, line) in std::io::stdin().lock().lines().enumerate() {
-        // What follows a line that cannot be read may rest on it: nothing after it runs, and
-        // a transaction left open is not committed.
-        let Ok(line) = line else {
-            let message = format!(
-                "line {} of the input is not text, so the run ends there",
-                at + 1
-            );
-            shell.output.refusal("io", &message);
-            return false;
-        };
-        if shell.line(&line).is_break() {
-            return !shell.refused;
+}
+pub fn prompt(writer: bool, pending: bool) -> &'static str {
+    match (writer, pending) {
+        (_, true) => "      ...> ",
+        (true, false) => "contextdb> ",
+        (false, false) => "contextdb(ro)> ",
+    }
+}
+/// Whether the run succeeded, and whether an interrupt ended it.
+pub fn run(store: &Store, output: Output, stop: bool, terminal: bool) -> (bool, bool) {
+    let mut s = Shell::new(store, output, stop, terminal);
+    if terminal {
+        s.at_a_terminal();
+        return (succeeded(true, s.refused, s.failed), false);
+    }
+    let (lines, input) = std::sync::mpsc::channel();
+    let (end, reading) = (Err(io::ErrorKind::UnexpectedEof.into()), lines.clone());
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "input read beside the statements, so an interrupt wakes a waiting run"
+    )]
+    std::thread::spawn(move || {
+        io::stdin()
+            .lines()
+            .chain([end])
+            .try_for_each(|l| reading.send(l))
+    });
+    let ok = interrupt::running(interrupt::Active::Input(lines), || {
+        for line in input {
+            match line {
+                Ok(line) => {
+                    if s.line(&line).is_break() {
+                        return succeeded(false, s.refused, s.failed);
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                    s.interrupted = true;
+                    return false;
+                }
+                Err(e) => {
+                    s.output.refusal(
+                        "io",
+                        &format!("line {} of the input is not text: {e}", s.line + 1),
+                    );
+                    return false;
+                }
+            }
+        }
+        let rest = std::mem::take(&mut s.pending);
+        let _ = s.statement(&rest);
+        succeeded(false, s.refused, s.failed)
+    });
+    (ok, s.interrupted)
+}
+impl<'a> Shell<'a> {
+    pub fn new(store: &'a Store, output: Output, stop: bool, terminal: bool) -> Self {
+        Shell {
+            store,
+            terminal,
+            interrupted: false,
+            output,
+            transaction: None,
+            pending: String::new(),
+            refused: false,
+            failed: false,
+            stop: stop && !terminal,
+            line: 0,
+            start: 1,
+            cursor: None,
+            trace: false,
+            writer: None,
         }
     }
-    // Piped input ends its last statement without a `;`.
-    let rest = std::mem::take(&mut shell.pending);
-    let _ = shell.statement(&rest);
-    !shell.refused
-}
-
-impl<'a> Shell<'a> {
-    /// Reads lines a person types, with line editing and recall of the session's earlier
-    /// lines. Nothing of the session is kept after it ends.
     fn at_a_terminal(&mut self) {
-        let (banner, prompt) = match self.store {
-            Store::Read(_) => (
-                "read-only session — pass --write to mutate",
-                "contextdb(ro)> ",
-            ),
-            Store::Write(_) => ("write session — mutations are enabled", "contextdb> "),
-        };
+        let writer = self.store.writer.is_some();
         let mut editor = match DefaultEditor::new() {
-            Ok(editor) => editor,
-            Err(error) => {
-                self.output
-                    .refusal("io", &format!("the terminal cannot be read: {error}"));
+            Ok(e) => e,
+            Err(e) => {
+                self.output.refusal("io", &e.to_string());
+                self.failed = true;
                 return;
             }
         };
-        eprintln!("{banner}");
+        eprintln!("{}", banner(writer));
         loop {
-            let open = !self.pending.is_empty();
-            match editor.readline(if open { "      ...> " } else { prompt }) {
+            match editor.readline(prompt(writer, !self.pending.is_empty())) {
                 Ok(line) => {
-                    if line.trim().is_empty() && !open {
-                        continue;
-                    }
-                    // A line that cannot be kept for recall is still run.
                     let _ = editor.add_history_entry(line.trim());
                     if self.line(&line).is_break() {
-                        return;
+                        break;
                     }
                 }
-                // Ctrl-C drops what was typed and the session goes on.
                 Err(ReadlineError::Interrupted) => self.pending.clear(),
-                // Ctrl-D, or a terminal that went away.
-                Err(_) => break,
+                Err(ReadlineError::Eof) => break,
+                Err(e) => {
+                    self.output.refusal("io", &e.to_string());
+                    self.failed = true;
+                    break;
+                }
             }
         }
         if !self.pending.is_empty() {
             eprintln!("Discarding incomplete statement (no closing `;`).");
         }
     }
-
-    /// Takes one line of input. Breaks when the line ends the session.
-    fn line(&mut self, line: &str) -> ControlFlow<()> {
-        // A shell command is one line, and only where no statement is open: inside a statement
-        // a line that starts with a dot is that statement's text.
-        let command = line.trim();
-        if self.pending.is_empty() && command.starts_with(['.', '\\']) {
-            return self.command(command);
+    pub fn line(&mut self, line: &str) -> ControlFlow<()> {
+        self.line += 1;
+        if self.pending.is_empty() {
+            self.start = self.line;
+            if line.trim().starts_with(['.', '\\']) {
+                return self.command(line.trim());
+            }
         }
         self.pending.push_str(line);
         self.pending.push('\n');
         loop {
             match scan(&self.pending) {
                 Scan::Ends(end) => {
-                    let statement: String = self.pending.drain(..end).collect();
-                    if self.statement(&statement).is_break() {
+                    let text: String = self.pending.drain(..end).collect();
+                    let lines = text.bytes().filter(|b| *b == b'\n').count() as u64;
+                    if self.statement(&text).is_break() {
                         return ControlFlow::Break(());
                     }
+                    self.start += lines;
                 }
                 Scan::Open => break,
                 Scan::Blank => {
@@ -149,128 +197,220 @@ impl<'a> Shell<'a> {
         }
         ControlFlow::Continue(())
     }
-
-    /// Runs one shell command.
     fn command(&mut self, line: &str) -> ControlFlow<()> {
         let mut words = line.split_whitespace();
-        let answered = match (words.next(), words.next(), words.next()) {
-            (Some(".tables" | "\\dt"), None, _) => match self.store {
-                Store::Read(reader) => reader.table_names(),
-                Store::Write(db) => Ok(db.table_names()),
+        let answer = match (words.next(), words.next(), words.next()) {
+            (Some(".tables" | "\\dt"), None, _) => self.measured(
+                "tables",
+                self.store.reader.table_names().map(|v| Output::tables(&v)),
+            ),
+            (Some(".schema" | "\\d"), Some(t), None) => {
+                let reader = &self.store.reader;
+                let meta = reader.table_meta(t);
+                let doc = reader
+                    .declaration(t)
+                    .and_then(|v| meta.map(|m| Output::schema(t, &v, &m)));
+                self.measured("schema", doc)
             }
-            .map(|names| self.output.tables(&names)),
-            (Some(".schema" | "\\d"), Some(table), None) => match self.store {
-                Store::Read(reader) => reader.declaration(table),
-                Store::Write(db) => db.declaration(table),
-            }
-            .map(|declaration| self.output.schema(table, &declaration)),
             (Some(".explain"), Some(_), _) => {
-                let sql = line[".explain".len()..].trim();
-                let sql = sql.strip_suffix(';').unwrap_or(sql);
-                match self.store {
-                    Store::Read(reader) => reader.explain(sql),
-                    Store::Write(db) => db.explain(sql),
-                }
-                .map(|lines| self.output.explain(&lines))
+                let lines = self
+                    .store
+                    .reader
+                    .explain(line[8..].trim().trim_end_matches(';'));
+                self.measured("explain", lines.map(|v| Output::explain(&v)))
             }
-            (Some(".help" | "\\?"), None, _) => Ok(self.output.help(&HELP)),
+            (Some(".help" | "\\?"), None, _) => Ok(self.output.help(HELP)),
+            (Some(".help" | "\\?"), Some("vector"), None) => Ok(self.output.help(VECTOR_HELP)),
+            (Some(".help" | "\\?"), Some("propagate"), None) => {
+                Ok(self.output.help(PROPAGATE_HELP))
+            }
             (Some(".quit" | ".exit" | "\\q"), None, _) => return ControlFlow::Break(()),
+            (Some(".verify"), None, _) => return self.statement("SHOW CONTENT_SIZE"),
+            (Some(".events"), Some("status"), None) => self.measured("events", self.store.reader.event_bus_status()
+            .map(|v|json!(&*v))),
+            (Some(".maintenance"),Some("run"),None)=>self.store.writer.as_ref().ok_or(Error::ReadOnlySession).and_then(Database::run_maintenance_cycle).map(|r|self.output.status("maintenance_cycle",r)),
+            (Some(".maintenance"), Some("compact"), steps) => self.store.writer.as_ref().ok_or(Error::ReadOnlySession).and_then(|db| {
+                let steps = steps.map_or(Ok(u32::MAX), str::parse::<u32>).map_err(|_| Error::ParseError("steps is a whole number".into()))?;
+                let (mut report, mut moved) = (Default::default(), 0);
+                for _ in 0..steps {
+                    report = db.compact_now()?;
+                    moved += report.compacted_pages.unwrap_or(0);
+                    if report.work_remaining != Some(true) || report.compaction_waiting_on.is_some() {
+                        break;
+                    }
+                }
+                report.compacted_pages = Some(moved);
+                report.page_slack_ratio = db.page_slack_ratio();
+                Ok(report)
+            }).map(|r| self.output.status("maintenance_cycle", r)),
+            (Some(".maintenance"),Some("status"),None)=>self.measured("maintenance",self.store.writer.as_ref().ok_or(Error::ReadOnlySession).and_then(Database::last_maintenance_cycle).map(|r|json!({"mode":if self.store.mode==Maintenance::Engine {"engine"}else{"caller"},"last_cycle":r}))),
+            (Some(".trace"), Some(state @ ("on" | "off")), None) => {
+                self.trace = state == "on";
+                Ok(self.output.trace_state(state))
+            }
+            (Some(".cursor"), Some(action), _) => self.cursor(action, line),
             _ => {
                 self.refused = true;
                 let first = line.split_whitespace().next().unwrap_or_default();
                 let usage = HELP
-                    .into_iter()
+                    .iter()
                     .find(|h| h.split_whitespace().any(|w| w == first));
-                self.output.unknown_command(line, usage);
+                self.output.unknown_command(line, usage.copied());
                 Ok(Ok(()))
             }
         };
-        self.answered(answered)
+        self.answered(answer, line)
     }
-
-    /// Runs one statement and prints its result or its refusal. Breaks when the result
-    /// cannot be written.
+    fn cursor(&mut self, action: &str, line: &str) -> Result<io::Result<()>> {
+        let reader = &self.store.reader;
+        match action {
+            "open" => {
+                if self.transaction.is_some() {
+                    return self.refuse(
+                        "cursor_transaction_active",
+                        "close the transaction before opening a cursor",
+                    );
+                }
+                if self.cursor.is_some() {
+                    return self.refuse("cursor_already_open", "close the open cursor first");
+                }
+                let sql = line[".cursor open".len()..].trim().trim_end_matches(';');
+                let mut c =
+                    interrupt::reading(reader, || reader.open_cursor(sql, &HashMap::new()))?;
+                let page = interrupt::reading(reader, || c.fetch(None))?;
+                let answer = self.output.cursor(&page, c.has_more());
+                self.cursor = Some(c);
+                Ok(answer)
+            }
+            "fetch" if line.split_whitespace().count() <= 3 => {
+                let n = line
+                    .split_whitespace()
+                    .nth(2)
+                    .map(str::parse)
+                    .transpose()
+                    .map_err(|_| Error::ParseError("fetch rows must be positive".into()))?;
+                let Some(c) = self.cursor.as_mut() else {
+                    return self.refuse("cursor_not_found", "open a cursor first");
+                };
+                let result = interrupt::reading(reader, || c.fetch(n))?;
+                Ok(self.output.cursor(&result, c.has_more()))
+            }
+            "close" if line.split_whitespace().count() == 2 => {
+                if let Some(mut c) = self.cursor.take() {
+                    c.close()?;
+                }
+                Ok(self.output.cursor_close())
+            }
+            _ => self.refuse("usage", ".cursor open <sql> | fetch [rows] | close"),
+        }
+    }
     fn statement(&mut self, text: &str) -> ControlFlow<()> {
-        let sql = text.trim();
-        let sql = sql.strip_suffix(';').unwrap_or(sql).trim_end();
+        let sql = text.trim().trim_end_matches(';').trim_end();
         if sql.is_empty() {
             return ControlFlow::Continue(());
         }
-        let ran = if sql.eq_ignore_ascii_case("BEGIN") {
-            self.begin()
-        } else if sql.eq_ignore_ascii_case("COMMIT") {
-            self.end(Transaction::commit)
-        } else if sql.eq_ignore_ascii_case("ROLLBACK") {
-            self.end(|transaction| {
-                transaction.rollback();
-                Ok(())
-            })
-        } else {
-            // The rows of the two inspection statements are too wide for a table.
-            let mut words = sql.split_whitespace().map(str::to_ascii_uppercase);
-            let inspection = words.next().as_deref() == Some("SHOW")
-                && words.next().is_some_and(|word| word.starts_with("VECTOR_"));
-            self.execute(sql).map(|result| match inspection {
-                true => self.output.fields(&result),
-                false => self.output.result(&result),
-            })
-        };
-        self.answered(ran)
-    }
-
-    /// Prints a refusal, or ends the session when the answer could not be written: as `.quit`
-    /// does when nobody reads the output any more, and as a refusal for any other failure.
-    fn answered(&mut self, answered: Result<io::Result<()>>) -> ControlFlow<()> {
-        match answered {
-            Ok(Ok(())) => {}
-            Err(error) => {
-                self.refused = true;
-                self.output.error(&error);
+        let result = (|| {
+            let current = self.store.reader.writer_running()?;
+            if self.writer.is_some_and(|old| old != current) {
+                let n = self.store.reader.committed_watermark()?.0;
+                let what = ["the writer stopped", "the writer is back"][usize::from(current)];
+                self.output
+                    .notice("writer", &format!("{what}; reading commit {n}"));
             }
-            Ok(Err(error)) => {
-                if error.kind() != io::ErrorKind::BrokenPipe {
-                    self.refused = true;
-                    let message = format!("the output cannot be written: {error}");
-                    self.output.refusal("io", &message);
+            self.writer = Some(current);
+            if sql.eq_ignore_ascii_case("BEGIN") {
+                self.begin()
+            } else if sql.eq_ignore_ascii_case("COMMIT") {
+                self.end(Transaction::commit)
+            } else if sql.eq_ignore_ascii_case("ROLLBACK") {
+                self.end(|t| {
+                    t.rollback();
+                    Ok(())
+                })
+            } else {
+                let result = self.execute(sql)?;
+                if self.trace {
+                    self.output.trace(&result);
+                }
+                Ok(if result.is_report() {
+                    self.output.fields(&result)
+                } else {
+                    self.output.result(&result)
+                })
+            }
+        })();
+        self.answered(result, sql)
+    }
+    fn answered(&mut self, answer: Result<io::Result<()>>, sql: &str) -> ControlFlow<()> {
+        match answer {
+            Ok(Ok(())) => {}
+            Err(e) => {
+                self.refused = true;
+                self.output.error(&e, Some((self.start, sql)));
+            }
+            Ok(Err(e)) => {
+                if e.kind() != io::ErrorKind::BrokenPipe {
+                    self.failed = true;
+                    self.output.refusal("io", &e.to_string());
                 }
                 return ControlFlow::Break(());
             }
         }
-        ControlFlow::Continue(())
-    }
-
-    fn execute(&self, sql: &str) -> Result<QueryResult> {
-        let params = HashMap::new();
-        match (&self.transaction, self.store) {
-            (Some(transaction), _) => transaction.execute(sql, &params),
-            (None, Store::Write(db)) => db.execute(sql, &params),
-            (None, Store::Read(reader)) => reader.execute(sql, &params),
+        self.interrupted |= interrupt::FIRED.swap(false, SeqCst) && !self.terminal;
+        if self.interrupted || self.stop && self.refused {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
         }
     }
-
-    /// `BEGIN`. With a transaction open already it changes nothing, warns, and answers the same.
+    fn measured(&mut self, kind: &str, value: Result<Json>) -> Result<io::Result<()>> {
+        let mut text = Vec::new();
+        let drawn = self.output.draw(kind, value?, &mut text);
+        if drawn.is_ok() && text.len() as u64 > self.output.result {
+            self.output.too_large(text.len() as u64, self.start);
+            self.refused = true;
+            return Ok(Ok(()));
+        }
+        Ok(drawn.and_then(|()| io::stdout().write_all(&text)))
+    }
+    fn refuse(&mut self, kind: &str, message: &str) -> Result<io::Result<()>> {
+        self.refused = true;
+        self.output.shell_refusal(kind, message, self.start);
+        Ok(Ok(()))
+    }
+    /// The open transaction answers all; else the read session reads, and the writer the rest.
+    fn execute(&self, sql: &str) -> Result<QueryResult> {
+        let (params, reader) = (HashMap::new(), &self.store.reader);
+        let write = |db: &Database| interrupt::writing(db, || db.execute(sql, &params));
+        match (&self.transaction, &self.store.writer) {
+            (Some(tx), Some(db)) => interrupt::writing(db, || tx.execute(sql, &params)),
+            (_, Some(db)) if !contextdb::read_session_answers(sql) => write(db),
+            (_, writer) => match interrupt::reading(reader, || reader.execute(sql, &params)) {
+                Err(Error::ReadOnlySession) => {
+                    write(writer.as_ref().ok_or(Error::ReadOnlySession)?)
+                }
+                answer => answer,
+            },
+        }
+    }
     fn begin(&mut self) -> Result<io::Result<()>> {
-        let Store::Write(db) = self.store else {
-            return Err(Error::ReadOnlySession);
-        };
-        match self.transaction {
-            None => self.transaction = Some(db.transaction()?),
-            Some(_) => self
-                .output
-                .warning("there is already a transaction in progress"),
+        let db = self.store.writer.as_ref().ok_or(Error::ReadOnlySession)?;
+        if self.transaction.is_none() {
+            self.transaction = Some(db.transaction()?);
+        } else {
+            self.output
+                .warning("there is already a transaction in progress");
         }
         Ok(self.output.rows_affected(0))
     }
-
-    /// `COMMIT` or `ROLLBACK`. With no transaction open it changes nothing, warns, and answers
-    /// the same.
     fn end(&mut self, how: impl FnOnce(Transaction<'a>) -> Result<()>) -> Result<io::Result<()>> {
-        if let Store::Read(_) = self.store {
+        if self.store.writer.is_none() {
             return Err(Error::ReadOnlySession);
         }
-        match self.transaction.take() {
-            Some(transaction) => how(transaction)?,
-            None => self.output.warning("there is no transaction in progress"),
+        if let Some(tx) = self.transaction.take() {
+            how(tx)?;
+        } else {
+            self.output.warning("there is no transaction in progress");
         }
         Ok(self.output.rows_affected(0))
     }

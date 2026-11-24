@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, title TEXT NOT NULL DE
 INSERT INTO notes (id, body) VALUES (1, 'first');
 CREATE TABLE IF NOT EXISTS notes (id UUID PRIMARY KEY, other REAL) IMMUTABLE;
 ----
-rows affected: 0
+rows affected: 0  (read 0, compared 0)
 
 SELECT other FROM notes;
 ----
@@ -16,11 +16,11 @@ error: ColumnNotFound
 
 UPDATE notes SET body = 'again' WHERE id = 1;
 ----
-rows affected: 1
+rows affected: 1  (read 1, compared 0)
 
 SELECT id, title, body FROM notes ORDER BY id;
 ----
-id | title | body
+id | title | body  (read 1, compared 0)
 1 | none | again
 
 # The clauses of a VECTOR column: its partition key, its limit and its search mode.
@@ -38,7 +38,7 @@ error: VectorPartitionLimitExceeded
 
 SELECT id FROM docs ORDER BY v <=> [1.0, 0.0, 0.0] LIMIT 1;
 ----
-id
+id  (read 3, compared 2)
 1
 
 # A plain index with a direction for each column.
@@ -46,7 +46,7 @@ CREATE INDEX notes_by_title ON notes (title DESC, id ASC);
 INSERT INTO notes (id, title, body) VALUES (2, 'b', 'x'), (3, 'a', 'y');
 SELECT id, title FROM notes ORDER BY title DESC, id;
 ----
-id | title
+id | title  (read 3, compared 0)
 1 | none
 2 | b
 3 | a
@@ -64,7 +64,7 @@ error: ReservedIndexName
 CREATE INDEX notes_by_body ON notes (body);
 SELECT id FROM notes WHERE body = 'x';
 ----
-id
+id  (read 1, compared 0)
 2
 
 # A name written without quotes is its lower-case letters, and a name in quotes is the letters
@@ -73,7 +73,7 @@ CREATE TABLE Items (Id INTEGER PRIMARY KEY, Name TEXT);
 INSERT INTO ITEMS (ID, NAME) VALUES (1, 'a');
 SELECT Id, NAME FROM items;
 ----
-id | name
+id | name  (read 1, compared 0)
 1 | a
 
 CREATE TABLE ITEMS (id INTEGER PRIMARY KEY);
@@ -92,12 +92,12 @@ CREATE TABLE "Items" ("Id" INTEGER PRIMARY KEY, "Name" TEXT);
 INSERT INTO "Items" ("Id", "Name") VALUES (7, 'quoted');
 SELECT "Id", "Name" FROM "Items";
 ----
-Id | Name
+Id | Name  (read 1, compared 0)
 7 | quoted
 
 SELECT id, name FROM items;
 ----
-id | name
+id | name  (read 1, compared 0)
 1 | a
 
 # An index's name folds the same way, and belongs to its table: a second index of the name on
@@ -171,7 +171,7 @@ CREATE TABLE lines (line TEXT NOT NULL);
 INSERT INTO lines (line) VALUES ('same'), ('same');
 SELECT COUNT(*) AS kept FROM lines;
 ----
-kept
+kept  (read 0, compared 0)
 2
 
 # Every option of a table, alone.
@@ -283,7 +283,7 @@ INSERT INTO kinds (id, doc) VALUES (1, '{"kind": "a"}'), (2, '{"kind": "b"}');
 UPDATE kinds SET doc = '{"kind": "c"}' WHERE id = 2;
 SELECT id FROM kinds ORDER BY id;
 ----
-id
+id  (read 2, compared 0)
 1
 2
 
@@ -292,7 +292,7 @@ INSERT INTO filled (id, doc) VALUES (1, '{"kind": "a"}');
 CREATE INDEX filled_by_kind ON filled ((doc -> 'kind'));
 SELECT id FROM filled;
 ----
-id
+id  (read 1, compared 0)
 1
 
 # A JSON-path index may name a path of two keys.
@@ -301,5 +301,279 @@ CREATE INDEX chained_by_path ON chained ((doc -> 'k' -> 'j'));
 INSERT INTO chained (id, doc) VALUES (1, '{"k": {"j": 1}}');
 SELECT id FROM chained;
 ----
-id
+id  (read 1, compared 0)
 1
+
+# A refused declaration declares nothing, whatever refuses it. Keeping only current versions
+# beside sending rows out or keeping the first write; a reference no key or UNIQUE rule of the
+# parent covers; counts without an index led by them; a DAG without its columns; EXCLUDE VECTOR
+# without the state it names; a default that is not a literal or NOW(); and more than 32 columns
+# under a key or a UNIQUE rule.
+CREATE TABLE parents (id UUID PRIMARY KEY, name TEXT NOT NULL, context_id UUID, UNIQUE (context_id, id));
+CREATE TABLE gauges (id INTEGER PRIMARY KEY) HISTORY CURRENT ONLY;
+----
+error: SchemaInvalid
+
+CREATE TABLE gauges (id INTEGER PRIMARY KEY) HISTORY CURRENT ONLY SYNC PUSH ONLY;
+----
+error: SchemaInvalid
+
+CREATE TABLE gauges (id INTEGER PRIMARY KEY) IMMUTABLE RETAIN 7 DAYS;
+----
+error: SchemaInvalid
+
+CREATE TABLE gauges (id INTEGER PRIMARY KEY) IMMUTABLE HISTORY CURRENT ONLY SYNC OFF;
+----
+error: SchemaInvalid
+
+CREATE TABLE gauges (id INTEGER PRIMARY KEY) RETAIN 7 DAYS SYNC SAFE SYNC OFF;
+----
+error: SchemaInvalid
+
+CREATE TABLE gauges (id INTEGER PRIMARY KEY) RETAIN 7 DAYS SYNC SAFE SYNC PULL ONLY;
+----
+error: SchemaInvalid
+
+CREATE TABLE gauges (id INTEGER PRIMARY KEY, plan TEXT REFERENCES parents(name));
+----
+error: SchemaInvalid
+
+CREATE TABLE gauges (id INTEGER PRIMARY KEY, context_id UUID, name TEXT, FOREIGN KEY (context_id, name) REFERENCES parents(context_id, name));
+----
+error: SchemaInvalid
+
+CREATE TABLE gauges (id INTEGER PRIMARY KEY, kind TEXT) MAINTAIN COUNT (kind);
+----
+error: SchemaInvalid
+
+CREATE TABLE gauges (id INTEGER PRIMARY KEY, kind TEXT) MAINTAIN COUNT (id);
+----
+error: SchemaInvalid
+
+CREATE TABLE gauges (id INTEGER PRIMARY KEY, source_id UUID, target_id UUID) DAG('NEEDS');
+----
+error: SchemaInvalid
+
+CREATE TABLE gauges (id INTEGER PRIMARY KEY, status TEXT, v VECTOR(4)) PROPAGATE ON STATE gone EXCLUDE VECTOR;
+----
+error: SchemaInvalid
+
+CREATE TABLE gauges (id INTEGER PRIMARY KEY, status TEXT, v VECTOR(4)) STATE MACHINE (status: on -> [off]) PROPAGATE ON STATE gone EXCLUDE VECTOR;
+----
+error: SchemaInvalid
+
+CREATE TABLE gauges (id INTEGER PRIMARY KEY, c INTEGER DEFAULT $p);
+----
+error: SchemaInvalid
+
+CREATE TABLE gauges (id INTEGER PRIMARY KEY, c INTEGER DEFAULT -'x');
+----
+error: SchemaInvalid
+
+CREATE TABLE gauges (c01 INTEGER, c02 INTEGER, c03 INTEGER, c04 INTEGER, c05 INTEGER, c06 INTEGER, c07 INTEGER, c08 INTEGER, c09 INTEGER, c10 INTEGER, c11 INTEGER, c12 INTEGER, c13 INTEGER, c14 INTEGER, c15 INTEGER, c16 INTEGER, c17 INTEGER, c18 INTEGER, c19 INTEGER, c20 INTEGER, c21 INTEGER, c22 INTEGER, c23 INTEGER, c24 INTEGER, c25 INTEGER, c26 INTEGER, c27 INTEGER, c28 INTEGER, c29 INTEGER, c30 INTEGER, c31 INTEGER, c32 INTEGER, c33 INTEGER, PRIMARY KEY (c01, c02, c03, c04, c05, c06, c07, c08, c09, c10, c11, c12, c13, c14, c15, c16, c17, c18, c19, c20, c21, c22, c23, c24, c25, c26, c27, c28, c29, c30, c31, c32, c33));
+----
+error: SchemaInvalid
+
+CREATE TABLE gauges (c01 INTEGER, c02 INTEGER, c03 INTEGER, c04 INTEGER, c05 INTEGER, c06 INTEGER, c07 INTEGER, c08 INTEGER, c09 INTEGER, c10 INTEGER, c11 INTEGER, c12 INTEGER, c13 INTEGER, c14 INTEGER, c15 INTEGER, c16 INTEGER, c17 INTEGER, c18 INTEGER, c19 INTEGER, c20 INTEGER, c21 INTEGER, c22 INTEGER, c23 INTEGER, c24 INTEGER, c25 INTEGER, c26 INTEGER, c27 INTEGER, c28 INTEGER, c29 INTEGER, c30 INTEGER, c31 INTEGER, c32 INTEGER, c33 INTEGER, UNIQUE (c01, c02, c03, c04, c05, c06, c07, c08, c09, c10, c11, c12, c13, c14, c15, c16, c17, c18, c19, c20, c21, c22, c23, c24, c25, c26, c27, c28, c29, c30, c31, c32, c33));
+----
+error: SchemaInvalid
+
+CREATE TABLE gauges (a INTEGER PRIMARY KEY, b TEXT, PRIMARY KEY (a, b));
+----
+error: SchemaInvalid
+
+SELECT id FROM gauges;
+----
+error: TableNotFound
+
+# An index over 33 columns is refused the same way, and one over 32 is made.
+CREATE TABLE broad (c01 INTEGER PRIMARY KEY, c02 INTEGER, c03 INTEGER, c04 INTEGER, c05 INTEGER, c06 INTEGER, c07 INTEGER, c08 INTEGER, c09 INTEGER, c10 INTEGER, c11 INTEGER, c12 INTEGER, c13 INTEGER, c14 INTEGER, c15 INTEGER, c16 INTEGER, c17 INTEGER, c18 INTEGER, c19 INTEGER, c20 INTEGER, c21 INTEGER, c22 INTEGER, c23 INTEGER, c24 INTEGER, c25 INTEGER, c26 INTEGER, c27 INTEGER, c28 INTEGER, c29 INTEGER, c30 INTEGER, c31 INTEGER, c32 INTEGER, c33 INTEGER);
+CREATE INDEX broad_by ON broad (c01, c02, c03, c04, c05, c06, c07, c08, c09, c10, c11, c12, c13, c14, c15, c16, c17, c18, c19, c20, c21, c22, c23, c24, c25, c26, c27, c28, c29, c30, c31, c32, c33);
+----
+error: SchemaInvalid
+
+CREATE INDEX broad_by ON broad (c01, c02, c03, c04, c05, c06, c07, c08, c09, c10, c11, c12, c13, c14, c15, c16, c17, c18, c19, c20, c21, c22, c23, c24, c25, c26, c27, c28, c29, c30, c31, c32);
+
+# Saying a thing twice or two ways is a parse error: a direction inside RETAIN, an option or a
+# column's clause written twice, a list that names a column twice or one the table lacks, a
+# reference of unequal sides, DEFAULT for a new table's counts, and words no version reads.
+CREATE TABLE gauges (id INTEGER PRIMARY KEY) RETAIN 24 HOURS SYNC SAFE PUSH ONLY;
+----
+error: ParseError
+
+CREATE TABLE gauges (id INTEGER PRIMARY KEY) RETAIN 24 HOURS SYNC SAFE TWO WAY;
+----
+error: ParseError
+
+ALTER TABLE t SET RETAIN 24 HOURS SYNC SAFE PUSH ONLY;
+----
+error: ParseError
+
+CREATE TABLE gauges (a INTEGER, b TEXT, PRIMARY KEY (a, b), PRIMARY KEY (a));
+----
+error: ParseError
+
+CREATE TABLE t (id UUID PRIMARY KEY) SYNC OFF SYNC TWO WAY;
+----
+error: ParseError
+
+CREATE TABLE t (id UUID PRIMARY KEY) RETAIN 1 DAYS RETAIN 2 DAYS;
+----
+error: ParseError
+
+CREATE TABLE t (id UUID PRIMARY KEY) HISTORY ALL HISTORY CURRENT ONLY;
+----
+error: ParseError
+
+CREATE TABLE t (id UUID PRIMARY KEY) SYNC CONFLICT KEEP FIRST SYNC CONFLICT KEEP LATEST;
+----
+error: ParseError
+
+CREATE TABLE t (id UUID PRIMARY KEY) MAINTAIN COUNT NONE MAINTAIN COUNT ALL PREFIXES;
+----
+error: ParseError
+
+CREATE TABLE t (id UUID PRIMARY KEY, o UUID REFERENCES p(id) REFERENCES q(id));
+----
+error: ParseError
+
+ALTER TABLE t ADD COLUMN c TEXT NOT NULL NOT NULL;
+----
+error: ParseError
+
+CREATE TABLE t (a INTEGER, b TEXT, PRIMARY KEY (a, a));
+----
+error: ParseError
+
+CREATE TABLE t (a INTEGER, b TEXT, PRIMARY KEY (a, nope));
+----
+error: ParseError
+
+CREATE TABLE t (a INTEGER, b TEXT, FOREIGN KEY (a, nope) REFERENCES p(a, b));
+----
+error: ParseError
+
+CREATE TABLE t (a INTEGER, b TEXT, FOREIGN KEY (a, b) REFERENCES p(a));
+----
+error: ParseError
+
+CREATE TABLE t (id UUID PRIMARY KEY) MAINTAIN COUNT DEFAULT;
+----
+error: ParseError
+
+ALTER TABLE t DROP COLUMN c RESTRICT CASCADE;
+----
+error: ParseError
+
+ALTER TABLE t SET HISTORY NONE;
+----
+error: ParseError
+
+ALTER TABLE t ALTER COLUMN v SET PARTITION_KEY (a);
+----
+error: ParseError
+
+ALTER TABLE t RENAME a TO b;
+----
+error: ParseError
+
+DROP INDEX i;
+----
+error: IndexNotFound | index not found: i
+
+DROP TABLE;
+----
+error: ParseError
+
+CREATE TABLE t (id UUID PRIMARY KEY) SYNC SIDEWAYS;
+----
+error: ParseError
+
+CREATE TABLE t (id UUID PRIMARY KEY) EDGE DISCARD SOMETIMES;
+----
+error: ParseError
+
+CREATE TABLE t (id UUID PRIMARY KEY) RETAIN 7 WEEKS;
+----
+error: ParseError
+
+# What a later version reads, and the tuning clauses no version reads, are refused by name;
+# a procedure or function is refused as one, and either word may still name a table.
+ALTER TABLE t ALTER COLUMN v SET SEARCH DEFAULT;
+----
+error: PlanError
+
+ALTER TABLE t ALTER COLUMN v SET SEARCH (TARGET_ACCURACY = 95);
+----
+error: PlanError
+
+ALTER TABLE t ALTER COLUMN v SET IVF DEFAULT;
+----
+error: PlanError
+
+ALTER TABLE t ALTER COLUMN v SET IVF (LISTS = 64, PROBES = 8, REFINE_FACTOR = 2);
+----
+error: PlanError
+
+create procedure tidy;
+----
+error: StoredProcNotSupported
+
+CREATE FUNCTION one () RETURNS INTEGER AS 'SELECT 1';
+----
+error: StoredProcNotSupported
+
+Create Function one;
+----
+error: StoredProcNotSupported
+
+CREATE TABLE procedure (id INTEGER PRIMARY KEY, function TEXT);
+
+CREATE TABLE expiry (id INTEGER PRIMARY KEY, expires TIMESTAMP EXPIRES) RETAIN 10 SECONDS;
+INSERT INTO expiry VALUES (1, NULL), (2, '2099-01-01T00:00:00Z'), (3, NULL);
+SELECT id FROM expiry WHERE expires IS NULL ORDER BY id;
+----
+id  (read 2, compared 0)
+1
+3
+
+UPDATE expiry SET expires = '2099-01-02T00:00:00Z' WHERE id = 1;
+SELECT id FROM expiry WHERE expires IS NULL ORDER BY id;
+----
+id  (read 1, compared 0)
+3
+
+UPDATE expiry SET expires = NULL WHERE id = 2;
+SELECT id FROM expiry WHERE expires IS NULL ORDER BY id;
+----
+id  (read 2, compared 0)
+2
+3
+
+# CONTEXT_ID and ACL are declared on a UUID column, SCOPE_LABEL on a TEXT column.
+CREATE TABLE ctx_bad (id INTEGER PRIMARY KEY, ctx TEXT CONTEXT_ID);
+----
+error: SchemaInvalid | schema invalid: table 'ctx_bad': declare CONTEXT_ID on a UUID column
+
+CREATE TABLE label_bad (id INTEGER PRIMARY KEY, scope INTEGER SCOPE_LABEL ('public'));
+----
+error: SchemaInvalid
+
+CREATE TABLE acl_bad (id INTEGER PRIMARY KEY, acl_id TEXT ACL REFERENCES acl_grants(acl_id));
+----
+error: SchemaInvalid
+
+# A vector DEFAULT written as quoted text is checked for length; a sync-safe table needs a multi-column key, not a UNIQUE.
+CREATE TABLE vdef_bad (id INTEGER PRIMARY KEY, v VECTOR(2) DEFAULT '[1.0, 2.0, 3.0]');
+----
+error: ColumnTypeMismatch | column type mismatch: vdef_bad.v expected VECTOR(2), got Text
+
+CREATE TABLE vdef_ok (id INTEGER PRIMARY KEY, v VECTOR(2) DEFAULT '[1.0, 2.0]');
+CREATE TABLE sy_multi (a INTEGER, b INTEGER, PRIMARY KEY (a, b)) RETAIN 1 DAYS SYNC SAFE;
+CREATE TABLE sy_uniq (a INTEGER, b INTEGER, UNIQUE (a, b)) RETAIN 1 DAYS SYNC SAFE;
+----
+error: SchemaInvalid | schema invalid: table 'sy_uniq' declares RETAIN ... SYNC SAFE without a PRIMARY KEY: declare a PRIMARY KEY so delivered rows have an identity
+
+CREATE TABLE rp_missing (id INTEGER PRIMARY KEY, v VECTOR(2) RANK_POLICY (JOIN nowhere ON id, FORMULA '{vector_score}', SORT_KEY s));
+----
+error: RankPolicyInvalid | invalid rank policy on rp_missing.v: it joins the unknown table 'nowhere'

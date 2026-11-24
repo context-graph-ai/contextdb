@@ -13,23 +13,23 @@ CREATE TABLE items (
 
 INSERT INTO items (id, name) VALUES (1, 'one');
 ----
-rows affected: 1
+rows affected: 1  (read 0, compared 0)
 
 INSERT INTO items (id, name, label, qty, note, ok, score)
 VALUES (2, 'two', 'b', 20, 'second', FALSE, 2.5),
        (3, 'three', 'c', 30, NULL, TRUE, 3.5),
        (4, 'four', 'd', 40, 'fourth', FALSE, 4.5);
 ----
-rows affected: 3
+rows affected: 3  (read 0, compared 0)
 
 # A NULL the statement gives stays NULL: the default is for a column that was left out.
 INSERT INTO items (id, name, qty) VALUES (5, 'five', NULL);
 ----
-rows affected: 1
+rows affected: 1  (read 0, compared 0)
 
 SELECT id, name, label, qty, note, ok, score FROM items ORDER BY id;
 ----
-id | name | label | qty | note | ok | score
+id | name | label | qty | note | ok | score  (read 5, compared 0)
 1 | one | unnamed | 1 | NULL | true | 0.5
 2 | two | b | 20 | second | false | 2.5
 3 | three | c | 30 | NULL | true | 3.5
@@ -53,7 +53,7 @@ error: UniqueViolation
 
 SELECT id FROM items ORDER BY id;
 ----
-id
+id  (read 5, compared 0)
 1
 2
 3
@@ -67,7 +67,7 @@ error: PlanError
 
 SELECT COUNT(*) FROM items WHERE id = 7;
 ----
-count
+count  (read 0, compared 0)
 0
 
 # A SELECT among the VALUES is worked out before the row is stored.
@@ -75,11 +75,11 @@ CREATE TABLE counted (id INTEGER PRIMARY KEY, seen INTEGER);
 INSERT INTO counted (id, seen) VALUES (1, 0), (2, 0);
 INSERT INTO counted (id, seen) VALUES (3, (SELECT COUNT(*) FROM counted));
 ----
-rows affected: 1
+rows affected: 1  (read 0, compared 0)
 
 SELECT seen FROM counted WHERE id = 3;
 ----
-seen
+seen  (read 1, compared 0)
 2
 
 # A comparison of unlike types with the value a SELECT gives is refused in VALUES, and nothing is stored.
@@ -96,5 +96,5 @@ error: PlanError
 
 SELECT COUNT(*) FROM flags;
 ----
-count
+count  (read 0, compared 0)
 0

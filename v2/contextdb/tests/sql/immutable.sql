@@ -1,20 +1,54 @@
-# IMMUTABLE on a table: its rows are inserted once and never updated or deleted. IMMUTABLE on a
-# column: the value is set when the row is inserted and never changed, while the row's other
-# columns stay as free as before.
+# IMMUTABLE tables allow vector-only UPDATEs; any non-vector assignment and DELETE refuse.
+# IMMUTABLE on a column: the value is set when the row is inserted and never changed, while
+# the row's other columns stay as free as before.
+
+CREATE TABLE handles (id INTEGER PRIMARY KEY, produced_by JSON) IMMUTABLE;
+INSERT INTO handles VALUES (1, '{"model":"encoder"}');
+UPDATE handles SET produced_by = produced_by;
+----
+error: ImmutableTable
 
 CREATE TABLE documents (
   id UUID PRIMARY KEY,
   data JSON,
   embedding VECTOR(3),
   title TEXT,
+  score REAL DEFAULT 0.0,
   created_at TIMESTAMP DEFAULT NOW()
 ) IMMUTABLE;
 INSERT INTO documents (id, data, embedding, title)
-VALUES ('00000000-0000-0000-0000-000000000001', '{"k": 1}', [1.0, 0.0, 0.0], 'first');
+VALUES ('00000000-0000-0000-0000-000000000001', '{"a": 0.0, "b": -0.0}', [1.0, 0.0, 0.0], 'first');
 ----
-rows affected: 1
+rows affected: 1  (read 0, compared 0)
 
-# Refused whether or not the statement would reach a row: the table says so, not the data.
+UPDATE documents SET embedding = [0.0, 1.0, 0.0];
+UPDATE documents SET embedding = [1.0, 0.0, 0.0], title = 'changed';
+----
+error: ImmutableTable
+
+UPDATE documents SET score = -0.0;
+----
+error: ImmutableTable
+
+UPDATE documents SET embedding = [1.0, 0.0, 0.0], data = '{"a": -0.0, "b": -0.0}';
+----
+error: ImmutableTable
+
+UPDATE documents SET embedding = [1.0, 0.0, 0.0], data = '{"b": 0.0, "a": -0.0}';
+----
+error: ImmutableTable
+
+SELECT embedding, title, score, data FROM documents;
+----
+embedding | title | score | data  (read 1, compared 0)
+[0.0, 1.0, 0.0] | first | 0.0 | {"a":0.0,"b":-0.0}
+
+SELECT id FROM documents ORDER BY embedding <=> [0.0, 1.0, 0.0] USE VECTOR EXACT LIMIT 1;
+----
+id  (read 2, compared 1)
+00000000-0000-0000-0000-000000000001
+
+# Scalar assignments refuse before matching rows, including when the key is missing.
 UPDATE documents SET title = 'changed' WHERE id = '00000000-0000-0000-0000-000000000001';
 ----
 error: ImmutableTable
@@ -47,6 +81,11 @@ ON CONFLICT (id) DO UPDATE SET title = 'ninth';
 ----
 error: ImmutableTable
 
+INSERT INTO documents (id, title) VALUES ('00000000-0000-0000-0000-000000000001', 'again')
+ON CONFLICT (id) DO UPDATE SET embedding = [0.0, 0.0, 1.0];
+----
+error: ImmutableTable
+
 # A plain insert is what the table takes, and a taken key is refused as on any table.
 INSERT INTO documents (id, data, title) VALUES ('00000000-0000-0000-0000-000000000002', '[2]', 'second');
 INSERT INTO documents (id, title) VALUES ('00000000-0000-0000-0000-000000000002', 'twice');
@@ -55,8 +94,8 @@ error: UniqueViolation
 
 SELECT id, data, title FROM documents ORDER BY id;
 ----
-id | data | title
-00000000-0000-0000-0000-000000000001 | {"k":1} | first
+id | data | title  (read 2, compared 0)
+00000000-0000-0000-0000-000000000001 | {"a":0.0,"b":-0.0} | first
 00000000-0000-0000-0000-000000000002 | [2] | second
 
 # A table that is never changed has no rows to expire and no older versions to drop, so IMMUTABLE
@@ -113,35 +152,35 @@ error: ImmutableColumn
 
 SELECT id, task_type, description, confidence, status FROM tasks ORDER BY id;
 ----
-id | task_type | description | confidence | status
+id | task_type | description | confidence | status  (read 1, compared 0)
 1 | sql-migration | migrate the store | NULL | active
 
 # The other columns change, by an UPDATE and by an insert that meets the row.
 UPDATE tasks SET confidence = 0.5 WHERE id = 1;
 ----
-rows affected: 1
+rows affected: 1  (read 1, compared 0)
 
 INSERT INTO tasks (id, task_type, description) VALUES (1, 'sql-migration', 'migrate the store')
 ON CONFLICT (id) DO UPDATE SET confidence = 0.75;
 ----
-rows affected: 1
+rows affected: 1  (read 1, compared 0)
 
 # A record that turned out wrong is corrected by a second row, and the first is marked: both
 # stay, and both are found.
 INSERT INTO tasks (id, task_type, description) VALUES (2, 'sql-migration', 'migrate the store (rev 2)');
 UPDATE tasks SET status = 'superseded' WHERE id = 1;
 ----
-rows affected: 1
+rows affected: 1  (read 1, compared 0)
 
 SELECT id, task_type, description, confidence, status FROM tasks ORDER BY id;
 ----
-id | task_type | description | confidence | status
+id | task_type | description | confidence | status  (read 2, compared 0)
 1 | sql-migration | migrate the store | 0.75 | superseded
 2 | sql-migration | migrate the store (rev 2) | NULL | active
 
 SELECT id FROM tasks WHERE status = 'superseded';
 ----
-id
+id  (read 2, compared 0)
 1
 
 # The column cannot be taken out of the table or given another name, with CASCADE or without.
@@ -153,13 +192,21 @@ ALTER TABLE tasks DROP COLUMN task_type CASCADE;
 ----
 error: ImmutableColumn
 
+ALTER TABLE tasks ALTER COLUMN task_type SET DATA TYPE INTEGER;
+----
+error: ParseError
+
 ALTER TABLE tasks RENAME COLUMN description TO summary;
 ----
 error: ImmutableColumn
 
+ALTER TABLE tasks ALTER COLUMN task_type SET DATA TYPE INTEGER;
+----
+error: ParseError
+
 SELECT task_type, description FROM tasks WHERE id = 2;
 ----
-task_type | description
+task_type | description  (read 1, compared 0)
 sql-migration | migrate the store (rev 2)
 
 # A column that is not IMMUTABLE goes or is renamed, and a row of the table may be deleted.
@@ -167,9 +214,9 @@ ALTER TABLE tasks RENAME COLUMN confidence TO certainty;
 ALTER TABLE tasks DROP COLUMN certainty;
 DELETE FROM tasks WHERE id = 1;
 ----
-rows affected: 1
+rows affected: 1  (read 1, compared 0)
 
 SELECT id, task_type, description, status FROM tasks ORDER BY id;
 ----
-id | task_type | description | status
+id | task_type | description | status  (read 1, compared 0)
 2 | sql-migration | migrate the store (rev 2) | active

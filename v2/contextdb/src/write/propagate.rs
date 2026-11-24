@@ -20,7 +20,7 @@ use crate::query::{Reader, Visible, equal};
 use crate::schema::Table;
 use crate::sql::ast::{EdgePropagation, Propagation};
 use crate::store::{Beside, ChangeSet, Read};
-use crate::types::{Error, Result, Value};
+use crate::types::{Error, Result, Value, heap_bytes};
 use crate::vector::Tally;
 
 /// How many edges from a changed row a rule reaches when it names no `MAX DEPTH`.
@@ -67,8 +67,9 @@ impl Rules<'_> {
             return Ok(());
         }
         let step = |follower: &Table, via: Via, columns: &[usize]| -> Result<()> {
-            let bytes = size_of::<Step>() + columns.len() * size_of::<Value>();
-            let mut held = self.given.budget.reserve(bytes as u64, "query")?;
+            let bytes =
+                3 * size_of::<Step>() + columns.len() * size_of::<Value>() + follower.name.len();
+            let mut held = self.given.budget.reserve(bytes as u64, "query_decode")?;
             let mut values = Vec::new();
             for &at in columns {
                 values.push(match left.iter().find(|unread| unread.0 == at) {
@@ -87,7 +88,7 @@ impl Rules<'_> {
             });
             Ok(())
         };
-        for child in self.given.catalog.tables() {
+        for child in self.given.catalog.children(table) {
             for (place, reference) in child.rules.references.iter().enumerate() {
                 let rule = reference.on_state.as_ref();
                 if reference.parent == table.name && rule.is_some_and(|r| r.on_state == *state) {
@@ -134,9 +135,12 @@ pub(super) fn follow(rules: &Rules, changes: &mut ChangeSet, partitions: &mut Ta
     if first.is_empty() {
         return Ok(());
     }
+    changes.operation = Some(crate::types::TriggerEvent::Update);
     let admin = Reader::admin();
+    let narrowed = !rules.given.reader.is_admin();
     let given = Given {
         reader: &admin,
+        examined: rules.given.examined.filter(|_| !narrowed),
         ..*rules.given
     };
     let mut walk = Walk {
@@ -188,11 +192,7 @@ impl Walk<'_> {
         }
         let given = self.given;
         let key = [table.column("id")?];
-        for edges in given.catalog.tables() {
-            let mut indexes = edges.meta.indexes.iter();
-            if !indexes.any(|index| index.name.starts_with("__graph_edge_")) {
-                continue;
-            }
+        for edges in given.catalog.edges() {
             let ends = [edges.column("source_id")?, edges.column("target_id")?];
             let kind = edges.column("edge_type")?;
             let rules = Rules::of(edges, given)?;
@@ -249,6 +249,7 @@ impl Walk<'_> {
         let (filter, bound) = equal(table, columns, values);
         let assigned = state.as_slice();
         let asked = rules.asked(Some(&filter), &bound, assigned, &needed, given.reader);
+        let mut cover = given.budget.passing("propagated row")?;
         let to = Value::Text(rule.set.clone());
         rules.each(&asked, changes, |changes, key, cells| {
             let (old, left) = split(cells);
@@ -274,6 +275,8 @@ impl Walk<'_> {
                     ),
                 });
             };
+            let bytes = old.iter().map(heap_bytes).sum::<u64>();
+            cover.cover(bytes + size_of_val(old.as_slice()) as u64 + rule.set.len() as u64)?;
             let mut row = old.clone();
             row[at] = to.clone();
             rules.moved(&old, &row, &left, &*changes)?;

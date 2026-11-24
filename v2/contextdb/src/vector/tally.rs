@@ -17,7 +17,7 @@ use crate::types::{Error, Result, Value};
 ///
 /// It is kept in step with the staged rows, row by row, and is exact for the moment the
 /// transaction began at together with what the transaction has staged. A partition that
-/// another transaction commits meanwhile is not seen here: [`super::stage`] counts again
+/// another transaction commits meanwhile is not seen here: [`super::track_unindexed`] counts again
 /// inside the commit function, over the newest moment.
 pub(crate) struct Tally {
     /// Vectors under each key tuple a statement has touched: what the committed moment has
@@ -27,6 +27,7 @@ pub(crate) struct Tally {
     partitions: BTreeMap<VectorId, u64>,
     /// What the statement that is running has noted, in order, so that it can be undone.
     noted: Vec<Note>,
+    notes: Reservation,
     /// Never read: holds what the three lists above take.
     reserved: Reservation,
 }
@@ -38,13 +39,6 @@ struct Note {
     arrived: bool,
     /// True when the tuple had no vector until this one arrived.
     began: bool,
-}
-
-impl Note {
-    /// What a note is counted as while its statement runs.
-    fn bytes(&self) -> u64 {
-        self.place.1.as_bytes().len() as u64 + 16
-    }
 }
 
 /// Puts one vector under a key tuple, or takes one from it, and keeps the column's number of
@@ -67,6 +61,7 @@ impl Tally {
             live: BTreeMap::new(),
             partitions: BTreeMap::new(),
             noted: Vec::new(),
+            notes: budget.reserve(0, "partition notes")?,
             reserved: budget.reserve(0, "transaction")?,
         })
     }
@@ -98,7 +93,7 @@ impl Tally {
             }
             for (tuple, arrived) in [(left, false), (entered, true)] {
                 if let Some(tuple) = tuple {
-                    self.count((column.id, tuple), arrived, read)?;
+                    self.count((column, tuple), arrived, read)?;
                 }
             }
         }
@@ -107,19 +102,30 @@ impl Tally {
 
     /// Counts one vector more under a key tuple, or one fewer, and notes it. The column's
     /// partitions and the tuple's vectors are read from the committed moment the first time.
-    fn count(&mut self, place: (VectorId, Key), arrived: bool, read: &dyn Read) -> Result<()> {
+    fn count(&mut self, at: (&VectorColumn, Key), arrived: bool, read: &dyn Read) -> Result<()> {
+        let (col, place) = (at.0, (at.0.id, at.1));
         let (vector, tuple) = (place.0, &place.1);
+        self.notes.room(&mut self.noted, usize::MAX)?;
+        self.notes.grow(tuple.as_bytes().len() as u64 + 16)?;
+        let node = crate::memory::node::<((VectorId, Key), u64)>();
+        self.reserved.grow(
+            tuple.as_bytes().len() as u64 + node * if self.live.is_empty() { 4 } else { 1 },
+        )?;
         let partitions = match self.partitions.entry(vector) {
             Entry::Occupied(counted) => counted.into_mut(),
             Entry::Vacant(first) => {
+                self.reserved
+                    .grow(crate::memory::node::<(VectorId, u64)>() * 4)?;
                 first.insert(read.vector_number(VectorNumber::Partitions(vector))?)
             }
         };
         let live = match self.live.entry(place.clone()) {
-            Entry::Occupied(counted) => counted.into_mut(),
+            Entry::Occupied(counted) => {
+                self.reserved.shrink(tuple.as_bytes().len() as u64 + node);
+                counted.into_mut()
+            }
             Entry::Vacant(first) => {
-                let partition = directory::partition(read, vector, tuple)?;
-                self.reserved.grow(tuple.as_bytes().len() as u64 + 64)?;
+                let partition = directory::partition(read, col, tuple)?;
                 first.insert(partition.map_or(0, |partition| partition.live))
             }
         };
@@ -132,7 +138,6 @@ impl Tally {
             arrived,
             began: false,
         };
-        self.reserved.grow(note.bytes())?;
         note.began = shift(live, partitions, arrived);
         self.noted.push(note);
         Ok(())
@@ -156,9 +161,8 @@ impl Tally {
                 });
             }
         }
-        let kept: u64 = self.noted.iter().map(Note::bytes).sum();
-        self.reserved.shrink(kept);
-        self.noted.clear();
+        self.noted = Vec::new();
+        self.notes.shrink(self.notes.bytes());
         Ok(())
     }
 
@@ -171,17 +175,18 @@ impl Tally {
             {
                 shift(live, partitions, !note.arrived);
             }
-            self.reserved.shrink(note.bytes());
         }
+        self.noted = Vec::new();
+        self.notes.shrink(self.notes.bytes());
     }
 }
 
 /// Where a column that a table's declaration names is in a row of the table.
-pub(super) fn position(table: &Table, name: &str) -> usize {
+pub(super) fn position(table: &Table, name: &str, read: &dyn Read) -> Result<usize> {
     let mut columns = table.meta.columns.iter();
     columns
         .position(|column| column.name == name)
-        .expect("a VECTOR column and the columns of its PARTITION_KEY are columns of its table")
+        .ok_or_else(|| read.damaged("a VECTOR column or its PARTITION_KEY names no column"))
 }
 
 /// The key tuple a row's vector was under in a VECTOR column, and the one it is under now.
@@ -202,12 +207,13 @@ pub(super) fn tuples(
     read: &dyn Read,
     held: &mut Reservation,
 ) -> Result<(Option<Key>, Option<Key>)> {
-    let vector = position(table, &column.column);
+    let at = |name: &str| position(table, name, read);
+    let vector = at(&column.column)?;
     let machine = table.meta.state_machine.as_ref();
-    let state = machine.map(|machine| position(table, &machine.column));
+    let state = machine.map(|machine| at(&machine.column)).transpose()?;
     let excluded = |value: &Value| matches!(value, Value::Text(state) if table.rules.exclude_vector_states.contains(state));
     let keys = column.partition_key.iter();
-    let keys: Vec<usize> = keys.map(|name| position(table, name)).collect();
+    let keys: Vec<usize> = keys.map(|name| at(name)).collect::<Result<_>>()?;
     let tuple = |values: Result<Vec<Value>>| Key::from_values(&values?, &[]).map(Some);
     let was = match before {
         Some(row)

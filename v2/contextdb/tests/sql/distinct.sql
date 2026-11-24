@@ -6,7 +6,7 @@ VALUES (1, 'a', 'x'), (2, 'a', 'x'), (3, 'a', 'y'), (4, 'b', 'x'), (5, NULL, NUL
 
 SELECT DISTINCT ctx FROM hits ORDER BY ctx;
 ----
-ctx
+ctx  (read 6, compared 0)
 a
 b
 NULL
@@ -14,7 +14,7 @@ NULL
 # Rows are the same when every column is, and two NULLs are the same here.
 SELECT DISTINCT ctx, conn FROM hits ORDER BY ctx, conn;
 ----
-ctx | conn
+ctx | conn  (read 6, compared 0)
 a | x
 a | y
 b | x
@@ -23,7 +23,7 @@ NULL | NULL
 # LIMIT counts the rows that are left.
 SELECT DISTINCT conn FROM hits ORDER BY conn LIMIT 2;
 ----
-conn
+conn  (read 6, compared 0)
 x
 y
 
@@ -35,14 +35,14 @@ VALUES (0, [1.0, 0.0, 0.0], 1), (1, [0.0, 1.0, 0.0], 2), (2, NULL, NULL),
 
 SELECT DISTINCT v FROM marks;
 ----
-v
+v  (read 6, compared 0)
 *
 *
 *
 
 SELECT DISTINCT x FROM marks ORDER BY x;
 ----
-x
+x  (read 6, compared 0)
 1
 2
 NULL
@@ -50,14 +50,14 @@ NULL
 # Vectors are values: equal ones group and partition together, and sort by their numbers.
 SELECT COUNT(*) AS n FROM marks GROUP BY v ORDER BY n;
 ----
-n
+n  (read 6, compared 0)
 2
 2
 2
 
 SELECT id, ROW_NUMBER() OVER (PARTITION BY v ORDER BY id) AS rn FROM marks ORDER BY id;
 ----
-id | rn
+id | rn  (read 6, compared 0)
 0 | 1
 1 | 1
 2 | 1
@@ -67,7 +67,7 @@ id | rn
 
 SELECT id FROM marks WHERE v IS NOT NULL ORDER BY v, id;
 ----
-id
+id  (read 6, compared 0)
 1
 4
 0
@@ -81,14 +81,14 @@ error: PlanError
 # Equal vectors are equal: = matches every row that holds them.
 SELECT id FROM marks WHERE v = [1.0, 0.0, 0.0] ORDER BY id;
 ----
-id
+id  (read 6, compared 0)
 0
 3
 
 # A name the select list gives under a qualifier is that item: it may be sorted by.
 SELECT DISTINCT marks.x FROM marks ORDER BY x;
 ----
-x
+x  (read 6, compared 0)
 1
 2
 NULL
@@ -97,5 +97,5 @@ NULL
 # (Postgres matches the two by structure; not shown in its pages, believed from its source.)
 SELECT DISTINCT (SELECT 1) AS k FROM marks ORDER BY (SELECT 1);
 ----
-k
+k  (read 6, compared 0)
 1

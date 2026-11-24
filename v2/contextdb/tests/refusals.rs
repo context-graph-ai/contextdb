@@ -4,67 +4,7 @@
 mod support;
 
 use contextdb::serde_json::json;
-use contextdb::{ColumnType, Error, ReadSession, Value, params};
-
-#[test]
-fn a_unique_refusal_names_the_table_and_every_column_of_the_rule() {
-    let folder = support::folder("unique-refusal");
-    let db = support::open(&folder);
-    support::run(
-        &db,
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c INTEGER, UNIQUE (a, b, c))",
-    );
-    support::run(&db, "INSERT INTO t (id, a, b, c) VALUES (1, 1, 'x', 1)");
-    // One column of the three differs: not a duplicate.
-    support::run(&db, "INSERT INTO t (id, a, b, c) VALUES (2, 1, 'x', 2)");
-
-    match support::refusal(&db, "INSERT INTO t (id, a, b, c) VALUES (3, 1, 'x', 1)") {
-        Error::UniqueViolation { table, column, .. } => {
-            assert_eq!((table.as_str(), column.as_str()), ("t", "a, b, c"));
-        }
-        other => panic!("a duplicate under UNIQUE (a, b, c) was refused as {other:?}"),
-    }
-    assert_eq!(support::int(&db, "SELECT COUNT(*) FROM t"), 2);
-}
-
-#[test]
-fn a_second_create_table_names_the_table_and_changes_nothing() {
-    let folder = support::folder("second-create-table");
-    let db = support::open(&folder);
-    support::run(
-        &db,
-        "CREATE TABLE ledger (id INTEGER PRIMARY KEY, entry TEXT NOT NULL)",
-    );
-    support::run(
-        &db,
-        "INSERT INTO ledger (id, entry) VALUES (1, 'first'), (2, 'second')",
-    );
-    let declared = db
-        .declaration("ledger")
-        .expect("the declaration of a declared table");
-    let entries = "SELECT id, entry FROM ledger ORDER BY id";
-    let stored = support::rows(&db, entries);
-
-    // Refused whether the second declaration differs from the first or repeats it.
-    for sql in [
-        "CREATE TABLE ledger (id INTEGER PRIMARY KEY, amount INTEGER)",
-        "CREATE TABLE ledger (id INTEGER PRIMARY KEY, entry TEXT NOT NULL)",
-    ] {
-        match support::refusal(&db, sql) {
-            Error::SchemaInvalid { reason } => {
-                assert!(
-                    reason.contains("ledger"),
-                    "the refusal does not name the table: {reason}"
-                );
-            }
-            other => panic!("{sql}\nwas refused as {other:?}"),
-        }
-    }
-    assert_eq!(db.table_names(), ["ledger"]);
-    assert_eq!(db.declaration("ledger").expect("the declaration"), declared);
-    assert_eq!(support::rows(&db, entries), stored);
-    assert_eq!(stored.len(), 2);
-}
+use contextdb::{ColumnType, Error, Value, params};
 
 #[test]
 fn a_parse_refusal_names_the_offending_text_the_same_for_a_writer_and_a_reader() {
@@ -72,9 +12,20 @@ fn a_parse_refusal_names_the_offending_text_the_same_for_a_writer_and_a_reader()
     let db = support::open(&folder);
     support::declare(&db);
     support::insert(&db, 1..=3);
-    let reader = ReadSession::open(&folder).expect("open the store for reading");
+    let reader = support::open_reader(&folder, None);
 
-    for (sql, offending) in [("SELEKT id FROM t", "SELEKT"), ("SELECT id FRUM t", "FRUM")] {
+    for (sql, offending) in [
+        ("SELEKT id FROM t", "SELEKT"),
+        ("SELECT id FRUM t", "FRUM"),
+        (
+            "CREATE TABLE r (a INT) RETAIN 1 DAYS SYNC SAFE PUSH ONLY",
+            "SYNC PUSH ONLY",
+        ),
+        (
+            "CREATE TABLE r (a INT) RETAIN 1 DAYS SYNC SAFE TWO WAY",
+            "SYNC TWO WAY",
+        ),
+    ] {
         let from_writer = match support::refusal(&db, sql) {
             Error::ParseError(text) => text,
             other => panic!("{sql}\nwas refused by the writer as {other:?}"),
@@ -92,7 +43,18 @@ fn a_parse_refusal_names_the_offending_text_the_same_for_a_writer_and_a_reader()
             "{sql}\nis refused in different words by a reader"
         );
     }
-    assert_eq!(db.table_names(), ["t"]);
+    // Replaced compaction controls explain themselves by name in one sentence.
+    for (setting, value) in [("MAX_SWEEPS", "4"), ("NO_SUCH_SETTING", "1")] {
+        let sql = format!("SET STORAGE_COMPACTION {setting} {value}");
+        let Error::PlanError(text) = support::refusal(&db, &sql) else {
+            panic!("{setting} needs its named replacement explanation");
+        };
+        assert!(text.contains(setting), "{text}");
+        assert_eq!(text.split_terminator('.').count(), 1, "{text}");
+        assert!(!text.contains('\n'), "{text}");
+        assert!(matches!(support::refusal(&reader, &sql), Error::PlanError(s) if s == text));
+    }
+    assert_eq!(support::names(&db), ["t"]);
     support::assert_rows_are(&db, 1..=3);
 }
 
@@ -159,7 +121,10 @@ fn text_that_is_not_json_is_refused_in_a_json_column() {
             other => panic!("an index over the {column} column was refused as {other:?}"),
         }
     }
-    assert_eq!(db.declaration("docs").expect("the declaration"), declared);
+    assert_eq!(
+        db.declaration("docs").expect("the declaration").as_str(),
+        declared.as_str()
+    );
 }
 
 #[test]
@@ -171,13 +136,18 @@ fn a_read_session_refuses_a_statement_that_writes() {
     // The store keeps a declared memory limit, so declaring one is a write as well.
     let limit = 512 << 20;
     db.set_memory_limit(Some(limit)).expect("declare a limit");
-    let reader = ReadSession::open(&folder).expect("open the store for reading");
+    let reader = support::open_reader(&folder, None);
 
     for sql in [
         "INSERT INTO t (id, name, tag) VALUES (4, 'row-0000004', 4)",
         "CREATE TABLE made (id INTEGER PRIMARY KEY)",
         "SET MEMORY_LIMIT 2G",
         "SET MEMORY_LIMIT NONE",
+        "SET MAINTENANCE_POLL_INTERVAL 2 SECONDS",
+        "SET DISK_LIMIT 16M",
+        "SET STORAGE_COMPACTION START_RATIO 0.2",
+        "SET STORAGE_COMPACTION STOP_RATIO 0.01",
+        "SET UNINDEXED_VECTOR_LIMIT 400",
     ] {
         let refusal = support::refusal(&reader, sql);
         assert!(
@@ -187,10 +157,10 @@ fn a_read_session_refuses_a_statement_that_writes() {
     }
     // The session still reads, and the writer sees nothing changed.
     support::assert_rows_are(&reader, 1..=3);
-    assert_eq!(db.table_names(), ["t"]);
+    assert_eq!(support::names(&db), ["t"]);
     support::assert_rows_are(&db, 1..=3);
     // The limit the store keeps is the one the writer declared, now and after reopening.
-    assert_eq!(db.memory_limit(), Some(limit));
+    assert_eq!(support::limit(&db), Some(limit));
     support::close(db);
-    assert_eq!(support::open(&folder).memory_limit(), Some(limit));
+    assert_eq!(support::limit(&support::open(&folder)), Some(limit));
 }

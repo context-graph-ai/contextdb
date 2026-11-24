@@ -82,11 +82,11 @@ error: TableNotFound
 # What does compare, on the empty table: an answer of no rows and no refusal.
 SELECT id FROM things WHERE n = 7 AND ratio > 1 AND label = 'seven' AND flag = TRUE;
 ----
-id
+id  (read 0, compared 0)
 
 SELECT id FROM things WHERE n = NULL;
 ----
-id
+id  (read 0, compared 0)
 
 INSERT INTO things (id, n, ratio, label, flag, ref, at)
 VALUES (1, 7, 1.5, 'seven', TRUE, '550e8400-e29b-41d4-a716-446655440001', '2026-01-01T00:00:00Z'),
@@ -113,47 +113,47 @@ error: PlanError
 # Quoted text is read as a UUID, in either case, and as a TIMESTAMP.
 SELECT id FROM things WHERE ref = '550E8400-E29B-41D4-A716-446655440002';
 ----
-id
+id  (read 3, compared 0)
 2
 
 SELECT id FROM things WHERE at = '2026-01-01T00:00:00Z';
 ----
-id
+id  (read 3, compared 0)
 1
 
 SELECT id FROM things WHERE at > '2026-01-01T12:00:00Z' ORDER BY id;
 ----
-id
+id  (read 3, compared 0)
 2
 
 # An INTEGER is read as a REAL.
 SELECT id FROM things WHERE ratio = 2;
 ----
-id
+id  (read 3, compared 0)
 2
 
 SELECT id FROM things WHERE ratio > 1 ORDER BY id;
 ----
-id
+id  (read 3, compared 0)
 1
 2
 
 # The same conversions in an UPDATE and a DELETE.
 UPDATE things SET label = 'two' WHERE ratio = 2;
 ----
-rows affected: 1
+rows affected: 1  (read 3, compared 0)
 
 UPDATE things SET n = 9 WHERE ref = '550e8400-e29b-41d4-a716-446655440001';
 ----
-rows affected: 1
+rows affected: 1  (read 3, compared 0)
 
 DELETE FROM things WHERE at = '2026-01-02T00:00:00Z';
 ----
-rows affected: 1
+rows affected: 1  (read 3, compared 0)
 
 SELECT id, n, label FROM things ORDER BY id;
 ----
-id | n | label
+id | n | label  (read 2, compared 0)
 1 | 9 | seven
 3 | NULL | NULL
 
@@ -167,27 +167,27 @@ CREATE TABLE wide (id INTEGER PRIMARY KEY, x REAL);
 CREATE INDEX wide_x ON wide (x);
 INSERT INTO wide (id, x) VALUES (1, 9007199254740992.0);
 ----
-rows affected: 1
+rows affected: 1  (read 0, compared 0)
 
 SELECT id FROM wide WHERE x = 9007199254740993;
 ----
-id
+id  (read 1, compared 0)
 
 SELECT id FROM wide WHERE x >= 9007199254740993;
 ----
-id
+id  (read 1, compared 0)
 
 SELECT id FROM wide WHERE x = 9007199254740992;
 ----
-id
+id  (read 1, compared 0)
 1
 
 # A whole number a REAL cannot hold is above the REAL that is nearest it.
 INSERT INTO wide (id, x) VALUES (2, 9223372036854775808.0);
 ----
-rows affected: 1
+rows affected: 1  (read 0, compared 0)
 
 SELECT id FROM wide WHERE x > 9223372036854775807;
 ----
-id
+id  (read 2, compared 0)
 2

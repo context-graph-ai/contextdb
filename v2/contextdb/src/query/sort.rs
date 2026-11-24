@@ -27,7 +27,7 @@ pub(super) struct Sort<'s> {
 }
 
 impl Source for Sort<'_> {
-    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<u64> {
+    fn rows(&self, reservation: &mut Reservation, each: &mut Each<'_>) -> Result<()> {
         let (scope, ctx) = (&self.scope, self.ctx);
         // A row whose distance in a sort key is NULL is in no answer.
         let distance = |expr: &Expr| matches!(expr, Expr::Distance { .. });
@@ -38,17 +38,15 @@ impl Source for Sort<'_> {
         // The greatest of a heap is the row that sorts last: the one to drop for a better one.
         let mut best = BinaryHeap::new();
         let mut arrived = 0_i64;
-        let examined = self
-            .input
+        self.input
             .rows(reservation, &mut |row, bytes, reservation| {
                 let order = self.order.iter();
                 let most = order.map(|key| most_bytes(&key.expr, scope, &row, ctx));
-                let beside = row_overhead(descending.len())
-                    + size_of::<Key<'_, (Vec<Value>, u64, u64)>>() as u64
-                    + most.sum::<u64>();
+                let beside = row_overhead(descending.len()) + most.sum::<u64>();
                 reservation.grow(beside)?;
                 let order = self.order.iter();
-                let keys = order.map(|key| eval(&key.expr, scope, &row, ctx));
+                let keys = order
+                    .map(|key| eval(&key.expr, scope, &row, ctx).map(std::borrow::Cow::into_owned));
                 let keys: Vec<Value> = keys
                     .chain([Ok(Value::Int64(arrived))])
                     .collect::<Result<_>>()?;
@@ -57,6 +55,7 @@ impl Source for Sort<'_> {
                     reservation.shrink(bytes + beside);
                     return Ok(true);
                 }
+                reservation.room(&mut best, usize::MAX)?;
                 best.push(Key(keys, &descending, (row, bytes, beside)));
                 arrived += 1;
                 if best.len() > self.most
@@ -71,7 +70,7 @@ impl Source for Sort<'_> {
             .into_iter()
             .map(|Key(_, _, kept)| kept);
         hand_on(kept, reservation, each)?;
-        Ok(examined)
+        Ok(())
     }
 }
 

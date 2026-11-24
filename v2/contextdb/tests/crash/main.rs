@@ -10,57 +10,27 @@
 //! syncs of its data file; before call number `stop_at` it announces `stopped` and waits there,
 //! and the parent kills it.
 
+mod purge;
 #[path = "../support/mod.rs"]
 mod support;
 
 use std::collections::BTreeSet;
 use std::fs;
 use std::io;
-use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use contextdb::{
-    Database, DatabaseOpenOptions, Error, ReadSession, ReadSessionOptions, Value, WrapStorage,
-    params,
-};
+use contextdb::{Database, DatabaseOpenOptions, Error, ReadSession, Value, WrapStorage, params};
 
-use support::{Call, Child, Run};
-
-/// Runs the child `role` of `test` over `folder` to its end, and returns what it announced: the
-/// storage calls made when the work under test began (announced under the word `begins`, none
-/// for 0), the calls in all, and every line.
-fn learned(test: &str, role: &str, folder: &Path, begins: Option<&str>) -> (u64, u64, Vec<String>) {
-    let lines = Child::start(test, &format!("{role} stop_at=0"), folder).end();
-    let announced = |word: &str| {
-        support::last_number(&lines, word).unwrap_or_else(|| panic!("the {role} announces {word}"))
-    };
-    (begins.map_or(0, announced), announced("calls"), lines)
-}
-
-/// For each storage call in `calls`: makes a store, runs the child `role` of `test` over it until
-/// it stops before that call, kills it, and gives `after` the call, the store and the lines the
-/// child announced before it stopped.
-fn for_each_stop(
-    test: &str,
-    role: &str,
-    calls: RangeInclusive<u64>,
-    store: impl Fn(u64) -> PathBuf,
-    mut after: impl FnMut(u64, &Path, &[String]),
-) {
-    for k in calls {
-        let folder = store(k);
-        let mut child = Child::start(test, &format!("{role} stop_at={k}"), &folder);
-        let announced = child.until("stopped");
-        child.kill();
-        after(k, &folder, &announced);
-    }
-}
+use support::{Call, Child, Run, count, faulting_before_call, for_each_stop, learned};
 
 #[test]
 fn a_kill_at_any_storage_call_of_a_commit_leaves_all_or_nothing() {
     if let Some(role) = support::role() {
+        if role.name == "purger" {
+            return purge::purging(role);
+        }
         return five_commits(role);
     }
     let test = "a_kill_at_any_storage_call_of_a_commit_leaves_all_or_nothing";
@@ -68,7 +38,9 @@ fn a_kill_at_any_storage_call_of_a_commit_leaves_all_or_nothing() {
     let (_, calls, _) = learned(test, "writer", &store_with_rows("kill-count", 0), None);
     assert!(calls >= 5, "five commits made {calls} writes and syncs");
 
-    let store = |k| store_with_rows(&format!("kill-at-{k}"), 0);
+    let store = store_with_rows("kill-source", 0);
+    let sequel = support::folder("kill-again");
+    let mut from = 0;
     for_each_stop(test, "writer", 1..=calls, store, |k, folder, before| {
         // Commits that had returned before the kill.
         let committed = support::last_number(before, "committed").unwrap_or(0) as i64;
@@ -83,14 +55,37 @@ fn a_kill_at_any_storage_call_of_a_commit_leaves_all_or_nothing() {
         // The store goes on from the state it reopened at.
         support::insert(&db, rows + 1..=rows + 1);
         support::assert_rows_are(&db, 1..=rows + 1);
+        if k == calls / 2 {
+            fs::copy(folder.join("data"), sequel.join("data")).unwrap();
+            from = rows + 1;
+        }
     });
+    let counted = support::folder("kill-again-count");
+    fs::copy(sequel.join("data"), counted.join("data")).unwrap();
+    let (_, calls, _) = learned(test, "writer", &counted, None);
+    for_each_stop(
+        test,
+        "writer",
+        [1, calls / 2, calls],
+        sequel,
+        |_, folder, before| {
+            let db = support::open(folder);
+            let committed = support::last_number(before, "committed").map_or(from, |n| n as i64);
+            let rows = support::int(&db, "SELECT COUNT(*) FROM t");
+            assert!(rows == committed || rows == committed + 1);
+            support::assert_rows_are(&db, 1..=rows);
+            db.verify().unwrap();
+        },
+    );
+    purge::kill_workload(test);
 }
 
 /// Commits rows 1 to 5, one commit each, announcing `committed <n>` after each one returns, and
 /// `calls <total>` once the store is closed.
 fn five_commits(role: support::Role) {
     let (db, calls) = open_stopping(&role);
-    for n in 1..=5 {
+    let first = support::int(&db, "SELECT COUNT(*) FROM t") + 1;
+    for n in first..first + 5 {
         support::insert(&db, n..=n);
         support::say(format!("committed {n}"));
     }
@@ -112,7 +107,7 @@ fn a_kill_inside_a_commit_of_many_rows_keeps_rows_index_and_count_together() {
         "a commit of a thousand rows made no write and no sync"
     );
 
-    let store = |k| store_with_rows(&format!("kill-large-at-{k}"), 10);
+    let store = store_with_rows("kill-large-source", 10);
     for_each_stop(
         test,
         "writer",
@@ -169,8 +164,8 @@ fn a_damaged_page_is_refused_as_damage_by_name() {
 
     // Through a reader: each page the scan reads is damaged in turn, on its way from the file.
     let on_disk = fs::read(folder.join("data")).expect("read the data file");
-    let refused = damage_each_page_of_a_scan(&wanted, |storage| {
-        let mut options = ReadSessionOptions::default();
+    let refused = damage_each_page_of_a_scan(&wanted, support::SCAN, |storage| {
+        let mut options = support::reader_options(None);
         options.storage = Some(storage);
         ReadSession::open_with_options(&folder, options)
     });
@@ -182,7 +177,7 @@ fn a_damaged_page_is_refused_as_damage_by_name() {
     );
 
     // Through the writer: the same.
-    let refused = damage_each_page_of_a_scan(&wanted, |storage| {
+    let refused = damage_each_page_of_a_scan(&wanted, support::SCAN, |storage| {
         let mut options = DatabaseOpenOptions::default();
         options.storage = Some(storage);
         support::open_with(&folder, options)
@@ -194,6 +189,39 @@ fn a_damaged_page_is_refused_as_damage_by_name() {
     // The file itself was never damaged, and nothing was rebuilt from a damaged read: opened
     // with no damage on the way, the store holds what it held.
     support::assert_rows_are(&support::open(&folder), 1..=310);
+}
+
+#[test]
+fn a_damaged_page_of_an_indexed_search_is_refused_as_damage_by_name() {
+    let folder = support::folder("damaged-vector-page");
+    let db = support::open(&folder);
+    support::declare_docs(&db, DIMENSION, "INDEXING_THRESHOLD 100");
+    support::load_docs(&db, 1..=300, "a", |n| support::gathered(n, DIMENSION));
+    support::maintenance(&db);
+    assert_eq!(groups(&db), Value::Int64(17), "the IVF is built");
+    support::load_docs(&db, 301..=310, "a", |n| support::gathered(n, DIMENSION));
+    let sql = support::by_mode(None, "INDEXED", 10);
+    let query = support::gathered(98_101, DIMENSION);
+    let wanted = support::search(&db, &sql, &query).unwrap().rows().to_vec();
+    support::close(db);
+    let reader = |storage| {
+        let mut options = support::reader_options(None);
+        options.storage = Some(storage);
+        ReadSession::open_with_options(&folder, options)
+    };
+    assert!(
+        damage_each_page_of_a_scan(&wanted, &sql, reader) > 0,
+        "a reader met no damage"
+    );
+    let writer = |storage| {
+        let mut options = DatabaseOpenOptions::default();
+        options.storage = Some(storage);
+        support::open_with(&folder, options)
+    };
+    assert!(
+        damage_each_page_of_a_scan(&wanted, &sql, writer) > 0,
+        "the writer met no damage"
+    );
 }
 
 /// Opens the store, adds rows 301 to 310, announces `committed` and holds the store until it is
@@ -211,6 +239,7 @@ fn killed_writer(role: support::Role) {
 /// another refusal. Returns how many times it was refused as damage.
 fn damage_each_page_of_a_scan<S: Run>(
     wanted: &[Vec<Value>],
+    scan: &str,
     open: impl Fn(WrapStorage) -> contextdb::Result<S>,
 ) -> usize {
     // The offsets the scan reads at, in order.
@@ -228,11 +257,9 @@ fn damage_each_page_of_a_scan<S: Run>(
     }))
     .unwrap_or_else(|error| panic!("the undamaged store did not open: {error:?}"));
     scanning.store(true, Ordering::SeqCst);
-    support::assert_same_rows(
-        &support::rows(&session, support::SCAN),
-        wanted,
-        "the undamaged scan",
-    );
+    let query = params! { "q" => support::gathered(98_101, DIMENSION) };
+    let answer = session.run(scan, &query).unwrap();
+    support::assert_same_rows(answer.rows(), wanted, "the undamaged scan");
     scanning.store(false, Ordering::SeqCst);
     drop(session);
     let offsets = offsets.lock().expect("the list of offsets").clone();
@@ -251,7 +278,7 @@ fn damage_each_page_of_a_scan<S: Run>(
                 *byte ^= 0xFF;
             }
         });
-        let answer = open(storage).and_then(|session| session.run(support::SCAN, &params! {}));
+        let answer = open(storage).and_then(|session| session.run(scan, &query));
         match answer {
             Err(Error::StoreCorrupted { .. }) => refused += 1,
             Err(other) => panic!("damage in the page at {damaged} was reported as {other:?}"),
@@ -270,7 +297,19 @@ const PADDING_ROWS: i64 = 20_000;
 
 #[test]
 fn a_commit_on_disk_is_reported_and_served_though_the_read_after_it_fails() {
-    let folder = support::folder("read-fails-after-commit");
+    let test = "a_commit_on_disk_is_reported_and_served_though_the_read_after_it_fails";
+    let folder = if let Some(role) = support::role() {
+        role.folder
+    } else {
+        let mut child = Child::start(test, "faults", &support::folder("read-fails-after-commit"));
+        child.until("failed");
+        child.tell("resume");
+        child.end();
+        return;
+    };
+    let (pause, searching, reads) = support::pausing_at_read(1);
+    let paused = Arc::new(std::sync::OnceLock::new());
+    let fail_kind = Arc::new(AtomicU64::new(0));
     // The storage door counts syncs. Told a number, it fails every read made once that many
     // syncs have been counted: the reads that follow a commit's arrival on disk.
     let syncs = Arc::new(AtomicU64::new(0));
@@ -282,13 +321,30 @@ fn a_commit_on_disk_is_reported_and_served_though_the_read_after_it_fails() {
         let mut options = DatabaseOpenOptions::default();
         options.storage = Some(support::failing_storage({
             let (syncs, fail_after, failed) = (syncs.clone(), fail_after.clone(), failed.clone());
-            let fail_now = fail_now.clone();
+            let (fail_now, fail_kind) = (fail_now.clone(), fail_kind.clone());
+            let (pause, paused, searching, data) = (
+                pause.clone(),
+                paused.clone(),
+                searching.clone(),
+                folder.join("data"),
+            );
             move |call| {
+                if matches!(
+                    (&call, fail_kind.load(Ordering::SeqCst)),
+                    (Call::Write(..), 1) | (Call::Sync, 2)
+                ) {
+                    return Err(io::Error::other("a write or sync this test makes fail"));
+                }
                 match call {
                     Call::Sync => {
                         syncs.fetch_add(1, Ordering::SeqCst);
                     }
-                    Call::Read(..) => {
+                    Call::Read(offset, out) => {
+                        if searching.load(Ordering::SeqCst) {
+                            paused
+                                .get_or_init(|| pause(fs::File::open(&data).unwrap()).unwrap())
+                                .read(offset, out)?;
+                        }
                         let after = fail_after.load(Ordering::SeqCst);
                         if fail_now.load(Ordering::SeqCst)
                             || (after > 0 && syncs.load(Ordering::SeqCst) >= after)
@@ -297,7 +353,7 @@ fn a_commit_on_disk_is_reported_and_served_though_the_read_after_it_fails() {
                             return Err(io::Error::other("a read this test makes fail"));
                         }
                     }
-                    Call::Write(..) => {}
+                    Call::Write(..) | Call::Resize(_) | Call::Close => {}
                 }
                 Ok(())
             }
@@ -366,7 +422,12 @@ fn a_commit_on_disk_is_reported_and_served_though_the_read_after_it_fails() {
     // The padding does not fit the page cache, so reading all of it now has to fail, and by
     // name. That also shows the failure this test makes is one the store meets.
     match db.run(padding, &params! {}) {
-        Err(Error::StoreIo { .. }) => {}
+        Err(error @ Error::StoreIo { .. }) => {
+            assert!(
+                !error.to_string().contains("reset"),
+                "a read that failed is retryable: {error}"
+            )
+        }
         other => panic!("a scan that must read the file got {other:?} while reads fail"),
     }
     assert!(
@@ -374,7 +435,7 @@ fn a_commit_on_disk_is_reported_and_served_though_the_read_after_it_fails() {
         "no read was made to fail after the commit"
     );
     fail_after.store(0, Ordering::SeqCst);
-    answers_with_rows_or_store_io(&db, 2, "once reads work again");
+    support::assert_rows_are(&db, 1..=2); // a failed read does not end the handle
 
     // The next write lands on top of the commit, or is refused the same way.
     let [id, name, tag] = <[Value; 3]>::try_from(support::row(3)).expect("a row has three columns");
@@ -392,43 +453,6 @@ fn a_commit_on_disk_is_reported_and_served_though_the_read_after_it_fails() {
     let _ = db.close();
     support::assert_rows_are(&support::open(&folder), 1..=rows);
 
-    // A read that fails inside a statement, and inside a commit before it reaches the disk, is
-    // a failure of the storage and never damage; the handle that met it says so until it is
-    // opened again, nothing aborts, and a commit that was refused left no row. Each is made on a
-    // handle just opened, whose cache is empty, so that it has to read the file.
-    fail_after.store(0, Ordering::SeqCst);
-    let db = support::open_with(&folder, options()).expect("open again");
-    fail_now.store(true, Ordering::SeqCst);
-    let failed_before = failed.load(Ordering::SeqCst);
-    match db.run("SELECT COUNT(name) FROM t", &params! {}) {
-        Err(Error::StoreIo { .. }) => {}
-        other => panic!("a statement whose read failed got {other:?}, not a storage failure"),
-    }
-    assert!(
-        failed.load(Ordering::SeqCst) > failed_before,
-        "the statement made no read that failed"
-    );
-    fail_now.store(false, Ordering::SeqCst);
-    let _ = db.close();
-    let db = support::open_with(&folder, options()).expect("open again");
-    fail_now.store(true, Ordering::SeqCst);
-    let failed_before = failed.load(Ordering::SeqCst);
-    let [id, name, tag] =
-        <[Value; 3]>::try_from(support::row(rows + 1)).expect("a row has three columns");
-    let refused = db.execute(
-        "INSERT INTO t (id, name, tag) VALUES ($id, $name, $tag)",
-        &params! { "id" => id, "name" => name, "tag" => tag },
-    );
-    let read_failed = failed.load(Ordering::SeqCst) > failed_before;
-    fail_now.store(false, Ordering::SeqCst);
-    match refused {
-        Err(Error::StoreIo { .. }) => {}
-        Ok(_) if !read_failed => panic!("the commit made no read that failed: nothing was shown"),
-        other => panic!("a commit whose read failed got {other:?}, not a storage failure"),
-    }
-    let _ = db.close();
-    support::assert_rows_are(&support::open(&folder), 1..=rows);
-
     // An open, for writing and for reading, while every read fails is a failure of the storage.
     let failing = || {
         support::failing_storage(|call| match call {
@@ -442,13 +466,93 @@ fn a_commit_on_disk_is_reported_and_served_though_the_read_after_it_fails() {
         Err(Error::StoreIo { .. }) => {}
         other => panic!("an open for writing while reads fail got {:?}", other.err()),
     }
-    let mut reading = ReadSessionOptions::default();
+    let mut reading = support::reader_options(None);
     reading.storage = Some(failing());
     match ReadSession::open_with_options(&folder, reading) {
         Err(Error::StoreIo { .. }) => {}
         other => panic!("an open for reading while reads fail got {:?}", other.err()),
     }
     support::assert_rows_are(&support::open(&folder), 1..=rows);
+    for kind in [0, 1, 2] {
+        let db = support::open_with(&folder, options()).unwrap();
+        let read = db.read_session(Default::default()).unwrap();
+        let tx = db.transaction().unwrap();
+        let mut live = read.open_cursor(support::SCAN, &params! {}).unwrap();
+        let empty = "SELECT * FROM t WHERE id=0";
+        let mut ended = read.open_cursor(empty, &params! {}).unwrap();
+        assert!(ended.fetch(None).unwrap().rows().is_empty());
+        for sql in [support::SCAN, "SHOW MEMORY_LIMIT"] {
+            db.execute(sql, &params! {}).unwrap();
+        }
+        db.table_names().unwrap();
+        read.execute("SELECT body FROM padding WHERE id = 10010", &params! {})
+            .unwrap();
+        let scan_sql = "SELECT body FROM padding WHERE id=10000";
+        std::thread::scope(|scope| {
+            let scan = (kind == 1).then(|| {
+                searching.store(true, Ordering::SeqCst);
+                scope.spawn(|| read.execute(scan_sql, &params! {}))
+            });
+            if let Some(scan) = &scan {
+                while reads.load(Ordering::SeqCst) == 0 && !scan.is_finished() {
+                    std::thread::yield_now();
+                }
+                assert!(!scan.is_finished(), "scan missed its storage gate");
+            }
+            searching.store(false, Ordering::SeqCst);
+            let failed_before = failed.load(Ordering::SeqCst);
+            fail_now.store(kind == 0, Ordering::SeqCst);
+            fail_kind.store(kind, Ordering::SeqCst);
+            let purge = if kind == 0 {
+                "PURGE FROM padding WHERE id = 1"
+            } else {
+                "PURGE FROM t"
+            };
+            let error = db.execute(purge, &params! {}).unwrap_err();
+            assert!(matches!(error, Error::StoreIo { .. }));
+            fail_kind.store(0, Ordering::SeqCst);
+            fail_now.store(false, Ordering::SeqCst);
+            assert!(kind != 0 || failed.load(Ordering::SeqCst) > failed_before);
+            if let Some(scan) = scan {
+                support::say("failed");
+                let error = scan.join().unwrap().unwrap_err();
+                assert!(matches!(error, Error::StoreIo { .. }));
+            }
+        });
+        for refused in [
+            db.execute(support::SCAN, &params! {}).map(drop),
+            db.execute("SHOW MEMORY_LIMIT", &params! {}).map(drop),
+            db.table_names().map(drop),
+            db.declaration("t").map(drop),
+            db.committed_watermark().map(drop),
+            tx.execute(support::SCAN, &params! {}).map(drop),
+            read.execute(support::SCAN, &params! {}).map(drop),
+            read.table_names().map(drop),
+            read.declaration("t").map(drop),
+            live.fetch(None).map(drop),
+            ended.fetch(None).map(drop),
+        ] {
+            let closed = matches!(refused, Err(Error::StoreIo { .. }));
+            assert_eq!(refused.is_ok(), kind == 0, "kind {kind}: {refused:?}");
+            assert!(kind == 0 || closed, "kind {kind} is refused as StoreIo");
+        }
+        assert!(db.execute("SELECT FROM", &params! {}).is_err());
+        drop((tx, live, ended, read));
+        let _ = db.close();
+        drop(db);
+        let db = support::open(&folder);
+        let count = support::int(&db, "SELECT COUNT(*) FROM t");
+        assert!([0, rows].contains(&count));
+        db.verify().unwrap();
+        assert_eq!(support::int(&db, padding), PADDING_ROWS);
+        if count == 0 {
+            support::insert_together(&db, 1..=rows);
+        }
+        support::insert(&db, rows + 1..=rows + 1);
+        support::run(&db, &format!("DELETE FROM t WHERE id = {}", rows + 1));
+        support::assert_rows_are(&db, 1..=rows);
+        support::close(db);
+    }
 }
 
 /// Asserts that the scan and the count of the table give rows 1 to `rows`, or are refused
@@ -474,19 +578,31 @@ fn answers_with_rows_or_store_io(db: &Database, rows: i64, when: &str) {
 /// The numbers in a vector of the two tests below.
 const DIMENSION: usize = 16;
 
-/// A closed store with `docs`, its VECTOR column partitioned by context: rows 1 to 100 are in
-/// blocks and rows 101 to 300 on pending lists, half of each under `c0` and half under `c1`.
-fn store_with_vectors(name: &str) -> PathBuf {
+/// Each row of `docs` has an edge from one node to its own, committed with the row.
+fn edge(on: &impl Run, n: i64) {
+    let sql = "INSERT INTO edges VALUES ($n, $a, $b, 'E')";
+    let (a, b) = (support::context(0), support::context(n as u128));
+    on.run(sql, &params! { "n" => n, "a" => a, "b" => b })
+        .unwrap();
+}
+
+/// A closed store with sealed and pending rows, half of each under `c0` and half under `c1`.
+fn store_with_vectors(name: &str, sealed: i64, pending: std::ops::RangeInclusive<i64>) -> PathBuf {
     let folder = support::folder(name);
     let db = support::open(&folder);
     support::declare_docs(&db, DIMENSION, "PARTITION_KEY (ctx)");
-    for numbers in [1..=100, 101..=300] {
+    support::run(
+        &db,
+        "CREATE TABLE edges (id INT PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+    );
+    for numbers in [1..=sealed, pending] {
         let tx = db.transaction().expect("begin");
+        numbers.clone().for_each(|n| edge(&tx, n));
         support::insert_docs(&tx, numbers, DIMENSION, |n| format!("c{}", n % 2));
         tx.commit().expect("commit");
-        // The first hundred are sealed before the rest arrive.
-        if support::int(&db, "SELECT COUNT(*) FROM docs") == 100 {
-            assert_eq!(support::seal_all(&db), 100);
+        // The first batch is sealed before the rest arrive.
+        if support::int(&db, "SELECT COUNT(*) FROM docs") == sealed {
+            assert_eq!(support::seal_all(&db), sealed as u64);
         }
     }
     support::close(db);
@@ -522,10 +638,14 @@ fn a_kill_at_any_storage_call_of_a_seal_leaves_every_vector_found() {
         return one_seal(role);
     }
     let test = "a_kill_at_any_storage_call_of_a_seal_leaves_every_vector_found";
-    // Run once to the end to learn which storage calls belong to the sealing commit.
-    let folder = store_with_vectors("kill-seal-count");
-    let rows = searches_agree(&support::open(&folder), "before the cycle");
+    // Learn and replay every cut from identical closed bytes: even a verification open can
+    // change the physical metadata that the next sealing cycle has to maintain.
+    let store = store_with_vectors("kill-seal-source", 100, 101..=300);
+    let rows = searches_agree(&support::open(&store), "before the cycle");
     assert_eq!(rows.len(), 300);
+    let folder = support::folder("kill-seal-count");
+    fs::copy(store.join("data"), folder.join("data"))
+        .expect("copy the closed store to count calls");
     let (begins, calls, lines) = learned(test, "sealer", &folder, Some("sealing"));
     assert!(
         lines.iter().any(|line| line == "sealed 200 0"),
@@ -536,7 +656,6 @@ fn a_kill_at_any_storage_call_of_a_seal_leaves_every_vector_found() {
         "a cycle that sealed 200 vectors made no write and no sync"
     );
 
-    let store = |k| store_with_vectors(&format!("kill-seal-at-{k}"));
     for_each_stop(
         test,
         "sealer",
@@ -549,6 +668,7 @@ fn a_kill_at_any_storage_call_of_a_seal_leaves_every_vector_found() {
             // exactly the vectors of those rows, whether the seal's commit is there or not.
             let db = support::open(folder);
             let state = format!("killed at storage call {k} of a seal");
+            db.verify().expect("every vector record has its row");
             assert!(
                 searches_agree(&db, &state) == rows,
                 "{state}: the rows of docs"
@@ -556,6 +676,7 @@ fn a_kill_at_any_storage_call_of_a_seal_leaves_every_vector_found() {
             // The next cycles finish the sealing: all 200 vectors when the killed commit is not
             // there, none when it is. A cycle that had returned is there.
             let sealed = support::seal_all(&db);
+            db.verify().expect("every vector record has its row");
             assert!(
                 sealed == 0 || sealed == 200 && !returned,
                 "{state}: the next cycles sealed {sealed} vectors; the killed cycle had {}returned",
@@ -564,8 +685,8 @@ fn a_kill_at_any_storage_call_of_a_seal_leaves_every_vector_found() {
             let report = db.run_maintenance_cycle().expect("one more cycle").vector;
             assert_eq!(
                 (
-                    report.maintenance_vectors_done,
-                    report.maintenance_vectors_remaining
+                    count(report.maintenance_vectors_done),
+                    count(report.maintenance_vectors_remaining)
                 ),
                 (0, 0),
                 "{state}: a cycle after the sealing was finished"
@@ -587,7 +708,8 @@ fn one_seal(role: support::Role) {
     let report = db.run_maintenance_cycle().expect("a cycle").vector;
     support::say(format!(
         "sealed {} {}",
-        report.maintenance_vectors_done, report.maintenance_vectors_remaining
+        count(report.maintenance_vectors_done),
+        count(report.maintenance_vectors_remaining)
     ));
     support::close(db);
     support::say(format!("calls {}", calls.load(Ordering::SeqCst)));
@@ -596,14 +718,22 @@ fn one_seal(role: support::Role) {
 #[test]
 fn a_kill_inside_a_commit_of_vectors_keeps_rows_and_vectors_together() {
     if let Some(role) = support::role() {
+        if role.name == "expiry" {
+            let (db, calls) = open_stopping(&role);
+            support::say(format!("committing {}", calls.load(Ordering::SeqCst)));
+            assert_eq!(db.run_maintenance_cycle().unwrap().expired_rows, Some(30));
+            support::say("committed");
+            support::close(db);
+            return support::say(format!("calls {}", calls.load(Ordering::SeqCst)));
+        }
         return one_commit_of_vectors(role);
     }
     let test = "a_kill_inside_a_commit_of_vectors_keeps_rows_and_vectors_together";
     // The rows before the commit, from a store nothing was done to, and the rows after it,
     // from a run of the commit to its end, which also tells which storage calls are its own.
-    let untouched = store_with_vectors("kill-vectors-before");
+    let untouched = store_with_vectors("kill-vectors-before", 100, 101..=300);
     let before = searches_agree(&support::open(&untouched), "before the commit");
-    let folder = store_with_vectors("kill-vectors-count");
+    let folder = store_with_vectors("kill-vectors-count", 100, 101..=300);
     let (begins, calls, _) = learned(test, "writer", &folder, Some("committing"));
     assert!(
         calls > begins,
@@ -612,12 +742,11 @@ fn a_kill_inside_a_commit_of_vectors_keeps_rows_and_vectors_together() {
     let after = searches_agree(&support::open(&folder), "after the commit");
     assert_eq!((before.len(), after.len()), (300, 358));
 
-    let store = |k| store_with_vectors(&format!("kill-vectors-at-{k}"));
     for_each_stop(
         test,
         "writer",
         begins + 1..=calls,
-        store,
+        untouched,
         |k, folder, told| {
             let returned = told.iter().any(|line| line == "committed");
 
@@ -627,6 +756,10 @@ fn a_kill_inside_a_commit_of_vectors_keeps_rows_and_vectors_together() {
             let db = support::open(folder);
             let state = format!("killed at storage call {k} of a commit of vectors");
             let rows = searches_agree(&db, &state);
+            let walk = "SELECT COUNT(*) FROM GRAPH_TABLE(edges MATCH (a)-[:E]->(b) COLUMNS (b.id AS b_id))";
+            let orphans = "SELECT COUNT(*) FROM edges WHERE id NOT IN (SELECT id FROM docs)";
+            let reach = (support::int(&db, walk), support::int(&db, orphans));
+            assert_eq!(reach, (rows.len() as i64, 0), "{state}: edges");
             assert!(
                 rows == after || rows == before && !returned,
                 "{state}: {} rows are there, of neither state or of the wrong one; the commit had \
@@ -636,10 +769,56 @@ fn a_kill_inside_a_commit_of_vectors_keeps_rows_and_vectors_together() {
             );
             // The store goes on from there: what waits is sealed, and the answers stay.
             support::seal_all(&db);
+            db.verify().expect("every vector record has its row");
             assert!(
                 searches_agree(&db, &state) == rows,
                 "{state}: the rows after sealing"
             );
+        },
+    );
+    let store = |name: &str| {
+        let folder = store_with_vectors(name, 10, 150..=169);
+        let db = support::open(&folder);
+        support::insert_docs(&db, 300..=300, DIMENSION, |_| "c0".to_owned());
+        support::run(&db, "ALTER TABLE docs SET RETAIN 10 SECONDS");
+        support::run(&db, "ALTER TABLE docs ADD COLUMN expires TIMESTAMP EXPIRES");
+        support::run(&db, "ALTER TABLE docs ADD COLUMN body TEXT");
+        db.execute(
+            "UPDATE docs SET expires = $due, body = $body WHERE id < 300",
+            &params! { "due" => Value::Timestamp(-1), "body" => support::letters(7, 4000) },
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE docs SET expires = $pin WHERE id = 300",
+            &params! { "pin" => Value::Timestamp(i64::MAX) },
+        )
+        .unwrap();
+        support::run(&db, "CREATE INDEX by_body ON docs (body)");
+        support::run(&db, "CREATE INDEX by_context ON docs (ctx)");
+        support::run(&db, "ALTER TABLE docs SET MAINTAIN COUNT (ctx)");
+        support::close(db);
+        folder
+    };
+    let folder = store("kill-expiry-count");
+    let (begins, calls, _) = learned(test, "expiry", &folder, Some("committing"));
+    assert!(calls > begins, "expiry made no durable commit");
+    let body = vec![Value::Text(support::letters(7, 4000))];
+    for_each_stop(
+        test,
+        "expiry",
+        begins + 1..=calls,
+        store("kill-expiry-source"),
+        |k, folder, told| {
+            let db = support::open(folder);
+            let rows = searches_agree(&db, &format!("expiry kill {k}"));
+            let returned = told.iter().any(|line| line == "committed");
+            assert!(rows.len() == 1 || rows.len() == 31 && !returned);
+            assert_eq!(rows.last().unwrap()[0], Value::Int64(300));
+            db.verify()
+                .expect("expiry keeps rows, counts, indexes, large values and vectors together");
+            let bodies = support::rows(&db, "SELECT body FROM docs WHERE body IS NOT NULL");
+            assert_eq!(bodies.len(), rows.len() - 1);
+            assert!(bodies.iter().all(|row| row == &body));
         },
     );
 }
@@ -652,6 +831,7 @@ fn a_kill_inside_a_commit_of_vectors_keeps_rows_and_vectors_together() {
 fn one_commit_of_vectors(role: support::Role) {
     let (db, calls) = open_stopping(&role);
     let tx = db.transaction().expect("begin");
+    (301..=360).for_each(|n| edge(&tx, n));
     support::insert_docs(&tx, 301..=360, DIMENSION, |n| {
         ["c0", "new", "newer"][(n % 3) as usize].to_owned()
     });
@@ -664,6 +844,7 @@ fn one_commit_of_vectors(role: support::Role) {
     }
     support::run(&tx, "DELETE FROM docs WHERE id = 6");
     support::run(&tx, "DELETE FROM docs WHERE id = 151");
+    support::run(&tx, "DELETE FROM edges WHERE id IN (6, 151)");
     support::run(&tx, "UPDATE docs SET ctx = 'new' WHERE id = 7");
     support::say(format!("committing {}", calls.load(Ordering::SeqCst)));
     tx.commit().expect("commit");
@@ -806,7 +987,7 @@ fn a_kill_inside_a_commit_keeps_references_counts_and_long_entries_with_their_ro
         "after the whole commit",
     );
 
-    let store = |k| store_with_children(&format!("kill-children-at-{k}"));
+    let store = store_with_children("kill-children-source");
     for_each_stop(
         test,
         "writer",
@@ -872,6 +1053,51 @@ fn one_commit_of_children(role: support::Role) {
     support::say(format!("calls {}", calls.load(Ordering::SeqCst)));
 }
 
+#[test]
+fn a_kill_in_a_commit_with_an_event_route_keeps_rows_and_actions_together() {
+    if let Some(role) = support::role() {
+        return one_large_commit(role);
+    }
+    let test = "a_kill_in_a_commit_with_an_event_route_keeps_rows_and_actions_together";
+    let routed = |name| {
+        let folder = store_with_rows(name, 0);
+        let db = support::open(&folder);
+        let wiring = "CREATE SINK out TYPE callback; CREATE EVENT TYPE added WHEN INSERT ON t; ";
+        for sql in wiring.split_terminator("; ") {
+            support::run(&db, sql);
+        }
+        support::run(&db, "CREATE ROUTE notify EVENT added TO out");
+        support::close(db);
+        folder
+    };
+    let counted = routed("kill-events-count");
+    let (begins, calls, _) = learned(test, "writer", &counted, Some("committing"));
+    assert!(calls > begins, "the commit made no write and no sync");
+    for_each_stop(
+        test,
+        "writer",
+        begins + 1..=calls,
+        routed("kill-events-source"),
+        |k, folder, _| {
+            let db = support::open(folder);
+            let rows = support::int(&db, "SELECT COUNT(*) FROM t");
+            let heard = Arc::new(AtomicU64::new(0));
+            let sink = heard.clone();
+            db.register_sink("out", None, move |_| {
+                sink.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap();
+            let queued = db.sink_metrics("out").unwrap().queued as i64;
+            let delivered = count(db.run_maintenance_cycle().unwrap().delivered) as i64;
+            let all = (queued, delivered, heard.load(Ordering::SeqCst) as i64);
+            assert!(rows == 0 || rows == 1000, "killed at call {k}: {rows} rows");
+            let first = rows.min(256); // a cycle delivers at most 256
+            assert_eq!(all, (rows, first, first), "killed at call {k}: one per row");
+        },
+    );
+}
+
 /// A closed store with the table declared and rows 1 to `rows` committed.
 fn store_with_rows(name: &str, rows: i64) -> PathBuf {
     let folder = support::folder(name);
@@ -885,7 +1111,7 @@ fn store_with_rows(name: &str, rows: i64) -> PathBuf {
 /// Opens the child's store through a door that stops before the call the role names, and gives
 /// the store with the door's count of calls.
 fn open_stopping(role: &support::Role) -> (Database, Arc<AtomicU64>) {
-    let (storage, calls) = stopping_before_call(role.number("stop_at"));
+    let (storage, calls) = faulting_before_call(role.number("stop_at"), true, false);
     let mut options = DatabaseOpenOptions::default();
     options.storage = Some(storage);
     (
@@ -894,28 +1120,10 @@ fn open_stopping(role: &support::Role) -> (Database, Arc<AtomicU64>) {
     )
 }
 
-/// A storage door that counts the writes and syncs of the data file. Before call number
-/// `stop_at` it announces `stopped` and waits there to be killed, so that call and every later
-/// one never reach the file. `stop_at` 0 never stops. Returns the door and its count.
-fn stopping_before_call(stop_at: u64) -> (WrapStorage, Arc<AtomicU64>) {
-    let calls = Arc::new(AtomicU64::new(0));
-    let storage = support::storage({
-        let calls = calls.clone();
-        move |call| {
-            if matches!(call, Call::Write(..) | Call::Sync)
-                && calls.fetch_add(1, Ordering::SeqCst) + 1 == stop_at
-            {
-                support::wait_to_be_killed("stopped");
-            }
-        }
-    });
-    (storage, calls)
-}
-
 // ---- a kill inside a build ----
 
 /// A closed store whose `docs` has `rows` pending vectors in a column that is at its size from
-/// a third of them on: the cycles seal them and build one grouping of `round(sqrt(rows))`
+/// a third of them on: the cycles seal them and build one IVF of `round(sqrt(rows))`
 /// groups, 17 for 300 rows and 3 for 12.
 fn store_to_build(name: &str, rows: i64) -> PathBuf {
     let folder = support::folder(name);
@@ -951,38 +1159,41 @@ fn groups(db: &Database) -> Value {
 }
 
 #[test]
-fn a_kill_at_any_storage_call_of_a_build_leaves_every_vector_found() {
+fn a_kill_in_any_step_of_a_build_leaves_every_vector_found() {
     if let Some(role) = support::role() {
         return one_build(role);
     }
-    let test = "a_kill_at_any_storage_call_of_a_build_leaves_every_vector_found";
-    // Twelve rows: a build finds centres only for more than one group, which takes
-    // `round(sqrt(rows))` of 2 or more, and the INDEXED search asks for ten rows. The test's
-    // length is one store built for every storage call of the sixteen cycles.
+    let test = "a_kill_in_any_step_of_a_build_leaves_every_vector_found";
+    // Twelve rows: a build finds centroids only for more than one group, which takes
+    // `round(sqrt(rows))` of 2 or more, and the INDEXED search asks for ten rows.
     const ROWS: i64 = 12;
-    // Run once to the end to learn which storage calls belong to the cycles of the build.
+    // Run once to the end to learn the storage calls of each cycle of the build. Every call of
+    // one commit is killed by the first test of this file; here each cycle's commits are
+    // killed at their first call, their middle one and their last, three kills a cycle.
     let folder = store_to_build("kill-build-count", ROWS);
-    let (begins, calls, lines) = learned(test, "builder", &folder, Some("building"));
-    assert_eq!(support::last_number(&lines, "cycles"), Some(16));
+    let (begins, _, lines) = learned(test, "builder", &folder, Some("building"));
     assert_eq!(groups(&support::open(&folder)), Value::Int64(3));
-
-    let store = |k| store_to_build(&format!("kill-build-at-{k}"), ROWS);
-    for_each_stop(
-        test,
-        "builder",
-        begins + 1..=calls,
-        store,
-        |k, folder, _| {
-            // The store opens with nothing to mend and every vector is found, whichever step's
-            // commit the kill fell in; the next cycles finish the build.
-            let db = support::open(folder);
-            let state = format!("killed at storage call {k} of a build");
-            every_vector_is_found(&db, ROWS as usize, &state);
-            support::upkeep(&db);
-            assert_eq!(groups(&db), Value::Int64(3), "{state}");
-            every_vector_is_found(&db, ROWS as usize, &format!("{state}, then built"));
-        },
+    let mut ends = vec![begins];
+    ends.extend(
+        lines
+            .iter()
+            .filter_map(|line| line.strip_prefix("called ")?.parse::<u64>().ok()),
     );
+    let stops: BTreeSet<u64> = (ends.windows(2).filter(|cycle| cycle[1] > cycle[0]))
+        .flat_map(|cycle| [cycle[0] + 1, (cycle[0] + 1 + cycle[1]) / 2, cycle[1]])
+        .collect();
+
+    let store = store_to_build("kill-build-source", ROWS);
+    for_each_stop(test, "builder", stops, store, |k, folder, _| {
+        // The store opens with nothing to mend and every vector is found, whichever step's
+        // commit the kill fell in; the next cycles finish the build.
+        let db = support::open(folder);
+        let state = format!("killed at storage call {k} of a build");
+        every_vector_is_found(&db, ROWS as usize, &state);
+        support::maintenance(&db);
+        assert_eq!(groups(&db), Value::Int64(3), "{state}");
+        every_vector_is_found(&db, ROWS as usize, &format!("{state}, then built"));
+    });
 }
 
 #[test]
@@ -994,7 +1205,6 @@ fn a_killed_build_goes_on_from_its_record() {
     let folder = store_to_build("killed-build-count", 300);
     let (begins, calls, lines) = learned(test, "builder", &folder, Some("building"));
     let whole = support::last_number(&lines, "cycles").expect("the builder counts its cycles");
-    assert_eq!(whole, 16);
 
     // Killed at the middle storage call of the build's cycles.
     let folder = store_to_build("killed-build-goes-on", 300);
@@ -1010,7 +1220,17 @@ fn a_killed_build_goes_on_from_its_record() {
     // The cycles after reopening are those the build had left: the killed cycle's step is
     // there or it is not, and no step that was committed is worked out again.
     let db = support::open(&folder);
-    let (ran, _) = support::upkeep(&db);
+    // Finish recovery without consuming a committed vector-build step.
+    let position = support::watermark(&db);
+    loop {
+        let report = db.run_maintenance_cycle().unwrap();
+        assert_eq!(report.vector.maintenance_vectors_done, Some(0));
+        assert_eq!(support::watermark(&db), position);
+        if count(report.recovery_pages_remaining) == 0 {
+            break;
+        }
+    }
+    let (ran, _) = support::maintenance(&db);
     assert!(
         ran == whole - returned || ran == whole - returned - 1,
         "{returned} of {whole} cycles had returned; the build then took {ran} more"
@@ -1020,20 +1240,150 @@ fn a_killed_build_goes_on_from_its_record() {
 }
 
 /// Runs maintenance cycles until nothing is left. Announces `building <n>` with the storage
-/// calls made so far before the first, `cycles <n>` as each returns, and `calls <total>` once
-/// the store is closed.
+/// calls made so far before the first, `cycles <n>` and `called <n>` with the calls made so far
+/// as each returns, and `calls <total>` once the store is closed.
 fn one_build(role: support::Role) {
     let (db, calls) = open_stopping(&role);
     support::say(format!("building {}", calls.load(Ordering::SeqCst)));
     for cycles in 1_u64.. {
         let report = support::cycle(&db);
         support::say(format!("cycles {cycles}"));
-        if report.maintenance_vectors_remaining == 0
-            && report.remaining_partitions <= report.stalled_partitions
+        support::say(format!("called {}", calls.load(Ordering::SeqCst)));
+        if count(report.maintenance_vectors_remaining) == 0
+            && count(report.remaining_partitions) <= count(report.stalled_partitions)
         {
             break;
         }
     }
     support::close(db);
     support::say(format!("calls {}", calls.load(Ordering::SeqCst)));
+}
+
+// A killed open reads the allocator record/log and the last commit, not every stored page: at
+// most 4 pages more at 20,000 rows than at 1,000 (section 7, C1). The close of that open
+// finishes the rebuild, and a read that fails there is what the close returns (C2).
+#[test]
+fn a_killed_open_reads_the_log_and_last_commit_pages() {
+    if let Some(role) = support::role() {
+        let db = support::open(&role.folder);
+        support::insert(&db, 0..=0);
+        support::wait_to_be_killed("committed");
+    }
+    let (mut reads, mut readers) = (Vec::new(), Vec::new());
+    for rows in [1_000, 20_000] {
+        let folder = store_with_rows(&format!("killed-open-{rows}"), rows);
+        let mut child = Child::start(
+            "a_killed_open_reads_the_log_and_last_commit_pages",
+            "writer",
+            &folder,
+        );
+        child.until("committed");
+        child.kill();
+        let (seen, read) = support::counting_bytes_read();
+        let size = || fs::metadata(folder.join("data")).unwrap().len();
+        let (before, mut as_reader) = (size(), support::reader_options(None));
+        as_reader.storage = Some(seen);
+        drop(ReadSession::open_with_options(&folder, as_reader).unwrap());
+        readers.push(read.load(Ordering::SeqCst).div_ceil(4096));
+        assert_eq!(size(), before, "a read mends nothing");
+        let bytes = Arc::new(AtomicU64::new(0));
+        let armed = Arc::new(AtomicBool::new(false));
+        let (counted, failing) = (bytes.clone(), armed.clone());
+        let mut options = DatabaseOpenOptions::default();
+        options.storage = Some(support::failing_storage(move |call| match call {
+            Call::Read(..) if failing.load(Ordering::SeqCst) => {
+                Err(io::Error::other("a rebuild read this test makes fail"))
+            }
+            Call::Read(_, out) => {
+                counted.fetch_add(out.len() as u64, Ordering::SeqCst);
+                Ok(())
+            }
+            _ => Ok(()),
+        }));
+        let db = support::open_with(&folder, options).unwrap();
+        reads.push(bytes.load(Ordering::SeqCst).div_ceil(4096));
+        assert_eq!(support::int(&db, "SELECT COUNT(*) FROM t"), rows + 1);
+        armed.store(true, Ordering::SeqCst);
+        let closed = db.close();
+        assert!(
+            matches!(&closed, Err(Error::StoreIo { reason, .. }) if reason.contains("rebuild read")),
+            "the close finishes the rebuild, and its failed read is what the last close returns: {closed:?}"
+        );
+    }
+    // The count follows the depth of the trees on the open's path, not the rows (section 7).
+    for (opens, what) in [(&reads, "writer"), (&readers, "read session")] {
+        let more = opens[1].saturating_sub(opens[0]);
+        assert!(
+            more <= 4,
+            "a {what}'s open after a kill reads at most 4 pages more at 20,000 rows than at 1,000: {opens:?}"
+        );
+    }
+}
+
+/// A call that fails in an INSERT leaves its row whole or absent, and its handle serves the disk.
+#[test]
+fn a_call_that_fails_anywhere_in_an_insert_leaves_the_row_whole_or_absent() {
+    let source = support::folder("read-fault-source");
+    let create = "CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)";
+    support::run(&support::open(&source), create);
+    let trial = |stop_at: u64| {
+        let folder = support::folder(&format!("read-fault-{stop_at}"));
+        fs::copy(source.join("data"), folder.join("data")).unwrap();
+        let (storage, calls) = support::faulting_before_call(stop_at, false, true);
+        let mut options = DatabaseOpenOptions::default();
+        options.storage = Some(storage);
+        let (count, mut same) = ("SELECT COUNT(*) FROM t", None);
+        let done = support::open_with(&folder, options).and_then(|db| {
+            let done = db.execute("INSERT INTO t VALUES (1, 'x')", &params! {});
+            same = db.run(count, &params! {}).ok();
+            done
+        });
+        let db = support::open(&folder);
+        let rows = support::int(&db, count);
+        let whole = rows == 1 || (rows == 0 && done.is_err());
+        assert!(whole, "call {stop_at}: {rows} rows, {done:?}");
+        if let Some(same) = same {
+            assert_eq!(same.rows(), [[Value::Int64(rows)]], "call {stop_at}");
+        }
+        db.verify().unwrap();
+        calls.load(Ordering::SeqCst)
+    };
+    (1..=trial(0)).for_each(|n| _ = trial(n));
+}
+#[test]
+fn a_cut_sink_call_is_uncertain_and_retried() {
+    if let Some(role) = support::role() {
+        let db = support::open(&role.folder);
+        db.register_sink("outgoing", None, |e| match e.action_id {
+            2 => support::wait_to_be_killed("calling 2"),
+            _ => Ok(()),
+        })
+        .unwrap();
+        return assert!(db.run_maintenance_cycle().is_ok());
+    }
+    let folder = support::folder("kill-in-sink-call");
+    support::close(support::delivery_queue(&folder, 8, 2));
+    let mut child = Child::start("a_cut_sink_call_is_uncertain_and_retried", "sink", &folder);
+    child.until("calling 2");
+    child.kill();
+    // A reader opens at once on what the killed writer last saved: the cut call is queued and
+    // uncertain.
+    let reader = contextdb::ReadSession::open(&folder, contextdb::ReadLimits::default()).unwrap();
+    let status = reader.event_bus_status().unwrap();
+    let saved = &status.sinks[0].metrics;
+    assert_eq!(
+        (saved.queued, saved.uncertain),
+        (1, 1),
+        "a reader sees the cut call uncertain"
+    );
+    drop((status, reader));
+    let db = support::open(&folder);
+    db.register_sink("outgoing", None, |e| {
+        assert_eq!(e.action_id, 2, "only the cut one comes again");
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(db.run_maintenance_cycle().unwrap().delivered, Some(1));
+    let uncertain = db.sink_metrics("outgoing").unwrap().uncertain;
+    assert_eq!(uncertain, 1, "a call begun and never finished is uncertain");
 }

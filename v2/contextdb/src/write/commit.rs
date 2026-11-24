@@ -10,8 +10,45 @@ use super::{Given, Rules, pick};
 use crate::memory::{Budget, Reservation};
 use crate::query::{self, Reader, equal};
 use crate::schema::{Catalog, Reference, Table};
-use crate::store::{Cell, ChangeSet, Key, Read, Row, RowGuard, View};
-use crate::types::{Error, Result, TxId, Value, shown};
+use crate::store::{Cell, ChangeSet, Key, Read, Row, RowGuard, StagedValues, TableId, View};
+use crate::types::{Error, Result, Value, shown};
+
+pub(crate) fn stage_retention(
+    changes: &mut ChangeSet,
+    catalog: &Catalog,
+    now: u32,
+    budget: &Budget,
+) -> Result<()> {
+    let mut held = budget.reserve(0, "retention entries")?;
+    let mut cover = held.passing();
+    let changed = changes
+        .changed_tables()
+        .filter_map(|(id, _)| catalog.by_id(id));
+    let retained: Vec<&Table> = changed.filter(|t| t.meta.retain.is_some()).collect();
+    for table in retained {
+        changes.stamp_table(table.id, now);
+        let (id, mut keys) = (*table.index_ids.last().unwrap(), Vec::new());
+        changes.staged(table.id, &mut |key| {
+            held.grow(key.as_bytes().len() as u64 + 32)?;
+            keys.push(key.clone());
+            Ok(true)
+        })?;
+        let entry = |r| table.retention_entry(&r);
+        for key in keys {
+            if let Some(old) = changes
+                .base()
+                .row(table.id, &key, &mut cover)?
+                .and_then(entry)
+            {
+                changes.delete_index(id, &old.key, &key)?;
+            }
+            if let Some(new) = changes.row(table.id, &key, &mut cover)?.and_then(entry) {
+                changes.put_index(id, new, key)?;
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Checks everything a transaction staged against the moment its change set is laid over.
 ///
@@ -43,56 +80,47 @@ pub(crate) fn check_at_commit(
     catalog: &Catalog,
     before: Option<&View>,
     budget: &Budget,
+    visit: impl FnOnce(
+        &mut dyn FnMut((TableId, &Key, Option<StagedValues<'_>>, bool)) -> Result<()>,
+    ) -> Result<()>,
 ) -> Result<()> {
     let (params, reader) = (HashMap::new(), Reader::admin());
-    let given = Given {
-        params: &params,
-        catalog,
-        budget,
-        reader: &reader,
-        now: 0,
-        number: TxId(0),
-    };
-    let (tables, base) = (catalog.tables(), changes.base());
-    let mut overtaken = 0;
+    let kept = query::Kept::new(budget.passing("expression evaluation")?);
+    let given = Given::admin(&params, catalog, budget, &reader, &kept);
+    let base = changes.first();
+    let mut cover = budget.passing("commit row")?;
     // The table the staged rows now walked are of, with the references that name it as their
     // parent, each with its own table.
     let mut of: Option<(Rules, Vec<(&Table, _)>)> = None;
-    for (id, key, row, new_key) in changes.rows_changed() {
+    visit(&mut |(id, key, row, new_key)| {
         if of.as_ref().is_none_or(|(rules, _)| rules.table.id != id) {
             of = None;
-            if let Some(table) = tables.iter().find(|table| table.id == id) {
+            if let Some(table) = catalog.by_id(id) {
                 let name = &table.name;
-                let children = tables.iter().flat_map(|child| {
+                let children = catalog.children(table).flat_map(|child| {
                     let references = child.rules.references.iter();
                     let named = references.filter(move |reference| reference.parent == *name);
-                    named.map(move |reference| (*child, reference))
+                    named.map(move |reference| (child, reference))
                 });
                 of = Some((Rules::of(table, &given)?, children.collect()));
             }
         }
         let Some((rules, children)) = &of else {
-            continue;
+            return Ok(());
         };
         let table = rules.table;
         let named = !new_key && !children.is_empty();
         let there = match before.is_some() || named {
-            true => base.row(id, key)?,
+            true => base.row(id, key, &mut cover)?,
             false => None,
         };
-        if let Some(before) = before {
-            if let (true, Some((row, _))) = (new_key, row) {
-                if there.is_some() {
-                    return Err(rules.violation(&table.key, row));
-                }
-            } else if before.row(id, key)? != there {
-                overtaken += 1;
-            }
+        if let (Some(_), true, Some((row, _)), Some(_)) = (before, new_key, row, &there) {
+            return Err(rules.violation(&table.key, row));
         }
         // The values this row was named by until now: when it no longer holds them, no row
         // may name them, unless another row of the table holds them now.
         if let (true, Some(was)) = (named, &there) {
-            let mut loaded = budget.reserve(0, "query")?;
+            let mut loaded = budget.reserve(0, "query_decode")?;
             for &(child, reference) in children {
                 let at = reference.parent_columns.iter();
                 let at: Vec<usize> = at.map(|name| table.column(name)).collect::<Result<_>>()?;
@@ -118,7 +146,9 @@ pub(crate) fn check_at_commit(
         // A large value the row left where it is reads as NULL here, which takes the row out
         // of a rule over it: the statement that staged the row changed no entry of that rule
         // and no value of that reference, so the row holds what it held.
-        let Some((row, _)) = row else { continue };
+        let Some((row, _)) = row else {
+            return Ok(());
+        };
         for reference in &table.rules.references {
             let values = pick(&reference.columns, row);
             if values.contains(&Value::Null) {
@@ -133,7 +163,7 @@ pub(crate) fn check_at_commit(
             }
         }
         if before.is_none() {
-            continue;
+            return Ok(());
         }
         rules.acyclic(changes, rules.edge(None, row)?)?;
         for index in &rules.indexes {
@@ -144,11 +174,21 @@ pub(crate) fn check_at_commit(
                 return Err(rules.violation(&index.columns, row));
             }
         }
-    }
-    if let Some(before) = before {
-        for guard in changes.guards() {
-            overtaken += u64::from(lost(guard, before, base, budget)?);
+        Ok(())
+    })
+}
+
+/// Rejects overtaken inputs before callbacks load their large cells.
+pub(crate) fn check_provenance(changes: &ChangeSet, before: &View, budget: &Budget) -> Result<()> {
+    let base = changes.base();
+    let mut overtaken = 0;
+    for (id, key, row, new_key) in changes.rows_changed() {
+        if !(new_key && row.is_some() || before.same_row(base, id, key, budget)?) {
+            overtaken += 1;
         }
+    }
+    for guard in changes.guards() {
+        overtaken += u64::from(lost(guard, before, base, budget)?);
     }
     if overtaken > 0 {
         return Err(Error::ConditionalUpdateConflict { count: overtaken });
@@ -161,12 +201,14 @@ pub(crate) fn check_at_commit(
 /// the commit is laid over. A row that is at both moments what it was, whatever its
 /// transaction itself has done to it since, is as its guard found it.
 fn lost(guard: &RowGuard, before: &View, now: &View, budget: &Budget) -> Result<bool> {
-    let row = now.row(guard.table, &guard.key)?;
-    if before.row(guard.table, &guard.key)? == row {
+    let mut cover = budget.passing("guard row")?;
+    if before.same_row(now, guard.table, &guard.key, budget)? {
         return Ok(false);
     }
-    let Some(row) = row else { return Ok(true) };
-    let mut loaded = budget.reserve(0, "query")?;
+    let Some(row) = now.row(guard.table, &guard.key, &mut cover)? else {
+        return Ok(true);
+    };
+    let mut loaded = budget.reserve(0, "query_decode")?;
     for (cell, value) in &guard.columns {
         // A position the row has no cell at is a column added after the row was written: the
         // row reads there what it read when the guard was asked.
@@ -236,12 +278,11 @@ fn holds(
     // The index behind the primary key holds no entries: a row is kept under its key.
     if table.meta.indexes[index].name.starts_with("__pk_") {
         let key = Key::from_values(values, &[])?;
-        let at = Bound::Included(&key);
-        return Ok(read.rows(table.id, at, at)?.next().transpose()?.is_some());
+        return read.contains(table.id, &key);
     }
     let entry = table.entry_shape(index).entry(values)?;
     let at = Bound::Included(&entry.key);
-    let found = read.index(table.index_ids[index], at, at)?.next();
+    let found = read.index(table.index_ids[index], at, at, false)?.next();
     if found.transpose()?.is_none() {
         return Ok(false);
     }
@@ -250,12 +291,14 @@ fn holds(
     }
     let (filter, bound) = equal(table, columns, values);
     let asked = query::Asked {
+        keys: None,
         table,
         filter: Some(&filter),
         assigned: &[],
         needed: &vec![false; table.meta.columns.len()],
         reader: given.reader,
-        ctx: query::EvalContext::new(&bound, given.now),
+        examined: None,
+        ctx: query::EvalContext::new(&bound, given.now, given.kept),
     };
     let found = query::rows_for_write(&asked, None, given.catalog, read, given.budget)?;
     Ok(found.is_some())
