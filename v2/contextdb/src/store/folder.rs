@@ -411,6 +411,8 @@ pub(super) fn writing_with_cache(
         budget: budget.clone(),
         _cache: cache,
         marks: Default::default(),
+        surplus: Default::default(),
+        space: super::space::Space::opened(folder),
     })
 }
 

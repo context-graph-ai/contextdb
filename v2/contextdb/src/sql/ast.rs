@@ -189,8 +189,8 @@ pub enum Expr {
         op: UnaryOp,
         operand: Box<Expr>,
     },
-    /// A call by name. `a + b` arrives as the call `__add(a, b)`, and likewise `__sub`, `__mul`
-    /// and `__div`. The `*` of `COUNT(*)` is a column named `*`.
+    /// A call by name. `a + b` arrives as the call `__add(a, b)`, and likewise `__sub`, `__mul`,
+    /// `__div` and `__mod`. The `*` of `COUNT(*)` is a column named `*`.
     FunctionCall {
         name: String,
         args: Vec<Expr>,

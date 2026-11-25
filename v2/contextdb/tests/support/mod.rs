@@ -1240,13 +1240,12 @@ pub fn assert_sound(
     answer
 }
 
-/// How the refusal of an INDEXED search goes on after the column's name.
+/// How the refusal of an INDEXED search over an index behind its writes goes on after the
+/// column's name (design section 6, F3): a maintenance cycle cures it.
 pub const INDEXED_REFUSED: &str = " cannot be searched INDEXED for this statement now: its index \
-    is behind its writes, or the statement's filter leaves the index nothing to choose among; \
-    run a maintenance cycle, or use EXACT or AUTO";
+    is behind its writes; run a maintenance cycle, or use EXACT or AUTO";
 
-/// Asserts that a search of `docs.v` was refused as one that asked for the index, in the
-/// sentence that names both causes.
+/// Asserts that a search of `docs.v` was refused as one whose index is behind its writes.
 pub fn assert_indexed_refused(outcome: contextdb::Result<QueryResult>, what: &str) {
     match outcome {
         Err(error @ Error::VectorIndexedRouteUnavailable { .. }) => {
@@ -1471,4 +1470,57 @@ pub fn vector_records(folder: &Path) -> BTreeMap<Vec<u8>, Vec<u8>> {
         }
     }
     records
+}
+/// A store whose data file cancels the handle at the first sync after the flag is set: a
+/// maintenance batch is one commit, so the cycle ends after it (design 4, the guard).
+pub fn cancelling(
+    folder: &Path,
+    mut options: DatabaseOpenOptions,
+) -> (Arc<Database>, Arc<AtomicBool>) {
+    let armed = Arc::new(AtomicBool::new(false));
+    let handle = Arc::new(std::sync::OnceLock::new());
+    options.storage = Some(storage({
+        let (armed, handle) = (armed.clone(), handle.clone());
+        move |call| {
+            if matches!(call, Call::Sync) && armed.swap(false, SeqCst) {
+                let db: Option<Arc<Database>> = handle.get().and_then(Weak::upgrade);
+                db.expect("the cancelling handle").cancel();
+            }
+        }
+    }));
+    let db = Arc::new(open_with(folder, options).expect("open through the cancelling door"));
+    handle.set(Arc::downgrade(&db)).ok();
+    (db, armed)
+}
+
+/// Runs at most `most` cycles through [`cancelling`]'s door, ending early at one that commits
+/// nothing. Each that commits must return the interruption with its report kept (S2, rule 2) and
+/// leave `verify` clean. Gives each batch's report and the `verify` after it.
+pub fn batches(
+    db: &Database,
+    armed: &AtomicBool,
+    most: usize,
+) -> Vec<(contextdb::MaintenanceReport, contextdb::VerifyReport)> {
+    let mut batches = Vec::new();
+    while batches.len() < most {
+        armed.store(true, SeqCst);
+        let outcome = db.run_maintenance_cycle();
+        if armed.swap(false, SeqCst) {
+            outcome.expect("a cycle that committed nothing");
+            return batches;
+        }
+        let Err(Error::QueryCanceled {
+            statement_timeout: false,
+        }) = outcome
+        else {
+            panic!("a cycle cancelled at its commit returned {outcome:?}, not the interruption");
+        };
+        let report = db
+            .last_maintenance_cycle()
+            .unwrap()
+            .expect("the cycle's report");
+        let verified = db.verify().expect("verify is clean after every batch");
+        batches.push((report, (*verified).clone()));
+    }
+    batches
 }

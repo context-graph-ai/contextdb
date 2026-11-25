@@ -32,20 +32,40 @@ impl Open {
         })
     }
 
-    /// Starts every host-write transaction through the same number allocator.
+    /// Starts every host-write transaction through the same number allocator. A writer at the
+    /// disk limit wakes maintenance and, after each cycle, retakes the turn and looks for room
+    /// again; it waits for another cycle only when that one moved what frees room.
     pub(super) fn writing_turn(&self) -> Result<commit::Held<'_>> {
+        let mut waited = false;
         loop {
             let held = self.turn()?;
             let Some((current_bytes, budget_limit_bytes)) = self.store.recovery_wait()? else {
                 return Ok(held);
             };
+            let refused = |hint| Error::DiskLimitExceeded {
+                operation: "write",
+                current_bytes,
+                budget_limit_bytes,
+                hint,
+            };
             if self.maintenance == Maintenance::Caller {
-                return Err(Error::DiskLimitExceeded {
-                    operation: "write",
-                    current_bytes,
-                    budget_limit_bytes,
-                    hint: "free space is being found; run maintenance",
-                });
+                return Err(refused("free space is being found; run maintenance"));
+            }
+            let r = locked(&self.last_cycle).unwrap_or_default();
+            let n = |field: Option<u64>| field.unwrap_or(0);
+            if waited
+                && r.recovery_advanced != Some(true)
+                && r.removal_advanced != Some(true)
+                && r.compaction_advanced != Some(true)
+                && n(r.removed_records) + n(r.expired_rows) == 0
+            {
+                return Err(refused(match r {
+                    _ if self.store.readers_hold() => crate::store::READERS,
+                    _ if r.memory_refused == Some(true) => {
+                        "maintenance was refused memory and could free no space; raise the memory limit"
+                    }
+                    _ => "nothing is left to give back; raise the disk limit or remove data",
+                }));
             }
             let generation = self.signal.generation();
             drop(held);
@@ -53,6 +73,7 @@ impl Open {
             if !self.signal.wait_progress(generation) {
                 return Err(Error::DatabaseClosed);
             }
+            waited = true;
         }
     }
 

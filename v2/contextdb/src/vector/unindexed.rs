@@ -6,13 +6,14 @@ use std::collections::btree_map::Entry;
 
 use super::build::{self, Build};
 use super::directory::{self, Partition};
+use super::slot::{slot_len, write_slot};
 use super::tally::{position, tuples};
 use super::{pack, seal};
 use crate::memory::{Budget, Reservation};
 use crate::schema::{Catalog, VectorColumn};
 use crate::sql::not_supported;
 use crate::store::{Cell, ChangeSet, Key, Read, VectorId, VectorNumber, VectorRecord};
-use crate::types::{Error, Result};
+use crate::types::{Error, Result, Value};
 
 /// Derived column totals, reconstructed once at open and published only after a commit.
 /// This handle state is covered by the open's fixed 1 MiB allowance.
@@ -62,6 +63,8 @@ struct Move {
     row: Key,
     leaves: Option<Key>,
     enters: Option<Key>,
+    /// The slot of the vector that arrives, the value of its pending record.
+    slot: Vec<u8>,
 }
 
 /// One partition the commit's rows touch.
@@ -192,7 +195,7 @@ pub(crate) fn track_unindexed(
                 changes.put_vector_number(VectorNumber::Pending, *pending)?;
                 let bytes = (super::block::BLOCK_BYTES as u64).max(more + 4);
                 let mut sealing = budget.reserve(bytes, "maintenance")?;
-                let (done, _) = seal::seal_partition(
+                let (done, ..) = seal::seal_partition(
                     changes,
                     catalog,
                     &mut sealing,
@@ -215,7 +218,7 @@ pub(crate) fn track_unindexed(
             .checked_add(1)
             .ok_or_else(|| changes.damaged(directory::SHORT))?;
         let unindexed = VectorRecord::Pending(moved.vector, entered.number, &moved.row);
-        changes.put_vector(unindexed, Vec::new())?;
+        changes.put_vector(unindexed, moved.slot.clone())?;
         pending += 1;
         if more + 4 > super::block::BLOCK_BYTES as u64
             || changes
@@ -364,18 +367,49 @@ fn moves(changes: &ChangeSet, catalog: &Catalog, held: &mut Reservation) -> Resu
                 let keys = [Some(key), leaves.as_ref(), enters.as_ref()];
                 let keys = keys.into_iter().flatten();
                 let bytes: usize = keys.map(|key| key.as_bytes().len()).sum();
-                held.grow(bytes as u64)?;
+                let slot = match (&enters, staged) {
+                    (Some(_), Some((values, left))) => {
+                        slot_of(table, column, values, left, base, held)?
+                    }
+                    _ => Vec::new(),
+                };
+                held.grow((bytes + slot.len()) as u64)?;
                 held.room(&mut moves, usize::MAX)?;
                 moves.push(Move {
                     vector: column.id,
                     row: key.clone(),
                     leaves,
                     enters,
+                    slot,
                 });
             }
         }
     }
     Ok(moves)
+}
+
+/// The slot of a staged row's vector, loaded first where it was left beside the row.
+fn slot_of(
+    table: &crate::schema::Table,
+    column: &VectorColumn,
+    values: &[Value],
+    left: &[(usize, crate::store::Beside)],
+    base: &dyn Read,
+    held: &mut Reservation,
+) -> Result<Vec<u8>> {
+    let at = position(table, &column.column, base)?;
+    let taken = held.bytes();
+    let loaded = match left.iter().find(|(slot, _)| *slot == at) {
+        Some((_, beside)) => Some(base.load(beside, held)?),
+        None => None,
+    };
+    let Value::Vector(numbers) = loaded.as_ref().unwrap_or(&values[at]) else {
+        return Err(base.damaged("a staged vector is not a vector"));
+    };
+    let mut slot = vec![0; slot_len(numbers.len())];
+    write_slot(numbers, &mut slot);
+    held.shrink(held.bytes() - taken);
+    Ok(slot)
 }
 
 /// The partition under a key tuple as the commit has it so far: read from the committed moment
@@ -758,9 +792,9 @@ fn regroup(
                 ivf::centroid_range(&*changes, index, range, room)?,
             );
         }
-        let centre = &mut hand.1[(group % per) * dim..][..dim];
-        centre.fill(0.0);
-        train::normalize(&sum, centre);
+        let centroid = &mut hand.1[(group % per) * dim..][..dim];
+        centroid.fill(0.0);
+        train::normalize(&sum, centroid);
     }
     flush(changes, room, &mut hand)?;
     drop(sum);
@@ -788,7 +822,7 @@ fn regroup(
             room.grow((4 + slots.len() * code_len(dim)) as u64)?;
             let mut codes = vec![0; 4 + slots.len() * code_len(dim)];
             codes[..4].copy_from_slice(&(slots.len() as u32).to_le_bytes());
-            let (mut record, mut centres) = (usize::MAX, Vec::new());
+            let (mut record, mut centroids) = (usize::MAX, Vec::new());
             for (slot, code) in codes[4..].chunks_exact_mut(code_len(dim)).enumerate() {
                 let place = Place {
                     block,
@@ -796,22 +830,22 @@ fn regroup(
                 };
                 let group = (starts.partition_point(|s| *s <= place) - 1).min(groups - 1);
                 if record != group / per {
-                    let bytes = 4 * centres.len() as u64;
-                    drop(std::mem::take(&mut centres));
+                    let bytes = 4 * centroids.len() as u64;
+                    drop(std::mem::take(&mut centroids));
                     room.shrink(bytes);
                     record = group / per;
                     let from = record * per;
                     let range = from as u32..(from + per).min(groups) as u32;
-                    centres = ivf::centroid_range(&*changes, index, range, room)?;
+                    centroids = ivf::centroid_range(&*changes, index, range, room)?;
                 }
                 write_code(
                     slots.slot(slot),
-                    &centres[(group % per) * dim..][..dim],
+                    &centroids[(group % per) * dim..][..dim],
                     code,
                 );
             }
-            let held = 4 * centres.len() as u64;
-            drop(centres);
+            let held = 4 * centroids.len() as u64;
+            drop(centroids);
             room.shrink(held);
             Ok(codes)
         })?;

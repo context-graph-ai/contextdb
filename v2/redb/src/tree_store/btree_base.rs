@@ -702,7 +702,7 @@ fn bytes<'a>(key: &Parts<'a>) -> impl Iterator<Item = &'a u8> {
     key[0].iter().chain(key[1])
 }
 
-fn common(a: &Parts, b: &Parts) -> usize {
+pub(super) fn common(a: &Parts, b: &Parts) -> usize {
     bytes(a).zip(bytes(b)).take_while(|(x, y)| x == y).count()
 }
 
@@ -794,13 +794,12 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
     // Cuts at the first place in a short list that leaves both sides within one page, else the
     // place whose sides take the fewest pages. A pair new at `at` (`fresh`) that ends a run
     // (nothing after it, or sharing 4 more bytes with the pair before than after) lists after it,
-    // before it, half; another insert or an update half, after, before; a join half, then the
-    // place nearest half, towards `at` where the leaves met, that leaves both sides within a page,
-    // then `at`. The separator is the shortest beginning of the right key above the left key.
+    // before it, half; another insert or an update half, after, before. The separator is the
+    // shortest beginning of the right key above the left key.
     pub(super) fn build_split<'txn>(
         mut self,
         at: usize,
-        fresh: Option<bool>,
+        fresh: bool,
     ) -> Result<(PageMut<'txn>, Vec<u8>, PageMut<'txn>)> {
         let total_size = self.total_key_bytes + self.total_value_bytes;
         let mut division = 0;
@@ -816,22 +815,16 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
         }
 
         let (pairs, last, half) = (&self.pairs, self.pairs.len() - 1, division);
-        let run_end = fresh == Some(true)
+        let run_end = fresh
             && (at == last
                 || (self.bytewise
                     && at > 0
                     && common(&pairs[at - 1].0, &pairs[at].0)
                         >= common(&pairs[at].0, &pairs[at + 1].0) + 4));
-        let fits = |place: usize| self.pages(&pairs[..place]) + self.pages(&pairs[place..]) == 2;
-        let (mut near, mut over) = (at, half);
-        while fresh.is_none() && near.abs_diff(over) > 1 {
-            let mid = near.midpoint(over);
-            if fits(mid) { near = mid } else { over = mid }
-        }
-        let places = match fresh {
-            Some(_) if run_end => [at + 1, at, half],
-            Some(_) => [half, at + 1, at],
-            None => [half, near, at],
+        let places = if run_end {
+            [at + 1, at, half]
+        } else {
+            [half, at + 1, at]
         };
         let division = places
             .into_iter()
@@ -1145,9 +1138,7 @@ impl<'b> LeafMutator<'b> {
         );
 
         // Update value end pointers for i..num_pairs
-        for j in i..num_pairs {
-            self.update_value_end(j, value_delta);
-        }
+        self.update_ends(true, i..num_pairs, value_delta);
 
         // Shift trailing values to accommodate the new value size
         let mut dest: usize = (isize::try_from(shift_value_start).unwrap() + value_delta)
@@ -1194,21 +1185,19 @@ impl<'b> LeafMutator<'b> {
         } else {
             0
         };
-        for j in 0..i {
-            self.update_key_end(j, (key_ptr_size + value_ptr_size).try_into().unwrap());
-            let value_delta: isize = (key_ptr_size + value_ptr_size + key.len())
-                .try_into()
-                .unwrap();
-            self.update_value_end(j, value_delta);
-        }
-        for j in i..num_pairs {
-            let key_delta: isize = (key_ptr_size + value_ptr_size + key.len())
-                .try_into()
-                .unwrap();
-            self.update_key_end(j, key_delta);
-            let value_delta = key_delta + isize::try_from(value.len()).unwrap();
-            self.update_value_end(j, value_delta);
-        }
+        let key_delta = isize::try_from(key_ptr_size + value_ptr_size + key.len()).unwrap();
+        self.update_ends(
+            false,
+            0..i,
+            (key_ptr_size + value_ptr_size).try_into().unwrap(),
+        );
+        self.update_ends(true, 0..i, key_delta);
+        self.update_ends(false, i..num_pairs, key_delta);
+        self.update_ends(
+            true,
+            i..num_pairs,
+            key_delta + isize::try_from(value.len()).unwrap(),
+        );
 
         let new_num_pairs = num_pairs + 1;
         self.page[2..4].copy_from_slice(&u16::try_from(new_num_pairs).unwrap().to_le_bytes());
@@ -1291,19 +1280,17 @@ impl<'b> LeafMutator<'b> {
         } else {
             0
         };
-        for j in 0..i {
-            self.update_key_end(j, -isize::try_from(key_ptr_size + value_ptr_size).unwrap());
-            let value_delta = -isize::try_from(key_ptr_size + value_ptr_size).unwrap()
-                - isize::try_from(key_end - key_start).unwrap();
-            self.update_value_end(j, value_delta);
-        }
-        for j in (i + 1)..num_pairs {
-            let key_delta = -isize::try_from(key_ptr_size + value_ptr_size).unwrap()
-                - isize::try_from(key_end - key_start).unwrap();
-            self.update_key_end(j, key_delta);
-            let value_delta = key_delta - isize::try_from(value_end - value_start).unwrap();
-            self.update_value_end(j, value_delta);
-        }
+        let key_delta = -isize::try_from(key_ptr_size + value_ptr_size).unwrap()
+            - isize::try_from(key_end - key_start).unwrap();
+        self.update_ends(
+            false,
+            0..i,
+            -isize::try_from(key_ptr_size + value_ptr_size).unwrap(),
+        );
+        self.update_ends(true, 0..i, key_delta);
+        self.update_ends(false, (i + 1)..num_pairs, key_delta);
+        let value_delta = key_delta - isize::try_from(value_end - value_start).unwrap();
+        self.update_ends(true, (i + 1)..num_pairs, value_delta);
 
         // Left shift all the pointers & data
 
@@ -1349,38 +1336,33 @@ impl<'b> LeafMutator<'b> {
         self.page.copy_within(start..end, dest);
     }
 
-    fn update_key_end(&mut self, i: usize, delta: isize) {
-        if self.fixed_key_size.is_some() {
+    // Moves by `delta` the key ends, or the value ends, the page keeps for `pairs`
+    fn update_ends(&mut self, values: bool, pairs: Range<usize>, delta: isize) {
+        let (fixed, before) = if values {
+            (
+                self.fixed_value_size,
+                usize::from(self.fixed_key_size.is_none()),
+            )
+        } else {
+            (self.fixed_key_size, 0)
+        };
+        if fixed.is_some() {
             return;
         }
-        let offset = 4 + size_of::<u32>() * i;
-        let mut ptr = u32::from_le_bytes(
-            self.page[offset..(offset + size_of::<u32>())]
-                .try_into()
-                .unwrap(),
-        );
-        ptr = (isize::try_from(ptr).unwrap() + delta).try_into().unwrap();
-        self.page[offset..(offset + size_of::<u32>())].copy_from_slice(&ptr.to_le_bytes());
+        let num_pairs = usize::from(u16::from_le_bytes(self.page[2..4].try_into().unwrap()));
+        let first = 4 + size_of::<u32>() * (before * num_pairs + pairs.start);
+        let last = first + size_of::<u32>() * pairs.len();
+        for end in self.page[first..last].chunks_exact_mut(size_of::<u32>()) {
+            let moved = moved_end(u32::from_le_bytes((&*end).try_into().unwrap()), delta);
+            end.copy_from_slice(&moved.to_le_bytes());
+        }
     }
+}
 
-    fn update_value_end(&mut self, i: usize, delta: isize) {
-        if self.fixed_value_size.is_some() {
-            return;
-        }
-        let accessor = LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size);
-        let num_pairs = accessor.num_pairs();
-        let mut offset = 4 + size_of::<u32>() * i;
-        if self.fixed_key_size.is_none() {
-            offset += size_of::<u32>() * num_pairs;
-        }
-        let mut ptr = u32::from_le_bytes(
-            self.page[offset..(offset + size_of::<u32>())]
-                .try_into()
-                .unwrap(),
-        );
-        ptr = (isize::try_from(ptr).unwrap() + delta).try_into().unwrap();
-        self.page[offset..(offset + size_of::<u32>())].copy_from_slice(&ptr.to_le_bytes());
-    }
+// A kept end moved by `delta`, wide until the end it gives is checked to fit: a value may be
+// longer than an i32 can say
+fn moved_end(end: u32, delta: isize) -> u32 {
+    u32::try_from(i64::from(end) + i64::try_from(delta).unwrap()).unwrap()
 }
 
 // Provides a simple zero-copy way to access a branch page
@@ -1869,5 +1851,17 @@ impl<'b> BranchMutator<'b> {
             8 + size_of::<Checksum>() * (self.num_keys() + 1) + PageNumber::serialized_size() * i;
         self.page[offset..(offset + PageNumber::serialized_size())]
             .copy_from_slice(&page_number.to_le_bytes());
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::moved_end;
+
+    #[test]
+    fn an_end_moves_by_more_than_an_i32_holds() {
+        // A 2.5 GB value replaced by an empty one, and the reverse
+        assert_eq!(moved_end(2_500_000_000, -2_500_000_000), 0);
+        assert_eq!(moved_end(10, 2_500_000_000), 2_500_000_010);
     }
 }

@@ -133,7 +133,7 @@ pub(super) fn one<'a>(
     // A search names a VECTOR column of its table and a vector of its length, or NULL, and
     // under USE RANK a policy of that column: all settled before any row, whatever the LIMIT.
     let search = match (table, search::asked(select)) {
-        (Some((table, _)), Some((_, column, near))) => {
+        (Some((table, qualifier)), Some((_, column, near))) => {
             let (at, _) = scope.find(column)?;
             let Some(vector) = table.vector(&column.column) else {
                 let (table, column) = (table.name.clone(), column.column.clone());
@@ -145,7 +145,7 @@ pub(super) fn one<'a>(
             // column is left open: neither changes what the search says.
             let explained = given.ctx.said.is_some();
             if explained {
-                let keys = search::Scope::new(table, vector, given);
+                let keys = search::Scope::new(table, qualifier, vector, given);
                 keys.keys(select.filter.as_ref())?;
                 scope.open = keys.unbound.take();
             }

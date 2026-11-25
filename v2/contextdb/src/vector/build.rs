@@ -9,7 +9,7 @@
 
 use super::block::BlockReader;
 use super::directory::{self, Grouped, Partition, kept};
-use super::ivf::{self, Place, centroids_per_record};
+use super::ivf::{self, LEVELS, Place, centroids_per_record};
 use super::train::{
     DRAWN, Mean, ROUNDS, Round, SAMPLE_TO_A_CENTROID, first_centroids, groups_for, nearest_among,
     sampled,
@@ -36,7 +36,7 @@ pub(super) const STEP_COMPARISONS: u64 = 1 << 22;
 pub(super) const MEASURED: u32 = 128;
 
 /// Bytes of a build's record before its lists.
-const HEAD: usize = 174;
+const HEAD: usize = 174 + 4 * LEVELS;
 
 /// What a build does next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,7 +91,7 @@ pub(super) struct Build {
     /// Whether any of them had been left behind by its row, so that every slot's key is
     /// looked up among the partition's `Left` records. No row is read.
     pub stale: bool,
-    /// Kept centres, live outside assignments, and the packed members' sum.
+    /// Kept centroids, live outside assignments, and the packed members' sum.
     pub reusing: bool,
     pub outside: u64,
     pub sum: Vec<f64>,
@@ -106,6 +106,9 @@ pub(super) struct Build {
     /// The ten slots nearest each question asked so far, in the order asked: what measuring
     /// the gap found and measuring the width reads. Empty until the first question.
     pub tens: Vec<Place>,
+    /// For each likeness level, the most groups any question asked so far needed (`Ivf::reach`):
+    /// what measuring the gap finds and the switch writes. Zero until then.
+    pub reach: [u32; LEVELS],
     /// The bytes the step that was last refused for memory needed; zero when the last step
     /// was staged.
     pub needing: u64,
@@ -114,10 +117,10 @@ pub(super) struct Build {
 impl Build {
     /// The record of the build, every number low byte first. Eight numbers of eight bytes:
     /// `steps`, `needing`, `slots`, `upto`, the `slots` and `upto` of `from`, outside assignments
-    /// and sum length. Flags (1: stale; 2: has `from`; 4: kept centres) and one phase byte,
+    /// and sum length. Flags (1: stale; 2: has `from`; 4: kept centroids) and one phase byte,
     /// counted from zero in the order of [`Phase`]. Then numbers of four bytes: `number`, the
     /// two of `tail`, `groups`, the `number`, `blocks` and `groups` of `from`, nineteen for the
-    /// fields of the phase in their order, the count of `starts`, `counts`, and the two
+    /// fields of the phase in their order, `reach`, the count of `starts`, `counts`, and the two
     /// numbers of every place of `starts` and `tens`, then the f64 sum. Unfilled fields are zero.
     pub(super) fn encode(&self) -> Vec<u8> {
         let from = self.from.map(|from| {
@@ -149,7 +152,7 @@ impl Build {
         let places = places.flat_map(|place| [place.block, place.slot]);
         let head = [self.number, self.tail.0, self.tail.1, self.groups];
         let short = head.into_iter().chain(short).chain(carried);
-        let short = short.chain([self.starts.len() as u32]);
+        let short = short.chain(self.reach).chain([self.starts.len() as u32]);
         let short = short.chain(self.counts.iter().copied()).chain(places);
         let mut record = Vec::new();
         let first = [self.steps, self.needing, self.slots, self.upto];
@@ -183,7 +186,7 @@ impl Build {
         let short =
             |at: usize| u32::from_le_bytes(std::array::from_fn(|byte| head[66 + 4 * at + byte]));
         let listed = |at: usize| u32::from_le_bytes(lists[at]);
-        let (flags, groups, begun) = (head[64], short(3) as usize, short(26) as usize);
+        let (flags, groups, begun) = (head[64], short(3) as usize, short(26 + LEVELS) as usize);
         if flags > 7 || lists.len() < groups + 2 * begun || (lists.len() - groups) % 2 != 0 {
             return None;
         }
@@ -236,6 +239,7 @@ impl Build {
             counts: (0..groups).map(listed).collect(),
             starts: places.by_ref().take(begun).collect(),
             tens: places.collect(),
+            reach: std::array::from_fn(|at| short(26 + at)),
             needing: long(1),
         };
         let (inside, grouped) = build.from.map_or((0, 0), |from| (from.blocks, from.slots));
@@ -262,7 +266,11 @@ impl Build {
                 .starts
                 .first()
                 .is_none_or(|first| *first == Place::default());
-        let sound = 0 < groups && groups as u64 <= build.slots && build.upto >= tail && placed;
+        // A sweep reads no slot count: once rows leave, its IVF may pack fewer slots than groups.
+        let sweeping = matches!(phase, Phase::Sweep { .. });
+        let sound = 0 < groups && (sweeping || groups as u64 <= build.slots) && placed;
+        let sound = sound && build.upto >= tail;
+        let sound = sound && ivf::reach_holds(&build.reach, build.groups);
         (sound && whole && agrees && build.sum.iter().all(|n| n.is_finite())).then_some(build)
     }
 
@@ -355,6 +363,8 @@ impl Build {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Work {
     pub vector: VectorId,
+    /// The partition's number within its column.
+    pub number: u32,
     /// The partition's key tuple.
     pub tuple: Key,
 }
@@ -386,8 +396,7 @@ pub(crate) struct Step {
     pub(super) slots: Vec<(Key, Option<[u32; 3]>)>,
     /// How many vectors the step finished: those it packed.
     pub(super) done: u64,
-    /// Slots read while packing, and (`compared`) the comparisons assigning made, apart from `done`.
-    pub(crate) rows_read: u64,
+    /// The comparisons assigning made, apart from `done`.
     pub(crate) compared: u64,
     /// Never read: holds what the records above take until they are staged.
     pub(super) held: Reservation,
@@ -488,7 +497,7 @@ pub(super) fn usable(read: &dyn Read, p: &Partition, pending: u64, column: &Vect
 }
 
 /// Calls `each` with every partition after `after` and its key tuple until `each` answers false.
-pub(super) fn entries(
+pub(crate) fn entries(
     read: &dyn Read,
     column: &VectorColumn,
     after: Option<&Key>,
@@ -560,7 +569,11 @@ pub(crate) fn unindexed_work(
     held.grow((found.len() * size_of::<Work>()) as u64)?;
     Ok(found
         .into_iter()
-        .map(|(_, vector, _, tuple)| Work { vector, tuple })
+        .map(|(_, vector, number, tuple)| Work {
+            vector,
+            number,
+            tuple,
+        })
         .collect())
 }
 
@@ -595,18 +608,21 @@ pub(crate) fn prepare(
         mean: None,
         slots: Vec::new(),
         done: 0,
-        rows_read: 0,
         compared: 0,
         held: budget.reserve(0, "maintenance")?,
     };
-    let Some(build) = Build::read(
+    let found = Build::read(
         read,
         vector,
         partition.number,
-        table.dimension(column),
+        step.dimension,
         &mut step.held,
-    )?
-    else {
+    );
+    // A build record that does not decode is damage the cycles rebuild, as a damaged IVF is.
+    let Some(build) = (match found {
+        Err(crate::types::Error::StoreCorrupted { .. }) => return Ok(Some(step)),
+        found => found?,
+    }) else {
         let pending = u64::from(partition.unindexed);
         let due = due(&partition, pending, column, vectors)
             || repair(read, vector, &partition, &mut step.held)?;
@@ -652,7 +668,14 @@ pub(crate) fn stage_step(step: Step, changes: &mut ChangeSet, vectors: u64) -> R
     let entry = VectorRecord::Partition(vector, tuple);
     let own = VectorRecord::Build(vector, partition.number);
     let mut held = step.held;
-    let build = Build::read(&*changes, vector, partition.number, dimension, &mut held)?;
+    let build = match Build::read(&*changes, vector, partition.number, dimension, &mut held) {
+        Err(crate::types::Error::StoreCorrupted { .. }) if step.at.1.is_none() => {
+            let sweep = discard(changes, vector, &mut partition)?;
+            changes.put_vector(entry, partition.encode())?;
+            sweep
+        }
+        build => build?,
+    };
     let Some((number, steps)) = step.at.1 else {
         let pending = u64::from(partition.unindexed);
         if build.is_some()
@@ -675,6 +698,7 @@ pub(crate) fn stage_step(step: Step, changes: &mut ChangeSet, vectors: u64) -> R
         let keep = partition.ivf.filter(|g| {
             grouped
                 && g.groups > 1
+                && g.groups <= groups
                 && partition.assigned + if stale { 0 } else { partition.slots }
                     < u64::from(g.groups).pow(2)
         });
@@ -717,6 +741,7 @@ pub(crate) fn stage_step(step: Step, changes: &mut ChangeSet, vectors: u64) -> R
             counts: vec![0; groups as usize],
             starts: Vec::new(),
             tens: Vec::new(),
+            reach: [0; LEVELS],
             needing: 0,
         };
         changes.put_vector(own, build.encode())?;
@@ -786,6 +811,67 @@ pub(crate) fn stage_step(step: Step, changes: &mut ChangeSet, vectors: u64) -> R
         changes.put_vector(entry, partition.encode())?;
     }
     Ok(step.done)
+}
+
+/// Stages the removal of a build whose record does not decode: the record and every record
+/// numbered for the build, found by scanning; the partition then builds none, and the notes
+/// of slots in the build's blocks are let go of as the next build packs their rows. A build
+/// that has switched in its IVF owes its sweep: it is answered with the sweep begun again,
+/// from the IVF's first block, and the rest of its records are the IVF's.
+fn discard(
+    changes: &mut ChangeSet,
+    vector: VectorId,
+    partition: &mut Partition,
+) -> Result<Option<Build>> {
+    let own = VectorRecord::Build(vector, partition.number);
+    let Some((n, _)) = partition.building else {
+        return changes.delete_vector(own).map(|()| None);
+    };
+    if let Some(ivf) = partition.ivf.filter(|ivf| ivf.number == n) {
+        let build = Build {
+            number: n,
+            steps: 0,
+            from: None,
+            tail: (0, 0),
+            slots: ivf.slots,
+            upto: ivf.upto,
+            stale: false,
+            reusing: false,
+            outside: 0,
+            sum: Vec::new(),
+            groups: ivf.groups,
+            phase: Phase::Sweep { block: 0 },
+            counts: vec![0; ivf.groups as usize],
+            starts: vec![Place::default(); ivf.groups as usize + 1],
+            tens: Vec::new(),
+            reach: [0; LEVELS],
+            needing: 0,
+        };
+        changes.put_vector(own, build.encode())?;
+        return Ok(Some(build));
+    }
+    changes.delete_vector(own)?;
+    changes.delete_vector(VectorRecord::Mean(vector, n))?;
+    partition.building = None;
+    let kinds: [fn(_, _, _) -> VectorRecord<'static>; 4] = [
+        VectorRecord::Assigned,
+        VectorRecord::Centroids,
+        VectorRecord::Block,
+        VectorRecord::Binary,
+    ];
+    // Each kind's records are numbered from the first place on, one after another.
+    for kind in kinds {
+        let mut places = 0;
+        changes.vectors(kind(vector, n, 0), &mut |record, _| {
+            let ours = record == kind(vector, n, places);
+            places += u32::from(ours);
+            Ok(ours)
+        })?;
+        for at in 0..places {
+            changes.delete_vector(kind(vector, n, at))?;
+        }
+    }
+    Ok(None)
 }
 
 /// Records, in a commit of its own, that the next step of a partition's build was refused

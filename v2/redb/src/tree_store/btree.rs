@@ -411,6 +411,8 @@ impl UntypedBtreeMut {
             }
             _ => unreachable!(),
         }
+        // A page this transaction wrote, such as one the early release changed, is freed now
+        drop(old_page);
 
         let mut freed_pages = self.freed_pages.lock().unwrap();
         // No need to track allocations, because this method is only called during compaction when

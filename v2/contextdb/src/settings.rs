@@ -20,7 +20,7 @@ pub(crate) const SETTINGS: [(&str, Kind, u64); 8] = [
     ("SET DISK_LIMIT", Bytes, u64::MAX),
     ("SET STORAGE_COMPACTION START_RATIO", Ratio(3), START),
     ("SET STORAGE_COMPACTION STOP_RATIO", Ratio(2), STOP),
-    ("SET STORAGE_COMPACTION MIN_INTERVAL", Seconds, 0),
+    ("SET STORAGE_COMPACTION MIN_INTERVAL", Seconds, 60_000),
     ("SET UNINDEXED_VECTOR_LIMIT", Count, 0),
     ("SET STATEMENT_STATISTICS_LIMIT", Many, 1024),
     ("SET MAINTENANCE_POLL_INTERVAL", Seconds, 60_000),
@@ -113,8 +113,8 @@ pub(crate) fn check(at: usize, next: u64, values: &Values) -> Result<()> {
             let peer = f64::from_bits(values[other].unwrap_or(SETTINGS[other].2));
             (0.0..=1.0).contains(&n) && if at < other { n > peer } else { n < peer }
         }
-        // A setting whose default is zero may be set to zero. A poll interval of zero is refused.
-        Seconds => next > 0 || SETTINGS[at].2 == 0,
+        // The compaction interval may be set to zero. A poll interval of zero is refused.
+        Seconds => next > 0 || at == 4,
         Count => next > 0 && next <= u32::MAX as u64,
         Many => next <= u32::MAX as u64,
     };

@@ -110,7 +110,7 @@ pub enum Create {
 pub struct WorkDone {
     /// Rows read, including maintenance's sealed or packed vectors.
     pub rows_read: u64,
-    /// Full-precision vector distance evaluations, and maintenance's slot-to-centre ones.
+    /// Full-precision vector distance evaluations, and maintenance's slot-to-centroid ones.
     pub vectors_compared: u64,
 }
 
@@ -139,7 +139,11 @@ pub(crate) struct Open {
     closes: Closes,
     this: Weak<Open>,
     pub(crate) last_cycle: Mutex<Option<MaintenanceReport>>,
+    /// When the tidy-up's window began, the commit and file length a pass that moved nothing
+    /// ended at, and whether the pass under way has moved a page.
     pub(crate) last_sweep: Mutex<Option<std::time::SystemTime>>,
+    /// The source of removal the next cycle starts at.
+    pub(crate) removal_from: Mutex<usize>,
     plans: KeptPlans,
     pub(crate) statements: Arc<Statements>,
     plugin: Option<Arc<dyn DatabasePlugin>>,
@@ -168,7 +172,7 @@ pub(crate) struct Open {
     callback_wait: Duration,
     /// What every statement and every transaction begins from. Held to copy it, to replace it
     /// and to read it again after a read that failed, never while a commit goes to the disk.
-    newest: Mutex<Core>,
+    pub(crate) newest: Mutex<Core>,
     /// The highest number a transaction was given or a commit carries.
     numbered: Mutex<u64>,
     pub(crate) cancelled: std::sync::atomic::AtomicU64,
@@ -346,7 +350,8 @@ impl Database {
             closes: Closes(options.plugin.clone()),
             this: this.clone(),
             last_cycle: Mutex::new(None),
-            last_sweep: Mutex::new(None),
+            last_sweep: Mutex::default(),
+            removal_from: Mutex::default(),
             plans,
             statements: Arc::new(Statements::new(&budget, settings[6])),
             plugin: options.plugin,
@@ -973,9 +978,8 @@ impl Database {
     /// dispatch, and `DatabaseClosed` after close.
     pub fn run_maintenance_cycle(&self) -> Result<MaintenanceReport> {
         let open = self.opened()?;
-        maintenance::cycle(&open, true).map(|(mut report, more)| {
+        maintenance::cycle(&open, true).map(|(report, _)| {
             if self.reader.is_admin() {
-                report.work_remaining = Some(more || report.compaction_waiting_on.is_some());
                 report
             } else {
                 report.withheld()
@@ -983,17 +987,17 @@ impl Database {
         })
     }
 
-    /// One compaction step of at most 256 pages now; a reader holding moved pages is reported.
+    /// One step of the tidy-up now, whatever share of the file is free; `work_remaining` says
+    /// whether its pass goes on. A reader holding moved pages is reported. After a crash the
+    /// step is one of the free-page recovery it left owed, as `recovery_advanced` says.
     pub fn compact_now(&self) -> Result<MaintenanceReport> {
         let open = self.opened()?;
-        let (moved, waiting, more, ratio) = maintenance::compact(&open, true)?;
-        let report = MaintenanceReport {
-            compacted_pages: Some(moved),
-            compaction_waiting_on: waiting,
-            compaction_free_ratio: ratio,
-            work_remaining: Some(more || waiting.is_some()),
-            ..Default::default()
-        };
+        let mut report = MaintenanceReport::default();
+        let before = open.store.recovery_state()?.1;
+        let more = maintenance::recover(&open, &mut report)?.is_some()
+            || maintenance::compact(&open, true, &mut report)?;
+        report.reclaimed_bytes = Some(before.saturating_sub(open.store.recovery_state()?.1));
+        report.work_remaining = Some(more || report.compaction_waiting_on.is_some());
         Ok(if self.reader.is_admin() {
             report
         } else {

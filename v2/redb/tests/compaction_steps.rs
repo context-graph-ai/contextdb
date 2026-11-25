@@ -14,6 +14,12 @@ fn commit(db: &Database, change: impl FnOnce(&redb::WriteTransaction)) {
     change(&write);
     write.commit().unwrap();
 }
+fn remove(write: &redb::WriteTransaction, rows: impl IntoIterator<Item = u64>) {
+    let mut table = write.open_table(ROWS).unwrap();
+    for row in rows {
+        table.remove(row).unwrap();
+    }
+}
 fn drain(db: &Database, count: usize) {
     for _ in 0..count {
         commit(db, |_| {});
@@ -42,6 +48,206 @@ fn page_rows(read: &ReadTransaction, count: u64) {
         assert_eq!(table.get(row).unwrap().unwrap().value(), &[7; 3000][..]);
     }
 }
+#[test]
+fn a_tidy_up_step_moves_pages_only_down_within_its_allowance() {
+    // Design 4, S3: a step moves a page only to the lowest place wholly below it, is charged each
+    // page it reads and writes once against one allowance, always moves the first movable page,
+    // and a whole walk that moves nothing ends the pass. Each block is the one value of its own
+    // table, so the file holds one copy of it until a step moves it.
+    const BLOCKS: [TableDefinition<u64, &[u8]>; 6] = [
+        TableDefinition::new("b0"),
+        TableDefinition::new("b1"),
+        TableDefinition::new("b2"),
+        TableDefinition::new("b3"),
+        TableDefinition::new("b4"),
+        TableDefinition::new("b5"),
+    ];
+    let path = folder("tidy-up-step").join("data");
+    let opened = || {
+        let backend = PlainFile::open(&path, Vec::new());
+        let counters = (backend.read_pages.clone(), backend.sent.clone());
+        (
+            manual_builder().create_with_backend(backend).unwrap(),
+            counters,
+        )
+    };
+    // The first and last pages of the file that end in each block's bytes: a page is copied
+    // whole, so its copy ends in them too.
+    let places = || {
+        let file = std::fs::read(&path).unwrap();
+        let tails = file.chunks_exact(4096).map(|page| &page[4032..]);
+        let tails: Vec<&[u8]> = tails.collect();
+        (0..6u8)
+            .map(|b| {
+                let at = |w: &&[u8]| w.iter().all(|&x| x == 0xB0 + b);
+                (
+                    tails.iter().position(at).unwrap(),
+                    tails.iter().rposition(at).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    // One step as the engine takes it, from the stored place in its own commit, with the pages
+    // the file was asked for during it.
+    let step = |db: &Database, read_pages: &AtomicU64| {
+        let was = places();
+        let mut write = db.begin_write().unwrap();
+        let place = write.compaction_position(false).unwrap().0;
+        let before = read_pages.load(Relaxed);
+        let (step, _) = write.compact_pages(256, place.as_deref()).unwrap();
+        let file_reads = read_pages.load(Relaxed) - before;
+        write.commit().unwrap();
+        // Each moved page is read and written; past the allowance of 256 a step took only its
+        // first movable block after discovery, with the block's copy and the pages above it.
+        let (now, pages) = (places(), |b: usize| if b == 5 { 128 } else { 64 });
+        // A block stays where it was or moves whole into a place wholly below the one it left.
+        // The lowest copy is the block itself (a moved block's old pages keep its bytes until
+        // they are written again); its value fills 50 pages, or 100 for the last.
+        for (b, (now, was)) in now.iter().zip(&was).enumerate() {
+            let last = now.0 + if b == 5 { 99 } else { 49 };
+            assert!(
+                now.0 == was.0 || last < was.0,
+                "block {b} moved from {was:?} to pages {}..={last}, not wholly below where it was",
+                now.0
+            );
+        }
+        let lower: Vec<usize> = (0..6).filter(|&b| now[b].0 < was[b].0).collect();
+        let known: u64 = lower.iter().map(|&b| pages(b)).sum();
+        let over = (step.read + step.written).saturating_sub(256);
+        assert!(
+            step.read >= known
+                && step.written >= known
+                && (over == 0
+                    || lower.len() == 1
+                        && step.moved == pages(lower[0])
+                        && over <= step.moved + step.written),
+            "uncharged, or past 256 for more than its first block: {step:?} {lower:?}"
+        );
+        (step, file_reads)
+    };
+    let (db, (read_pages, _)) = opened();
+    commit(&db, |write| fill(write, ROWS, 0..800, &[7; 3000]));
+    for (b, table) in BLOCKS.iter().enumerate() {
+        // Five blocks of 64 pages and one of 128 pages, above 800 one-page leaves.
+        let bytes = if b == 5 { 400 << 10 } else { 200 << 10 };
+        commit(&db, |write| {
+            fill(write, *table, [0], &vec![0xB0 + b as u8; bytes])
+        });
+    }
+    // More one-page leaves take every free page left between the blocks, beside the pages the
+    // commits wrote for themselves: a step releases freed pages first (design 4, S3), so once
+    // those pages are rewritten a place wholly free would otherwise open below a block.
+    let free = db.begin_write().unwrap().compaction_state().unwrap().0;
+    let leaves = 800 + free;
+    commit(&db, |write| fill(write, ROWS, 800..leaves, &[7; 3000]));
+    let start = places();
+    // Every other leaf freed: the walk moves small pages down into the holes and a block into a
+    // place they leave wholly below it, each step within its allowance, and reaches rest with
+    // the file no longer than before it.
+    commit(&db, |write| remove(write, (0..800).step_by(2)));
+    drain(&db, 2);
+    let before = length(&path);
+    while !step(&db, &read_pages).0.ended {}
+    assert!(
+        length(&path) <= before,
+        "a walk that moves pages only down grew the file"
+    );
+    // Every leaf freed: the pass moves all six blocks below where any of them began, across a
+    // reopen that it goes on from.
+    commit(&db, |write| remove(write, (1..800).step_by(2).chain(800..leaves)));
+    drain(&db, 2);
+    // Two small commits write the catalog's page again, now low in the file, so the first page
+    // past the cut in tree order is a block.
+    for row in 0..2 {
+        commit(&db, |write| fill(write, TableDefinition::new("after"), [row], &[1]));
+    }
+    let (first, _) = step(&db, &read_pages);
+    assert!(
+        first.moved >= 64,
+        "the first movable page always moves: {first:?}"
+    );
+    drop(db);
+    let (db, (read_pages, sent)) = opened();
+    let place = db
+        .begin_write()
+        .unwrap()
+        .compaction_position(false)
+        .unwrap()
+        .0;
+    assert!(
+        place.is_some() || first.ended,
+        "the pass's place is stored in the step's commit"
+    );
+    let (mut moved, mut ends) = (first.moved, u64::from(first.ended));
+    while ends == 0 {
+        let (taken, _) = step(&db, &read_pages);
+        moved += taken.moved;
+        ends += u64::from(taken.ended);
+        for (b, (now, then)) in places().iter().zip(&start).enumerate() {
+            assert!(
+                now.1 <= then.1,
+                "block {b} rose from {then:?} to {now:?} in {taken:?}"
+            );
+        }
+    }
+    let low = start.iter().map(|s| s.0).min().unwrap();
+    for (b, now) in places().iter().enumerate() {
+        assert!(
+            now.0 < low,
+            "block {b} of 64 or 128 pages did not move below {low}: {now:?}"
+        );
+    }
+    let written = sent.load(Relaxed) / 4096;
+    assert!(
+        written <= 3 * moved,
+        "the pass wrote {written} pages to move {moved}"
+    );
+    // A second pass moves nothing.
+    loop {
+        let (taken, file_reads) = step(&db, &read_pages);
+        assert_eq!(taken.moved, 0, "a second pass moved pages: {taken:?}");
+        let reads = "a step where nothing can move read";
+        assert!(file_reads <= 256, "{reads} {file_reads} pages");
+        if taken.ended {
+            break;
+        }
+    }
+    // One more commit cuts the file to its pages in use and at most one growth step, which is
+    // never less than twice the largest allocation (`page_manager.rs` grow).
+    drain(&db, 1);
+    let (free, total, _, _) = db.begin_write().unwrap().compaction_state().unwrap();
+    let used = (total - free) * 4096;
+    let slack = length(&path) - used;
+    assert!(
+        slack <= (length(&path) / 16).max(2 * (512 << 10)),
+        "{slack} bytes past {used} in use"
+    );
+    // The low mark (S4): the free pages at a commit's start less the most it had taken. A commit
+    // that takes 200 pages while 200 that earlier commits freed come back at its end has a low
+    // mark at least 200 below its end count; a commit that lengthened the file has none.
+    commit(&db, |write| fill(write, ROWS, 0..600, &[7; 3000]));
+    commit(&db, |write| remove(write, 200..600));
+    drain(&db, 2);
+    commit(&db, |write| remove(write, 0..200));
+    commit(&db, |write| fill(write, ROWS, 1000..1200, &[7; 3000]));
+    let next = db.begin_write().unwrap();
+    let (end, _, _, _) = next.compaction_state().unwrap();
+    let mark = next.last_commit_low_mark().unwrap();
+    assert!(
+        mark.is_some_and(|mark| end >= mark + 200),
+        "end count {end}, low mark {mark:?}"
+    );
+    drop(next);
+    let grown = length(&path);
+    commit(&db, |write| fill(write, BLOCKS[0], [1], &vec![1; 8 << 20]));
+    assert!(length(&path) > grown);
+    let mark = db.begin_write().unwrap().last_commit_low_mark().unwrap();
+    assert_eq!(
+        mark, None,
+        "a commit that lengthened the file has no low mark"
+    );
+}
+
 fn fill_pages(write: &redb::WriteTransaction, count: u64) {
     fill(write, ROWS, 0..count, &[7; 3000]);
     let table = write.open_table(ROWS).unwrap();

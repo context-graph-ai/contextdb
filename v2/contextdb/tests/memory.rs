@@ -686,9 +686,9 @@ fn a_limit_set_inside_a_transaction_holds_at_once_and_a_rollback_does_not_undo_i
 fn a_compaction_step_with_too_little_memory_is_refused_before_it_reads_a_page() {
     use std::sync::atomic::{AtomicU64, Ordering};
     // The step reserves one fixed workspace, whatever the size of the file: at 2,000 and at
-    // 10,000 notes the refusal asks for the same bytes.
+    // 6,000 notes the refusal asks for the same bytes.
     let mut requested = Vec::new();
-    for notes in [2000_i64, 10_000] {
+    for notes in [2000_i64, 6000] {
         // Deleting the first 1,000 of 2,000 notes of 1,700 letters frees far more than a tenth of
         // the file, so a compaction step is due.
         let folder = support::folder(&format!("compaction-under-a-small-limit-{notes}"));

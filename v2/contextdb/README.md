@@ -199,8 +199,9 @@ DROP SCHEDULE [IF EXISTS] name;
   folded to lower case, as in Postgres; a state or an edge type is a value and is kept as written.
 - A condition or a value is built from column names (`table.column` or `alias.column` when
   tables are joined), literals, `$name` values, `=  !=  <>  <  <=  >  >=`, `AND`, `OR`, `NOT`,
-  `IS NULL`, `IS NOT NULL`, `+  -  *  /`, parentheses, `NOW()` and `COALESCE(a, b, ...)`; no
-  other function is read. A comparison with NULL is not true, as in standard SQL.
+  `IS NULL`, `IS NOT NULL`, `+  -  *  /  %`, parentheses, `NOW()` and `COALESCE(a, b, ...)`; no
+  other function is read. `%` is the remainder of two whole numbers, with the sign of the
+  dividend, as in Postgres. A comparison with NULL is not true, as in standard SQL.
   `x LIKE 'a%'` and `NOT LIKE` match text (`%` any run, `_` one character, backslash escapes
   either), and `x BETWEEN a AND b` and `NOT BETWEEN` include both ends. A JSON column is read
   with `->` (the field as JSON) and `->>` (the field as text). JSON values compare by value,
@@ -647,12 +648,20 @@ A table opts in by declaring a column:
 What a narrowed handle gets:
 
 - A list read (a scan, a range, a count) leaves hidden rows out, and says nothing of them.
-- A `SELECT` that names one hidden row whole, by its primary key or a `UNIQUE` rule (`=` a
-  value, a `$name` or a `(SELECT ...)`; not `IN` or `OR`), is refused
-  by the rule that hid it: `ContextScopeViolation`, `ScopeLabelViolation`, `AclDenied`, or
-  `PrincipalRequired` for a table that wants a principal and got none. That tells "not yours"
-  from "not there", which is an empty answer; the sentence never carries a value or a number of
-  the hidden row. A `GRAPH_TABLE` whose filter names one start node by `id` with `=` (a value,
+- A `SELECT` of one table that names one row whole, by its primary key or every column of a
+  `UNIQUE` rule (`=` a value, a `$name` or a `(SELECT ...)`; not `IN`, and not `OR` between
+  different rows, though `id = 2 OR id = 2` names one), is refused when that row is hidden and
+  the rest of the filter holds for it, by the rule that hid it: `ContextScopeViolation`,
+  `ScopeLabelViolation`, `AclDenied`, or `PrincipalRequired` for a table that wants a principal
+  and got none. That tells "not yours" from "not there", which is an empty answer; the sentence
+  never carries a value or a number of the hidden row. A hidden row your conditions do not
+  select is simply not there: `WHERE id = $1 AND context_id = $ctx` over a row of another
+  Context answers nothing. The answer is the same whichever index reads the table, and under
+  every `USE VECTOR` mode the handle may run, its distance bound included; a vector find left
+  none of the handle's Contexts, by its filter or a handle given none, finds nothing. A `JOIN`
+  reads each of its tables as a list and leaves a hidden row out, even one its filter names by
+  key; a `(SELECT ...)` in it is a `SELECT` of its own.
+  A `GRAPH_TABLE` whose filter names one start node by `id` with `=` (a value,
   a `$name` or a `(SELECT ...)`) is refused likewise when the node is hidden; a list of starts
   (`IN`, `OR`) leaves the hidden node out and answers the rest, and NULL names no start.
 - An `UPDATE` or `DELETE` changes no row the handle cannot see, and says it changed none; an
@@ -987,8 +996,8 @@ values of the named columns, one partition for each combination that has a row w
 so that a search which filters on the key reads only that part. A partition is not a wall: a
 search with no filter on the key reads every partition, and which rows a caller may see is the
 `WHERE`'s business. A search whose `WHERE` gives the key columns values with `=` or `IN` reads
-only the partitions named, up to 4,096 of them (a filter that names more reads every
-partition); the whole condition is still applied to every row, so partitions change the work
+only the partitions named, up to 4,096 of them (above that, the stored combinations are checked
+against the filter and only those that can match are searched); the whole condition is still applied to every row, so partitions change the work
 and never the answer. A key column is `NOT NULL` and a `UUID`, `TEXT`,
 `INTEGER`, `BOOLEAN` or `TIMESTAMP`.
 
@@ -1306,15 +1315,23 @@ never the answer built at the first page, and its charge goes back when the page
 Rows an `ORDER BY` leaves tied, and the rows of a statement with no `ORDER BY`, come in the order
 of the walk: entries by index key and then row key, or the exact reverse from the far end. The same
 rows give the same order on every machine, but a statement that needs one order names it, and a
-`LIMIT` over tied rows can return any of them. A filter no row can pass (`WHERE FALSE`, `a = 1
+`LIMIT` over tied rows can return any of them. A key or index that names at most one row, the
+table's whole key or a UNIQUE rule every column of which is given one value by `=` or by a joined
+row's value, is read before any other, and of several the first in the table's order: the key,
+then UNIQUE columns in column order, then UNIQUE rules as declared. Then comes the whole key
+given by a list, then the one that fixes the most leading columns. Two the filter narrows alike
+go to the table's own key, then to the index declared first (`tied with chosen index; lost by
+creation order`): an index over the columns the filter gives together wins by fixing more of
+them. A filter no row can pass (`WHERE FALSE`, `a = 1
 AND a = 2`, `a > 5 AND a < 3`, a parameter bound to FALSE) answers no rows in every kind of
 statement and reads nothing. A row the handle may not see, named whole by its key or a UNIQUE
-rule given by `=`, is refused by the rule that hid it, however the filter writes the value
-(`id = 1 + 1`, `(a, b) = (1, 2)`, `id = 2 OR id = 2`); a list never names a row, and leaves it out.
+rule given by `=` and passed by the rest of the filter, is refused by the rule that hid it,
+however the filter writes the value (`id = 1 + 1`, `(a, b) = (1, 2)`, `id = 2 OR id = 2`); a list
+never names a row, and leaves it out.
 A value of another type for an `INTEGER` key (`id = 1.5`) gives no key, and a filter of more than
 4,096 cases is left unread; the statement then reads rows and asks each of them, and a row the
 handle may not see gives a no-row answer, never the row.
-<!-- enforced by: pages_in_an_order_with_ties_cost_their_rows_and_one_run, pages_of_one_indexed_value_read_backward_cost_their_rows, a_long_paged_read_in_an_order_with_ties_does_not_creep_toward_the_memory_limit, a_filter_no_row_can_pass_reads_nothing_by_a_parameter_as_by_its_text, a_hidden_row_named_whole_is_refused_and_a_list_read_leaves_it_out -->
+<!-- enforced by: pages_in_an_order_with_ties_cost_their_rows_and_one_run, a_composite_key_a_unique_column_and_an_upsert_read_only_the_rows_they_name, partitioning_never_changes_the_contexts_a_caller_may_read, pages_of_one_indexed_value_read_backward_cost_their_rows, a_long_paged_read_in_an_order_with_ties_does_not_creep_toward_the_memory_limit, a_filter_no_row_can_pass_reads_nothing_by_a_parameter_as_by_its_text, a_hidden_row_named_whole_is_refused_and_a_list_read_leaves_it_out -->
 
 ## Binding values
 
@@ -1570,8 +1587,16 @@ notes/
   lock       names the process that holds the store for writing, or held it last
   writer     short writer-startup admission marker
   writer.sock  optional request-channel socket on Linux, while registered
+  space      what maintenance must remember past a commit the disk limit refused
   readers/   one small file per reader, while a statement of its runs
 ```
+
+`space` is written only by the writer, replaced whole, and read by any process: it holds the
+next move the tidy-up owes after a refused step, and the vector partitions whose seal or build
+step was refused for disk room, which `SHOW VECTOR_PARTITIONS` reports as `stalled` with the
+reason `disk_limit`. Each entry is believed only while the committed state it was decided at
+holds, so a missing or stale file says nothing. It is not counted against the disk limit, and
+`export_snapshot` does not copy it.
 
 A file under `readers/` contains the decimal commit id its live view holds. Its lock marks
 the reader as alive; it is removed when the view is released. The oldest live commit keeps
@@ -1589,14 +1614,16 @@ Text and JSON values from about 1 KiB up to 1 MiB are stored
 compressed when that saves an eighth or more, and read back byte for byte, with nothing to
 switch on or off, so a store of long text is usually smaller than the text. While no process has the folder open for writing it is a plain
 folder: copy it, move it or delete it with ordinary tools. Do not copy it while a writer is
-running; this version has no command that copies a store beside a live writer.
+running; `Database::export_snapshot(dest)` copies one committed moment of every record kind to a
+new folder beside a live writer, refusing an existing destination, and leaves out `identity.key`.
 
 **When a process is killed.** Nothing committed is lost: a commit that had returned is there,
 and one that was in flight is whole or absent. A killed writer leaves its `lock` file and a
 reader killed inside a statement leaves its file in `readers/`; the next open for writing clears
 both, and nobody cleans anything by hand. Readers open and answer at once. The next open for writing after a kill
-first reads every page the store uses, so recovery work grows with the store. The flat-recovery
-implementation is not present in this version. The historical figures and their source revisions
+first reads every page the store uses, so recovery work grows with the store. The free-page
+recovery a crash leaves owed is done in steps by maintenance with the store already open; under a
+disk limit a write waits for it only when the declared disk has no room left. The historical figures and their source revisions
 belong in the [performance results](../../docs/performance/README.md).
 
 ## Retention and checking a store
@@ -1615,18 +1642,20 @@ in this version. It does not protect unsynced rows from expiry here.
 with tables in name order. Each `ContentSize` counts key/value bytes for `rows`, `large_values`,
 `indexes`, `vectors` and `blocks`; `rows` is bytes, not a row count. These are content bytes,
 not physical disk allocation or free space. A damaged record or inconsistent index/count gives
-`StoreCorrupted`. A narrowed handle is refused with `AdminRequired`. The shell has no
-`verify` or physical-size command. `verify` is a Rust API; `SHOW VECTOR_*` byte fields count
+`StoreCorrupted`. A narrowed handle is refused with `AdminRequired`. The shell's `.verify` runs
+`SHOW CONTENT_SIZE`, which reports the same content sizes; it has no physical-size command. `verify` is also a Rust API; `SHOW VECTOR_*` byte fields count
 vector payload/index structures, not the whole file or free space.
 
 To measure a stopped store from a shell, use `wc -c < ./notes/data` for file length and
 `du -k ./notes/data` for allocated KiB, then compare against your application's own current
 data-byte total. Neither is per-table or free-space accounting. Deleted and expired pages
-are reused by later writes, and the maintenance cycle compacts them: once the pages that can be
-reclaimed reach `START_RATIO` of the file (0.05 when the store declares none) it moves pages
-toward the start of the file, at most 256 in one cycle, until they fall to `STOP_RATIO` (0.02),
-and the free pages left at the end of the file are cut off `data`. `compacted_pages` counts the
-pages a cycle moved, and a cycle reports `compaction_waiting_on` while a reader still holds pages
+are reused by later writes, and the maintenance cycle compacts them: space that no commit used
+for the whole interval is given back when it is at least the start share of the file. The
+interval is `MIN_INTERVAL` (60 seconds when the store declares none; `MIN_INTERVAL 0` makes it
+one commit) and the start share `START_RATIO` (0.05). The cycle then moves pages toward the
+start of the file, at most 256 in one cycle, until free pages fall to `STOP_RATIO` (0.02), and
+the free pages left at the end of the file are cut off `data`. `compacted_pages` counts the
+pages a cycle moved, `reclaimed_bytes` the bytes `data` lost over the cycle, and a cycle reports `compaction_waiting_on` while a reader still holds pages
 it moved.
 
 If the store reports `StoreCorrupted`, stop its writers and preserve the folder before
@@ -1692,7 +1721,8 @@ one `Database::transaction` and call `commit`, and a transaction dropped or roll
 none of them.
 
 `SET DISK_LIMIT 512M` and `db.set_disk_limit(Some(bytes))` persist the same ceiling;
-`SHOW DISK_LIMIT` and `db.disk_limit()` inspect it. NONE clears it. The setter commits under
-the prior ceiling; its new ceiling governs following writes. A growth refusal is
+`SHOW DISK_LIMIT` and `db.disk_limit()` inspect it. NONE clears it. A lower ceiling governs the
+commit that records it, so a setting with no room in the file is refused and the prior ceiling
+stays; a raised or cleared one commits under the prior ceiling. A growth refusal is
 `DiskLimitExceeded` and leaves the handle usable. `DatabaseOpenOptions::disk_limit` applies
 only to that open. `parse_size` reads byte counts for CLI options through the shared reader.

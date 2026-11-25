@@ -61,8 +61,14 @@ Checking pages when they are read:
 Keeping a file close to the size of what it holds:
 
 - `Builder::set_manual_compaction(true)` leaves ordinary commits untrimmed.
-  `WriteTransaction::compact_pages(allowance, from)` bounds candidate reads and relocation,
-  returns `(moved, next)` with an opaque position; commit and clean close trim.
+  `WriteTransaction::compact_pages(allowance, from)` is one step of the tidy-up: it first
+  releases the freed pages no reader holds, then in tree order moves each page past the packed
+  length to the lowest place wholly below it, with the pages above it copied within the file,
+  and passes by a page with no such room. It returns the step's counts and an opaque position;
+  commit and clean close trim. `compact_pages_choosing` adds a share of free pages under which
+  the pass ends and a retry ordinal that passes by the first candidates and takes the next
+  alone, and says whether the step had chosen a page. `compaction_mark()` gives the last
+  committed id and the oldest reader, external pins included, clamped to it.
   `compaction_space(&mut allowance)` returns free, total, eligible pending, last freed pages and held readers;
   its pending scan shares the read allowance and stops at churn. `compaction_state()` reads no tree.
   Relocation uses free-now minus churn; one scoped file-size clip covers moves and metadata.
@@ -74,13 +80,13 @@ Keeping a file close to the size of what it holds:
   releasing pending pages and selects maximum trimming for move and drain commits; the clip
   is restored on transaction exit. `pending_free_pages` excludes the newest retired proof,
   which each publication replaces, while retaining older chains and ordinary pending frees.
-  `compaction_backlog` applies the same exclusion to its pending batch count;
   `has_free_tail` exposes the allocator's trim check. Drains commit only for those pending
   entries or a trimmable tail. A drain admits iterations only while pending entries at or
   before its starting physical commit remain, stopping once those are gone or a pass makes
   no progress. An admitted pass still trims a free tail and may release newer frees.
   `RELEASE_PAGES` bounds compaction's staged addresses at 4,096 (32 KiB encoded); ordinary release
-  uses its commit's allocated-page count clamped to 4,096..=131,072 (at most 1 MiB encoded).
+  uses its commit's allocated-page count, at least 4,096 and at most 131,072 (1 MiB encoded),
+  less what the step's early release already spent.
   Remaining entries wait. Failed writes and syncs still require reopening the handle.
   Settings and position metadata have a bounded lookup cost; release has at most the bounded
   entries' root-to-leaf paths. Discovery and pending inspection still share the work allowance.

@@ -1,5 +1,7 @@
 //! Callbacks need a Rust host; no existing test exercises their commit or cascade rules.
 mod support;
+#[path = "support/workev.rs"]
+mod workev;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
@@ -9,6 +11,28 @@ use contextdb::{
     TriggerContext, TriggerEvent, Value, params,
 };
 use support::*;
+use workev::open_with;
+
+fn open(folder: &std::path::Path) -> contextdb::Database {
+    open_with(folder, DatabaseOpenOptions::default()).expect("open the store for writing")
+}
+
+fn reopen(db: contextdb::Database, folder: &std::path::Path) -> contextdb::Database {
+    close(db);
+    open(folder)
+}
+
+/// Registers `sink` on `on` to take every event it is given and keep it.
+fn kept_events(on: &contextdb::Database, sink: &str) -> Arc<Mutex<Vec<SinkEvent>>> {
+    let kept = Arc::new(Mutex::new(Vec::new()));
+    let into = kept.clone();
+    on.register_sink(sink, None, move |event| {
+        into.lock().unwrap().push(event.clone());
+        Ok(())
+    })
+    .expect("register a sink that keeps its events");
+    kept
+}
 
 const RECORDS: [&str; 3] = ["entities", "incidents", "notifications"];
 
@@ -74,13 +98,7 @@ fn trigger_writes_and_the_firing_rows_commit_or_roll_back_together() {
             run(&tx, &format!("CREATE TRIGGER other ON notes WHEN {when}"));
             run(&tx, "CREATE EVENT TYPE edited WHEN UPDATE ON notes");
             tx.commit().unwrap();
-            let delivered = Arc::new(Mutex::new(Vec::new()));
-            let external = delivered.clone();
-            db.register_sink("audit", None, move |event| {
-                external.lock().unwrap().push(event.action_id);
-                Ok(())
-            })
-            .expect("register external delivery");
+            let delivered = kept_events(&db, "audit");
             let refused = db.register_transactional_trigger_callback("missing", |_, _| Ok(()));
             let refused = refused.unwrap_err();
             assert!(matches!(refused, Error::TriggerNotDeclared { .. }));
@@ -478,8 +496,9 @@ fn callback_writes_fire_triggers_through_the_cap_and_refuse_the_whole_commit_bey
             let (started, entered) = std::sync::mpsc::sync_channel(0);
             let (release, resume) = std::sync::mpsc::sync_channel(0);
             let held = Mutex::new((started, resume));
-            // The refusal's text is long: kept once, not once a firing, it fits the limit.
-            let long = "x".repeat(32 << 10);
+            // The refusal's text is long: kept once, not once a firing, it fits the limit. The
+            // ring's 1,024 copies of it would be 20 MiB, past the 16 MiB above the floor.
+            let long = "x".repeat(20 << 10);
             let reason = format!("the last firing refuses {long}");
             let refused = reason.clone();
             db.register_transactional_trigger_callback("wide", move |host, ctx| {
@@ -1061,17 +1080,17 @@ fn delivery_reads_a_long_backlog_in_batches_from_the_store_under_a_small_limit()
     assert!(!db.event_bus_status().unwrap().sinks[0].callback_registered);
     let limit = support::opening::open_floor() + (2 << 20);
     db.set_memory_limit(Some(limit)).unwrap();
-    let ids = Arc::new(Mutex::new(Vec::new()));
-    let kept = ids.clone();
-    db.register_sink("outgoing", None, move |event| {
-        kept.lock().unwrap().push(event.action_id);
-        Ok(())
-    })
-    .unwrap();
+    let kept = kept_events(&db, "outgoing");
     let batches = [0; 3].map(|_| db.run_maintenance_cycle().unwrap().delivered);
     assert_eq!(batches[..2], [Some(256); 2], "a cycle delivers one batch");
     assert_eq!(batches[2], Some(88));
-    assert_eq!(*ids.lock().unwrap(), (1..=600).collect::<Vec<u64>>());
+    let ids = kept
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| e.action_id)
+        .collect::<Vec<_>>();
+    assert_eq!(ids, (1..=600).collect::<Vec<u64>>());
 }
 
 struct Veto;
@@ -1123,13 +1142,7 @@ fn a_commit_the_plug_in_or_the_disk_refuses_queues_and_delivers_nothing() {
         );
         drop(db);
         let db = open(&path);
-        let heard = Arc::new(AtomicUsize::new(0));
-        let counter = heard.clone();
-        let hear = move |_: &SinkEvent| {
-            counter.fetch_add(1, SeqCst);
-            Ok(())
-        };
-        db.register_sink("outgoing", None, hear).unwrap();
+        let heard = kept_events(&db, "outgoing");
         db.run_maintenance_cycle().unwrap();
         let metrics = db.sink_metrics("outgoing").unwrap();
         let rows = int(&db, "SELECT COUNT(*) FROM queued");
@@ -1138,7 +1151,7 @@ fn a_commit_the_plug_in_or_the_disk_refuses_queues_and_delivers_nothing() {
             "{outcome}: {rows}"
         );
         assert_eq!(
-            heard.load(SeqCst) as i64,
+            heard.lock().unwrap().len() as i64,
             rows,
             "{outcome}: the event goes with its row"
         );
@@ -1165,23 +1178,20 @@ fn hidden_events_wait_while_later_visible_events_are_delivered_first() {
         db.execute("INSERT INTO notes VALUES ($id, $c, $label)", &values)
             .unwrap();
     }
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let register = |handle: &contextdb::Database| {
-        let seen = seen.clone();
-        let heard = move |event: &SinkEvent| {
-            seen.lock().unwrap().push(event.row_values["id"].clone());
-            Ok(())
-        };
-        handle.register_sink("outgoing", None, heard).unwrap();
+    let ids = |kept: &Mutex<Vec<SinkEvent>>| {
+        let kept = kept.lock().unwrap();
+        kept.iter()
+            .map(|e| e.row_values["id"].clone())
+            .collect::<Vec<_>>()
     };
-    register(&with_labels(&in_contexts(&db, &[1]), &["public"]));
-    assert_eq!(db.run_maintenance_cycle().unwrap().delivered, Some(1));
-    assert_eq!(*seen.lock().unwrap(), [Value::Int64(3)]);
-    assert_eq!(db.sink_metrics("outgoing").unwrap().queued, 2);
-    register(&db);
-    assert_eq!(db.run_maintenance_cycle().unwrap().delivered, Some(2));
-    assert_eq!(
-        seen.lock().unwrap()[1..],
-        [Value::Int64(1), Value::Int64(2)]
+    let narrowed = kept_events(
+        &with_labels(&in_contexts(&db, &[1]), &["public"]),
+        "outgoing",
     );
+    assert_eq!(db.run_maintenance_cycle().unwrap().delivered, Some(1));
+    assert_eq!(ids(&narrowed), [Value::Int64(3)]);
+    assert_eq!(db.sink_metrics("outgoing").unwrap().queued, 2);
+    let whole = kept_events(&db, "outgoing");
+    assert_eq!(db.run_maintenance_cycle().unwrap().delivered, Some(2));
+    assert_eq!(ids(&whole), [Value::Int64(1), Value::Int64(2)]);
 }

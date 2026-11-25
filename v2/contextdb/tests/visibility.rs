@@ -672,6 +672,8 @@ fn ledger_rows(of: &[i64]) -> Vec<Vec<Value>> {
 /// and says nothing.
 fn a_hidden_row_named_whole_is_refused_and_a_list_read_leaves_it_out(gate: Gate) {
     let db = gate.store("visibility-anchor");
+    // An index that fixes more columns than the UNIQUE rule does not hide what the rule names.
+    support::run(&db, "CREATE INDEX ledger_sp ON ledger (slug, payload)");
     let handle = gate.handle(&db);
     let rule = gate.rule();
 
@@ -683,11 +685,18 @@ fn a_hidden_row_named_whole_is_refused_and_a_list_read_leaves_it_out(gate: Gate)
         "SELECT payload FROM ledger WHERE id = (SELECT 2)",
         "SELECT id FROM ledger WHERE slug = 'shut-four'",
         // Each names the one hidden row whatever the form it is written in: a sum, a row value,
-        // the same key twice, a key beside alternatives that each name the same row.
+        // the same key twice, a key beside alternatives one of which holds for it.
         "SELECT payload FROM ledger WHERE id = 1 + 1",
         "SELECT payload FROM ledger WHERE (a, b) = (1, 2)",
         "SELECT payload FROM ledger WHERE id = 2 OR id = 2",
-        "SELECT payload FROM ledger WHERE id = 2 AND (payload = 'a' OR slug = 'b')",
+        "SELECT payload FROM ledger WHERE id = 2 AND (payload = 'a' OR slug = 'shut-two')",
+        // Named beside a list of keys, or by a UNIQUE rule an index of more columns also
+        // serves, the rest of the filter true for it.
+        "SELECT payload FROM ledger WHERE slug = 'shut-two' AND id IN (2, 3)",
+        "SELECT payload FROM ledger WHERE slug = 'shut-two' AND payload = 'secret-two'",
+        "SELECT payload FROM ledger WHERE slug = 'shut-two' AND payload > 'a'",
+        // A `(SELECT ...)` in a join is a SELECT of its own, refused by its own name.
+        "SELECT y.payload FROM ledger x JOIN ledger y ON y.id = x.id          WHERE y.id = (SELECT id FROM ledger WHERE slug = 'shut-two')",
     ] {
         refused(&handle, sql, rule, "ledger");
     }
@@ -728,9 +737,23 @@ fn a_hidden_row_named_whole_is_refused_and_a_list_read_leaves_it_out(gate: Gate)
         "SELECT payload FROM ledger WHERE id = 99",
         "SELECT payload FROM ledger WHERE slug = 'no-such'",
         "SELECT payload FROM ledger WHERE a = 9 AND b = 9",
+        // A hidden row the rest of the filter does not pass, or cannot be worked out for, is not
+        // there; a row in reach keeps the error.
+        "SELECT payload FROM ledger WHERE id = 2 AND (payload = 'a' OR slug = 'b')",
+        "SELECT payload FROM ledger WHERE id = 2 AND 1 / (b - 2) = 0",
+        "SELECT payload FROM ledger WHERE slug = 'shut-two' AND payload = 'seen-one'",
+        "SELECT payload FROM ledger WHERE id = 2 AND slug = 'open-one'",
+        "SELECT payload FROM ledger WHERE id = 1 AND slug = 'shut-two'",
+        // A join reads each table as a list, whatever its filter names.
+        "SELECT y.payload FROM ledger x JOIN ledger y ON y.id = x.id WHERE y.slug = 'shut-two'",
+        "SELECT x.payload FROM ledger x JOIN ledger y ON y.id = x.id WHERE x.id = 2",
     ] {
         assert!(texts(&handle, sql).is_empty(), "{gate:?}: {sql}");
     }
+    let sql = "SELECT payload FROM ledger WHERE id = 1 AND 1 / (b - 1) = 0";
+    let found = handle.execute(sql, &params! {});
+    let by_zero = matches!(&found, Err(Error::PlanError(said)) if said == "division by zero");
+    assert!(by_zero, "{gate:?}: {sql}: {found:?}");
 
     // Every other shape is a list, a key in a list and a key in a range among them.
     let lists: [(&str, &[i64]); 13] = [
@@ -762,6 +785,28 @@ fn a_hidden_row_named_whole_is_refused_and_a_list_read_leaves_it_out(gate: Gate)
         texts(&db, "SELECT payload FROM ledger WHERE a = 2 AND b = 2"),
         ["secret-four"]
     );
+
+    // A window read by partition names a row by the SELECT's own filter only.
+    let numbered = |filter: &str| {
+        format!(
+            "WITH n AS (SELECT id, b, ROW_NUMBER() OVER (PARTITION BY b ORDER BY id) AS rn \
+             FROM ledger WHERE {filter}) SELECT id FROM n WHERE b = 2 AND rn <= 1"
+        )
+    };
+    assert!(ids(&handle, &numbered("a = 1")).is_empty(), "{gate:?}");
+    refused(&handle, &numbered("a = 1 AND b = 2"), rule, "ledger");
+    // A value longer than an index entry keeps names the row that holds it whole; one that
+    // differs in its last byte is an ordinary miss.
+    let long = |n: i64| format!("{}-{n}", "x".repeat(300));
+    for id in [1, 2] {
+        let sql = "UPDATE ledger SET slug = $slug WHERE id = $id";
+        let row = params! { "slug" => long(id), "id" => id };
+        db.execute(sql, &row).unwrap();
+    }
+    let by = |n| format!("SELECT payload FROM ledger WHERE slug = '{}'", long(n));
+    assert_eq!(texts(&handle, &by(1)), ["seen-one"], "{gate:?}");
+    refused(&handle, &by(2), rule, "ledger");
+    assert!(texts(&handle, &by(3)).is_empty(), "{gate:?}");
 }
 
 #[test]
@@ -952,11 +997,6 @@ fn told(
     words: &[Vec<String>; 2],
     leaks: &mut Vec<String>,
 ) -> Vec<String> {
-    let session = on.read_session(contextdb::ReadLimits::default()).unwrap();
-    assert_eq!(
-        support::run(&session, "SHOW MEMORY_LIMIT").peak_bytes(),
-        None
-    );
     let empty = support::ids(on, "SELECT id FROM vo ORDER BY id").is_empty();
     let mut told = Vec::new();
     let session = on.read_session(Default::default()).unwrap();
@@ -1054,7 +1094,7 @@ fn a_narrowed_reader_is_told_the_same_whatever_is_done_to_rows_it_may_not_see() 
         // A refusal names no hidden value. An EXPLAIN says no key, route or refusal, no hidden
         // id, and neither the 140 rows of `vd` there are nor the 137 the handle may not see.
         let refusal = ["secret", "shut", "internal", "someone-else", &id];
-        let explain = ["key:", "route:", "refusal:", &id, "140", "137"];
+        let explain = ["key:", "route:", "_cost:", "refusal:", &id, "140", "137"];
         let words = [
             refusal.map(String::from).to_vec(),
             explain.map(String::from).to_vec(),

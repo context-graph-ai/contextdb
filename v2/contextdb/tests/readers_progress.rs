@@ -1,4 +1,6 @@
 //! The observer and cancellation cannot be expressed by a SQL script; extends readers.rs.
+#[path = "support/readmem.rs"]
+mod readmem;
 mod support;
 use contextdb::{
     Database, DatabaseOpenOptions, DatabasePlugin, Error, QueryOutcome, ReadLimits, ReadProgress,
@@ -6,15 +8,10 @@ use contextdb::{
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Barrier, Mutex, Weak};
-use support::{Millis, Observer};
+use support::Observer;
 #[test]
 fn progress_reports_the_read_and_time_or_cancel_ends_only_its_statement() {
-    let now = Arc::new(AtomicU64::new(0));
-    let mut options = DatabaseOpenOptions::default();
-    options.clock = Some(Arc::new(Millis(now.clone())));
-    let db = support::open_with(&support::folder("read-progress"), options).unwrap();
-    support::declare(&db);
-    support::insert_together(&db, 1..=8192);
+    let (db, now) = readmem::clocked(&support::folder("read-progress"), 8192);
     support::declare_docs(&db, 2, "");
     support::load_docs(&db, 1..=8192, "c", |n| support::vector(n, 2));
     let search = support::by_mode(None, "EXACT", 4);

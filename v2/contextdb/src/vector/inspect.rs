@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use super::build::{self, Build, Phase};
 use super::directory::Partition;
-use super::ivf::Ivf;
+use super::ivf::{Ivf, LEVELS};
 use crate::memory::Reservation as Held;
 use crate::schema::{Table, VectorColumn};
 use crate::store::{Cell, Key, READING, Read, VectorRecord};
@@ -24,6 +24,9 @@ pub(crate) enum State {
     Building,
     /// A build is under way and its last step was refused for memory.
     Stalled,
+    /// Its last seal or build step was refused for disk room, as the store folder's `space`
+    /// file says while the partition stays as it was then.
+    Full,
 }
 
 /// One partition as its records describe it.
@@ -73,6 +76,8 @@ pub(crate) fn partitions(
     most: Option<u64>,
     held: &mut Held,
 ) -> Result<Vec<Inspected>> {
+    let full = crate::store::Space::read(read.committed().folder()).full;
+    let full: Vec<_> = full.into_iter().filter(|f| f.0 == column.id).collect();
     let mut entries = Vec::new();
     build::entries(read, column, None, &mut |tuple, partition| {
         held.room(&mut entries, usize::MAX)?;
@@ -92,30 +97,24 @@ pub(crate) fn partitions(
     asked
         .map(|(tuple, partition)| {
             let before = held.bytes();
-            let found = inspected(
-                read,
-                column,
-                dimension as u64,
-                vectors,
-                tuple,
-                &partition,
-                held,
-            );
+            let sizes = (dimension as u64, vectors);
+            let found = inspected(read, column, sizes, tuple, &partition, held, &full);
             held.shrink(held.bytes() - before);
             found
         })
         .collect()
 }
 
-/// One partition from its entry, its pending count, its IVF's record and its build's.
+/// One partition from its entry, its pending count, its IVF's record and its build's; `n` is
+/// the column's dimension and `vectors` its rows with a vector.
 fn inspected(
     read: &dyn Read,
     column: &VectorColumn,
-    n: u64,
-    vectors: u64,
+    (n, vectors): (u64, u64),
     tuple: Key,
     p: &Partition,
     held: &mut Held,
+    full: &[(crate::store::VectorId, u32, u64)],
 ) -> Result<Inspected> {
     let pending = u64::from(p.unindexed);
     let grouped = p.ivf.map_or(0, |ivf| ivf.slots);
@@ -125,7 +124,7 @@ fn inspected(
     if let Some(ivf) = p.ivf {
         (groups, damage) = (ivf.groups, read.committed().marked(column.id, ivf.number));
         let (g, tail) = (u64::from(groups), p.blocks - p.first);
-        index_bytes += 12 + 8 * (g + 1);
+        index_bytes += 12 + 8 * (g + 1) + 4 * LEVELS as u64;
         if groups > 1 {
             let codes = slots * (n.div_ceil(8) + 2) + 4 * u64::from(ivf.blocks + tail);
             index_bytes += 4 * n * (g + 1) + codes;
@@ -137,7 +136,10 @@ fn inspected(
         }
     }
     let build = Build::read(read, column.id, p.number, n as usize, held)?;
+    let stamp = stamped(p, build.as_ref());
+    let refused = full.iter().any(|f| f.1 == p.number && f.2 == stamp);
     let (state, total, done, needing) = match build {
+        _ if refused => (State::Full, slots, 0, 0),
         Some(build) => {
             let state = if build.needing > 0 {
                 State::Stalled
@@ -168,6 +170,39 @@ fn inspected(
         needing,
         damage,
     })
+}
+
+/// The stamp of a partition's committed state: its record and its build's count of steps.
+fn stamped(p: &Partition, build: Option<&Build>) -> u64 {
+    let steps = build.map_or(u64::MAX, |build| build.steps);
+    crate::store::fnv(&[p.encode(), steps.to_le_bytes().to_vec()].concat())
+}
+
+/// The stamp of the committed state of the partition of `vector` numbered `number`, found
+/// under `tuple` when it is given and else among the column's partitions; `None` when the
+/// column or the partition is gone.
+pub(crate) fn stamp(
+    read: &dyn Read,
+    catalog: &crate::schema::Catalog,
+    (vector, number, tuple): (crate::store::VectorId, u32, Option<&Key>),
+    held: &mut Held,
+) -> Result<Option<u64>> {
+    let Some((table, column)) = catalog.vector(vector) else {
+        return Ok(None);
+    };
+    let mut found = None;
+    match tuple {
+        Some(tuple) => found = super::directory::partition(read, column, tuple)?,
+        None => build::entries(read, column, None, &mut |_, p| {
+            found = (p.number == number).then_some(p);
+            Ok(found.is_none())
+        })?,
+    }
+    let Some(p) = found.filter(|p| p.number == number) else {
+        return Ok(None);
+    };
+    let build = Build::read(read, vector, p.number, table.dimension(column), held)?;
+    Ok(Some(stamped(&p, build.as_ref())))
 }
 
 /// Numbers owned by a column, resolved once before inspecting its records.
@@ -276,7 +311,7 @@ pub(crate) fn verify_record(
             owner(number)?;
             let at = table.column(&column.column)?;
             let row = read.row(table.id, key, cover)?;
-            bytes.is_empty()
+            bytes.len() == super::slot::slot_len(n)
                 && row.is_some_and(|r| !matches!(&*table.cell(&r, at), Cell::Here(Value::Null)))
         }
         Block(_, number, block) | Binary(_, number, block) => {

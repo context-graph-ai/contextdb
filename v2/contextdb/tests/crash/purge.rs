@@ -147,16 +147,43 @@ fn a_purge_leaves_no_copy_in_either_commit_slot() {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         assert!(kept.keys().any(|k| k[0] == 9) && kept.keys().any(|k| k[0] == 6));
+        // A PURGE that matches no live row still takes what is owed: a deleted row's version.
+        let gone = letters(988, 100);
+        run(
+            &db,
+            "CREATE TABLE gone (id TEXT PRIMARY KEY, n INTEGER) RETAIN 2 DAYS",
+        );
+        run(&db, &format!("INSERT INTO gone VALUES ('{gone}', 0)"));
+        run(&db, "UPDATE gone SET n = 1");
+        run(&db, "DELETE FROM gone");
+        run(&db, "PURGE FROM gone");
+        db.export_snapshot(folder.join("gone")).unwrap();
+        let exported = fs::read(folder.join("gone/data")).unwrap();
+        assert!(
+            !exported.windows(100).any(|w| w == gone.as_bytes()),
+            "export keeps the version"
+        );
         run(
             &db,
             "CREATE TABLE secrets (id TEXT PRIMARY KEY, body TEXT, v VECTOR(384))",
         );
+        // A drop leaves owed what lies past its batch, the marker last: its index entry, and its
+        // row, version and large value in a dropped table.
+        let ids: String = (0..1024).map(|n| format!("('{n:04}'),")).collect();
+        run(&db, &format!("INSERT INTO secrets (id) VALUES {ids}('-')"));
+        run(&db, "CREATE INDEX by_id ON secrets (id)");
+        run(&db, "CREATE TABLE copies (id TEXT PRIMARY KEY, body TEXT)");
+        run(&db, &format!("INSERT INTO copies (id) VALUES {ids}('-')"));
         run(&db, "CREATE EVENT TYPE added WHEN INSERT ON secrets");
         run(&db, "CREATE SINK absent TYPE callback");
         run(&db, "CREATE ROUTE notify EVENT added TO absent");
         let marker = letters(987, 100);
         let vector = vector(987, 384);
         db.execute("INSERT INTO secrets VALUES ($key, $body, $v)", &params! { "key" => marker.as_str(), "body" => letters(1234, 4000), "v" => vector.clone() }).unwrap();
+        db.execute("INSERT INTO copies VALUES ($key, $body)", &params! { "key" => marker.as_str(), "body" => format!("{marker}{}", letters(1234, 4000)) }).unwrap();
+        run(&db, "UPDATE copies SET body = ''");
+        run(&db, "DROP INDEX by_id ON secrets");
+        run(&db, "DROP TABLE copies");
         if mode == Maintenance::Engine {
             close(db);
             let mut options = DatabaseOpenOptions::default();
@@ -191,7 +218,8 @@ fn a_purge_leaves_no_copy_in_either_commit_slot() {
                 }
                 assert!(
                     after.get(k).is_some_and(|now| now.len() == v.len()
-                        && (0..(v.len() - 20) / 8).all(|g| {
+                        // The record ends with the reach, 16 counts (7364fc08b).
+                        && (0..(v.len() - 20 - 4 * 16) / 8).all(|g| {
                             let empty = |at| {
                                 members
                                     .iter()
@@ -372,19 +400,7 @@ fn a_purge_erases_what_rows_deleted_earlier_left_behind_that_it_selects() {
                 .any(|(k, _)| k == key_of(id))
         };
         assert_eq!([1, 2, 3].map(names), kept, "{name}: vectors left behind");
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let seen = sent.clone();
-        db.register_sink("absent", None, move |event| {
-            let Value::Int64(id) = event.row_values["id"] else {
-                panic!("an id")
-            };
-            let tag = format!("{:?}", event.row_values["tag"]);
-            seen.lock().unwrap().push((id, tag));
-            Ok(())
-        })
-        .unwrap();
-        while db.run_maintenance_cycle().unwrap().work_remaining == Some(true) {}
-        let sent = sent.lock().unwrap();
+        let sent = delivered(&db, |row| format!("{:?}", row["tag"]));
         let gone: Vec<_> = sent.iter().filter(|(id, _)| *id <= 3).cloned().collect();
         let wanted: Vec<_> = gone_sent
             .iter()
@@ -452,18 +468,10 @@ fn a_purge_follows_every_generation_and_every_clause() {
             child.rows.rows().is_empty(),
             "{name}: child 30 keeps no version"
         );
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let seen = sent.clone();
-        db.register_sink("absent", None, move |event| {
-            let Value::Int64(id) = event.row_values["id"] else {
-                panic!("an id")
-            };
-            seen.lock().unwrap().push(id);
-            Ok(())
-        })
-        .unwrap();
-        while db.run_maintenance_cycle().unwrap().work_remaining == Some(true) {}
-        let mut sent = sent.lock().unwrap().clone();
+        let mut sent: Vec<i64> = delivered(&db, |_| ())
+            .into_iter()
+            .map(|(id, ())| id)
+            .collect();
         sent.sort();
         let left: &[i64] = if kept { &[20, 200] } else { &[20, 30, 200] };
         assert_eq!(sent, left, "{name}: deliveries left");
@@ -562,24 +570,36 @@ fn a_purge_follows_each_value_no_row_holds_and_reads_only_the_keys_it_names() {
         assert_eq!(run(&db, purge).rows_affected(), 0, "{purge}");
     }
     db.set_memory_limit(None).unwrap();
-    let sent = Arc::new(Mutex::new(Vec::new()));
-    let seen = sent.clone();
-    db.register_sink("absent", None, move |event| {
-        let Value::Int64(id) = event.row_values["id"] else {
-            panic!("an id")
-        };
-        seen.lock().unwrap().push(id);
-        Ok(())
-    })
-    .unwrap();
-    while db.run_maintenance_cycle().unwrap().work_remaining == Some(true) {}
-    let mut sent = sent.lock().unwrap().clone();
+    let mut sent: Vec<i64> = delivered(&db, |_| ())
+        .into_iter()
+        .map(|(id, ())| id)
+        .collect();
     sent.sort();
     assert_eq!(
         sent,
         [2, 2, 20],
         "deliveries left: parent 2, body 2, child 20"
     );
+}
+
+/// Registers the sink `absent`, runs maintenance until no work is left, and gives the id of each
+/// row delivered to it, with what `also` takes of the row, in the order they were delivered.
+fn delivered<T: Send + 'static>(
+    db: &Database,
+    also: impl Fn(&std::collections::HashMap<String, Value>) -> T + Send + Sync + 'static,
+) -> Vec<(i64, T)> {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let seen = sent.clone();
+    db.register_sink("absent", None, move |event| {
+        let Value::Int64(id) = event.row_values["id"] else {
+            panic!("an id")
+        };
+        seen.lock().unwrap().push((id, also(&event.row_values)));
+        Ok(())
+    })
+    .unwrap();
+    while db.run_maintenance_cycle().unwrap().work_remaining == Some(true) {}
+    std::mem::take(&mut *sent.lock().unwrap())
 }
 
 pub(super) fn purging(role: Role) {

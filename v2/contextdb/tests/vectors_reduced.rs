@@ -3,6 +3,8 @@
 //! vector, every search ranks by it, and such a column is grouped and searched as any other.
 
 mod support;
+#[path = "support/vecsearch.rs"]
+mod vecsearch;
 
 use std::fs;
 
@@ -32,9 +34,7 @@ fn kept(db: &contextdb::Database, id: i64) -> Vec<f32> {
 
 /// The bytes of the data file of a closed store of 2,000 rows of 384 numbers each.
 fn file_of(name: &str, clauses: &str) -> u64 {
-    let folder = support::folder(name);
-    let db = support::open(&folder);
-    support::declare_docs(&db, 384, clauses);
+    let (folder, db) = vecsearch::docs(name, 384, clauses);
     support::load_docs(&db, 1..=2000, "a", |n| written(n, 384));
     support::close(db);
     fs::metadata(folder.join("data"))
@@ -44,9 +44,7 @@ fn file_of(name: &str, clauses: &str) -> u64 {
 
 #[test]
 fn a_reduced_column_keeps_the_nearest_one_byte_vector() {
-    let folder = support::folder("reduced-keeps");
-    let db = support::open(&folder);
-    support::declare_docs(&db, DIMENSION, REDUCED);
+    let (_, db) = vecsearch::docs("reduced-keeps", DIMENSION, REDUCED);
     support::load_docs(&db, 1..=20, "a", |n| written(n, DIMENSION));
     let largest = |numbers: &[f32]| numbers.iter().fold(0.0_f32, |most, x| most.max(x.abs()));
     for id in 1..=20 {
@@ -90,9 +88,11 @@ fn a_reduced_value_that_would_expand_past_the_limit_is_refused_by_name() {
     // what an open sets aside: the kept bytes fit, the kept and the expanded bytes together do
     // not.
     for numbers in [250_000, 300_000] {
-        let folder = support::folder(&format!("reduced-over-limit-{numbers}"));
-        let db = support::open(&folder);
-        support::declare_docs(&db, numbers, &format!("{REDUCED} PARTITION_KEY (ctx)"));
+        let (folder, db) = vecsearch::docs(
+            &format!("reduced-over-limit-{numbers}"),
+            numbers,
+            &format!("{REDUCED} PARTITION_KEY (ctx)"),
+        );
         support::load_docs(&db, 1..=1, "a", |n| written(n, numbers));
         let query = "SELECT id FROM docs WHERE ctx = 'b' ORDER BY v <=> $v LIMIT 1";
         let q = contextdb::params! { "v" => kept(&db, 1) };
@@ -128,9 +128,7 @@ fn a_reduced_value_that_would_expand_past_the_limit_is_refused_by_name() {
 
 #[test]
 fn exact_on_a_reduced_column_ranks_by_the_kept_vectors() {
-    let folder = support::folder("reduced-exact");
-    let db = support::open(&folder);
-    support::declare_docs(&db, DIMENSION, REDUCED);
+    let (_, db) = vecsearch::docs("reduced-exact", DIMENSION, REDUCED);
     support::load_docs(&db, 1..=500, "a", |n| written(n, DIMENSION));
     // The reference is worked out from the vectors a SELECT returns, which are the kept ones.
     let stored = support::stored(&db, support::DOCS);

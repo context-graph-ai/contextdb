@@ -80,7 +80,7 @@ pub use table::{
     Table, TableStats,
 };
 pub use transactions::{
-    DatabaseStats, Durability, RELEASE_PAGES, ReadTransaction, WriteTransaction,
+    CompactionStep, DatabaseStats, Durability, RELEASE_PAGES, ReadTransaction, WriteTransaction,
 };
 pub use tree_store::{AccessGuard, AccessGuardMut, AccessGuardMutInPlace, Savepoint};
 pub use types::{Key, MutInPlaceValue, TypeName, Value};

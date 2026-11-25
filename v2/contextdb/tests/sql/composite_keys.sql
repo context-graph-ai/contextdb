@@ -218,7 +218,7 @@ error: VectorPartitionLimitExceeded
 
 SELECT id FROM partitioned WHERE b = TRUE ORDER BY v <=> [0.0, 1.0] LIMIT 5;
 ----
-id  (read 5, compared 2)
+id  (read 4, compared 2)
 2
 1
 

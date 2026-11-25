@@ -65,7 +65,7 @@ pub(super) fn nearest(centroids: &[f32], dimension: usize, slot: &[u8]) -> (u32,
     nearest_among(centroids, dimension, slot, None)
 }
 
-/// The nearest centre among eligible groups; no filter while training a new IVF.
+/// The nearest centroid among eligible groups; no filter while training a new IVF.
 pub(super) fn nearest_among(
     centroids: &[f32],
     dimension: usize,
@@ -175,11 +175,11 @@ pub(super) fn mean(sum: &[f64], count: u64) -> Vec<f32> {
     sum.iter().map(|sum| (sum / count) as f32).collect()
 }
 
-/// The direction of a sum; a sum without direction leaves its centre unchanged.
-pub(super) fn normalize(sum: &[f64], centre: &mut [f32]) {
+/// The direction of a sum; a sum without direction leaves its centroid unchanged.
+pub(super) fn normalize(sum: &[f64], centroid: &mut [f32]) {
     let length = sum.iter().map(|x| x * x).sum::<f64>().sqrt();
     if length > 0.0 {
-        for (number, sum) in centre.iter_mut().zip(sum) {
+        for (number, sum) in centroid.iter_mut().zip(sum) {
             *number = (sum / length) as f32;
         }
     }

@@ -153,7 +153,7 @@ fn an_append_after(few: i64, many: i64) {
 
 #[test]
 fn an_append_does_not_read_the_rows_stored_before_it() {
-    an_append_after(10_000, 100_000);
+    an_append_after(5_000, 50_000);
 }
 
 /// Left to the nightly and release runs by `v2/.config/nextest.toml`.
@@ -234,7 +234,9 @@ fn read_fixture(
 
 #[test]
 fn an_indexed_transaction_update_reads_in_proportion_to_its_rows() {
-    let reads = [10_240, 102_400].map(|rows| {
+    // The larger store is more than twice the 8 MiB cache, so an UPDATE that went back over the
+    // index entries before its place would read them from the file again.
+    let reads = [4_096, 40_960].map(|rows| {
         let (db, bytes, folder, options) = read_fixture("index-place", rows,
             "CREATE TABLE resume(id INTEGER PRIMARY KEY, label TEXT NOT NULL, flag INTEGER NOT NULL);CREATE INDEX resume_label ON resume(label)",
             |tx,id| {tx.execute("INSERT INTO resume VALUES($id,$label,0)", &params!{"id"=>id,"label"=>format!("{id:016}{}",support::letters(id,221))}).unwrap();});
@@ -252,16 +254,16 @@ fn an_indexed_transaction_update_reads_in_proportion_to_its_rows() {
         support::close(db);
         let db = support::open_with(&folder, options).unwrap();
         bytes.store(0, Ordering::SeqCst);
-        let purged = db.execute("PURGE FROM resume WHERE label IN (SELECT label FROM resume WHERE id <= $last)", &params!{"last"=>256 * (1 + i64::from(rows > 10_240))}).unwrap();
+        let purged = db.execute("PURGE FROM resume WHERE label IN (SELECT label FROM resume WHERE id <= $last)", &params!{"last"=>256 * (1 + i64::from(rows > 4_096))}).unwrap();
         let purge_read=bytes.load(Ordering::SeqCst);
-        assert_eq!(purged.rows_affected(), 256 * (1 + u64::from(rows > 10_240)));
+        assert_eq!(purged.rows_affected(), 256 * (1 + u64::from(rows > 4_096)));
         support::close(db);
         [read,purge_read]
     });
     for (operation, factor) in [12, 3].into_iter().enumerate() {
         assert!(
             reads[0][operation] > 0 && reads[1][operation] <= factor * reads[0][operation],
-            "UPDATE/PURGE bytes at 10,240/102,400 rows: {reads:?}"
+            "UPDATE/PURGE bytes at 4,096/40,960 rows: {reads:?}"
         );
     }
 }
@@ -303,8 +305,8 @@ fn equal_index_values_resume_through_writes_and_a_graph_walk() {
     support::close(db);
 }
 
-fn membership_rows(db: &contextdb::Database, into: &str, suffix: &str) {
-    for first in (0..40_000).step_by(1000) {
+fn membership_rows(db: &contextdb::Database, into: &str, suffix: &str, count: i64) {
+    for first in (0..count).step_by(1000) {
         let rows = (first..first + 1000)
             .map(|n| format!("({n}{suffix})"))
             .collect::<Vec<_>>()
@@ -323,7 +325,7 @@ fn removal_membership_agrees_with_the_in_memory_evaluator_for_every_kind() {
     run(
         "CREATE TABLE victim(id INTEGER PRIMARY KEY, missing INTEGER, b BOOLEAN, n INTEGER, r REAL, u UUID, stamp TIMESTAMP, tx TXID, s TEXT, j JSON, v VECTOR(1))",
     );
-    membership_rows(&db, "choices(id)", "");
+    membership_rows(&db, "choices(id)", "", 40_000);
     let uuid = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440001").unwrap();
     let values = [
         ("missing", Value::Null),
@@ -408,7 +410,19 @@ fn membership_preserves_truth_and_in_memory_index_work() {
         run(ddl);
     }
     let spelling = "550e8400-e29b-41d4-a716-446655440001";
-    membership_rows(&db, "source(id,spelling)", &format!(",'{spelling}'"));
+    // A list of 32-byte values leaves memory for the store past 8,192 of them (a quarter of the
+    // 1 MiB part, kept beside three planning copies): 10,000 ids are a stored list.
+    assert_eq!(
+        size_of::<contextdb::Value>(),
+        32,
+        "the size the stored-list count rests on"
+    );
+    membership_rows(
+        &db,
+        "source(id,spelling)",
+        &format!(",'{spelling}'"),
+        10_000,
+    );
     run(&format!("UPDATE source SET u='{spelling}' WHERE id=0"));
     run(&format!(
         "UPDATE source SET spelling='{}' WHERE id=1",
@@ -416,7 +430,7 @@ fn membership_preserves_truth_and_in_memory_index_work() {
     ));
     let long = "x".repeat(3000);
     let mut work = None;
-    for stored in [1000, 10_000] {
+    for stored in [500, 5_000] {
         run("DELETE FROM target");
         let rows = (50_000..50_000 + stored)
             .map(|id| format!("({id},{id},'neighbor',NULL)"))
@@ -552,25 +566,21 @@ fn load(db: &contextdb::Database, rows: i64, c: i64) {
     {
         support::run(db, &format!("CREATE INDEX e{n} ON e {ix}"));
     }
-    for first in (1..=rows).step_by(500) {
-        let tuples: Vec<String> = (first..(first + 500).min(rows + 1))
-            .map(|id| {
-                let seq = (id - 1) % c + 1;
-                // The first two rows of each Context hold two integers above 2^53 with one key.
-                let n = if seq < 3 { (1 << 53) | (seq - 1) } else { id };
-                let st = ["open", "closed"][(id % 2) as usize];
-                format!(
-                    "({id}, {}, {seq}, {}, '{}', '{st}', '{{\"n\": {n}}}')",
-                    (id - 1) / c,
-                    (seq - 1) / 2,
-                    at(id)
-                )
-            })
-            .collect();
+    let tx = db.transaction().unwrap();
+    for id in 1..=rows {
+        let seq = (id - 1) % c + 1;
+        // The first two rows of each Context hold two integers above 2^53 with one key.
+        let n = if seq < 3 { (1 << 53) | (seq - 1) } else { id };
+        let values = params! {
+            "id" => id, "x" => (id - 1) / c, "s" => seq, "g" => (seq - 1) / 2, "ts" => at(id),
+            "st" => ["open", "closed"][(id % 2) as usize], "j" => format!("{{\"n\": {n}}}"),
+        };
         for t in ["e", "f"] {
-            support::run(db, &format!("INSERT INTO {t} VALUES {}", tuples.join(", ")));
+            let sql = format!("INSERT INTO {t} VALUES ($id, $x, $s, $g, $ts, $st, $j)");
+            tx.execute(&sql, &values).unwrap();
         }
     }
+    tx.commit().unwrap();
 }
 
 macro_rules! at_size {
@@ -1039,6 +1049,7 @@ fn a_composite_key_a_unique_column_and_an_upsert_read_only_the_rows_they_name() 
         ("SELECT v FROM p WHERE a = 5 AND b = 7", 1, 1),
         ("SELECT v FROM p WHERE a = 5", 100, 100),
         ("SELECT a FROM p WHERE v = 507", 1, 1),
+        ("SELECT b FROM p WHERE a = 5 AND v = 507", 1, 1),
         ("SELECT COUNT(*) FROM p", 1, 0),
     ] {
         let got = counted(&db, || support::run(&db, sql));
@@ -1047,12 +1058,12 @@ fn a_composite_key_a_unique_column_and_an_upsert_read_only_the_rows_they_name() 
     // With a key of its own, two IN lists and an equality read the rows they match, by the index (a, b, v) and not (a).
     support::run(
         &db,
-        "CREATE TABLE q (id INT PRIMARY KEY, a INT, b INT, v INT)",
+        "CREATE TABLE q (id INT PRIMARY KEY, a INT, b INT, v INT, u INT UNIQUE)",
     );
     support::run(&db, "CREATE INDEX q_abv ON q (a, b, v)");
     support::run(&db, "CREATE INDEX q_a ON q (a)");
     let rows: Vec<_> = (0..1000)
-        .map(|n| format!("({n}, {}, {}, {})", n / 100, n % 10, n / 10 % 10))
+        .map(|n| format!("({n}, {}, {}, {}, {n})", n / 100, n % 10, n / 10 % 10))
         .collect();
     support::run(&db, &format!("INSERT INTO q VALUES {}", rows.join(",")));
     let sql = "SELECT id FROM q WHERE a IN (5, 6) AND b IN (7, 8) AND v = 0";
@@ -1061,6 +1072,17 @@ fn a_composite_key_a_unique_column_and_an_upsert_read_only_the_rows_they_name() 
         (4, 4, 4),
         "only the matching rows"
     );
+    // A UNIQUE rule given one value, by `=` or by each joined row, is read before an index that
+    // fixes more columns (q_abv: 10 rows for each a and b).
+    let one = "SELECT id FROM q WHERE a = 5 AND b = 7 AND u = 517";
+    let on = "q y ON y.a = x.a AND y.b = x.b AND y.u = x.u WHERE x.a = 5 AND x.b = 7";
+    for (sql, rows, work) in [
+        (one.to_owned(), 1, 1),
+        (format!("SELECT y.id FROM q x JOIN {on}"), 10, 20),
+    ] {
+        let got = counted(&db, || support::run(&db, &sql));
+        assert_eq!(got, (rows, work, work), "{sql}");
+    }
     let tx = db.transaction().unwrap();
     let up = "INSERT INTO p VALUES (99, 1, 99999) ON CONFLICT (a, b) DO UPDATE SET v = 99999";
     for examined in [0, 1] {

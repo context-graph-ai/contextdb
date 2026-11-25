@@ -295,7 +295,9 @@ impl Source for Side<'_> {
         match self {
             Side::Joined(join) => join.rows(reservation, each),
             Side::Table(table) => {
-                let path = table.choose(&[], &[])?;
+                // A joined table is read as a list: a row it hides is left out, named or not.
+                let mut path = table.choose(&[], &[])?;
+                path.one = false;
                 table.walk(&path, reservation, |_, row, bytes, reservation| {
                     each(row, bytes, reservation)
                 })
@@ -380,7 +382,8 @@ impl Source for Join<'_> {
                                 Ok(more)
                             };
                         // A value no path takes reads the right side through, holding none of it.
-                        let path = table.given(&given, &[], &[])?;
+                        let mut path = table.given(&given, &[], &[])?;
+                        path.one = false;
                         match path.serves(own) {
                             true => {
                                 table.walk(&path, reservation, |_, right, bytes, reservation| {
@@ -531,11 +534,12 @@ pub(super) fn firsts<'c>(
     let parts = asked.into_iter().map(|(_, value, most)| {
         let copy = width as u64 + copied(value) + inner.map_or(0, copied);
         let held = given.budget.reserve(copy, "query")?;
-        // The partition's value first: it is the one value the path reads the column at.
-        let mut filter = Expr::BinaryOp {
-            left: Box::new(Expr::Column(partition.clone())),
-            op: BinOp::Eq,
-            right: Box::new(value.clone()),
+        // The partition's value first: it is the one value the path reads the column at, as
+        // a list, so that it names no row the SELECT's own filter does not.
+        let mut filter = Expr::InList {
+            expr: Box::new(Expr::Column(partition.clone())),
+            list: vec![value.clone()],
+            negated: false,
         };
         if let Some(inner) = &select.filter {
             filter = Expr::BinaryOp {

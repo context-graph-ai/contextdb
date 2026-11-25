@@ -21,6 +21,7 @@ use crate::{
 use log::{debug, warn};
 use std::borrow::Borrow;
 use std::cmp::min;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::{Debug, Display, Formatter};
 use std::marker::PhantomData;
@@ -822,6 +823,20 @@ impl SavepointTransactionState {
     }
 }
 
+/// The pages one step of [`WriteTransaction::compact_pages`] read, moved and wrote, and whether
+/// it ended its pass
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompactionStep {
+    /// Pages the walk read to find what moves
+    pub read: u64,
+    /// Pages moved, each to a place wholly below it
+    pub moved: u64,
+    /// Pages written: the moved pages and the pages above them
+    pub written: u64,
+    /// The pass ended, its place cleared: a whole walk moved nothing, or the pass was finished
+    pub ended: bool,
+}
+
 /// A read/write transaction
 ///
 /// Only a single [`WriteTransaction`] may exist at a time
@@ -836,6 +851,8 @@ pub struct WriteTransaction {
     growth_limit: Option<u64>,
     prepared_commit: Option<(Option<BtreeHeader>, u64)>,
     released_pages: Vec<[u8; 8]>,
+    // Allowance units the step's early release spent, which the commit's release does not repeat
+    release_spent: usize,
     dirty: AtomicBool,
     durability: InternalDurability,
     two_phase_commit: bool,
@@ -846,6 +863,8 @@ pub struct WriteTransaction {
     savepoint_state: Mutex<SavepointTransactionState>,
     freed_pagination: [Mutex<u64>; 2],
     flushed_freed_pages: [AtomicU64; 2],
+    // The free pages and the file's length when the transaction began
+    begun: (u64, u64),
 }
 
 impl WriteTransaction {
@@ -868,6 +887,7 @@ impl WriteTransaction {
 
         let tables = TableNamespace::new(root_page, guard.clone(), mem.clone());
         let system_tables = SystemNamespace::new(system_page, guard.clone(), mem.clone());
+        mem.taken.lock().unwrap().0 = 0;
 
         Ok(Self {
             transaction_tracker,
@@ -880,6 +900,7 @@ impl WriteTransaction {
             growth_limit: None,
             prepared_commit: None,
             released_pages: Vec::new(),
+            release_spent: 0,
             dirty: AtomicBool::new(false),
             durability: InternalDurability::Immediate,
             two_phase_commit: false,
@@ -888,6 +909,7 @@ impl WriteTransaction {
             savepoint_state: Mutex::new(SavepointTransactionState::default()),
             freed_pagination: Default::default(),
             flushed_freed_pages: Default::default(),
+            begun: (mem.count_free_pages()?, mem.file_len()?),
         })
     }
 
@@ -913,41 +935,12 @@ impl WriteTransaction {
         }
         let system_freed = system_tables.open_system_table(self, SYSTEM_FREED_TABLE)?;
         if let Some((key, _)) = system_freed.tree.first()? {
+            // Every commit holds its own bookkeeping pages for the next: only older ones drain.
             let key = key.value();
-            // Every publication replaces its newest retired proof. Draining that one
-            // alone only creates another held proof instead of reclaiming space.
             return Ok(key.transaction_id < self.mem.get_last_committed_transaction_id()?.raw_id());
         }
 
         Ok(false)
-    }
-
-    /// Pending-free batch count beyond the newest retained proof, and physical file length.
-    pub fn compaction_backlog(&self) -> Result<(u64, u64)> {
-        let (pending, length, _) = self.compaction_drain_backlog(None)?;
-        Ok((pending, length))
-    }
-
-    /// Pending batches through a fixed commit, file length, and newest committed transaction.
-    pub fn compaction_drain_backlog(&self, through: Option<u64>) -> Result<(u64, u64, u64)> {
-        let newest = self.mem.get_last_committed_transaction_id()?.raw_id();
-        let range = ..=TransactionIdWithPagination {
-            transaction_id: through.unwrap_or(newest),
-            pagination_id: u64::MAX,
-        };
-        let mut tables = self.system_tables.lock().unwrap();
-        let mut pending = 0;
-        for definition in [DATA_FREED_TABLE, SYSTEM_FREED_TABLE] {
-            let table = tables.open_system_table(self, definition)?;
-            for entry in table.tree.range(&range)? {
-                let key = entry?.key();
-                // Every commit holds its own system-freed bookkeeping pages for the next commit.
-                pending += u64::from(
-                    definition.name() == DATA_FREED_TABLE.name() || key.transaction_id < newest,
-                );
-            }
-        }
-        Ok((pending, self.mem.file_len()?, newest))
     }
 
     #[cfg(debug_assertions)]
@@ -1587,7 +1580,16 @@ impl WriteTransaction {
         }
         // Publication starts only after all refusable metadata work.
         self.completed = true;
-        self.commit_inner().inspect_err(|_| self.mem.fail())
+        // A refusal for room comes before any header is written: the transaction is refused and
+        // aborted on drop, and the file is sound
+        self.commit_inner().inspect_err(|error| match error {
+            CommitError::Storage(StorageError::Io(e))
+                if e.get_ref().is_some_and(|e| e.is::<crate::FileSizeLimit>()) =>
+            {
+                self.completed = false;
+            }
+            _ => self.mem.fail(),
+        })
     }
 
     fn commit_inner(&mut self) -> Result<(), CommitError> {
@@ -1596,6 +1598,12 @@ impl WriteTransaction {
             self.two_phase_commit = true;
         }
 
+        if self.prepared_commit.is_none() && self.durability == InternalDurability::Immediate {
+            let mem = self.mem.clone();
+            let _lowest = mem.lowest_scope(mem.incremental_recovery() || self.shrinks());
+            let allowance = self.mem.count_uncommitted_pages();
+            self.release_freed_pages(allowance.clamp(RELEASE_PAGES, MAX_RELEASE_PAGES))?;
+        }
         let (user_root, freed) = match &self.prepared_commit {
             Some((root, freed)) => (*root, *freed),
             None => self.prepare_user_commit()?,
@@ -1643,13 +1651,18 @@ impl WriteTransaction {
         );
 
         self.mem.last_freed_pages.store(freed, Ordering::Relaxed);
+        let mut taken = self.mem.taken.lock().unwrap();
+        taken.1 =
+            (self.mem.file_len()? <= self.begun.1).then(|| self.begun.0.saturating_sub(taken.0));
         Ok(())
     }
 
     fn prepare_user_commit(&self) -> Result<(Option<BtreeHeader>, u64)> {
         let (user_root, allocated_pages, data_freed) =
             self.tables.lock().unwrap().table_tree.flush_and_close()?;
-        let _lowest = self.mem.lowest_scope(self.mem.incremental_recovery());
+        let _lowest = self
+            .mem
+            .lowest_scope(self.mem.incremental_recovery() || self.shrinks());
         self.retire_commit_pages()?;
 
         let freed = data_freed.iter().map(|p| 1u64 << p.page_order).sum::<u64>()
@@ -1666,7 +1679,9 @@ impl WriteTransaction {
     /// Write out pending freed-page lists at 4,096 entries without committing.
     /// May be called while a user table is open. Abort the transaction on error.
     pub fn flush_freed_pages(&self) -> Result {
-        let _lowest = self.mem.lowest_scope(self.mem.incremental_recovery());
+        let _lowest = self
+            .mem
+            .lowest_scope(self.mem.incremental_recovery() || self.shrinks());
         let pages = {
             let tables = self.tables.lock().unwrap();
             let mut pages = tables.freed_pages.lock().unwrap();
@@ -1795,6 +1810,8 @@ impl WriteTransaction {
             .lock()
             .unwrap()
             .apply_on_abort(&self.transaction_tracker);
+        // The pass's place is read again from the last commit
+        self.mem.compaction_position.lock().unwrap().0 = false;
         self.mem.rollback_uncommitted_writes()?;
         for page in self.released_pages.drain(..) {
             self.mem
@@ -1805,6 +1822,11 @@ impl WriteTransaction {
         Ok(())
     }
 
+    // A commit that gives back the file's free end takes the lowest places, leaving that end free
+    fn shrinks(&self) -> bool {
+        matches!(self.shrink_policy, ShrinkPolicy::Maximum)
+    }
+
     fn free_until(&self) -> TransactionId {
         self.transaction_tracker
             .oldest_live_read_transaction()
@@ -1813,14 +1835,7 @@ impl WriteTransaction {
 
     pub(crate) fn durable_commit(&mut self, user_root: Option<BtreeHeader>) -> Result<u64> {
         let mem = self.mem.clone();
-        let _lowest = mem.lowest_scope(mem.incremental_recovery());
-        if self.prepared_commit.take().is_none() {
-            self.release_freed_pages(
-                self.mem
-                    .count_uncommitted_pages()
-                    .clamp(RELEASE_PAGES, MAX_RELEASE_PAGES),
-            )?;
-        }
+        let _lowest = mem.lowest_scope(mem.incremental_recovery() || self.shrinks());
 
         let mut system_tables = self.system_tables.lock().unwrap();
         let system_freed_pages = system_tables.system_freed_pages();
@@ -1890,7 +1905,7 @@ impl WriteTransaction {
     // Commit without a durability guarantee
     pub(crate) fn non_durable_commit(&mut self, user_root: Option<BtreeHeader>) -> Result<u64> {
         let mem = self.mem.clone();
-        let _lowest = mem.lowest_scope(mem.incremental_recovery());
+        let _lowest = mem.lowest_scope(mem.incremental_recovery() || self.shrinks());
         let mut free_until_transaction = self
             .transaction_tracker
             .oldest_live_read_nondurable_transaction()
@@ -1969,14 +1984,16 @@ impl WriteTransaction {
         if self.prepared_commit.is_some() {
             return Ok(());
         }
-        let (root, mut freed) = self.prepare_user_commit()?;
         let mem = self.mem.clone();
-        let _lowest = mem.lowest_scope(mem.incremental_recovery());
+        let _lowest = mem.lowest_scope(mem.incremental_recovery() || self.shrinks());
         let allowance = self
             .mem
             .count_uncommitted_pages()
-            .clamp(RELEASE_PAGES, limit);
-        self.release_freed_pages(allowance)?;
+            .max(RELEASE_PAGES)
+            .min(limit);
+        // Freed pages are released before the commit places its own, so those can take them
+        self.release_freed_pages(allowance.saturating_sub(self.release_spent))?;
+        let (root, mut freed) = self.prepare_user_commit()?;
         let mut system = self.system_tables.lock().unwrap();
         system
             .table_tree
@@ -2004,52 +2021,71 @@ impl WriteTransaction {
         Ok(())
     }
 
-    /// The scan position and sweep progress, recording any completed moves.
+    /// The place of the pass under way, if one is, and whether its walk has moved a page yet,
+    /// recording `moved`; with no place, whether the last whole walk found nothing to move.
     pub fn compaction_position(&self, moved: bool) -> Result<(Option<Vec<u8>>, bool)> {
         let mut position = self.mem.compaction_position.lock().unwrap();
         if !position.0 {
             let tables = self.system_tables.lock().unwrap();
-            let root = tables
+            let record = tables
                 .table_tree
                 .get_table_untyped(COMPACTION_TABLE.name(), TableType::Normal)
-                .map_err(|e| e.into_storage_error_or_corrupted("Invalid compaction position"))?
-                .and_then(|d| d.private_get_root());
+                .map_err(|e| e.into_storage_error_or_corrupted("Invalid compaction position"))?;
+            let root = record.as_ref().and_then(|d| d.private_get_root());
             let tree = Btree::<(), &[u8]>::new(
                 root,
                 PageHint::None,
                 self.transaction_guard.clone(),
                 self.mem.clone(),
             )?;
-            position.1 = tree.get(&())?.map(|v| v.value().to_vec());
+            let stored = tree.get(&())?.map(|v| v.value().to_vec());
+            position.2 = record.is_some() && stored.as_ref().is_none_or(|s| s.first() == Some(&1));
+            position.1 = stored.map(|s| s.get(1..).unwrap_or_default().to_vec());
             position.0 = true;
         }
         position.2 |= moved;
         Ok((position.1.clone(), position.2))
     }
 
-    /// Stores an internal position; a clipped write retains its hint for the next step.
-    pub fn set_compaction_position(&self, position: Option<&[u8]>) -> Result<()> {
-        let mut current = self.mem.compaction_position.lock().unwrap();
-        *current = (true, position.map(Vec::from), current.2);
-        drop(current);
+    // Stores the pass's place and whether its walk moved a page, or with none whether it rests
+    fn set_compaction_position(&self, position: Option<&[u8]>, moved: bool) -> Result<()> {
+        *self.mem.compaction_position.lock().unwrap() = (true, position.map(Vec::from), moved);
         let mut tables = self.system_tables.lock().unwrap();
+        // A rest is the record left empty, which takes no page; with neither, there is no record
+        if position.is_none() && !moved {
+            tables
+                .table_tree
+                .delete_table(COMPACTION_TABLE.name(), TableType::Normal)
+                .map_err(|e| e.into_storage_error_or_corrupted("Invalid compaction position"))?;
+            return Ok(());
+        }
         let mut table = tables.open_system_table(self, COMPACTION_TABLE)?;
-        if let Some(position) = position {
-            table.insert((), position)?;
-        } else {
-            table.remove(())?;
+        match position {
+            Some(position) => {
+                drop(table.insert((), [&[u8::from(moved)], position].concat().as_slice())?);
+            }
+            None => drop(table.remove(())?),
         }
         Ok(())
     }
 
-    /// Allocator free, total, last commit's freed pages and held readers; no tree read.
+    // Ends the pass under way, clearing its stored place; with `rest`, records that it rests
+    fn finish_compaction(&self, rest: bool) -> Result<CompactionStep> {
+        self.set_compaction_position(None, rest)?;
+        Ok(CompactionStep {
+            ended: true,
+            ..CompactionStep::default()
+        })
+    }
+
+    /// Allocator free, total, last commit's freed pages, and whether the store rests (no pass).
     pub fn compaction_state(&self) -> Result<(u64, u64, u64, bool)> {
         let free = self.mem.count_free_pages()?;
         Ok((
             free,
             free + self.mem.count_allocated_pages()?,
             self.mem.last_freed_pages.load(Ordering::Relaxed),
-            self.free_until() <= self.mem.get_last_committed_transaction_id()?,
+            self.compaction_position(false)? == (None, true) && !self.releasable()?,
         ))
     }
 
@@ -2097,22 +2133,100 @@ impl WriteTransaction {
         Ok((free, total, eligible, churn, held))
     }
 
-    /// Reads and relocates within `allowance`; the opaque position resumes against fresh roots.
+    /// The release mark: the last committed id and the oldest reader, external pins included,
+    /// clamped to it; with no reader, the last committed id twice.
+    pub fn compaction_mark(&self) -> Result<(u64, u64)> {
+        let last = self.mem.get_last_committed_transaction_id()?.raw_id();
+        let oldest = self.transaction_tracker.oldest_live_read_transaction();
+        Ok((last, oldest.map_or(last, |id| id.raw_id().min(last))))
+    }
+
+    /// Whether a live reader holds back freed pages: a freed-page record the reclamation
+    /// cutoff keeps that would be released were no reader live.
+    pub fn readers_hold_freed_pages(&self) -> Result<bool> {
+        let from = self.free_until().raw_id();
+        self.freed_in([from, from], [self.transaction_id.raw_id(); 2])
+    }
+
+    // Freed pages no live reader holds wait for release, beyond the last commit's own bookkeeping
+    fn releasable(&self) -> Result<bool> {
+        let until = self.free_until().raw_id();
+        let last = self.mem.get_last_committed_transaction_id()?.raw_id();
+        self.freed_in([0, 0], [until, until.min(last)])
+    }
+
+    fn freed_in(&self, from: [u64; 2], to: [u64; 2]) -> Result<bool> {
+        let at = |transaction_id| TransactionIdWithPagination {
+            transaction_id,
+            pagination_id: 0,
+        };
+        let mut tables = self.system_tables.lock().unwrap();
+        for (definition, (from, to)) in [DATA_FREED_TABLE, SYSTEM_FREED_TABLE]
+            .into_iter()
+            .zip(from.into_iter().zip(to))
+        {
+            let table = tables.open_system_table(self, definition)?;
+            if table
+                .range::<&TransactionIdWithPagination>(&at(from)..&at(to))?
+                .next()
+                .is_some()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The low mark of the last commit: the free pages at its start less the most pages it had
+    /// taken and not committed at any moment; `None` when it lengthened the file.
+    pub fn last_commit_low_mark(&self) -> Result<Option<u64>> {
+        Ok(self.mem.taken.lock().unwrap().1)
+    }
+
+    /// One step of the pass that packs the file, from the place `from`. In tree order it moves
+    /// the pages at or past the packed length, each to the lowest place wholly below it, and
+    /// passes by a page with no such place. One `allowance` is charged each page read and each
+    /// page written once, a moved block both where it was read and where it goes; the first
+    /// movable block moves whatever its size. A whole walk that
+    /// moved nothing ends the pass. The place to go on from, and whether the walk has moved a
+    /// page, are stored in this transaction and returned with what the step did.
     pub fn compact_pages(
+        &mut self,
+        allowance: usize,
+        from: Option<&[u8]>,
+    ) -> Result<(CompactionStep, Option<Vec<u8>>)> {
+        self.compact_pages_choosing(allowance, from, 0, 0, &mut false)
+    }
+
+    /// [`Self::compact_pages`], releasing what is due first, finishing the pass when free pages
+    /// are fewer than `stop`, and with `skip` above zero passing by the first `skip - 1`
+    /// pages that have a lower place for this attempt and taking the next alone. `selected`
+    /// says, also when the step fails, whether it had chosen a page to move.
+    pub fn compact_pages_choosing(
         &mut self,
         mut allowance: usize,
         from: Option<&[u8]>,
-    ) -> Result<(usize, Option<Vec<u8>>)> {
+        stop: u64,
+        skip: usize,
+        selected: &mut bool,
+    ) -> Result<(CompactionStep, Option<Vec<u8>>)> {
+        let mut step = CompactionStep::default();
         if self.mem.recovery_state()?.0.is_some() {
-            return Ok((0, None));
-        }
-        if from.is_none() {
-            self.mem.compaction_position.lock().unwrap().2 = false;
+            return Ok((step, from.map(Vec::from)));
         }
         self.limit_file_growth()?;
+        self.release_freed_pages(RELEASE_PAGES)?;
+        let walked = from.is_some() && self.compaction_position(false)?.1;
         self.shrink_policy = ShrinkPolicy::Maximum;
-        let (free, _, churn, _) = self.compaction_state()?;
-        let mut capacity = usize::try_from(free.saturating_sub(churn)).unwrap_or(usize::MAX);
+        let (free, cut) = (
+            self.mem.count_free_pages()?,
+            self.mem.count_allocated_pages()?,
+        );
+        // With no free page nothing has a place below it, so the store rests.
+        if free == 0 || free < stop {
+            return Ok((self.finish_compaction(free == 0)?, None));
+        }
+        let mut pass = skip.saturating_sub(1);
         // A phase distinguishes both namespaces and catalog progress from even an empty table name.
         let (phase, position, name) = from
             .and_then(|b| {
@@ -2125,9 +2239,15 @@ impl WriteTransaction {
                 Some((*b.first()?, path, std::str::from_utf8(name).ok()?)).filter(|v| v.0 < 4)
             })
             .unwrap_or_default();
-        let cut = self.mem.count_allocated_pages()?;
         let region_pages = self.mem.region_pages();
-        let mut highest_pages = BTreeMap::new();
+        let mem = self.mem.clone();
+        // A block that found no place below it has the next walk clear an aligned run of its
+        // size under it: the smaller pages in the run move below the run, so it comes free.
+        let wanted = mem.stuck.lock().unwrap().take();
+        let (run, mut held) =
+            wanted.map_or((0..0, Vec::new()), |(order, at)| mem.hold_run(order, at));
+        let (mut moving, mut above) = (BTreeMap::new(), HashSet::new());
+        let mut copies = Vec::new();
         let mut tables = self.tables.lock().unwrap();
         let table_tree = &mut tables.table_tree;
         let mut system_tables = self.system_tables.lock().unwrap();
@@ -2135,27 +2255,66 @@ impl WriteTransaction {
         let mut next = None;
         let mut visited = [BTreeMap::new(), BTreeMap::new()];
         let mut from = ((phase % 2 == 1).then_some(name), position.as_slice());
-        let mut select_page =
-            |_name: Option<&str>, path: &PagePath, read: &mut bool, page: Option<&[u8]>| {
+        let mut select =
+            |_: Option<&str>, path: &PagePath, read: &mut bool, page: Option<&[u8]>| {
                 if page.is_some() {
                     return Ok(true);
                 }
                 let number = path.page_number();
+                let size = 1usize << number.page_order;
                 let address = u64::from(number.region) * region_pages
                     + (u64::from(number.page_index) << number.page_order);
-                let select = address >= cut && !highest_pages.contains_key(&number);
-                let moving = std::iter::once(&number)
-                    .chain(path.parents())
-                    .map(|p| 2usize << p.page_order)
-                    .sum::<usize>();
-                let cost = (usize::from(*read) << number.page_order) + usize::from(select) * moving;
-                if cost > allowance || select && moving / 2 > capacity {
-                    return Ok(false);
+                let order = number.page_order;
+                let inside = run.contains(&address) && wanted.is_some_and(|w| order < w.0);
+                if address >= cut || inside {
+                    let parents = path.parents().iter().filter(|p| !above.contains(*p));
+                    // A block is read where it was and written where it goes.
+                    let cost = 2 * size + parents.map(|p| 1usize << p.page_order).sum::<usize>();
+                    if !moving.is_empty() && (skip > 0 || cost > allowance) {
+                        return Ok(false);
+                    }
+                    let copy = mem.allocate_below(number)?;
+                    if copy.is_none() && address >= cut && order > 0 {
+                        let mut stuck = mem.stuck.lock().unwrap();
+                        *stuck = (*stuck).max(Some((order, address)));
+                    }
+                    if let Some(copy) = copy {
+                        let mut taken = vec![(number, copy.get_page_number())];
+                        drop(copy);
+                        // The pages above it are copied too, within the file
+                        let mut room = true;
+                        for parent in path.parents().iter().filter(|p| !above.contains(*p)) {
+                            let Some(copy) = mem.allocate_within(parent.page_order)? else {
+                                room = false;
+                                break;
+                            };
+                            taken.push((*parent, copy.get_page_number()));
+                        }
+                        if room && pass == 0 {
+                            allowance = allowance.saturating_sub(cost);
+                            step.read += size as u64;
+                            above.extend(path.parents().iter().copied());
+                            moving.insert(number, (path.clone(), taken[0].1));
+                            copies.extend(taken.drain(1..));
+                            *read = false;
+                            return Ok(true);
+                        }
+                        // Passed by: with no room above it, or for this attempt, as a later one
+                        // takes it
+                        pass -= usize::from(room);
+                        for (_, at) in taken {
+                            mem.free_if_uncommitted(at, &mut PageTrackerPolicy::Ignore);
+                        }
+                    }
                 }
-                allowance -= cost;
-                if select {
-                    capacity -= moving / 2;
-                    highest_pages.insert(number, path.clone());
+                // A page larger than one is a leaf, and a leaf that does not move is not read
+                *read &= number.page_order == 0;
+                if *read {
+                    if allowance == 0 {
+                        return Ok(false);
+                    }
+                    allowance -= 1;
+                    step.read += 1;
                 }
                 Ok(true)
             };
@@ -2165,8 +2324,9 @@ impl WriteTransaction {
                 from,
                 PageHint::None,
                 &mut visited[usize::from(namespace)],
-                &mut select_page,
-            )?;
+                &mut select,
+            );
+            let stopped = stopped.inspect_err(|_| mem.give_back(std::mem::take(&mut held)))?;
             if let Some((name, path)) = stopped {
                 let mut bytes = vec![
                     namespace * 2 + u8::from(name.is_some()),
@@ -2179,38 +2339,57 @@ impl WriteTransaction {
             }
             from = (None, &[]);
         }
-        if highest_pages.is_empty() {
-            return Ok((0, next));
-        }
-
+        mem.give_back(held);
+        *selected = !moving.is_empty();
         let mut relocation_map = HashMap::new();
-        for path in highest_pages.into_values().rev() {
-            for old in std::iter::once(&path.page_number()).chain(path.parents()) {
-                if relocation_map.contains_key(old) {
-                    continue;
+        for (number, (_, copy)) in moving {
+            step.moved += 1 << number.page_order;
+            relocation_map.insert(number, copy);
+        }
+        // A page above one move that moves itself keeps its own place
+        for (parent, copy) in copies {
+            match relocation_map.entry(parent) {
+                Entry::Occupied(_) => {
+                    self.mem
+                        .free_if_uncommitted(copy, &mut PageTrackerPolicy::Ignore);
                 }
-                let page = self.mem.get_page(*old, PageHint::None)?;
-                let mut copy = self.mem.allocate_lowest(page.memory().len())?;
-                copy.memory_mut()[0] = page.memory()[0];
-                relocation_map.insert(*old, copy.get_page_number());
+                Entry::Vacant(place) => drop(place.insert(copy)),
             }
         }
-
-        let [user, system] = visited;
-        table_tree.relocate_tables(user, &relocation_map)?;
-        system_table_tree.relocate_tables(system, &relocation_map)?;
-
-        Ok((relocation_map.len(), next))
+        step.written = relocation_map.keys().map(|p| 1 << p.page_order).sum();
+        if !relocation_map.is_empty() {
+            let [user, system] = visited;
+            table_tree.relocate_tables(user, &relocation_map)?;
+            system_table_tree.relocate_tables(system, &relocation_map)?;
+        }
+        drop((tables, system_tables));
+        // A walk that moved a page is followed by another; one that moved none ends the pass
+        let found = wanted.is_none() && self.mem.stuck.lock().unwrap().is_some();
+        let moved = walked || step.moved > 0 || found;
+        let (next, moved) = match next {
+            Some(at) => (Some(at), moved),
+            None => (moved.then(|| vec![0, 0]), !moved),
+        };
+        step.ended = next.is_none();
+        self.set_compaction_position(next.as_deref(), moved)?;
+        Ok((step, next))
     }
 
     fn release_freed_pages(&mut self, allowance: usize) -> Result {
+        // A release that can open a lower place ends a rest, and has a pass under way walk again
+        let opens = self.releasable()?;
         let mut released = Vec::with_capacity(allowance);
         let result = self.process_freed_pages(self.free_until(), allowance, |page| {
             released.push(page.to_le_bytes());
             self.mem.free(page, &mut PageTrackerPolicy::Ignore);
         });
-        self.released_pages = released;
-        result
+        self.released_pages.extend(released);
+        self.release_spent += allowance - result?;
+        let (place, again) = self.compaction_position(false)?;
+        if opens && (place.is_some() || again) {
+            self.set_compaction_position(place.as_deref(), place.is_some())?;
+        }
+        Ok(())
     }
 
     // NOTE: must be called before store_system_freed_pages() during commit, since this can create
@@ -2220,9 +2399,9 @@ impl WriteTransaction {
         free_until: TransactionId,
         mut allowance: usize,
         mut release: impl FnMut(PageNumber),
-    ) -> Result {
+    ) -> Result<usize> {
         if self.mem.recovery_state()?.0.is_some() {
-            return Ok(());
+            return Ok(allowance);
         }
         let mut tables = self.system_tables.lock().unwrap();
         let deferred_chains = tables.system_freed_pages();
@@ -2261,7 +2440,7 @@ impl WriteTransaction {
                 }
             }
         }
-        Ok(())
+        Ok(allowance)
     }
 
     fn retire_commit_pages(&self) -> Result {

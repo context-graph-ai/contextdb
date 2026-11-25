@@ -85,6 +85,10 @@ const BLOCKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("vector_block
 pub(crate) const DELIVERY: u8 = keys::LEFT + 1;
 pub(crate) const SCHEDULE: u8 = DELIVERY + 1;
 pub(crate) const AUDIT: u8 = SCHEDULE + 1;
+/// The first byte of the mark of an owed range: what `drop::VECTOR` and the kinds after it
+/// name, then the number of what owes, to the commit or the end place that bounds it in eight
+/// bytes and the key the next batch goes on after. Kinds 13 to 35 are taken by other records.
+pub(crate) const OWED: u8 = 36;
 pub(super) const LAST_ACTION: u64 = 5 << 32;
 pub(crate) const LAST_AUDIT: u64 = 8 << 32;
 const VECTORS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("vectors");
@@ -116,7 +120,7 @@ pub(super) fn vector_number_at(number: VectorNumber) -> u64 {
 
 /// The places of the slices of a large value: its cell gives them, so nothing is read to
 /// find them.
-fn places(kept: &Beside) -> Stored<Range<u64>> {
+pub(super) fn places(kept: &Beside) -> Stored<Range<u64>> {
     let end = kept
         .place
         .checked_add(kept.bytes.div_ceil(SLICE as u64))
@@ -157,41 +161,58 @@ pub(super) fn remove_slices(
     Ok(())
 }
 
-/// Removes every version of a row's stored `key` and frees the large values they and `before`
-/// held, each at its last holder in commit order, and none that `after` holds. An address is held
-/// by a run of one key's holders, so each is compared with the next.
+/// Frees the large values `before` held that `after` and the newest version of its stored
+/// `key` do not, and owes the key's versions as of `commit`: from it they are gone to every
+/// reader, and the removal loop frees what they hold. When `erasing`, the key's versions and
+/// every value they hold go in this commit instead, so an erase leaves no copy to give back later.
 pub(super) fn release(
-    (versions, beside): (&mut ByteTable<'_>, &mut redb::Table<'_, u64, &'static [u8]>),
+    (versions, beside, marks): (
+        &mut ByteTable<'_>,
+        &mut redb::Table<'_, u64, &'static [u8]>,
+        &mut ByteTable<'_>,
+    ),
     key: &[u8],
-    before: Option<Row>,
-    after: &[Beside],
+    (before, after): (Row, &[Beside]),
+    (commit, erasing): (u64, bool),
     cover: &mut Passing,
     write: &redb::WriteTransaction,
 ) -> Stored<()> {
-    let mut handover = |held: &[Beside], next: &[Beside]| {
-        let mut gone = held.iter().filter(|kept| !next.contains(kept));
-        gone.try_for_each(|kept| remove_slices(beside, kept, write))
-    };
     let (from, to) = ([key, &[0; 8]].concat(), [key, &[0xFF; 8]].concat());
-    let mut held = Vec::new();
-    for version in
-        versions.extract_from_if::<&[u8], _>(from.as_slice()..=to.as_slice(), |_, _| true)?
-    {
-        let now: Vec<_> = record::decode_record(version?.1.value(), cover)?
-            .besides()
-            .collect();
-        handover(&held, &now)?;
-        held = now;
+    let range = from.as_slice()..=to.as_slice();
+    let (mut held, mut gone) = (after.to_vec(), before.besides().collect::<Vec<_>>());
+    if erasing {
+        let first = |versions: &ByteTable<'_>| -> Stored<_> {
+            let first = versions.range(range.clone())?.next().transpose()?;
+            Ok(first.map(|(at, record)| (at.value().to_vec(), record.value().to_vec())))
+        };
+        while let Some((at, record)) = first(versions)? {
+            gone.extend(record::decode_record(&record, cover)?.besides());
+            versions.remove(at.as_slice())?;
+        }
+    } else if let Some((_, newest)) = versions.range(range)?.next_back().transpose()? {
+        held.extend(record::decode_record(newest.value(), cover)?.besides());
+        let mark = drop::mark(drop::VERSIONS, key);
+        marks.insert_discard(mark.as_slice(), &commit.to_le_bytes()[..])?;
     }
-    if let Some(before) = before {
-        let now: Vec<_> = before.besides().collect();
-        handover(&held, &now)?;
-        held = now;
+    for kept in unheld(&gone, &held) {
+        remove_slices(beside, kept, write)?;
     }
-    handover(&held, after)
+    Ok(())
+}
+
+/// The large values `held` holds that `next`, its next holder, does not: they go with it.
+pub(super) fn unheld<'a>(
+    held: &'a [Beside],
+    next: &'a [Beside],
+) -> impl Iterator<Item = &'a Beside> {
+    held.iter().filter(|kept| !next.contains(kept))
 }
 
 pub(super) type ByteTable<'a> = redb::Table<'a, &'static [u8], &'static [u8]>;
+
+/// The hint of a disk refusal when a live reader holds back freed pages.
+pub(crate) const READERS: &str =
+    "a reader on an older commit holds the freed space; end that reader or raise the disk limit";
 
 /// Tells a failure of the storage library or of a file as the engine tells it: as damage when
 /// stored data failed its check, and otherwise as a failure of `operation`, which is what the
@@ -710,13 +731,17 @@ impl View {
             [&key.0[..], &[0xFF; 9]].concat(),
         );
         let m = &*self.moment;
-        m.scan(&m.versions, table.0, &span, true, |key, row| {
+        // A version at or below an owed mark of its table or its key is gone to every reader.
+        let gone = self.retired(&table.0.to_be_bytes(), &stored(table.0, &key.0))?;
+        let gone = gone.unwrap_or(0);
+        let read = m.scan(&m.versions, table.0, &span, true, |key, row| {
             let commit = key
                 .get(key.len().saturating_sub(8)..)
                 .and_then(|c| c.try_into().ok());
             let commit = TxId(u64::from_be_bytes(commit.ok_or_else(unsound)?));
             Ok((commit, record::decode_record(row, cover)?))
-        })
+        })?;
+        Ok(read.filter(move |v| v.as_ref().map_or(true, |(commit, _)| commit.0 > gone)))
     }
 
     pub(crate) fn versioned(
@@ -729,6 +754,20 @@ impl View {
             let length = key.len().checked_sub(8).ok_or_else(unsound)?;
             Ok(Key(key[..length].to_vec()))
         })
+    }
+
+    /// The bound of the owed range `source` names at `named`, when one is marked.
+    pub(crate) fn owed(&self, source: u8, named: &[u8]) -> Result<Option<u64>> {
+        let m = &*self.moment;
+        let mark = m.told(m.vectors.get(drop::mark(source, named).as_slice()))?;
+        Ok(mark.and_then(|v| v.value().first_chunk().map(|n| u64::from_le_bytes(*n))))
+    }
+
+    /// The commit at and below which a version of the stored row `key` of `table` is owed: its
+    /// table's mark or its key's, whichever is higher.
+    fn retired(&self, table: &[u8], key: &[u8]) -> Result<Option<u64>> {
+        let owed = |named| self.owed(drop::VERSIONS, named);
+        Ok(owed(table)?.max(owed(key)?))
     }
 
     /// `error`; when it is damage met by the writer's process, [`READING`] is marked.
@@ -749,7 +788,12 @@ impl View {
     pub(crate) fn page_slack(&self) -> Result<f64> {
         use redb::ReadableTableMetadata as _;
         let m = &self.moment;
-        let a = [m.rows.stats(), m.index.stats(), m.beside.stats()];
+        let a = [
+            m.rows.stats(),
+            m.index.stats(),
+            m.beside.stats(),
+            m.versions.stats(),
+        ];
         let b = [m.counts.stats(), m.schema.stats(), m.numbers.stats()];
         let c = [m.blocks.stats(), m.vectors.stats()];
         let (mut held, mut slack) = (0, 0);
@@ -812,8 +856,32 @@ impl View {
         let mut lent = Key(Vec::new());
         self.pairs(|kind, key, value| {
             let bytes = (key.len() + value.len()) as u64;
+            if kind == 4 && key.first() == Some(&OWED) {
+                return Ok(());
+            }
             if kind == 4 && key.first().is_some_and(|k| (DELIVERY..=AUDIT).contains(k)) {
                 return f(self.runtime_record(key, value)?, bytes);
+            }
+            // A record under an owed range is no table's and is passed by.
+            let at = usize::from(kind == 3 || kind == 4);
+            let id = key
+                .get(at..at + 4)
+                .ok_or_else(|| m.damaged("a record key lacks its owner"))?;
+            let source = [
+                drop::ROWS,
+                drop::INDEX,
+                drop::KEPT,
+                drop::VECTOR,
+                drop::VECTOR,
+            ];
+            let (row, commit) = key.split_at(key.len().saturating_sub(8));
+            let commit = commit.try_into().map_or(0, u64::from_be_bytes);
+            if self
+                .owed(*source.get(kind).unwrap_or(&drop::ROWS), id)?
+                .is_some()
+                || kind == 5 && self.retired(id, row)?.is_some_and(|gone| commit <= gone)
+            {
+                return Ok(());
             }
             if kind == 3 || kind == 4 {
                 let record = keys::vector_of(key, &mut lent)
@@ -914,7 +982,11 @@ impl View {
                         Key(joined[length..].to_vec()),
                     )?;
                 }
-                3 | 4 if kind == 3 || k.first().is_none_or(|k| !(DELIVERY..=AUDIT).contains(k)) => {
+                3 | 4
+                    if kind == 3
+                        || k.first()
+                            .is_none_or(|k| !(DELIVERY..=AUDIT).contains(k) && *k != OWED) =>
+                {
                     let record = m.told(keys::vector_of(k, &mut key).ok_or_else(unsound))?;
                     changes.put_vector(record, v.to_vec())?;
                 }
@@ -1049,62 +1121,39 @@ impl ChangeSet {
 
 /// Writes a change set as one transaction of the storage library and waits for the disk.
 /// Returns the number of the commit it made.
-pub(super) fn write(data: &redb::Database, changes: &mut ChangeSet) -> Stored<u64> {
+pub(super) fn write(
+    data: &redb::Database,
+    changes: &mut ChangeSet,
+    surplus: &std::sync::Mutex<Option<u64>>,
+) -> Stored<u64> {
     // The storage library has a commit option, `set_quick_repair`, that lets reopening after a
     // kill skip its repair. It is not used: with it every commit rewrites the library's whole
     // free-page table, about 133 KB for each GiB of file. So an open after a kill reads every
     // page in use, while an open after a clean close reads almost nothing.
-    if let Some((from, allowance, drain, outcome)) = &changes.compaction {
-        let mut write = data.begin_write()?;
-        let step = || -> Stored<_> {
-            write.limit_file_growth()?;
-            if *drain && *allowance == Some(0) {
-                write.set_two_phase_commit(true);
-            }
-            let (pages, next) = match allowance {
-                Some(0) => (0, from.clone()),
-                Some(allowance) => write.compact_pages(*allowance, from.as_deref())?,
-                None => (0, None),
-            };
-            let changed = next != *from;
-            if changed {
-                write.set_compaction_position(next.as_deref())?;
-            }
-            if pages == 0 && !changed && !*drain {
-                return Ok(0);
-            }
-            checkpoint(&write)?;
-            write.prepare_compaction_commit()?;
-            write.commit()?;
-            Ok(if pages > 0 || changed { pages + 1 } else { 0 })
-        };
-        let result = match step() {
-            Err(Failed::Storage(redb::Error::Io(e)))
-                if e.get_ref().is_some_and(|e| e.is::<redb::FileSizeLimit>()) =>
-            {
-                0
-            }
-            other => other?,
-        };
-        outcome.store(result as u64, Ordering::Relaxed);
-        return Ok(changes.base().commit().0);
-    }
     let mut write = match changes.data {
         Some(_) => changes.writing()?,
         None => begin(data, changes)?,
     };
+    // The fewest free pages a commit since the window began left itself; none when one grew.
+    let low = write.last_commit_low_mark()?.unwrap_or(0);
+    let mut fewest = locked(surplus);
+    *fewest = Some(fewest.map_or(low, |fewest| fewest.min(low)));
+    drop(fewest);
     put(&write, changes)?;
     // A key whose last write removed its row from a table that keeps no removed row's
     // versions takes its versions with it, as it would have in one part.
     if changes.data.is_some() && changes.keeps.values().any(|removed| !removed) {
         let mut cover = changes.reserved.passing();
         let (mut versions, mut beside) = (write.open_table(VERSIONS)?, write.open_table(BESIDE)?);
+        let mut marks = write.open_table(VECTORS)?;
         let notes = write.open_table(super::through::NOTES)?;
+        let erasing = (changes.commit_number().0, changes.erasing);
         for note in notes.range(&[NOTE, b'N'][..]..&[NOTE, b'O'][..])? {
             let (key, flag) = note?;
             if flag.value() == [super::through::ERASED] {
-                let tables = (&mut versions, &mut beside);
-                release(tables, &key.value()[2..], None, &[], &mut cover, &write)?;
+                let tables = (&mut versions, &mut beside, &mut marks);
+                let gone = (Row::default(), &[][..]);
+                release(tables, &key.value()[2..], gone, erasing, &mut cover, &write)?;
             }
         }
     }
@@ -1145,6 +1194,8 @@ pub(super) fn put(write: &redb::WriteTransaction, changes: &mut ChangeSet) -> St
         let mut notes = notes
             .map(|_| write.open_table(super::through::NOTES))
             .transpose()?;
+        let mut counts = write.open_table(COUNTS)?;
+        let (mut blocks, mut vectors) = (write.open_table(BLOCKS)?, write.open_table(VECTORS)?);
         let first_free = number(&numbers, NEXT_PLACE)?;
         let mut free = first_free;
         let commit = changes.commit_number().0.to_be_bytes();
@@ -1193,13 +1244,16 @@ pub(super) fn put(write: &redb::WriteTransaction, changes: &mut ChangeSet) -> St
                     Some(old) => {
                         let old = record::decode_record(old.value(), &mut cover)?;
                         let after: Vec<_> = row.left.iter().map(|left| left.1.clone()).collect();
-                        let tables = (&mut versions, &mut beside);
-                        release(tables, &key, Some(old), &after, &mut cover, write)?;
+                        let tables = (&mut versions, &mut beside, &mut vectors);
+                        let erasing = (u64::from_be_bytes(commit), changes.erasing);
+                        release(tables, &key, (old, &after), erasing, &mut cover, write)?;
                     }
                     // An erased key whose row was deleted earlier: its kept versions go.
                     None if changes.erasing => {
-                        let tables = (&mut versions, &mut beside);
-                        release(tables, &key, None, &[], &mut cover, write)?;
+                        let tables = (&mut versions, &mut beside, &mut vectors);
+                        let erasing = (u64::from_be_bytes(commit), true);
+                        let gone = (Row::default(), &[][..]);
+                        release(tables, &key, gone, erasing, &mut cover, write)?;
                     }
                     None => {}
                 }
@@ -1257,20 +1311,18 @@ pub(super) fn put(write: &redb::WriteTransaction, changes: &mut ChangeSet) -> St
             checkpoint(write)?;
         }
 
-        counts::write(&changes.kept, &mut write.open_table(COUNTS)?, write)?;
+        counts::write(&changes.kept, &mut counts, write)?;
 
         // Last, so that a drop takes with it what the transaction staged under its number.
-        let mut blocks = write.open_table(BLOCKS)?;
-        let mut vectors = write.open_table(VECTORS)?;
-        drop::write(
-            changes,
-            (&mut rows, &mut versions, &mut beside),
+        let mut tables = [
+            &mut rows,
             &mut index,
-            &mut write.open_table(COUNTS)?,
-            &mut numbers,
-            [&mut blocks, &mut vectors],
-            write,
-        )?;
+            &mut counts,
+            &mut blocks,
+            &mut vectors,
+            &mut versions,
+        ];
+        drop::write(changes, &mut tables, &mut beside, &mut numbers, write)?;
 
         let mut schema = write.open_table(SCHEMA)?;
         for (name, record) in &changes.schema {
@@ -1287,11 +1339,10 @@ pub(super) fn put(write: &redb::WriteTransaction, changes: &mut ChangeSet) -> St
         if free != first_free {
             numbers.insert_discard(NEXT_PLACE, free)?;
         }
-        let mut kept = write.open_table(COUNTS)?;
         for (kind, key, value) in &changes.copied {
             match kind {
                 0 => rows.insert_discard(key.as_slice(), value.as_slice())?,
-                2 => kept.insert_discard(key.as_slice(), value.as_slice())?,
+                2 => counts.insert_discard(key.as_slice(), value.as_slice())?,
                 4 => vectors.insert_discard(key.as_slice(), value.as_slice())?,
                 5 => versions.insert_discard(key.as_slice(), value.as_slice())?,
                 8 => drop(beside.insert(

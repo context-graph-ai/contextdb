@@ -683,13 +683,15 @@ pub(super) enum Scalar {
     Coalesce,
 }
 
-/// The four operators as the parser names them: `a + b` arrives as the call `__add(a, b)`.
+/// The five operators as the parser names them: `a + b` arrives as the call `__add(a, b)`.
 #[derive(Clone, Copy)]
 pub(super) enum Arithmetic {
     Add,
     Sub,
     Mul,
     Div,
+    /// The remainder of whole numbers, with the sign of the dividend, as Postgres `%` gives it.
+    Rem,
 }
 
 /// The scalar function of this name, if it is one.
@@ -699,6 +701,7 @@ pub(super) fn scalar(name: &str) -> Option<Scalar> {
         ("__sub", Scalar::Arithmetic(Arithmetic::Sub)),
         ("__mul", Scalar::Arithmetic(Arithmetic::Mul)),
         ("__div", Scalar::Arithmetic(Arithmetic::Div)),
+        ("__mod", Scalar::Arithmetic(Arithmetic::Rem)),
         ("now", Scalar::Now),
         ("coalesce", Scalar::Coalesce),
     ]
@@ -709,7 +712,8 @@ pub(super) fn scalar(name: &str) -> Option<Scalar> {
 
 /// Arithmetic as standard SQL does it: NULL in gives NULL out, two whole numbers give a whole
 /// number or are refused when it would not fit, and a REAL on either side gives a REAL.
-/// Dividing by zero is refused.
+/// Dividing by zero is refused. `%` takes whole numbers only, as Postgres has no `%` of a
+/// double precision; `MIN % -1` is 0, as there.
 pub(super) fn arithmetic(op: Arithmetic, left: &Value, right: &Value) -> Result<Value> {
     let by_zero = || Error::PlanError("division by zero".to_owned());
     Ok(match (left, right) {
@@ -719,8 +723,9 @@ pub(super) fn arithmetic(op: Arithmetic, left: &Value, right: &Value) -> Result<
                 Arithmetic::Add => left.checked_add(*right),
                 Arithmetic::Sub => left.checked_sub(*right),
                 Arithmetic::Mul => left.checked_mul(*right),
-                Arithmetic::Div if *right == 0 => return Err(by_zero()),
+                Arithmetic::Div | Arithmetic::Rem if *right == 0 => return Err(by_zero()),
                 Arithmetic::Div => left.checked_div(*right),
+                Arithmetic::Rem => Some(left.wrapping_rem(*right)),
             }
             .ok_or_else(out_of_range)?,
         ),
@@ -736,6 +741,11 @@ pub(super) fn arithmetic(op: Arithmetic, left: &Value, right: &Value) -> Result<
                 Arithmetic::Mul => left * right,
                 Arithmetic::Div if right == 0.0 => return Err(by_zero()),
                 Arithmetic::Div => left / right,
+                Arithmetic::Rem => {
+                    return Err(Error::PlanError(
+                        "the remainder % takes two whole numbers".to_owned(),
+                    ));
+                }
             })
         }
     })

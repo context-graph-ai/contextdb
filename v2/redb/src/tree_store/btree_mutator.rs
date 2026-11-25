@@ -1,6 +1,6 @@
 use crate::tree_store::btree_base::{
     BRANCH, BranchAccessor, BranchBuilder, BranchMutator, Checksum, DEFERRED, LEAF, LeafAccessor,
-    LeafBuilder, LeafMutator,
+    LeafBuilder, LeafMutator, common,
 };
 use crate::tree_store::btree_mutator::DeletionResult::{
     DeletedBranch, DeletedLeaf, PartialBranch, PartialLeaf, Subtree,
@@ -12,7 +12,6 @@ use crate::tree_store::{
 };
 use crate::types::{Key, Value};
 use crate::{AccessGuard, Result};
-use std::cell::OnceCell;
 use std::cmp::{max, min};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
@@ -134,6 +133,7 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                 )?,
                 checksum,
                 K::as_bytes(key).as_ref(),
+                None,
             )?;
             let new_length = if found.is_some() { length - 1 } else { length };
             let new_root = match deletion_result {
@@ -433,7 +433,7 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                     }
                 } else {
                     let (new_page1, split_key, new_page2) =
-                        builder.build_split(position, Some(!found))?;
+                        builder.build_split(position, !found)?;
                     let page_number = page.get_page_number();
                     let existing_value = if found {
                         let (start, end) = accessor.value_range(position).unwrap();
@@ -661,16 +661,18 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
         page: PageImpl,
         checksum: Checksum,
         key: &[u8],
+        sibling: Option<(PageNumber, Checksum, bool)>,
     ) -> Result<(DeletionResult, Option<AccessGuard<'a, V>>)> {
         let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
         let (position, found) = accessor.position::<K>(key);
         if !found {
             return Ok((Subtree(page.get_page_number(), checksum), None));
         }
-        // Counted with every key whole: the shared bytes again for each pair left kept without them
+        // The bytes the page stores, so a page that keeps its keys' shared beginning once is judged
+        // by what it holds: the pair after a deleted first pair is stored whole
         let new_kv_bytes = accessor.length_of_pairs(0, accessor.num_pairs())
             - accessor.length_of_pairs(position, position + 1)
-            + accessor.prefix().len() * (accessor.num_pairs() - 1 - usize::from(position > 0));
+            + accessor.prefix().len() * usize::from(position == 0);
         let new_required_bytes = RawLeafBuilder::required_bytes(
             accessor.num_pairs() - 1,
             new_kv_bytes,
@@ -678,15 +680,16 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
             V::fixed_width(),
         );
         let uncommitted = self.mem.uncommitted(page.get_page_number());
+        // Merge when less than 33% full and the pairs fit one page with the sibling's. Splits
+        // occur when a page is full and produce two 50% full pages, so we use 33% instead of 50%
+        // to avoid oscillating; a leaf that cannot join stays alone, so its sibling is kept as it is
+        let partial = accessor.num_pairs() > 1
+            && new_required_bytes < self.mem.get_page_size() / 3
+            && sibling.map_or(Ok(true), |sibling| self.joins(&accessor, position, sibling))?;
 
-        // Fast-path for dirty pages: perform in-place removal without allocating a new page.
-        // The threshold matches the merge threshold (page_size/3) so that we use in-place
-        // removal for all cases where the page won't need merging with a sibling.
-        if uncommitted
-            && self.modify_uncommitted
-            && new_required_bytes >= self.mem.get_page_size() / 3
-            && accessor.num_pairs() > 1
-        {
+        // Fast-path for dirty pages: perform in-place removal without allocating a new page
+        // wherever the page won't be merged with a sibling.
+        if uncommitted && self.modify_uncommitted && accessor.num_pairs() > 1 && !partial {
             let (start, end) = accessor.value_range(position).unwrap();
             let page_number = page.get_page_number();
             drop(page);
@@ -704,9 +707,7 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
 
         let result = if accessor.num_pairs() == 1 {
             DeletedLeaf
-        } else if new_required_bytes < self.mem.get_page_size() / 3 {
-            // Merge when less than 33% full. Splits occur when a page is full and produce two 50%
-            // full pages, so we use 33% instead of 50% to avoid oscillating
+        } else if partial {
             PartialLeaf {
                 page: page.to_arc(),
                 deleted_pair: position,
@@ -747,6 +748,46 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
         Ok((result, guard))
     }
 
+    // Whether a leaf without its pair `deleted` and its sibling (right of it or not) fit one page
+    // joined, as a page of their pairs is built: the joined first and last keys' share kept once
+    fn joins(
+        &self,
+        leaf: &LeafAccessor,
+        deleted: usize,
+        (number, checksum, right): (PageNumber, Checksum, bool),
+    ) -> Result<bool> {
+        let (fixed_key, fixed_value) = (K::fixed_width(), V::fixed_width());
+        let page =
+            self.mem
+                .get_checked_page(number, checksum, fixed_key, fixed_value, PageHint::None)?;
+        let other = LeafAccessor::new(page.memory(), fixed_key, fixed_value);
+        let whole = |l: &LeafAccessor| {
+            l.length_of_pairs(0, l.num_pairs()) + l.prefix().len() * (l.num_pairs() - 1)
+        };
+        let gone = leaf.length_of_pairs(deleted, deleted + 1)
+            + leaf.prefix().len() * usize::from(deleted > 0);
+        let last = leaf.num_pairs() - 1;
+        let (first, end) = if right {
+            (
+                leaf.entry(usize::from(deleted == 0)).unwrap(),
+                other.last_entry(),
+            )
+        } else {
+            (
+                other.entry(0).unwrap(),
+                leaf.entry(last - usize::from(deleted == last)).unwrap(),
+            )
+        };
+        let bytewise = K::compares_as_bytes() && fixed_value != Some(0);
+        let shared = common(&first.key_parts(), &end.key_parts()).min(255 * usize::from(bytewise));
+        let pairs = last + other.num_pairs();
+        let bytes = whole(leaf) - gone + whole(&other) - shared * (pairs - 1);
+        Ok(
+            RawLeafBuilder::required_bytes(pairs, bytes, fixed_key, fixed_value)
+                <= self.mem.get_page_size(),
+        )
+    }
+
     fn finalize_branch_builder(
         builder: BranchBuilder<'_, '_>,
         page_size: usize,
@@ -776,10 +817,16 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
         let original_page_number = page.get_page_number();
         let (child_index, child_page_number) = accessor.child_for_key::<K>(key);
         let child_checksum = accessor.child_checksum(child_index).unwrap();
+        let merge_with = if child_index == 0 { 1 } else { child_index - 1 };
         let (result, found) = self.delete_helper(
             accessor.get_child(child_index, V::fixed_width(), &self.mem, PageHint::None)?,
             child_checksum,
             key,
+            Some((
+                accessor.child_page(merge_with).unwrap(),
+                accessor.child_checksum(merge_with).unwrap(),
+                merge_with > child_index,
+            )),
         )?;
         if found.is_none() {
             return Ok((Subtree(original_page_number, checksum), None));
@@ -859,41 +906,28 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                     LeafAccessor::new(&partial_child_page, K::fixed_width(), V::fixed_width());
                 debug_assert!(partial_child_accessor.num_pairs() > 1);
 
-                let merge_with = if child_index == 0 { 1 } else { child_index - 1 };
                 debug_assert!(merge_with < accessor.count_children());
                 let merge_with_page =
                     accessor.get_child(merge_with, V::fixed_width(), &self.mem, PageHint::None)?;
                 let merge_with_accessor =
                     LeafAccessor::new(merge_with_page.memory(), K::fixed_width(), V::fixed_width());
 
-                let single_large_value = merge_with_accessor.num_pairs() == 1
-                    && merge_with_accessor.total_length() >= self.mem.get_page_size();
-                // Don't try to merge or rebalance, if the sibling contains a single large value
-                if single_large_value {
-                    let mut child_builder = LeafBuilder::new(
-                        &self.mem,
-                        &self.allocated,
-                        partial_child_accessor.num_pairs() - 1,
-                        K::fixed_width(),
-                        V::fixed_width(),
-                        K::compares_as_bytes(),
-                    );
-                    child_builder.push_all_except(&partial_child_accessor, Some(deleted_pair));
-                    let new_page = child_builder.build()?;
-                    builder.push_all(&accessor);
-                    builder.replace_child(child_index, new_page.get_page_number(), DEFERRED);
-
-                    let result = Self::finalize_branch_builder(builder, self.mem.get_page_size())?;
-
-                    drop(page);
-                    self.conditional_free(original_page_number);
-                    // child_page_number does not need to be freed, because it's a leaf and the
-                    // MutAccessGuard will free it
-
-                    return Ok((result, found));
+                let mut joined = LeafBuilder::new(
+                    &self.mem,
+                    &self.allocated,
+                    partial_child_accessor.num_pairs() - 1 + merge_with_accessor.num_pairs(),
+                    K::fixed_width(),
+                    V::fixed_width(),
+                    K::compares_as_bytes(),
+                );
+                if child_index > merge_with {
+                    joined.push_all_except(&merge_with_accessor, None);
                 }
-
-                let signpost = OnceCell::new();
+                joined.push_all_except(&partial_child_accessor, Some(deleted_pair));
+                if child_index < merge_with {
+                    joined.push_all_except(&merge_with_accessor, None);
+                }
+                let joined = joined.build()?;
                 for i in 0..accessor.count_children() {
                     if i == child_index {
                         continue;
@@ -901,40 +935,7 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                     let page_number = accessor.child_page(i).unwrap();
                     let page_checksum = accessor.child_checksum(i).unwrap();
                     if i == merge_with {
-                        let mut child_builder = LeafBuilder::new(
-                            &self.mem,
-                            &self.allocated,
-                            partial_child_accessor.num_pairs() - 1
-                                + merge_with_accessor.num_pairs(),
-                            K::fixed_width(),
-                            V::fixed_width(),
-                            K::compares_as_bytes(),
-                        );
-                        if child_index < merge_with {
-                            child_builder
-                                .push_all_except(&partial_child_accessor, Some(deleted_pair));
-                        }
-                        child_builder.push_all_except(&merge_with_accessor, None);
-                        if child_index > merge_with {
-                            child_builder
-                                .push_all_except(&partial_child_accessor, Some(deleted_pair));
-                        }
-                        if child_builder.should_split() {
-                            let met = if child_index < merge_with {
-                                partial_child_accessor.num_pairs() - 1
-                            } else {
-                                merge_with_accessor.num_pairs()
-                            };
-                            let (new_page1, split_key, new_page2) =
-                                child_builder.build_split(met, None)?;
-                            builder.push_key(signpost.get_or_init(|| split_key));
-                            builder.push_child(new_page1.get_page_number(), DEFERRED);
-                            builder.push_child(new_page2.get_page_number(), DEFERRED);
-                        } else {
-                            let new_page = child_builder.build()?;
-                            builder.push_child(new_page.get_page_number(), DEFERRED);
-                        }
-
+                        builder.push_child(joined.get_page_number(), DEFERRED);
                         let merged_key_index = max(child_index, merge_with);
                         if merged_key_index < accessor.count_children() - 1 {
                             builder.push_key(accessor.key(merged_key_index).unwrap());
@@ -958,7 +959,6 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                 result
             }
             DeletedBranch(only_grandchild, grandchild_checksum) => {
-                let merge_with = if child_index == 0 { 1 } else { child_index - 1 };
                 let merge_with_page =
                     accessor.get_child(merge_with, V::fixed_width(), &self.mem, PageHint::None)?;
                 let merge_with_accessor = BranchAccessor::new(&merge_with_page, K::fixed_width());
@@ -1019,7 +1019,6 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                 children: partial_children,
                 keys: partial_keys,
             } => {
-                let merge_with = if child_index == 0 { 1 } else { child_index - 1 };
                 let merge_with_page =
                     accessor.get_child(merge_with, V::fixed_width(), &self.mem, PageHint::None)?;
                 let merge_with_accessor = BranchAccessor::new(&merge_with_page, K::fixed_width());
@@ -1101,10 +1100,11 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
         page: PageImpl,
         checksum: Checksum,
         key: &[u8],
+        sibling: Option<(PageNumber, Checksum, bool)>,
     ) -> Result<(DeletionResult, Option<AccessGuard<'a, V>>)> {
         let node_mem = page.memory();
         match node_mem[0] {
-            LEAF => self.delete_leaf_helper(page, checksum, key),
+            LEAF => self.delete_leaf_helper(page, checksum, key, sibling),
             BRANCH => self.delete_branch_helper(page, checksum, key),
             _ => unreachable!(),
         }

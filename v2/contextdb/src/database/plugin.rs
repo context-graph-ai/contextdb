@@ -90,6 +90,8 @@ pub struct RouteStatus {
 pub struct ScheduleStatus {
     pub name: String,
     pub callback_registered: bool,
+    /// The last failure of a tick that ended no cycle: a callback not registered.
+    pub last_error: Option<String>,
 }
 /// One committed snapshot of declared events, sinks and routes.
 #[derive(Debug, Clone, serde::Serialize)]

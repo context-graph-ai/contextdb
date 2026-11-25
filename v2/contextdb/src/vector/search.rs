@@ -5,17 +5,16 @@
 
 use std::cell::Cell;
 use std::cmp::{Ordering, Reverse};
-use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{BTreeSet, BinaryHeap};
 use std::ops::Range;
 
 use super::binary::{Codes, Estimate, WIDEST, code_len, write_code};
 use super::block::{BLOCK_BYTES, BlockReader};
 use super::build::usable;
 use super::directory::{self, Grouped, Partition};
-use super::ivf::{self, Ivf, Place};
+use super::ivf::{self, Ivf, LEVELS, Place, level};
 use super::pack;
-use super::slot::{SLOT_HEADER, Screen, product, scale, slot_len, summed};
+use super::slot::{Screen, slot_len, summed};
 use super::train;
 use crate::memory::Reservation;
 use crate::schema::VectorColumn;
@@ -36,20 +35,21 @@ pub(crate) struct Nearest<'a> {
     /// The partitions to search, as key tuples or the first values of key tuples; empty for
     /// every partition of the column.
     pub scope: &'a [Key],
+    /// Whether a partition's key tuple can pass the filter; one that cannot is not selected.
+    pub matching: Option<&'a dyn Fn(&Key) -> bool>,
     /// The vector to be near: of the column's dimension, every number finite.
     pub query: &'a [f32],
     /// How many rows to return at most.
     pub k: usize,
-    /// Whether the statement has a filter on rows: one that does more than select partitions.
-    /// The filter itself is asked through `distance_of`. This says one thing more: a search
-    /// under INDEXED that runs out of binary codes to choose among is refused.
-    pub filtered: bool,
     /// Whether a rank orders the answer: a partition searched exactly then asks the distance of
     /// every live vector, and screens none.
     pub ranked: bool,
     /// The least likeness, `1 - distance`, a row may have: a slot or a binary code whose high end
     /// is below it is not kept, and short of `k` rows it stands in for the last row.
     pub bound: Option<f64>,
+    /// Whether a filter on the rows, or a state the table leaves out of every search, may pass
+    /// a row by: the build's reach then ends no walk.
+    pub filtered: bool,
 }
 
 /// One row of an answer.
@@ -79,7 +79,7 @@ pub(crate) enum Route {
 }
 
 /// What a search does with one of the partitions it selects, settled from the partition's
-/// small records before a block is read, and how far it has gone over it.
+/// small records before a block is read.
 pub(crate) struct Planned {
     /// The partition's key tuple.
     pub tuple: Key,
@@ -100,10 +100,6 @@ pub(crate) struct Planned {
     /// The record of its IVF, read when its nearest groups are searched and it has more
     /// than one group.
     ivf: Option<Ivf>,
-    /// How many of its groups the last pass took, nearest first, and how far in
-    /// ten-thousandths the next one lies past its gap: infinitely when it took them all.
-    taken: usize,
-    next: f64,
 }
 
 impl Planned {
@@ -136,7 +132,8 @@ pub(crate) fn plan(
     read: &dyn Read,
     reservation: &mut Reservation,
 ) -> Result<Vec<Planned>> {
-    let partitions = directory::selected(read, nearest.column, nearest.scope, reservation)?;
+    let mut partitions = directory::selected(read, nearest.column, nearest.scope, reservation)?;
+    partitions.retain(|(tuple, _)| nearest.matching.is_none_or(|can| can(tuple)));
     reservation.grow((partitions.len() * size_of::<Planned>()) as u64)?;
     let live: u64 = partitions.iter().map(|(_, partition)| partition.live).sum();
     let mode = match nearest.mode {
@@ -178,8 +175,6 @@ pub(crate) fn plan(
             usable,
             partition,
             ivf,
-            taken: 0,
-            next: f64::INFINITY,
         });
     }
     Ok(targets)
@@ -232,13 +227,10 @@ fn apart(nearest: f32, product: f32) -> f64 {
 }
 
 /// How many of the groups, nearest first, lie no farther from the nearest than a gap in
-/// ten-thousandths widened by `fall`, a difference of products.
-fn within(ranked: &[(u32, f32)], gap: f64, fall: f64) -> usize {
+/// ten-thousandths.
+fn within(ranked: &[(u32, f32)], gap: f64) -> usize {
     let past = |(_, product): &&(u32, f32)| apart(ranked[0].1, *product) - gap;
-    ranked
-        .iter()
-        .take_while(|group| past(group) <= fall * 10_000.0)
-        .count()
+    ranked.iter().take_while(|group| past(group) <= 0.0).count()
 }
 
 /// The first place of a block.
@@ -320,6 +312,10 @@ impl Wide {
 /// row is read. Every group is scanned. The gap is the best centroid's product with `query`
 /// less the least such product among the groups those slots are in, in ten-thousandths,
 /// rounded up and held to 20,000; zero for an IVF of no slot, which has no place to give.
+/// In the same pass one histogram counts the slots by their group and the highest level their
+/// high end reaches. Then, nearest group first, each level of `reach` is raised to the rank,
+/// from one, that holds 999 in 1,000 of the slots at least that alike, and to the rank of each
+/// such slot of the ten; and no level is left below a higher one.
 pub(super) fn gap_needed(
     read: &dyn Read,
     vector: VectorId,
@@ -327,21 +323,29 @@ pub(super) fn gap_needed(
     ivf: &Ivf,
     query: &[f32],
     reservation: &mut Reservation,
+    reach: &mut [u32; LEVELS],
 ) -> Result<(u32, Vec<Place>)> {
     let before = reservation.bytes();
-    reservation.grow(4 * query.len() as u64)?;
+    reservation.grow(4 * (query.len() + (LEVELS + 1) * grouped.groups as usize) as u64)?;
     let screen = Screen::new(query);
-    let mut ten: Vec<(f32, Place)> = Vec::with_capacity(11);
+    // Each group's row counts its slots by the highest level they reach, none at the row's start.
+    let mut counts = vec![0_u32; (LEVELS + 1) * grouped.groups as usize];
+    let mut ten: Vec<(f32, Place, usize, usize)> = Vec::with_capacity(11);
+    let (mut all, mut seen) = ([0_u64; LEVELS], [0_u64; LEVELS]);
     for block in 0..grouped.blocks {
         let record = VectorRecord::Block(vector, grouped.number, block);
         pack::with_block(read, record, query.len(), &mut |slots| {
             for slot in 0..slots.len() {
-                let kept = slots.slot(slot);
-                let scale = scale(kept);
-                let near = scale * product(&kept[SLOT_HEADER..], screen.unit());
+                let (_, high, near) = screen.range(slots.slot(slot));
+                let slot = slot as u32;
+                let place = Place { block, slot };
+                let group = ivf.starts.partition_point(|start| *start <= place) - 1;
+                let high = f64::from(high);
+                let levels = (0..LEVELS).take_while(|at| level(*at) <= high).count();
+                counts[(LEVELS + 1) * group + levels] += 1;
+                all[..levels].iter_mut().for_each(|count| *count += 1);
                 if ten.len() < 10 || near > ten[9].0 {
-                    let slot = slot as u32;
-                    ten.push((near, Place { block, slot }));
+                    ten.push((near, place, group, levels));
                     // The sort keeps slots of one product in the order of their places.
                     ten.sort_by(|one, other| other.0.total_cmp(&one.0));
                     ten.truncate(10);
@@ -352,16 +356,30 @@ pub(super) fn gap_needed(
     }
     let mut ranked = ivf::nearest(read, vector, grouped, screen.unit(), reservation, None)?;
     ranked.retain(|(group, _)| ivf.nonempty(*group));
+    for (rank, (group, _)) in (1..).zip(&ranked) {
+        let (row, mut above) = (&counts[(LEVELS + 1) * *group as usize..], 0);
+        for at in (0..LEVELS).rev() {
+            above += u64::from(row[at + 1]);
+            let of_ten = ten.iter().any(|one| one.2 == *group as usize && at < one.3);
+            if 1000 * seen[at] < 999 * all[at] || of_ten {
+                reach[at] = reach[at].max(rank);
+            }
+            seen[at] += above;
+        }
+    }
+    for at in (1..LEVELS).rev() {
+        reach[at - 1] = reach[at - 1].max(reach[at]);
+    }
     let nearest = ranked[0].1;
     let of = |place: &Place| {
         let group = ivf.starts.partition_point(|start| start <= place) - 1;
         let found = ranked.iter().find(|(number, _)| *number as usize == group);
         found.map_or(nearest, |(_, product)| *product)
     };
-    let least = ten.iter().map(|(_, place)| of(place));
+    let least = ten.iter().map(|(_, place, ..)| of(place));
     let least = least.fold(nearest, f32::min);
     reservation.shrink(reservation.bytes() - before);
-    let places = ten.into_iter().map(|(_, place)| place);
+    let places = ten.into_iter().map(|(_, place, ..)| place);
     Ok((apart(nearest, least).ceil() as u32, places.collect()))
 }
 
@@ -397,7 +415,7 @@ pub(super) fn kept_by_width(
     let mut wide = Wide::new(query, reservation)?;
     let mut ranked = ivf::nearest(read, vector, grouped, screen.unit(), reservation, None)?;
     ranked.retain(|(group, _)| ivf.nonempty(*group));
-    let inside = within(&ranked, f64::from(ivf.gap), 0.0);
+    let inside = within(&ranked, f64::from(ivf.gap));
     ranked.truncate(inside);
     ranked.sort_unstable_by_key(|(group, _)| *group);
     // Each binary code is estimated once, at the widest: its middle and a quarter of its factor
@@ -462,17 +480,19 @@ pub(super) fn kept_by_width(
 const PAIR: u64 = 96;
 const _: () = assert!(size_of::<(Order, Key)>() <= 32);
 
-/// Bytes reserved for a lower bound. A search holds at most as many as the answer has rows.
+/// Bytes reserved for a lower end. A search holds at most as many as the answer has rows.
 const LOW: u64 = 8;
+
+/// The most binary codes a walk holds at once, twelve bytes each.
+const HELD: usize = 1_024;
 
 /// The `k` nearest rows, nearest first; rows at one distance come in the order of their keys.
 ///
 /// `distance_of` is `query`'s: given a row's key it reads the row and answers with its distance
 /// from the vector of the search, or with `None` when the row is not there, does not pass the
 /// statement's filter or has no vector. This function calls it once for every row the reader
-/// has staged, once for every pending row of the selected partitions, and for the slots it
-/// could not rule out, best range first. It never returns a row `distance_of` did not give a
-/// distance for.
+/// has staged, and for the slots, pending or in blocks, it could not rule out, best range
+/// first. It never returns a row `distance_of` did not give a distance for.
 ///
 /// A row is in an answer once. Several entries can lead to one row: a row the reader has staged
 /// and the pending record or the slot of the row it replaces, or the slots of two vectors the
@@ -482,37 +502,31 @@ const LOW: u64 = 8;
 /// because it is greater than every pair the answer holds by then. An entry left by an earlier
 /// vector therefore costs one row read and changes nothing.
 ///
-/// It runs [`plan`]. Over partitions searched whole the answer is exactly the `k` least of
-/// `(distance, key)` over the rows `distance_of` gives a distance for. Of a partition searched
-/// by its nearest groups it screens the slots that the binary codes of the groups inside the
-/// IVF's gap and of the tail keep, or all of them where the IVF's width is 0.
-/// Blocks and binary codes are read in place from the page cache; everything that grows is taken
-/// from `reservation` first. When the answer is returned, `reservation` holds 32 bytes and
-/// the key's for each of its rows and nothing else of the search but what [`plan`] took.
+/// What rules a slot or a binary code out is only ever a row read and given a distance: the
+/// similarity of the last row of a full answer, or the search's bound. A slot or a binary code
+/// whose high end is below it cannot enter, and nothing is screened, estimated or asked twice.
 ///
-/// A row is turned away when `distance_of` gives no distance for it. While the answer is short
-/// of `k` rows that were not turned away, the search takes four times as many binary codes from
-/// the groups it has, then twice as many groups. When it holds `k`, it widens each gap by how
-/// far its last row lies below the `k`-th best slot screened, and keeps every binary code that
-/// reaches that row. Having kept every binary code of every group it has done the work of EXACT and
-/// returns what there is; under INDEXED with `nearest.filtered` it answers `None` at the step
-/// that would keep them all. With `None` the caller lets go of what `reservation` took.
-/// `targets` are what [`plan`] gave for `nearest`, and `reservation` holds what it took and
-/// nothing else.
+/// Over partitions searched whole the answer is exactly the `k` least of `(distance, key)` over
+/// the rows `distance_of` gives a distance for. A partition searched by its nearest groups is
+/// walked outward from its centroids, ranked once: its pending slots, its tail and its nearest
+/// group first, then one group at a time, each group's kept slots asked for before the next is
+/// taken. The walk takes the groups inside the IVF's gap, or the declared `PROBES`, and goes on
+/// past them only while the answer is short of `k` rows and its bound cut nothing; it ends at
+/// the last group. Blocks and binary codes are read in place from the page cache; everything
+/// that grows is taken from `reservation` first. When the answer is returned, `reservation`
+/// holds 32 bytes and the key's for each of its rows and nothing else of the search but what
+/// [`plan`] took. `targets` are what [`plan`] gave for `nearest`.
 ///
 /// The caller may retry index damage as EXACT with its candidate set restored.
 pub(crate) fn search(
     nearest: &Nearest<'_>,
     read: &dyn Read,
     reservation: &mut Reservation,
-    targets: &mut [Planned],
+    targets: &[Planned],
     distance_of: &mut dyn FnMut(&Key) -> Result<Option<f64>>,
-    (limit, evaluations): (Option<u64>, &Cell<u64>),
-) -> Result<Option<Outcome>> {
-    let work = Work {
-        evaluations,
-        limit: Cell::new(limit.unwrap_or(u64::MAX)),
-    };
+    (limit, evaluations): (&Cell<u64>, &Cell<u64>),
+) -> Result<Outcome> {
+    let work = Work { evaluations, limit };
     answer(nearest, read, reservation, targets, distance_of, &work)
         .inspect_err(|_| READING.set(None))
 }
@@ -522,18 +536,17 @@ fn answer(
     nearest: &Nearest<'_>,
     read: &dyn Read,
     reservation: &mut Reservation,
-    targets: &mut [Planned],
+    targets: &[Planned],
     distance_of: &mut dyn FnMut(&Key) -> Result<Option<f64>>,
     work: &Work<'_>,
-) -> Result<Option<Outcome>> {
+) -> Result<Outcome> {
     if nearest.k == 0 {
-        return Ok(Some(Outcome {
+        return Ok(Outcome {
             hits: Vec::new(),
             stopped: false,
-        }));
+        });
     }
     let before = reservation.bytes();
-    let indexed = nearest.mode == VectorSearchMode::Indexed;
     // The vector at length one that the screen keeps: four bytes a number.
     reservation.grow(4 * nearest.query.len() as u64)?;
     let screen = Screen::new(nearest.query);
@@ -552,92 +565,29 @@ fn answer(
         k: nearest.k,
         declared: nearest.column.probes,
         answer: BTreeSet::new(),
-        lows: Best::new(nearest.k),
+        lows: Default::default(),
         reservation,
         distance_of,
-        threshold: f64::NEG_INFINITY,
-        rises: true,
         kept: Kept::default(),
-        marks: BTreeMap::new(),
-
-        refused: indexed && nearest.filtered,
         ranked: nearest.ranked,
+        reaching: !nearest.ranked && !nearest.filtered && nearest.column.probes.is_none(),
         every: false,
         work,
         bound: nearest.bound.unwrap_or(f64::NEG_INFINITY),
         cut: false,
     };
 
-    // The rows that are in no block, exactly: those the reader has staged, then the pending
-    // rows of each partition, which end where the records of the next partition begin.
+    // The rows that are in no block, exactly: those the reader has staged.
     read.staged(nearest.table, &mut |key| found.score(key).map(|()| true))?;
-    // With fewer than `k` rows left to ask, the answer stays short: a search that is refused
-    // then is refused here, before any of them is asked.
-    let live: u64 = targets.iter().map(|target| target.partition.live).sum();
-    let possible = (found.answer.len() as u64).saturating_add(live);
-    if found.refused && nearest.bound.is_none() && possible < nearest.k as u64 {
-        return Ok(None);
-    }
-    let first = Key::from_values(&[], &[])?;
-    for target in &*targets {
-        let run = (nearest.vector, target.partition.number);
-        let from = VectorRecord::Pending(run.0, run.1, &first);
-        read.vectors(from, &mut |record, _| match record {
-            VectorRecord::Pending(vector, number, key) if (vector, number) == run => {
-                found.score(key).map(|()| true)
-            }
-            _ => Ok(false),
-        })?;
-    }
-
-    // The slots. A pass leaves out every slot whose `high` is below the threshold its screen
-    // ended with, and every binary code whose high end is below the one its binary codes ended with.
-    // So when the last row of a full answer is at least as similar as both, and no group left
-    // out lies within the gap widened by the fall, nothing left out could have entered.
-    // Otherwise rows were turned away or counted twice, and a further pass goes on from there.
-    let mut most = nearest.k;
-    let mut ended = found.pass(&asked, targets, &mut wide, None, None, 0.0)?;
-    loop {
+    let mut held = Vec::new();
+    for target in targets {
         if !work.fits(1) {
             break;
         }
-        // Short of `k` rows, a bound that cut something stands in for the last row.
-        let (floor, codes, fall) = match found.last().or(nearest.bound.filter(|_| found.cut)) {
-            // Short of `k` rows: four times the binary codes, and twice the groups once every
-            // binary code of the groups taken was kept.
-            None => {
-                most = most.max(ended.kept).saturating_mul(4);
-                let mut all = most as u64 >= targets.iter().map(Planned::codes).sum::<u64>();
-                for target in &mut *targets {
-                    target.taken = target.taken.saturating_mul(if ended.all { 2 } else { 1 });
-                    let ivf = target.ivf.as_ref();
-                    all &= ivf.is_none_or(|ivf| target.taken >= ivf.starts.len() - 1);
-                }
-                // A filter on rows left the index nothing to choose among: the pass in hand
-                // kept everything there is, or the next one would.
-                if found.refused && (ended.whole || all) {
-                    return Ok(None);
-                }
-                if ended.whole {
-                    break;
-                }
-                (f64::NEG_INFINITY, Some(most), 0.0)
-            }
-            Some(last) => {
-                // A row a fall below the nearest can lie in a group whose centroid is four times
-                // as far below the best centroid's: twice the angle from the vector of the
-                // search. The cover takes the groups that far out.
-                let fall = 4.0 * (found.lows.least() - last).max(0.0);
-                let nearer = |t: &Planned| found.declared.is_none() && t.next <= fall * 10_000.0;
-                let proven = last >= ended.threshold && last >= ended.codes;
-                if proven && !targets.iter().any(nearer) {
-                    break;
-                }
-                (last, None, fall)
-            }
-        };
-        ended = found.pass(&asked, targets, &mut wide, Some(floor), codes, fall)?;
+        found.walk(&asked, target, &mut wide, &mut held)?;
     }
+    READING.set(None);
+    drop(held);
 
     let pairs = found.answer.iter();
     let pairs = pairs.map(|(_, key)| PAIR + key.as_bytes().len() as u64);
@@ -645,10 +595,10 @@ fn answer(
     found.reservation.shrink(found.reservation.bytes() - held);
     let hits = found.answer.into_iter();
     let hits = hits.map(|(Order(distance), key)| Hit { key, distance });
-    Ok(Some(Outcome {
+    Ok(Outcome {
         hits: hits.collect(),
         stopped: !work.fits(1),
-    }))
+    })
 }
 
 /// A distance or a similarity where numbers are put in order. None is NaN: a distance is
@@ -676,59 +626,11 @@ impl PartialEq for Order {
 
 impl Eq for Order {}
 
-/// The greatest `most` of the numbers offered, the least of them on top.
-struct Best {
-    most: usize,
-    held: BinaryHeap<Reverse<Order>>,
-}
-
-impl Best {
-    fn new(most: usize) -> Best {
-        let held = BinaryHeap::new();
-        Best { most, held }
-    }
-
-    /// Offers a number. Eight bytes are taken for each place the list has, before it is made
-    /// again with as many more.
-    fn offer(&mut self, number: f64, reservation: &mut Reservation) -> Result<()> {
-        if self.held.len() < self.most {
-            if self.held.len() == self.held.capacity() {
-                let more = self.held.capacity().max(4).min(self.most - self.held.len());
-                reservation.grow(LOW * (self.held.len() + more) as u64)?;
-                self.held.reserve_exact(more);
-                reservation.shrink(LOW * self.held.len() as u64);
-            }
-            self.held.push(Reverse(Order(number)));
-        } else if let Some(mut least) = self.held.peek_mut()
-            && Order(number) > least.0
-        {
-            *least = Reverse(Order(number));
-        }
-        Ok(())
-    }
-
-    /// The least of `most` numbers, and nothing while there are fewer.
-    fn least(&self) -> f64 {
-        let least = self.held.peek().filter(|_| self.held.len() == self.most);
-        least.map_or(f64::NEG_INFINITY, |Reverse(Order(number))| *number)
-    }
-}
-
-/// How a pass ended: what the `high` of a slot had to reach when the screen ended and the
-/// high end of a binary code when the binary codes did; how many binary codes were kept and whether all
-/// it estimated were; and whether every binary code of every group and every slot screened was.
-struct Ended {
-    threshold: f64,
-    codes: f64,
-    kept: usize,
-    all: bool,
-    whole: bool,
-}
-
-/// What a search has found so far.
+/// The units a search has spent and the most it may: the caller may lower the most while the
+/// search runs, and the search then stops at its next unit.
 struct Work<'a> {
     evaluations: &'a Cell<u64>,
-    limit: Cell<u64>,
+    limit: &'a Cell<u64>,
 }
 impl Work<'_> {
     fn fits(&self, count: u64) -> bool {
@@ -740,52 +642,71 @@ impl Work<'_> {
     }
 }
 
+/// What a search has found so far.
 struct Found<'a> {
     k: usize,
     declared: Option<u32>,
     /// The answer so far: the `k` least pairs of distance and key among the rows scored.
     answer: BTreeSet<(Order, Key)>,
-    /// The `k` greatest similarities proven so far to be reached by a row or by a slot's
-    /// vector. With `k` of them, a slot whose `high` is below the least cannot be among the
-    /// `k` nearest of the vectors seen.
-    lows: Best,
     reservation: &'a mut Reservation,
     distance_of: &'a mut dyn FnMut(&Key) -> Result<Option<f64>>,
-    /// What the `high` of a slot must reach in the pass in hand, and whether that rises with
-    /// the lower bounds, as it does in the first pass alone.
-    threshold: f64,
-    rises: bool,
-    /// The slots the pass in hand keeps.
+    /// The `k` greatest lower ends of the rows read and the slots screened, whose fall to the
+    /// answer's last row widens the gap in the proof; and of the binary codes estimated, below
+    /// which, and below the last row, a code is dropped, as its ends are calibrated, not proven.
+    lows: [BinaryHeap<Reverse<Order>>; 2],
+    /// The slots screened and not yet asked for.
     kept: Kept,
-    /// One bit a slot of each block an earlier pass kept a slot of, by the number the block
-    /// is kept under and its own: set for the slots those passes kept, which are not screened
-    /// and whose rows are not asked for again.
-    marks: BTreeMap<(u32, u32), Vec<u64>>,
     work: &'a Work<'a>,
-
-    /// Whether the search is refused when it runs out of binary codes to choose among: the mode
-    /// is INDEXED and the statement has a filter on rows.
-    refused: bool,
     /// Whether a rank orders the answer, and whether every slot of the partition in hand
     /// has its row's distance asked for without screening.
     ranked: bool,
     every: bool,
+    /// Whether the build's reach may end the walk: no rank, no filter on the rows and no
+    /// declared PROBES.
+    reaching: bool,
     /// The least likeness a row may have, and whether it has cut a row, a slot or a binary code.
     bound: f64,
     cut: bool,
 }
 
 impl Found<'_> {
-    /// Asks for the distance of one row and offers it to the answer, and its similarity to
-    /// the lower bounds when the answer took it.
+    /// Asks for the distance of one row and offers it to the answer.
     fn score(&mut self, key: &Key) -> Result<()> {
         if self.work.fits(1)
             && let Some(distance) = (self.distance_of)(key)?
             && self.offer(distance, key)?
         {
-            self.lows.offer(1.0 - distance, self.reservation)?;
+            self.low(0, 1.0 - distance)?;
         }
         Ok(())
+    }
+
+    /// Offers a lower end to one list, keeping the `k` greatest.
+    fn low(&mut self, list: usize, low: f64) -> Result<()> {
+        let lows = &mut self.lows[list];
+        if lows.len() < self.k {
+            self.reservation.grow(LOW)?;
+            lows.push(Reverse(Order(low)));
+        } else if let Some(mut least) = lows.peek_mut()
+            && Order(low) > least.0
+        {
+            *least = Reverse(Order(low));
+        }
+        Ok(())
+    }
+
+    /// The least of one list's `k` lower ends, and nothing while there are fewer.
+    fn least(&self, list: usize) -> Option<f64> {
+        let lows = &self.lows[list];
+        let least = lows.peek().filter(|_| lows.len() == self.k);
+        least.map(|Reverse(Order(low))| *low)
+    }
+
+    /// How far below the `k`-th greatest lower end the last row of the answer, or the bound
+    /// that stands for it, lies: four times that, as a product, is how far behind the nearest
+    /// group a group can lie and hold a nearer row.
+    fn fall(&self, last: f64) -> f64 {
+        4.0 * (self.least(0).unwrap_or(last) - last).max(0.0)
     }
 
     /// Offers a row to the answer and says whether it went in. This is the one way in, and
@@ -821,49 +742,78 @@ impl Found<'_> {
         last.map(|(Order(distance), _)| 1.0 - distance)
     }
 
-    /// Screens one slot of a block kept under `number`, unless an earlier pass kept it. The
-    /// slot is kept, with its `high`, its place and a copy of its key, unless its `high` is
-    /// below the threshold, and then offers its `low` to the lower bounds.
-    fn look(
-        &mut self,
-        asked: &Asked<'_>,
-        number: u32,
-        at: Place,
-        block: &BlockReader<'_>,
-    ) -> Result<()> {
-        let slot = at.slot as usize;
-        if block.key(slot).as_bytes().is_empty() {
-            return Ok(());
-        }
-        let bits = self.marks.get(&(number, at.block));
-        let word = bits.and_then(|bits| bits.get(slot / 64));
-        if word.is_some_and(|word| word >> (slot % 64) & 1 == 1) {
+    /// What the high end of a slot or a binary code must reach: proven by rows read.
+    fn floor(&self) -> f64 {
+        self.last().unwrap_or(f64::NEG_INFINITY).max(self.bound)
+    }
+
+    /// Whether a high end is below the floor, noting a cut by the bound.
+    fn below(&mut self, high: f32) -> bool {
+        self.cut |= f64::from(high) < self.bound;
+        f64::from(high) < self.floor()
+    }
+
+    /// Screens one slot, of a block or of a pending record, and keeps it with a copy of its
+    /// key unless its `high` is below the floor.
+    fn look(&mut self, asked: &Asked<'_>, slot: &[u8], key: &Key) -> Result<()> {
+        if key.as_bytes().is_empty() {
             return Ok(());
         }
         if self.every {
-            self.score(&block.key(slot))?;
-            return self.mark(number, at, asked.dimension);
+            return self.score(key);
         }
         if !self.work.fits(1) {
             return Ok(());
         }
         asked.count.map(|c| c(1)).transpose()?;
-        let (low, high) = asked.screen.range(block.slot(slot));
-        if f64::from(high) < self.threshold.max(self.bound) {
-            self.cut |= f64::from(high) < self.bound;
+        let (low, high, _) = asked.screen.range(slot);
+        if self.below(high) {
             return Ok(());
         }
-        let key = block.key(slot);
-        self.kept
-            .keep(high, (number, at), &key, self.threshold, self.reservation)?;
-        self.lows.offer(f64::from(low), self.reservation)?;
-        if self.rises {
-            self.threshold = self.lows.least();
+        self.low(0, f64::from(low))?;
+        // The list never holds more than one batch: a full one is asked for first.
+        if self.kept.slots.len() == HELD {
+            self.verify()?;
         }
+        self.kept.keep(high, key, self.reservation)
+    }
+
+    /// Asks for the rows of the kept slots, best `high` first, while a `high` reaches the
+    /// floor, and empties the list.
+    fn verify(&mut self) -> Result<()> {
+        self.ask(usize::MAX)
+    }
+
+    /// Asks for the rows of at most `most` kept slots, best `high` first, while a `high` reaches
+    /// the floor; keeps the rest of a list cut short by `most`, else empties it.
+    fn ask(&mut self, most: usize) -> Result<()> {
+        let mut kept = std::mem::take(&mut self.kept);
+        let by_high = |a: &Slot, b: &Slot| b.high.total_cmp(&a.high).then(a.start.cmp(&b.start));
+        kept.slots.sort_unstable_by(by_high);
+        let mut asked = 0;
+        for slot in &kept.slots {
+            if f64::from(slot.high) < self.floor() || !self.work.fits(1) {
+                asked = kept.slots.len();
+                break;
+            }
+            if asked == most {
+                break;
+            }
+            self.score(&Key::from_bytes(
+                &kept.keys[slot.start..][..slot.len as usize],
+            ))?;
+            asked += 1;
+        }
+        match asked < kept.slots.len() {
+            true => kept.forget(asked),
+            false => kept.clear(),
+        }
+        self.kept = kept;
         Ok(())
     }
 
-    /// Screens every slot from one place up to another of the blocks kept under `number`.
+    /// Screens every slot from one place up to another of the blocks kept under `number`, and
+    /// asks for the rows of each block's kept slots.
     fn between(&mut self, asked: &Asked<'_>, number: u32, places: Range<Place>) -> Result<()> {
         if places.start >= places.end {
             return Ok(());
@@ -877,11 +827,12 @@ impl Found<'_> {
             let record = VectorRecord::Block(asked.vector, number, at);
             pack::with_block(asked.read, record, asked.dimension, &mut |block| {
                 for slot in part(&places, at, block.len()) {
-                    let slot = slot as u32;
-                    self.look(asked, number, Place { block: at, slot }, block)?;
+                    self.look(asked, block.slot(slot), &block.key(slot))?;
                 }
                 Ok(())
             })?;
+            // A block's kept slots are asked for before the next block is read.
+            self.verify()?;
             if !self.work.fits(1) {
                 break;
             }
@@ -889,30 +840,50 @@ impl Found<'_> {
         Ok(())
     }
 
-    /// Screens the slots of the binary codes kept among the blocks under `number`, and those
-    /// only, and empties the list. A block is read here for the first time, so here its
-    /// binary codes are found to be one for each of its slots, or damage.
-    fn screen_kept(
+    /// Holds a binary code unless its high end is below the floor; a full list is screened
+    /// first.
+    fn code(
         &mut self,
         asked: &Asked<'_>,
-        p: &Partition,
-        n: u32,
-        chosen: &mut Chosen,
+        at: (&Partition, u32),
+        held: &mut Vec<(f32, Place)>,
+        place: Place,
+        (low, high): (f32, f32),
     ) -> Result<()> {
-        let threshold = chosen.threshold();
-        chosen
-            .held
-            .retain(|(high, _)| f64::from(*high) >= threshold);
-        chosen.kept += chosen.held.len();
-        for places in chosen
-            .held
-            .chunk_by(|one, next| one.1.block == next.1.block)
-        {
+        let floor = self.last().unwrap_or(f64::NEG_INFINITY);
+        let floor = floor
+            .min(self.least(1).unwrap_or(f64::NEG_INFINITY))
+            .max(self.bound);
+        self.cut |= f64::from(high) < self.bound;
+        if f64::from(high) < floor {
+            return Ok(());
+        }
+        self.low(1, f64::from(low))?;
+        if held.len() == HELD {
+            self.screen_held(asked, at, held)?;
+        }
+        self.reservation.room(held, HELD)?;
+        held.push((high, place));
+        Ok(())
+    }
+
+    /// Screens the slots of the binary codes held among the blocks under `number`, and those
+    /// only, and empties the list. A block is read here for the first time, so here its
+    /// binary codes are found to be one for each of its slots, or damage.
+    fn screen_held(
+        &mut self,
+        asked: &Asked<'_>,
+        (p, n): (&Partition, u32),
+        held: &mut Vec<(f32, Place)>,
+    ) -> Result<()> {
+        for places in held.chunk_by(|one, next| one.1.block == next.1.block) {
             let record = VectorRecord::Block(asked.vector, n, places[0].1.block);
             let mut look = |b: &BlockReader<'_>| {
-                places
-                    .iter()
-                    .try_for_each(|(_, at)| self.look(asked, n, *at, b))
+                let mut each = |(_, at): &(f32, Place)| {
+                    let slot = at.slot as usize;
+                    self.look(asked, b.slot(slot), &b.key(slot))
+                };
+                places.iter().try_for_each(&mut each)
             };
             pack::companions(
                 asked.read,
@@ -923,301 +894,143 @@ impl Found<'_> {
                 &mut look,
             )?;
         }
-        chosen.held.clear();
+        held.clear();
         Ok(())
     }
 
-    /// Marks a slot already visited, charging its block's bits before allocation.
-    fn mark(&mut self, number: u32, at: Place, dimension: usize) -> Result<()> {
-        let words = (BLOCK_BYTES / slot_len(dimension)).div_ceil(64).max(1);
-        let bits = match self.marks.entry((number, at.block)) {
-            Entry::Occupied(bits) => bits.into_mut(),
-            Entry::Vacant(none) => {
-                // The bits of the block, and 64 bytes for its place in the list.
-                self.reservation.grow(8 * words as u64 + 64)?;
-                none.insert(vec![0_u64; words])
-            }
-        };
-        if let Some(word) = bits.get_mut(at.slot as usize / 64) {
-            *word |= 1 << (at.slot % 64);
-        }
-        Ok(())
-    }
-
-    /// One pass over the slots of the partitions, and the visit of the slots it keeps.
-    ///
-    /// A slot is kept unless its `high` is below the threshold. With no `floor` the threshold
-    /// is the least of `k` lower bounds and rises as kept slots offer their `low`; with one
-    /// it is the floor throughout. Kept slots are visited by `high`, greatest first, and the
-    /// visit ends at the first whose `high` is below the similarity of the last row of a full
-    /// answer: neither it nor any after it can enter, while one that equals it may, on its key.
-    ///
-    /// Every slot of a partition searched whole is screened. Of one searched by its nearest
-    /// groups: the slots of its tail and of the groups within its gap and `fall` of the
-    /// nearest, and of as many groups as it was told to take. Where the IVF has a width
-    /// those slots are first chosen by their binary codes: with no `floor`, every binary code whose
-    /// high end reaches the `k`-th best low end so far; with `most`, the `most` with the best
-    /// high ends; else every one whose high end reaches the floor. The slots the pass before
-    /// kept are marked first, and none of them is screened, or its row asked for, again.
-    fn pass(
+    /// The slots between two places of the blocks under `number`: screened by their binary
+    /// codes around `base` where the IVF has a width, else each one.
+    fn span(
         &mut self,
         asked: &Asked<'_>,
-        targets: &mut [Planned],
-        wide: &mut Option<Wide>,
-        floor: Option<f64>,
-        most: Option<usize>,
-        fall: f64,
-    ) -> Result<Ended> {
-        for at in 0..self.kept.slots.len() {
-            let slot = &self.kept.slots[at];
-            self.mark(slot.number, slot.at, asked.dimension)?;
-        }
-        self.kept.clear();
-        self.threshold = floor.unwrap_or_else(|| self.lows.least());
-        self.rises = floor.is_none();
-        let mut chosen = Chosen {
-            ends: Best::new(most.unwrap_or(self.k)),
-            by_high: most.is_some(),
-            fixed: floor.filter(|_| most.is_none()),
-            held: Vec::new(),
-            room: 0,
-            estimated: 0,
-            kept: 0,
-            bound: self.bound,
-            cut: false,
-        };
-        for target in targets.iter_mut() {
-            if !self.work.fits(1) {
-                break;
-            }
-            let partition = target.partition;
-            READING.set(partition.ivf.map(|grouped| (asked.vector, grouped.number)));
-            self.every = (self.ranked && target.route == Route::Exact)
-                || (!self.refused && partition.ivf.is_none() && target.live <= self.k as u64);
-            let tail = first_of(partition.first)..first_of(partition.blocks);
-            let (Some(ivf), Some(grouped)) = (&target.ivf, partition.ivf) else {
-                if let Some(grouped) = partition.ivf {
-                    let every = Place::default()..first_of(grouped.blocks);
-                    self.between(asked, grouped.number, every)?;
-                }
-                self.between(asked, partition.number, tail)?;
-                continue;
-            };
-            let unit = asked.screen.unit();
-            if !self.work.fits(u64::from(grouped.groups)) {
-                break;
-            }
-            let mut ranked = ivf::nearest(
-                asked.read,
-                asked.vector,
-                grouped,
-                unit,
-                self.reservation,
-                asked.count,
-            )?;
-            ranked.retain(|(group, _)| ivf.nonempty(*group));
-            if ranked.is_empty() {
-                self.between(asked, partition.number, tail)?;
-                target.next = f64::INFINITY;
-                continue;
-            }
-            let (nearest, gap) = (ranked[0].1, f64::from(ivf.gap));
-            let take = self
-                .declared
-                .map_or_else(|| within(&ranked, gap, fall), |n| n as usize)
-                .max(target.taken)
-                .min(ranked.len());
-            let next = ranked
-                .get(take)
-                .map(|(_, product)| apart(nearest, *product) - gap);
-            (target.taken, target.next) = (take, next.unwrap_or(f64::INFINITY));
-            ranked.truncate(take);
-            ranked.sort_unstable_by_key(|(group, _)| *group);
-            let spans = ranked.iter().map(|(group, base)| {
-                let group = *group as usize;
-                (ivf.starts[group]..ivf.starts[group + 1], *base)
-            });
-            match (ivf.width, wide.as_mut()) {
-                (0, _) | (_, None) => {
-                    for (places, _) in spans {
-                        self.between(asked, grouped.number, places)?;
-                    }
-                    self.between(asked, partition.number, tail)?;
-                }
-                (width, Some(wide)) => {
-                    if !self.work.fits(1) {
-                        self.reservation.shrink(8 * u64::from(grouped.groups));
-                        break;
-                    }
-                    let (read, vector, n) = (asked.read, asked.vector, asked.dimension);
-                    let mean = {
-                        let mean = ivf::mean(read, vector, grouped.number, n, self.reservation)?;
-                        asked.count.map(|c| c(1)).transpose()?;
-                        summed(&mean, unit, |number| number)
-                    };
-                    self.reservation.shrink(4 * n as u64);
-
-                    let each =
-                        &mut |place, low, high| chosen.offer(place, low, high, self.reservation);
-                    for (places, base) in spans {
-                        wide.span(
-                            asked,
-                            grouped.number,
-                            places,
-                            (base, width),
-                            each,
-                            Some(self.work),
-                        )?;
-                    }
-                    self.screen_kept(asked, &partition, grouped.number, &mut chosen)?;
-                    // A tail's binary codes are held against the low end the groups left, as the
-                    // build measured them: none of them raises it for the next.
-                    let rising = chosen.fixed.is_none() && !chosen.by_high;
-                    if rising {
-                        chosen.fixed = Some(chosen.threshold());
-                    }
-                    let each =
-                        &mut |place, low, high| chosen.offer(place, low, high, self.reservation);
-                    wide.span(
-                        asked,
-                        partition.number,
-                        tail,
-                        (mean, width),
-                        each,
-                        Some(self.work),
-                    )?;
-                    self.screen_kept(asked, &partition, partition.number, &mut chosen)?;
-                    if rising {
-                        chosen.fixed = None;
-                    }
-                }
-            }
-            self.reservation.shrink(8 * u64::from(grouped.groups));
-        }
-        READING.set(None);
-        let every = targets.iter().all(|target| target.next == f64::INFINITY);
-        let all = chosen.kept == chosen.estimated;
-        self.cut |= chosen.cut;
-        let ended = Ended {
-            threshold: self.threshold,
-            codes: chosen.threshold(),
-            kept: chosen.kept,
-            all,
-            whole: all && every && self.threshold == f64::NEG_INFINITY && !self.cut,
-        };
-        // The lists of the binary codes are let go before their bytes are given back.
-        let places = chosen.ends.held.capacity() as u64;
-        let chosen_bytes = (chosen.room * size_of::<(f32, Place)>()) as u64;
-        drop(chosen);
-        self.reservation.shrink(LOW * places + chosen_bytes);
-        // The pass kept every slot there is and the answer cannot reach `k` rows: a search with
-        // no bound that is refused then is refused here, before the filter is asked of every row.
-        if !self.work.fits(1) || (ended.whole && self.refused && self.bound == f64::NEG_INFINITY) {
-            return Ok(ended);
-        }
-
-        self.kept.drop_below(self.threshold);
-        let by_high = |a: &Slot, b: &Slot| b.high.total_cmp(&a.high).then(a.start.cmp(&b.start));
-        self.kept.slots.sort_unstable_by(by_high);
-        let kept = std::mem::take(&mut self.kept);
-        for slot in &kept.slots {
-            if self.last().is_some_and(|last| f64::from(slot.high) < last) {
-                break;
-            }
-            // The slot's low end is among the lower bounds already: its row's similarity is
-            // not offered beside it, or one row would count twice and the fall never be zero.
-            let key = Key::from_bytes(&kept.keys[slot.start..][..slot.len as usize]);
-            if self.work.fits(1)
-                && let Some(distance) = (self.distance_of)(&key)?
-            {
-                self.offer(distance, &key)?;
-            }
-        }
-        self.kept = kept;
-        Ok(ended)
-    }
-}
-
-/// The binary codes one pass keeps: the high end of each and its place, in the order of the
-/// places, twelve bytes each.
-struct Chosen {
-    /// With no fixed threshold: the `k` best low ends so far, or the best high ends so far
-    /// of a pass that keeps the binary codes with the best high ends.
-    ends: Best,
-    by_high: bool,
-    /// What a high end must reach in a pass that keeps every binary code reaching one similarity.
-    fixed: Option<f64>,
-    held: Vec<(f32, Place)>,
-    /// How many binary codes the reservation holds room for.
-    room: usize,
-    /// How many binary codes were offered, and how many of them were kept in the end.
-    estimated: usize,
-    kept: usize,
-    /// The search's bound, and whether it cut a binary code.
-    bound: f64,
-    cut: bool,
-}
-
-impl Chosen {
-    /// What the high end of a binary code must reach to stay in the running.
-    fn threshold(&self) -> f64 {
-        self.fixed.unwrap_or(self.ends.least()).max(self.bound)
-    }
-
-    /// Offers the range of one binary code. It is kept unless its high end is below the
-    /// threshold; when the list is full, those now below the threshold are dropped first.
-    fn offer(
-        &mut self,
-        place: Place,
-        low: f32,
-        high: f32,
-        reservation: &mut Reservation,
+        (p, number): (&Partition, u32),
+        places: Range<Place>,
+        (base, width): (f32, u8),
+        (wide, held): (&mut Option<Wide>, &mut Vec<(f32, Place)>),
     ) -> Result<()> {
-        self.estimated += 1;
-        let threshold = self.threshold();
-        if f64::from(high) < threshold {
-            self.cut |= f64::from(high) < self.bound;
+        let Some(wide) = wide.as_mut().filter(|_| width != 0) else {
+            return self.between(asked, number, places);
+        };
+        let work = self.work;
+        let each = &mut |place, low, high| self.code(asked, (p, number), held, place, (low, high));
+        wide.span(asked, number, places, (base, width), each, Some(work))?;
+        self.screen_held(asked, (p, number), held)
+    }
+
+    /// Walks one partition: its pending slots, then every slot of a partition searched whole,
+    /// or, outward from its nearest centroid, its tail and its groups.
+    fn walk(
+        &mut self,
+        asked: &Asked<'_>,
+        target: &Planned,
+        wide: &mut Option<Wide>,
+        held: &mut Vec<(f32, Place)>,
+    ) -> Result<()> {
+        let p = &target.partition;
+        READING.set(p.ivf.map(|grouped| (asked.vector, grouped.number)));
+        self.every = (self.ranked && target.route == Route::Exact)
+            || (p.ivf.is_none() && target.live <= self.k as u64);
+        let (first, run) = (Key::from_values(&[], &[])?, (asked.vector, p.number));
+        let from = VectorRecord::Pending(run.0, run.1, &first);
+        asked.read.vectors(from, &mut |record, slot| match record {
+            VectorRecord::Pending(vector, number, key) if (vector, number) == run => {
+                if slot.len() != slot_len(asked.dimension) {
+                    return Err(asked.read.damaged("a pending record is not a slot"));
+                }
+                self.look(asked, slot, key).map(|()| true)
+            }
+            _ => Ok(false),
+        })?;
+        let tail = first_of(p.first)..first_of(p.blocks);
+        let (Some(ivf), Some(grouped)) = (&target.ivf, p.ivf) else {
+            if let Some(grouped) = p.ivf {
+                self.between(
+                    asked,
+                    grouped.number,
+                    Place::default()..first_of(grouped.blocks),
+                )?;
+            }
+            self.between(asked, p.number, tail)?;
+            return self.verify();
+        };
+        if !self.work.fits(u64::from(grouped.groups)) {
             return Ok(());
         }
-        if self.held.len() == self.room {
-            self.held.retain(|(high, _)| f64::from(*high) >= threshold);
-            widen(&mut self.held, &mut self.room, reservation)?;
+        let (unit, n) = (asked.screen.unit(), asked.dimension);
+        let mut ranked = ivf::nearest(
+            asked.read,
+            asked.vector,
+            grouped,
+            unit,
+            self.reservation,
+            asked.count,
+        )?;
+        ranked.retain(|(group, _)| ivf.nonempty(*group));
+        let width = if wide.is_some() { ivf.width } else { 0 };
+        let mean = if width == 0 {
+            0.0
+        } else {
+            let mean = ivf::mean(
+                asked.read,
+                asked.vector,
+                grouped.number,
+                n,
+                self.reservation,
+            )?;
+            asked.count.map(|c| c(1)).transpose()?;
+            self.reservation.shrink(4 * n as u64);
+            summed(&mean, unit, |number| number)
+        };
+        // The tail's binary codes are held against the mean, as the build measured them.
+        self.span(asked, (p, p.number), tail, (mean, width), (wide, held))?;
+        let cover = self
+            .declared
+            .map_or_else(|| within(&ranked, f64::from(ivf.gap)), |n| n as usize);
+        let nearest = ranked.first().map_or(0.0, |(_, product)| *product);
+        for (at, (group, base)) in ranked.iter().enumerate() {
+            // The proof: the answer is full, or short with a bound that cut, and no group left
+            // out lies within the gap widened by the fall; a declared PROBES is not widened.
+            let last = self.last().or(Some(self.bound).filter(|_| self.cut));
+            let past = |last| apart(nearest, *base) - f64::from(ivf.gap) > self.fall(last) * 1e4;
+            let proven = last.is_some_and(|last| self.declared.is_some() || past(last));
+            // Or, short of the cover, by the build's reach at the cutoff's level; never under a
+            // bound that has cut nothing.
+            let open = self.reaching && at < cover && (self.cut || self.bound == f64::NEG_INFINITY);
+            let reach = last.filter(|_| open).and_then(|last| ivf.reach_at(last));
+            if !self.work.fits(1) || at >= cover && proven || reach.is_some_and(|r| at >= r) {
+                break;
+            }
+            let group = *group as usize;
+            let places = ivf.starts[group]..ivf.starts[group + 1];
+            self.span(
+                asked,
+                (p, grouped.number),
+                places,
+                (*base, width),
+                (wide, held),
+            )?;
+            // The best `k` set the answer's last row for the next group's proof and reach; the
+            // rest wait, so a row a nearer group would push out is not read now.
+            self.ask(self.k)?;
         }
-        self.held.push((high, place));
-        if self.fixed.is_none() {
-            let end = if self.by_high { high } else { low };
-            self.ends.offer(f64::from(end), reservation)?;
-        }
-        Ok(())
+        self.reservation.shrink(8 * u64::from(grouped.groups));
+        self.verify()
     }
 }
 
-/// Makes room in a list that is full after it dropped what it could: for 1,024 entries at
-/// first, and for as many again only if more than half are left.
-fn widen<T>(list: &mut Vec<T>, room: &mut usize, reservation: &mut Reservation) -> Result<()> {
-    reservation.room(list, usize::MAX)?;
-    *room = list.capacity();
-    Ok(())
-}
-
-/// A slot still in the running: the top of its range, the number its block is kept under,
-/// its place, and where its key is in [`Kept::keys`].
+/// A slot still in the running: the top of its range and where its key is in [`Kept::keys`].
 struct Slot {
     high: f32,
-    number: u32,
-    at: Place,
     len: u32,
     start: usize,
 }
-
 /// The slots still in the running.
 #[derive(Default)]
 struct Kept {
     slots: Vec<Slot>,
     /// The keys of the slots, one after another.
     keys: Vec<u8>,
-    /// How many slots, and how many bytes of keys, the reservation holds room for.
-    room: usize,
+    /// How many bytes of keys the reservation holds room for.
     key_room: usize,
 }
 
@@ -1228,20 +1041,22 @@ impl Kept {
         self.keys.clear();
     }
 
-    /// Adds a slot. When the list is full, the slots now below the threshold are dropped
-    /// first.
-    fn keep(
-        &mut self,
-        high: f32,
-        (number, at): (u32, Place),
-        key: &Key,
-        threshold: f64,
-        reservation: &mut Reservation,
-    ) -> Result<()> {
-        if self.slots.len() == self.room {
-            self.drop_below(threshold);
-            widen(&mut self.slots, &mut self.room, reservation)?;
+    /// Drops the first `n` slots and their keys, moving the other keys down in place.
+    fn forget(&mut self, n: usize) {
+        self.slots.drain(..n);
+        self.slots.sort_unstable_by_key(|slot| slot.start);
+        let mut end = 0;
+        for slot in &mut self.slots {
+            let len = slot.len as usize;
+            self.keys.copy_within(slot.start..slot.start + len, end);
+            (slot.start, end) = (end, end + len);
         }
+        self.keys.truncate(end);
+    }
+
+    /// Adds a slot to a list that holds fewer than `HELD`.
+    fn keep(&mut self, high: f32, key: &Key, reservation: &mut Reservation) -> Result<()> {
+        reservation.room(&mut self.slots, HELD)?;
         let key = key.as_bytes();
         let start = self.keys.len();
         if start + key.len() > self.key_room {
@@ -1254,30 +1069,7 @@ impl Kept {
         self.keys.extend_from_slice(key);
         // The key is out of a block, where four bytes say where it ends: its length fits.
         let len = key.len() as u32;
-        self.slots.push(Slot {
-            high,
-            number,
-            at,
-            len,
-            start,
-        });
+        self.slots.push(Slot { high, len, start });
         Ok(())
-    }
-
-    /// Drops the slots whose `high` is below the threshold and closes the gaps their keys
-    /// leave. The slots are in the order they were kept in, the order their keys lie in, so
-    /// a key that stays only ever moves towards the start.
-    fn drop_below(&mut self, threshold: f64) {
-        let (keys, mut end) = (&mut self.keys, 0);
-        self.slots.retain_mut(|slot| {
-            let stays = f64::from(slot.high) >= threshold;
-            if stays {
-                keys.copy_within(slot.start..slot.start + slot.len as usize, end);
-                slot.start = end;
-                end += slot.len as usize;
-            }
-            stays
-        });
-        keys.truncate(end);
     }
 }

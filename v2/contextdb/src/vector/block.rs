@@ -6,7 +6,7 @@
 //! another. Every number is low byte first. The slots come first and are of one length, so a
 //! search strides over them without reading a key.
 
-use super::slot::{slot_len, write_slot};
+use super::slot::slot_len;
 use crate::store::Key;
 
 /// The most bytes a block is written with: 64 less than 256 KiB. The storage library keeps a
@@ -37,7 +37,6 @@ pub(super) fn takes(dimension: usize, bytes: usize, keys: &[Key]) -> (usize, usi
 
 /// A block being put together.
 pub(super) struct BlockWriter {
-    dimension: usize,
     slots: Vec<u8>,
     ends: Vec<u32>,
     keys: Vec<u8>,
@@ -57,12 +56,7 @@ impl BlockWriter {
         slots.extend_from_slice(&block[NUMBER..reader.ends_at()]);
         ends.extend((0..reader.len()).map(|at| reader.end(at) as u32));
         keys.extend_from_slice(&block[reader.keys_at()..]);
-        let writer = BlockWriter {
-            dimension,
-            slots,
-            ends,
-            keys,
-        };
+        let writer = BlockWriter { slots, ends, keys };
         (writer, count)
     }
 
@@ -72,12 +66,11 @@ impl BlockWriter {
     }
 
     /// Adds the slot of `vector` and the key of its row.
+    #[cfg(test)]
     pub(super) fn push(&mut self, key: &Key, vector: &[f32]) {
-        let at = self.slots.len();
-        self.slots.resize(at + slot_len(self.dimension), 0);
-        write_slot(vector, &mut self.slots[at..]);
-        self.keys.extend_from_slice(key.as_bytes());
-        self.ends.push(self.keys.len() as u32);
+        let mut slot = vec![0; slot_len(vector.len())];
+        super::slot::write_slot(vector, &mut slot);
+        self.push_slot(key, &slot);
     }
 
     /// Adds a slot as it was written for another block, with the key of its row.

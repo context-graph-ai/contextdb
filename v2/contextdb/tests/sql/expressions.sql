@@ -107,6 +107,12 @@ SELECT 7 / 2 AS whole, 7 * 0.5 AS mixed, 1.5 - 1 AS real, NULL + 1 AS unknown;
 whole | mixed | real | unknown  (read 0, compared 0)
 3 | 3.5 | 0.5 | NULL
 
+# `%` is the remainder of whole numbers, binds as `*` does and takes the dividend's sign, as in Postgres.
+SELECT 7 % 3 AS r, -7 % 3 AS neg, 7 % -3 AS pos, 1 + 7 % 3 * 2 AS bound, NULL % 2 AS unknown;
+----
+r | neg | pos | bound | unknown  (read 0, compared 0)
+1 | -1 | 1 | 3 | NULL
+
 # What does not fit a column, divides by zero or adds a number to text is refused, never wrapped.
 SELECT 9223372036854775807 + 1;
 ----
@@ -117,6 +123,14 @@ SELECT (-9223372036854775807 - 1) * -1;
 error: PlanError
 
 SELECT 7 / 0;
+----
+error: PlanError
+
+SELECT 7 % 0;
+----
+error: PlanError
+
+SELECT 7.5 % 2;
 ----
 error: PlanError
 

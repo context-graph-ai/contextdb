@@ -189,14 +189,15 @@ fn subquery(pair: Pair<'_>) -> Result<Box<Select>> {
     select(pair).map(Box::new)
 }
 
-/// `left <op> right` as a call of `__add`, `__sub`, `__mul` or `__div`. A chain of operators
+/// `left <op> right` as a call of `__add`, `__sub`, `__mul`, `__div` or `__mod`. A chain of operators
 /// builds a tree one deeper per operator, so its depth is checked as it grows.
 fn arithmetic(op: &str, left: Expr, right: Expr) -> Result<Expr> {
     let name = match op {
         "+" => "__add",
         "-" => "__sub",
         "*" => "__mul",
-        _ => "__div",
+        "/" => "__div",
+        _ => "__mod",
     };
     within_limit(Expr::FunctionCall {
         name: name.to_owned(),
@@ -204,11 +205,11 @@ fn arithmetic(op: &str, left: Expr, right: Expr) -> Result<Expr> {
     })
 }
 
-/// `[-] primary {+ | - | * | / [-] primary}`, read left to right with `*` and `/` binding
+/// `[-] primary {+ | - | * | / | % [-] primary}`, read left to right with `*`, `/` and `%` binding
 /// tighter; a rank formula's sum the same way.
 pub(super) fn additive_expr(pair: Pair<'_>) -> Result<Expr> {
     // `sum` is everything before the last `+` or `-`, with that operator; `product` is the run
-    // of `*` and `/` being read, with the operator that waits for its right side.
+    // of `*`, `/` and `%` being read, with the operator that waits for its right side.
     let mut sum: Option<(Expr, &str)> = None;
     let mut product: Option<(Expr, &str)> = None;
     let mut minuses = 0;
@@ -218,7 +219,7 @@ pub(super) fn additive_expr(pair: Pair<'_>) -> Result<Expr> {
             Rule::math_op | Rule::formula_op => {
                 let (operand, _) = product.take().expect("an operand before an operator");
                 let op = part.as_str();
-                if op == "*" || op == "/" {
+                if matches!(op, "*" | "/" | "%") {
                     product = Some((operand, op));
                 } else {
                     let total = match sum.take() {

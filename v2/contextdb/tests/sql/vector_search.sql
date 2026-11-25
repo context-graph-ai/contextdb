@@ -27,14 +27,14 @@ id | v  (read 4, compared 0)
 # The vector searched from is a literal or its quoted text.
 SELECT id FROM points ORDER BY v <=> [1.0, 0.0, 0.0, 0.0] LIMIT 3;
 ----
-id  (read 10, compared 7)
+id  (read 6, compared 10)
 1
 2
 5
 
 SELECT id FROM points ORDER BY v <=> '[1,0,0,0]' LIMIT 3;
 ----
-id  (read 10, compared 7)
+id  (read 6, compared 10)
 1
 2
 5
@@ -54,7 +54,7 @@ id | distance  (read 14, compared 7)
 
 SELECT id, v <=> '[1,0,0,0]' AS distance FROM points ORDER BY v <=> '[1,0,0,0]' LIMIT 4;
 ----
-id | distance  (read 11, compared 7)
+id | distance  (read 10, compared 13)
 1 | 0.0
 2 | 0.0
 5 | *
@@ -62,7 +62,7 @@ id | distance  (read 11, compared 7)
 
 SELECT id, v <=> '[1,0,0,0]' AS distance FROM points ORDER BY v <=> '[1,0,0,0]' ASC LIMIT 4;
 ----
-id | distance  (read 11, compared 7)
+id | distance  (read 10, compared 13)
 1 | 0.0
 2 | 0.0
 5 | *
@@ -83,7 +83,7 @@ id | similarity  (read 14, compared 7)
 # A distance with no name is called what any unnamed expression is called.
 SELECT id, v <=> '[1,0,0,0]' FROM points ORDER BY v <=> '[1,0,0,0]' LIMIT 2;
 ----
-id | ?column?  (read 9, compared 7)
+id | ?column?  (read 4, compared 9)
 1 | 0.0
 2 | 0.0
 
@@ -91,13 +91,13 @@ id | ?column?  (read 9, compared 7)
 # SELECT * and none from a list that does not write one.
 SELECT * FROM points ORDER BY v <=> '[1,0,0,0]' LIMIT 2;
 ----
-id | tag | v  (read 9, compared 7)
+id | tag | v  (read 4, compared 9)
 1 | red | [1.0, 0.0, 0.0, 0.0]
 2 | red | [2.0, 0.0, 0.0, 0.0]
 
 SELECT id, tag FROM points ORDER BY v <=> '[1,0,0,0]' LIMIT 2;
 ----
-id | tag  (read 9, compared 7)
+id | tag  (read 4, compared 9)
 1 | red
 2 | red
 
@@ -105,7 +105,7 @@ id | tag  (read 9, compared 7)
 # distance from or to a vector of all zeros is 1 as well.
 SELECT id, v <=> [0.0, 0.0, 0.0, 1.0] AS distance FROM points ORDER BY distance LIMIT 4;
 ----
-id | distance  (read 11, compared 7)
+id | distance  (read 11, compared 14)
 1 | 1.0
 2 | 1.0
 3 | 1.0
@@ -113,7 +113,7 @@ id | distance  (read 11, compared 7)
 
 SELECT id, v <=> [0.0, 0.0, 0.0, 0.0] AS distance FROM points ORDER BY distance LIMIT 2;
 ----
-id | distance  (read 9, compared 7)
+id | distance  (read 9, compared 14)
 1 | 1.0
 2 | 1.0
 
@@ -138,7 +138,7 @@ id  (read 0, compared 0)
 # nearest. The two nearest rows of the table are red.
 SELECT id, v <=> '[1,0,0,0]' AS distance FROM points WHERE tag = 'blue' ORDER BY distance LIMIT 2;
 ----
-id | distance  (read 9, compared 3)
+id | distance  (read 8, compared 9)
 3 | 1.0
 7 | 1.0
 
@@ -150,7 +150,7 @@ id | distance  (read 7, compared 2)
 
 SELECT id FROM points WHERE tag = 'green' ORDER BY v <=> '[1,0,0,0]' LIMIT 5;
 ----
-id  (read 7, compared 0)
+id  (read 7, compared 7)
 
 # Two VECTOR columns of one table, each of its own dimension, are searched each by its own name.
 # Row 4 has a vector in one of them only.
@@ -295,7 +295,7 @@ id  (read 5, compared 0)
 # distance (rows 1 and 2 are both 0); between two columns.
 SELECT id FROM points WHERE v <=> '[1,0,0,0]' < 1.5 ORDER BY v <=> '[1,0,0,0]' LIMIT 4;
 ----
-id  (read 11, compared 7)
+id  (read 10, compared 13)
 1
 2
 5
@@ -310,7 +310,7 @@ id | distance  (read 3, compared 0)
 
 SELECT id FROM points ORDER BY v <=> '[1,0,0,0]', id DESC LIMIT 1;
 ----
-id  (read 22, compared 7)
+id  (read 17, compared 9)
 2
 
 CREATE TABLE pairs (id INTEGER PRIMARY KEY, a VECTOR(2), b VECTOR(2));
@@ -380,7 +380,7 @@ error: VectorIndexDimensionMismatch
 CREATE INDEX points_tag ON points (tag);
 SELECT id FROM points WHERE tag = 'blue' ORDER BY v <=> [1.0, 0.0, 0.0, 0.0] LIMIT 2;
 ----
-id  (read 9, compared 3)
+id  (read 6, compared 3)
 3
 7
 

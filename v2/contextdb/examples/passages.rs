@@ -73,7 +73,7 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use contextdb::serde_json::Value as Json;
-use contextdb::{Database, Uuid, Value, params};
+use contextdb::{Database, DatabaseOpenOptions, Maintenance, Uuid, Value, params};
 use support::{
     AUTO, Asked, EXACT, Fallible, INDEXED, READER_LIMIT, Values, against, ask, counted, line,
     mebibytes, peak_resident_bytes, ratio, seconds, session, setting, spread, timed, times,
@@ -253,7 +253,9 @@ impl<'a> Case<'a> {
 /// Opens a new store with Context Graph's table, its vector column declared `with` this
 /// quantization clause and with these clauses after `SEARCH_MODE AUTO`.
 fn create(store: &Path, with: &str, clauses: &str) -> Fallible<Database> {
-    let db = Database::open(store)?;
+    let mut options = DatabaseOpenOptions::default();
+    options.maintenance = Maintenance::Caller;
+    let db = Database::open_with_options(store, options)?;
     db.execute(
         &format!(
             "CREATE TABLE event_search_passages (

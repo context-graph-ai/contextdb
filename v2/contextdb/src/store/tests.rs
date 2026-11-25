@@ -333,13 +333,10 @@ fn fresh_folder(name: &str) -> PathBuf {
 /// no memory limit, so that a value the store compresses is compressed, and closes it.
 fn store_row(folder: &Path, cells: Vec<Cell>, reduced: Vec<Compact>) {
     let (table, row_key) = the_row();
-    let budget = Budget::new(None).expect("a budget");
-    let store = Store::open_for_writing(folder, &budget, &DatabaseOpenOptions::default())
-        .expect("open a fresh store");
-    let mut changes = ChangeSet::new(store.view().expect("a view"), &budget).expect("begin");
-    let staged = changes.put_row(table, row_key, cells, reduced, true);
-    staged.expect("stage");
-    store.commit(changes).expect("commit");
+    commit_staged(folder, |changes| {
+        let staged = changes.put_row(table, row_key, cells, reduced, true);
+        staged.expect("stage");
+    });
 }
 
 /// Writes a store of one row, the number 1 and then `value`.
@@ -384,11 +381,17 @@ fn entries(read: &dyn Read, index: IndexId) -> Result<Vec<(Key, Key, Option<usiz
         .and_then(|entries| entries.collect())
 }
 
-/// Opens the store in this folder under no memory limit and runs `read` on its newest moment.
-fn on_the_newest_moment<T>(folder: &Path, read: impl FnOnce(&dyn Read, &mut Passing) -> T) -> T {
+/// The store in this folder, opened for writing under no memory limit, with its budget.
+fn opened(folder: &Path) -> (Store, Budget) {
     let budget = Budget::new(None).expect("a budget");
     let store = Store::open_for_writing(folder, &budget, &DatabaseOpenOptions::default())
         .expect("open the store");
+    (store, budget)
+}
+
+/// Opens the store in this folder under no memory limit and runs `read` on its newest moment.
+fn on_the_newest_moment<T>(folder: &Path, read: impl FnOnce(&dyn Read, &mut Passing) -> T) -> T {
+    let (store, budget) = opened(folder);
     let view = store.view().expect("a view");
     let mut cover = budget.passing("query").expect("a cover");
     read(&view, &mut cover)
@@ -399,9 +402,7 @@ fn try_commit(
     folder: &Path,
     stage: impl FnOnce(&mut ChangeSet) -> Result<()>,
 ) -> Result<crate::types::TxId> {
-    let budget = Budget::new(None).expect("a budget");
-    let store = Store::open_for_writing(folder, &budget, &DatabaseOpenOptions::default())
-        .expect("open the store");
+    let (store, budget) = opened(folder);
     let mut changes = ChangeSet::new(store.view().expect("a view"), &budget).expect("begin");
     stage(&mut changes)?;
     store.commit(changes)
@@ -1065,9 +1066,7 @@ fn read(folder: &Path, sound: Sound, room: Option<u64>) -> Result<()> {
         let db = crate::Database::open(folder)?;
         return db.verify().map(drop);
     }
-    let budget = Budget::new(None).expect("a budget");
-    let store = Store::open_for_writing(folder, &budget, &DatabaseOpenOptions::default())
-        .expect("open the store");
+    let (store, budget) = opened(folder);
     budget.set_limit(room.map(|room| budget.used() + room))?;
     let view = store.view().expect("a view");
     let (table, row_key) = the_row();
@@ -1265,9 +1264,7 @@ fn each_pinned_commit_is_charged_its_roots_and_given_back_when_pruned() {
     const LEN: usize = 300_000;
     const PINS: usize = 3;
     let folder = fresh_folder("pin-charge");
-    let budget = Budget::new(None).expect("a budget");
-    let store = Store::open_for_writing(&folder, &budget, &DatabaseOpenOptions::default())
-        .expect("open a fresh store");
+    let (store, budget) = opened(&folder);
     let (table, row_key) = the_row();
     let put = |n: i64| {
         let view = store.view().expect("a view");
@@ -1403,10 +1400,44 @@ fn a_range_read_from_the_far_end_is_the_forward_read_reversed_on_the_file_and_in
         check(read, cover, "file", [400, 299, 0])
     });
     // The transaction's own rows lie between the file's.
-    let budget = Budget::new(None).unwrap();
-    let store = Store::open_for_writing(&folder, &budget, &DatabaseOpenOptions::default()).unwrap();
+    let (store, budget) = opened(&folder);
     let mut changes = ChangeSet::new(store.view().unwrap(), &budget).unwrap();
     (1..800).step_by(2).for_each(|n| put(&mut changes, n));
     let mut cover = budget.passing("query").unwrap();
     check(&changes, &mut cover, "transaction", [800, 598, 0]);
+}
+
+#[test]
+fn the_space_file_keeps_its_retry_and_the_partitions_that_fit_past_a_mebibyte() {
+    let folder = fresh_folder("space-past-a-mebibyte");
+    // 2^20 refused partitions of 16 bytes each pass 1 MiB, and the file's limit too.
+    let full: Vec<_> = (0..1 << 20)
+        .map(|n| (VectorId(n), n, u64::from(n)))
+        .collect();
+    let (store, _budget) = opened(&folder);
+    store.remember(|space| (space.retry, space.full) = (((1, 2), 3, true), full.clone()));
+    let read = super::Space::read(&folder);
+    assert_eq!(read.retry, ((1, 2), 3, true), "the retry is never dropped");
+    assert!(read.full.len() > 1 << 16 && full.starts_with(&read.full));
+}
+
+#[test]
+fn a_batch_with_no_allowance_left_keeps_the_mark_of_the_slices_it_reaches() {
+    let folder = fresh_folder("slices-past-the-allowance");
+    drop(opened(&folder));
+    // Owed slices 0..1022 leave a batch of 1,024 one for the next mark, which reads it.
+    tamper(&folder, BESIDE, |t| {
+        (0..1024).for_each(|n| drop(t.insert(n, &[][..]).unwrap()))
+    });
+    let vectors = redb::TableDefinition::new("vectors");
+    for (from, to) in [(0u64, 1022u64), (1022, 1024)] {
+        let mark = [&[super::OWED, super::drop::SLICES][..], &from.to_be_bytes()].concat();
+        write_record(&folder, vectors, &mark, &to.to_le_bytes());
+    }
+    for _ in 0..2 {
+        commit_staged(&folder, |c| c.reclaim = Some(Default::default()));
+    }
+    tamper(&folder, BESIDE, |t| {
+        assert_eq!(t.iter().unwrap().count(), 0, "no slice orphaned")
+    });
 }

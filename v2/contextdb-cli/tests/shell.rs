@@ -22,6 +22,20 @@ struct Run {
 }
 
 impl Run {
+    /// This run, asserted to have exited 0, with its error stream as the reason when it did not.
+    fn ok(self) -> Self {
+        assert_eq!(self.code, Some(0), "{}", self.stderr);
+        self
+    }
+
+    /// The documents of the error stream that report a refused statement.
+    fn refusals(&self) -> Vec<Json> {
+        let documents = documents(&self.stderr).into_iter();
+        documents
+            .filter(|document| document.get("error").is_some())
+            .collect()
+    }
+
     /// The lines of the error stream that report a refused statement to a person.
     fn errors(&self) -> Vec<&str> {
         self.stderr
@@ -39,6 +53,13 @@ fn folder(test: &str) -> PathBuf {
     }
     std::fs::create_dir_all(&folder).unwrap();
     folder
+}
+
+/// An empty folder of this test's own, and the path of a store in it.
+fn folder_with_store(test: &str) -> (PathBuf, PathBuf) {
+    let dir = folder(test);
+    let store = dir.join("store");
+    (dir, store)
 }
 
 /// Runs `contextdb` in `dir` with these arguments and this text piped to its standard input.
@@ -99,6 +120,11 @@ fn interrupt(child: &std::process::Child) -> bool {
 /// A path as a command-line argument.
 fn arg(path: &Path) -> &str {
     path.to_str().unwrap()
+}
+
+/// Runs one statement on `db`, which must succeed.
+fn run_sql(db: &Database, sql: &str) {
+    db.execute(sql, &params! {}).unwrap();
 }
 
 /// A read shell over `store`.
@@ -203,8 +229,7 @@ const TWO_NOTES: &str = "\
 
 #[test]
 fn reading_a_missing_store_is_refused_and_creates_nothing() {
-    let dir = folder("reading-a-missing-store");
-    let store = dir.join("store");
+    let (dir, store) = folder_with_store("reading-a-missing-store");
 
     let run = run_read(&dir, &store, SELECT_NOTES);
     assert_eq!(run.code, Some(1), "{}", run.stderr);
@@ -273,8 +298,7 @@ fn reading_a_missing_store_is_refused_and_creates_nothing() {
 
 #[test]
 fn write_creates_a_missing_store() {
-    let dir = folder("write-creates-a-missing-store");
-    let store = dir.join("store");
+    let (dir, store) = folder_with_store("write-creates-a-missing-store");
 
     let insert = "INSERT INTO notes (id, body) VALUES (1, 'first');\n";
     let run = run_write(&dir, &store, format!("{CREATE_NOTES}{insert}"));
@@ -292,8 +316,7 @@ fn write_creates_a_missing_store() {
     );
 
     // It was a whole read-write session: the next shell reads what it wrote.
-    let run = run_read(&dir, &store, SELECT_NOTES);
-    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let run = run_read(&dir, &store, SELECT_NOTES).ok();
     assert_eq!(run.stdout, ONE_NOTE);
 
     // On a store that is there, --write opens it and keeps what it holds.
@@ -303,7 +326,7 @@ fn write_creates_a_missing_store() {
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert!(run.stdout.contains(TWO_NOTES), "{}", run.stdout);
     let events = "CREATE EVENT TYPE changed WHEN UPDATE ON notes;\nCREATE SINK audit TYPE callback;\nCREATE ROUTE r EVENT changed TO audit;\nUPDATE notes SET body = 'changed' WHERE id = 2;\nUPDATE notes SET body = 'second' WHERE id = 2;\n";
-    assert_eq!(run_write(&dir, &store, events).code, Some(0));
+    run_write(&dir, &store, events).ok();
     let mut writer = Some(Database::open(&store).unwrap());
     let inspect = r#"inspect key store --table notes --key-json {"column":"id","value":{"Int64":1}} --column body --json"#;
     let read = "store --json";
@@ -473,8 +496,7 @@ fn write_creates_a_missing_store() {
 
 #[test]
 fn purge_table_names_one_table_and_nothing_else() {
-    let dir = folder("purge-table-names-one-table");
-    let store = dir.join("store");
+    let (dir, store) = folder_with_store("purge-table-names-one-table");
     let setup = "CREATE TABLE other (id INTEGER PRIMARY KEY);\nINSERT INTO other (id) VALUES (1);\nINSERT INTO notes (id, body) VALUES (1, 'a'), (2, 'b');\n";
     run_write(&dir, &store, format!("{CREATE_NOTES}{setup}"));
     // --table is one table's name: a list or a WHERE is refused and purges nothing.
@@ -503,8 +525,7 @@ fn purge_table_names_one_table_and_nothing_else() {
 
 #[test]
 fn a_removed_option_is_refused_by_name_with_exit_2_before_the_store_opens() {
-    let dir = folder("a-removed-option-is-refused");
-    let store = dir.join("store");
+    let (dir, store) = folder_with_store("a-removed-option-is-refused");
     let removed = [
         ["--read-owner-connect-ms", "1000"],
         ["--read-owner-routing-retry-ms", "1000"],
@@ -575,17 +596,16 @@ fn a_removed_option_is_refused_by_name_with_exit_2_before_the_store_opens() {
 #[test]
 fn a_folder_named_like_a_command_opens_when_written_as_a_path() {
     let dir = folder("a-folder-named-like-a-command");
-    let made = shell(
+    shell(
         &dir,
         &["./server", "--write"],
         "CREATE TABLE notes (id INTEGER PRIMARY KEY);\nINSERT INTO notes (id) VALUES (7);\n",
-    );
-    assert_eq!(made.code, Some(0), "{}", made.stderr);
+    )
+    .ok();
     assert!(dir.join("server").is_dir());
 
     // Written as a path, the folder is the store.
-    let as_path = shell(&dir, &["./server"], "SELECT id FROM notes;\n");
-    assert_eq!(as_path.code, Some(0), "{}", as_path.stderr);
+    let as_path = shell(&dir, &["./server"], "SELECT id FROM notes;\n").ok();
     assert_eq!(
         as_path.stdout,
         "+----+\n| id |\n+----+\n| 7  |\n+----+\n(1 row)\n"
@@ -605,8 +625,7 @@ fn a_folder_named_like_a_command_opens_when_written_as_a_path() {
 
 #[test]
 fn piped_statements_all_run_and_a_refused_one_fails_the_run() {
-    let dir = folder("piped-statements-all-run");
-    let store = dir.join("store");
+    let (dir, store) = folder_with_store("piped-statements-all-run");
     let input = "\
 CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);
 .tables
@@ -675,8 +694,7 @@ SELECT COUNT(*) AS n FROM notes;
     assert!(stopped.stderr.contains("line 1"));
 
     // A run in which every statement succeeded exits 0 and prints its results and nothing else.
-    let run = run_read(&dir, &store, SELECT_NOTES);
-    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let run = run_read(&dir, &store, SELECT_NOTES).ok();
     assert_eq!(run.stdout, TWO_NOTES);
     // At the end of piped input a last statement with no `;` is run, as psql runs it.
     let run = run_read(&dir, &store, SELECT_NOTES.trim_end().trim_end_matches(';'));
@@ -740,8 +758,7 @@ SELECT COUNT(*) AS n FROM notes;
 
 #[test]
 fn json_prints_one_document_per_statement_with_columns_in_declared_order() {
-    let dir = folder("json-prints-one-document-per-statement");
-    let store = dir.join("store");
+    let (dir, store) = folder_with_store("json-prints-one-document-per-statement");
     let input = "\
 CREATE TABLE notes (id INTEGER PRIMARY KEY, zeta TEXT, alpha TEXT);
 INSERT INTO notes (id, zeta, alpha) VALUES (1, 'z1', 'a1'), (2, 'z2', NULL);
@@ -788,10 +805,7 @@ UPDATE jobs SET st = 'draft' WHERE id = 1;
     assert!(at("zeta") < at("id") && at("id") < at("alpha"), "{rows}");
 
     // The refused statement is a document too, on the error stream.
-    let refusals: Vec<Json> = documents(&run.stderr)
-        .into_iter()
-        .filter(|document| document.get("error").is_some())
-        .collect();
+    let refusals = run.refusals();
     assert_eq!(refusals.len(), 2, "{}", run.stderr);
     assert_eq!(refusals[0]["error"]["class"], "sql");
     assert_eq!(refusals[1]["error"]["class"], "sql");
@@ -803,11 +817,9 @@ UPDATE jobs SET st = 'draft' WHERE id = 1;
 
 #[test]
 fn a_read_shell_refuses_a_write_by_name() {
-    let dir = folder("a-read-shell-refuses-a-write");
-    let store = dir.join("store");
+    let (dir, store) = folder_with_store("a-read-shell-refuses-a-write");
     let insert = "INSERT INTO notes (id, body) VALUES (1, 'first');\n";
-    let made = run_write(&dir, &store, format!("{CREATE_NOTES}{insert}"));
-    assert_eq!(made.code, Some(0), "{}", made.stderr);
+    run_write(&dir, &store, format!("{CREATE_NOTES}{insert}")).ok();
 
     let writes = "\
 INSERT INTO notes (id, body) VALUES (2, 'second');
@@ -832,10 +844,7 @@ BEGIN;
     // A program reads the refusal's kind.
     let run = run_json(&dir, &store, writes);
     assert_eq!(run.code, Some(1));
-    let refusals: Vec<Json> = documents(&run.stderr)
-        .into_iter()
-        .filter(|document| document.get("error").is_some())
-        .collect();
+    let refusals = run.refusals();
     assert_eq!(refusals.len(), 5, "{}", run.stderr);
     for refusal in &refusals {
         assert_eq!(
@@ -845,8 +854,7 @@ BEGIN;
     }
 
     // Nothing was written: one row, one table.
-    let run = run_json(&dir, &store, format!("{SELECT_NOTES}.tables\n"));
-    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let run = run_json(&dir, &store, format!("{SELECT_NOTES}.tables\n")).ok();
     let results = documents(&run.stdout);
     assert_eq!(
         results[0]["result"]["rows"],
@@ -857,58 +865,40 @@ BEGIN;
 
 #[test]
 fn a_read_shell_answers_while_a_writer_holds_the_store() {
-    let dir = folder("a-read-shell-answers-while-a-writer-holds");
-    let store = dir.join("store");
+    let (dir, store) = folder_with_store("a-read-shell-answers-while-a-writer-holds");
 
     // This test is the writer, and holds the store until the end.
     let writer = Database::open(&store).unwrap();
-    writer
-        .execute(
-            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
-            &params! {},
-        )
-        .unwrap();
-    writer
-        .execute(
-            "INSERT INTO notes (id, body) VALUES (1, 'first')",
-            &params! {},
-        )
-        .unwrap();
+    run_sql(
+        &writer,
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
+    );
+    run_sql(&writer, "INSERT INTO notes (id, body) VALUES (1, 'first')");
 
     // The same for a similarity search: from [1, 0, 0] row 1 is at distance 1 and row 2 at 2.
     for sql in [
         "CREATE TABLE passages (id INTEGER PRIMARY KEY, embedding VECTOR(3))",
         "INSERT INTO passages (id, embedding) VALUES (1, [0.0, 1.0, 0.0]), (2, [-1.0, 0.0, 0.0])",
     ] {
-        writer.execute(sql, &params! {}).unwrap();
+        run_sql(&writer, sql);
     }
     let search = "SELECT id, embedding <=> [1.0, 0.0, 0.0] AS distance FROM passages \
                   ORDER BY distance LIMIT 2;\n";
 
     // A read shell needs nothing from the writer and answers.
-    let run = run_read(&dir, &store, SELECT_NOTES);
-    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let run = run_read(&dir, &store, SELECT_NOTES).ok();
     assert_eq!(run.stdout, ONE_NOTE);
-    let run = run_read(&dir, &store, search);
-    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let run = run_read(&dir, &store, search).ok();
     assert_eq!(nearest(&tables(&run.stdout)[0]), [(1, 1.0), (2, 2.0)]);
 
     // The writer was not held up by it, and the next read shell reads its next commit, in which
     // row 3 is the nearest.
-    writer
-        .execute(
-            "INSERT INTO passages (id, embedding) VALUES (3, [1.0, 0.0, 0.0])",
-            &params! {},
-        )
-        .unwrap();
-    writer
-        .execute(
-            "INSERT INTO notes (id, body) VALUES (2, 'second')",
-            &params! {},
-        )
-        .unwrap();
-    let run = run_read(&dir, &store, SELECT_NOTES);
-    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    run_sql(
+        &writer,
+        "INSERT INTO passages (id, embedding) VALUES (3, [1.0, 0.0, 0.0])",
+    );
+    run_sql(&writer, "INSERT INTO notes (id, body) VALUES (2, 'second')");
+    let run = run_read(&dir, &store, SELECT_NOTES).ok();
     assert_eq!(run.stdout, TWO_NOTES);
     let run = run_read(&dir, &store, search);
     assert_eq!(
@@ -980,8 +970,7 @@ fn a_read_shell_answers_while_a_writer_holds_the_store() {
 
 #[test]
 fn begin_commit_and_rollback_run_a_transaction() {
-    let dir = folder("begin-commit-and-rollback");
-    let store = dir.join("store");
+    let (dir, store) = folder_with_store("begin-commit-and-rollback");
     let input = "\
 CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);
 BEGIN;
@@ -996,8 +985,7 @@ WITH n AS (SELECT id FROM notes) SELECT id FROM n ORDER BY id;
 ROLLBACK;
 SELECT id, body FROM notes ORDER BY id;
 ";
-    let run = run_write(&dir, &store, input);
-    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let run = run_write(&dir, &store, input).ok();
     assert_eq!(run.errors(), Vec::<&str>::new());
 
     // Inside the second transaction its own changes are read, by a WITH as by a SELECT (M6);
@@ -1015,8 +1003,7 @@ SELECT id, body FROM notes ORDER BY id;
     assert!(seen_inside < seen_after);
 
     // The committed transaction reached the store, and the rolled-back one never did.
-    let run = run_read(&dir, &store, SELECT_NOTES);
-    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let run = run_read(&dir, &store, SELECT_NOTES).ok();
     assert_eq!(run.stdout, TWO_NOTES);
 
     // As in Postgres, BEGIN inside a transaction and COMMIT or ROLLBACK outside one each warn on
@@ -1025,8 +1012,8 @@ SELECT id, body FROM notes ORDER BY id;
         &dir,
         &store,
         "BEGIN;\nBEGIN;\nCOMMIT;\nCOMMIT;\nROLLBACK;\n",
-    );
-    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    )
+    .ok();
     let warnings: Vec<&str> = run
         .stderr
         .lines()
@@ -1046,8 +1033,7 @@ SELECT id, body FROM notes ORDER BY id;
 
 #[test]
 fn tables_and_schema_print_what_was_declared() {
-    let dir = folder("tables-and-schema");
-    let store = dir.join("store");
+    let (dir, store) = folder_with_store("tables-and-schema");
     // What `.schema notes` prints: the declaration as SQL. A column with no rule prints its name
     // and type alone, and nothing the author did not write is printed: no index behind the key
     // or the unique rules, no table option.
@@ -1062,12 +1048,10 @@ CREATE TABLE notes (
 );
 ";
     let authors = "CREATE TABLE authors (id UUID PRIMARY KEY, name TEXT);\n";
-    let made = run_write(&dir, &store, format!("{notes}{authors}"));
-    assert_eq!(made.code, Some(0), "{}", made.stderr);
+    run_write(&dir, &store, format!("{notes}{authors}")).ok();
 
     // `.tables` lists the names in order, one a line.
-    let tables = run_read(&dir, &store, ".tables\n");
-    assert_eq!(tables.code, Some(0), "{}", tables.stderr);
+    let tables = run_read(&dir, &store, ".tables\n").ok();
     let names: Vec<&str> = tables
         .stdout
         .lines()
@@ -1075,8 +1059,7 @@ CREATE TABLE notes (
         .collect();
     assert_eq!(names, ["authors", "notes"], "{}", tables.stdout);
 
-    let schema = run_read(&dir, &store, ".schema notes\n");
-    assert_eq!(schema.code, Some(0), "{}", schema.stderr);
+    let schema = run_read(&dir, &store, ".schema notes\n").ok();
     assert_eq!(schema.stdout, notes);
 
     // Each command has a short spelling that prints the same.
@@ -1085,8 +1068,7 @@ CREATE TABLE notes (
 
     // What `.schema` printed declares the same table again in another store.
     let copy = dir.join("copy");
-    let made = run_write(&dir, &copy, &schema.stdout);
-    assert_eq!(made.code, Some(0), "{}", made.stderr);
+    run_write(&dir, &copy, &schema.stdout).ok();
     assert_eq!(run_read(&dir, &copy, ".schema notes\n").stdout, notes);
 
     // A command used wrongly prints how it is used, never that it is unknown.
@@ -1156,14 +1138,12 @@ CREATE TABLE notes (
 
 #[test]
 fn the_memory_limit_option_is_the_sessions_ceiling() {
-    let dir = folder("the-memory-limit-option");
-    let store = dir.join("store");
+    let (dir, store) = folder_with_store("the-memory-limit-option");
 
     // The option is the ceiling the session reports, in bytes, with K, M and G as powers of
     // 1024; without it a writer is under the default, a quarter of the machine's memory.
     let limit = |args: &[&str]| {
-        let run = shell(&dir, args, "SHOW MEMORY_LIMIT;\n");
-        assert_eq!(run.code, Some(0), "{}", run.stderr);
+        let run = shell(&dir, args, "SHOW MEMORY_LIMIT;\n").ok();
         documents(&run.stdout)[0]["result"]["rows"][0]["limit"].clone()
     };
     let default = limit(&[arg(&store), "--write", "--json"]);
@@ -1177,8 +1157,7 @@ fn the_memory_limit_option_is_the_sessions_ceiling() {
         (&[arg(&store), "--write", "--json"][..], true),
         (&[arg(&store), "--json"], false),
     ] {
-        let run = shell(&dir, args, "SHOW MEMORY_LIMIT;\n");
-        assert_eq!(run.code, Some(0), "{}", run.stderr);
+        let run = shell(&dir, args, "SHOW MEMORY_LIMIT;\n").ok();
         let expected = if writer {
             opening::opening_charge(&store, None)
         } else {
@@ -1209,8 +1188,7 @@ fn the_memory_limit_option_is_the_sessions_ceiling() {
         "startup_ceiling",
         "ceiling_refresh_failures",
     ];
-    let run = run_json(&dir, &store, "SHOW MEMORY_LIMIT;\n");
-    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let run = run_json(&dir, &store, "SHOW MEMORY_LIMIT;\n").ok();
     assert_eq!(
         documents(&run.stdout)[0]["result"]["columns"],
         json!(columns)
@@ -1235,12 +1213,10 @@ fn the_memory_limit_option_is_the_sessions_ceiling() {
     // 64 rows of one mebibyte each, written with no ceiling.
     let big = dir.join("big");
     let writer = Database::open(&big).unwrap();
-    writer
-        .execute(
-            "CREATE TABLE blobs (id INTEGER PRIMARY KEY, body TEXT)",
-            &params! {},
-        )
-        .unwrap();
+    run_sql(
+        &writer,
+        "CREATE TABLE blobs (id INTEGER PRIMARY KEY, body TEXT)",
+    );
     for id in 1..=64_i64 {
         let body = format!("{id:08}").repeat(131_072);
         writer
@@ -1262,10 +1238,7 @@ fn the_memory_limit_option_is_the_sessions_ceiling() {
         args.extend_from_slice(mode);
         let run = shell(&dir, &args, statements);
         assert_eq!(run.code, Some(1), "{mode:?}: {}", run.stderr);
-        let refusals: Vec<Json> = documents(&run.stderr)
-            .into_iter()
-            .filter(|document| document.get("error").is_some())
-            .collect();
+        let refusals = run.refusals();
         assert_eq!(refusals.len(), 1, "{mode:?}: {}", run.stderr);
         let error = &refusals[0]["error"];
         assert_eq!(error["class"], "io", "{mode:?}: {error}");
@@ -1290,6 +1263,16 @@ fn the_memory_limit_option_is_the_sessions_ceiling() {
             "{mode:?}"
         );
     }
+    let args = [
+        arg(&big),
+        "--json",
+        "--read-memory",
+        "16M",
+        "--read-result-bytes",
+        "1073741824",
+    ];
+    let said = shell(&dir, &args, statements).stderr;
+    assert!(said.contains("; raise it with --read-memory"), "{said}");
     let run = shell(&dir, &[arg(&big), "--json", "--write"], statements);
     assert!(
         run.code == Some(1)
@@ -1303,8 +1286,7 @@ fn the_memory_limit_option_is_the_sessions_ceiling() {
 
 #[test]
 fn a_similarity_search_runs_through_the_program() {
-    let dir = folder("a-similarity-search-runs");
-    let store = dir.join("store");
+    let (dir, store) = folder_with_store("a-similarity-search-runs");
     // From [1, 0, 0] row 1 is at distance 0, row 5 between 0 and 1, row 2 at 1 and row 3 at 2.
     // Row 4 has no vector.
     let declare = "\
@@ -1322,8 +1304,7 @@ VALUES (1, 'a', [1.0, 0.0, 0.0]), (2, 'a', [0.0, 1.0, 0.0]), (3, 'b', [-1.0, 0.0
     let rows = "SELECT id, v FROM t ORDER BY id;\n";
 
     // Declared, written and searched in one piped write session.
-    let run = run_write(&dir, &store, format!("{declare}{search}{rows}"));
-    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let run = run_write(&dir, &store, format!("{declare}{search}{rows}")).ok();
     assert_eq!(run.errors(), Vec::<&str>::new());
     let printed = tables(&run.stdout);
     assert_eq!(printed.len(), 2, "{}", run.stdout);
@@ -1348,8 +1329,7 @@ VALUES (1, 'a', [1.0, 0.0, 0.0]), (2, 'a', [0.0, 1.0, 0.0]), (3, 'b', [-1.0, 0.0
     assert_eq!(printed[1][5], ["5", "[0.1, 0.2, 0.3]"], "{}", run.stdout);
 
     // For a program the distance is a number, a vector an array of numbers and no vector null.
-    let run = run_json(&dir, &store, format!("{search}{rows}"));
-    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let run = run_json(&dir, &store, format!("{search}{rows}")).ok();
     let results = documents(&run.stdout);
     assert_eq!(results.len(), 2, "{}", run.stdout);
     assert_eq!(results[0]["result"]["columns"], json!(["id", "distance"]));
@@ -1379,8 +1359,7 @@ VALUES (1, 'a', [1.0, 0.0, 0.0]), (2, 'a', [0.0, 1.0, 0.0]), (3, 'b', [-1.0, 0.0
 
     // `.schema` prints the VECTOR column with its clauses in the order they are declared in,
     // and with the limit of 256 partitions that a key declared without one has.
-    let schema = run_read(&dir, &store, ".schema t\n");
-    assert_eq!(schema.code, Some(0), "{}", schema.stderr);
+    let schema = run_read(&dir, &store, ".schema t\n").ok();
     let words = schema
         .stdout
         .split_whitespace()
@@ -1394,22 +1373,20 @@ VALUES (1, 'a', [1.0, 0.0, 0.0]), (2, 'a', [0.0, 1.0, 0.0]), (3, 'b', [-1.0, 0.0
 
     // What it printed declares the same table again in another store.
     let copy = dir.join("copy");
-    let made = run_write(&dir, &copy, &schema.stdout);
-    assert_eq!(made.code, Some(0), "{}", made.stderr);
+    run_write(&dir, &copy, &schema.stdout).ok();
     assert_eq!(run_read(&dir, &copy, ".schema t\n").stdout, schema.stdout);
 }
 
 #[test]
 fn an_indexed_search_runs_through_the_program() {
-    let dir = folder("an-indexed-search-runs");
-    let store = dir.join("store");
-    let made = run_write(
+    let (dir, store) = folder_with_store("an-indexed-search-runs");
+    run_write(
         &dir,
         &store,
         "CREATE TABLE passages (id INTEGER PRIMARY KEY, embedding VECTOR(3));\n\
          INSERT INTO passages (id, embedding) VALUES (1, [0.0, 1.0, 0.0]), (2, [1.0, 0.0, 0.0]);\n",
-    );
-    assert_eq!(made.code, Some(0), "{}", made.stderr);
+    )
+    .ok();
 
     // The same search asked for INDEXED and then for EXACT: no maintenance cycle has grouped
     // these rows, so INDEXED searches every one of them and both give the same table.
@@ -1445,13 +1422,13 @@ fn an_indexed_search_runs_through_the_program() {
     // Two vectors outside any IVF under INDEXING_THRESHOLD 1: the index is behind its writes,
     // and INDEXED is refused by name rather than answered as an exact scan.
     let behind = dir.join("behind");
-    let made = run_write(
+    run_write(
         &dir,
         &behind,
         "CREATE TABLE behind (id INTEGER PRIMARY KEY, v VECTOR(3) INDEXING_THRESHOLD 1);\n\
          INSERT INTO behind (id, v) VALUES (1, [1.0, 0.0, 0.0]), (2, [0.0, 1.0, 0.0]);\n",
-    );
-    assert_eq!(made.code, Some(0), "{}", made.stderr);
+    )
+    .ok();
     let run = run_json(
         &dir,
         &behind,
@@ -1499,11 +1476,9 @@ maintenance_vectors_remaining lists probes recovery_action";
 
 #[test]
 fn vector_inspection_prints_one_field_to_a_line() {
-    let dir = folder("vector-inspection-prints");
-    let store = dir.join("store");
+    let (dir, store) = folder_with_store("vector-inspection-prints");
     let more = "CREATE TABLE other (id INTEGER PRIMARY KEY, w VECTOR(2));\n";
-    let made = run_write(&dir, &store, format!("{KINDS}{more}"));
-    assert_eq!(made.code, Some(0), "{}", made.stderr);
+    run_write(&dir, &store, format!("{KINDS}{more}")).ok();
 
     // Each statement with the fields it prints and, for each row, the values of three of them.
     let indexes = [["notes", "v", "3"], ["other", "w", "2"]];
@@ -1524,8 +1499,7 @@ fn vector_inspection_prints_one_field_to_a_line() {
         let fields: Vec<&str> = fields.split(' ').collect();
         // For a person: rows with an empty line between them, each `name: value` lines in the
         // statement's order, and no line too long for a terminal.
-        let run = run_read(&dir, &store, statement);
-        assert_eq!(run.code, Some(0), "{}", run.stderr);
+        let run = run_read(&dir, &store, statement).ok();
         assert!(
             run.stdout.lines().all(|line| line.chars().count() <= 120),
             "{}",
@@ -1554,8 +1528,7 @@ fn vector_inspection_prints_one_field_to_a_line() {
         }
 
         // For a program: the usual result document, its columns the same names.
-        let run = run_json(&dir, &store, statement);
-        assert_eq!(run.code, Some(0), "{}", run.stderr);
+        let run = run_json(&dir, &store, statement).ok();
         let results = documents(&run.stdout);
         assert_eq!(results.len(), 1, "{}", run.stdout);
         assert_eq!(results[0]["result"]["columns"], json!(fields));
@@ -1567,10 +1540,8 @@ fn vector_inspection_prints_one_field_to_a_line() {
 
 #[test]
 fn explain_prints_how_each_partition_is_searched() {
-    let dir = folder("explain-prints");
-    let store = dir.join("store");
-    let made = run_write(&dir, &store, KINDS);
-    assert_eq!(made.code, Some(0), "{}", made.stderr);
+    let (dir, store) = folder_with_store("explain-prints");
+    run_write(&dir, &store, KINDS).ok();
 
     // Four vectors in two partitions, far below the 100,000 from which AUTO uses an IVF,
     // so the search asked for under AUTO is the exact one, and none grouped. A line ending in
@@ -1608,8 +1579,7 @@ fn explain_prints_how_each_partition_is_searched() {
     let search = ".explain SELECT id FROM notes ORDER BY v <=> '[1,0,0]' LIMIT 3\n";
 
     // The lines and nothing else: the search is not run, so no table of rows is printed.
-    let run = run_read(&dir, &store, search);
-    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let run = run_read(&dir, &store, search).ok();
     assert!(
         same(&run.stdout.lines().collect::<Vec<_>>()),
         "{}",
@@ -1634,8 +1604,7 @@ fn explain_prints_how_each_partition_is_searched() {
     assert_eq!(tables(&run.stdout), [[["id"], ["5"]]], "{}", run.stdout);
 
     // For a program: one document that holds the same lines.
-    let run = run_json(&dir, &store, search);
-    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let run = run_json(&dir, &store, search).ok();
     let results = documents(&run.stdout);
     assert_eq!(results.len(), 1, "{}", run.stdout);
     let printed: Vec<&str> = results[0]["explain"]["lines"]
@@ -1649,23 +1618,21 @@ fn explain_prints_how_each_partition_is_searched() {
 
 #[test]
 fn explain_prints_the_path_of_a_statement_and_runs_nothing() {
-    let dir = folder("explain-prints-the-path");
-    let store = dir.join("store");
+    let (dir, store) = folder_with_store("explain-prints-the-path");
     let declare = "\
 CREATE TABLE notes (id INTEGER PRIMARY KEY, tag TEXT);
 CREATE INDEX notes_tag ON notes (tag);
 INSERT INTO notes (id, tag) VALUES (1, 'a'), (2, 'b');
 ";
-    let made = run_write(&dir, &store, declare);
-    assert_eq!(made.code, Some(0), "{}", made.stderr);
+    run_write(&dir, &store, declare).ok();
 
     // The path of a read, in the words the library documents.
     let read = run_read(
         &dir,
         &store,
         ".explain SELECT id FROM notes WHERE tag = 'a'\n",
-    );
-    assert_eq!(read.code, Some(0), "{}", read.stderr);
+    )
+    .ok();
     assert_eq!(read.errors(), Vec::<&str>::new());
     for words in ["IndexScan { index: notes_tag }", "predicates_pushed: [tag]"] {
         assert!(
@@ -1680,8 +1647,8 @@ INSERT INTO notes (id, tag) VALUES (1, 'a'), (2, 'b');
         &dir,
         &store,
         ".explain DELETE FROM notes WHERE id = 1\nSELECT COUNT(*) AS n FROM notes;\n",
-    );
-    assert_eq!(asked.code, Some(0), "{}", asked.stderr);
+    )
+    .ok();
     assert_eq!(asked.errors(), Vec::<&str>::new());
     assert!(
         asked.stdout.contains("IndexScan { index: __pk_id }"),
@@ -1703,17 +1670,14 @@ INSERT INTO notes (id, tag) VALUES (1, 'a'), (2, 'b');
 
 #[test]
 fn a_cell_70000_characters_wide_is_printed_without_a_panic() {
-    let dir = folder("a-cell-70000-characters-wide");
-    let store = dir.join("store");
+    let (dir, store) = folder_with_store("a-cell-70000-characters-wide");
 
     // This test is the writer, and holds the store until the end; the shell reads beside it.
     let writer = Database::open(&store).unwrap();
-    writer
-        .execute(
-            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
-            &params! {},
-        )
-        .unwrap();
+    run_sql(
+        &writer,
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
+    );
     writer
         .execute(
             "INSERT INTO notes (id, body) VALUES ($id, $body)",
@@ -1722,8 +1686,7 @@ fn a_cell_70000_characters_wide_is_printed_without_a_panic() {
         .unwrap();
 
     // `shell` itself fails the test on a panic; a panic also ends the program with 101.
-    let run = run_read(&dir, &store, SELECT_NOTES);
-    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let run = run_read(&dir, &store, SELECT_NOTES).ok();
     assert_eq!(run.errors(), Vec::<&str>::new());
     // The row is printed: its other cell is there, however the wide one is shown.
     assert!(
@@ -1744,7 +1707,7 @@ fn notes_store(dir: &Path, name: &str, rows: u32) -> PathBuf {
     for id in 1..=rows {
         sql += &format!("INSERT INTO notes (id, body) VALUES ({id}, 'row {id}');\n");
     }
-    assert_eq!(run_write(dir, &store, sql + "COMMIT;\n").code, Some(0));
+    run_write(dir, &store, sql + "COMMIT;\n").ok();
     store
 }
 
@@ -1864,11 +1827,12 @@ fn every_command_help_lists_its_arguments_and_matches_the_usage_a_wrong_call_pri
 
 #[test]
 fn compact_runs_to_the_end_and_stops_for_a_reader() {
-    let dir = folder("compact-to-the-end");
-    let store = dir.join("store");
+    let (dir, store) = folder_with_store("compact-to-the-end");
     let row = |i| format!("INSERT INTO notes VALUES ({i}, '{}');\n", "x".repeat(6000));
-    let sql = (1..=1000).map(row).collect::<String>();
-    let free = format!("{CREATE_NOTES}BEGIN;\n{sql}COMMIT;\nDELETE FROM notes WHERE id < 501;\n");
+    // Half of 2,000 large rows deleted from the low end: once leaves a delete empties join, the
+    // pass still has pages to move past its first step, where the next compact meets the reader.
+    let sql = (1..=2000).map(row).collect::<String>();
+    let free = format!("{CREATE_NOTES}BEGIN;\n{sql}COMMIT;\nDELETE FROM notes WHERE id < 1001;\n");
     run_write(&dir, &store, free);
     let cycle = |input: &str| {
         let run = shell(&dir, &[arg(&store), "--write", "--json"], input);
@@ -1882,18 +1846,43 @@ fn compact_runs_to_the_end_and_stops_for_a_reader() {
         held["compaction_waiting_on"], "Readers",
         "an open cursor keeps its view: stop"
     );
+    assert_eq!(
+        held["work_remaining"], true,
+        "a stop for a reader leaves work owed"
+    );
+    // With the reader gone the next compact moves the one page that reader's view held and
+    // reaches the end; no disk limit is set, so nothing was refused for room.
+    let rest = cycle(".maintenance compact\n");
+    assert_eq!(
+        (&rest["compacted_pages"], &rest["work_remaining"]),
+        (&1.into(), &false.into()),
+        "the page the reader held moves, then the pass ends: {rest}"
+    );
+    assert_ne!(
+        rest["compaction_disk_refused"], true,
+        "no room was refused: {rest}"
+    );
+    // A later compact has nothing left, and a session that moves nothing, or does nothing,
+    // leaves the file as it was.
+    let length = || std::fs::metadata(store.join("data")).unwrap().len();
+    let ended = length();
     let all = cycle(".maintenance compact\n");
-    // The steps before moved what was pending. A later compact has nothing left.
     assert!(
         all["compacted_pages"].as_u64() == Some(0) && all["work_remaining"] == false,
         "compact report {all}"
     );
+    assert_eq!(
+        length(),
+        ended,
+        "a compact that moved nothing grew the file"
+    );
+    run_write(&dir, &store, "");
+    assert_eq!(length(), ended, "an empty writing session changed the file");
 }
 
 #[test]
 fn inspect_key_values_may_come_in_any_order_and_the_versions_say_if_more_exist() {
-    let dir = folder("inspect-key-order");
-    let store = dir.join("store");
+    let (dir, store) = folder_with_store("inspect-key-order");
     let make = "CREATE TABLE p (a INT, b INT, body TEXT, PRIMARY KEY (a, b));\n";
     run_write(
         &dir,
@@ -2008,9 +1997,8 @@ fn a_cursor_session_prints_and_refuses_by_its_documented_contract() {
 /// after an exit with the store open it is refused while free space is being found.
 #[test]
 fn an_interrupt_while_a_piped_writing_shell_waits_closes_the_store() {
-    let dir = folder("interrupt-idle-writer");
-    let store = dir.join("store");
-    assert_eq!(run_write(&dir, &store, CREATE_NOTES).code, Some(0));
+    let (dir, store) = folder_with_store("interrupt-idle-writer");
+    run_write(&dir, &store, CREATE_NOTES).ok();
     let mut writer = piped(&dir, &[arg(&store), "--write", "--json"]);
     let (mut input, mut line) = (writer.stdin.take().unwrap(), String::new());
     let mut output = BufReader::new(writer.stdout.take().unwrap());
@@ -2036,8 +2024,7 @@ fn an_interrupt_while_a_piped_writing_shell_waits_closes_the_store() {
 /// Its reads have no row ceiling.
 #[test]
 fn a_writing_shell_sends_each_statement_to_the_session_that_answers_it() {
-    let dir = folder("which-session");
-    let store = dir.join("store");
+    let (dir, store) = folder_with_store("which-session");
     let rows: Vec<String> = (1000..=1500).map(|n| format!("({n}, 'n')")).collect();
     let input = format!(
         "{CREATE_NOTES}SET MEMORY_LIMIT 64M;\nSHOW MEMORY_LIMIT;\n\

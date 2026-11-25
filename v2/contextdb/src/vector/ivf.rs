@@ -22,6 +22,25 @@ pub(super) struct Place {
     pub slot: u32,
 }
 
+/// How many likeness levels the build measures a reach for: 0.20 to 0.95 by 0.05.
+pub(super) const LEVELS: usize = 16;
+
+/// Likeness level `at`, from 2,000 ten-thousandths by 500: the build and the walk compare
+/// against this one number.
+pub(super) fn level(at: usize) -> f64 {
+    (2000 + 500 * at) as f64 / 10_000.0
+}
+
+/// How many levels lower than its cutoff's a walk reads the reach at, where the cutoff's level
+/// is `MARGIN_FROM` (0.75) or above: the build's questions are not every question.
+pub(super) const MARGIN: usize = 1;
+pub(super) const MARGIN_FROM: usize = 11;
+
+/// Whether a reach is one a build can measure: no level above a lower one, none past `groups`.
+pub(super) fn reach_holds(reach: &[u32; LEVELS], groups: u32) -> bool {
+    reach.is_sorted_by(|lower, higher| lower >= higher) && reach[0] <= groups
+}
+
 /// What a search of the nearest groups reads of an IVF.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Ivf {
@@ -40,6 +59,10 @@ pub(super) struct Ivf {
     /// where the slots end: one more place than there are groups. Group `g` is the slots from
     /// `starts[g]` up to `starts[g + 1]`.
     pub starts: Vec<Place>,
+    /// For each likeness level, the most groups, nearest first, any of the build's questions
+    /// needed for 999 in 1,000 of its slots whose high end is at least that alike and for every
+    /// such slot of its ten nearest; no level below a higher one; zero where no slot was.
+    pub reach: [u32; LEVELS],
 }
 
 impl Ivf {
@@ -48,21 +71,31 @@ impl Ivf {
         self.starts[group] != self.starts[group + 1]
     }
 
+    /// How many groups a walk whose cutoff is `c` takes by the build's evidence: the reach of
+    /// the greatest level at or below `c`, lowered by the margin; `None` where no question
+    /// reached that level, or `c` is below every level.
+    pub(super) fn reach_at(&self, c: f64) -> Option<usize> {
+        let at = (0..LEVELS).rev().find(|at| level(*at) <= c)?;
+        let groups = self.reach[if at >= MARGIN_FROM { at - MARGIN } else { at }];
+        (groups > 0).then_some(groups as usize)
+    }
+
     /// The record of the IVF: `gap`, `width` and `probes` as four bytes each, then every place
-    /// as two numbers of four bytes, all low byte first.
+    /// as two numbers of four bytes, then `reach`, all low byte first.
     pub(super) fn encode(&self) -> Vec<u8> {
         let head = [self.gap, u32::from(self.width), self.probes];
         let places = self.starts.iter();
         let places = places.flat_map(|place| [place.block, place.slot]);
-        let numbers = head.into_iter().chain(places);
+        let numbers = head.into_iter().chain(places).chain(self.reach);
         numbers.flat_map(u32::to_le_bytes).collect()
     }
 
     /// The IVF kept under `grouped.number`. A record that is missing, of a length other
-    /// than `12 + 8 * (grouped.groups + 1)`, with a `gap` above 20,000, with `probes` outside
-    /// `1..=grouped.groups`, with a
+    /// than `12 + 8 * (grouped.groups + 1) + 4 * LEVELS`, with a `gap` above 20,000, with
+    /// `probes` outside `1..=grouped.groups`, with a
     /// `width` of 1 or above 16, with a first place other than the first slot, with a place
-    /// before the one ahead of it or a last place past `grouped.blocks`, is damage.
+    /// before the one ahead of it or a last place past `grouped.blocks`, or with a reach past
+    /// `grouped.groups` or above the reach of a lower level, is damage.
     pub(super) fn read(
         read: &dyn Read,
         vector: VectorId,
@@ -75,14 +108,16 @@ impl Ivf {
         };
         let record = VectorRecord::Ivf(vector, grouped.number);
         let found = kept(read, record, |value| -> Result<_> {
-            if value.len() as u64 != 20 + 8 * u64::from(grouped.groups) {
+            if value.len() as u64 != 20 + 4 * LEVELS as u64 + 8 * u64::from(grouped.groups) {
                 return Ok(None);
             }
             held.grow(value.len() as u64)?;
             let (numbers, _) = value.as_chunks::<4>();
             let number = |at: usize| u32::from_le_bytes(numbers[at]);
             let (gap, width, probes) = (number(0), number(1), number(2));
-            let places = (3..numbers.len()).step_by(2);
+            let tail = numbers.len() - LEVELS;
+            let reach: [u32; LEVELS] = std::array::from_fn(|at| number(tail + at));
+            let places = (3..tail).step_by(2);
             let starts: Vec<Place> = places
                 .map(|at| Place {
                     block: number(at),
@@ -94,12 +129,14 @@ impl Ivf {
                 && (width == 0 || (2..=16).contains(&width))
                 && starts[0] == Place::default()
                 && starts.is_sorted()
-                && starts[starts.len() - 1] <= end;
+                && starts[starts.len() - 1] <= end
+                && reach_holds(&reach, grouped.groups);
             Ok(agrees.then_some(Ivf {
                 gap,
                 probes,
                 width: width as u8,
                 starts,
+                reach,
             }))
         })?
         .transpose()?;
@@ -138,9 +175,9 @@ pub(super) fn put_centroids(
 pub(super) fn put_centroids_at(
     changes: &mut ChangeSet,
     (vector, number, place): (VectorId, u32, u32),
-    centres: &[f32],
+    centroids: &[f32],
 ) -> Result<()> {
-    let value = centres.iter().flat_map(|n| n.to_le_bytes()).collect();
+    let value = centroids.iter().flat_map(|n| n.to_le_bytes()).collect();
     changes.put_vector(VectorRecord::Centroids(vector, number, place), value)
 }
 

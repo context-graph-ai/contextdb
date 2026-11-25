@@ -62,10 +62,16 @@ fn imports_and_one_row_commits_keep_their_counted_write_bounds() {
         db.execute(sql, &params! {"q" => support::vector(at, 768)})
             .unwrap()
     };
-    find(1);
+    // Passage `id` holds vector(id % 1000): after the one-row commit ids 1 and 1001 hold
+    // vector(1), and in the second thousand 1001 and 2001 do. vector(2) is held by exactly one
+    // row at every point (2, 2, then 1002), so every find reads one exact match and the peaks
+    // compare like for like.
+    let asked = 2;
+    find(asked);
     // With each sealed row's slot record kept in the vector part, a one-row commit writes 29
-    // pages, one more than before.
-    for (first, rows, pages) in [(1, 1000, 1815), (1001, 1, 29), (1002, 1000, 1835)] {
+    // pages, one more than before. The pending record carries the row's 776-byte slot (Find F1,
+    // design.md:1173-1175), where it held only the key: 31 pages since the Find merge 0acee6147.
+    for (first, rows, pages) in [(1, 1000, 1815), (1001, 1, 31), (1002, 1000, 1835)] {
         if first == 1002 {
             support::run(
                 &db,
@@ -82,7 +88,7 @@ fn imports_and_one_row_commits_keep_their_counted_write_bounds() {
         imported.get_or_insert_with(|| support::data_file(&folder));
         let written = counts[0].load(SeqCst);
         work.push((rows, written, pages, counts[1].load(SeqCst)));
-        let found = find(1); // the same question at every point, so peaks compare like for like
+        let found = find(asked);
         assert_eq!(found.rows().len(), 1);
         level.push((support::memory_used(&db), found.peak_bytes()));
         for part in support::shown(
@@ -156,6 +162,9 @@ fn a_season_stays_level() {
     options.clock = Some(Arc::new(support::At(clock.clone())));
     let db = support::open_with(&folder, options).unwrap();
     consumer(&db);
+    // The promise is the size at rest after each turnover, not the interval: MIN_INTERVAL 0 lets
+    // a pass start in this short run (design 4, S4).
+    support::run(&db, "SET STORAGE_COMPACTION MIN_INTERVAL 0 SECONDS");
     support::run(
         &db,
         "ALTER TABLE event_search_passages SET RETAIN 10 SECONDS",
@@ -222,15 +231,17 @@ fn a_season_stays_level() {
     println!("churn-size {} bytes", support::data_file(&folder));
     // The eighth turnover against the store as first filled and drained (design 4, the guard).
     let (old, state) = (states[0], states[7]);
-    // Size, statement peak and fixed-find drift, in that order. The file's drift from the first
-    // turnover (its compaction step and a tenth) is Space's to hold, and returns with PR 5C.
+    let growth = state.0.abs_diff(old.0);
+    // Size, compaction step, file drift, statement peak and fixed-find drift, in that order.
     let checks = [
         states.iter().all(|s| s.0 <= 2 * s.3),
+        growth <= 1 << 20,
+        growth * 10 <= old.0,
         state.1 == old.1,
         state.2.abs_diff(old.2) * 10 <= old.2,
     ];
     assert_eq!(
-        checks, [true; 3],
+        checks, [true; 5],
         "season (file, statement peak, compared, input): {states:?}"
     );
     support::close(db);

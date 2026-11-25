@@ -52,7 +52,8 @@ pub fn grouped(records: &Records) -> Grouped {
         .iter()
         .find(|(k, _)| k[0] == 3)
         .expect("an IVF exists");
-    let starts: Vec<_> = ivf[12..]
+    // The record ends with the reach, a count for each of 16 levels (7364fc08b).
+    let starts: Vec<_> = ivf[12..ivf.len() - 4 * 16]
         .chunks_exact(8)
         .map(|p| (number(p, 0), number(p, 4)))
         .collect();

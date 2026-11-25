@@ -33,6 +33,13 @@ fn declare(db: &Database, table: &str, clauses: &str) {
     );
 }
 
+/// Inserts rows with these numbers in one transaction, as [`fill`] does.
+fn fill_committed(db: &Database, table: &str, numbers: std::ops::RangeInclusive<i64>) {
+    let tx = db.transaction().expect("begin");
+    fill(&tx, table, numbers);
+    tx.commit().expect("commit");
+}
+
 /// Inserts rows with these numbers: row `n` under the context `c<n % 3>`.
 fn fill(on: &impl Run, table: &str, numbers: std::ops::RangeInclusive<i64>) {
     for n in numbers {
@@ -92,15 +99,11 @@ fn vector_search_mode_routes_each_request() {
     }
     // Rows 1 to 80 in blocks, rows 81 to 120 on pending lists.
     for (table, _) in tables {
-        let tx = db.transaction().expect("begin");
-        fill(&tx, table, 1..=80);
-        tx.commit().expect("commit");
+        fill_committed(&db, table, 1..=80);
     }
     support::seal_all(&db);
     for (table, _) in tables {
-        let tx = db.transaction().expect("begin");
-        fill(&tx, table, 81..=120);
-        tx.commit().expect("commit");
+        fill_committed(&db, table, 81..=120);
     }
     let query = support::vector(90_000, DIMENSION);
     type Scope = (Option<&'static str>, fn(&[Value]) -> bool);
@@ -188,15 +191,11 @@ fn indexed_search_is_refused_at_every_door() {
     );
     declare(&db, "empty", "SEARCH_MODE INDEXED");
     declare(&db, "small", "PARTITION_KEY (ctx) INDEXING_THRESHOLD 1000");
-    let tx = db.transaction().expect("begin");
-    fill(&tx, "small", 1..=300);
-    tx.commit().expect("commit");
+    fill_committed(&db, "small", 1..=300);
     // Two thousand pending rows in each of three partitions: twice the vectors a column of
     // these clauses may have outside an IVF, so the index is behind its writes.
     for table in ["plain", "indexed"] {
-        let tx = db.transaction().expect("begin");
-        fill(&tx, table, 1..=6000);
-        tx.commit().expect("commit");
+        fill_committed(&db, table, 1..=6000);
     }
     let query = support::vector(91_000, DIMENSION);
     // Every way a search asks for an index that is behind: in the statement, by the column's
@@ -405,27 +404,22 @@ fn vector_query_errors_are_typed() {
         "CREATE TABLE docs (id INTEGER PRIMARY KEY, ctx TEXT NOT NULL, r REAL, v VECTOR(4), \
          w VECTOR(4))",
     );
-    for n in 1..=20_i64 {
-        db.execute(
-            "INSERT INTO docs (id, ctx, r, v, w) VALUES ($id, 'a', 0.5, $v, $w)",
-            &params! {
-                "id" => n, "v" => support::vector(n, 4), "w" => support::vector(100 + n, 4),
-            },
-        )
-        .expect("insert a row");
-    }
+    let insert = |numbers: std::ops::RangeInclusive<i64>, r: &str| {
+        for n in numbers {
+            db.execute(
+                &format!("INSERT INTO docs (id, ctx, r, v, w) VALUES ($id, 'a', {r}, $v, $w)"),
+                &params! {
+                    "id" => n, "v" => support::vector(n, 4), "w" => support::vector(100 + n, 4),
+                },
+            )
+            .expect("insert a row");
+        }
+    };
+    insert(1..=20, "0.5");
     // Half of them sealed.
     support::seal_all(&db);
     support::run(&db, "UPDATE docs SET r = 1.5 WHERE id > 10");
-    for n in 21..=30_i64 {
-        db.execute(
-            "INSERT INTO docs (id, ctx, v, w) VALUES ($id, 'a', $v, $w)",
-            &params! {
-                "id" => n, "v" => support::vector(n, 4), "w" => support::vector(100 + n, 4),
-            },
-        )
-        .expect("insert a row");
-    }
+    insert(21..=30, "NULL");
     let reader = support::open_reader(&folder, None);
     let state = |db: &Database| {
         let rows = support::rows(db, "SELECT id, ctx, r, v, w FROM docs ORDER BY id");
@@ -611,25 +605,9 @@ fn what_the_parser_reads_and_this_version_does_not_run_is_refused_when_planned()
         "CREATE TABLE pairs (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, v VECTOR(3))",
     );
     let reader = support::open_reader(&folder, None);
-    let refused_when_planned = |sql: &str| -> String {
-        let tx = db.transaction().expect("begin");
-        let none = params! {};
-        let doors = [
-            db.execute(sql, &none),
-            tx.execute(sql, &none),
-            reader.execute(sql, &none),
-        ];
-        let sentences = doors.map(|outcome| match outcome {
-            Err(Error::PlanError(text)) => text,
-            Err(other) => panic!("{sql}\nwas refused as {other:?}, not as a plan error"),
-            Ok(result) => panic!("{sql}\nwas not refused: {result:?}"),
-        });
-        assert!(
-            sentences[0] == sentences[1] && sentences[0] == sentences[2],
-            "{sql}\nwas refused in three sentences: {sentences:?}"
-        );
-        let [sentence, ..] = sentences;
-        sentence
+    let refused_when_planned = |sql: &str| match refused_at_every_door(&db, &reader, sql, &[]) {
+        Error::PlanError(text) => text,
+        other => panic!("{sql}\nwas refused as {other:?}, not as a plan error"),
     };
     for (sql, form) in [
         ("SELECT (a, b) FROM pairs", "row value"),
@@ -677,17 +655,33 @@ fn what_the_parser_reads_and_this_version_does_not_run_is_refused_when_planned()
     );
 }
 
-/// The words of a declaration's line for one column: what stands between spaces, commas and
-/// parentheses.
-fn words(declaration: &str, column: &str) -> Vec<String> {
+/// Asserts that a declaration's line for the column declared as `declared`, whose first word is
+/// its name, is these words: what stands between spaces, commas and parentheses.
+fn assert_printed(declaration: &str, declared: &str, wanted: &str, state: &str) {
+    let column = declared.split(' ').next().expect("a column's name");
     let line = declaration
         .lines()
         .find(|line| line.trim_start().starts_with(&format!("{column} ")))
         .unwrap_or_else(|| panic!("no line for the column {column} in\n{declaration}"));
-    line.split(|c: char| c.is_whitespace() || "(),".contains(c))
+    let words: Vec<&str> = line
+        .split(|c: char| c.is_whitespace() || "(),".contains(c))
         .filter(|word| !word.is_empty())
-        .map(str::to_owned)
-        .collect()
+        .collect();
+    let wanted: Vec<&str> = wanted.split(' ').collect();
+    assert_eq!(words, wanted, "{state}: the line of {column}");
+}
+
+/// Closes the store and opens it again: the declaration of `t` is the same text, through the
+/// writer and through a reader. Gives the store opened again.
+fn reopened_as_printed(db: Database, folder: &std::path::Path, printed: &str) -> Database {
+    support::close(db);
+    let db = support::open(folder);
+    let again = db.declaration("t").expect("the declaration");
+    assert_eq!(again.as_str(), printed, "after reopen");
+    let reader = support::open_reader(folder, None);
+    let read = reader.declaration("t").expect("a reader's declaration");
+    assert_eq!(read.as_str(), printed, "through a reader");
+    db
 }
 
 #[test]
@@ -696,63 +690,55 @@ fn vector_column_declarations_are_checked_stored_and_printed_back() {
     let db = support::open(&folder);
     let fresh = support::watermark(&db);
 
-    // Each clause that cannot stand, by its kind, naming the column; and no table declared.
+    // Each clause that cannot stand after `v VECTOR(4)`, by its kind, naming the column; and no
+    // table declared.
     use VectorPartitionDeclarationIssue as Issue;
     let refused: [(&str, Issue); 14] = [
+        ("PARTITION_KEY (nowhere)", Issue::UnknownPartitionKeyColumn),
         (
-            "v VECTOR(4) PARTITION_KEY (nowhere)",
+            "PARTITION_KEY (ctx, nowhere)",
             Issue::UnknownPartitionKeyColumn,
         ),
+        ("PARTITION_KEY (loose)", Issue::NullablePartitionKeyColumn),
         (
-            "v VECTOR(4) PARTITION_KEY (ctx, nowhere)",
-            Issue::UnknownPartitionKeyColumn,
-        ),
-        (
-            "v VECTOR(4) PARTITION_KEY (loose)",
+            "PARTITION_KEY (ctx, loose)",
             Issue::NullablePartitionKeyColumn,
         ),
         (
-            "v VECTOR(4) PARTITION_KEY (ctx, loose)",
-            Issue::NullablePartitionKeyColumn,
-        ),
-        (
-            "v VECTOR(4) PARTITION_KEY (r)",
+            "PARTITION_KEY (r)",
             Issue::UnsupportedPartitionKeyColumnType,
         ),
         (
-            "v VECTOR(4) PARTITION_KEY (doc)",
+            "PARTITION_KEY (doc)",
             Issue::UnsupportedPartitionKeyColumnType,
         ),
         (
-            "v VECTOR(4) PARTITION_KEY (other)",
+            "PARTITION_KEY (other)",
             Issue::UnsupportedPartitionKeyColumnType,
         ),
         (
-            "v VECTOR(4) PARTITION_KEY (ctx, ctx)",
+            "PARTITION_KEY (ctx, ctx)",
             Issue::DuplicatePartitionKeyColumn,
         ),
         (
-            "v VECTOR(4) PARTITION_KEY (v) NOT NULL",
+            "PARTITION_KEY (v) NOT NULL",
             Issue::VectorColumnInPartitionKey,
         ),
+        ("MAX_PARTITIONS 4", Issue::MaxPartitionsWithoutPartitionKey),
         (
-            "v VECTOR(4) MAX_PARTITIONS 4",
-            Issue::MaxPartitionsWithoutPartitionKey,
-        ),
-        (
-            "v VECTOR(4) PARTITION_KEY (ctx) MAX_PARTITIONS 0",
+            "PARTITION_KEY (ctx) MAX_PARTITIONS 0",
             Issue::MaxPartitionsNotPositive,
         ),
         (
-            "v VECTOR(4) PARTITION_KEY (ctx) MAX_PARTITIONS -1",
+            "PARTITION_KEY (ctx) MAX_PARTITIONS -1",
             Issue::MaxPartitionsNotPositive,
         ),
         (
-            "v VECTOR(4) PARTITION_KEY (ctx) MAX_PARTITIONS 4294967296",
+            "PARTITION_KEY (ctx) MAX_PARTITIONS 4294967296",
             Issue::MaxPartitionsOutOfRange,
         ),
         (
-            "v VECTOR(4) PARTITION_KEY (ctx) MAX_PARTITIONS 99999999999999999999999999999999",
+            "PARTITION_KEY (ctx) MAX_PARTITIONS 99999999999999999999999999999999",
             Issue::MaxPartitionsOutOfRange,
         ),
     ];
@@ -763,8 +749,8 @@ fn vector_column_declarations_are_checked_stored_and_printed_back() {
              {vector_column})"
         )
     };
-    for (vector_column, wanted) in refused {
-        let sql = table(vector_column);
+    for (clauses, wanted) in refused {
+        let sql = table(&format!("v VECTOR(4) {clauses}"));
         match support::refusal(&db, &sql) {
             Error::InvalidVectorPartitionDeclaration { index, issue } => {
                 assert_eq!(index, column("t", "v"), "{sql}");
@@ -801,79 +787,35 @@ fn vector_column_declarations_are_checked_stored_and_printed_back() {
     // What stands: each column with the words its declaration prints back for it. The three
     // clauses come in one order; MAX_PARTITIONS is printed for every column with a
     // PARTITION_KEY, as 256 when none was written; SEARCH_MODE only when it was written.
-    let stands: [(&str, &str, &[&str]); 7] = [
-        ("bare", "VECTOR(4)", &["bare", "VECTOR", "4"]),
+    let stands: [(&str, &str); 7] = [
+        ("bare VECTOR(4)", "bare VECTOR 4"),
         (
-            "keyed",
-            "VECTOR(4) PARTITION_KEY (ctx)",
-            &[
-                "keyed",
-                "VECTOR",
-                "4",
-                "PARTITION_KEY",
-                "ctx",
-                "MAX_PARTITIONS",
-                "256",
-            ],
+            "keyed VECTOR(4) PARTITION_KEY (ctx)",
+            "keyed VECTOR 4 PARTITION_KEY ctx MAX_PARTITIONS 256",
         ),
         (
-            "two_keys",
-            "VECTOR(4) PARTITION_KEY (kind, ctx) MAX_PARTITIONS 4294967295",
-            &[
-                "two_keys",
-                "VECTOR",
-                "4",
-                "PARTITION_KEY",
-                "kind",
-                "ctx",
-                "MAX_PARTITIONS",
-                "4294967295",
-            ],
+            "two_keys VECTOR(4) PARTITION_KEY (kind, ctx) MAX_PARTITIONS 4294967295",
+            "two_keys VECTOR 4 PARTITION_KEY kind ctx MAX_PARTITIONS 4294967295",
         ),
         (
-            "capped",
-            "VECTOR(4) PARTITION_KEY (ctx) MAX_PARTITIONS 2 SEARCH_MODE AUTO",
-            &[
-                "capped",
-                "VECTOR",
-                "4",
-                "PARTITION_KEY",
-                "ctx",
-                "MAX_PARTITIONS",
-                "2",
-                "SEARCH_MODE",
-                "AUTO",
-            ],
+            "capped VECTOR(4) PARTITION_KEY (ctx) MAX_PARTITIONS 2 SEARCH_MODE AUTO",
+            "capped VECTOR 4 PARTITION_KEY ctx MAX_PARTITIONS 2 SEARCH_MODE AUTO",
         ),
         (
-            "strict",
-            "VECTOR(768) partition_key (ctx) search_mode exact NOT NULL",
-            &[
-                "strict",
-                "VECTOR",
-                "768",
-                "PARTITION_KEY",
-                "ctx",
-                "MAX_PARTITIONS",
-                "256",
-                "SEARCH_MODE",
-                "EXACT",
-                "NOT",
-                "NULL",
-            ],
+            "strict VECTOR(768) partition_key (ctx) search_mode exact NOT NULL",
+            "strict VECTOR 768 PARTITION_KEY ctx MAX_PARTITIONS 256 SEARCH_MODE EXACT NOT NULL",
         ),
         (
-            "by_index",
-            "VECTOR(3) SEARCH_MODE INDEXED",
-            &["by_index", "VECTOR", "3", "SEARCH_MODE", "INDEXED"],
+            "by_index VECTOR(3) SEARCH_MODE INDEXED",
+            "by_index VECTOR 3 SEARCH_MODE INDEXED",
         ),
-        ("one", "VECTOR(1) MAX_PARTITIONS 1 PARTITION_KEY (ctx)", &[]),
+        ("one VECTOR(1) MAX_PARTITIONS 1 PARTITION_KEY (ctx)", ""),
     ];
     // The last of them writes two clauses the wrong way round, which is not read.
     let (out_of_order, standing) = stands.split_last().expect("seven columns");
     let wrong = format!(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, ctx TEXT NOT NULL, {} {})",
-        out_of_order.0, out_of_order.1
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, ctx TEXT NOT NULL, {})",
+        out_of_order.0
     );
     assert!(
         matches!(
@@ -884,10 +826,7 @@ fn vector_column_declarations_are_checked_stored_and_printed_back() {
     );
     assert!(support::names(&db).is_empty());
 
-    let columns: Vec<String> = standing
-        .iter()
-        .map(|(name, clauses, _)| format!("{name} {clauses}"))
-        .collect();
+    let columns: Vec<&str> = standing.iter().map(|(declared, _)| *declared).collect();
     support::run(
         &db,
         &format!(
@@ -897,12 +836,8 @@ fn vector_column_declarations_are_checked_stored_and_printed_back() {
     );
     let printed = db.declaration("t").expect("the declaration of t");
     let check = |declaration: &str, state: &str| {
-        for (name, _, wanted) in standing {
-            assert_eq!(
-                words(declaration, name),
-                *wanted,
-                "{state}: the line of {name}"
-            );
+        for (declared, wanted) in standing {
+            assert_printed(declaration, declared, wanted, state);
         }
     };
     check(&printed, "as declared");
@@ -943,22 +878,7 @@ fn vector_column_declarations_are_checked_stored_and_printed_back() {
     };
     holds(&db, "as declared");
 
-    // After reopen the same text, through the writer and through a reader.
-    support::close(db);
-    let db = support::open(&folder);
-    assert_eq!(
-        db.declaration("t").expect("the declaration").as_str(),
-        printed.as_str(),
-        "after reopen"
-    );
-    let reader = support::open_reader(&folder, None);
-    assert_eq!(
-        reader
-            .declaration("t")
-            .expect("a reader's declaration")
-            .as_str(),
-        printed.as_str()
-    );
+    reopened_as_printed(db, &folder, &printed);
 
     // The printed text declares the same table in a new store.
     let folder = support::folder("vector-declarations-again");
@@ -1224,13 +1144,22 @@ fn a_filtered_search_reads_its_index_range_and_a_ranked_one_asks_every_vector() 
     let range =
         ask("SELECT id FROM docs WHERE tag >= 7 AND tag < 8 ORDER BY v <=> $q LIMIT 3".into());
     assert_eq!(range.distance_evaluations(), 4, "the rows of a range");
-    // Ungrouped rows weigh 1 in 16, so 12 rows are few: under INDEXED four rows are compared.
-    let by_index = ask(
-        "SELECT id FROM docs WHERE tag = 7 ORDER BY v <=> $q USE VECTOR INDEXED LIMIT 3".into(),
+    let most = "SELECT id FROM docs WHERE tag = 7 ORDER BY v <=> $q LIMIT 9223372036854775807";
+    assert_eq!(ask(most.into()).rows().len(), 4, "the largest LIMIT");
+    // Comparing directly is AUTO's alone: INDEXED gives the same rows through the walk.
+    let walked = "SELECT id FROM docs WHERE tag = 7 ORDER BY v <=> $q USE VECTOR INDEXED LIMIT 3";
+    assert_eq!(
+        ask(walked.into()).rows(),
+        indexed.rows(),
+        "the rows of the tag"
     );
-    assert_eq!(by_index.distance_evaluations(), 4, "the rows of the tag");
-    // Ten tags are 40 of 200 rows: not few, so the index saves reads, not distance evaluations;
-    // four rows of a range are few.
+    let plan = db.explain(walked).expect("explained").to_string();
+    assert!(
+        plan.contains("filter_route: walk"),
+        "INDEXED keeps to the walk:\n{plan}"
+    );
+    // Ten tags are 40 of 200 rows, compared directly: the count reads no row, the 40 are read
+    // and compared, and the three returned are read once more.
     let many = |table: &str| {
         ask(format!(
             "SELECT id FROM {table} WHERE tag IN (10, 11, 12, 13, 14, 15, 16, 17, 18, 19) \
@@ -1239,14 +1168,13 @@ fn a_filtered_search_reads_its_index_range_and_a_ranked_one_asks_every_vector() 
     };
     let (indexed, bare) = (many("docs"), many("bare"));
     assert_eq!(indexed.rows(), bare.rows(), "the index changes no answer");
-    assert_eq!(
-        indexed.distance_evaluations(),
-        bare.distance_evaluations(),
-        "many rows are not walked"
+    assert!(
+        indexed.distance_evaluations() <= bare.distance_evaluations(),
+        "the index never compares more"
     );
-    assert!(indexed.rows_examined() < bare.rows_examined());
-    // A rank policy: EXACT asks every allowed vector, and each of the 40 candidates is one
-    // lookup of its joined row (counted as a row examined).
+    assert_eq!(indexed.rows_examined(), 40 + indexed.rows().len() as u64);
+    // A rank policy: EXACT asks every allowed vector, and any may win, so each of the 40 is
+    // kept: its row read, its joined row looked up, and the three returned read once more.
     support::run(
         &db,
         "CREATE TABLE results (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL)",
@@ -1271,27 +1199,52 @@ fn a_filtered_search_reads_its_index_range_and_a_ranked_one_asks_every_vector() 
             &format!("INSERT INTO results (id, task_id) VALUES ({n}, {n})"),
         );
     }
-    let ask_tasks = |rank: &str| {
-        ask(format!(
-            "SELECT id FROM tasks ORDER BY v <=> $q USE VECTOR EXACT {rank} LIMIT 3"
-        ))
-    };
-    let (plain, ranked) = (ask_tasks(""), ask_tasks("USE RANK worth"));
+    let ranked = ask(
+        "SELECT id FROM tasks ORDER BY v <=> $q USE VECTOR EXACT USE RANK worth LIMIT 3".into(),
+    );
     assert_eq!(
         ranked.distance_evaluations(),
         40,
         "EXACT asks every allowed vector"
     );
+    let read = 2 * 40 + ranked.rows().len() as u64;
+    assert_eq!(ranked.rows_examined(), read, "one lookup per candidate");
+    // With a key range, and a formula under which the farthest row wins, EXACT with USE RANK
+    // answers the farthest of the ten rows the range reaches first, reading those rows and their
+    // joined rows and no other (section 6, F3).
+    let range = "FROM tasks WHERE id <= 10 ORDER BY v <=> $q USE VECTOR EXACT";
+    let farthest = ask(format!("SELECT id {range} LIMIT 10")).rows()[9][0].clone();
+    let far = "JOIN results ON task_id, FORMULA '{w} + {vector_score}', SORT_KEY far";
+    let table = "far (id INTEGER PRIMARY KEY, w REAL NOT NULL, v VECTOR";
+    support::run(
+        &db,
+        &format!("CREATE TABLE {table}({DIMENSION}) RANK_POLICY ({far}))"),
+    );
+    for n in 1..=40_i64 {
+        let w = 3 * u8::from(Value::Int64(n) == farthest);
+        let values = params! { "v" => support::vector(n, DIMENSION) };
+        let sql = format!("INSERT INTO far (id, w, v) VALUES ({n}, {w}.0, $v)");
+        db.execute(&sql, &values).expect("far");
+    }
+    let range = range.replace("tasks", "far");
+    let ranked = ask(format!("SELECT id {range} USE RANK far LIMIT 3"));
     assert_eq!(
-        ranked.rows_examined(),
-        plain.rows_examined() + 40,
-        "one lookup per candidate"
+        ranked.rows()[0][0],
+        farthest,
+        "the farthest row's formula wins"
+    );
+    let counted = (ranked.rows_examined(), ranked.distance_evaluations());
+    let read = 20 + ranked.rows().len() as u64;
+    assert_eq!(
+        counted,
+        (read, 10),
+        "the range's rows, joined rows and the three returned"
     );
 }
 
-/// A table `t` whose one VECTOR column `v` is declared with this text, as a statement.
+/// A table `t` whose one VECTOR column `v` is declared `VECTOR(4)` and this text, as a statement.
 fn with_vector(declared: &str) -> String {
-    format!("CREATE TABLE t (id INTEGER PRIMARY KEY, ctx TEXT NOT NULL, v {declared})")
+    format!("CREATE TABLE t (id INTEGER PRIMARY KEY, ctx TEXT NOT NULL, v VECTOR(4) {declared})")
 }
 
 #[test]
@@ -1301,71 +1254,31 @@ fn the_index_clauses_are_read_checked_and_printed_back() {
     // Each column as it is declared, and the words its declaration prints back: a clause
     // that was not written is not printed, F32 is the silent quantization, and
     // MAX_PARTITIONS is printed for every column with a PARTITION_KEY.
-    let columns: [(&str, &str, &[&str]); 5] = [
+    let columns: [(&str, &str); 5] = [
         (
-            "a",
-            "VECTOR(4) WITH (quantization = 'sq8')",
-            &["a", "VECTOR", "4", "WITH", "quantization", "=", "'SQ8'"],
+            "a VECTOR(4) WITH (quantization = 'sq8')",
+            "a VECTOR 4 WITH quantization = 'SQ8'",
         ),
         (
-            "b",
-            "VECTOR(4) WITH (quantization = 'F32') INDEXING_THRESHOLD 5000",
-            &["b", "VECTOR", "4", "INDEXING_THRESHOLD", "5000"],
+            "b VECTOR(4) WITH (quantization = 'F32') INDEXING_THRESHOLD 5000",
+            "b VECTOR 4 INDEXING_THRESHOLD 5000",
         ),
         (
-            "c",
-            "VECTOR(4) PARTITION_KEY (ctx) SEARCH_MODE INDEXED \
+            "c VECTOR(4) PARTITION_KEY (ctx) SEARCH_MODE INDEXED \
              INDEXING_THRESHOLD 18446744073709551615 COMPACTION NONE",
-            &[
-                "c",
-                "VECTOR",
-                "4",
-                "PARTITION_KEY",
-                "ctx",
-                "MAX_PARTITIONS",
-                "256",
-                "SEARCH_MODE",
-                "INDEXED",
-                "INDEXING_THRESHOLD",
-                "18446744073709551615",
-                "COMPACTION",
-                "NONE",
-            ],
+            "c VECTOR 4 PARTITION_KEY ctx MAX_PARTITIONS 256 SEARCH_MODE INDEXED \
+             INDEXING_THRESHOLD 18446744073709551615 COMPACTION NONE",
         ),
         (
-            "d",
-            "VECTOR(4) compaction (tombstone_percent = 100)",
-            &[
-                "d",
-                "VECTOR",
-                "4",
-                "COMPACTION",
-                "TOMBSTONE_PERCENT",
-                "=",
-                "100",
-            ],
+            "d VECTOR(4) compaction (tombstone_percent = 100)",
+            "d VECTOR 4 COMPACTION TOMBSTONE_PERCENT = 100",
         ),
         (
-            "e",
-            "VECTOR(4) COMPACTION (CHANGE_PERCENT = 1, TOMBSTONE_PERCENT = 100)",
-            &[
-                "e",
-                "VECTOR",
-                "4",
-                "COMPACTION",
-                "CHANGE_PERCENT",
-                "=",
-                "1",
-                "TOMBSTONE_PERCENT",
-                "=",
-                "100",
-            ],
+            "e VECTOR(4) COMPACTION (CHANGE_PERCENT = 1, TOMBSTONE_PERCENT = 100)",
+            "e VECTOR 4 COMPACTION CHANGE_PERCENT = 1 TOMBSTONE_PERCENT = 100",
         ),
     ];
-    let declared: Vec<String> = columns
-        .iter()
-        .map(|(name, clauses, _)| format!("{name} {clauses}"))
-        .collect();
+    let declared: Vec<&str> = columns.iter().map(|(declared, _)| *declared).collect();
     support::run(
         &db,
         &format!(
@@ -1374,26 +1287,15 @@ fn the_index_clauses_are_read_checked_and_printed_back() {
         ),
     );
     let check = |printed: &str, state: &str| {
-        for (name, _, wanted) in columns {
-            assert_eq!(words(printed, name), wanted, "{state}: {name}");
+        for (declared, wanted) in columns {
+            assert_printed(printed, declared, wanted, state);
         }
     };
     let printed = db.declaration("t").expect("the declaration");
     check(&printed, "as declared");
 
-    // After reopen the same text, through the writer and through a reader; and the printed
-    // text declares the same table in a new store.
-    support::close(db);
-    let db = support::open(&folder);
-    assert_eq!(
-        db.declaration("t").expect("the declaration").as_str(),
-        printed.as_str()
-    );
-    let reader = support::open_reader(&folder, None);
-    assert_eq!(
-        reader.declaration("t").expect("a reader's").as_str(),
-        printed.as_str()
-    );
+    // The printed text declares the same table in a new store.
+    let db = reopened_as_printed(db, &folder, &printed);
     support::assert_roundtrips("index-clauses", &db, &["t"]);
 }
 
@@ -1406,57 +1308,50 @@ fn the_index_clauses_are_refused_by_kind() {
     let quantization = Issue::InvalidMember {
         member: "quantization",
     };
-    let refused: [(&str, Issue, &str); 9] = [
+    let refused: [(&str, Issue); 9] = [
+        ("WITH (quantization = 'SQ16')", quantization),
+        ("WITH (quantization = '')", quantization),
+        ("INDEXING_THRESHOLD 0", Issue::IndexingThresholdNotPositive),
+        ("INDEXING_THRESHOLD -1", Issue::IndexingThresholdNotPositive),
         (
-            "VECTOR(4) WITH (quantization = 'SQ16')",
-            quantization,
-            "quantization has an invalid vector policy value",
-        ),
-        (
-            "VECTOR(4) WITH (quantization = '')",
-            quantization,
-            "quantization has an invalid vector policy value",
-        ),
-        (
-            "VECTOR(4) INDEXING_THRESHOLD 0",
-            Issue::IndexingThresholdNotPositive,
-            "INDEXING_THRESHOLD must be a positive integer",
-        ),
-        (
-            "VECTOR(4) INDEXING_THRESHOLD -1",
-            Issue::IndexingThresholdNotPositive,
-            "INDEXING_THRESHOLD must be a positive integer",
-        ),
-        (
-            "VECTOR(4) INDEXING_THRESHOLD 18446744073709551616",
+            "INDEXING_THRESHOLD 18446744073709551616",
             Issue::IndexingThresholdOutOfRange,
-            "INDEXING_THRESHOLD is outside the persisted numeric range",
         ),
         (
-            "VECTOR(4) COMPACTION (CHANGE_PERCENT = 0)",
+            "COMPACTION (CHANGE_PERCENT = 0)",
             Issue::CompactionPercentOutOfRange,
-            "vector compaction percentages must be integers from 1 through 100",
         ),
         (
-            "VECTOR(4) COMPACTION (CHANGE_PERCENT = 101)",
+            "COMPACTION (CHANGE_PERCENT = 101)",
             Issue::CompactionPercentOutOfRange,
-            "vector compaction percentages must be integers from 1 through 100",
         ),
         (
-            "VECTOR(4) COMPACTION (TOMBSTONE_PERCENT = -5)",
+            "COMPACTION (TOMBSTONE_PERCENT = -5)",
             Issue::CompactionPercentOutOfRange,
-            "vector compaction percentages must be integers from 1 through 100",
         ),
         (
-            "VECTOR(4) COMPACTION (CHANGE_PERCENT = 20, TOMBSTONE_PERCENT = 0)",
+            "COMPACTION (CHANGE_PERCENT = 20, TOMBSTONE_PERCENT = 0)",
             Issue::CompactionPercentOutOfRange,
-            "vector compaction percentages must be integers from 1 through 100",
         ),
     ];
-    for (declared, wanted, sentence) in refused {
+    let sentence = |issue: Issue| match issue {
+        Issue::InvalidMember { .. } => "quantization has an invalid vector policy value",
+        Issue::IndexingThresholdNotPositive => "INDEXING_THRESHOLD must be a positive integer",
+        Issue::IndexingThresholdOutOfRange => {
+            "INDEXING_THRESHOLD is outside the persisted numeric range"
+        }
+        Issue::CompactionPercentOutOfRange => {
+            "vector compaction percentages must be integers from 1 through 100"
+        }
+        other => panic!("no case here is refused as {other:?}"),
+    };
+    for (declared, wanted) in refused {
         let sql = with_vector(declared);
         let error = support::refusal(&db, &sql);
-        assert!(error.to_string().ends_with(sentence), "{sql}: {error}");
+        assert!(
+            error.to_string().ends_with(sentence(wanted)),
+            "{sql}: {error}"
+        );
         match error {
             Error::InvalidVectorPolicyDeclaration { index, issue } => {
                 assert_eq!(index, column("t", "v"), "{sql}");
@@ -1476,17 +1371,17 @@ fn the_index_clauses_are_refused_by_kind() {
     };
     for (declared, sentence) in [
         (
-            "VECTOR(4) WITH (quantization = 'SQ4')",
+            "WITH (quantization = 'SQ4')",
             "WITH (quantization = 'SQ4') is not part of this library: write 'SQ8' to store one \
              byte a component, or leave the clause out to store each vector as given"
                 .to_owned(),
         ),
         (
-            "VECTOR(4) IVF (LISTS = 16, PROBES = 4, REFINE_FACTOR = 2)",
+            "IVF (LISTS = 16, PROBES = 4, REFINE_FACTOR = 2)",
             tuning("IVF"),
         ),
         (
-            "VECTOR(4) SEARCH (TARGET_ACCURACY = 0.95, EXPECTED_VECTORS = 1000000)",
+            "SEARCH (TARGET_ACCURACY = 0.95, EXPECTED_VECTORS = 1000000)",
             tuning("SEARCH"),
         ),
     ] {

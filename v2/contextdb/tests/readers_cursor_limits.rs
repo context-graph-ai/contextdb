@@ -1,18 +1,15 @@
 //! Extends readers_limits.rs and readers_progress.rs; isolated until the cursor API exists.
+#[path = "support/readmem.rs"]
+mod readmem;
 mod support;
-use contextdb::{DatabaseOpenOptions, Error, ReadLimits, ReadSession, params};
+use contextdb::{Error, ReadLimits, ReadSession, params};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+use std::sync::atomic::Ordering::SeqCst;
 use support::{Bytes, Millis, Observer};
 #[test]
 fn a_cursor_holds_one_reader_file_until_it_ends() {
     let folder = support::folder("cursor-limits");
-    let now = Arc::new(AtomicU64::new(0));
-    let mut options = DatabaseOpenOptions::default();
-    options.clock = Some(Arc::new(Millis(now.clone())));
-    let db = support::open_with(&folder, options).unwrap();
-    support::declare(&db);
-    support::insert_together(&db, 1..=3);
+    let (db, now) = readmem::clocked(&folder, 3);
     support::run(&db, "UPDATE t SET name = 'row-00000003' WHERE id = 3");
     let bytes = Arc::new(Bytes::default());
     let measured = db
@@ -111,12 +108,7 @@ fn a_cursor_holds_one_reader_file_until_it_ends() {
 #[test]
 fn a_cursor_nobody_fetches_again_lets_go_of_its_commit_at_its_limit_or_a_purge() {
     let folder = support::folder("cursor-lapse");
-    let now = Arc::new(AtomicU64::new(0));
-    let mut options = DatabaseOpenOptions::default();
-    options.clock = Some(Arc::new(Millis(now.clone())));
-    let db = support::open_with(&folder, options).unwrap();
-    support::declare(&db);
-    support::insert_together(&db, 1..=3);
+    let (db, now) = readmem::clocked(&folder, 3);
     let held = || {
         support::run(&db, "UPDATE t SET tag = tag + 1");
         support::listing(&folder.join("readers")).len()

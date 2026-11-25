@@ -771,18 +771,22 @@ fn searcher(role: &support::Role) {
 
 #[test]
 fn a_replaced_grouping_is_freed_when_its_last_reader_goes() {
-    // 2,000 vectors of 1,024 numbers, two MiB of blocks at a byte a number, are grouped;
-    // 1,000 more make a regrouping due, which replaces them. A reader holds the first
-    // IVF through the switch while new searches use the second, and then lets go.
-    const DIMENSION: usize = 1024;
+    // 1,000 vectors of 512 numbers, half a MiB of blocks at a byte a number, are grouped;
+    // 500 more make a regrouping due, which replaces them. A reader holds the first IVF
+    // through the switch while new searches use the second, and then lets go. The replaced
+    // blocks are some twelfth of the file while held, more than the twentieth the bound
+    // below allows to stay free, so a file that kept them would fail it.
+    const DIMENSION: usize = 512;
     let folder = support::folder("replaced-ivf");
     let db = support::open(&folder);
+    // Not about the interval: MIN_INTERVAL 0 keeps a pass starting at once (design 4, S4).
+    support::run(&db, "SET STORAGE_COMPACTION MIN_INTERVAL 0 SECONDS");
     support::declare_docs(&db, DIMENSION, "INDEXING_THRESHOLD 1000");
-    support::load_docs(&db, 1..=2000, "a", |n| support::gathered(n, DIMENSION));
+    support::load_docs(&db, 1..=1000, "a", |n| support::gathered(n, DIMENSION));
     support::maintenance(&db);
     let first = support::whole(&support::the_partition(&db), "durable_vector_bytes") as u64;
     let held = db.transaction().expect("a reader of the first IVF");
-    support::load_docs(&db, 2001..=3000, "a", |n| support::gathered(n, DIMENSION));
+    support::load_docs(&db, 1001..=1500, "a", |n| support::gathered(n, DIMENSION));
     let mut states = Vec::new();
     while states.len() < 100 && states.last().is_none_or(|state| state != "idle") {
         db.run_maintenance_cycle().expect("a maintenance cycle");
@@ -795,7 +799,7 @@ fn a_replaced_grouping_is_freed_when_its_last_reader_goes() {
     let indexed = support::by_mode(None, "INDEXED", 10);
     let q = support::gathered(97_000, DIMENSION);
     assert_eq!(support::answer(&db, &indexed, &q).rows().len(), 10);
-    assert_eq!(support::int(&held, "SELECT COUNT(*) FROM docs"), 2000);
+    assert_eq!(support::int(&held, "SELECT COUNT(*) FROM docs"), 1000);
     let while_held = support::data_file(&folder);
     let newer = db.read_session(Default::default()).unwrap();
     drop(held);
@@ -808,7 +812,7 @@ fn a_replaced_grouping_is_freed_when_its_last_reader_goes() {
         "the file went from {while_held} to {end} bytes after the reader of {first} bytes of \
          replaced blocks let go"
     );
-    assert_eq!(support::int(&newer, "SELECT COUNT(*) FROM docs"), 3000);
+    assert_eq!(support::int(&newer, "SELECT COUNT(*) FROM docs"), 1500);
 }
 
 #[test]
@@ -832,10 +836,11 @@ fn rows_deleted_under_a_reader_return_their_file_when_it_ends_cycle_after_cycle(
             "deleted rows keep their pages: {ends:?}"
         );
     }
-    let (first, grown) = (ends[0], ends[4]);
+    // 5%, or one page where 5% is under a page, within the section's 10% ceiling.
+    let (first, grown) = (ends[0] / 4096, ends[4] / 4096);
     assert!(
-        grown <= first + first / 20,
-        "the file grew {first} to {grown}: {ends:?}"
+        grown <= first + (first / 20).max(1) && grown <= first + first / 10,
+        "the file grew {first} to {grown} pages: {ends:?}"
     );
 }
 

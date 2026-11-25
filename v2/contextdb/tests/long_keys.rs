@@ -835,6 +835,9 @@ fn a_store_with_twelve_indexes_stays_under_twice_its_bytes_and_under_its_recorde
         tx.execute(sql, &row).expect("insert");
     }
     tx.commit().expect("commit the events");
+    // The promise is the size at rest, not the interval: MIN_INTERVAL 0 lets the pass start in
+    // this short session (design 4, S4).
+    support::run(&db, "SET STORAGE_COMPACTION MIN_INTERVAL 0 SECONDS");
     support::maintenance(&db);
     support::close(db);
     let stored = fs::metadata(folder.join("data")).expect("data file").len();

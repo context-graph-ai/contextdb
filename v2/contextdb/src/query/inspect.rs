@@ -7,7 +7,7 @@ use serde_json::json;
 
 use super::expression::EvalContext;
 use super::plan::{self, Given};
-use super::search::{self, Scope, Search, small};
+use super::search::{self, Scope, Search};
 use super::{QueryResult, Reader, Visible};
 use super::{filter, subquery, table};
 use crate::memory::{Budget, Reservation};
@@ -392,7 +392,7 @@ fn state_name(state: State) -> &'static str {
         State::Idle => "idle",
         State::Pending => "pending",
         State::Building => "building",
-        State::Stalled => "stalled",
+        State::Stalled | State::Full => "stalled",
     }
 }
 
@@ -402,6 +402,7 @@ fn recovery(state: State, wait: &str) -> &str {
         State::Idle => "none",
         State::Pending | State::Building => wait,
         State::Stalled => "raise the memory limit",
+        State::Full => "raise the disk limit or free space",
     }
 }
 
@@ -482,7 +483,7 @@ fn index_row(table: &Table, column: &VectorColumn, parts: &[Inspected], wait: &s
         whole(done),
         whole(total - done),
         whole(unavailable),
-        whole(count(|part| part.state == State::Stalled)),
+        whole(count(|part| part.state >= State::Stalled)),
         text("fan_out"),
         text(recovery(state, wait)),
     ]
@@ -496,6 +497,7 @@ fn partition_row(table: &Table, column: &VectorColumn, part: &Inspected, wait: &
         _ if part.damage => "damaged",
         State::Idle => "none",
         State::Stalled => "memory_limit",
+        State::Full => "disk_limit",
         _ if part.groups == 0 => "unindexed",
         _ if part.left_behind => "tombstones",
         _ => "changes",
@@ -618,7 +620,7 @@ pub(super) fn searched(search: &Search) -> Result<String> {
     let (mode, reader) = (&select.use_vector, given.reader);
     let (bound, filter) = search::bound(select, &given.ctx);
     let mode = mode.unwrap_or_else(|| vector.mode());
-    let scope = Scope::new(table, vector, given);
+    let scope = Scope::new(table, search.qualifier, vector, given);
     // A narrowed handle is told nothing the state of the index decides: no partition is planned.
     let narrowed = !reader.is_admin();
     let mut lines = vec![
@@ -633,7 +635,8 @@ pub(super) fn searched(search: &Search) -> Result<String> {
         let op = if equal { "<=" } else { "<" };
         lines.push(format!("distance_bound: {op} {most}"));
     }
-    let keys = scope.keys(filter.as_ref())?.0;
+    let (keys, on_rows) = scope.keys(filter.as_ref())?;
+    let matching = |tuple: &Key| scope.matches(tuple);
     let every = scope.unbound.take().pop();
     // The list is let go with the text made from it; a reader with no partition plans none.
     let mut reservation = given.budget.reserve(0, "query")?;
@@ -646,12 +649,12 @@ pub(super) fn searched(search: &Search) -> Result<String> {
                 column: vector,
                 mode,
                 scope,
+                matching: Some(&matching),
                 query: &[],
                 k,
-                // Whether rows are turned away is known only when the search runs.
-                filtered: false,
                 ranked: false,
                 bound: None,
+                filtered: on_rows,
             };
             vector::plan(&nearest, given.read, &mut reservation)?
         }
@@ -666,7 +669,6 @@ pub(super) fn searched(search: &Search) -> Result<String> {
         .sum();
     let held = given.ctx.held.expect("explanation reservation");
     held.borrow_mut().grow(bytes)?;
-    let indexed = mode == VectorSearchMode::Indexed;
     let allowed: u64 = planned.iter().map(|partition| partition.live).sum();
     // AUTO over fewer vectors than the column's size is EXACT, as the search settles it.
     let resolved = match mode {
@@ -682,7 +684,14 @@ pub(super) fn searched(search: &Search) -> Result<String> {
             Some(name) => format!("partitions: every partition (${name} is not bound)"),
         });
     }
-    for partition in &planned {
+    let mut seeing = given.budget.reserve(0, "query")?;
+    let visible = Visible::new(table, given.catalog, reader, &mut seeing)?;
+    let source = table::Source::new(table, filter.as_ref(), &given.ctx, given.read, visible);
+    let rest = filter.as_ref().filter(|_| on_rows);
+    let how = (mode, k, search.rank.is_some());
+    let decided = search::decide(&source, (table, &scope.key, rest), &planned, how)?;
+    let refused = search::refusal(mode, &planned, &decided, table.vector_ref(vector));
+    for (partition, decided) in planned.iter().zip(&decided) {
         let route = match partition.route {
             Route::Exact => "exact",
             Route::Indexed => "indexed",
@@ -700,45 +709,50 @@ pub(super) fn searched(search: &Search) -> Result<String> {
             format!("  live_rows: {}", partition.live),
             format!("  unindexed_rows: {}", partition.tail + partition.pending),
         ]);
+        // A refusal made when planning has no walk and no cost to print.
+        if rest.is_none() || refused.is_some() {
+            continue;
+        }
+        let way = if decided.direct { "direct" } else { "walk" };
+        lines.push(format!("  filter_route: {way}"));
+        if decided.path.is_some() {
+            let (m, crossing) = (decided.m, decided.crossing);
+            let m = if m > crossing {
+                format!("more than {crossing}")
+            } else {
+                m.to_string()
+            };
+            lines.push(format!("  direct_cost: {m}"));
+            lines.push(format!("  walk_cost: {}", decided.walk));
+        }
     }
     // The path the filter is read by, as its table source says it, when every name has a value.
-    if let Some(filter) = filter.as_ref().filter(|_| every.is_none()) {
-        let mut seeing = given.budget.reserve(0, "query")?;
-        let visible = Visible::new(table, given.catalog, reader, &mut seeing)?;
-        let source = table::Source::new(table, Some(filter), &given.ctx, given.read, visible);
+    if filter.is_some() && every.is_none() {
         source.say(&[], &[], &[])?;
         let said = given.ctx.said.map(|said| said.take()).unwrap_or_default();
         let mut said = said.iter().map(|line| line.trim_start());
         let path = said.next().filter(|path| *path != "Scan");
         lines.push(format!("filter_path: {}", path.unwrap_or("none")));
         lines.extend(said.map(str::to_owned));
-        // Rows a path reaches are compared one by one, and no partition searched, when few.
-        if !narrowed && path.is_some() {
-            let few = source.few(&source.choose(&[], &[])?, small(&planned, k))?;
-            lines.push(format!("small_set: {}", if few { "yes" } else { "no" }));
-        }
-        // For a filter of one case no index serves: the index that would, by the columns the
-        // case gives values then one it gives a range.
+        // For a filter of one case that is not countable for a selected partition: the index
+        // that would be, by the partition's columns, the columns the case gives values, then
+        // one it gives a range.
         let (columns, cases) = (&table.meta.columns, &source.facts()?.cases);
         let case = cases.iter().flatten().filter(|_| cases.len() == 1);
         let (values, ranges): (Vec<_>, Vec<_>) = case
-            .filter(|(at, _)| *at < columns.len())
+            .filter(|(at, _)| *at < columns.len() && !scope.key.contains(at))
             .partition(|(_, fact)| matches!(fact, filter::Fact::Among { .. }));
-        let wanted = values
-            .iter()
-            .chain(ranges.first())
-            .map(|(at, _)| &columns[*at].name);
+        let wanted = values.iter().chain(ranges.first()).map(|(at, _)| at);
+        let wanted = scope.key.iter().chain(wanted).map(|at| &columns[*at].name);
         let wanted: Vec<&str> = wanted.map(String::as_str).collect();
-        if path.is_none() && !wanted.is_empty() {
+        let uncountable = rest.is_some() && decided.iter().any(|d| d.path.is_none());
+        if (uncountable || planned.is_empty() && path.is_none()) && !wanted.is_empty() {
             let (name, list) = (&table.name, wanted.join(", "));
             let index = format!("{name}_{}_idx", wanted.join("_"));
             lines.push(format!("recovery: CREATE INDEX {index} ON {name} ({list})"));
         }
     }
-    // A search under INDEXED with a partition that is not usable is refused whole.
-    let index = table.vector_ref(vector);
-    let refused = indexed && planned.iter().any(|partition| !partition.usable);
-    let refused = refused.then(|| Error::VectorIndexedRouteUnavailable { index }.to_string());
+    let refused = refused.map(|refused| refused.to_string());
     let refused = refused.as_deref().unwrap_or("none");
     lines.extend((!narrowed && keys.is_some()).then(|| format!("refusal: {refused}")));
     Ok(lines.join("\n"))

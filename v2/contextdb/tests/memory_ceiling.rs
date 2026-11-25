@@ -113,7 +113,8 @@ fn a_million_rows_load_and_scan_under_64_mib() {
         db.export_snapshot(&exported).unwrap();
         let records = vector_records(&exported);
         let ivf = records.iter().find(|(k, _)| k[0] == 3).unwrap().1;
-        let starts: Vec<_> = ivf[12..]
+        // The record ends with the reach, a count for each of 16 levels (7364fc08b).
+        let starts: Vec<_> = ivf[12..ivf.len() - 4 * 16]
             .chunks_exact(8)
             .map(|p| {
                 3 * u32::from_le_bytes(p[..4].try_into().unwrap())
@@ -321,15 +322,19 @@ fn a_refused_compressed_value_is_never_produced() {
         refused_select(&role);
         return refused_json(&role);
     }
+    // The filler is written once and each door's store begins as a copy of it.
+    let filled = support::folder("delivery-filler");
+    let db = support::open(&filled);
+    write_the_filler(&db);
+    support::close(db);
     let mut peaks = Vec::new();
     for door in "delivery-status delivery-metrics delivery-pass1 delivery-pass10".split_whitespace()
     {
         let path = support::folder(door);
+        fs::copy(filled.join("data"), path.join("data")).expect("copy the filled store");
         let count = if door.ends_with("10") { 10 } else { 1 };
         let bytes = if door.contains("pass") { 8 } else { 2 << 20 };
-        let db = support::delivery_queue(&path, bytes, count);
-        write_the_filler(&db);
-        support::close(db);
+        support::close(support::delivery_queue(&path, bytes, count));
         let lines =
             support::Child::start("a_refused_compressed_value_is_never_produced", door, &path)
                 .end();
@@ -386,6 +391,8 @@ fn a_refused_compressed_value_is_never_produced() {
     );
     let folder = support::folder("refused-value-never-produced");
     let db = support::open(&folder);
+    // Not about the interval: MIN_INTERVAL 0 keeps a pass starting at once (design 4, S4).
+    support::run(&db, "SET STORAGE_COMPACTION MIN_INTERVAL 0 SECONDS");
     support::run(
         &db,
         "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",

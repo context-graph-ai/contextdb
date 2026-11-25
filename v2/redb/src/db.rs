@@ -691,16 +691,10 @@ impl Database {
         loop {
             let progress = match (|| -> Result<bool, CompactionError> {
                 let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
-                let (moved, position) = txn.compact_pages(1_000_000, next.as_deref())?;
-                let advanced = position != next;
+                let (step, position) = txn.compact_pages(1_000_000, next.as_deref())?;
                 next = position;
-                let progress = moved > 0 || advanced;
-                if progress {
-                    txn.commit().map_err(|e| e.into_storage_error())?;
-                } else {
-                    txn.abort()?;
-                }
-                Ok(progress)
+                txn.commit().map_err(|e| e.into_storage_error())?;
+                Ok(!step.ended)
             })() {
                 Err(CompactionError::Storage(StorageError::Io(ref e)))
                     if e.get_ref().is_some_and(|e| e.is::<crate::FileSizeLimit>()) =>
@@ -1157,6 +1151,11 @@ impl Database {
     fn ensure_allocator_state_table_and_trim(&self) -> Result<(), Error> {
         while self.recovery_state()?.0.is_some() {
             self.recovery_step(4096)?;
+        }
+        // The allocator state the last commit saved still holds when nothing committed since:
+        // saving it again would take pages beside the copy it replaces, and grow a packed file
+        if Self::get_allocator_state_table(&self.mem)?.is_some() {
+            return Ok(());
         }
         // Make a new quick-repair commit to update the allocator state table
         #[cfg(feature = "logging")]

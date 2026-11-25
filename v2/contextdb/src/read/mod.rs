@@ -262,11 +262,11 @@ impl ReadSession {
     /// `StoreMissing` if absent; `StoreCorrupted` on damaged records; `StoreIo` on file
     /// failures; `MemoryBudgetExceeded` when the separate opening caches cannot fit.
     pub fn open_with_options(path: impl AsRef<Path>, options: ReadSessionOptions) -> Result<Self> {
+        query::limit("cache_share", options.limits.cache_share.unwrap_or(0), 100)?;
         let limit = crate::settings::limit(options.limits.memory);
         let cache = crate::store::cache_under(limit, options.limits.cache_share);
         crate::memory::admit(limit, crate::memory::account(limit, cache, None))?;
         let budget = Budget::new(limit)?;
-        query::limit("cache_share", options.limits.cache_share.unwrap_or(0), 100)?;
         let store = Store::open_for_reading(path.as_ref(), &budget, &options)?;
         Ok(Self {
             plans: KeptPlans::new(&budget, budget.limit())?,

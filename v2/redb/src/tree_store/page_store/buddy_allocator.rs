@@ -180,6 +180,41 @@ impl BuddyAllocator {
         None
     }
 
+    /// The nearest aligned run of `order` ending by page `end` with some free pages and no more
+    /// taken ones than the free pages before it, `lower` carrying that count in from the regions
+    /// before; the run's first page and its free blocks.
+    pub(crate) fn nearest_run(
+        &self,
+        order: u8,
+        end: u32,
+        lower: &mut u64,
+    ) -> Option<(u32, Vec<(u32, u8)>)> {
+        let (size, mut best, mut page) = (1u32 << order, None, 0);
+        for start in (0..self.len() / size).map(|i| i * size) {
+            if start + size > end {
+                break;
+            }
+            // A run inside a free block already counted is wholly free
+            if page > start {
+                continue;
+            }
+            let (mut free, mut blocks) = (0, Vec::new());
+            while page < start + size {
+                let Some(order) = self.find_free_order(page) else {
+                    page += 1;
+                    continue;
+                };
+                blocks.push((page >> order, order));
+                (free, page) = (free + (1 << order), page + (1 << order));
+            }
+            if free < size && free > 0 && u64::from(size - free) <= *lower {
+                best = Some((start, blocks));
+            }
+            *lower += u64::from(free);
+        }
+        best
+    }
+
     pub(crate) fn trailing_free_pages(&self) -> u32 {
         let mut free_pages = 0;
         let mut next_page = self.len() - 1;
@@ -289,7 +324,7 @@ impl BuddyAllocator {
         self.debug_check_consistency();
     }
 
-    #[allow(unused_variables)]
+    #[allow(unused_variables, clippy::unused_self)]
     fn debug_check_consistency(&self) {
         // Don't enable when fuzzing, because this is kind of expensive
         #[cfg(all(debug_assertions, not(fuzzing)))]
@@ -421,28 +456,30 @@ impl BuddyAllocator {
     }
 
     /// data must have been initialized by `Self::init_new()`
-    pub(crate) fn free(&mut self, page_number: u32, order: u8) {
+    /// Frees the page, merging it with free buddies; returns the order of the free block it ends in
+    pub(crate) fn free(&mut self, page_number: u32, order: u8) -> u8 {
         debug_assert!(self.get_order_free_mut(order).get(page_number));
 
         // Update the free index and merge free pages
-        self.free_inner(page_number, order);
+        self.free_inner(page_number, order)
     }
 
-    pub(crate) fn free_inner(&mut self, page_number: u32, order: u8) {
+    pub(crate) fn free_inner(&mut self, page_number: u32, order: u8) -> u8 {
         if order == self.max_order {
             let allocator = self.get_order_free_mut(order);
             allocator.clear(page_number);
-            return;
+            return order;
         }
 
         let allocator = self.get_order_free_mut(order);
         let buddy = buddy_page(page_number);
         if buddy >= allocator.len() || allocator.get(buddy) {
             allocator.clear(page_number);
+            order
         } else {
             // Merge into higher order page
             allocator.set(buddy);
-            self.free_inner(next_higher_order(page_number), order + 1);
+            self.free_inner(next_higher_order(page_number), order + 1)
         }
     }
 
@@ -458,6 +495,17 @@ impl BuddyAllocator {
 #[cfg(test)]
 mod test {
     use crate::tree_store::page_store::buddy_allocator::BuddyAllocator;
+
+    #[test]
+    fn a_run_counts_each_free_page_below_it_once() {
+        let mut allocator = BuddyAllocator::new(1 << 18, 1 << 18);
+        allocator.record_alloc(1 << 17, 0);
+        let run = allocator.nearest_run(1, 1 << 18, &mut 0);
+        assert_eq!(run, Some((1 << 17, vec![((1 << 17) + 1, 0)])));
+        // Free pages counted across regions may pass what a region's count holds.
+        let mut lower = u32::MAX.into();
+        assert_eq!(allocator.nearest_run(1, 1 << 18, &mut lower), run);
+    }
 
     #[test]
     fn record_alloc_buddy() {

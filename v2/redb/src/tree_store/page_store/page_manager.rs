@@ -20,6 +20,7 @@ use std::collections::HashSet;
 use std::convert::TryInto;
 use std::io::ErrorKind;
 use std::marker::PhantomData;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -101,6 +102,9 @@ impl InMemoryState {
 
 pub(crate) struct TransactionalMemory {
     pub(crate) last_freed_pages: AtomicU64,
+    // The largest block compaction found with no place below it (order, address), for its next
+    // walk
+    pub(crate) stuck: Mutex<Option<(u8, u64)>>,
     // Pages allocated since the last commit
     // TODO: maybe this should be moved to WriteTransaction?
     pub(super) allocated_since_commit: Mutex<PageTrackerPolicy>,
@@ -115,6 +119,9 @@ pub(crate) struct TransactionalMemory {
     pub(super) commit_pages: Mutex<Option<PageNumber>>,
     pub(crate) file_size_limit: AtomicU64,
     pub(crate) compaction_position: Mutex<(bool, Option<Vec<u8>>, bool)>,
+    // The most pages the open write transaction has taken and not committed, and the last
+    // commit's low mark
+    pub(crate) taken: Mutex<(u64, Option<u64>)>,
     allocator_state_lowest: AtomicBool,
     storage: PagedCachedFile,
     pub(super) state: Mutex<InMemoryState>,
@@ -267,6 +274,7 @@ impl TransactionalMemory {
 
         Ok(Self {
             last_freed_pages: AtomicU64::new(0),
+            stuck: Mutex::new(None),
             allocated_since_commit: Mutex::new(PageTrackerPolicy::new_tracking()),
             unpersisted: Mutex::new(Default::default()),
             needs_recovery: AtomicBool::new(needs_recovery),
@@ -277,6 +285,7 @@ impl TransactionalMemory {
             commit_pages: Mutex::new(None),
             file_size_limit: AtomicU64::new(u64::MAX),
             compaction_position: Mutex::new((false, None, false)),
+            taken: Mutex::new((0, None)),
             allocator_state_lowest: AtomicBool::new(false),
             storage,
             state: Mutex::new(state),
@@ -311,6 +320,7 @@ impl TransactionalMemory {
 
         Ok(Self {
             last_freed_pages: AtomicU64::new(0),
+            stuck: Mutex::new(None),
             allocated_since_commit: Mutex::new(PageTrackerPolicy::new_tracking()),
             unpersisted: Mutex::new(Default::default()),
             needs_recovery: AtomicBool::new(false),
@@ -321,6 +331,7 @@ impl TransactionalMemory {
             commit_pages: Mutex::new(None),
             file_size_limit: AtomicU64::new(u64::MAX),
             compaction_position: Mutex::new((false, None, false)),
+            taken: Mutex::new((0, None)),
             allocator_state_lowest: AtomicBool::new(false),
             storage,
             // A reader never allocates, so it builds no allocators
@@ -714,7 +725,7 @@ impl TransactionalMemory {
         Ok(())
     }
 
-    #[cfg_attr(not(debug_assertions), expect(unused_variables))]
+    #[cfg_attr(not(debug_assertions), allow(unused_variables, clippy::unused_self))]
     pub(crate) fn is_allocated(&self, page: PageNumber) -> bool {
         #[cfg(debug_assertions)]
         {
@@ -903,12 +914,12 @@ impl TransactionalMemory {
         let mut guard = self.allocated_since_commit.lock().unwrap();
         for page_number in guard.iter() {
             let region_index = page_number.region;
-            state
-                .get_region_tracker_mut()
-                .mark_free(page_number.page_order, region_index);
-            state
+            let order = state
                 .get_region_mut(region_index)
                 .free(page_number.page_index, page_number.page_order);
+            state
+                .get_region_tracker_mut()
+                .mark_free(order, region_index);
             #[cfg(debug_assertions)]
             assert!(self.allocated_pages.lock().unwrap().remove(&page_number));
 
@@ -1115,13 +1126,13 @@ impl TransactionalMemory {
         let mut state = self.state.lock().unwrap();
         let region_index = page.region;
         // Free in the regional allocator
-        state
+        let order = state
             .get_region_mut(region_index)
             .free(page.page_index, page.page_order);
-        // Ensure that the region is marked as having free space
+        // Mark the region as having a free block of the order the page merged into
         state
             .get_region_tracker_mut()
-            .mark_free(page.page_order, region_index);
+            .mark_free(order, region_index);
 
         let address_range = page.address_range(
             self.page_size.into(),
@@ -1207,10 +1218,10 @@ impl TransactionalMemory {
         }
 
         if transactional {
-            self.allocated_since_commit
-                .lock()
-                .unwrap()
-                .insert(page_number);
+            let mut since = self.allocated_since_commit.lock().unwrap();
+            since.insert(page_number);
+            let mut taken = self.taken.lock().unwrap();
+            taken.0 = taken.0.max(since.counts().0 as u64);
         }
 
         let address_range = page_number.address_range(
@@ -1428,6 +1439,75 @@ impl TransactionalMemory {
 
     pub(crate) fn allocate_lowest<'txn>(&self, allocation_size: usize) -> Result<PageMut<'txn>> {
         self.allocate_helper(allocation_size, true, true)
+    }
+
+    /// The lowest free place of a page of `order`, when one lies within the file's allowed growth
+    pub(crate) fn allocate_within<'txn>(&self, order: u8) -> Result<Option<PageMut<'txn>>> {
+        match self.allocate_lowest((self.page_size as usize) << order) {
+            Err(StorageError::Io(e))
+                if e.get_ref().is_some_and(|e| e.is::<crate::FileSizeLimit>()) =>
+            {
+                Ok(None)
+            }
+            copy => copy.map(Some),
+        }
+    }
+
+    /// The lowest free place of `page`'s size, when it lies wholly below `page`
+    pub(crate) fn allocate_below<'txn>(&self, page: PageNumber) -> Result<Option<PageMut<'txn>>> {
+        let (size, header) = (self.page_size, self.region_header_with_padding_size);
+        let start = |p: PageNumber| p.address_range(size.into(), self.region_size, header, size);
+        let Some(copy) = self.allocate_within(page.page_order)? else {
+            return Ok(None);
+        };
+        let number = copy.get_page_number();
+        if start(number).end <= start(page).start {
+            return Ok(Some(copy));
+        }
+        drop(copy);
+        self.free_if_uncommitted(number, &mut PageTrackerPolicy::Ignore);
+        Ok(None)
+    }
+
+    /// Holds taken, until [`Self::give_back`], the free blocks of the aligned run of `order`
+    /// nearest under page `below` with some free pages and no more taken ones than the free pages
+    /// below it, so nothing is placed in it; returns the run's pages and the blocks held. The
+    /// nearest is the last a commit's lowest places would fill again.
+    pub(crate) fn hold_run(&self, order: u8, below: u64) -> (Range<u64>, Vec<PageNumber>) {
+        let mut state = self.state.lock().unwrap();
+        let layout = state.header.layout();
+        let region_pages = u64::from(layout.full_region_layout().num_pages());
+        let (mut best, mut lower) = (None, 0);
+        for region in 0..layout.num_regions() {
+            let first = u64::from(region) * region_pages;
+            let end = u32::try_from(below.saturating_sub(first).min(region_pages)).unwrap();
+            let allocator = state.get_region(region);
+            if let Some((start, blocks)) = allocator.nearest_run(order, end, &mut lower) {
+                best = Some((first + u64::from(start), region, blocks));
+            }
+        }
+        let Some((at, region, blocks)) = best else {
+            return (0..0, Vec::new());
+        };
+        let blocks: Vec<_> = (blocks.into_iter())
+            .map(|(index, order)| PageNumber::new(region, index, order))
+            .collect();
+        for page in &blocks {
+            let allocator = state.get_region_mut(region);
+            allocator.record_alloc(page.page_index, page.page_order);
+        }
+        (at..at + (1 << order), blocks)
+    }
+
+    /// Gives back to the allocator the blocks [`Self::hold_run`] held
+    pub(crate) fn give_back(&self, held: Vec<PageNumber>) {
+        let mut state = self.state.lock().unwrap();
+        for page in held {
+            let order = state
+                .get_region_mut(page.region)
+                .free(page.page_index, page.page_order);
+            state.get_region_tracker_mut().mark_free(order, page.region);
+        }
     }
 
     pub(crate) fn count_uncommitted_pages(&self) -> usize {

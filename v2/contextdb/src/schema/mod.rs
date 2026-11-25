@@ -34,8 +34,8 @@ use crate::sql::ast::EventDeclaration;
 use crate::sql::plan::{CreateTablePlan, InsertPlan};
 use crate::sql::{self, Expr, Plan};
 use crate::store::{
-    Cell, ChangeSet, Entry, EntryShape, IndexId, Read, Record, Row, SCHEDULE, TableId, VectorId,
-    View,
+    Cell, ChangeSet, Entry, EntryShape, IndexId, OWED, Read, Record, Row, SCHEDULE, TableId,
+    VectorId, View,
 };
 pub(crate) use crate::types::Quantization;
 use crate::types::{
@@ -510,6 +510,20 @@ impl Catalog {
                 Ok(true)
             },
         )?;
+        // A number an owed range names is not given again while it owes.
+        for (source, n) in catalog.numbers.iter_mut().enumerate() {
+            let range = [source as u8, source as u8 + 1].map(|at| [OWED, at]);
+            view.deliveries(
+                (Included(&range[0][..]), Excluded(&range[1][..])),
+                &mut |key, _| {
+                    let id = key
+                        .get(2..6)
+                        .map_or(0, |id| u32::from_be_bytes(id.try_into().unwrap()));
+                    *n = (*n).max(id + 1);
+                    Ok(true)
+                },
+            )?;
+        }
         // A reference may name a table loaded after its own.
         let _copy = budget.reserve(catalog.pointers(), "loading declarations")?;
         for table in catalog.tables.clone().into_values() {

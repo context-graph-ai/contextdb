@@ -62,6 +62,7 @@ fn ivf_of(build: &Build, step: &mut Step, (gap, probes, width): (u32, u32, u8)) 
         probes,
         width,
         starts: build.starts.clone(),
+        reach: build.reach,
     })
 }
 
@@ -207,7 +208,6 @@ pub(super) fn pack(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
                 let key = block.key(at);
                 held.grow(key.as_bytes().len() as u64)?;
                 slots.extend_from_slice(block.slot(at));
-                step.rows_read += 1;
                 found.push((to(at), key, found.len() as u32));
             }
             Ok(())
@@ -315,10 +315,11 @@ pub(super) fn pack(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
 /// Makes question `number` of a build over `slots` slots in `query`, from the vectors that
 /// slots of the new IVF keep (scale times codes), brought to length one. An even
 /// question is the middle of two: the slot at `number * slots / M`, with `M` the lesser of
-/// `MEASURED` and `slots`, and the one half the IVF further on, added. An odd question is
-/// the first of those alone, a stored vector, whose nearest slot is itself: a search asks
-/// both kinds. A slot is found from the running sum of the groups' counts and the place
-/// where its group begins; no row is read.
+/// `MEASURED` and `slots`, and the one half the IVF and half a question's step (one slot at
+/// least) further on, added, so that no two questions are the middle of one pair. An odd
+/// question is the first of those alone, a stored vector, whose nearest slot is itself: a
+/// search asks both kinds. A slot is found from the running sum of the groups' counts and the
+/// place where its group begins; no row is read.
 fn question(
     ground: &Ground<'_>,
     vector: VectorId,
@@ -332,7 +333,8 @@ fn question(
     query.resize(ground.dimension, 0.0);
     let first = u64::from(number) * slots / slots.min(u64::from(MEASURED));
     let taken = 2 - number as usize % 2;
-    for mut ordinal in [first, (first + slots / 2) % slots].into_iter().take(taken) {
+    let second = (first + slots / 2 + (slots / u64::from(2 * MEASURED)).max(1)) % slots;
+    for mut ordinal in [first, second].into_iter().take(taken) {
         let mut group = 0;
         while ordinal >= u64::from(build.counts[group]) {
             ordinal -= u64::from(build.counts[group]);
@@ -358,7 +360,8 @@ fn question(
 
 /// The step that asks the new IVF the next of its questions (`build::MEASURED`) and
 /// keeps the largest gap any of them needed for its ten nearest: how far the centroid of the
-/// furthest group holding one of them falls short of the best centroid's product.
+/// furthest group holding one of them falls short of the best centroid's product; and, in the
+/// same pass, at each likeness level the most groups any of them needed (`Build::reach`).
 pub(super) fn measure(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
     let Phase::Measure { mut done, mut most } = ground.build.phase else {
         unreachable!("a build that measures its gap is in that phase")
@@ -377,7 +380,8 @@ pub(super) fn measure(ground: &Ground<'_>, step: &mut Step) -> Result<()> {
         let taken = step.held.bytes();
         step.held.grow(80)?;
         let held = &mut step.held;
-        let (gap, places) = gap_needed(read, vector, grouped, &ivf, &query, held)?;
+        let reach = &mut build.reach;
+        let (gap, places) = gap_needed(read, vector, grouped, &ivf, &query, held, reach)?;
         most = most.max(gap);
         build.tens.extend(places);
         step.held.shrink(step.held.bytes() - taken);

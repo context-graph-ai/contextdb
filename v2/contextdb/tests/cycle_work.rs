@@ -1,6 +1,5 @@
-//! What one maintenance cycle reads. A camera box keeps up with 500 rows a second for a day only
-//! when a cycle reads each row it seals or packs once and no other row: the difference across
-//! the cycle in `Database::work_done()`, the store's running totals since it opened.
+//! What one maintenance cycle reads. Sealing and packing copy slots and read no row (design
+//! 1078, 1793): the difference across the cycle in `Database::work_done()`, the store's totals.
 
 mod support;
 use support::count;
@@ -16,7 +15,7 @@ fn one_cycle(db: &Database) -> (u64, contextdb::VectorMaintenanceReport) {
 }
 
 #[test]
-fn a_cycle_reads_each_row_it_seals_once() {
+fn a_cycle_reads_no_row_to_seal_or_pack() {
     let folder = support::folder("cycle-reads");
     let db = support::open(&folder);
     support::declare_docs(&db, 768, "INDEXING_THRESHOLD 300");
@@ -25,18 +24,17 @@ fn a_cycle_reads_each_row_it_seals_once() {
     let (read, report) = one_cycle(&db);
     assert_eq!(
         (read, count(report.maintenance_vectors_done)),
-        (100, 100),
-        "the rows read by the cycle that seals the 100 vectors left, and the vectors it sealed"
+        (0, 100),
+        "sealing copies the 100 vectors' slots and reads no row: rows read, vectors sealed"
     );
-    // An IVF made due: each cycle of its build reads the rows it seals or packs, once each.
+    // An IVF made due: a cycle of its build copies the slots it seals or packs, reading no row.
     support::load_docs(&db, 101..=400, "a", |n| support::gathered(n, 768));
     let mut done = 0;
     for ran in 1..=1000 {
         let (read, report) = one_cycle(&db);
         assert_eq!(
-            read,
-            count(report.maintenance_vectors_done),
-            "the rows cycle {ran} of the build read, against the vectors it sealed or packed"
+            read, 0,
+            "cycle {ran} sealed or packed by copying slots, yet read rows"
         );
         done += count(report.maintenance_vectors_done);
         if count(report.maintenance_vectors_remaining) == 0
