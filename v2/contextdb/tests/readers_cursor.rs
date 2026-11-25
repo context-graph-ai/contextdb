@@ -14,7 +14,10 @@ fn a_cursor_page_reads_its_own_rows() {
         let mut limits = contextdb::ReadLimits::default();
         (limits.result_rows, limits.cursor_page_rows, limits.work) = (2, 1, 3);
         let session = support::read_session(&db, &folder, file, limits.clone()).unwrap();
-        let q = params! {"body" => support::letters(1, 512 << 10)};
+        // Large rows are for the byte count below, which only the session in this process
+        // takes; a file session's rows are small.
+        let body = if file { 16 << 10 } else { 512 << 10 };
+        let q = params! {"body" => support::letters(1, body)};
         db.execute("UPDATE t SET name = $body", &q).unwrap();
         let sql = "SELECT id, name FROM t";
         bytes.store(0, SeqCst);
@@ -97,9 +100,11 @@ fn a_cursor_page_reads_its_own_rows() {
         let mut memory = support::reader_options(Some(16 << 20)).limits;
         memory.cursor_page_rows = 1;
         let bounded = support::read_session(&db, &folder, file, memory).unwrap();
-        // The whole answer is built by the first fetch, which is where it is refused.
+        // The whole answer is built by the first fetch, which is where it is refused: 40 rows of
+        // 512 KiB, past the 16 MiB limit.
+        let big = params! {"big" => support::letters(1, 512 << 10)};
         let whole = bounded
-            .open_cursor("SELECT DISTINCT id, $body FROM t", &q)
+            .open_cursor("SELECT DISTINCT id, $big FROM t", &big)
             .and_then(|mut cursor| cursor.fetch(None));
         assert!(matches!(whole, Err(Error::MemoryBudgetExceeded { .. })));
         assert!(support::listing(&folder.join("readers")).is_empty());

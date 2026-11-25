@@ -1,8 +1,9 @@
-//! An exact search with a row condition over a narrowed handle: where the table's vectors are at
-//! least 16 times the key set's rows it walks those rows and compares them; under that it screens
-//! every slot by its one-byte copy and measures only the key set's slots (sheet section 10).
+//! An exact search with a row condition: it compares the rows its condition reaches where that
+//! costs no more than its walk, and otherwise screens every vector once (design F3).
 
 mod support;
+#[path = "support/vecsearch.rs"]
+mod vecsearch;
 use contextdb::Value;
 
 const DIMENSION: usize = 16;
@@ -10,90 +11,65 @@ const EXACT: &str = "USE VECTOR EXACT LIMIT 10";
 
 #[test]
 fn an_exact_search_compares_the_vectors_of_the_rows_its_condition_reaches() {
-    for (rows, c) in [
-        (2000_i64, 200_i64),
-        (2000, 2000),
-        (20_000, 200),
-        (20_000, 1000),
-        (20_000, 2000),
+    // Each table: the sizes of its contexts in the order they are loaded, and the contexts
+    // asked of it. A table of 2,000 rows is asked a Context of 200 and one of 2,000, both under
+    // a sixteenth of it; one of 20,000 rows a Context of 200 and one of 1,000, a sixteenth of it
+    // or less, and one of 2,000, more.
+    let mixed = [vec![200_i64; 25], vec![1000; 5], vec![2000; 5]].concat();
+    for (sizes, asked) in [
+        (vec![200_i64; 10], vec![5]),
+        (vec![2000], vec![0]),
+        (mixed, vec![12, 27, 32]),
     ] {
-        let db = support::open(&support::folder(&format!("exact-work-{rows}-{c}")));
-        support::declare_docs(&db, DIMENSION, "");
+        let rows: i64 = sizes.iter().sum();
+        let name = format!("exact-work-{rows}-{}", sizes.len());
+        let (_, db) = vecsearch::docs(&name, DIMENSION, "");
         support::run(&db, "CREATE INDEX docs_ctx ON docs (ctx)");
-        for first in (0..rows / c).map(|j| j * c) {
-            support::load_docs(
-                &db,
-                first + 1..=first + c,
-                &format!("c{}", first / c),
-                |n| support::gathered(n, DIMENSION),
-            );
+        // Of each Context asked: its size, its name and the row before its first.
+        let mut cases = Vec::new();
+        let mut first = 0;
+        for (number, &c) in sizes.iter().enumerate() {
+            let ctx = format!("c{number}");
+            support::load_docs(&db, first + 1..=first + c, &ctx, |n| {
+                support::gathered(n, DIMENSION)
+            });
+            if asked.contains(&number) {
+                cases.push((c, ctx, first));
+            }
+            first += c;
         }
-        let asked = rows / c / 2;
-        let ctx = format!("c{asked}");
-        let query = support::gathered(asked * c + 7, DIMENSION);
-        let sql = format!(
-            "SELECT id, v <=> $q AS distance FROM docs WHERE ctx = '{ctx}' ORDER BY distance USE VECTOR EXACT LIMIT 10"
-        );
-        let wanted = support::stored(&db, "SELECT id, ctx, tag, v FROM docs").nearest(
-            |row| row[1] == support::text(&ctx),
-            &query,
-            10,
-        );
+        let every = support::stored(&db, "SELECT id, ctx, tag, v FROM docs");
         for (when, sealed) in [("loose", false), ("sealed", true)] {
             if sealed {
                 support::seal_all(&db);
             }
-            let found = support::answer(&db, &sql, &query);
-            support::assert_same_rows(&support::found(&found, when), &wanted, when);
-            // The designer's rule (sheet section 10). Where the table's vectors N are at least 16
-            // times the key set's m rows, the search walks those rows: m compared, and m rows plus
-            // the 10 answer rows examined. Under 16m it takes the key-set route: it gathers the
-            // key set's c entries (each charged), screens every sealed vector by its one-byte copy
-            // (one compared each), and measures exactly only the key set's rows: e exact distances,
-            // each of a row read for it. Compared = screens + e, rows examined = c + e + LIMIT, and
-            // e is at most m, because every exact distance passes the key-set check first.
-            let (n, m) = (rows as u64, c as u64);
-            let compared = found.distance_evaluations();
-            let examined = found.rows_examined();
-            if n >= 16 * m {
-                assert_eq!(
-                    compared, m,
-                    "table {rows}, Context {c}, {when}: N is at least 16m, so the search walks the key set's rows and compares m"
+            for (c, ctx, first) in &cases {
+                let (c, query) = (*c, support::gathered(first + 7, DIMENSION));
+                let sql = format!(
+                    "SELECT id, v <=> $q AS distance FROM docs WHERE ctx = '{ctx}' ORDER BY distance USE VECTOR EXACT LIMIT 10"
                 );
-                assert_eq!(
-                    examined,
-                    m + 10,
-                    "table {rows}, Context {c}, {when}: a walk reads the m rows and the 10 answer rows"
-                );
-            } else {
-                assert!(
-                    examined >= m + 10,
-                    "table {rows}, Context {c}, {when}: the key-set route gathers its {m} entries and the 10 answer rows are read: {examined} examined"
-                );
-                let exact = examined - m - 10;
-                assert!(
-                    exact <= m,
-                    "table {rows}, Context {c}, {when}: {exact} exact distances, of a key set of {m}: a vector outside the set was measured"
-                );
-                assert!(
-                    compared <= n + m,
-                    "table {rows}, Context {c}, {when}: {compared} compared, over one screen for each of the {n} vectors and one exact distance for each of the {m} in the set"
-                );
-                // The vectors sealed are screened, and the pending ones are not: all or none where
-                // the test knows which. At 20,000 rows 14,166 are sealed by the load itself, a
-                // count the engine's block size decides, so that one case asserts the bounds only.
-                let screens = if sealed {
-                    Some(n)
-                } else if rows <= 2000 {
-                    Some(0)
+                let wanted = every.nearest(|row| row[1] == support::text(ctx), &query, 10);
+                let found = support::answer(&db, &sql, &query);
+                support::assert_same_rows(&support::found(&found, when), &wanted, when);
+                // The route is chosen by counted cost (design F3): comparing the m rows the key's
+                // path reaches costs m, and the walk, with no index a screen of the table, a 16th
+                // of its N vectors plus 3 rows read for each of the 10 asked for in every N/m.
+                let (n, m) = (rows as u64, c as u64);
+                let compared = found.distance_evaluations();
+                let examined = found.rows_examined();
+                if m * m <= m * n / 16 + 3 * 10 * n {
+                    let direct = [compared, examined] == [m, m + 10];
+                    let what = format!("table {rows}, Context {c}, {when}");
+                    assert!(
+                        direct,
+                        "{what}: compares the m rows, reads them and the 10 answer rows"
+                    );
                 } else {
-                    None
-                };
-                if let Some(screens) = screens {
-                    assert_eq!(
-                        compared,
-                        screens + exact,
-                        "table {rows}, Context {c}, {when}: compared is the screens plus the exact distances"
+                    // The walk screens each vector at most once and compares a row it reads once
+                    // more; the doubling check keeps the rows read to test the filter below 3m.
+                    assert!(
+                        compared <= n + examined && examined < 3 * m + 10,
+                        "table {rows}, Context {c}, {when}: {compared} compared, {examined} read"
                     );
                 }
             }

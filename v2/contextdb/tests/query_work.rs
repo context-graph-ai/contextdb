@@ -297,25 +297,33 @@ fn is_refused_by_depth(result: contextdb::Result<contextdb::QueryResult>) -> boo
     }
 }
 
+/// What went wrong, if anything, with `read` of `what` (read) and with `refused` (refused by
+/// depth), each run by `ran`.
+fn read_and_refused(
+    what: &str,
+    [read, refused]: [usize; 2],
+    ran: impl Fn(usize) -> contextdb::Result<contextdb::QueryResult>,
+) -> Vec<String> {
+    let mut told = Vec::new();
+    if let Err(error) = ran(read) {
+        told.push(format!("{read} {what} were refused: {error:?}"));
+    }
+    if !is_refused_by_depth(ran(refused)) {
+        told.push(format!("{refused} {what} were not refused by depth"));
+    }
+    told
+}
+
 /// What went wrong, if anything, with 64 levels of an expression that nests by `open` and
 /// `close` (read) and with 65 (refused by depth).
 fn nested_to_the_limit(db: &Database, open: &str, close: &str) -> Vec<String> {
-    let ran = |levels: usize| {
-        let sql = format!(
-            "SELECT id FROM t WHERE {}id{}",
-            open.repeat(levels),
-            close.repeat(levels)
-        );
-        db.execute(&sql, &params! {})
-    };
-    let mut told = Vec::new();
-    if let Err(error) = ran(64) {
-        told.push(format!("64 levels of `{open}` were refused: {error:?}"));
-    }
-    if !is_refused_by_depth(ran(65)) {
-        told.push(format!("65 levels of `{open}` were not refused by depth"));
-    }
-    told
+    read_and_refused(&format!("levels of `{open}`"), [64, 65], |levels| {
+        let (open, close) = (open.repeat(levels), close.repeat(levels));
+        db.execute(
+            &format!("SELECT id FROM t WHERE {open}id{close}"),
+            &params! {},
+        )
+    })
 }
 
 #[test]
@@ -406,12 +414,9 @@ fn a_chain_of_operators_is_refused_by_depth_and_quoted_parentheses_and_ands_are_
                 format!("SELECT id FROM t WHERE id IN ({inner})")
             })
         };
-        if let Err(error) = ran(&selects(64)) {
-            told.push(format!("64 nested SELECTs were refused: {error:?}"));
-        }
-        if !is_refused_by_depth(ran(&selects(65))) {
-            told.push("65 nested SELECTs were not refused by depth".to_owned());
-        }
+        told.extend(read_and_refused("nested SELECTs", [64, 65], |n| {
+            ran(&selects(n))
+        }));
         told
     });
 }
@@ -439,12 +444,9 @@ fn union_arms_and_with_names_in_a_long_statement_are_read_or_refused_on_a_small_
             }
             format!("{text} SELECT id FROM n{}", names - 1)
         };
-        if let Err(error) = ran(&with(16)) {
-            told.push(format!("a chain of 16 WITH names was refused: {error:?}"));
-        }
-        if !is_refused_by_depth(ran(&with(300))) {
-            told.push("a chain of 300 WITH names was not refused by depth".to_owned());
-        }
+        told.extend(read_and_refused("chained WITH names", [16, 300], |n| {
+            ran(&with(n))
+        }));
         told
     });
 }

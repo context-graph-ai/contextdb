@@ -6,16 +6,23 @@
 //! partition's working set does not.
 
 mod support;
+#[path = "support/vecmaint.rs"]
+mod vecmaint;
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use contextdb::{Database, DatabaseOpenOptions, Error, ReadLimits, ReadSession, Value, params};
 
-use support::{Call, Run};
+use support::Run;
 
 const MIB: usize = 1 << 20;
 const KIB: usize = 1 << 10;
+
+/// What an open under `limit` sets aside in a store where an open under no declared limit
+/// sets aside `opening`: the caches of the limit in place of the smallest.
+fn under(limit: Option<usize>, opening: usize) -> usize {
+    support::opening::set_aside(limit) + opening - support::opening::open_floor()
+}
 
 #[test]
 fn vector_search_ends_complete_or_refused() {
@@ -36,13 +43,13 @@ fn vector_search_ends_complete_or_refused() {
     }
     let stored = support::stored(&db, support::DOCS);
     let query = support::vector(96_000, DIMENSION);
-    // Two searches: ten rows of the half of the table that passes a filter, and two thousand
-    // rows of all of it.
+    // Two thousand rows of the half that passes a filter, 1,800, and of all of it: a LIMIT
+    // between the matching and the live rows, so the walk uses the kept list (F4a).
     let half = |row: &[Value]| matches!(row[2], Value::Int64(tag) if tag < 25);
     let searches = [
         (
-            support::nearest_sql("docs", "v", Some("tag < 25"), 10),
-            stored.nearest(half, &query, 10),
+            support::nearest_sql("docs", "v", Some("tag < 25"), 2000),
+            stored.nearest(half, &query, 2000),
         ),
         (
             support::nearest_sql("docs", "v", None, 2000),
@@ -53,7 +60,7 @@ fn vector_search_ends_complete_or_refused() {
             stored.nearest(|_| true, &query, 2000),
         ),
     ];
-    assert_eq!((searches[0].1.len(), searches[1].1.len()), (10, 2000));
+    assert_eq!((searches[0].1.len(), searches[1].1.len()), (1800, 2000));
     let every = stored.nearest(|_| true, &query, 5000);
     assert_eq!(every.len(), 3600);
     let pending = |db: &Database| support::whole(&support::the_partition(db), "pending_tuples");
@@ -200,6 +207,54 @@ fn vector_search_ends_complete_or_refused() {
 }
 
 #[test]
+fn a_find_keeps_one_batch_of_slots_whatever_the_coded_tail_it_walks() {
+    const DIMENSION: usize = 64;
+    let query = support::vector(96_000, DIMENSION);
+    // A find keeps one batch of 1,024 slots, whatever the coded tail it walks (design F4a).
+    // 1,000 rows are grouped, then a tail of 2,000 or 20,000 is sealed and, under COMPACTION
+    // NONE, never grouped. Five rows of tag 99 pass a served filter, short of ten, so nothing
+    // tightens the bound: every live slot is kept and verified a batch at a time. Four hold the
+    // question, tied across the tail's 1,024th slot, and one is the tail's last, in a short batch.
+    let (sql, mut room) = (support::by_mode(Some("tag = 99"), "INDEXED", 10), 0);
+    for tail in [2000_i64, 20_000] {
+        let folder = support::folder(&format!("one-batch-{tail}"));
+        let db = support::open(&folder);
+        support::declare_docs(&db, DIMENSION, "INDEXING_THRESHOLD 1000 COMPACTION NONE");
+        support::run(&db, "CREATE INDEX docs_tag ON docs (tag)");
+        support::load_docs(&db, 1..=1000, "a", |n| support::vector(n, DIMENSION));
+        support::maintenance(&db);
+        let (tied, last) = (2024..=2027, 1000 + tail);
+        let near = |n| tied.contains(&n).then(|| query.clone());
+        support::load_docs(&db, 1001..=last, "a", |n| {
+            near(n).unwrap_or(support::vector(n, DIMENSION))
+        });
+        support::run(
+            &db,
+            &format!("UPDATE docs SET tag = 99 WHERE id IN (2024, 2025, 2026, 2027, {last})"),
+        );
+        support::maintenance(&db);
+        let partition = support::the_partition(&db);
+        let groups = support::whole(&partition, "lists") as u64;
+        let sealed = support::whole(&partition, "pending_tuples") == 0;
+        assert!(groups > 1 && sealed, "{tail}: {partition:?}");
+        let stored = support::stored(&db, support::DOCS);
+        let wanted = stored.nearest(|row| row[2] == Value::Int64(99), &query, 10);
+        support::close(db);
+        if room == 0 {
+            let peak =
+                support::answer(&support::open_reader(&folder, None), &sql, &query).peak_bytes();
+            room = peak.unwrap() as usize + support::form_charge(&support::form_of(&sql));
+        }
+        let limit = support::opening::opening_charge(&folder, None) + room;
+        let found = support::answer(&support::open_reader(&folder, Some(limit)), &sql, &query);
+        support::assert_same_rows(&support::found(&found, &sql), &wanted, &format!("{tail}"));
+        // Each centre, the mean, each live code and slot once, and the five passing rows' distances.
+        let counted = groups + 1 + 2 * (1000 + tail as u64) + 5;
+        assert_eq!(found.distance_evaluations(), counted, "{tail}: walked once");
+    }
+}
+
+#[test]
 fn memory_stays_bounded_as_data_grows_vector() {
     const DIMENSION: usize = 768;
     // Vectors in the large partition of a plain column. In a block each takes 8 + 768 bytes of
@@ -240,16 +295,9 @@ fn memory_stays_bounded_as_data_grows_vector() {
     support::close(db);
 
     // A reader with a limit of 16 MiB, whose storage door counts the bytes it reads.
-    let read = Arc::new(AtomicU64::new(0));
+    let (door, read) = support::counting_bytes_read();
     let mut options = support::reader_options(Some(LIMIT));
-    options.storage = Some(support::storage({
-        let read = read.clone();
-        move |call| {
-            if let Call::Read(_, bytes) = call {
-                read.fetch_add(bytes.len() as u64, Ordering::SeqCst);
-            }
-        }
-    }));
+    options.storage = Some(door);
     let reader = ReadSession::open_with_options(&folder, options)
         .expect("open a store larger than the limit");
     drop(reader.table_names().expect("admit the reader catalog"));
@@ -259,9 +307,10 @@ fn memory_stays_bounded_as_data_grows_vector() {
         at_open < BLOCK,
         "opening the store read {at_open} bytes of it before any statement"
     );
+    let charge = support::opening::reader_charge(&folder, None);
     assert_eq!(
         support::memory_used(&reader),
-        support::opening::reader_charge(&folder, None),
+        charge,
         "set aside by an open under 16 MiB"
     );
 
@@ -272,7 +321,7 @@ fn memory_stays_bounded_as_data_grows_vector() {
         support::assert_nearest(&reader, &sql, &query, &wanted, "the small partition");
         assert_eq!(
             support::memory_used(&reader),
-            support::opening::reader_charge(&folder, None)
+            charge
                 + support::form_charge(
                     "SELECT id, v <=> $q AS distance FROM docs WHERE ctx = ? ORDER BY distance LIMIT ?"
                 ),
@@ -298,29 +347,27 @@ fn the_page_cache_follows_the_limit_in_force() {
     // an 8 MiB page cache and 1 MiB for kept plans, leaving any larger limit settable.
     let db = support::open(&folder);
     support::assert_default_limit(support::limit(&db), "a fresh store");
+    let empty = support::opening::opening_charge(&folder, None);
     assert_eq!(
         support::used(&db),
-        support::opening::opening_charge(&folder, None),
+        empty,
         "set aside with no limit declared"
     );
-    assert_eq!(
-        support::memory_used(&db),
-        support::opening::opening_charge(&folder, None)
-    );
+    assert_eq!(support::memory_used(&db), empty);
     support::declare(&db);
     support::insert(&db, 1..=10);
     support::close(db);
 
-    // The cache is max(limit/4, 8 MiB); plans take limit/32, clamped between 1 and 8 MiB.
+    // The cache is max(limit/4, 8 MiB); plans take limit/32, clamped between 1 and 8 MiB. The
+    // store's catalog no longer changes, so neither do the charges of its opens.
     let floor = support::opening::opening_charge(&folder, None);
+    let charge = support::opening::reader_charge(&folder, None);
     for limit in [64 * MIB, 16 * MIB, floor, 32 * MIB, 40 * MIB, 1024 * MIB] {
         let db = support::open_limited(&folder, limit);
         assert_eq!(support::limit(&db), Some(limit));
         assert_eq!(
             support::used(&db),
-            support::opening::set_aside(Some(limit))
-                + support::opening::opening_charge(&folder, None)
-                - support::opening::open_floor(),
+            under(Some(limit), floor),
             "set aside under a limit of {limit} bytes"
         );
         // Under the smallest limit nothing is left for a statement; under the others it reads.
@@ -339,8 +386,7 @@ fn the_page_cache_follows_the_limit_in_force() {
         drop(reader.table_names().expect("admit the reader catalog"));
         assert_eq!(
             support::memory_used(&reader),
-            support::opening::set_aside(limit) + support::opening::reader_charge(&folder, None)
-                - support::opening::open_floor(),
+            under(limit, charge),
             "a reader under {limit:?} bytes"
         );
         support::assert_rows_are(&reader, 1..=10);
@@ -352,13 +398,11 @@ fn the_page_cache_follows_the_limit_in_force() {
     assert_eq!(support::limit(&db), Some(512 * MIB));
     assert_eq!(
         support::used(&db),
-        support::opening::opening_charge(&folder, None),
+        floor,
         "the cache of an open keeps its size"
     );
     let db = support::reopen(db, &folder);
-    let under_512 = support::opening::set_aside(Some(512 * MIB))
-        + support::opening::opening_charge(&folder, None)
-        - support::opening::open_floor();
+    let under_512 = under(Some(512 * MIB), floor);
     assert_eq!(support::limit(&db), Some(512 * MIB));
     assert_eq!(
         support::used(&db),
@@ -381,29 +425,18 @@ fn the_page_cache_follows_the_limit_in_force() {
         support::memory_shown(&reader, "limit"),
         Value::Int64(16 * MIB as i64)
     );
-    assert_eq!(
-        support::memory_used(&reader),
-        support::opening::reader_charge(&folder, None)
-    );
+    assert_eq!(support::memory_used(&reader), charge);
     let reader = support::open_reader(&folder, Some(16 * MIB));
     drop(reader.table_names().expect("admit the reader catalog"));
-    assert_eq!(
-        support::memory_used(&reader),
-        support::opening::reader_charge(&folder, None)
-    );
+    assert_eq!(support::memory_used(&reader), charge);
     assert_eq!(
         support::memory_shown(&reader, "available"),
-        Value::Int64((16 * MIB - support::opening::reader_charge(&folder, None)) as i64)
+        Value::Int64((16 * MIB - charge) as i64)
     );
     // An open that names a limit has its own cache and leaves what the store remembers.
     support::close(db);
     let db = support::open_limited(&folder, 64 * MIB);
-    assert_eq!(
-        support::used(&db),
-        support::opening::set_aside(Some(64 * MIB))
-            + support::opening::opening_charge(&folder, None)
-            - support::opening::open_floor()
-    );
+    assert_eq!(support::used(&db), under(Some(64 * MIB), floor));
     let db = support::reopen(db, &folder);
     assert_eq!(support::limit(&db), Some(512 * MIB));
     assert_eq!(support::used(&db), under_512);
@@ -586,10 +619,8 @@ fn a_limit_of_64_mib_is_taken_in_a_store_opened_with_no_limit() {
         let folder = support::folder(&format!("limit-64-in-a-plain-store-{name}"));
         let db = support::open(&folder);
         support::assert_default_limit(support::limit(&db), "a fresh store");
-        assert_eq!(
-            support::used(&db),
-            support::opening::opening_charge(&folder, None)
-        );
+        let empty = support::opening::opening_charge(&folder, None);
+        assert_eq!(support::used(&db), empty);
         support::run(&db, "CREATE TABLE big (id INTEGER PRIMARY KEY, body TEXT)");
         let held_before = support::used(&db);
 
@@ -630,9 +661,10 @@ fn a_limit_of_64_mib_is_taken_in_a_store_opened_with_no_limit() {
         // The store remembers it: the next plain open is under 64 MiB, with a cache of a
         // quarter of it, 16 MiB, 2 MiB for kept plans and 1 MiB set aside before any statement.
         let db = support::reopen(db, &folder);
-        let under_64 = support::opening::set_aside(Some(64 * MIB))
-            + support::opening::opening_charge(&folder, None)
-            - support::opening::open_floor();
+        let under_64 = under(
+            Some(64 * MIB),
+            support::opening::opening_charge(&folder, None),
+        );
         assert_eq!(support::limit(&db), Some(64 * MIB));
         assert_eq!(support::used(&db), under_64);
         assert_eq!(support::memory_used(&db), under_64);
@@ -655,9 +687,7 @@ fn a_limit_of_64_mib_is_taken_in_a_store_opened_with_no_limit() {
         // 64 MiB is refused there with the action, to open the store with the limit.
         let folder = support::folder(&format!("limit-64-under-1-gib-{name}"));
         let db = support::open_limited(&folder, 1024 * MIB);
-        let under_1_gib = support::opening::set_aside(Some(1024 * MIB))
-            + support::opening::opening_charge(&folder, None)
-            - support::opening::open_floor();
+        let under_1_gib = under(Some(1024 * MIB), empty);
         assert_eq!(support::used(&db), under_1_gib);
         refused_below_the_cache(set(&db, 64), 64 * MIB, under_1_gib);
         assert_eq!(support::limit(&db), Some(1024 * MIB));
@@ -723,12 +753,9 @@ fn a_cycle_under_a_tight_limit_seals_what_fits_and_is_refused_only_when_one_part
         })
     };
     let wanted = wanted_now();
-    // Every vector is pending: a search reads each pending row of the partitions it selects
-    // once, and each row it returns once more.
-    assert_eq!(
-        searched(&wanted, "nothing sealed"),
-        [ROWS as u64 + 10, EACH as u64 + 10]
-    );
+    // Every vector is pending, screened as a block's slots are (design F1): a search reads no
+    // more rows than once all are sealed, plus the ten asked for.
+    let (pending, mut sealed) = (searched(&wanted, "nothing sealed"), [0, 0]);
 
     // Under the tight limit every cycle seals at least one partition and none is refused.
     let db = support::open_limited(&folder, tight);
@@ -741,15 +768,14 @@ fn a_cycle_under_a_tight_limit_seals_what_fits_and_is_refused_only_when_one_part
             cycles <= PARTITIONS,
             "{remaining} vectors still wait after {PARTITIONS} cycles over {PARTITIONS} partitions"
         );
-        let report = support::cycle(&db);
-        let done = support::count(report.maintenance_vectors_done);
+        let (done, left) = vecmaint::done_left(&support::cycle(&db));
         assert!(
             done >= EACH as u64 && done <= remaining,
             "cycle {cycles} sealed {done} of {remaining} unindexed vectors: at least one \
              partition's {EACH} were to be sealed"
         );
         assert_eq!(
-            support::count(report.maintenance_vectors_remaining),
+            left,
             remaining - done,
             "what cycle {cycles} reports as still unindexed"
         );
@@ -767,20 +793,15 @@ fn a_cycle_under_a_tight_limit_seals_what_fits_and_is_refused_only_when_one_part
         );
         remaining -= done;
         // The same rows at the same distances after every cycle.
-        searched(
+        sealed = searched(
             &wanted,
             &format!("after cycle {cycles} under the tight limit"),
         );
     }
+    let fewer = pending.iter().zip(sealed).all(|(p, s)| *p <= s + 10);
+    assert!(fewer, "rows read pending {pending:?} and sealed {sealed:?}");
     let position = support::watermark(&db);
-    let report = support::cycle(&db);
-    assert_eq!(
-        (
-            support::count(report.maintenance_vectors_done),
-            support::count(report.maintenance_vectors_remaining)
-        ),
-        (0, 0)
-    );
+    assert_eq!(vecmaint::done_left(&support::cycle(&db)), (0, 0));
     assert_eq!(support::watermark(&db), position);
     support::close(db);
 
@@ -830,14 +851,7 @@ fn a_cycle_under_a_tight_limit_seals_what_fits_and_is_refused_only_when_one_part
     // Opened under a larger limit the cycle goes through, and all two hundred were still unindexed.
     support::close(db);
     let db = support::open_limited(&folder, 64 * MIB);
-    let report = support::cycle(&db);
-    assert_eq!(
-        (
-            support::count(report.maintenance_vectors_done),
-            support::count(report.maintenance_vectors_remaining)
-        ),
-        (200, 0)
-    );
+    assert_eq!(vecmaint::done_left(&support::cycle(&db)), (200, 0));
     searched(&wanted, "after the cycle under the raised limit");
 }
 

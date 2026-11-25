@@ -18,6 +18,9 @@ fn statuses(on: &impl Run, table: &str) -> Vec<String> {
         .collect()
 }
 
+/// How many tasks are invalidated.
+const INVALIDATED: &str = "SELECT COUNT(*) FROM tasks WHERE status = 'invalidated'";
+
 /// `count` times one status.
 fn all(status: &str, count: usize) -> Vec<String> {
     vec![status.to_owned(); count]
@@ -58,10 +61,11 @@ fn store_of_projects(name: &str, clause: &str) -> Database {
 }
 
 /// The statuses the tasks have once the projects in `archived` are archived and nothing else
-/// has happened.
-fn tasks_after(archived: &[i64]) -> Vec<String> {
+/// has happened but the task `superseded`, if one is named, being superseded.
+fn tasks_after(archived: &[i64], superseded: Option<usize>) -> Vec<String> {
     (0..3000_i64)
         .map(|n| match archived.contains(&(n % 3 + 1)) {
+            _ if superseded == Some(n as usize) => "superseded".to_owned(),
             true => "invalidated".to_owned(),
             false => "active".to_owned(),
         })
@@ -77,14 +81,8 @@ fn rows_follow_inside_the_statement_and_are_seen_and_undone_with_its_transaction
     let archived = support::run(&tx, "UPDATE projects SET status = 'archived' WHERE id = 2");
     assert_eq!(archived.rows_affected(), 1, "the rows the statement named");
     // The transaction reads its own propagation, a thousand rows of it and no other row.
-    assert_eq!(statuses(&tx, "tasks"), tasks_after(&[2]));
-    assert_eq!(
-        support::int(
-            &tx,
-            "SELECT COUNT(*) FROM tasks WHERE status = 'invalidated'"
-        ),
-        1000
-    );
+    assert_eq!(statuses(&tx, "tasks"), tasks_after(&[2], None));
+    assert_eq!(support::int(&tx, INVALIDATED), 1000);
     // Nobody else does.
     assert_eq!(statuses(&db, "tasks"), all("active", 3000));
     assert_eq!(statuses(&db, "projects"), all("active", 3));
@@ -98,26 +96,16 @@ fn rows_follow_inside_the_statement_and_are_seen_and_undone_with_its_transaction
     // A task that follows may still be changed by the transaction's next statement.
     support::run(&tx, "UPDATE tasks SET status = 'superseded' WHERE id = 0");
     tx.commit().expect("commit the transition");
-    let mut wanted = tasks_after(&[2]);
-    wanted[0] = "superseded".to_owned();
-    assert_eq!(statuses(&db, "tasks"), wanted);
+    assert_eq!(statuses(&db, "tasks"), tasks_after(&[2], Some(0)));
     assert_eq!(statuses(&db, "projects"), ["active", "archived", "active"]);
 
     // One statement that moves two projects moves the tasks of both. Task 0, of project 1, was
     // superseded, which lists no next state: it is left as it is and the rest follow.
     let both = support::run(&db, "UPDATE projects SET status = 'archived' WHERE id <> 2");
     assert_eq!(both.rows_affected(), 2);
-    let mut wanted = all("invalidated", 3000);
-    wanted[0] = "superseded".to_owned();
-    assert_eq!(statuses(&db, "tasks"), wanted);
+    assert_eq!(statuses(&db, "tasks"), tasks_after(&[1, 2, 3], Some(0)));
 
-    assert_eq!(
-        support::int(
-            &db,
-            "SELECT COUNT(*) FROM tasks WHERE status = 'invalidated'"
-        ),
-        2999
-    );
+    assert_eq!(support::int(&db, INVALIDATED), 2999);
 }
 
 #[test]
@@ -128,8 +116,7 @@ fn an_aborting_propagation_names_its_table_and_undoes_its_statement_and_no_other
         &db,
         "UPDATE tasks SET status = 'superseded' WHERE id = 1500",
     );
-    let mut before = all("active", 3000);
-    before[1500] = "superseded".to_owned();
+    let before = tasks_after(&[], Some(1500));
 
     let aborted = |error: Error, how: &str| match error {
         Error::PropagationAborted { table, reason } => {
@@ -158,8 +145,7 @@ fn an_aborting_propagation_names_its_table_and_undoes_its_statement_and_no_other
         "inside a transaction",
     );
     assert_eq!(statuses(&tx, "projects"), ["active", "archived", "active"]);
-    let mut wanted = tasks_after(&[2]);
-    wanted[1500] = "superseded".to_owned();
+    let wanted = tasks_after(&[2], Some(1500));
     assert_eq!(statuses(&tx, "tasks"), wanted);
     tx.commit().expect("commit the statement that stood");
     assert_eq!(statuses(&db, "projects"), ["active", "archived", "active"]);
@@ -167,46 +153,46 @@ fn an_aborting_propagation_names_its_table_and_undoes_its_statement_and_no_other
 
     // A project all of whose tasks can follow is archived with them.
     support::run(&db, "UPDATE projects SET status = 'archived' WHERE id = 3");
-    let mut wanted = tasks_after(&[2, 3]);
-    wanted[1500] = "superseded".to_owned();
-    assert_eq!(statuses(&db, "tasks"), wanted);
+    assert_eq!(statuses(&db, "tasks"), tasks_after(&[2, 3], Some(1500)));
 }
 
 const EDGES: &str = "CREATE TABLE edges (id INTEGER PRIMARY KEY, source_id UUID NOT NULL, \
                      target_id UUID NOT NULL, edge_type TEXT NOT NULL)";
 
-/// Declares `claims`, whose rows follow each other into `invalidated` along incoming `CITES`
-/// edges, with this `clause` after the declaration, and the edge table beside it. Claim `n`
-/// has the id `Uuid::from_u128(n)`.
-fn store_of_claims(name: &str, claims: u128, clause: &str) -> Database {
+/// The edge table and the table `create` declares, with rows 1 to `count` written by `insert`
+/// in the state `first`. Row `n` has the id `Uuid::from_u128(n)`.
+fn store_of_edges(name: &str, create: &str, insert: &str, first: &str, count: u128) -> Database {
     let db = support::open(&support::folder(name));
     support::run(&db, EDGES);
-    support::run(
-        &db,
-        &format!(
-            "CREATE TABLE claims (id UUID PRIMARY KEY, status TEXT NOT NULL) \
-             STATE MACHINE (status: active -> [invalidated]) \
-             PROPAGATE ON EDGE CITES INCOMING STATE invalidated SET invalidated {clause}"
-        ),
-    );
+    support::run(&db, create);
     let tx = db.transaction().expect("begin");
-    for n in 1..=claims {
-        tx.execute(
-            "INSERT INTO claims (id, status) VALUES ($id, 'active')",
-            &params! { "id" => Uuid::from_u128(n) },
-        )
-        .expect("insert a claim");
+    for n in 1..=count {
+        let row = params! { "id" => Uuid::from_u128(n), "status" => first };
+        tx.execute(insert, &row).expect("insert a row");
     }
-    tx.commit().expect("commit the claims");
+    tx.commit().expect("commit the rows");
     db
 }
 
-/// Writes the edge `id`: claim `source` cites claim `target`.
-fn cites(on: &impl Run, id: i64, source: u128, target: u128) {
+/// Declares `claims`, whose rows follow each other into `invalidated` along incoming `CITES`
+/// edges, with this `clause` after the declaration, and the edge table beside it.
+fn store_of_claims(name: &str, claims: u128, clause: &str) -> Database {
+    let create = format!(
+        "CREATE TABLE claims (id UUID PRIMARY KEY, status TEXT NOT NULL) \
+         STATE MACHINE (status: active -> [invalidated]) \
+         PROPAGATE ON EDGE CITES INCOMING STATE invalidated SET invalidated {clause}"
+    );
+    let insert = "INSERT INTO claims (id, status) VALUES ($id, $status)";
+    store_of_edges(name, &create, insert, "active", claims)
+}
+
+/// Writes the edge `id` of type `kind` from row `source` to row `target`.
+fn edge(on: &impl Run, id: i64, kind: &str, source: u128, target: u128) {
     on.run(
-        "INSERT INTO edges (id, source_id, target_id, edge_type) VALUES ($id, $source, $target, 'CITES')",
+        "INSERT INTO edges (id, source_id, target_id, edge_type) VALUES ($id, $source, $target, $kind)",
         &params! {
             "id" => id, "source" => Uuid::from_u128(source), "target" => Uuid::from_u128(target),
+            "kind" => kind,
         },
     )
     .expect("insert an edge");
@@ -225,8 +211,8 @@ fn max_depth_reaches_rows_at_most_that_many_edges_from_the_changed_row() {
     // A chain of three: claim 2 cites claim 1, and claim 3 cites claim 2.
     let chain = |name: &str, clause: &str| {
         let db = store_of_claims(name, 3, clause);
-        cites(&db, 1, 2, 1);
-        cites(&db, 2, 3, 2);
+        edge(&db, 1, "CITES", 2, 1);
+        edge(&db, 2, "CITES", 3, 2);
         invalidate(&db, 1);
         statuses(&db, "claims")
     };
@@ -242,49 +228,14 @@ fn max_depth_reaches_rows_at_most_that_many_edges_from_the_changed_row() {
     );
 }
 
-/// Row `n` of a table whose rows follow each other along edges.
-fn node(n: u128) -> Uuid {
-    Uuid::from_u128(n)
-}
-
-/// The table of edges, and `nodes` with rows 1 to `count` in the state `first`, declared with
-/// `rules` after its columns.
-fn store_of_nodes(name: &str, rules: &str, first: &str, count: u128) -> Database {
-    let db = support::open(&support::folder(name));
-    support::run(&db, EDGES);
-    support::run(
-        &db,
-        &format!(
-            "CREATE TABLE nodes (id UUID PRIMARY KEY, status TEXT NOT NULL, \
-             batch INTEGER NOT NULL) {rules}"
-        ),
-    );
-    for n in 1..=count {
-        db.execute(
-            "INSERT INTO nodes (id, status, batch) VALUES ($id, $status, 0)",
-            &params! { "id" => node(n), "status" => first },
-        )
-        .expect("insert a node");
-    }
-    db
-}
-
-/// Joins node `from` to node `to` by an edge of type FEEDS.
-fn feed(db: &Database, edge: i64, from: u128, to: u128) {
-    db.execute(
-        "INSERT INTO edges (id, source_id, target_id, edge_type) \
-         VALUES ($id, $from, $to, 'FEEDS')",
-        &params! { "id" => edge, "from" => node(from), "to" => node(to) },
-    )
-    .expect("insert an edge");
-}
-
 #[test]
 fn a_follower_reachable_from_two_changed_rows_changes_once_by_the_shorter_way() {
-    let db = store_of_nodes(
+    let db = store_of_edges(
         "propagation-shorter-way",
-        "STATE MACHINE (status: running -> [stopped]) \
+        "CREATE TABLE nodes (id UUID PRIMARY KEY, status TEXT NOT NULL, batch INTEGER NOT NULL) \
+         STATE MACHINE (status: running -> [stopped]) \
          PROPAGATE ON EDGE FEEDS OUTGOING STATE stopped SET stopped MAX DEPTH 2",
+        "INSERT INTO nodes (id, status, batch) VALUES ($id, $status, 0)",
         "running",
         6,
     );
@@ -292,13 +243,13 @@ fn a_follower_reachable_from_two_changed_rows_changes_once_by_the_shorter_way() 
     support::run(&db, "ALTER TABLE nodes SET MAINTAIN COUNT (status)");
     // 1 feeds 2, 2 feeds 3, 3 feeds 4 and 4 feeds 5; 6 feeds 3 as well. So node 3 is two
     // edges from node 1 and one edge from node 6.
-    for (edge, from, to) in [(1, 1, 2), (2, 2, 3), (3, 3, 4), (4, 4, 5), (5, 6, 3)] {
-        feed(&db, edge, from, to);
+    for (id, from, to) in [(1, 1, 2), (2, 2, 3), (3, 3, 4), (4, 4, 5), (5, 6, 3)] {
+        edge(&db, id, "FEEDS", from, to);
     }
     for n in [1, 6] {
         db.execute(
             "UPDATE nodes SET batch = 1 WHERE id = $id",
-            &params! { "id" => node(n) },
+            &params! { "id" => Uuid::from_u128(n) },
         )
         .expect("mark a node");
     }

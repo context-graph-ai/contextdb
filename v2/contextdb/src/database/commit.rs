@@ -107,7 +107,9 @@ impl Open {
         } = staged;
         let before = (self.budget.limit(), *locked(&self.disk));
         let result = (|| {
-            if changes.is_empty() {
+            // A PURGE that matches no row still takes what is owed.
+            let purge = erasing == Some(true);
+            if changes.is_empty() && !(purge && crate::maintenance::any_owed(self)?) {
                 return Ok(None);
             }
             self.host(|plugin| plugin.pre_commit(&changes, source))?;
@@ -134,6 +136,7 @@ impl Open {
             let deliveries =
                 erasing != Some(true) && crate::events::prepare(&mut changes, &catalog, &budget)?;
             if erasing == Some(true) {
+                changes.purging = true;
                 self.store.cut_off(None)?;
                 vector::erase(&mut changes, &catalog, &budget)?;
                 crate::events::erase(&mut changes, &budget)?;
@@ -142,6 +145,14 @@ impl Open {
             let mut event = self.summary(&mut changes, &catalog, source);
             if let Some(n) = changes.changed_setting(0) {
                 self.budget.set_limit(crate::settings::applied(0, n))?;
+            }
+            // A lower disk limit holds for the commit that records it: setting it never grows the
+            // file past it
+            let lower = changes
+                .changed_setting(1)
+                .and_then(|n| crate::settings::applied(1, n));
+            if let Some(n) = lower.filter(|n| before.1.is_none_or(|b| *n < b)) {
+                self.store.disk_limit(Some(n));
             }
             // Only a declaration erases a trigger.
             let retire = declared.first().map(|_| self.triggers.retiring(&changes));

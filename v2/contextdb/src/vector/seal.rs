@@ -2,14 +2,16 @@
 
 use super::binary::{code_len, codes_of};
 use super::block::{BLOCK_BYTES, BROKEN, BlockReader, BlockWriter};
+use super::build::Work;
 use super::directory;
 use super::ivf;
 use super::pack;
-use super::tally::{position, tuples};
+use super::slot::slot_len;
+use super::tally::position;
 use crate::memory::{Budget, Reservation};
 use crate::schema::Catalog;
-use crate::store::{Cell, ChangeSet, Key, Read, VectorId, VectorNumber, VectorRecord};
-use crate::types::{ColumnType, Error, Result, Value};
+use crate::store::{ChangeSet, Key, Read, VectorId, VectorNumber, VectorRecord};
+use crate::types::{ColumnType, Error, Result};
 
 /// What a store is told when a pending record is not of a row that has a vector in a
 /// partition of a VECTOR column, which [`super::track_unindexed`] keeps true of every one.
@@ -18,11 +20,11 @@ const UNINDEXED: &str = "a pending record of the vector part is of no row with a
 /// Stages the sealing of the first `most` pending vectors, in the order of column number,
 /// partition number and row key.
 ///
-/// Returns the vectors moved and the rows read, counted at their lookups.
+/// Returns the vectors moved. No row is read.
 ///
 /// The vectors of a partition are added to its last tail block while that block has room and
 /// is not closed, and to new blocks after it, so every block from the first that is not closed
-/// on but the last is full. Each is read from its row at full precision, one at a time, and
+/// on but the last is full. Each is the slot its pending record holds, copied as it is, and
 /// its pending record is removed. In a partition that has a mean every block that is staged
 /// comes with the record of its binary codes, each taken from the mean. Nothing is staged when
 /// nothing is pending.
@@ -30,10 +32,9 @@ const UNINDEXED: &str = "a pending record of the vector part is of no row with a
 /// Every byte is reserved before it is taken. The blocks, the removals and the partition
 /// records it stages are charged to the change set's reservation as they are staged. What it
 /// works with is held by one reservation it takes from `budget`, named `maintenance`: the keys
-/// of the pending records it collected, one block being put together (`BLOCK_BYTES`, taken once
+/// and slots of the pending records it collected, one block being put together (`BLOCK_BYTES`, taken once
 /// and kept for the call), the partition record it is adding to, the partition's mean, the
-/// record of one block's binary codes until it is staged, and one row with its vector, given back
-/// before the next is read.
+/// and the record of one block's binary codes until it is staged.
 ///
 /// A pending record, a partition record, a block or a count that does not agree with the rows
 /// is `StoreCorrupted`, and nothing is staged.
@@ -47,10 +48,22 @@ pub(crate) fn seal(
     budget: &Budget,
     most: usize,
 ) -> Result<u64> {
-    let mut done = 0;
+    sealing(changes, catalog, budget, most, false).map(|(done, _)| done)
+}
+
+/// [`seal`], with `alone` of the first partition only; also gives that partition's column and
+/// key tuple.
+pub(crate) fn sealing(
+    changes: &mut ChangeSet,
+    catalog: &Catalog,
+    budget: &Budget,
+    most: usize,
+    alone: bool,
+) -> Result<(u64, Option<Work>)> {
+    let (mut done, mut first) = (0, None);
     let mut remaining = changes.vector_number(VectorNumber::Pending)?;
     if remaining == 0 {
-        return Ok(done);
+        return Ok((done, first));
     }
     // One block is put together at a time, so its bytes are taken once.
     let mut held = budget.reserve(BLOCK_BYTES as u64, "maintenance")?;
@@ -61,10 +74,11 @@ pub(crate) fn seal(
         let mark = changes.mark();
         let room = most - done as usize;
         match seal_partition(changes, catalog, &mut held, from, room, remaining) {
-            Ok((sealed, following)) => {
+            Ok((sealed, following, sealed_at)) => {
                 done += sealed;
                 remaining -= sealed;
-                next = following;
+                next = following.filter(|_| !alone);
+                first = first.or(sealed_at);
             }
             Err(refused) => {
                 changes.rewind(mark);
@@ -77,7 +91,7 @@ pub(crate) fn seal(
         }
         held.shrink(held.bytes() - BLOCK_BYTES as u64);
     }
-    Ok(done)
+    Ok((done, first))
 }
 
 /// Bytes one pending vector will occupy in a block, beside its four-byte count.
@@ -91,7 +105,8 @@ type PartitionAt = (VectorId, u32);
 /// Stages the sealing of one partition: the first that has a pending record at `from`, a
 /// column and a partition number, or after it. Seals at most `most` of its vectors, of the
 /// `remaining` that are pending over every column. Answers how many it sealed and the next
-/// column and partition number with a pending record, `None` when it met none, and the rows read.
+/// column and partition number with a pending record, `None` when it met none, and the column
+/// and key tuple of the partition it sealed.
 pub(super) fn seal_partition(
     changes: &mut ChangeSet,
     catalog: &Catalog,
@@ -99,13 +114,13 @@ pub(super) fn seal_partition(
     from: PartitionAt,
     most: usize,
     remaining: u64,
-) -> Result<(u64, Option<PartitionAt>)> {
+) -> Result<(u64, Option<PartitionAt>, Option<Work>)> {
     let first = Key::from_values(&[], &[])?;
     let (mut found, mut following) = (None, None);
-    let mut keys: Vec<Key> = Vec::new();
+    let (mut keys, mut slots): (Vec<Key>, Vec<u8>) = (Vec::new(), Vec::new());
     changes.vectors(
         VectorRecord::Pending(from.0, from.1, &first),
-        &mut |record, _| {
+        &mut |record, slot| {
             let VectorRecord::Pending(vector, number, key) = record else {
                 return Ok(false);
             };
@@ -114,13 +129,14 @@ pub(super) fn seal_partition(
                 return Ok(false);
             }
             held.room(&mut keys, most)?;
-            held.grow(key.as_bytes().len() as u64)?;
+            held.grow((key.as_bytes().len() + slot.len()) as u64)?;
             keys.push(key.clone());
+            slots.extend_from_slice(slot);
             Ok(keys.len() < most)
         },
     )?;
     let Some((vector, number)) = found else {
-        return Ok((0, None));
+        return Ok((0, None, None));
     };
     let unindexed = catalog.vector(vector);
     let (table, column) = unindexed.ok_or_else(|| changes.damaged(UNINDEXED))?;
@@ -129,14 +145,21 @@ pub(super) fn seal_partition(
         unreachable!("a VECTOR column is of the type VECTOR")
     };
 
-    // The partition is found through the key tuple of its first pending row.
-    let mut cover = held.passing();
-    let mut first_row = changes.row(table.id, &keys[0], &mut cover)?;
-    let (tuple, _) = tuples(table, column, first_row.as_ref(), None, &*changes, held)?;
-    let tuple = tuple.ok_or_else(|| changes.damaged(UNINDEXED))?;
+    let len = slot_len(dimension);
+    if slots.len() != keys.len() * len {
+        return Err(changes.damaged(UNINDEXED));
+    }
+    // The partition is the one its record numbers so.
+    let mut named = None;
+    super::build::entries(&*changes, column, None, &mut |tuple, partition| {
+        let found = partition.number == number;
+        if found {
+            named = Some((tuple.clone(), partition));
+        }
+        Ok(!found)
+    })?;
+    let (tuple, mut partition) = named.ok_or_else(|| changes.damaged(UNINDEXED))?;
     held.grow(tuple.as_bytes().len() as u64 + 64)?;
-    let partition = directory::partition(&*changes, column, &tuple)?;
-    let mut partition = partition.ok_or_else(|| changes.damaged(UNINDEXED))?;
 
     // The mean is read once, and held until the partition is done.
     let mean = partition
@@ -167,23 +190,7 @@ pub(super) fn seal_partition(
     } else {
         BlockWriter::new(dimension, None, &keys)
     };
-    // A row is its cells and, when the row itself holds it, its vector; a vector kept beside
-    // its row is counted as it is loaded.
-    for (done, key) in keys.iter().enumerate() {
-        let taken = held.bytes();
-        let row = if done == 0 {
-            first_row.take()
-        } else {
-            changes.row(table.id, key, &mut cover)?
-        };
-        let mut row = row.ok_or_else(|| changes.damaged(UNINDEXED))?;
-        let numbers = match row.cells.swap_remove(at) {
-            Cell::Here(numbers) => numbers,
-            Cell::Beside(beside) => changes.load(&beside, held)?,
-        };
-        let Value::Vector(numbers) = numbers else {
-            return Err(changes.damaged(UNINDEXED));
-        };
+    for (done, (key, slot)) in keys.iter().zip(slots.chunks_exact(len)).enumerate() {
         if left == 0 {
             // A block that was full before this call is left as it is.
             if writer.len() > 0 {
@@ -192,12 +199,10 @@ pub(super) fn seal_partition(
             block += 1;
             (writer, left) = BlockWriter::new(dimension, None, &keys[done..]);
         }
-        writer.push(key, &numbers);
-        let slot = [number, block, writer.len() as u32 - 1];
-        directory::hold(changes, (vector, &partition), key, Some(slot), held)?;
+        writer.push_slot(key, slot);
+        let at = [number, block, writer.len() as u32 - 1];
+        directory::hold(changes, (vector, &partition), key, Some(at), held)?;
         left -= 1;
-        drop((row, numbers));
-        held.shrink(held.bytes() - taken);
         changes.delete_vector(VectorRecord::Pending(vector, number, key))?;
     }
     partition.tail_room = BLOCK_BYTES.saturating_sub(writer.bytes()) as u32;
@@ -219,7 +224,15 @@ pub(super) fn seal_partition(
     let left = remaining.checked_sub(sealed);
     let left = left.ok_or_else(|| changes.damaged(directory::SHORT))?;
     changes.put_vector_number(VectorNumber::Pending, left)?;
-    Ok((sealed, following))
+    Ok((
+        sealed,
+        following,
+        Some(Work {
+            vector,
+            number,
+            tuple,
+        }),
+    ))
 }
 
 /// Stages again the binary codes of a block of `under` from `mean`, or, with none, removes them.

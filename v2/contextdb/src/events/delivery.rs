@@ -21,6 +21,8 @@ pub(crate) struct Deliveries {
     callbacks: Mutex<BTreeMap<String, SinkEntry>>,
     pub(crate) active: Mutex<()>,
     counters: Mutex<BTreeMap<String, (SinkMetrics, Reservation, u64)>>,
+    /// Each schedule's last failure that ended no cycle, until it next runs.
+    pub(crate) failed: Mutex<BTreeMap<String, String>>,
 }
 impl Deliveries {
     pub(crate) fn register<F>(
@@ -621,6 +623,7 @@ impl Deliveries {
                 EventDeclaration::Schedule(d) => status.schedules.push(ScheduleStatus {
                     name: d.name.clone(),
                     callback_registered: live && cron.contains(&d.callback),
+                    last_error: locked(&self.failed).get(&d.name).cloned(),
                 }),
                 _ => {}
             }

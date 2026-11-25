@@ -20,6 +20,7 @@ mod folder;
 mod keys;
 pub(crate) mod record;
 mod recovery;
+mod space;
 #[cfg(test)]
 mod tests;
 
@@ -41,14 +42,15 @@ use crate::events::AuditQueue;
 use crate::memory::{Budget, Passing, Reservation};
 use crate::read::ReadSessionOptions;
 use crate::types::{Error, Result, SortDirection, TriggerEvent, TxId, Value, heap_bytes};
-pub(crate) use disk::{AUDIT, DELIVERY, LAST_AUDIT, READING, Record, SCHEDULE};
+pub(crate) use disk::{AUDIT, DELIVERY, LAST_AUDIT, OWED, READERS, READING, Record, SCHEDULE};
 use disk::{Moment, Stored, Tables};
-pub(crate) use drop::{Dropped, VERSION_KEYS};
+pub(crate) use drop::{BATCH, Dropped, Reclaim};
 use folder::{Hold, Locked};
 pub(crate) use keys::{Entry, EntryShape, KEY_LIMIT, Span, cells_end, encoded_len, span};
 pub(crate) use record::{
     delivery_parts, most, put_text, put_value, read_value, value_len, value_prefix,
 };
+pub(crate) use space::{Space, fnv};
 
 /// The size of the page cache of a store opened under this memory limit, in bytes: a quarter
 /// of the limit and never less than 8 MiB, which is also its size when there is no limit. It is
@@ -229,7 +231,7 @@ impl Key {
 }
 
 /// One stored row as a read returns it: one cell per column, in the order the row was written.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Row {
     pub written: Option<u32>,
     pub cells: Vec<Cell>,
@@ -426,9 +428,6 @@ impl View {
     }
 }
 
-type Space = (u64, u64, u64, u64, bool);
-pub(super) type Compaction = (Option<Vec<u8>>, Option<usize>, bool, Arc<AtomicU64>);
-
 /// The change set to write with: everything one transaction means to change, held in memory
 /// until it is committed or dropped.
 ///
@@ -466,11 +465,14 @@ pub struct ChangeSet {
     keeps: BTreeMap<u32, bool>,
     /// A PURGE or an expiry: a removed row's versions go with it.
     pub(crate) erasing: bool,
+    /// A PURGE: every owed range goes in its commit too.
+    pub(crate) purging: bool,
     /// The row guards, in the order they were staged.
     guards: Vec<RowGuard>,
     /// The number the transaction took when it began; zero when it took none.
     number: TxId,
-    pub(super) compaction: Option<Compaction>,
+    /// A batch of the removal loop to run in this commit, and what it did.
+    pub(crate) reclaim: Option<Arc<Mutex<Reclaim>>>,
     /// Staged records of the vector part by their stored key: the value, or `None` for a
     /// removal.
     vectors: BTreeMap<Key, Option<Vec<u8>>>,
@@ -564,9 +566,10 @@ impl ChangeSet {
             dropped: Vec::new(),
             keeps: BTreeMap::new(),
             erasing: false,
+            purging: false,
             guards: Vec::new(),
             number: TxId(0),
-            compaction: None,
+            reclaim: None,
             vectors: BTreeMap::new(),
             numbers: BTreeMap::new(),
             copied: Vec::new(),
@@ -1020,17 +1023,6 @@ impl ChangeSet {
         self.touched_since(mark).count()
     }
 
-    pub(crate) fn compact_pages(
-        &mut self,
-        from: Option<Vec<u8>>,
-        allowance: Option<usize>,
-        drain: bool,
-    ) -> Arc<AtomicU64> {
-        let outcome = Arc::default();
-        self.compaction = Some((from, allowance, drain, Arc::clone(&outcome)));
-        outcome
-    }
-
     /// The charge of a commit notice naming `tables` tables, taken from what the write holds.
     pub(crate) fn summary_charge(&mut self, tables: u64) -> Option<Reservation> {
         (tables > 0).then(|| self.held.split(128 + TABLE_SUMMARY * tables))
@@ -1039,7 +1031,7 @@ impl ChangeSet {
     /// function asks before it commits, so that a transaction that changed nothing writes
     /// nothing and spends no commit number.
     pub fn is_empty(&self) -> bool {
-        self.calls.is_empty() && !self.written && self.compaction.is_none()
+        self.calls.is_empty() && !self.written && self.reclaim.is_none()
     }
 
     /// A stored row of `table` as it is once the cells this change set drops are gone, so that
@@ -1163,6 +1155,10 @@ pub(crate) struct Store {
     budget: Budget,
     _cache: Reservation,
     marks: Marks,
+    /// The fewest free pages a commit left itself since the tidy-up last looked.
+    surplus: Mutex<Option<u64>>,
+    /// The writer's copy of the folder's `space` file.
+    space: Mutex<Space>,
 }
 
 /// How a store is held. The storage library's handle comes first in each, so the data file is
@@ -1320,6 +1316,8 @@ impl Store {
             budget: budget.clone(),
             _cache: reserved,
             marks: Marks::default(),
+            surplus: Mutex::default(),
+            space: Mutex::default(),
         })
     }
 
@@ -1428,35 +1426,6 @@ impl Store {
         Ok((records, bytes))
     }
 
-    /// Allocator space and readers of an older physical commit; no data-tree walk.
-    pub(crate) fn compaction_space(&self, allowance: &mut usize) -> Result<Space> {
-        self.compaction(|t| Ok(t.compaction_space(allowance)?))
-    }
-
-    pub(crate) fn compaction_position(&self, moved: bool) -> Result<(Option<Vec<u8>>, bool)> {
-        self.compaction(|t| Ok(t.compaction_position(moved)?))
-    }
-
-    pub(crate) fn has_free_tail(&self) -> Result<bool> {
-        self.compaction(|t| Ok(t.has_free_tail()?))
-    }
-
-    pub(crate) fn compaction_backlog(&self, through: Option<u64>) -> Result<(u64, u64, u64)> {
-        self.compaction(|t| Ok(t.compaction_drain_backlog(through)?))
-    }
-
-    pub(crate) fn compaction_state(&self) -> Result<(u64, u64, u64, bool)> {
-        self.compaction(|t| Ok(t.compaction_state()?))
-    }
-
-    fn compaction<T>(&self, f: impl FnOnce(&redb::WriteTransaction) -> Stored<T>) -> Result<T> {
-        let HeldFor::Writing { data, .. } = &self.held else {
-            unreachable!()
-        };
-        let space = || -> Stored<_> { f(&data.begin_write()?) };
-        space().map_err(|e| disk::failed(&self.folder, "compaction", e))
-    }
-
     /// Writes a change set as one commit and waits for the disk.
     ///
     /// Whatever is dropped whole goes after the staged records, and takes with it those staged
@@ -1476,9 +1445,17 @@ impl Store {
         let HeldFor::Writing { data, .. } = &self.held else {
             unreachable!("a store opened for reading is given nothing to commit")
         };
-        match disk::write(data, changes.borrow_mut()) {
+        match disk::write(data, changes.borrow_mut(), &self.surplus) {
             Ok(commit) => Ok(TxId(commit)),
-            Err(error) => Err(disk::failed(&self.folder, "commit", error)),
+            Err(error) => {
+                let mut error = disk::failed(&self.folder, "commit", error);
+                if let Error::DiskLimitExceeded { hint, .. } = &mut error
+                    && self.readers_hold()
+                {
+                    *hint = READERS;
+                }
+                Err(error)
+            }
         }
     }
 }

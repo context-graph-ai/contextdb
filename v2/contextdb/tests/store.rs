@@ -186,9 +186,21 @@ fn an_exported_snapshot_opens_and_answers_as_its_source_did() {
     let sql = support::by_mode(None, "INDEXED", 10);
     let q = support::gathered(99_000, 16);
     assert_eq!(answer(&copy, &sql, &q).rows(), answer(&db, &sql, &q).rows());
+    // The copied schedule falls due at the same second as its source's, and its missing
+    // callback is that schedule's own failure, named in its last error on both.
+    let failed = |on: &contextdb::Database| {
+        let status = contextdb::serde_json::to_value(&*on.event_bus_status().unwrap()).unwrap();
+        status["schedules"][0]["last_error"].is_string()
+    };
     for (time, due) in [(109, false), (110, true)] {
         now.store(time, SeqCst);
-        assert_eq!(copy.run_maintenance_cycle().is_err(), due);
+        copy.run_maintenance_cycle().unwrap();
+        db.run_maintenance_cycle().unwrap();
+        assert_eq!(
+            (failed(&copy), failed(&db)),
+            (due, due),
+            "at {time} the copy's schedule and its source's have failed alike"
+        );
     }
     support::insert_doc(&copy, 2002, "a", Some(q)).unwrap();
     assert!(db.export_snapshot(&dest).is_err(), "destination exists");

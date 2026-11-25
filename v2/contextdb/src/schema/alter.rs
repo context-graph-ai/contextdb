@@ -125,8 +125,18 @@ pub(super) fn declare(
     }
     for vector in &old.vectors {
         if !new.is_some_and(|table| table.vectors.iter().any(|kept| kept.id == vector.id)) {
-            changes.stage_drop(Dropped::Vectors(vector.id))?;
+            let mut pending = 0;
+            crate::vector::build::entries(changes, vector, None, &mut |_, partition| {
+                pending += u64::from(partition.unindexed);
+                Ok(true)
+            })?;
+            changes.stage_drop(Dropped::Vectors(vector.id, pending))?;
         }
+    }
+    // Its versions too, from the commit that stops keeping them.
+    let current = |table: &Table| table.meta.history == Some(crate::types::History::CurrentOnly);
+    if new.is_some_and(current) && !current(old) {
+        changes.stage_drop(Dropped::Versions(old.id))?;
     }
     match table {
         Some(mut table) => {

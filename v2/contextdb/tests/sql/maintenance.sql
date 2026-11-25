@@ -4,7 +4,7 @@ SHOW STORAGE_COMPACTION;
 setting | value | source  (read 0, compared 0)
 start_ratio | 0.05 | default
 stop_ratio | 0.02 | default
-min_interval | 0 | default
+min_interval | 60000 | default
 
 SET STORAGE_COMPACTION START_RATIO 0.2;
 SET STORAGE_COMPACTION STOP_RATIO 0.1;

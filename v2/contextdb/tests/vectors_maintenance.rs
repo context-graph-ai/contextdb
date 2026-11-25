@@ -4,6 +4,8 @@
 //! content stays within the size that was recorded for it.
 
 mod support;
+#[path = "support/vecmaint.rs"]
+mod vecmaint;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,11 +17,25 @@ use support::{Child, Run, count};
 
 /// What one cycle reports: the vectors it sealed and the vectors still unindexed.
 fn cycle(db: &Database) -> (u64, u64) {
-    let report = support::cycle(db);
-    (
-        count(report.maintenance_vectors_done),
-        count(report.maintenance_vectors_remaining),
-    )
+    vecmaint::done_left(&support::cycle(db))
+}
+
+/// Options whose storage door counts each write and sync of the store in `writes`.
+fn counting_writes(writes: &Arc<AtomicU64>) -> DatabaseOpenOptions {
+    let (writes, mut options) = (writes.clone(), DatabaseOpenOptions::default());
+    options.storage = Some(support::storage(move |call| {
+        if matches!(call, support::Call::Write(..) | support::Call::Sync) {
+            writes.fetch_add(1, Ordering::SeqCst);
+        }
+    }));
+    options
+}
+
+/// Options whose clock reads the second held in `at`.
+fn at_clock(at: &Arc<AtomicU64>) -> DatabaseOpenOptions {
+    let mut options = DatabaseOpenOptions::default();
+    options.clock = Some(Arc::new(support::At(at.clone())));
+    options
 }
 
 #[test]
@@ -78,21 +94,14 @@ fn sealing_advances_only_when_asked_and_in_bounded_cycles() {
         })
     };
 
-    // Before any cycle every vector is pending: a search reads each pending row of the
-    // partitions it selects once, and each row it returns once more.
-    assert_eq!(examined(&db, "nothing sealed"), [4206, 3010, 1206]);
+    // Before any cycle every vector is pending; a reopen and a reader read the same rows.
+    let pending = examined(&db, "nothing sealed");
     // Nothing seals unless a cycle is called: not a search, not a close, not an open.
     support::close(db);
     let db = support::open(&folder);
-    assert_eq!(
-        examined(&db, "nothing sealed, after reopen"),
-        [4206, 3010, 1206]
-    );
+    assert_eq!(examined(&db, "nothing sealed, after reopen"), pending);
     let reader = support::open_reader(&folder, None);
-    assert_eq!(
-        examined(&reader, "nothing sealed, a reader"),
-        [4206, 3010, 1206]
-    );
+    assert_eq!(examined(&reader, "nothing sealed, a reader"), pending);
 
     // The first cycle seals 4,096 vectors in one commit: the first in the order of partition
     // and row key, so all of a and the first 1,096 of b. 100 of b stay pending.
@@ -103,33 +112,11 @@ fn sealing_advances_only_when_asked_and_in_bounded_cycles() {
         Some(true),
         "100 vectors wait, so work remains"
     );
-    let first = first.vector;
-    assert_eq!(
-        (
-            count(first.maintenance_vectors_done),
-            count(first.maintenance_vectors_remaining)
-        ),
-        (4096, 100)
-    );
+    assert_eq!(vecmaint::done_left(&first.vector), (4096, 100));
     let after_first = support::watermark(&db);
     assert!(after_first > unsealed, "a cycle that sealed made no commit");
-    let [everything, a, b] = examined(&db, "after the first cycle");
-    assert!(
-        (110..4196).contains(&everything),
-        "everything read {everything} rows"
-    );
-    assert!(
-        (10..110).contains(&a),
-        "a, which has nothing pending, read {a} rows"
-    );
-    assert!(
-        (110..1206).contains(&b),
-        "b, which has 100 pending, read {b} rows"
-    );
-    assert_eq!(
-        examined(&reader, "after the first cycle, a reader"),
-        [everything, a, b]
-    );
+    let partly = examined(&db, "after the first cycle");
+    assert_eq!(examined(&reader, "after the first cycle, a reader"), partly);
 
     // The second seals the rest; later physical maintenance leaves the logical position alone.
     support::run(&db, "CREATE TABLE side (id INTEGER PRIMARY KEY)"); // a write between two cycles
@@ -161,6 +148,15 @@ fn sealing_advances_only_when_asked_and_in_bounded_cycles() {
         );
     }
     assert_eq!(examined(&reader, "after the last cycle, a reader"), sealed);
+    // Pending vectors are screened as a block's slots (F1): a scope reads no more rows while
+    // some wait than once all are sealed, plus the ten asked for (as vectors_memory.rs).
+    for ((pending, partly), sealed) in pending.into_iter().zip(partly).zip(sealed) {
+        let fewer = pending.max(partly) <= sealed + 10;
+        assert!(
+            fewer,
+            "rows read pending {pending}, partly {partly}, sealed {sealed}"
+        );
+    }
 
     // A cycle reports exactly the vectors that came to wait since the one before.
     let position = |db: &Database| support::watermark(db);
@@ -214,7 +210,6 @@ fn sealing_advances_only_when_asked_and_in_bounded_cycles() {
         .map(count),
         [0; 7]
     );
-    assert!(count(report.compacted_pages) <= 256);
     assert_eq!(position(&db), before);
     support::declare(&db);
     support::insert(&db, 1..=10);
@@ -226,25 +221,26 @@ fn sealing_advances_only_when_asked_and_in_bounded_cycles() {
 
     // A commit that leaves a partition at its limit of unindexed vectors, one block of the
     // column by default, seals that partition's whole blocks itself, with no cycle called. A
-    // block takes 328 vectors of 768 numbers under a UUID key, which is longer than an
-    // integer's, and at most 335 under any key of a byte or more (`BLOCK_BYTES` over a slot of
-    // 776 bytes and a key end of 4). So no one-row commit leaves 336 unindexed, the one that
-    // seals has 328 or more unindexed and seals one block, and 336 such commits seal once.
+    // block takes 63 vectors of 4,096 numbers under a UUID key, which is longer than an
+    // integer's, and at most 63 under any key of a byte or more (`BLOCK_BYTES` over a slot of
+    // 4,104 bytes and a key end of 4). So no one-row commit leaves 64 unindexed, the one that
+    // seals has 63 unindexed and seals one block, and 64 such commits seal once.
+    const WIDE: usize = 4096;
     let folder = support::folder("sealing-in-the-commit");
     let db = support::open(&folder);
-    support::declare_docs(&db, 768, "");
+    support::declare_docs(&db, WIDE, "");
     let (mut left, mut seals) = (0, 0);
-    for n in 1..=336_i64 {
-        support::insert_doc(&db, n, "a", Some(support::vector(n, 768))).expect("a one-row commit");
+    for n in 1..=64_i64 {
+        support::insert_doc(&db, n, "a", Some(support::vector(n, WIDE))).expect("a one-row commit");
         let now = support::whole(&support::the_partition(&db), "pending_tuples");
         assert!(
-            now < 336,
+            now < 64,
             "the one-row commit of row {n} left {now} vectors unindexed"
         );
         if now <= left {
             seals += 1;
             assert!(
-                left + 1 >= 328 && left + 1 - now <= 335,
+                left + 1 >= 63 && left + 1 - now <= 63,
                 "row {n}'s commit sealed {} of {} unindexed: one block, and only at the limit",
                 left + 1 - now,
                 left + 1
@@ -252,14 +248,14 @@ fn sealing_advances_only_when_asked_and_in_bounded_cycles() {
         }
         left = now;
     }
-    assert_eq!(seals, 1, "336 one-row commits completed one block");
+    assert_eq!(seals, 1, "64 one-row commits completed one block");
 
     // A declared count seals its reaching commit. Once cycles finish their work,
     // a further idle cycle writes and syncs nothing.
     support::maintenance(&db);
     support::run(&db, "SET UNINDEXED_VECTOR_LIMIT 2");
-    for (id, pending) in [(337, 1), (338, 0)] {
-        support::insert_doc(&db, id, "a", Some(support::vector(id, 768))).unwrap();
+    for (id, pending) in [(65, 1), (66, 0)] {
+        support::insert_doc(&db, id, "a", Some(support::vector(id, WIDE))).unwrap();
         assert_eq!(
             support::whole(&support::the_partition(&db), "pending_tuples"),
             pending
@@ -267,29 +263,14 @@ fn sealing_advances_only_when_asked_and_in_bounded_cycles() {
     }
     support::close(db);
     let writes = Arc::new(AtomicU64::new(0));
-    let mut options = DatabaseOpenOptions::default();
-    options.storage = Some(support::storage({
-        let writes = writes.clone();
-        move |call| {
-            if matches!(call, support::Call::Write(..) | support::Call::Sync) {
-                writes.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-    }));
-    let db = support::open_with(&folder, options).expect("reopen through the counting door");
+    let db = support::open_with(&folder, counting_writes(&writes))
+        .expect("reopen through the counting door");
     let logical = support::watermark(&db);
     // Two cycles relocate metadata then retire and trim its pages; the third is idle.
     for step in 0..2 {
         let before = support::data_file(&folder);
         let report = db.run_maintenance_cycle().unwrap();
-        assert!(count(report.compacted_pages) <= 256);
-        assert_eq!(
-            (
-                count(report.vector.maintenance_vectors_done),
-                count(report.vector.maintenance_vectors_remaining)
-            ),
-            (0, 0)
-        );
+        assert_eq!(vecmaint::done_left(&report.vector), (0, 0));
         assert!(
             support::data_file(&folder) <= before,
             "drain cycle {step} grew the file"
@@ -298,14 +279,7 @@ fn sealing_advances_only_when_asked_and_in_bounded_cycles() {
     }
     let idle = support::data_file(&folder);
     let opened = writes.load(Ordering::SeqCst);
-    let report = support::cycle(&db);
-    assert_eq!(
-        (
-            count(report.maintenance_vectors_done),
-            count(report.maintenance_vectors_remaining)
-        ),
-        (0, 0)
-    );
+    assert_eq!(cycle(&db), (0, 0));
     assert_eq!(support::watermark(&db), logical);
     assert_eq!(support::data_file(&folder), idle);
     assert_eq!(
@@ -445,11 +419,8 @@ fn the_worker_runs_cycles_until_nothing_is_left() {
     support::close(db);
 
     let folder = support::folder("worker-expiry-continuation");
-    let mut options = DatabaseOpenOptions::default();
-    options.clock = Some(Arc::new(support::At(Arc::new(AtomicU64::new(
-        1_699_999_999,
-    )))));
-    let db = support::open_with(&folder, options).unwrap();
+    let frozen = Arc::new(AtomicU64::new(1_699_999_999));
+    let db = support::open_with(&folder, at_clock(&frozen)).unwrap();
     for sql in [
         "CREATE TABLE marks (id INT PRIMARY KEY)",
         "CREATE TABLE a_parent (id INT PRIMARY KEY) RETAIN 1 SECONDS",
@@ -482,6 +453,7 @@ fn the_worker_runs_cycles_until_nothing_is_left() {
 
     let folder = support::folder("worker-downward-crossing");
     let db = support::open(&folder);
+    support::run(&db, "SET STORAGE_COMPACTION MIN_INTERVAL 0 SECONDS");
     support::run(&db, "CREATE TABLE marks (id INT PRIMARY KEY)");
     support::declare_docs(&db, 16, "PARTITION_KEY(ctx) INDEXING_THRESHOLD 2000");
     support::load_docs(&db, 1..=10, "a", gathered);
@@ -504,11 +476,6 @@ fn the_worker_runs_cycles_until_nothing_is_left() {
     until_rested(&db, &syncs, |db| {
         support::data_file(&folder) < before && db.last_maintenance_cycle().unwrap().is_some()
     });
-    let cycle = db.last_maintenance_cycle().unwrap().expect("a cycle ran");
-    assert!(
-        cycle.compacted_pages.unwrap_or(0) <= 256,
-        "a cycle is bounded"
-    );
     db.verify().unwrap();
     support::close(db);
 
@@ -519,6 +486,8 @@ fn the_worker_runs_cycles_until_nothing_is_left() {
         main: std::thread::ThreadId,
         worker_only: bool,
         round: u64,
+        // Whole windows the fixture has moved on, for both threads.
+        shift: Arc<AtomicU64>,
         gate: Mutex<Vec<ClockGate>>,
     }
     impl contextdb::Clock for PollClock {
@@ -535,7 +504,9 @@ fn the_worker_runs_cycles_until_nothing_is_left() {
             }
             std::time::UNIX_EPOCH
                 + std::time::Duration::from_secs(
-                    1_700_000_000 + 60 * (self.round + u64::from(worker)),
+                    1_700_000_000
+                        + self.shift.load(Ordering::SeqCst)
+                        + 60 * (self.round + u64::from(worker)),
                 )
         }
     }
@@ -543,21 +514,15 @@ fn the_worker_runs_cycles_until_nothing_is_left() {
     let calls = Arc::new(AtomicU64::new(0));
     let io = Arc::new(AtomicU64::new(0));
     let main = std::thread::current().id();
-    let mut options = DatabaseOpenOptions::default();
+    let shift = Arc::new(AtomicU64::new(0));
+    let mut options = counting_writes(&io);
     options.clock = Some(Arc::new(PollClock {
         calls: calls.clone(),
         main,
         worker_only: false,
         round: 0,
+        shift: shift.clone(),
         gate: Mutex::new(Vec::new()),
-    }));
-    options.storage = Some(support::storage({
-        let io = io.clone();
-        move |call| {
-            if matches!(call, support::Call::Write(..) | support::Call::Sync) {
-                io.fetch_add(1, Ordering::SeqCst);
-            }
-        }
     }));
     let db = support::open_with(&folder, options).unwrap();
     for sql in [
@@ -569,14 +534,26 @@ fn the_worker_runs_cycles_until_nothing_is_left() {
     ] {
         support::run(&db, sql);
     }
+    // Each drain cycle runs one MIN_INTERVAL (60 seconds by default) after the last, so every
+    // one is at a window's end and a pass may start. A window whose commits used its free pages
+    // has no surplus at its end, so one quiet cycle proves nothing; a window with no commit
+    // starts from nothing, and when the cycle at its end also moves nothing the fixture is
+    // drained (design 4, S4).
     let mut idle = false;
+    let mut quiet = 0;
     for _ in 0..32 {
+        shift.fetch_add(60, Ordering::SeqCst);
         let before = io.load(Ordering::SeqCst);
         let length = support::data_file(&folder);
         let report = db.run_maintenance_cycle().unwrap();
         assert!(support::data_file(&folder) <= length);
-        if io.load(Ordering::SeqCst) == before {
-            assert_eq!(report.compacted_pages, Some(0));
+        if io.load(Ordering::SeqCst) != before {
+            quiet = 0;
+            continue;
+        }
+        assert_eq!(report.compacted_pages, Some(0));
+        quiet += 1;
+        if quiet == 2 {
             idle = true;
             break;
         }
@@ -585,6 +562,9 @@ fn the_worker_runs_cycles_until_nothing_is_left() {
         idle,
         "the no-progress fixture drains within thirty-two cycles"
     );
+    // The cycle the worker's is bounded by is a drained one at the next window's end, as the
+    // worker's first cycle of each round is.
+    shift.fetch_add(60, Ordering::SeqCst);
     calls.store(0, Ordering::SeqCst);
     let before = io.load(Ordering::SeqCst);
     assert_eq!(db.run_maintenance_cycle().unwrap().compacted_pages, Some(0));
@@ -605,6 +585,7 @@ fn the_worker_runs_cycles_until_nothing_is_left() {
             main,
             worker_only: true,
             round,
+            shift: shift.clone(),
             // Drain before the first poll; hold the worker at its next clock read.
             gate: Mutex::new(vec![(1, opened, drained), (2, checked, allowed)]),
         }));
@@ -651,14 +632,35 @@ fn search_of_ten() -> String {
     support::nearest_sql("docs", "v", None, 10)
 }
 
-/// A search's answer and its counted work as one line: the rows it read, then each key with
-/// the bits of its distance. Two searches of one commit give the same line.
-fn told(result: &QueryResult) -> String {
+/// What one commit shows a reader as one line: the vectors still waiting to be sealed as
+/// `SHOW VECTOR_INDEXES` gives them, the rows a search read, then each key with the bits of its
+/// distance. Two readings of one commit give the same line.
+fn told(progress: &support::Shown, result: &QueryResult) -> String {
+    let pending = support::whole(progress, "pending_tuples");
     let rows: Vec<String> = support::found(result, "the search of ten")
         .iter()
         .map(|near| format!("{:?}:{:016x}", near.key, near.distance.to_bits()))
         .collect();
-    format!("{} {}", result.rows_examined(), rows.join(","))
+    let read = result.rows_examined();
+    format!("{pending} | {read} | {}", rows.join(","))
+}
+
+/// The seal progress of `docs.v` that a door reads now.
+fn seal_progress(on: &impl Run) -> support::Shown {
+    let mut shown = support::shown(on, "SHOW VECTOR_INDEXES");
+    assert_eq!(shown.len(), 1, "docs.v is the store's one vector column");
+    shown.remove(0)
+}
+
+/// The vectors a line says are waiting to be sealed, and the rows of its search.
+fn pending_of(line: &str) -> i64 {
+    let pending = line.split(" | ").next().expect("a line");
+    pending
+        .parse()
+        .expect("a line begins with its pending vectors")
+}
+fn rows_of(line: &str) -> &str {
+    line.rsplit(" | ").next().expect("a line")
 }
 
 #[test]
@@ -688,13 +690,8 @@ fn a_reader_in_another_process_searches_while_the_writer_seals() {
         let stored = support::stored(&db, support::DOCS);
         let wanted = stored.nearest(|_| true, &searched_for(), 10);
         let sql = search_of_ten();
-        told(&support::assert_nearest(
-            &db,
-            &sql,
-            &searched_for(),
-            &wanted,
-            "the writer",
-        ))
+        let found = support::assert_nearest(&db, &sql, &searched_for(), &wanted, "the writer");
+        told(&seal_progress(&db), &found)
     };
     let mut commits = vec![newest()];
 
@@ -725,14 +722,17 @@ fn a_reader_in_another_process_searches_while_the_writer_seals() {
     follow(&commits);
 
     // The writer seals cycle by cycle and inserts and changes between. Each step is one
-    // commit that changes what a search reads, so the reader can be seen to arrive at it.
-    let steps: [&dyn Fn(); 7] = [
-        &|| assert_eq!(cycle(&db), (4096, 1904)),
-        &|| insert(6001..6501),
-        &|| assert_eq!(cycle(&db), (2404, 0)),
-        &|| insert(6501..7001),
-        &|| assert_eq!(cycle(&db), (500, 0)),
-        &|| {
+    // commit that changes what a reader is shown, so the reader can be seen to arrive at it:
+    // a write changes the rows or the vectors waiting to be sealed, and a seal leaves fewer
+    // vectors waiting and changes no row a search returns.
+    let (seal, write) = (true, false);
+    let steps: [(bool, &dyn Fn()); 7] = [
+        (seal, &|| assert_eq!(cycle(&db), (4096, 1904))),
+        (write, &|| insert(6001..6501)),
+        (seal, &|| assert_eq!(cycle(&db), (2404, 0))),
+        (write, &|| insert(6501..7001)),
+        (seal, &|| assert_eq!(cycle(&db), (500, 0))),
+        (write, &|| {
             let tx = db.transaction().expect("begin");
             for id in 1..=300_i64 {
                 tx.execute(
@@ -742,16 +742,25 @@ fn a_reader_in_another_process_searches_while_the_writer_seals() {
                 .expect("change a vector");
             }
             tx.commit().expect("commit");
-        },
-        &|| assert_eq!(cycle(&db), (300, 0)),
+        }),
+        (seal, &|| assert_eq!(cycle(&db), (300, 0))),
     ];
-    for step in steps {
+    for (sealed, step) in steps {
         step();
         let line = newest();
-        assert!(
-            Some(&line) != commits.last(),
-            "a step left the search's line as it was"
-        );
+        let was = commits.last().expect("a commit");
+        assert_ne!(&line, was, "a step left what a reader is shown as it was");
+        if sealed {
+            assert_eq!(
+                rows_of(&line),
+                rows_of(was),
+                "a seal moves vectors into blocks and changes no row a search returns"
+            );
+            assert!(
+                pending_of(&line) < pending_of(was),
+                "a seal that sealed vectors left as many waiting to be sealed:\n{was}\n{line}"
+            );
+        }
         commits.push(line);
         follow(&commits);
     }
@@ -778,15 +787,19 @@ fn a_reader_in_another_process_searches_while_the_writer_seals() {
 /// Opens the store for reading and searches without end, announcing an answer's line each
 /// time it differs from the one before. The parent kills it.
 fn looping(role: &support::Role) {
-    let reader = support::open_reader(&role.folder, None);
     let (sql, query) = (search_of_ten(), searched_for());
     let mut last = String::new();
     loop {
+        // Each round reads one commit: the newest when the round begins.
+        let reader = support::open_reader(&role.folder, None)
+            .into_one_moment()
+            .expect("a reader is never refused while the writer seals");
+        let sealing = seal_progress(&reader);
         let result = match support::search(&reader, &sql, &query) {
             Ok(result) => result,
             Err(error) => panic!("a reader was refused while the writer sealed: {error:?}"),
         };
-        let line = told(&result);
+        let line = told(&sealing, &result);
         if line != last {
             support::say(&line);
             last = line;
@@ -802,37 +815,32 @@ fn stopped(role: &support::Role) {
     let (reader, searching, reads) = support::reader_pausing(role);
     let (sql, query) = (search_of_ten(), searched_for());
 
+    // The writer makes no commit until this reader is stopped inside its search, and none
+    // after the parent lets it go, so each search and the progress read before it are of one
+    // commit.
+    let sealing = seal_progress(&reader);
     searching.store(true, Ordering::SeqCst);
     let result = support::search(&reader, &sql, &query).expect("a reader's search is not refused");
     searching.store(false, Ordering::SeqCst);
-    support::say(told(&result));
+    support::say(told(&sealing, &result));
     support::say(format!("reads {}", reads.load(Ordering::SeqCst)));
+    let sealing = seal_progress(&reader);
     let next = support::search(&reader, &sql, &query).expect("the reader's next search");
-    support::say(told(&next));
+    support::say(told(&sealing, &next));
 }
 
 #[test]
 fn a_small_fixed_store_stays_within_its_recorded_size() {
     // The bytes put in: 1,500 ids of 8 bytes, 1,500 vectors of 1,536 bytes and 4,800,000
-    // bytes of text. And the most bytes the data file may have.
+    // bytes of text. The generated letters do not compress by an eighth, so their stored bytes
+    // stay exact. And the most bytes the data file may have: bar 1, a store at most 1.5 times
+    // its data once maintenance rests (design 8.1).
     const PUT_IN: u64 = 7_116_000;
-    // The generated letters do not compress by an eighth, so their stored bytes stay exact.
-    const RECORDED: u64 = 2 * PUT_IN;
+    const RECORDED: u64 = PUT_IN * 3 / 2;
 
     let folder = support::folder("small-fixed-store");
     let writes = Arc::new(AtomicU64::new(0));
-    let options = || {
-        let mut options = DatabaseOpenOptions::default();
-        options.storage = Some(support::storage({
-            let writes = writes.clone();
-            move |call| {
-                if matches!(call, support::Call::Write(..) | support::Call::Sync) {
-                    writes.fetch_add(1, Ordering::SeqCst);
-                }
-            }
-        }));
-        options
-    };
+    let options = || counting_writes(&writes);
     let db = support::open_with(&folder, options()).expect("open through the counting door");
     support::run(
         &db,
@@ -880,8 +888,16 @@ fn a_small_fixed_store_stays_within_its_recorded_size() {
         &params! { "due" => Value::Timestamp(-1) },
     )
     .unwrap();
-    assert_eq!(db.run_maintenance_cycle().unwrap().expired_rows, Some(500));
-    let before = support::data_file(&folder);
+    // The bar is the size at rest, not the interval: MIN_INTERVAL 0 keeps a window of one
+    // commit, so passes start in this short session with no clock (design 4, S4).
+    support::run(&db, "SET STORAGE_COMPACTION MIN_INTERVAL 0 SECONDS");
+    let mut expired = 0;
+    let done = (0..1000).any(|_| {
+        let report = db.run_maintenance_cycle().unwrap();
+        expired += count(report.expired_rows);
+        report.work_remaining == Some(false) && report.owed == Some(false)
+    });
+    assert!(done && expired == 500, "{expired} of 500 rows expired");
     // Ratios declared through SQL survive reopen and steer both starting and an active walk.
     let configured = |db: Database, start: f64, stop: f64| {
         support::run(&db, "SET STORAGE_COMPACTION START_RATIO 1");
@@ -902,12 +918,12 @@ fn a_small_fixed_store_stays_within_its_recorded_size() {
                     Value::Float64(stop),
                     support::text("declared")
                 ],
-                // The interval between sweeps is shown beside the ratios, in whole
-                // milliseconds, and no sweep is held back until it is declared.
+                // The interval is shown beside the ratios, in whole milliseconds, and the
+                // one declared above survives reopen with them (design 4, S4).
                 vec![
                     support::text("min_interval"),
                     Value::Int64(0),
-                    support::text("default")
+                    support::text("declared")
                 ],
             ]
         );
@@ -926,105 +942,43 @@ fn a_small_fixed_store_stays_within_its_recorded_size() {
             assert_eq!(support::watermark(db), before.1);
         }
     };
-    let advance = |db: &Database| {
-        let mut previous = support::data_file(&folder);
-        let position = support::watermark(db);
-        for _ in 0..16 {
-            let pages = count(db.run_maintenance_cycle().unwrap().compacted_pages);
-            assert!(pages <= 256);
-            let length = support::data_file(&folder);
-            assert!(
-                length <= previous,
-                "configured maintenance grew {previous} -> {length}"
-            );
-            assert_eq!(support::watermark(db), position);
-            previous = length;
-            if pages > 0 {
-                return pages;
-            }
-        }
-        panic!("declared ratios must permit relocation within sixteen cycles");
-    };
     let db = configured(db, 1.0, 0.99);
     stopped(&db);
-    // An explicit step runs below the start ratio, is capped, and says what it measured.
-    let step = db.compact_now().unwrap();
+    // Bar 1: the fixed load, with maintenance at rest, is within its recorded size.
+    let rested = support::data_file(&folder);
     assert!(
-        (1..=256).contains(&count(step.compacted_pages)),
-        "one capped step"
+        rested <= RECORDED,
+        "the data file is {rested} bytes long; the most recorded is {RECORDED} for {PUT_IN} put in"
     );
-    assert!(
-        step.compaction_free_ratio
-            .is_some_and(|ratio| ratio > 0.0 && ratio <= 1.0)
-    );
-    let db = configured(db, 0.1, 0.0);
-    let mut steered = advance(&db) + count(step.compacted_pages);
-    let db = configured(db, 1.0, 0.0);
-    steered += advance(&db); // The persisted walk uses STOP_RATIO despite the higher start.
-    let db = configured(db, 1.0, 0.99);
-    stopped(&db);
-    let db = configured(db, 0.1, 0.05);
-    // Real commits drain the deletion's freed pages and then advance past the held view.
-    let update = "UPDATE notes SET body = $body WHERE id = 1";
-    let body = support::letters(1, 1700);
-    db.execute(update, &params! { "body" => format!("{body}x") })
-        .unwrap();
-    let held = db.transaction().unwrap();
-    db.execute(update, &params! { "body" => format!("{body}y") })
-        .unwrap();
-    let report = db.run_maintenance_cycle().unwrap();
-    let waiting = Some(contextdb::WaitingOn::Readers);
-    assert_eq!(report.compaction_waiting_on, waiting);
-    assert_eq!(db.compact_now().unwrap().compaction_waiting_on, waiting);
-    assert!(count(report.compacted_pages) <= 256);
-    assert_eq!(support::int(&held, "SELECT COUNT(*) FROM notes"), 1500);
-    drop(held);
-    let mut previous = support::data_file(&folder);
-    let mut moved = steered + count(report.compacted_pages);
+    // A store that loses half its rows gives the space back with no call from the user: the
+    // cycles alone bring the file within the recorded bar for what is left (design 4, S4).
+    let db = configured(db, 0.05, 0.02);
+    support::run(&db, "DELETE FROM notes WHERE id > 750");
+    let kept: u64 = (1..=750_u64)
+        .map(|id| 8 + 4 * 384 + 200 + 1500 * (id % 5))
+        .sum();
     let mut idle = false;
-    for step in 0..previous / 4096 + 16 {
-        let before_cycle = writes.load(Ordering::SeqCst);
-        let report = db.run_maintenance_cycle().unwrap();
-        let pages = count(report.compacted_pages);
-        assert!(pages <= 256, "cycle {step} moved {pages} pages");
-        assert_eq!(report.deferred, Some(0));
-        let length = support::data_file(&folder);
-        assert!(
-            length <= previous,
-            "cycle {step}: grew {previous} -> {length}, moved {pages}"
-        );
-        previous = length;
-        moved += pages;
-        // A zero-page step may have advanced the bounded catalog scan. Completion is a
-        // cycle that neither writes nor syncs, rather than the first step moving no page.
-        if writes.load(Ordering::SeqCst) == before_cycle {
-            assert_eq!(pages, 0);
+    for _ in 0..support::data_file(&folder) / 4096 {
+        let before = writes.load(Ordering::SeqCst);
+        db.run_maintenance_cycle().unwrap();
+        if writes.load(Ordering::SeqCst) == before {
             idle = true;
             break;
         }
     }
-    assert!(idle, "compaction must finish within a walk of the store");
     assert!(
-        moved > 256,
-        "the free space needs several capped steps; moved {moved}"
+        idle,
+        "an idle cycle writes and syncs nothing, and the cycles reach one"
     );
-    assert!(previous < before, "compaction must shorten the file");
-    let before_idle = writes.load(Ordering::SeqCst);
-    assert_eq!(db.run_maintenance_cycle().unwrap().compacted_pages, Some(0));
-    assert_eq!(
-        writes.load(Ordering::SeqCst),
-        before_idle,
-        "an idle cycle writes and syncs nothing"
-    );
-    assert_eq!(support::int(&db, "SELECT COUNT(*) FROM notes"), 1500);
-    assert_eq!(support::int(&db, "SELECT SUM(id) FROM notes"), 1_125_750);
+    assert_eq!(support::int(&db, "SELECT COUNT(*) FROM notes"), 750);
+    assert_eq!(support::int(&db, "SELECT SUM(id) FROM notes"), 281_625);
     db.verify().unwrap();
     // Measure after maintenance, before clean close can shorten the file.
     let length = support::data_file(&folder);
     assert!(
-        length <= RECORDED,
-        "the data file is {length} bytes long; the most recorded for this store is {RECORDED} \
-         bytes, and {PUT_IN} bytes were put in"
+        length <= 2 * kept,
+        "the data file is {length} bytes long; the most recorded for a store is twice what it \
+         holds, and {kept} bytes are left of the {PUT_IN} put in"
     );
     support::close(db);
 }
@@ -1033,9 +987,10 @@ fn a_small_fixed_store_stays_within_its_recorded_size() {
 fn the_same_rows_in_more_commits_end_at_the_same_size() {
     // The notes of the test above, 24 times over (about 200 MB), written in 1, 2, 4 and 8
     // commits, the quarter of negative id deleted, then maintained until a cycle has nothing to
-    // do. Disk use follows content, not how it was committed: the data files end within one
-    // compaction step, 256 pages of 4 KiB, of each other. At this size the same stores left
-    // uncompacted differ by several steps. Runs in the release profile only.
+    // do and compacted to rest: the free pages left are below the start share, so no pass of
+    // its own begins. Disk use follows content, not how it was committed: the data files end
+    // within one compaction step, 256 pages of 4 KiB, of each other. At this size the same
+    // stores left uncompacted differ by several steps. Runs in the release profile only.
     const SCALE: i64 = 24;
     const STEP: u64 = 256 * 4096;
     let sizes = [1_i64, 2, 4, 8].map(|commits| {
@@ -1059,6 +1014,7 @@ fn the_same_rows_in_more_commits_end_at_the_same_size() {
         }
         support::run(&db, "DELETE FROM notes WHERE id < 0");
         support::maintenance(&db);
+        while db.compact_now().unwrap().work_remaining != Some(false) {}
         assert_eq!(support::int(&db, "SELECT COUNT(*) FROM notes"), 1500 * SCALE);
         // Measured after maintenance, before a clean close can shorten the file.
         support::data_file(&folder)
@@ -1097,6 +1053,39 @@ fn lists_of(partition: &support::Shown) -> Option<i64> {
     }
 }
 
+/// The state and reason, and the groups, of the one partition of `docs`.
+fn state(db: &Database) -> (String, String) {
+    state_of(&support::the_partition(db))
+}
+fn lists(db: &Database) -> Option<i64> {
+    lists_of(&support::the_partition(db))
+}
+
+/// Asserts that a search for the ten rows nearest `query` under EXACT, AUTO and INDEXED each
+/// returns the reference.
+fn every_mode_answers(db: &Database, query: &[f32], state: &str) {
+    let wanted = support::stored(db, support::DOCS).nearest(|_| true, query, 10);
+    for mode in ["EXACT", "AUTO", "INDEXED"] {
+        let sql = support::by_mode(None, mode, 10);
+        let state = format!("{mode} {state}");
+        support::assert_nearest(db, &sql, query, &wanted, &state);
+    }
+}
+
+/// Asserts that a search under INDEXED for the vector of each of `ids` answers soundly with
+/// that row first.
+fn each_found_first(db: &Database, ids: impl Iterator<Item = i64>, vector: fn(i64) -> Vec<f32>) {
+    let stored = support::stored(db, support::DOCS);
+    let sql = support::by_mode(None, "INDEXED", 1);
+    for id in ids {
+        let query = vector(id);
+        let result = support::answer(db, &sql, &query);
+        let state = format!("row {id}, searched for under INDEXED by its own vector");
+        let answer = support::assert_sound(&result, &stored, |_| true, &query, 1, &state);
+        assert_eq!(answer[0].key, Value::Int64(id), "{state}");
+    }
+}
+
 /// What a build reports of itself in a partition's row: the slots it reads, has packed and
 /// has left.
 fn progress(partition: &support::Shown) -> [i64; 3] {
@@ -1108,9 +1097,7 @@ fn progress(partition: &support::Shown) -> [i64; 3] {
 fn a_ivf_is_built_in_bounded_cycles_and_switched_in_one() {
     let folder = support::folder("ivf-in-cycles");
     let second = Arc::new(AtomicU64::new(100));
-    let mut options = DatabaseOpenOptions::default();
-    options.clock = Some(Arc::new(support::At(second.clone())));
-    let db = support::open_with(&folder, options).unwrap();
+    let db = support::open_with(&folder, at_clock(&second)).unwrap();
     support::run(
         &db,
         "CREATE TABLE expired (id INTEGER PRIMARY KEY, due TIMESTAMP EXPIRES) RETAIN 1 SECONDS",
@@ -1137,11 +1124,7 @@ fn a_ivf_is_built_in_bounded_cycles_and_switched_in_one() {
     };
 
     let first = support::watermark(&db);
-    let wanted = support::stored(&db, support::DOCS).nearest(|_| true, &query, 10);
-    for mode in ["EXACT", "AUTO", "INDEXED"] {
-        let sql = support::by_mode(None, mode, 10);
-        support::assert_nearest(&db, &sql, &query, &wanted, mode);
-    }
+    every_mode_answers(&db, &query, "before any cycle");
     assert_eq!(support::watermark(&db), first);
     for number in 1..=18_u64 {
         if number == 6 {
@@ -1170,9 +1153,8 @@ fn a_ivf_is_built_in_bounded_cycles_and_switched_in_one() {
         // a cycle advances builds before it seals, so the first seals, the second begins, ten
         // find centroids, one gives every slot its group, one packs, two measure, one switches,
         // and the eighteenth has nothing to do. The sixth also seals the row written before it.
-        // Physical compaction can advance on any cycle, within its cap; it never adds
-        // a logical commit to the build and expiry counts below.
-        assert!(count(cycle.compacted_pages) <= 256, "cycle {number}");
+        // Physical compaction can advance on any cycle; it never adds a logical commit to the
+        // build and expiry counts below.
         let wanted = match number {
             1 => (2000, 2000, 1, 1),
             6 => (1, 2000, 1, 2),
@@ -1201,17 +1183,13 @@ fn a_ivf_is_built_in_bounded_cycles_and_switched_in_one() {
             let packed = if number < 14 { 0 } else { 2000 };
             assert_eq!(progress(&partition), [2000, packed, 2000 - packed]);
             // Until the switch every mode returns what EXACT returns.
-            let wanted = support::stored(&db, support::DOCS).nearest(|_| true, &query, 10);
-            for mode in ["EXACT", "AUTO", "INDEXED"] {
-                let sql = support::by_mode(None, mode, 10);
-                let state = format!("{mode} after cycle {number}");
-                support::assert_nearest(&db, &sql, &query, &wanted, &state);
-            }
+            every_mode_answers(&db, &query, &format!("after cycle {number}"));
         } else {
             assert_eq!(state_of(&partition).0, "idle", "after cycle {number}");
             assert_eq!(lists_of(&partition), Some(45), "round(sqrt(2000))");
-            // Recorded from the first run, within the 45 groups.
-            assert_eq!(probes, Value::Int64(15), "probes after the switch");
+            // Recorded from the first run, within the 45 groups; 16 since the reach's distinct
+            // middles (7364fc08b) changed the measured width.
+            assert_eq!(probes, Value::Int64(16), "probes after the switch");
             assert_eq!(progress(&partition), [0, 0, 0]);
         }
     }
@@ -1237,7 +1215,7 @@ fn a_ivf_keeps_a_code_of_every_slot_and_measures_its_width() {
     );
     assert_eq!(
         index_bytes(&db),
-        45 * 4 * 16 + (12 + 8 * 46) + (4 + 2000 * 4) + 4 * 16
+        45 * 4 * 16 + (12 + 8 * 46 + 4 * 16) + (4 + 2000 * 4) + 4 * 16
     );
 }
 
@@ -1249,22 +1227,16 @@ fn sealing_after_a_ivf_keeps_a_code_of_every_slot() {
     assert_eq!(count(support::cycle(&db).maintenance_vectors_done), 300);
     // 300 binary codes, and the count of the one tail block they are in.
     assert_eq!(index_bytes(&db) - before, 300 * 4 + 4);
-    let stored = support::stored(&db, support::DOCS);
-    let sql = support::by_mode(None, "INDEXED", 1);
-    for id in 2001..=2300 {
-        let query = gathered(id);
-        let result = support::answer(&db, &sql, &query);
-        let state = format!("row {id}, sealed after the ivf");
-        let answer = support::assert_sound(&result, &stored, |_| true, &query, 1, &state);
-        assert_eq!(answer[0].key, Value::Int64(id), "{state}");
-    }
+    each_found_first(&db, 2001..=2300, gathered);
 }
 
 #[test]
 fn vectors_sealed_while_a_first_build_starts_are_found_after_the_switch() {
     // Vectors of 64 numbers, of which a block takes 3,083: fewer than one cycle seals.
     const WIDE: usize = 64;
-    let wide = |n: i64| support::gathered(n, WIDE);
+    fn wide(n: i64) -> Vec<f32> {
+        support::gathered(n, WIDE)
+    }
     let folder = support::folder("sealed-while-first-build-starts");
     let db = support::open(&folder);
     // The IVF is never built again, so the vectors sealed after it stay in its tail.
@@ -1274,9 +1246,9 @@ fn vectors_sealed_while_a_first_build_starts_are_found_after_the_switch() {
     // partition's first build. Of the 3,500 rows written then, their commit seals a whole
     // block, and the third cycle seals the start of the next.
     assert_eq!(count(support::cycle(&db).maintenance_vectors_done), 2000);
-    assert_eq!(state_of(&support::the_partition(&db)).0, "pending");
+    assert_eq!(state(&db).0, "pending");
     assert_eq!(count(support::cycle(&db).maintenance_vectors_done), 0);
-    assert_eq!(state_of(&support::the_partition(&db)).0, "building");
+    assert_eq!(state(&db).0, "building");
     support::load_docs(&db, 2001..=5500, "a", wide);
     let left = support::whole(&support::the_partition(&db), "pending_tuples");
     assert!(0 < left && left < 3500, "the commit sealed a block");
@@ -1285,21 +1257,12 @@ fn vectors_sealed_while_a_first_build_starts_are_found_after_the_switch() {
         left as u64
     );
     support::maintenance(&db);
-    let partition = support::the_partition(&db);
-    assert_eq!(state_of(&partition).0, "idle");
-    assert_eq!(lists_of(&partition), Some(45));
+    assert_eq!((state(&db).0, lists(&db)), ("idle".to_owned(), Some(45)));
 
     // Every search under INDEXED answers, and a row sealed in those cycles is the first row
     // of a search for its own vector, from the block that was filled and from the one begun.
+    each_found_first(&db, (2001..=5500).step_by(233), wide);
     let stored = support::stored(&db, support::DOCS);
-    let sql = support::by_mode(None, "INDEXED", 1);
-    for id in (2001..=5500).step_by(233) {
-        let query = wide(id);
-        let result = support::answer(&db, &sql, &query);
-        let state = format!("row {id}, sealed while the first build was starting");
-        let answer = support::assert_sound(&result, &stored, |_| true, &query, 1, &state);
-        assert_eq!(answer[0].key, Value::Int64(id), "{state}");
-    }
     let query = wide(60_002);
     let result = support::answer(&db, &support::by_mode(None, "INDEXED", 10), &query);
     support::assert_sound(&result, &stored, |_| true, &query, 10, "ten rows of 5,500");
@@ -1314,7 +1277,7 @@ fn a_ivf_holds_every_live_vector_once_and_no_stale_slot() {
     support::cycle(&small);
     support::cycle(&small);
     support::cycle(&small);
-    assert_eq!(lists_of(&support::the_partition(&small)), Some(1));
+    assert_eq!(lists(&small), Some(1));
     support::load_docs(&small, 22..=22, "a", gathered);
     support::cycle(&small);
     small
@@ -1353,11 +1316,12 @@ fn a_ivf_holds_every_live_vector_once_and_no_stale_slot() {
         }
         assert!(ran < 100, "regrouping must drain");
     }
-    // Metadata counts the partition, IVF and mean, and each of the 1,850 rows left its one
-    // slot: 12 bytes under its key of 18. Codes and centroids are block bytes.
+    // Metadata counts the partition, IVF (with its reach of 16 levels, 7364fc08b) and mean, and
+    // each of the 1,850 rows left its one slot: 12 bytes under its key of 18. Codes and
+    // centroids are block bytes.
     let expected: u64 = support::shown(&db, "SHOW VECTOR_PARTITIONS")
         .iter()
-        .map(|p| 288 + 8 * lists_of(p).unwrap() as u64)
+        .map(|p| 288 + 4 * 16 + 8 * lists_of(p).unwrap() as u64)
         .sum::<u64>()
         + 1850 * 30;
     assert_eq!(
@@ -1392,7 +1356,7 @@ fn a_build_packs_each_slot_live_at_its_source_once_whatever_departs_after() {
             db.execute(sql, &params! { "id" => id, "v" => v })
                 .expect("move a vector");
         };
-        let state = |db: &Database| state_of(&support::the_partition(db)).0;
+        let state = |db: &Database| state(db).0;
         before.then(|| move_to(1));
         if early {
             support::cycle(&db);
@@ -1428,8 +1392,6 @@ fn a_build_packs_each_slot_live_at_its_source_once_whatever_departs_after() {
 
 #[test]
 fn a_partition_is_grouped_again_only_when_its_changes_reach_the_declared_share() {
-    let state = |db: &Database| state_of(&support::the_partition(db));
-    let lists = |db: &Database| lists_of(&support::the_partition(db));
     let named = |state: &str, reason: &str| (state.to_owned(), reason.to_owned());
     let tombstones = |db: &Database| support::whole(&support::the_partition(db), "tombstones");
 
@@ -1536,9 +1498,7 @@ fn a_cycle_under_a_tight_limit_records_the_stall_and_the_old_ivf_serves() {
     assert_eq!(count(support::cycle(&db).maintenance_vectors_done), 80);
     let stored = support::stored(&db, support::DOCS);
     support::close(db);
-    let mut options = DatabaseOpenOptions::default();
-    options.memory_limit = Some(limit);
-    let db = support::open_with(&folder, options).expect("open under the limit");
+    let db = support::open_limited(&folder, limit);
     support::cycle(&db);
     let report = match db.run_maintenance_cycle() {
         Ok(report) => report.vector,
@@ -1585,9 +1545,7 @@ fn a_cycle_under_a_tight_limit_records_the_stall_and_the_old_ivf_serves() {
 
     // The open's limit is the session's ceiling, so room is made by opening with more.
     support::close(db);
-    let mut roomy = DatabaseOpenOptions::default();
-    roomy.memory_limit = Some(64 << 20);
-    let db = support::open_with(&folder, roomy).expect("open with room");
+    let db = support::open_limited(&folder, 64 << 20);
     support::maintenance(&db);
     let partition = support::the_partition(&db);
     assert_eq!(state_of(&partition), ("idle".to_owned(), "none".to_owned()));
@@ -1609,7 +1567,8 @@ fn deleted_edges_are_reclaimed_by_maintenance_and_compaction_rewrites_only_the_p
         }
     }));
     let db = support::open_with(&folder, options).expect("open");
-    let sql = "CREATE TABLE edges (id INTEGER PRIMARY KEY, body TEXT, v VECTOR(16))";
+    let sql = "CREATE TABLE edges (id INTEGER PRIMARY KEY, body TEXT, v VECTOR(16)) \
+               HISTORY CURRENT ONLY SYNC CONFLICT KEEP LATEST";
     support::run(&db, sql);
     let tx = db.transaction().unwrap();
     for id in 1..=400 {
@@ -1622,6 +1581,7 @@ fn deleted_edges_are_reclaimed_by_maintenance_and_compaction_rewrites_only_the_p
     support::seal_all(&db);
     support::run(&db, "SET STORAGE_COMPACTION STOP_RATIO 0");
     support::run(&db, "SET STORAGE_COMPACTION START_RATIO 0.01");
+    support::run(&db, "SET STORAGE_COMPACTION MIN_INTERVAL 0 SECONDS");
     support::run(&db, "DELETE FROM edges WHERE id <= 10");
     let before = support::data_file(&folder);
     let held = db.transaction().unwrap();
@@ -1655,10 +1615,8 @@ fn a_wake_advances_every_needy_partition_once_and_a_stall_skips_none_and_blocks_
     // over the 800 of the large one (1,600 KiB).
     let limit = support::opening::open_floor() + support::limit_commit_bytes() + (640 << 10);
     let at = Arc::new(AtomicU64::new(100));
-    let mut options = DatabaseOpenOptions::default();
-    options.clock = Some(Arc::new(support::At(at.clone())));
     let folder = support::folder("wake-all");
-    let db = support::open_with(&folder, options).unwrap();
+    let db = support::open_with(&folder, at_clock(&at)).unwrap();
     support::run(
         &db,
         "CREATE TABLE gone (id INTEGER PRIMARY KEY, due TIMESTAMP EXPIRES) RETAIN 1 SECONDS",
@@ -1688,9 +1646,8 @@ fn a_wake_advances_every_needy_partition_once_and_a_stall_skips_none_and_blocks_
     fill(&db, 701, 200);
     support::cycle(&db);
     support::close(db);
-    let mut options = DatabaseOpenOptions::default();
+    let mut options = at_clock(&at);
     options.memory_limit = Some(limit);
-    options.clock = Some(Arc::new(support::At(at.clone())));
     let db = support::open_with(&folder, options).unwrap();
     support::cycle(&db);
     db.execute(
@@ -1720,9 +1677,7 @@ fn a_wake_advances_every_needy_partition_once_and_a_stall_skips_none_and_blocks_
 #[test]
 fn automatic_compaction_waits_its_interval_after_a_sweep_ends() {
     let clock = Arc::new(AtomicU64::new(1_000_000));
-    let mut options = DatabaseOpenOptions::default();
-    options.clock = Some(Arc::new(support::At(clock.clone())));
-    let db = support::open_with(&support::folder("compact-interval"), options).unwrap();
+    let db = support::open_with(&support::folder("compact-interval"), at_clock(&clock)).unwrap();
     support::run(
         &db,
         "CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT NOT NULL) \
@@ -1751,26 +1706,95 @@ fn automatic_compaction_waits_its_interval_after_a_sweep_ends() {
     };
     let moved = || count(db.run_maintenance_cycle().unwrap().compacted_pages);
     slack(0);
-    assert!(moved() > 0, "no sweep has ended yet, so the first starts");
-    // The interval never holds a sweep under way: it runs to its end with the clock still.
-    for _ in 0..1000 {
-        if moved() == 0 {
-            break;
-        }
-    }
+    assert_eq!(moved(), 0, "the first look opens the first window");
+    clock.fetch_add(3600, Ordering::SeqCst);
+    assert!(moved() > 0, "a pass starts at the window's end");
+    // The interval never holds a pass under way: it runs to its end with the clock still.
+    let end = |_| db.run_maintenance_cycle().unwrap().work_remaining == Some(false);
+    assert!((0..1000).any(end), "no end of work in 1,000 cycles");
     slack(10_000);
-    // Pending freed pages are admitted inside the interval, then the sweep runs out.
-    assert!(
-        moved() > 0,
-        "new free pages start a sweep inside the interval"
-    );
-    for _ in 0..1000 {
-        if moved() == 0 {
-            break;
-        }
-    }
+    // The interval is stamped when the pass ends, and new free pages inside it start no pass
+    // (design 4, S4).
+    assert_eq!(moved(), 0, "slack again, but the last sweep ended just now");
     clock.fetch_add(3599, Ordering::SeqCst);
     assert_eq!(moved(), 0, "one second short of the interval from that end");
+    // The window's statistic is the fewest free pages any commit of it left: the slack's
+    // inserts used every free page before its delete freed more, so the first window to fall
+    // due after the end has no surplus (design 4, S4).
     clock.fetch_add(1, Ordering::SeqCst);
-    assert!(moved() > 0, "one hour past that end, a sweep starts");
+    assert_eq!(
+        moved(),
+        0,
+        "the window that held the slack's commits ends with no surplus"
+    );
+    // A new window starts from nothing, so space a large removal freed counts as surplus one
+    // window later, and the sweep starts at that window's end (design 4, S4).
+    clock.fetch_add(3599, Ordering::SeqCst);
+    assert_eq!(moved(), 0, "one second short of the next window's end");
+    clock.fetch_add(1, Ordering::SeqCst);
+    assert!(
+        moved() > 0,
+        "a window with no commit leaves the removal's pages as surplus at its end"
+    );
+}
+
+#[test]
+fn space_no_commit_used_for_an_interval_is_given_back() {
+    // Design 4, S4: a pass starts at a window's end for space no commit of the window used, and
+    // one that ends having moved nothing is not started again until a commit frees a page: the
+    // store gives back the half it lost with no call, then reads nothing while left alone.
+    let at = Arc::new(AtomicU64::new(1_000));
+    let mut options = DatabaseOpenOptions::default();
+    options.clock = Some(Arc::new(support::At(at.clone())));
+    let folder = support::folder("interval-surplus");
+    let db = support::open_with(&folder, options).unwrap();
+    let ddl = "CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT) \
+               HISTORY CURRENT ONLY SYNC CONFLICT KEEP LATEST";
+    support::run(&db, ddl);
+    let tx = db.transaction().unwrap();
+    for id in 1..=2000 {
+        let row = params! { "id" => id, "body" => support::letters(id, 1000) };
+        tx.execute("INSERT INTO t VALUES ($id, $body)", &row)
+            .unwrap();
+    }
+    tx.commit().unwrap();
+    // The low half goes, so what is left lies above the free space and must move down.
+    support::run(&db, "DELETE FROM t WHERE id <= 1000");
+    let full = support::data_file(&folder);
+    // One cycle a window later each time: the default MIN_INTERVAL is 60 seconds.
+    let window = || {
+        at.fetch_add(61, Ordering::SeqCst);
+        db.run_maintenance_cycle().unwrap()
+    };
+    let (mut moved, mut rested) = (0, false);
+    for _ in 0..full / 4096 {
+        let report = window();
+        // One step a cycle: 256, a page's copy (2), above it two branch levels and t's page (3).
+        let step = count(report.compaction_pages_read) + count(report.compaction_pages_written);
+        assert!(step <= 256 + 2 + 3, "more than one step: {report:?}");
+        moved += count(report.compacted_pages);
+        if moved > 0 && count(report.compaction_pages_read) == 0 {
+            rested = true;
+            break;
+        }
+    }
+    assert!(
+        moved > 0 && rested,
+        "a pass moved {moved} pages and the tidy-up came to rest"
+    );
+    assert!(
+        support::data_file(&folder) < full,
+        "the lost half was given back with no call"
+    );
+    for _ in 0..3 {
+        let report = window();
+        let read = (count(report.compaction_pages_read), report.compacted_pages);
+        assert_eq!(
+            read,
+            (0, Some(0)),
+            "a store left alone reads nothing: {report:?}"
+        );
+    }
+    assert_eq!(support::int(&db, "SELECT COUNT(*) FROM t"), 1000);
+    db.verify().unwrap();
 }

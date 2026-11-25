@@ -4,7 +4,7 @@
 //! and which rows may be seen, and works out each row's distance from its stored vector; the
 //! vector part finds the rows.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use super::aggregate::made;
 use super::expression::{EvalContext, Scope as Names, eval, holds, sort_order};
@@ -19,7 +19,9 @@ use crate::sql::Expr;
 use crate::sql::ast::{BinOp, ColumnRef, SortDirection};
 use crate::sql::plan::{FromItem, SelectPlan, SortKey};
 use crate::store::Key;
-use crate::types::{ColumnType, Error, Result, Value, VectorSearchMode};
+use crate::types::{
+    ColumnType, ContextId, Error, Result, Value, VectorIndexRef, VectorSearchMode, heap_bytes,
+};
 use crate::vector::{self, Nearest, Planned, Route};
 
 /// Whether a SELECT is a similarity search, and if so its table, its VECTOR column and the
@@ -81,6 +83,8 @@ pub(super) fn bound(select: &SelectPlan, ctx: &EvalContext) -> (Option<(f64, boo
                 let new = (most, matches!(op, BinOp::Lte | BinOp::Gte));
                 bound = bound.filter(|old| *old < new).or(Some(new));
             }
+            // NaN sorts above every number, so the bound holds for every row.
+            Some(Value::Float64(most)) if most.is_nan() => {}
             _ => rest.push(expr),
         }
     }
@@ -97,9 +101,9 @@ pub(super) fn bound(select: &SelectPlan, ctx: &EvalContext) -> (Option<(f64, boo
 /// the `most` the column's rank policy puts first among the rows the search compares. A row in
 /// a state its table leaves out of every search (`EXCLUDE VECTOR`) is in no answer.
 ///
-/// When the filter's path reaches few rows (see [`small`]), they are compared exactly; otherwise
-/// the vector part searches the partitions the filter selects and asks, row by row, for the
-/// distance. A row it asks about is read for the filter, its vector, its state and what its rank
+/// Each selected partition is read as [`decide`] says: directly through its countable path, or
+/// in the vector part's one walk over the partitions the filter selects, which asks, row by
+/// row, for the distance. A row it asks about is read for the filter, its vector, its state and what its rank
 /// reads; a row of the answer once more, for what the statement reads, its distance last unless
 /// it reads `*`. With further sort keys one row more is asked for: when it is at the distance of
 /// the last, and the search was exact, every row the search may answer with is handed on, for the
@@ -160,7 +164,11 @@ impl Source for Search<'_> {
         let asked = table::Source::new(table, filter, ctx, given.read, visible);
         let asked = asked.named(self.qualifier).counted(given.examined);
         let asked = asked.reading(self.filtered.clone(), &its);
-        let path = &asked.choose(&[], &[])?;
+        let mut path = asked.choose(&[], &[])?;
+        // The find's own reads leave a hidden row out; the row the statement names is decided
+        // once, below, by the whole WHERE.
+        let names = std::mem::take(&mut path.one);
+        let path = &path;
         // A row of the answer passed both filters when it was asked about: now only what is read.
         let (admin, mut shown) = (Reader::admin(), reserve()?);
         let shown = Visible::new(table, given.catalog, &admin, &mut shown)?;
@@ -178,7 +186,7 @@ impl Source for Search<'_> {
         let want = self.most.saturating_add(usize::from(further));
         let mut best = Vec::new();
 
-        let scope = Scope::new(table, vector, given);
+        let scope = Scope::new(table, self.qualifier, vector, given);
         let owned = asked.screen_owned(scope.context_leads());
         let mode = select.use_vector.unwrap_or_else(|| vector.mode());
         if !owned && mode == VectorSearchMode::Indexed {
@@ -191,6 +199,7 @@ impl Source for Search<'_> {
         let (Some(keys), on_rows) = scope.keys(filter)? else {
             return Ok(());
         };
+        let matching = |tuple: &Key| scope.matches(tuple);
         let mut nearest = Nearest {
             count: Some(&count),
             table: table.id,
@@ -198,31 +207,42 @@ impl Source for Search<'_> {
             column: vector,
             mode,
             scope: &keys,
+            matching: Some(&matching),
             query: near,
             k: want,
-            filtered: on_rows,
             ranked: rank.is_some(),
             bound: bound.map(|(most, _)| 1.0 - most),
+            filtered: on_rows || !states.is_empty(),
         };
+        // Keys the statement names are read directly under AUTO and EXACT, as are the rows a
+        // reader that does not own its partitions may see.
+        let named =
+            matches!(path.reach, table::Reach::Keys(_)) && mode != VectorSearchMode::Indexed;
+        let walks = owned && !named;
         let mut searching = given.budget.reserve(0, "query")?;
         let mut planned = Vec::new();
-        if owned {
+        if walks {
             planned = vector::plan(&nearest, given.read, &mut searching)?;
         }
-        // Under INDEXED a partition that is behind its writes refuses the search whole.
-        let index = table.vector_ref(vector);
-        let refused = Error::VectorIndexedRouteUnavailable { index };
-        if nearest.mode == VectorSearchMode::Indexed && planned.iter().any(|p| !p.usable) {
+        let on = (table, &scope.key[..], filter.filter(|_| on_rows));
+        let how = (mode, want, rank.is_some());
+        let mut decided = decide(&asked, on, &planned, how)?;
+        if let Some(refused) = refusal(mode, &planned, &decided, table.vector_ref(vector)) {
             return Err(refused);
         }
-        let confined = given.reader.contexts.is_none() || asked.confined(path, &keys);
-        let few = !owned || confined && asked.few(path, small(&planned, want))?;
-        let mut selected = reserve()?;
-        let mut passing = (!few && confined)
-            .then(|| asked.keys(path, &mut selected))
-            .transpose()?
-            .flatten();
-        let exact = few || planned.iter().all(|planned| planned.route == Route::Exact);
+        // The row the statement names is asked the whole WHERE, its distance bound too, by its
+        // own path: refused when it is hidden and passes. A handle that hides nothing skips it.
+        if names && !asked.screen_owned(false) {
+            let mut seeing = reserve()?;
+            let visible = Visible::new(table, given.catalog, given.reader, &mut seeing)?;
+            let whole = table::Source::new(table, select.filter.as_ref(), ctx, given.read, visible);
+            let whole = whole.named(self.qualifier);
+            let whole = whole.reading(self.filtered.clone(), &self.filtered);
+            whole.walk(&whole.choose(&[], &[])?, &mut kept, |_, _, bytes, kept| {
+                kept.shrink(bytes);
+                Ok(false)
+            })?;
+        }
         // Works a row's distance out from its stored vector and offers the row to the answer
         // by that distance, or by its rank; the vector part keeps the nearest itself.
         let mut offer = |key: &Key, row: &[Value], kept: &mut Reservation| -> Result<_> {
@@ -241,66 +261,86 @@ impl Source for Search<'_> {
             keep(&mut best, want, (by, key), kept)?;
             Ok(Some(distance))
         };
-        if !few {
-            let mut distance_of = |key: &Key| -> Result<Option<f64>> {
-                let Some((row, bytes)) = asked.row(key, &mut kept)? else {
-                    return Ok(None);
-                };
-                let distance = offer(key, &row, &mut kept)?;
-                kept.shrink(bytes);
-                Ok(distance)
-            };
-            let grouped = |p: &Planned| p.route == Route::Indexed && p.groups > 1;
-            let unit = if planned.iter().any(grouped) { 128 } else { 16 };
-            let cap = passing
-                .as_ref()
-                .filter(|_| mode == VectorSearchMode::Auto)
-                .map(|keys| {
-                    evaluations
-                        .get()
-                        .saturating_add((keys.len() as u64).saturating_mul(unit))
+        // The countable paths read directly: the partitions decided so, and the walked ones
+        // when the rows the walk read reached at a doubling the entries their paths reach.
+        let mut paths = Vec::new();
+        if walks {
+            loop {
+                let mut direct = decided.iter().map(|decided| decided.direct);
+                planned.retain(|_| !direct.next().unwrap_or(false));
+                let (now, walked): (Vec<_>, Vec<_>) = decided.drain(..).partition(|d| d.direct);
+                paths.extend(now.into_iter().filter_map(|decided| decided.path));
+                let doubling = !matches!(how, (VectorSearchMode::Indexed, ..))
+                    && !matches!(how, (VectorSearchMode::Exact, _, true))
+                    && walked.iter().all(|decided| decided.path.is_some());
+                let crossed = walked.iter().map(|decided| decided.crossing).sum::<u64>();
+                let next = Cell::new(if doubling {
+                    2 * crossed.max(1)
+                } else {
+                    u64::MAX
                 });
-            let found = loop {
-                let found = vector::search(
-                    &nearest,
-                    given.read,
-                    &mut searching,
-                    &mut planned,
-                    &mut |key| {
-                        if passing.as_mut().is_some_and(|keys| !keys.remove(key)) {
+                let (read, limit, doubled) =
+                    (Cell::new(0_u64), Cell::new(u64::MAX), Cell::new(false));
+                let mut distance_of = |key: &Key| -> Result<Option<f64>> {
+                    read.set(read.get() + 1);
+                    if read.get() == next.get() {
+                        let mut reached = 0;
+                        for path in walked.iter().filter_map(|decided| decided.path.as_ref()) {
+                            reached += asked.entries(path, next.get().saturating_add(1), false)?;
+                        }
+                        if reached <= next.get() {
+                            doubled.set(true);
+                            limit.set(evaluations.get());
                             return Ok(None);
                         }
-                        distance_of(key)
-                    },
-                    (cap, evaluations),
-                );
-                if matches!(found, Err(Error::StoreCorrupted { .. }))
-                    && nearest.mode == VectorSearchMode::Auto
-                {
-                    if passing.take().is_some() {
-                        selected.shrink(selected.bytes());
-                        passing = asked.keys(path, &mut selected)?;
+                        next.set(next.get().saturating_mul(2));
                     }
-                    nearest.mode = VectorSearchMode::Exact;
-                    planned.clear();
-                    searching.shrink(searching.bytes());
-                    planned = vector::plan(&nearest, given.read, &mut searching)?;
-                } else {
-                    break found?.ok_or(refused)?;
+                    let Some((row, bytes)) = asked.row(key, &mut kept)? else {
+                        return Ok(None);
+                    };
+                    let distance = offer(key, &row, &mut kept)?;
+                    kept.shrink(bytes);
+                    Ok(distance)
+                };
+                let read = given.read;
+                let found = vector::search(
+                    &nearest,
+                    read,
+                    &mut searching,
+                    &planned,
+                    &mut distance_of,
+                    (&limit, evaluations),
+                );
+                if !matches!(found, Err(Error::StoreCorrupted { .. }))
+                    || nearest.mode != VectorSearchMode::Auto
+                {
+                    found?;
+                    // At a doubling every walked partition is read directly: none is walked.
+                    if doubled.get() {
+                        planned.clear();
+                        paths.extend(walked.into_iter().filter_map(|decided| decided.path));
+                    }
+                    break;
                 }
-            };
-            if found.stopped {
-                for key in passing.iter().flatten() {
-                    distance_of(key)?;
-                }
+                nearest.mode = VectorSearchMode::Exact;
+                planned.clear();
+                paths.clear();
+                searching.shrink(searching.bytes());
+                planned = vector::plan(&nearest, read, &mut searching)?;
+                decided = decide(&asked, on, &planned, (VectorSearchMode::Exact, want, how.2))?;
             }
-        } else {
+        }
+        let statement = Some(path).filter(|_| !walks);
+        for path in statement.into_iter().chain(&paths) {
             asked.walk(path, &mut kept, |key, row, bytes, kept| {
                 offer(&key, &row, kept)?;
                 kept.shrink(bytes);
                 Ok(true)
             })?;
         }
+        // Every row was compared when no partition left is walked through its index: the
+        // direct ones were taken out of `planned` as they were decided or at a doubling.
+        let exact = !walks || planned.iter().all(|planned| planned.route == Route::Exact);
         let tied = matches!(&best[..], [.., (last, ..), (after, ..)] if last == after);
         if further && best.len() == want && tied && exact {
             asked.walk(path, &mut kept, |key, row, bytes, kept| {
@@ -318,14 +358,140 @@ impl Source for Search<'_> {
     }
 }
 
-/// The most rows a filter's path may reach and be compared one by one, and never fewer than the
-/// rows `asked` for: a 16th of the live vectors, or for a partition routed through its groups the
-/// rows of 16 groups where that is fewer, up to which reading rows by key beats an IVF walk,
-/// whose cost grows at least as a group does.
-pub(super) fn small(planned: &[Planned], asked: usize) -> u64 {
-    let groups = |p: &Planned| u32::from(p.route == Route::Indexed) * p.groups;
-    let rows = |p: &Planned| p.live / u64::from(groups(p) / 16).max(16);
-    planned.iter().map(rows).sum::<u64>().max(asked as u64)
+/// What one selected partition of a find does, the one decision execution and EXPLAIN read:
+/// whether its filter on rows is served, its countable path, the entries that path reaches
+/// counted no further than one past the crossing, the walk's expected cost in units, each
+/// vector compared or row read one, and whether it is read directly through its path.
+pub(super) struct Decided {
+    pub(super) served: bool,
+    pub(super) path: Option<table::Path>,
+    pub(super) m: u64,
+    pub(super) crossing: u64,
+    pub(super) walk: u64,
+    pub(super) direct: bool,
+}
+
+/// The decision for each of `planned`, from the statement's filter on rows `rest` with the
+/// partition's tuple met last as equalities on the key columns at `key`. With no filter on
+/// rows a partition is walked and decides nothing. A countable filter is direct while its path
+/// reaches no more than the crossing; under EXACT with a rank at every size; under INDEXED
+/// never.
+pub(super) fn decide(
+    asked: &table::Source,
+    (table, key, rest): (&Table, &[usize], Option<&Expr>),
+    planned: &[Planned],
+    (mode, k, ranked): (VectorSearchMode, usize, bool),
+) -> Result<Vec<Decided>> {
+    let and = |left, right| Expr::BinaryOp {
+        left: Box::new(left),
+        op: BinOp::And,
+        right: Box::new(right),
+    };
+    let decided = |p: &Planned| {
+        let (k, groups) = (k as u64, u64::from(p.groups));
+        let fixed = match p.route {
+            // Each centroid and each slot of the groups its build's questions needed is a unit.
+            Route::Indexed if groups > 1 => {
+                groups + per(p.probes.into(), p.live, groups).min(p.live)
+            }
+            _ => p.live / 16,
+        };
+        let crossing = crossing(fixed, p.live, k);
+        let Some(rest) = rest else {
+            let (path, m, walk, direct) = (None, 0, 0, false);
+            return Ok(Decided {
+                served: true,
+                path,
+                m,
+                crossing,
+                walk,
+                direct,
+            });
+        };
+        let tuple = key
+            .iter()
+            .zip(p.tuple.values().unwrap_or_default())
+            .map(|(at, value)| {
+                let column = table.meta.columns[*at].name.clone();
+                let column = Box::new(Expr::Column(ColumnRef {
+                    table: None,
+                    column,
+                }));
+                match value {
+                    Value::Null => Expr::IsNull {
+                        expr: column,
+                        negated: false,
+                    },
+                    value => Expr::BinaryOp {
+                        left: column,
+                        op: BinOp::Eq,
+                        right: Box::new(Expr::Literal(value)),
+                    },
+                }
+            });
+        let (served, path) = asked.partition(&tuple.fold(rest.clone(), and), key)?;
+        let m = match &path {
+            Some(path) => asked.entries(path, crossing.saturating_add(1), false)?,
+            None => 0,
+        };
+        let walk = fixed.saturating_add(per(3 * u128::from(k), p.live, m.max(1)));
+        let direct = path.is_some()
+            && match mode {
+                VectorSearchMode::Indexed => false,
+                VectorSearchMode::Exact if ranked => true,
+                _ => m <= crossing,
+            };
+        Ok(Decided {
+            served,
+            path,
+            m,
+            crossing,
+            walk,
+            direct,
+        })
+    };
+    planned.iter().map(decided).collect()
+}
+
+/// `a * b / c`, worked in 128 bits and at most `u64::MAX`, so no LIMIT or size overflows it.
+fn per(a: u128, b: u64, c: u64) -> u64 {
+    u64::try_from(a * u128::from(b) / u128::from(c)).unwrap_or(u64::MAX)
+}
+
+/// The most entries a partition's path may reach and be read directly: the largest `m` with
+/// `m * m <= fixed * m + 3 * k * live`, the walk's expected cost being its fixed part and three
+/// rows read for each of `k` rows asked where one row in `live / m` passes. Compared without
+/// dividing.
+fn crossing(fixed: u64, live: u64, k: u64) -> u64 {
+    let fits = |m: u64| {
+        let m = u128::from(m);
+        m * m <= u128::from(fixed) * m + 3 * u128::from(k) * u128::from(live)
+    };
+    let (f, c) = (fixed as f64, 3.0 * k as f64 * live as f64);
+    let mut m = ((f + (f * f + 4.0 * c).sqrt()) / 2.0) as u64;
+    while !fits(m) {
+        m -= 1;
+    }
+    while fits(m + 1) {
+        m += 1;
+    }
+    m
+}
+
+/// Whether a find under INDEXED is refused before anything is read, and by which kind: a
+/// selected partition behind its writes, or one whose filter on rows nothing serves.
+pub(super) fn refusal(
+    mode: VectorSearchMode,
+    planned: &[Planned],
+    decided: &[Decided],
+    index: VectorIndexRef,
+) -> Option<Error> {
+    let indexed = mode == VectorSearchMode::Indexed;
+    if indexed && planned.iter().any(|planned| !planned.usable) {
+        return Some(Error::VectorIndexedRouteUnavailable { index });
+    }
+    let unserved = indexed && decided.iter().any(|decided| !decided.served);
+    unserved.then_some(Error::VectorIndexedFilterUnindexed { index })
 }
 
 /// Offers a pair to `best`, which holds in order the `most` least pairs offered: by value as
@@ -356,6 +522,8 @@ fn keep(
 /// Reads a filter for the partitions it selects.
 pub(super) struct Scope<'a> {
     pub(super) table: &'a Table,
+    /// The name the statement gives the table, which its filter may qualify a column with.
+    qualifier: &'a str,
     /// Where each PARTITION_KEY column is in a row, in declared order.
     pub(super) key: Vec<usize>,
     pub(super) ctx: EvalContext<'a>,
@@ -366,21 +534,44 @@ pub(super) struct Scope<'a> {
     /// left open. A search refuses such a name before it asks; `explain` binds nothing, lists
     /// every partition and names the last.
     pub(super) unbound: RefCell<Vec<String>>,
+    /// Past the most tuples, each case's values for each key column it lists, sorted.
+    lists: RefCell<Vec<Listed>>,
 }
+
+/// One case's values for each key column it lists, sorted.
+type Listed = Vec<(usize, Vec<Value>)>;
 
 impl<'a> Scope<'a> {
     /// The scope of the partitions of `vector`, a VECTOR column of `table`.
-    pub(super) fn new(table: &'a Table, vector: &VectorColumn, given: &Given<'a>) -> Self {
+    pub(super) fn new(
+        table: &'a Table,
+        qualifier: &'a str,
+        vector: &VectorColumn,
+        given: &Given<'a>,
+    ) -> Self {
         let key = vector.partition_key.iter();
         let key = key.filter_map(|name| table.meta.columns.iter().position(|c| c.name == *name));
         Scope {
             table,
+            qualifier,
             key: key.collect(),
             ctx: given.ctx,
             reader: given.reader,
             held: RefCell::new(given.budget.reserve(0, "partition tuples").unwrap()),
             unbound: RefCell::default(),
+            lists: RefCell::default(),
         }
+    }
+
+    /// Whether a partition's key tuple can pass some case of the filter: one binary search for
+    /// each listed key column of each case. Every tuple can below the most tuples.
+    pub(super) fn matches(&self, tuple: &Key) -> bool {
+        let (lists, values) = (self.lists.borrow(), tuple.values().unwrap_or_default());
+        let holds = |(at, list): &(usize, Vec<Value>)| {
+            let value = values.get(*at);
+            value.is_some_and(|value| list.binary_search_by(|v| sort_order(v, value)).is_ok())
+        };
+        lists.is_empty() || lists.iter().any(|case| case.iter().all(holds))
     }
 
     fn context_leads(&self) -> bool {
@@ -399,7 +590,7 @@ impl<'a> Scope<'a> {
     /// column they are narrowed first to its own Contexts, so that nothing of another is read
     /// or counted: `None` when none is left.
     pub(super) fn keys(&self, filter: Option<&Expr>) -> Result<(Option<Vec<Key>>, bool)> {
-        let scope = self.table.scope();
+        let scope = Names::of(self.qualifier, &self.table.meta.columns);
         let reading = filter::read(
             filter,
             &Columns {
@@ -410,6 +601,19 @@ impl<'a> Scope<'a> {
         )?;
         if reading.cases.is_empty() {
             return Ok((None, false));
+        }
+        // A case searches the reader's Contexts, those it names among them when it names some:
+        // none in every case leaves nothing to search, however the table is partitioned.
+        let context = self.table.rules.context_column;
+        if let (Some(own), Some(context)) = (&self.reader.contexts, context) {
+            let mine = |v: &Value| matches!(v, Value::Uuid(id) if own.contains(&ContextId(*id)));
+            let none = |case: &Vec<_>| match case.iter().find(|(at, _)| *at == context) {
+                Some((_, Fact::Among { values, .. })) => !values.iter().any(mine),
+                _ => own.is_empty(),
+            };
+            if reading.cases.iter().all(none) {
+                return Ok((None, false));
+            }
         }
         let open = reading
             .unbound
@@ -444,9 +648,24 @@ impl<'a> Scope<'a> {
             on_rows |= tuples.len() > MOST_CASES;
         }
         let every = every || !self.unbound.borrow().is_empty();
+        let mut held = self.held.borrow_mut();
+        for case in reading.cases.iter().filter(|_| every) {
+            let mut lists = Vec::new();
+            for (place, at) in self.key.iter().enumerate() {
+                if let Some((_, Fact::Among { values, .. })) = case.iter().find(|(c, _)| c == at) {
+                    let bytes = values
+                        .iter()
+                        .map(|v| size_of::<Value>() as u64 + heap_bytes(v));
+                    held.grow(bytes.sum::<u64>() + 64)?;
+                    let mut values = values.clone();
+                    values.sort_by(sort_order);
+                    lists.push((place, values));
+                }
+            }
+            self.lists.borrow_mut().push(lists);
+        }
         let on_rows = filter.is_some() && on_rows || reading.parts.iter().any(|p| p.kept.is_some());
         let mut keys = Vec::new();
-        let mut held = self.held.borrow_mut();
         for leading in tuples.iter().filter(|_| !every) {
             held.grow(crate::store::encoded_len(leading) as u64)?;
             held.room(&mut keys, usize::MAX)?;

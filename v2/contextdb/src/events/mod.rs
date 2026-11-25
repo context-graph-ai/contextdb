@@ -515,6 +515,7 @@ pub(crate) fn run_schedules(open: &Arc<Open>) -> Result<bool> {
                 .ok_or_else(|| {
                     Error::PlanError(format!("no callback registered: {}", schedule.callback))
                 });
+            let callback_missing = callback.is_err() && !missed && first != ticks;
             let mut catalog = staged.catalog.next(&staged.budget)?;
             catalog.advance_schedule(name, next, &mut staged.changes)?;
             staged.catalog = Arc::new(catalog);
@@ -534,6 +535,15 @@ pub(crate) fn run_schedules(open: &Arc<Open>) -> Result<bool> {
                     .unwrap_or_else(|_| Err(Error::PlanError("schedule callback panicked".into())))
             });
             let result = result.and_then(|()| open.commit(guard, staged));
+            // A missing callback is this schedule's failure alone: the cycle goes on.
+            let mut failed = locked(&open.deliveries.failed);
+            match &result {
+                Err(error @ Error::PlanError(_)) if callback_missing => {
+                    failed.insert(name.clone(), error.to_string())
+                }
+                _ => failed.remove(name),
+            };
+            drop(failed);
             if let Err(error) = result {
                 let guard = open.turn()?;
                 let mut settlement = open.begin()?;
@@ -543,7 +553,9 @@ pub(crate) fn run_schedules(open: &Arc<Open>) -> Result<bool> {
                     settlement.catalog = Arc::new(catalog);
                     open.commit(guard, settlement)?;
                 }
-                failure.get_or_insert(error);
+                if !callback_missing {
+                    failure.get_or_insert(error);
+                }
             }
             changed = true;
         }

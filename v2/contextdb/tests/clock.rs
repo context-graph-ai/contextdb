@@ -2,6 +2,8 @@
 //! was stored stays what it was.
 
 mod support;
+#[path = "support/workev.rs"]
+mod workev;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -14,7 +16,7 @@ fn open_ticking(folder: &Path, second: u64) -> (Database, Arc<AtomicU64>) {
     let second = Arc::new(AtomicU64::new(second));
     let mut options = DatabaseOpenOptions::default();
     options.clock = Some(Arc::new(support::At(second.clone())));
-    let db = support::open_with(folder, options).expect("open the store with a clock");
+    let db = workev::open_with(folder, options).expect("open the store with a clock");
     (db, second)
 }
 
@@ -294,7 +296,7 @@ fn each_retained_row_leaves_at_the_second_its_judgement_gives() {
     let (mut db, mut second) = open_ticking(&folder, 100);
     let ddl = "CREATE TABLE t (id INTEGER PRIMARY KEY) RETAIN 1 SECONDS";
     support::run(&db, ddl);
-    for (ids, at, removed) in [(0..8193_i64, 200, 8192_u64), (8193..17193, 201, 9001)] {
+    for (ids, at, removed) in [(0..8193_i64, 200, 8193_u64), (8193..17193, 201, 9000)] {
         let tx = db.transaction().unwrap();
         for id in ids {
             tx.execute("INSERT INTO t VALUES ($id)", &params! { "id" => id })
@@ -306,8 +308,13 @@ fn each_retained_row_leaves_at_the_second_its_judgement_gives() {
             (db, second) = open_ticking(&folder, at);
         }
         second.store(at, Ordering::SeqCst);
-        let before = support::watermark(&db).0;
-        assert_eq!(expired(&db), removed, "expiry pace at {at}");
+        let (before, mut gone) = (support::watermark(&db).0, 0);
+        let done = (0..1000).any(|_| {
+            let report = db.run_maintenance_cycle().unwrap();
+            gone += support::count(report.expired_rows);
+            report.work_remaining == Some(false) && report.owed == Some(false)
+        });
+        assert!(done && gone == removed, "{gone} of {removed} left at {at}");
         assert!(support::watermark(&db).0 - before >= removed.div_ceil(1024));
     }
     assert_eq!(support::int(&db, "SELECT COUNT(*) FROM t"), 0);

@@ -5,7 +5,8 @@
 
 mod support;
 
-use contextdb::{Database, Error, Value, params};
+use contextdb::{Database, Error, QueryResult, Value, params};
+use std::collections::HashMap;
 use support::Run;
 
 const MIB: usize = 1 << 20;
@@ -23,21 +24,37 @@ fn filters() -> Vec<String> {
     filters
 }
 
+/// Counts the rows of `table` that pass `filter`, with `given` bound, and asserts that the count
+/// is the number of rows the same filter returns; gives the count's answer and that number.
+fn count_of_rows(
+    on: &impl Run,
+    (table, filter): (&str, &str),
+    given: &HashMap<String, Value>,
+    when: &str,
+) -> (QueryResult, u64) {
+    let found = on.run(&format!("SELECT id FROM {table} WHERE {filter}"), given);
+    let rows = found.expect("the rows of a filter").rows().len();
+    let count = on.run(
+        &format!("SELECT COUNT(*) FROM {table} WHERE {filter}"),
+        given,
+    );
+    let count = count.expect("the count of a filter");
+    assert_eq!(
+        count.rows(),
+        [[Value::Int64(rows as i64)]],
+        "{when}: COUNT(*) WHERE {filter}, beside the {rows} rows the filter returns"
+    );
+    (count, rows as u64)
+}
+
 /// Asserts that every count of `events` equals the number of rows its filter returns, and
 /// returns the rows each count read, in the order of [`filters`]. The whole table's count is
 /// checked the same way.
 fn counts_agree(on: &impl Run, when: &str) -> Vec<(u64, u64)> {
     let mut read = Vec::new();
     for filter in filters() {
-        let rows = support::rows(on, &format!("SELECT id FROM events WHERE {filter}"));
-        let count = support::run(on, &format!("SELECT COUNT(*) FROM events WHERE {filter}"));
-        assert_eq!(
-            count.rows(),
-            [[Value::Int64(rows.len() as i64)]],
-            "{when}: COUNT(*) WHERE {filter}, beside the {} rows the filter returns",
-            rows.len()
-        );
-        read.push((count.rows_examined(), rows.len() as u64));
+        let (count, rows) = count_of_rows(on, ("events", &filter), &params! {}, when);
+        read.push((count.rows_examined(), rows));
     }
     let rows = support::rows(on, "SELECT id FROM events");
     assert_eq!(
@@ -183,19 +200,12 @@ fn a_table_that_declares_no_count_counts_an_index_range_and_reads_no_row() {
     // A count whose filter the index does not pin has to read rows: by the index's second
     // column alone, and with a term over a column the index does not have.
     for filter in ["conn = 'a'", "ctx = 1 AND note = 'seen'"] {
-        let rows = support::rows(&db, &format!("SELECT id FROM events WHERE {filter}"));
-        let count = support::run(&db, &format!("SELECT COUNT(*) FROM events WHERE {filter}"));
-        assert_eq!(
-            count.rows(),
-            [[Value::Int64(rows.len() as i64)]],
-            "{filter}"
-        );
-        assert!(!rows.is_empty(), "{filter} returns no row");
+        let (count, rows) = count_of_rows(&db, ("events", filter), &params! {}, "unpinned");
+        assert!(rows > 0, "{filter} returns no row");
         assert!(
-            count.rows_examined() >= rows.len() as u64,
-            "COUNT(*) WHERE {filter} read {} rows and counted {}",
+            count.rows_examined() >= rows,
+            "COUNT(*) WHERE {filter} read {} rows and counted {rows}",
             count.rows_examined(),
-            rows.len()
         );
     }
 }
@@ -227,7 +237,14 @@ fn a_new_set_of_counts_on_a_table_with_rows_is_installed_whole_or_not_at_all() {
             &format!("INSERT INTO groups (id, tag) VALUES {}", values.join(", ")),
         );
     }
-    let declared = db.declaration("groups").expect("the declaration of groups");
+    let declaration = || {
+        let declared = db.declaration("groups");
+        declared
+            .expect("the declaration of groups")
+            .as_str()
+            .to_owned()
+    };
+    let declared = declaration();
     // Before the counts are installed a count reads the entries it counts; once installed it is
     // one stored number and reads none.
     let count_of = |tag: i64, kept: bool| {
@@ -266,12 +283,7 @@ fn a_new_set_of_counts_on_a_table_with_rows_is_installed_whole_or_not_at_all() {
         } => assert_eq!(budget_limit_bytes, limit as u64),
         other => panic!("counts that do not fit the limit were refused as {other:?}"),
     }
-    assert_eq!(
-        db.declaration("groups")
-            .expect("the declaration of groups")
-            .as_str(),
-        declared.as_str()
-    );
+    assert_eq!(declaration(), declared);
     assert_eq!(count_of(7, false), Value::Int64(1));
     assert_eq!(count_of(ROWS, false), Value::Int64(0));
 
@@ -279,11 +291,10 @@ fn a_new_set_of_counts_on_a_table_with_rows_is_installed_whole_or_not_at_all() {
     db.set_memory_limit(Some(256 * MIB))
         .expect("lift the limit");
     support::run(&db, "ALTER TABLE groups SET MAINTAIN COUNT (tag)");
-    let installed = db.declaration("groups").expect("the declaration of groups");
+    let installed = declaration();
     assert!(
         installed.contains("MAINTAIN COUNT (tag)"),
-        "the declaration does not say MAINTAIN COUNT (tag):\n{}",
-        installed.as_str()
+        "the declaration does not say MAINTAIN COUNT (tag):\n{installed}"
     );
     support::run(&db, "UPDATE groups SET tag = 7 WHERE id < 10");
     assert_eq!(count_of(7, true), Value::Int64(10));
@@ -292,12 +303,7 @@ fn a_new_set_of_counts_on_a_table_with_rows_is_installed_whole_or_not_at_all() {
 
     // Taking the counts away leaves the same answers, now read as the entries of `groups_tag`, and the declaration it had before.
     support::run(&db, "ALTER TABLE groups SET MAINTAIN COUNT DEFAULT");
-    assert_eq!(
-        db.declaration("groups")
-            .expect("the declaration of groups")
-            .as_str(),
-        declared.as_str()
-    );
+    assert_eq!(declaration(), declared);
     assert_eq!(count_of(7, false), Value::Int64(10));
     support::close(db);
     let db = support::open(&folder);
@@ -362,37 +368,21 @@ fn a_count_list_that_cannot_stand_is_refused_by_name_and_declares_nothing() {
 /// Asserts that every count of `notes` equals the number of rows its filter returns: each
 /// `ctx`, and each `ctx` with no tag, with the tag `long` and with the tag `s`.
 fn note_counts_agree(db: &Database, long: &str, when: &str) {
+    let tags = [
+        ("", None),
+        (" AND tag IS NULL", None),
+        (" AND tag = $tag", Some(long)),
+        (" AND tag = $tag", Some("s")),
+    ];
     for ctx in 1..=3_i64 {
-        let filters = [
-            (format!("ctx = {ctx}"), params! {}),
-            (format!("ctx = {ctx} AND tag IS NULL"), params! {}),
-            (
-                format!("ctx = {ctx} AND tag = $tag"),
-                params! { "tag" => long },
-            ),
-            (
-                format!("ctx = {ctx} AND tag = $tag"),
-                params! { "tag" => "s" },
-            ),
-        ];
-        for (filter, given) in filters {
-            let rows = db
-                .run(&format!("SELECT id FROM notes WHERE {filter}"), &given)
-                .expect("the rows of a filter");
-            let count = db
-                .run(
-                    &format!("SELECT COUNT(*) FROM notes WHERE {filter}"),
-                    &given,
-                )
-                .expect("the count of a filter");
-            assert_eq!(
-                count.rows(),
-                [[Value::Int64(rows.rows().len() as i64)]],
-                "{when}: COUNT(*) WHERE {filter}, tag of {} bytes",
-                given.get("tag").map_or(0, |tag| match tag {
-                    Value::Text(tag) => tag.len(),
-                    _ => 0,
-                })
+        for (filter, tag) in tags {
+            let given = tag.map_or(params! {}, |tag| params! { "tag" => tag });
+            let when = format!("{when}, tag of {} bytes", tag.map_or(0, str::len));
+            count_of_rows(
+                db,
+                ("notes", &format!("ctx = {ctx}{filter}")),
+                &given,
+                &when,
             );
         }
     }

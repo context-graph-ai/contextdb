@@ -139,9 +139,10 @@ audio, or policy embeddings with different dimensions and quantization choices.
 
 **Writing** a database file is owned by exactly one process at a time. A second
 writable open of the same path — whether from another thread in the same process
-or from a separate process — returns `Error::DatabaseLocked`. This is enforced at
-two layers: an in-process open registry and an on-disk PID lock backing an OS
-file lock. Single-writer ownership is a deliberate guarantee of the substrate,
+or from a separate process — returns `Error::DatabaseLocked`. This is enforced by
+the `lock` file in the store folder, held with an operating-system file lock that
+belongs to the open file, so a second open in the same process conflicts like one
+from another process and the lock goes with its process however it ends. Single-writer ownership is a deliberate guarantee of the substrate,
 not a missing feature.
 
 **Reading** is a separate door that does not take the write lock. A read session
@@ -178,9 +179,9 @@ candidate directory, and an empty inventory does not prove that no reader exists
 publishes purge fences to each candidate. If one cannot be authenticated, the affected purge or
 reclamation refuses with a typed error naming that directory while database open remains
 available. On Linux each reader also holds byte-free database-file advisory presence locks.
-An unmatched lock retains potentially old pages during commits and refuses explicit purge or
-reclamation with `ReaderCoordinationUnavailable`, covering readers with different supplied roots
-when no platform root exists. The filesystem must support Linux OFD locks. Other Unix systems
+A reader's file in the store's `readers/` folder keeps the pages of its commit from being
+reused until the reader lets the commit go; a reader killed inside a statement leaves its file,
+which the next open for writing clears. The filesystem must support Linux OFD locks. Other Unix systems
 without a common platform root retain a conservative floor and refuse these operations when
 the inventory cannot be proved complete.
 <!-- enforced by: local_transport_runtime::linux_process_fallback_is_derived_from_the_effective_uid_not_the_request, crates/contextdb-engine/src/persistence/reader_registration_privacy_tests.rs::reader_data_home_uses_effective_user_when_home_is_unset -->

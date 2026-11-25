@@ -59,6 +59,41 @@ fn each_read_limit_refuses_by_name() {
             "share {share:?} under {memory} MiB: declared, default, effective percent, cache bytes, session memory"
         );
     }
+    for share in [95, 100] {
+        let limits = ReadLimits {
+            cache_share: Some(share),
+            ..defaults.clone()
+        };
+        assert!(
+            matches!(
+                db.read_session(limits),
+                Err(Error::MemoryBudgetExceeded { .. })
+            ),
+            "a cache of {share}% leaves the session no memory"
+        );
+    }
+    let invalid = ReadLimits {
+        cache_share: Some(101),
+        ..defaults.clone()
+    };
+    let Err(refused) = ReadSession::open(&folder, invalid) else {
+        panic!("101 is refused")
+    };
+    assert!(
+        matches!(
+            refused,
+            Error::ReadLimitExceeded {
+                field: "cache_share",
+                limit: 100
+            }
+        ),
+        "101 under a finite limit is an invalid share, not a memory refusal: {refused}"
+    );
+    assert!(
+        refused
+            .to_string()
+            .ends_with("raise ReadLimits::cache_share")
+    );
     let mut wide = defaults.clone();
     wide.result_rows = 10_000;
     wide.work = 1_000_000;
@@ -93,6 +128,12 @@ fn each_read_limit_refuses_by_name() {
         let default = open(defaults.clone()).unwrap();
         assert_eq!(support::memory_shown(&default, "limit"), (16 << 20).into());
         let sql = "SELECT id FROM t WHERE id = 1";
+        let cold = default.execute(sql, &params! {}).unwrap().pages();
+        let warm = default.execute(sql, &params! {}).unwrap().pages();
+        assert!(
+            !file || (warm.0 > 0 && warm.1 == 0),
+            "a file reader answers a lookup from its cache {cold:?}, {warm:?}"
+        );
         let explained = default.explain(sql).unwrap();
         let text: Vec<_> = explained.lines().map(|line| vec![line.into()]).collect();
         assert_eq!(support::rows(&default, &format!("EXPLAIN {sql}")), text);

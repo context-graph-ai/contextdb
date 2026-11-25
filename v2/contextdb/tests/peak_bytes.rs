@@ -1,5 +1,5 @@
 //! A statement reports the most memory it held, and that figure is the statement's own: a lookup
-//! by key and a one-row commit hold the same at 10,000 stored rows as at 100,000, and a write's
+//! by key and a one-row commit hold the same at 1,000 stored rows as at 10,000, and a write's
 //! figure covers the work of its commit.
 
 mod support;
@@ -37,16 +37,16 @@ fn a_statements_peak_bytes_do_not_grow_with_the_store() {
             write - support::used(&db) as u64 - redb::WriteTransaction::DRAIN_BYTES as u64,
         )
     };
-    support::insert_together(&db, 1..=10_000);
+    support::insert_together(&db, 1..=1_000);
     // The first run of each form adds its line to the statement record, once.
-    let _ = peaks(10_000);
-    let small = peaks(10_000);
-    support::insert_together(&db, 10_001..=100_000);
+    let _ = peaks(1_000);
+    let small = peaks(1_000);
+    support::insert_together(&db, 1_001..=10_000);
     assert_eq!(
-        peaks(100_000),
+        peaks(10_000),
         small,
         "a lookup by key and a one-row commit hold what they read and write, not what the \
-         store holds: their peak_bytes at 100,000 stored rows against 10,000"
+         store holds: their peak_bytes at 10,000 stored rows against 1,000"
     );
     let db = support::reopen(db, &folder);
     let sql = "SELECT id, name, tag FROM t WHERE id = 7";

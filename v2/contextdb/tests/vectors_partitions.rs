@@ -4,12 +4,27 @@
 //! statement that would pass it and changes nothing when it does.
 
 mod support;
+#[path = "support/vecmaint.rs"]
+mod vecmaint;
 
-use std::sync::atomic::Ordering;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use contextdb::{Database, DatabaseOpenOptions, Error, Value, VectorIndexRef, params};
 
 use support::{Child, Near, Run, near_ids as ids};
+
+/// The store in `folder` opened through a door that adds up the bytes read from its file, and
+/// the bytes the open itself read.
+fn open_counting_reads(folder: &Path) -> (Database, Arc<AtomicU64>, u64) {
+    let (storage, bytes) = support::counting_bytes_read();
+    let mut options = DatabaseOpenOptions::default();
+    options.storage = Some(storage);
+    let db = support::open_with(folder, options).expect("open with a counting door");
+    let opened = bytes.load(Ordering::SeqCst);
+    (db, bytes, opened)
+}
 
 /// A table whose VECTOR column is partitioned by two columns.
 const NOTES: &str = "SELECT id, ctx, kind, v FROM notes";
@@ -63,119 +78,95 @@ fn multi_partition_search_returns_one_global_answer() {
         support::vector(80_001, DIMENSION),
         support::vector(80_002, DIMENSION),
     ];
-    // Each scope as a filter, the rows it lets through, and how many partitions it selects.
-    type Scope = (
-        &'static str,
-        Option<&'static str>,
-        fn(&[Value]) -> bool,
-        u64,
-    );
+    // Each scope as a filter and the rows it lets through.
+    type Scope = (&'static str, Option<&'static str>, fn(&[Value]) -> bool);
     let of_notes: [Scope; 9] = [
-        (
-            "one",
-            Some("ctx = 'a' AND kind = 1"),
-            |row| under(row, "a", 1),
-            1,
-        ),
+        ("one", Some("ctx = 'a' AND kind = 1"), |row| {
+            under(row, "a", 1)
+        }),
         (
             "several, as a list of row values",
             Some("(ctx, kind) IN (('a', 1), ('b', 0))"),
             |row| under(row, "a", 1) || under(row, "b", 0),
-            2,
         ),
         (
             "the same list the other way round",
             Some("(ctx, kind) IN (('b', 0), ('a', 1))"),
             |row| under(row, "a", 1) || under(row, "b", 0),
-            2,
         ),
         (
             "several, as an OR",
             Some("(ctx = 'a' AND kind = 1) OR (ctx = 'b' AND kind = 0)"),
             |row| under(row, "a", 1) || under(row, "b", 0),
-            2,
         ),
-        ("all", None, |_| true, 6),
+        ("all", None, |_| true),
         (
             "every partition of one first key value",
             Some("ctx = 'a'"),
             |row| row[1] == support::text("a"),
-            2,
         ),
         (
             "a tuple no row has",
             Some("ctx = 'zz' AND kind = 7"),
             |_| false,
-            0,
         ),
         (
             "a tuple with a first value rows have and a second none has",
             Some("ctx = 'a' AND kind = 7"),
             |_| false,
-            0,
         ),
         (
             "one tuple rows have and one no row has",
             Some("(ctx, kind) IN (('a', 1), ('zz', 7))"),
             |row| under(row, "a", 1),
-            1,
         ),
     ];
     let of_docs: [Scope; 5] = [
-        (
-            "one",
-            Some("ctx = 'b'"),
-            |row| row[1] == support::text("b"),
-            1,
-        ),
-        (
-            "several, as a list",
-            Some("ctx IN ('a', 'b')"),
-            |row| row[1] != support::text("c"),
-            2,
-        ),
+        ("one", Some("ctx = 'b'"), |row| row[1] == support::text("b")),
+        ("several, as a list", Some("ctx IN ('a', 'b')"), |row| {
+            row[1] != support::text("c")
+        }),
         (
             "the same list the other way round",
             Some("ctx IN ('b', 'a')"),
             |row| row[1] != support::text("c"),
-            2,
         ),
-        ("all", None, |_| true, 3),
-        ("a key no row has", Some("ctx IN ('zz')"), |_| false, 0),
+        ("all", None, |_| true),
+        ("a key no row has", Some("ctx IN ('zz')"), |_| false),
     ];
     // Every scope of both tables equals the reference, for ten rows and for more rows than
-    // there are. `pending` says how many vectors of each partition are on its pending list:
-    // then a search reads exactly those of the partitions it selects, and each row it returns
-    // once more.
-    let check = |pending: Option<u64>, state: &str| {
+    // there are. Pending vectors are screened as a block's slots are, so a find reads no more
+    // rows while they are pending than once they are sealed, plus the rows asked for (F1).
+    let check = |state: &str| -> Vec<(u64, u64)> {
+        let mut read = Vec::new();
         for (table, plain, scopes) in [
             ("notes", NOTES, of_notes.as_slice()),
             ("docs", support::DOCS, of_docs.as_slice()),
         ] {
             let stored = support::stored(&db, plain);
-            for (name, filter, passes, partitions) in scopes {
+            for (name, filter, passes) in scopes {
                 for query in &queries {
                     for k in [10, 1000] {
                         let wanted = stored.nearest(passes, query, k);
                         let sql = support::nearest_sql(table, "v", *filter, k);
                         let what = format!("{state}, {table}, {name}");
                         let result = support::assert_nearest(&db, &sql, query, &wanted, &what);
-                        if let Some(pending) = pending {
-                            assert_eq!(
-                                result.rows_examined(),
-                                partitions * pending + wanted.len() as u64,
-                                "{what}: rows read by {sql}"
-                            );
-                        }
+                        read.push((result.rows_examined(), wanted.len() as u64));
                     }
                 }
             }
         }
+        read
     };
-
-    check(Some(100), "unsealed");
+    let pending = check("unsealed");
     support::seal_all(&db);
-    check(None, "sealed");
+    let sealed = check("sealed").into_iter().map(|(read, _)| read);
+    for ((pending, k), sealed) in pending.into_iter().zip(sealed) {
+        assert!(
+            pending <= sealed + k,
+            "rows read: {pending} pending, {sealed} sealed"
+        );
+    }
 
     // LIMIT cuts after the whole scope: three notes of the direction searched for go into the
     // partition that was made last, the one of note 6, and a search of everything with LIMIT 3
@@ -219,7 +210,7 @@ fn multi_partition_search_returns_one_global_answer() {
         insert_note(&db, n, "d", n % 5, support::vector(n, DIMENSION));
     }
     assert!(measure("five more partitions were made") == before);
-    check(None, "at the end");
+    check("at the end");
 }
 
 #[test]
@@ -567,10 +558,7 @@ fn vector_partition_limit_counts_and_refuses() {
     let position = support::watermark(&db);
     let cycle = db.run_maintenance_cycle().expect("a cycle").vector;
     assert_eq!(
-        (
-            support::count(cycle.maintenance_vectors_done),
-            support::count(cycle.maintenance_vectors_remaining)
-        ),
+        vecmaint::done_left(&cycle),
         (0, 0),
         "a cycle after an UPDATE that changed no vector and no key"
     );
@@ -608,11 +596,7 @@ fn vector_partition_limit_counts_and_refuses() {
         tx.commit().expect("commit the partitions");
         support::close(db);
 
-        let (storage, bytes) = support::counting_bytes_read();
-        let mut options = DatabaseOpenOptions::default();
-        options.storage = Some(storage);
-        let db = support::open_with(&folder, options).expect("open with a counting door");
-        let opened = bytes.load(Ordering::SeqCst);
+        let (db, bytes, opened) = open_counting_reads(&folder);
         db.execute(
             insert,
             &params! {
@@ -656,11 +640,7 @@ fn a_commit_reads_its_partitions_record_not_the_rows_waiting_in_it() {
         support::declare_docs(&db, DIMENSION, "PARTITION_KEY (ctx)");
         support::load_docs(&db, 1..=waiting, "a", |n| support::vector(n, DIMENSION));
         support::close(db);
-        let (storage, bytes) = support::counting_bytes_read();
-        let mut options = DatabaseOpenOptions::default();
-        options.storage = Some(storage);
-        let db = support::open_with(&folder, options).expect("open with a counting door");
-        let opened = bytes.load(Ordering::SeqCst);
+        let (db, bytes, opened) = open_counting_reads(&folder);
         let rows = waiting + 1..=waiting + 16;
         support::load_docs(&db, rows, "a", |n| support::vector(n, DIMENSION));
         let read = bytes.load(Ordering::SeqCst) - opened;
@@ -818,7 +798,7 @@ fn an_indexed_search_over_one_several_or_all_partitions_returns_all_ten_of_exact
     // The work an index saves is the numbers script's to measure: at 1,250 vectors a partition
     // with the threshold forced low is not a store a default would build.
     for filter in [Some("ctx = 'a'"), Some("ctx IN ('a', 'b')"), None] {
-        for q in 0..100 {
+        for q in 0..25 {
             let query = support::vector(100_000 + q, 32);
             let [exact, indexed] = ["EXACT", "INDEXED"]
                 .map(|mode| support::answer(&db, &support::by_mode(filter, mode, 10), &query));

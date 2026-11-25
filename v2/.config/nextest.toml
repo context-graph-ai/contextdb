@@ -1,10 +1,11 @@
 # A test that runs past its limit is stopped and fails by name. Nothing is retried.
 # The default profile leaves the million-row load, the million-row append and the two scale
 # cases to the nightly and release profiles; the consumer performance bars run in release.
+# The event-route kill test runs in release: one sink call is one fsync by design, 3,584 of them.
 [profile.default]
 retries = 0
 slow-timeout = { period = "30s", terminate-after = 2 }
-default-filter = 'not (test(=a_million_rows_load_and_scan_under_64_mib) | test(=an_append_does_not_read_the_rows_stored_before_it_at_a_million_rows) | test(=a_hundred_thousand_sightings_are_found_with_the_recorded_work_recall_and_length) | test(=a_million_sightings_are_found_with_the_recorded_work_recall_and_length) | binary(=performance_bars) | test(streaming::) | test(=removal_membership_agrees_with_the_in_memory_evaluator_for_every_kind) | test(=purge::a_purge_leaves_no_copy_in_either_commit_slot) | test(=the_same_rows_in_more_commits_end_at_the_same_size) | test(=a_kill_in_any_step_of_a_build_leaves_every_vector_found) | test(=store::tests::every_damaged_record_is_told_as_damage_by_each_path_that_meets_it) | test(=schema::tests::every_damaged_schema_record_is_told_as_damage_or_read_as_tables_that_print) | test(=a_bound_finds_what_is_stored_and_nothing_for_a_face_never_stored) | test(=a_bound_over_sightings_answers_rows_inside_it_however_asked_or_written))'
+default-filter = 'not (test(=a_million_rows_load_and_scan_under_64_mib) | test(=an_append_does_not_read_the_rows_stored_before_it_at_a_million_rows) | test(=a_hundred_thousand_sightings_are_found_with_the_recorded_work_recall_and_length) | test(=a_million_sightings_are_found_with_the_recorded_work_recall_and_length) | binary(=performance_bars) | test(streaming::) | test(=removal_membership_agrees_with_the_in_memory_evaluator_for_every_kind) | test(=purge::a_purge_leaves_no_copy_in_either_commit_slot) | test(=the_same_rows_in_more_commits_end_at_the_same_size) | test(=a_kill_in_any_step_of_a_build_leaves_every_vector_found) | test(=a_kill_in_a_commit_with_an_event_route_keeps_rows_and_actions_together) | test(=store::tests::every_damaged_record_is_told_as_damage_by_each_path_that_meets_it) | test(=schema::tests::every_damaged_schema_record_is_told_as_damage_or_read_as_tables_that_print) | test(=a_bound_finds_what_is_stored_and_nothing_for_a_face_never_stored) | test(=a_bound_over_sightings_answers_rows_inside_it_however_asked_or_written))'
 
 # The kill-and-reopen tests start this test program again for each storage call they cut, copy a
 # store, fsync it and search it over: they spend processes, disk and the build host's cores, which
@@ -18,11 +19,6 @@ max-threads = 4
 filter = 'binary(=crash)'
 test-group = 'crash'
 threads-required = 2
-
-# Building two 1,024-dimensional IVFs in debug approaches 51s-60s on 4-core runners.
-[[profile.default.overrides]]
-filter = 'test(=a_replaced_grouping_is_freed_when_its_last_reader_goes)'
-slow-timeout = { period = "60s", terminate-after = 3 }
 
 # The nightly profile runs only the million-row load and the million-row append. Its limit is a
 # hang detector, well clear of the slowest hosted run seen (428 seconds).
@@ -45,4 +41,4 @@ slow-timeout = { period = "300s" }
 [profile.release]
 retries = 0
 slow-timeout = { period = "300s", terminate-after = 6 }
-default-filter = 'test(=a_million_rows_load_and_scan_under_64_mib) | test(=a_hundred_thousand_sightings_are_found_with_the_recorded_work_recall_and_length) | test(=a_million_sightings_are_found_with_the_recorded_work_recall_and_length) | test(=an_append_does_not_read_the_rows_stored_before_it_at_a_million_rows) | binary(=performance_bars) | test(=a_killed_open_reads_the_log_and_last_commit_pages) | test(streaming::) | test(=removal_membership_agrees_with_the_in_memory_evaluator_for_every_kind) | test(=purge::a_purge_leaves_no_copy_in_either_commit_slot) | test(=the_same_rows_in_more_commits_end_at_the_same_size) | test(=a_kill_in_any_step_of_a_build_leaves_every_vector_found) | test(=store::tests::every_damaged_record_is_told_as_damage_by_each_path_that_meets_it) | test(=schema::tests::every_damaged_schema_record_is_told_as_damage_or_read_as_tables_that_print) | test(=a_bound_finds_what_is_stored_and_nothing_for_a_face_never_stored) | test(=a_bound_over_sightings_answers_rows_inside_it_however_asked_or_written)'
+default-filter = 'test(=a_million_rows_load_and_scan_under_64_mib) | test(=a_hundred_thousand_sightings_are_found_with_the_recorded_work_recall_and_length) | test(=a_million_sightings_are_found_with_the_recorded_work_recall_and_length) | test(=an_append_does_not_read_the_rows_stored_before_it_at_a_million_rows) | binary(=performance_bars) | test(=a_killed_open_reads_the_log_and_last_commit_pages) | test(streaming::) | test(=removal_membership_agrees_with_the_in_memory_evaluator_for_every_kind) | test(=purge::a_purge_leaves_no_copy_in_either_commit_slot) | test(=the_same_rows_in_more_commits_end_at_the_same_size) | test(=a_kill_in_any_step_of_a_build_leaves_every_vector_found) | test(=a_kill_in_a_commit_with_an_event_route_keeps_rows_and_actions_together) | test(=store::tests::every_damaged_record_is_told_as_damage_by_each_path_that_meets_it) | test(=schema::tests::every_damaged_schema_record_is_told_as_damage_or_read_as_tables_that_print) | test(=a_bound_finds_what_is_stored_and_nothing_for_a_face_never_stored) | test(=a_bound_over_sightings_answers_rows_inside_it_however_asked_or_written)'

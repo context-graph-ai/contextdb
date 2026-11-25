@@ -14,10 +14,10 @@ use std::path::{Path, PathBuf};
 use super::binary::{Codes, Estimate, WIDEST, code_len, write_code};
 use super::block::{BLOCK_BYTES, BlockReader, BlockWriter, takes};
 use super::build::{Build, Phase, unindexed_work};
-use super::directory::{Grouped, Partition, partition};
+use super::directory::{self, Grouped, Partition, partition};
 use super::ivf::{
-    Ivf, Place, centroids, centroids_per_record, mean, nearest as nearest_groups, put_centroids,
-    put_mean,
+    Ivf, LEVELS, MARGIN, MARGIN_FROM, Place, centroids, centroids_per_record, mean,
+    nearest as nearest_groups, put_centroids, put_mean,
 };
 use super::seal::seal;
 use super::slot::{Screen, distance, slot_len, write_slot};
@@ -85,7 +85,7 @@ fn the_range_holds(stored: &[f32], query: &[f32], what: &str) {
     );
     let mut slot = vec![0_u8; slot_len(stored.len())];
     write_slot(stored, &mut slot);
-    let (low, high) = Screen::new(query).range(&slot);
+    let (low, high, _) = Screen::new(query).range(&slot);
     let similarity = 1.0 - found;
     assert!(
         f64::from(low) <= similarity && similarity <= f64::from(high),
@@ -350,6 +350,7 @@ fn an_ivf() -> Ivf {
         probes: 2,
         width: 4,
         starts: vec![place(0, 0), place(0, 200), place(1, 50), place(1, 300)],
+        reach: [2; LEVELS],
     }
 }
 
@@ -517,6 +518,7 @@ fn a_build(phase: Phase) -> Build {
         counts: vec![0; 45],
         starts: Vec::new(),
         tens: Vec::new(),
+        reach: [0; LEVELS],
         needing: 0,
     }
 }
@@ -768,7 +770,8 @@ fn every_build_renews_the_mean_and_each_centroid_from_its_members() {
         let g = entry.ivf.expect("an IVF");
         assert_eq!((g.blocks, g.slots), (1, last));
         let held = &mut budget.reserve(0, "query").expect("a reservation");
-        let centroids = centroids(&view, column, g.number, g.groups, BUILT, held).expect("centres");
+        let centroids =
+            centroids(&view, column, g.number, g.groups, BUILT, held).expect("centroids");
         let shape = Ivf::read(&view, column, g, held).expect("group boundaries");
         let (_, bytes) = first_record(&view, VectorRecord::Block(column, g.number, 0));
         let block = BlockReader::new(&bytes, BUILT);
@@ -787,6 +790,18 @@ fn every_build_renews_the_mean_and_each_centroid_from_its_members() {
         let wanted = average(0, block.len());
         let found = mean(&view, column, g.number, BUILT, held).expect("the IVF's mean");
         assert!(found.iter().zip(wanted).all(|(a, b)| (a - b).abs() < 1e-6));
+        // The build measured a reach; a cutoff exactly at a level takes that level's, and from
+        // the margin's floor up the level's below it.
+        assert!(
+            shape.reach[0] > 0,
+            "a reach at the lowest level: {:?}",
+            shape.reach
+        );
+        for at in (0..LEVELS).filter(|at| shape.reach[*at] > 0) {
+            let read = if at < MARGIN_FROM { at } else { at - MARGIN };
+            let wanted = Some(shape.reach[read] as usize);
+            assert_eq!(shape.reach_at(super::ivf::level(at)), wanted);
+        }
         drop((view, store));
         db = opened(&folder);
     }
@@ -901,6 +916,27 @@ fn records_from(view: &View, from: VectorRecord<'_>) -> usize {
     count
 }
 
+/// Closes the store: how many slots its `Slot` records note in blocks the partition keeps
+/// no more, and how many `Left` records the column keeps.
+fn loose(folder: &Path, db: Database) -> (usize, usize) {
+    let (store, _, column, p) = beneath(folder, db);
+    let (view, none, mut loose) = (store.view().unwrap(), Key::from_bytes(&[]), 0);
+    let live = |&[under, block, _]: &[u32; 3]| {
+        (under == p.number && block >= p.first) || p.ivf.is_some_and(|g| g.number == under)
+    };
+    let slots = VectorRecord::Slot(column, p.number, &none);
+    let ours = |r: &VectorRecord| matches!(r, VectorRecord::Slot(c, n, _) if (*c, *n) == (column, p.number));
+    view.vectors(slots, &mut |record, value| {
+        loose += usize::from(ours(&record)) * directory::slots(value).filter(|s| !live(s)).count();
+        Ok(ours(&record))
+    })
+    .unwrap();
+    (
+        loose,
+        records_from(&view, VectorRecord::Left(column, 0, &none)),
+    )
+}
+
 #[test]
 fn a_partition_that_empties_leaves_no_record_of_its_ivf_or_its_build() {
     for later in [false, true] {
@@ -975,9 +1011,74 @@ fn a_partition_that_empties_leaves_no_record_of_its_ivf_or_its_build() {
 /// Corruption retrains under the same limit; centroid I/O must escape without a commit.
 #[test]
 fn a_damaged_ivf_is_rebuilt_by_the_cycles_under_the_same_limit() {
-    let (folder, db) = a_store_with_vectors("rebuilt-ivf", IN_FORCE);
     let wide = |record: &mut Vec<u8>| record[..4].copy_from_slice(&20_001_u32.to_le_bytes());
     let in_force = |column| VectorRecord::Ivf(column, 0);
+    // The reach on and off (an IVF of no reach walks as before it): rows and units both ways,
+    // full, short under a bound that cut, full under a bound that cut nothing, and filtered.
+    // The store is a hundred tight clumps of twenty in scattered directions, so the ten nearest
+    // of a question near one clump lie in few groups while the gap the build measured covers
+    // many: there the reach has a walk to end. In the gathered store below the gap covers no
+    // more groups than the reach, and the reach ends no walk.
+    let clumped = |id: u64| -> Vec<f32> {
+        let (base, moved) = (vector(7_000_000 + id % 100, BUILT), vector(id, BUILT));
+        (0..BUILT).map(|at| base[at] + 0.05 * moved[at]).collect()
+    };
+    let folder = fresh("reach-on-and-off");
+    let db = opened(&folder);
+    let table = "CREATE TABLE docs (id INTEGER PRIMARY KEY, n INTEGER, v VECTOR(16) INDEXING_THRESHOLD 1000)";
+    db.execute(table, &HashMap::new()).expect("declare");
+    let tx = db.transaction().expect("begin");
+    for id in 1..=2000_u64 {
+        let row = crate::params! { "id" => id as i64, "v" => clumped(id) };
+        tx.execute("INSERT INTO docs (id, v) VALUES ($id, $v)", &row)
+            .expect("insert a row");
+    }
+    tx.commit().expect("commit");
+    let db = advance_to(&folder, db, IN_FORCE);
+    let asked = |db: &Database, filter: &str| {
+        let sql = format!(
+            "SELECT id, v <=> $q AS distance FROM docs {filter} ORDER BY distance USE VECTOR INDEXED LIMIT 10"
+        );
+        let found = db
+            .execute(&sql, &crate::params! { "q" => clumped(40_003) })
+            .unwrap();
+        (
+            found.rows().to_vec(),
+            found.rows_examined() + found.distance_evaluations(),
+        )
+    };
+    let shapes = [
+        "",
+        "WHERE v <=> $q < 0.02",
+        "WHERE v <=> $q < 2.0",
+        "WHERE id <= 900",
+    ];
+    let on = shapes.map(|filter| asked(&db, filter));
+    let db = damaged(&folder, db, in_force, |record| {
+        let at = record.len() - 4 * LEVELS;
+        record[at..].fill(0);
+    });
+    let off = shapes.map(|filter| asked(&db, filter));
+    assert!(
+        on[0].0 == off[0].0 && on[0].1 < off[0].1,
+        "full: {on:?} {off:?}"
+    );
+    assert!(
+        on[1].0 == off[1].0 && on[1].1 < off[1].1,
+        "short: {on:?} {off:?}"
+    );
+    assert_eq!(
+        on[2], off[2],
+        "a bound that cut nothing walks without the reach"
+    );
+    assert_eq!(
+        on[3], off[3],
+        "a filter on the rows walks without the reach"
+    );
+    drop(db);
+    std::fs::remove_dir_all(&folder).expect("remove the reach's store");
+
+    let (folder, db) = a_store_with_vectors("rebuilt-ivf", IN_FORCE);
     let db = damaged(&folder, db, in_force, wide);
     let exact = ten(&db, "EXACT").expect("EXACT reads no record of the index");
     let auto = ten(&db, "AUTO").expect("AUTO answers over a damaged IVF");
@@ -1012,7 +1113,7 @@ fn a_damaged_ivf_is_rebuilt_by_the_cycles_under_the_same_limit() {
     );
     assert!(entry.assigned + entry.slots < u64::from(ivf.groups).pow(2));
     let from = VectorRecord::Centroids(column, ivf.number, 0);
-    let (record, centres) = first_record(&store.view().unwrap(), from);
+    let (record, centroids) = first_record(&store.view().unwrap(), from);
     drop(store);
     let saved = std::fs::read(folder.join("data")).unwrap();
     let fault = report::Fault::new("reuse-centroid-sentinel");
@@ -1020,14 +1121,14 @@ fn a_damaged_ivf_is_rebuilt_by_the_cycles_under_the_same_limit() {
     let db = Database::open_with_options(&folder, options()).unwrap();
     fault.clear();
     db.run_maintenance_cycle().unwrap();
-    fault.identify(&centres);
+    fault.identify(&centroids);
     drop(db);
     for io_failure in [false, true] {
         std::fs::write(folder.join("data"), &saved).unwrap();
         if !io_failure {
             let store =
                 Store::open_for_writing(&folder, &budget, &DatabaseOpenOptions::default()).unwrap();
-            let mut bad = centres.clone();
+            let mut bad = centroids.clone();
             bad[..4].copy_from_slice(&f32::NAN.to_le_bytes());
             put(&store, &budget, record, bad);
         }
@@ -1091,7 +1192,7 @@ fn damage_stores() -> HashMap<&'static str, Vec<u8>> {
         let states: &[&str] = match count {
             0 => &["pending", "later-pending"],
             1 => &["begun", "assigned", "left-building", "left-sweeping"],
-            3 => &["packed", "width", "switch", "built"],
+            3 => &["packed", "width", "switch", "built", "sparse-sweeping"],
             _ => &["training"],
         };
         let (folder, mut db) = vectors_for_damage(&format!("damage-source-{count}"), count);
@@ -1099,6 +1200,11 @@ fn damage_stores() -> HashMap<&'static str, Vec<u8>> {
             if count == 0 {
                 insert_gathered(&db, at as u64 + 1..=at as u64 + 1);
             } else {
+                if name == "sparse-sweeping" {
+                    let moved = crate::params! { "v" => gathered(50_000) };
+                    let left = db.execute("UPDATE docs SET v = $v WHERE id > 1", &moved);
+                    left.expect("leave one packed slot of the two groups");
+                }
                 if name == "left-building" {
                     db = advance_to(&folder, db, IN_FORCE);
                     db.execute(
@@ -1116,7 +1222,9 @@ fn damage_stores() -> HashMap<&'static str, Vec<u8>> {
                     "packed" => |_, p| matches!(p, Some(Phase::Measure { done: 0, .. })),
                     "width" => |_, p| matches!(p, Some(Phase::Width { .. })),
                     "switch" => |_, p| matches!(p, Some(Phase::Switch { .. })),
-                    "left-sweeping" => |_, p| matches!(p, Some(Phase::Sweep { .. })),
+                    "left-sweeping" | "sparse-sweeping" => {
+                        |_, p| matches!(p, Some(Phase::Sweep { .. }))
+                    }
                     _ => IN_FORCE,
                 };
                 db = advance_to(&folder, db, reached);
@@ -1251,7 +1359,8 @@ fn met(test: &str, damage: Damage, saved: &HashMap<&str, Vec<u8>>) -> (PathBuf, 
                 .put_row(table, key, row, Vec::new(), false)
                 .expect("stage");
             store.commit(changes).expect("commit the damage");
-            vec![("a cycle", staged(&store, &budget, cycle))]
+            // Sealing reads no row (F1): only the whole-store check meets this damage.
+            Vec::new()
         }
         Damage::Named(column) => {
             let table = catalog.table("docs").expect("docs").id;
@@ -1296,6 +1405,7 @@ fn met(test: &str, damage: Damage, saved: &HashMap<&str, Vec<u8>>) -> (PathBuf, 
                 .expect("read the partition")
                 .expect("one partition");
             let left = matches!(damage, Damage::Left(..));
+            let building = matches!(damage, Damage::Building(..));
             let mut check_only = matches!(&damage, Damage::Built(_, from, _) if matches!(from(column), VectorRecord::Block(..)));
             match damage {
                 Damage::Built(_, from, change) => {
@@ -1363,6 +1473,16 @@ fn met(test: &str, damage: Damage, saved: &HashMap<&str, Vec<u8>>) -> (PathBuf, 
                 db.close().expect("close");
                 db = opened(&folder);
                 ("a search USE VECTOR INDEXED", ten(&db, "INDEXED").map(drop))
+            } else if building {
+                // A build's damage is told by its reads, and the cycles build it again.
+                let read = db.execute("SHOW VECTOR_PARTITIONS FOR docs.v", &HashMap::new());
+                assert!(matches!(read, Err(Error::StoreCorrupted { .. })));
+                let check = db.verify().map(drop);
+                let last = (0..100).map(|_| db.run_maintenance_cycle().expect("a cycle"));
+                let last = last.last().unwrap().vector.maintenance_vectors_remaining;
+                assert_eq!(count(last), 0, "the cycles finish the build");
+                assert_eq!(ten(&db, "INDEXED").unwrap(), ten(&db, "EXACT").unwrap());
+                ("the whole-store check", check)
             } else {
                 let (path, cycles) = if left {
                     ("the cycles that follow", 40)
@@ -1372,7 +1492,15 @@ fn met(test: &str, damage: Damage, saved: &HashMap<&str, Vec<u8>>) -> (PathBuf, 
                 let told = (0..cycles).find_map(|_| db.run_maintenance_cycle().err());
                 (path, told.map_or(Ok(()), Err))
             };
-            db.close().expect("close");
+            if building {
+                assert_eq!(
+                    loose(&folder, db),
+                    (0, 0),
+                    "a discarded build leaves no note"
+                );
+            } else {
+                db.close().expect("close");
+            }
             vec![given]
         }
     };
@@ -1427,6 +1555,16 @@ fn every_damaged_vector_record_is_told_as_damage_by_each_path_that_meets_it() {
     let orphan = |b: &mut Vec<u8>| *b.last_mut().unwrap() = 127;
     let past_build = Place("assigned", assigned, Some(u32::MAX));
     let no_centroids = Place("training", |v| VectorRecord::Centroids(v, 0, 0), None);
+    // A checkpoint of the reach that no build measures: a level above a lower one, or more
+    // groups than the build has.
+    let rising = |mut build: Build| {
+        build.reach[LEVELS - 1] = build.reach[0] + 1;
+        build
+    };
+    let past = |mut build: Build| {
+        build.reach[0] = build.groups + 1;
+        build
+    };
     let wrong_build = Building("begun", |mut b| {
         b.number += 1;
         b
@@ -1478,6 +1616,11 @@ fn every_damaged_vector_record_is_told_as_damage_by_each_path_that_meets_it() {
         ("IVF, not from slot 0", ivf(with(&g, 16, 1))),
         ("IVF, a place going back", ivf(with(&back, 32, 100))),
         ("IVF, ends past blocks", ivf(with(&g, 36, 5))),
+        (
+            "IVF, reach past groups",
+            ivf(with(&g, g.len() - 4 * LEVELS, 4)),
+        ),
+        ("IVF, reach rising", ivf(with(&g, g.len() - 4, 3))),
         ("three centroids, four groups", Alone(Groups(4), c.clone())),
         (
             "centroids, part of one",
@@ -1494,7 +1637,7 @@ fn every_damaged_vector_record_is_told_as_damage_by_each_path_that_meets_it() {
         ("build assigning past blocks", builds(assign)),
         ("build packing a missing group", builds(pack.encode())),
         ("build cut short", builds(train[..train.len() - 1].to_vec())),
-        // The first, which a cycle reads to find the partition, and one it reads for a slot.
+        // The first pending row and a later one, each with no vector.
         ("first pending row, no vector", NoVector(1)),
         ("later pending row, no vector", NoVector(2)),
         ("VECTOR entry of no column", Named(b'w')),
@@ -1522,6 +1665,13 @@ fn every_damaged_vector_record_is_told_as_damage_by_each_path_that_meets_it() {
         ("assigned, odd bytes", Built("assigned", assigned, one)),
         ("build, more groups than slots", Building("begun", groups)),
         ("build, groups out of order", Building("packed", swapped)),
+        ("measuring, reach rising", Building("packed", rising)),
+        ("measured, reach past groups", Building("width", past)),
+        ("sweeping, reach past", Building("left-sweeping", past)),
+        (
+            "sweeping, more groups than slots",
+            Building("sparse-sweeping", past),
+        ),
         ("left of 15 bytes, building", Left("left-building", 15)),
         ("left of 15 bytes, sweeping", Left("left-sweeping", 15)),
         ("left of 17 bytes, sweeping", Left("left-sweeping", 17)),
@@ -1543,7 +1693,7 @@ fn every_damaged_vector_record_is_told_as_damage_by_each_path_that_meets_it() {
         let query_only = matches!(&damage, Built(_, from, _) if matches!(from(COLUMN), VectorRecord::Centroids(..)));
         let unwritten = matches!(&damage, Alone(_, bytes) if bytes.is_empty());
         let (folder, mut given) = met(&format!("vector-damage-{at}"), damage, &saved);
-        if !unwritten && !query_only {
+        if !unwritten && !query_only && given.iter().all(|g| g.0 != "the whole-store check") {
             let check = Database::open(&folder).and_then(|db| db.verify());
             given.push(("the whole-store check", check.map(drop)));
         }
@@ -1576,7 +1726,8 @@ thread_local! {
 
 #[test]
 fn a_purge_reads_only_the_blocks_of_the_groups_it_erases_from_and_keeps_the_mean() {
-    const WIDE: usize = 1024;
+    // A block holds 15 slots of 16,384 numbers: 125 rows in 11 groups take several blocks.
+    const WIDE: usize = 16384;
     let folder = fresh("targeted-purge");
     let db = opened(&folder);
     let run = |db: &Database, sql: &str, id: u64, seed: u64| {
@@ -1585,12 +1736,12 @@ fn a_purge_reads_only_the_blocks_of_the_groups_it_erases_from_and_keeps_the_mean
     };
     run(
         &db,
-        "CREATE TABLE docs (id INTEGER PRIMARY KEY, v VECTOR(1024) INDEXING_THRESHOLD 1000)",
+        "CREATE TABLE docs (id INTEGER PRIMARY KEY, v VECTOR(16384) INDEXING_THRESHOLD 100)",
         0,
         0,
     );
     let tx = db.transaction().expect("begin");
-    for id in 1..=2000 {
+    for id in 1..=125 {
         let given = crate::params! { "id" => id as i64, "v" => vector(id, WIDE) };
         tx.execute("INSERT INTO docs (id, v) VALUES ($id, $v)", &given)
             .expect("insert");
@@ -1610,7 +1761,7 @@ fn a_purge_reads_only_the_blocks_of_the_groups_it_erases_from_and_keeps_the_mean
     drop(store);
 
     let db = opened(&folder);
-    for id in [7, 1500] {
+    for id in [7, 100] {
         BLOCKS_READ.with(|read| read.set(0));
         run(&db, "PURGE FROM docs WHERE id = $id", id, 0);
         let read = BLOCKS_READ.with(std::cell::Cell::get);
@@ -1627,7 +1778,7 @@ fn a_purge_reads_only_the_blocks_of_the_groups_it_erases_from_and_keeps_the_mean
         let (_, bytes) = first_record(&view, VectorRecord::Block(column2, g.number, at));
         let block = BlockReader::new(&bytes, WIDE);
         for slot in (0..block.len()).filter(|s| !block.key(*s).as_bytes().is_empty()) {
-            let erased = [7, 1500].map(|n| Key::from_values(&[Value::Int64(n)], &[]).unwrap());
+            let erased = [7, 100].map(|n| Key::from_values(&[Value::Int64(n)], &[]).unwrap());
             assert!(!erased.contains(&block.key(slot)), "an erased key kept");
             sum.take(block.slot(slot));
             count += 1;

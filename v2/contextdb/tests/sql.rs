@@ -1,4 +1,4 @@
-//! Runs every script in `tests/sql/`, in name order, as one test.
+//! Runs every script in `tests/sql/` as one test, reporting failures in name order.
 //!
 //! A script is statements, each ending with `;` at the end of a line. A line of `----` after a
 //! statement begins its expected output, which ends at the next blank line; a statement without
@@ -17,6 +17,7 @@
 mod support;
 
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
 use contextdb::{Error, QueryResult, Value, params};
 
@@ -33,11 +34,36 @@ fn every_script_gives_its_expected_output() {
     assert!(!names.is_empty(), "no script matches SQL_SCRIPT={only:?}");
     let source = support::folder("sql-source");
     support::close(support::open(&source));
-    let mut failures = Vec::new();
-    for name in &names {
-        failures.extend(failures_of(&folder, name, &source));
-    }
-    let report = failures.join("\n\n");
+    // Each script has its own store, so the scripts run on several threads at once and their
+    // failures are reported in name order.
+    let next = AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let mut failures: Vec<(usize, Vec<String>)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads.min(names.len()))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut found = Vec::new();
+                    loop {
+                        let at = next.fetch_add(1, SeqCst);
+                        let Some(name) = names.get(at) else {
+                            return found;
+                        };
+                        found.push((at, failures_of(&folder, name, &source)));
+                    }
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap())
+            .collect()
+    });
+    failures.sort_by_key(|(at, _)| *at);
+    let report = failures
+        .into_iter()
+        .flat_map(|(_, f)| f)
+        .collect::<Vec<_>>()
+        .join("\n\n");
     assert!(report.is_empty(), "statements that failed:\n\n{report}");
     // Both are tools for a developer: a run with either set never passes, so no environment
     // gives a pass that a clean one would not.

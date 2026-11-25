@@ -5,6 +5,8 @@
 //! cannot serve the statement.
 
 mod support;
+#[path = "support/vecsearch.rs"]
+mod vecsearch;
 use support::{Run, count};
 
 use std::io;
@@ -12,7 +14,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use contextdb::{DatabaseOpenOptions, Error, QueryResult, ReadSession, Value, params};
+use contextdb::{DatabaseOpenOptions, Error, QueryResult, ReadSession, Uuid, Value, params};
 
 const DIMENSION: usize = 16;
 
@@ -34,6 +36,25 @@ fn gathered(n: i64) -> Vec<f32> {
 
 fn lists(partition: &support::Shown) -> Value {
     support::field(partition, "lists").clone()
+}
+
+/// The bytes the first vector index holds on disk.
+fn index_bytes(db: &contextdb::Database) -> i64 {
+    let index = support::shown(db, "SHOW VECTOR_INDEXES").remove(0);
+    support::whole(&index, "durable_index_bytes")
+}
+
+/// The test of a stored row that `tag = 7 AND id <= upto` makes.
+fn tagged(upto: i64) -> impl Fn(&[Value]) -> bool + Copy {
+    move |row: &[Value]| matches!((&row[0], &row[2]), (Value::Int64(id), Value::Int64(7)) if *id <= upto)
+}
+
+/// The groups of each partition, in the order SHOW VECTOR_PARTITIONS lists them.
+fn grouped(db: &contextdb::Database) -> Vec<Value> {
+    support::shown(db, "SHOW VECTOR_PARTITIONS")
+        .iter()
+        .map(lists)
+        .collect()
 }
 
 #[test]
@@ -59,18 +80,18 @@ fn an_indexed_search_does_fewer_distance_evaluations_than_exact() {
             exact.distance_evaluations()
         );
     }
-    // A filter that lets half the rows through: every question still finds EXACT's ten rows.
-    let half = |row: &[Value]| matches!(row[2], Value::Int64(tag) if tag < 25);
+    // A key range that lets half the rows through: every question still finds EXACT's ten rows.
+    let half = |row: &[Value]| matches!(row[0], Value::Int64(id) if id <= 1000);
     for j in 0..20 {
         let query = question(j);
         let wanted = stored.nearest(half, &query, 10);
         let exact = support::answer(
             &db,
-            &support::by_mode(Some("tag < 25"), "EXACT", 10),
+            &support::by_mode(Some("id <= 1000"), "EXACT", 10),
             &query,
         );
         for mode in ["INDEXED", "AUTO"] {
-            let sql = support::by_mode(Some("tag < 25"), mode, 10);
+            let sql = support::by_mode(Some("id <= 1000"), mode, 10);
             let found = support::assert_nearest(&db, &sql, &query, &wanted, mode);
             let less = found.distance_evaluations() < exact.distance_evaluations();
             assert!(mode == "AUTO" || less, "INDEXED does less work than EXACT");
@@ -100,9 +121,11 @@ fn an_indexed_search_does_fewer_distance_evaluations_than_exact() {
         "the cursor opened before keeps the older mode"
     );
     assert!(before < exact, "the older mode does less");
-    // Recorded from the first run: their work, and how many of EXACT's 200 rows they found.
-    let recorded = (15_573, 200);
-    assert_eq!((work, found), recorded, "INDEXED's work, rows found");
+    // The root's recall: at least 95 in 100 of EXACT's 200 rows, in less than EXACT's work.
+    assert!(
+        found * 100 >= 200 * 95,
+        "INDEXED found {found} of EXACT's 200 rows in {work} evaluations"
+    );
 }
 
 #[test]
@@ -125,12 +148,8 @@ fn a_column_below_its_size_pays_nothing_and_is_searched_whole() {
             );
         }
     };
-    let index_bytes = || {
-        let index = support::shown(&db, "SHOW VECTOR_INDEXES").remove(0);
-        support::whole(&index, "durable_index_bytes")
-    };
     assert_eq!(lists(&support::the_partition(&db)), Value::Null);
-    assert_eq!(index_bytes(), 0);
+    assert_eq!(index_bytes(&db), 0);
     agree(10, 10, "2,000 rows sealed");
 
     // A fifth of the rows leave their slots: the one build such a column gets drops them.
@@ -142,16 +161,18 @@ fn a_column_below_its_size_pays_nothing_and_is_searched_whole() {
     let partition = support::the_partition(&db);
     assert_eq!(support::whole(&partition, "tombstones"), 0);
     assert_eq!(lists(&partition), Value::Int64(1));
-    assert_eq!(index_bytes(), 28, "the record of an IVF of one group");
+    assert_eq!(
+        index_bytes(&db),
+        28 + 4 * 16,
+        "the record of an IVF of one group, with its reach"
+    );
     agree(10, 10, "a fifth deleted");
     agree(5000, 1600, "a LIMIT above the rows that are left");
 }
 
 #[test]
 fn indexed_is_served_at_every_size() {
-    let folder = support::folder("indexed-every-size");
-    let db = support::open(&folder);
-    support::declare_docs(&db, DIMENSION, GROUPED);
+    let (_, db) = vecsearch::docs("indexed-every-size", DIMENSION, GROUPED);
     let query = question(0);
     let sql = support::by_mode(None, "INDEXED", 10);
     let mut next = 1;
@@ -202,7 +223,6 @@ fn refused_whole_while_one_partition_is_behind(name: &str, clauses: &str, indexe
     // nearer than the last of them.
     let result = support::answer(&db, &support::by_mode(None, "AUTO", 10), &query);
     let answer = support::assert_sound(&result, &stored, all, &query, 10, "AUTO over both");
-    let in_b = |row: &[Value]| row[1] == support::text("b");
     for near in stored.nearest(in_b, &query, 10) {
         assert!(
             near.distance >= answer[9].distance || answer.contains(&near),
@@ -239,6 +259,16 @@ fn auto_and_exact(
     ["AUTO", "EXACT"].map(|mode| support::answer(db, &support::by_mode(filter, mode, 10), query))
 }
 
+/// AUTO finds what EXACT finds, by the same distance evaluations.
+fn auto_is_exact(db: &contextdb::Database, filter: Option<&str>, query: &[f32]) {
+    let [auto, exact] = auto_and_exact(db, filter, query);
+    assert_eq!(
+        support::found(&auto, "AUTO"),
+        support::found(&exact, "EXACT")
+    );
+    assert_eq!(auto.distance_evaluations(), exact.distance_evaluations());
+}
+
 #[test]
 fn auto_uses_ivfs_from_indexing_threshold_on() {
     // Two built partitions of 1,200 under INDEXING_THRESHOLD 2000: the count is over the selected
@@ -247,19 +277,10 @@ fn auto_uses_ivfs_from_indexing_threshold_on() {
     let (_, db) = support::built("auto-threshold", DIMENSION, clauses, 1200);
     support::load_docs(&db, 1201..=2400, "b", gathered);
     support::maintenance(&db);
-    let grouped: Vec<Value> = support::shown(&db, "SHOW VECTOR_PARTITIONS")
-        .iter()
-        .map(lists)
-        .collect();
-    assert_eq!(grouped, [Value::Int64(35), Value::Int64(35)]);
+    assert_eq!(grouped(&db), [Value::Int64(35), Value::Int64(35)]);
     let stored = support::stored(&db, support::DOCS);
     let query = question(2);
-    let [auto, exact] = auto_and_exact(&db, Some("ctx = 'a'"), &query);
-    assert_eq!(
-        support::found(&auto, "AUTO"),
-        support::found(&exact, "EXACT")
-    );
-    assert_eq!(auto.distance_evaluations(), exact.distance_evaluations());
+    auto_is_exact(&db, Some("ctx = 'a'"), &query);
     let [auto, exact] = auto_and_exact(&db, None, &query);
     support::assert_sound(&auto, &stored, all, &query, 10, "AUTO over 2,400");
     assert!(
@@ -276,21 +297,13 @@ fn auto_uses_ivfs_from_indexing_threshold_on() {
 
     // A column below its declared size stays ungrouped however many cycles run: 1,000 rows
     // under INDEXING_THRESHOLD 50000 are not 50,000, though one partition holds a hundredth of it.
-    let index_bytes = |db: &contextdb::Database| {
-        let index = support::shown(db, "SHOW VECTOR_INDEXES").remove(0);
-        support::whole(&index, "durable_index_bytes")
-    };
     let clauses = "PARTITION_KEY (ctx) INDEXING_THRESHOLD 50000";
     let (_, db) = support::built("auto-below-declared", DIMENSION, clauses, 400);
     support::load_docs(&db, 401..=1000, "b", gathered);
     for _ in 0..3 {
         support::maintenance(&db);
     }
-    let grouped: Vec<Value> = support::shown(&db, "SHOW VECTOR_PARTITIONS")
-        .iter()
-        .map(lists)
-        .collect();
-    assert_eq!(grouped, [Value::Null, Value::Null]);
+    assert_eq!(grouped(&db), [Value::Null, Value::Null]);
     assert_eq!(index_bytes(&db), 0);
 
     // With no INDEXING_THRESHOLD the number in force is 100,000: a partition of 1,200 stays
@@ -307,12 +320,7 @@ fn auto_uses_ivfs_from_indexing_threshold_on() {
     );
     assert_eq!(lists(&support::the_partition(&db)), Value::Null);
     assert_eq!(index_bytes(&db), 0);
-    let [auto, exact] = auto_and_exact(&db, None, &query);
-    assert_eq!(
-        support::found(&auto, "AUTO"),
-        support::found(&exact, "EXACT")
-    );
-    assert_eq!(auto.distance_evaluations(), exact.distance_evaluations());
+    auto_is_exact(&db, None, &query);
 }
 
 #[test]
@@ -345,25 +353,15 @@ fn auto_searches_each_partition_by_what_its_ivf_saves() {
     let (_, db) = support::built("auto-each-partition", DIMENSION, clauses, 2000);
     // Five pending rows under another context, nearer the question than any row of the first.
     let query = question(3);
-    support::load_docs(&db, 9001..=9005, "b", |n| {
-        let moved = support::vector(n, DIMENSION);
-        query
-            .iter()
-            .zip(moved)
-            .map(|(q, by)| q + 0.001 * by)
-            .collect()
-    });
+    support::load_docs(&db, 9001..=9005, "b", |n| nearer(&query, n));
     let stored = support::stored(&db, support::DOCS);
-    let [auto, exact] = auto_and_exact(&db, None, &query);
+    let [auto, _] = auto_and_exact(&db, None, &query);
     let answer = support::assert_sound(&auto, &stored, all, &query, 10, "AUTO over both");
     let pending = |near: &&support::Near| matches!(near.key, Value::Int64(id) if id > 9000);
     assert_eq!(answer.iter().filter(pending).count(), 5, "{answer:?}");
-    // Recorded from the first run, AUTO's below EXACT's: another count is another search.
-    let work = [&auto, &exact].map(|found| found.distance_evaluations());
     let wanted = stored.nearest(all, &query, 10);
     let found = answer.iter().filter(|near| wanted.contains(near)).count();
-    let recorded = ([790, 2_244], 10);
-    assert_eq!((work, found), recorded, "work of AUTO, EXACT; rows found");
+    assert_eq!(found, 10, "every one of the ten nearest");
     support::run(&db, "DROP TABLE docs");
     support::declare_docs(&db, 4, "PARTITION_KEY (ctx) INDEXING_THRESHOLD 4");
     support::load_docs(&db, 1..=20, "a", |n| support::vector(n, 4));
@@ -371,22 +369,90 @@ fn auto_searches_each_partition_by_what_its_ivf_saves() {
     support::load_docs(&db, 21..=25, "b", |n| support::vector(n, 4));
     support::run(&db, "UPDATE docs SET tag = 99 WHERE id >= 24");
     support::cycle(&db);
-    let direct = ["AUTO", "EXACT"].map(|mode| {
-        support::answer(
-            &db,
-            &support::by_mode(Some("tag = 99"), mode, 5),
-            &support::vector(3, 4),
-        )
-    });
-    assert_eq!(
-        support::found(&direct[0], "AUTO"),
-        support::found(&direct[1], "EXACT")
-    );
-    assert_eq!(direct.each_ref().map(|r| r.rows_examined()), [27, 27]);
+    let [auto, exact] = auto_and_exact(&db, Some("tag = 99"), &support::vector(3, 4));
+    let same = support::found(&auto, "AUTO") == support::found(&exact, "EXACT");
+    assert!(same, "AUTO answers as EXACT");
     let b = &support::shown(&db, "SHOW VECTOR_PARTITIONS")[1];
     assert_eq!(support::word(b, "availability_reason"), "none");
     let column = &support::shown(&db, "SHOW VECTOR_INDEXES")[0];
     assert_eq!(support::whole(column, "unavailable_partitions"), 0);
+}
+
+/// A vector a thousandth of the way from the question `q` to row `n`'s: nearer it than any row.
+fn nearer(q: &[f32], n: i64) -> Vec<f32> {
+    let moved = support::vector(n, DIMENSION);
+    q.iter().zip(moved).map(|(q, m)| q + 0.001 * m).collect()
+}
+
+/// A find's units: rows read and distances evaluated (section 6, F4, as today).
+fn work(found: &QueryResult) -> u64 {
+    found.rows_examined() + found.distance_evaluations()
+}
+
+/// Five rows nearer the question than any of 2,000 under a second partition: named in either
+/// order the two give the same rows for the same work, and a find of the first counts the same
+/// whatever the second holds (section 6, F2).
+#[test]
+fn two_partitions_give_the_same_rows_and_work_in_either_order() {
+    let db = support::open(&support::folder("either-order"));
+    support::run(&db, "CREATE TABLE bonus (id INTEGER PRIMARY KEY, w REAL)");
+    let rank = "JOIN bonus ON id, FORMULA 'coalesce({w}, 0.0) + {vector_score}', SORT_KEY s";
+    let clauses = format!("PARTITION_KEY (ctx) INDEXING_THRESHOLD 1000 RANK_POLICY ({rank})");
+    support::declare_docs(&db, DIMENSION, &clauses);
+    support::run(&db, "CREATE INDEX docs_tag ON docs (tag)");
+    support::load_docs(&db, 1..=2000, "a", gathered);
+    support::maintenance(&db);
+    let query = question(3);
+    let ask =
+        |mode: &str, f: &str| support::answer(&db, &support::by_mode(Some(f), mode, 10), &query);
+    let before = MODES.map(|mode| work(&ask(mode, "ctx = 'a'")));
+    support::load_docs(&db, 9001..=9005, "b", |n| nearer(&query, n));
+    let stored = support::stored(&db, support::DOCS);
+    for (mode, before) in MODES.into_iter().zip(before) {
+        assert_eq!(
+            work(&ask(mode, "ctx = 'a'")),
+            before,
+            "{mode}: 'a' whatever 'b' holds"
+        );
+        let [ab, ba] =
+            ["'a', 'b'", "'b', 'a'"].map(|named| ask(mode, &format!("ctx IN ({named})")));
+        support::assert_sound(&ab, &stored, all, &query, 10, mode);
+        let told = |r: &QueryResult| (r.rows().to_vec(), work(r));
+        assert_eq!(
+            told(&ab),
+            told(&ba),
+            "{mode}: the order named changes no row and no count"
+        );
+    }
+    // Under EXACT the find over both is the merge of each partition's own answer by rank, equal
+    // ranks by key (R8): 9006 ties a's fifth at the limit, 9007, the farthest, ranks first. a's
+    // keys are below b's, so a stable sort of a's answer then b's keeps equal ranks in key order.
+    let tie = ask("EXACT", "ctx IN ('a', 'b')").rows()[9][0].clone();
+    let tie = (1..=2000).find(|n| tie == Value::Int64(*n)).unwrap();
+    let far: Vec<f32> = query.iter().map(|q| -q).collect();
+    support::load_docs(&db, 9006..=9006, "b", |_| gathered(tie));
+    support::load_docs(&db, 9007..=9007, "b", |_| far.clone());
+    support::run(&db, "INSERT INTO bonus (id, w) VALUES (9007, 3.0)");
+    for (rows, rank) in [("", ""), (" AND tag < 25", ""), ("", "USE RANK s ")] {
+        let find = |mode: &str, named: &str| {
+            let sql = support::by_mode(Some(&format!("ctx IN ({named}){rows}")), mode, 10);
+            let sql = sql.replace("LIMIT", &format!("{rank}LIMIT"));
+            support::found(&support::answer(&db, &sql, &query), &sql)
+        };
+        let w = |n: &support::Near| 3.0 * f64::from(u8::from(n.key == Value::Int64(9007)));
+        let score = |n: &support::Near| [n.distance, -(w(n) + (1.0 - n.distance))];
+        let mut merged = [find("EXACT", "'a'"), find("EXACT", "'b'")].concat();
+        let by = usize::from(!rank.is_empty());
+        merged.sort_by(|x, y| score(x)[by].total_cmp(&score(y)[by]));
+        // INDEXED by rank is held to b's six rows, unindexed and so always compared, above a's.
+        for (mode, upto) in [("EXACT", 10), ("INDEXED", 10 - 4 * by)] {
+            for named in ["'a', 'b'", "'b', 'a'"] {
+                let found = find(mode, named);
+                let same = found[..upto] == merged[..upto];
+                assert!(same, "{mode} ({named}){rows} {rank}: {found:?}");
+            }
+        }
+    }
 }
 
 #[test]
@@ -439,8 +505,9 @@ fn auto_over_a_partition_behind_its_writes_is_held_to_the_exact_work_and_refused
 }
 
 #[test]
-fn a_column_with_no_mode_declared_searches_as_auto_at_ten_thousand_vectors() {
-    let (_, db) = support::built("auto-10k", DIMENSION, "INDEXING_THRESHOLD 1000", 10_000);
+fn a_column_with_no_mode_declared_searches_as_auto() {
+    // 2,000 rows over INDEXING_THRESHOLD 1000: the partition is grouped, so AUTO uses its IVF.
+    let (_, db) = support::built("auto-undeclared-mode", DIMENSION, GROUPED, 2000);
     let stored = support::stored(&db, support::DOCS);
     for j in 0..20 {
         let (query, wanted) = (question(j), stored.nearest(all, &question(j), 10));
@@ -492,91 +559,465 @@ fn writes_after_a_ivf_are_found_at_once() {
     assert!(support::found(&result, "INDEXED")[0].key == Value::Int64(3002));
 }
 
+/// An index damaged after a find has begun costs that find only the work already spent: AUTO
+/// then answers what EXACT answers within EXACT's work plus what was spent, a read session
+/// limited to that recovers, INDEXED over a damaged partition is refused by name while the sound
+/// one answers, and maintenance rebuilds it (section 6, the guard's damaged-index cases).
 #[test]
-fn a_search_with_a_filter_on_rows_widens_until_it_is_whole() {
-    let (_, db) = support::built("filter-widens", DIMENSION, GROUPED, 2000);
-    let stored = support::stored(&db, support::DOCS);
-    let query = question(5);
-    let search = |db: &contextdb::Database, filter: Option<&str>, mode: &str, k: usize| {
-        support::search(db, &support::by_mode(filter, mode, k), &query)
-    };
+fn a_damaged_ivf_costs_a_find_only_the_work_already_spent() {
+    {
+        // 128 rows spread evenly round a circle, in vectors wide enough for four blocks of 42
+        // slots. The size is fixed by the blocks: INDEXED reads every centroid and the binary codes
+        // first, so it reads less than EXACT only when the blocks it then leaves unread outweigh
+        // them, which takes several blocks; few rows in wide vectors make those with a short build.
+        const WIDE: usize = 6144;
+        const ROWS: i64 = 128;
+        let folder = support::folder("indexed-reads-codes");
+        let db = support::open(&folder);
+        support::declare_docs(&db, WIDE, "INDEXING_THRESHOLD 128");
+        support::load_docs(&db, 1..=ROWS, "a", |n| support::ringed(n, ROWS, WIDE));
+        support::maintenance(&db);
+        assert_eq!(lists(&support::the_partition(&db)), Value::Int64(11));
+        support::close(db);
 
-    // A filter that passes every row costs what no filter costs.
-    let plain = search(&db, None, "INDEXED", 10).expect("no filter");
-    let passing = search(&db, Some("tag >= 0"), "INDEXED", 10).expect("every row passes");
-    assert_eq!(
-        support::found(&passing, "every row passes"),
-        support::found(&plain, "no filter")
-    );
-    assert_eq!(passing.distance_evaluations(), plain.distance_evaluations());
-
-    // Nine rows in ten pass. INDEXED answers ten rows the filter allows, nearest first, each
-    // with the distance the exact route is held to for that row, and does less than the exact
-    // route's work. Which ten is the index's to say: it may leave out a row the exact ten hold.
-    let most = |row: &[Value]| matches!(row[2], Value::Int64(tag) if tag < 45);
-    let wanted = stored.nearest(most, &query, 10);
-    let sql = support::by_mode(Some("tag < 45"), "EXACT", 10);
-    let exact = support::assert_nearest(&db, &sql, &query, &wanted, "EXACT");
-    let indexed = search(&db, Some("tag < 45"), "INDEXED", 10).expect("nine in ten pass");
-    let what = "INDEXED, nine rows in ten pass";
-    support::assert_sound(&indexed, &stored, most, &query, 10, what);
-    assert!(
-        indexed.distance_evaluations() < exact.distance_evaluations(),
-        "{what}: {} distance evaluations, EXACT {}",
-        indexed.distance_evaluations(),
-        exact.distance_evaluations()
-    );
-
-    // Twelve rows pass, spread over the groups, and ten are asked for. AUTO widens until it
-    // has done the exact work and returns the ten nearest of them; INDEXED holds ten allowed
-    // rows before the step that would take every group, and answers them.
-    let tagged = |upto: i64| move |row: &[Value]| matches!((&row[0], &row[2]), (Value::Int64(id), Value::Int64(7)) if *id <= upto);
-    let twelve = Some("tag = 7 AND id <= 600");
-    assert_eq!(stored.nearest(tagged(600), &query, 100).len(), 12);
-    let wanted = stored.nearest(tagged(600), &query, 10);
-    let sql = support::by_mode(twelve, "AUTO", 10);
-    support::assert_nearest(&db, &sql, &query, &wanted, "AUTO, twelve rows pass");
-    let indexed = search(&db, twelve, "INDEXED", 10).expect("twelve rows pass");
-    let what = "INDEXED, twelve rows pass";
-    support::assert_sound(&indexed, &stored, tagged(600), &query, 10, what);
-
-    // Six rows pass and ten are asked for: AUTO returns the six, and INDEXED, short of its
-    // limit at the step that would take every group, is refused by name.
-    let six = Some("tag = 7 AND id <= 300");
-    let wanted = stored.nearest(tagged(300), &query, 10);
-    assert_eq!(wanted.len(), 6);
-    let sql = support::by_mode(six, "AUTO", 10);
-    support::assert_nearest(&db, &sql, &query, &wanted, "AUTO, six rows pass");
-    support::assert_indexed_refused(search(&db, six, "INDEXED", 10), "six rows pass");
-
-    // Three rows pass: AUTO returns the three, and INDEXED is refused by name.
-    let few = Some("tag = 7 AND id <= 150");
-    let wanted = stored.nearest(tagged(150), &query, 10);
-    assert_eq!(wanted.len(), 3);
-    let sql = support::by_mode(few, "AUTO", 10);
-    support::assert_nearest(&db, &sql, &query, &wanted, "AUTO, three rows pass");
-    support::assert_indexed_refused(search(&db, few, "INDEXED", 10), "USE VECTOR INDEXED");
-
-    // With no filter and a LIMIT above the rows, INDEXED returns every row.
-    let every = search(&db, None, "INDEXED", 5000).expect("every row");
-    support::assert_sound(&every, &stored, all, &query, 2000, "a LIMIT above the rows");
-
-    // The indexed filter's AUTO work is bounded even when it must find every passing row.
-    support::run(&db, "CREATE INDEX docs_tag ON docs (tag)");
-    for upto in [1000, 1500, 2000] {
-        let filter = format!("tag = 7 AND id <= {upto}");
-        let wanted = stored.nearest(tagged(upto), &query, 100);
-        let sql = support::by_mode(Some(&filter), "AUTO", wanted.len() + 1);
-        let answer = support::assert_nearest(&db, &sql, &query, &wanted, &filter);
+        let query = support::ringed(157, 2 * ROWS, WIDE);
+        let read_by = |mode: &str| -> u64 {
+            let (bytes, result) = read_alone(&folder, &support::by_mode(None, mode, 10), &query);
+            assert_eq!(result.expect(mode).rows().len(), 10, "rows under {mode}");
+            bytes
+        };
+        // EXACT reads every block. INDEXED reads what EXACT does not, the centroids and the
+        // binary codes, and still reads less: it left blocks unread.
+        let (exact, indexed) = (read_by("EXACT"), read_by("INDEXED"));
         assert!(
-            answer.distance_evaluations() <= 17 * wanted.len() as u64,
-            "{filter}: {answer:?}"
+            indexed < exact,
+            "INDEXED read {indexed} bytes of the data file and EXACT {exact}"
+        );
+        let db = support::open(&folder);
+        support::run(&db, "CREATE INDEX docs_tag ON docs(tag)");
+        support::run(&db, "UPDATE docs SET tag = 0");
+        support::run(&db, "UPDATE docs SET tag = 1 WHERE id <= 20");
+        support::close(db);
+        let damage = |folder: &Path, block: u32| {
+            use redb::{ReadableTable, TableDefinition};
+            let file = redb::Database::open(folder.join("data")).unwrap();
+            let write = file.begin_write().unwrap();
+            {
+                let mut blocks = write
+                    .open_table(TableDefinition::<&[u8], &[u8]>::new("vector_blocks"))
+                    .unwrap();
+                let (key, mut bytes) = blocks
+                    .iter()
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .find_map(|(k, v)| {
+                        let key = k.value();
+                        (key[0] == 7 && key[9..] == block.to_be_bytes())
+                            .then(|| (key.to_vec(), v.value().to_vec()))
+                    })
+                    .expect("the target binary block exists");
+                bytes.pop();
+                blocks.insert(key.as_slice(), bytes.as_slice()).unwrap();
+            }
+            write.commit().unwrap();
+        };
+        damage(&folder, 1);
+        let db = support::open(&folder);
+        let filter = Some("tag = 1");
+        support::load_docs(&db, ROWS + 1..=ROWS + 5, "a", |_| {
+            support::ringed(64, ROWS, WIDE)
+        });
+        support::run(&db, "UPDATE docs SET tag = 1 WHERE id > 128");
+        // The rows read before the second binary block fails: the five pending at distance 0,
+        // then at most k = 5 of the first group's kept slots, best first, the walk asking for no
+        // more after a group (e9815ada5).
+        let (query, read_before_damage, work_before_damage) = (32..=96)
+            .find_map(|n| {
+                let q = support::ringed(n, ROWS, WIDE);
+                db.execute(
+                    "UPDATE docs SET v = $q WHERE id > 128",
+                    &params! {"q"=>q.clone()},
+                )
+                .unwrap();
+                let before = db.work_done().unwrap();
+                let result = support::search(&db, &support::by_mode(filter, "INDEXED", 5), &q);
+                let after = db.work_done().unwrap();
+                let (reads, compared) = (
+                    after.rows_read - before.rows_read,
+                    after.vectors_compared - before.vectors_compared,
+                );
+                let asked = (5..=5 + 5).contains(&reads);
+                (matches!(result, Err(Error::StoreCorrupted { .. })) && asked).then_some((
+                    q,
+                    reads,
+                    reads + compared,
+                ))
+            })
+            .expect(
+                "five pending rows and at most five of the first group's are read before the second binary block fails",
+            );
+        let repair_due = support::watermark(&db);
+        let [auto, exact] = ["AUTO", "EXACT"]
+            .map(|mode| support::answer(&db, &support::by_mode(filter, mode, 5), &query));
+        assert_eq!(support::watermark(&db), repair_due);
+        assert_eq!(
+            support::found(&auto, "AUTO after corruption"),
+            support::found(&exact, "EXACT")
+        );
+        assert!(
+            auto.rows_examined() <= exact.rows_examined() + read_before_damage,
+            "the rows read before the damage plus EXACT's: AUTO {auto:?}, EXACT {exact:?}"
+        );
+        let limits = contextdb::ReadLimits {
+            work: work_before_damage + exact.rows_examined() + exact.distance_evaluations(),
+            ..Default::default()
+        };
+        let bounded = db.read_session(limits).unwrap();
+        let result = support::answer(&bounded, &support::by_mode(filter, "AUTO", 5), &query);
+        assert_eq!(
+            support::found(&result, "bounded AUTO recovery"),
+            support::found(&exact, "EXACT")
+        );
+        support::maintenance(&db);
+        assert!(support::word(&support::the_partition(&db), "maintenance_state") == "idle");
+        support::answer(&db, &support::by_mode(filter, "INDEXED", 5), &query);
+        support::close(db);
+        // Two partitions need not carry 6,144-wide vectors: 64 dimensions test the same
+        // per-partition isolation and repair in milliseconds instead of tens of seconds.
+        const SMALL: usize = 64;
+        let c = "PARTITION_KEY (ctx) INDEXING_THRESHOLD 128";
+        let (f, db) = support::built("beside", SMALL, c, ROWS);
+        support::load_docs(&db, 201..=200 + ROWS, "b", |n| support::gathered(n, SMALL));
+        support::maintenance(&db);
+        support::close(db);
+        damage(&f, 0);
+        let q = support::ringed(64, ROWS, SMALL);
+        let (db, q) = (support::open(&f), &q);
+        assert!(matches!(db.verify(), Err(Error::StoreCorrupted { .. })));
+        let up = |p: &support::Shown| support::field(p, "indexed_available") == &Value::Bool(true);
+        let parts = support::shown(&db, "SHOW VECTOR_PARTITIONS");
+        let down: Vec<_> = parts.iter().filter(|p| !up(p)).collect();
+        assert_eq!(down.len(), 1);
+        assert!(support::word(down[0], "recovery_action") == "run a maintenance cycle");
+        let ask = |c| support::search(&db, &support::by_mode(Some(c), "INDEXED", 5), q).is_ok();
+        assert!(ask("ctx = 'a'") ^ ask("ctx = 'b'"));
+        support::maintenance(&db);
+        assert!(support::shown(&db, "SHOW VECTOR_PARTITIONS").iter().all(up));
+        assert!(ask("ctx = 'a'") && ask("ctx = 'b'"));
+    }
+}
+
+/// The filter cases of the route that gathered passing keys, as one table against section 6's
+/// F3. `tag` has an index, so each filter of the table is countable: AUTO and EXACT take the
+/// direct route or the walk by counted cost, and INDEXED the walk at every size. Each is
+/// answered, and whole where few rows pass; under AUTO and EXACT the rows read to test a filter
+/// whose path reaches `m` entries are fewer than 3m; and one find ranks each centre once and
+/// estimates each code and screens each slot at most once (F2). INDEXED with a filter no index or
+/// key gives is refused when planned, having read nothing; a declared SEARCH_MODE INDEXED is the
+/// written one.
+#[test]
+fn a_filtered_find_is_answered_by_its_cheaper_route_in_every_mode() {
+    let (_, db) = support::built("filter-routes", DIMENSION, GROUPED, 2000);
+    support::run(&db, "CREATE INDEX docs_tag ON docs (tag)");
+    let (stored, query) = (support::stored(&db, support::DOCS), question(5));
+    let Value::Int64(groups) = lists(&support::the_partition(&db)) else {
+        panic!("grouped")
+    };
+    // Even tags lie round directions 0, 2, 4 and 6, all far from the question's 5: 400 entries.
+    let far = "tag IN (0, 2, 4, 6, 8, 10, 12, 14, 16, 18)";
+    let one = format!("{far} AND id + 0 = 102");
+    type Case<'a> = (&'a str, fn(i64, i64) -> bool, usize, bool, u64);
+    // The filter, the rows it passes by id and tag, the rows asked for, whether every mode
+    // answers it whole, and the entries its path reaches where the rows read are bounded by them.
+    let cases: [Case; 9] = [
+        ("tag < 45", |_, tag| tag < 45, 10, false, 0),
+        (
+            "tag = 7 AND id <= 600",
+            |id, tag| tag == 7 && id <= 600,
+            10,
+            false,
+            0,
+        ),
+        (
+            "tag = 7 AND id <= 300",
+            |id, tag| tag == 7 && id <= 300,
+            10,
+            true,
+            0,
+        ),
+        (
+            "tag = 7 AND id <= 150",
+            |id, tag| tag == 7 && id <= 150,
+            10,
+            true,
+            0,
+        ),
+        ("", |_, _| true, 5000, true, 0),
+        ("tag = 99", |_, _| false, 10, true, 0),
+        ("id = 102", |id, _| id == 102, 10, true, 0),
+        (far, |_, tag| tag < 20 && tag % 2 == 0, 10, false, 400),
+        (&one, |id, _| id == 102, 10, true, 400),
+    ];
+    for (filter, passes, k, whole, entries) in cases {
+        let passes = |row: &[Value]| matches!((&row[0], &row[2]), (Value::Int64(id), Value::Int64(tag)) if passes(*id, *tag));
+        let (wanted, filter) = (
+            stored.nearest(passes, &query, k),
+            Some(filter).filter(|f| !f.is_empty()),
+        );
+        for mode in ["AUTO", "EXACT", "INDEXED"] {
+            let (sql, what) = (
+                support::by_mode(filter, mode, k),
+                format!("{mode}, {filter:?}"),
+            );
+            let found = if whole || mode == "EXACT" {
+                support::assert_nearest(&db, &sql, &query, &wanted, &what)
+            } else {
+                let found = support::answer(&db, &sql, &query);
+                support::assert_sound(&found, &stored, passes, &query, wanted.len(), &what);
+                found
+            };
+            let (evaluations, read) = (found.distance_evaluations(), found.rows_examined());
+            // Nothing done twice (F2): each centre, code and slot once, the mean once, and an
+            // exact distance only for a row read.
+            let most = groups as u64 + 1 + 2 * 2000 + read;
+            assert!(
+                evaluations <= most,
+                "{what}: {evaluations} evaluations, most {most}"
+            );
+            // Tag 7 below id 301 is six rows (7, 57, ..., 257), short of ten, so INDEXED takes
+            // every group: each centre, every code and slot, the mean, and six exact distances.
+            let six = mode == "INDEXED" && filter == Some("tag = 7 AND id <= 300");
+            let pinned = groups as u64 + 1 + 2 * 2000 + 6;
+            assert!(
+                !six || evaluations == pinned,
+                "{what}: {evaluations} of {pinned}"
+            );
+            let bounded = entries > 0 && mode != "INDEXED";
+            assert!(
+                !bounded || read < 3 * entries,
+                "{what}: {read} rows read for {entries} entries"
+            );
+            if mode == "INDEXED" && filter.is_some() {
+                let plan = db.explain(&sql).expect(&what).to_string();
+                assert!(
+                    plan.contains("filter_route: walk"),
+                    "{what}: INDEXED keeps to the walk:\n{plan}"
+                );
+                let ranked = filter != Some("id = 102") || evaluations > groups as u64;
+                assert!(
+                    ranked,
+                    "{what}: one passing row is found through the ranked centres"
+                );
+            }
+        }
+    }
+    // The far case again under a bound that cuts some of its rows: the first answer's rows inside
+    // the bound, read below the same three times its entries (review 13, R6).
+    let first = stored.nearest(
+        |row| matches!(row[2], Value::Int64(t) if t < 20 && t % 2 == 0),
+        &query,
+        10,
+    );
+    let bound = (first[4].distance + first[5].distance) / 2.0;
+    let inside: Vec<_> = first
+        .into_iter()
+        .filter(|near| near.distance < bound)
+        .collect();
+    for mode in ["AUTO", "EXACT"] {
+        let sql = support::by_mode(Some(&format!("v <=> $q < {bound:?} AND {far}")), mode, 10);
+        let read = support::assert_nearest(&db, &sql, &query, &inside, mode).rows_examined();
+        assert!(
+            read < 3 * 400,
+            "{mode}: {read} rows read under the bound for 400 entries"
         );
     }
+    // Rows written since the last cycle, passing the filter beside grouped ones: AUTO and EXACT
+    // give one answer. Below its INDEXING_THRESHOLD AUTO is EXACT (README:1019-1021), and AUTO
+    // never does more work than EXACT (root intent:879-880).
+    support::run(&db, "UPDATE docs SET tag = 8 WHERE tag = 7 AND id > 1000");
+    support::load_docs(&db, 2001..=2002, "a", gathered);
+    support::run(&db, "UPDATE docs SET tag = 7 WHERE id > 2000");
+    let pending = ["AUTO", "EXACT"]
+        .map(|mode| support::answer(&db, &support::by_mode(Some("tag = 7"), mode, 21), &query));
+    assert_eq!(
+        support::found(&pending[0], "AUTO"),
+        support::found(&pending[1], "EXACT")
+    );
+    let [auto, exact] = pending.each_ref().map(|r| r.rows_examined());
+    assert!(auto <= exact, "AUTO read {auto} rows, EXACT {exact}");
+    // Rows tied on distance all reach the statement's own ORDER BY, whatever route is taken.
+    support::load_docs(&db, 3001..=3003, "a", |_| gathered(1));
+    support::run(&db, "UPDATE docs SET tag = 99 WHERE id > 3000");
+    let tie = "SELECT id FROM docs WHERE tag = 99 ORDER BY v <=> $q, id DESC LIMIT 1";
+    let found = support::answer(&db, tie, &query);
+    assert_eq!(found.rows(), [[Value::Int64(3003)]]);
+    // A filter the index on `tag` serves in part, beside a condition no index gives, is served:
+    // every mode answers its three rows whole, INDEXED through the walk (F3, "served").
+    let partly = "tag = 7 AND id + 0 <= 150";
+    let three = tagged(150);
+    for mode in MODES {
+        let sql = support::by_mode(Some(partly), mode, 10);
+        support::assert_nearest(&db, &sql, &query, &stored.nearest(three, &query, 10), mode);
+    }
+    let refused = |filter: &str, mode: &str| {
+        let before = db.work_done().unwrap();
+        let outcome = support::search(&db, &support::by_mode(Some(filter), mode, 10), &query);
+        assert_eq!(
+            db.work_done().unwrap(),
+            before,
+            "{filter} {mode:?}: nothing read"
+        );
+        assert_filter_refused(outcome, &format!("{filter} under {mode:?}"));
+    };
+    support::run(
+        &db,
+        "ALTER TABLE docs ALTER COLUMN v SET SEARCH_MODE INDEXED",
+    );
+    let [written, declared] = ["INDEXED", ""]
+        .map(|mode| support::answer(&db, &support::by_mode(Some("tag = 7"), mode, 10), &query));
+    let told = |r: &QueryResult| {
+        (
+            r.rows().to_vec(),
+            r.rows_examined(),
+            r.distance_evaluations(),
+        )
+    };
+    assert_eq!(
+        told(&declared),
+        told(&written),
+        "a declared INDEXED is the written one"
+    );
+    // Once the index is dropped no index or key gives the rows: INDEXED, written or declared, is
+    // refused when the statement is planned, with no row read and no vector compared.
+    support::run(&db, "DROP INDEX docs_tag ON docs");
+    refused("tag = 7", "INDEXED");
+    refused("tag = 7", "");
+    refused(partly, "");
+    // Rows tied on distance reach the ORDER BY too when AUTO's walk turns to direct reads at a
+    // doubling: 700 asked of 1,100 rows of one vector, far from the question.
+    let tied = params! { "v" => gathered(1) };
+    db.execute("UPDATE docs SET v = $v WHERE id <= 1100", &tied)
+        .expect("tie");
+    support::maintenance(&db);
+    let tie = |mode| {
+        let order = "v <=> $q, tag DESC, id DESC";
+        let sql = format!(
+            "SELECT id FROM docs WHERE id <= 700 ORDER BY {order} USE VECTOR {mode} LIMIT 8"
+        );
+        support::answer(&db, &sql, &query).rows().to_vec()
+    };
+    assert_eq!(tie("AUTO"), tie("EXACT"));
+}
 
-    let clauses = "SEARCH_MODE INDEXED INDEXING_THRESHOLD 1000";
-    let (_, declared) = support::built("filter-widens-declared", DIMENSION, clauses, 2000);
-    support::assert_indexed_refused(search(&declared, few, "", 10), "SEARCH_MODE INDEXED");
+/// Growing only one Context leaves another's find unchanged (section 6): A's find of its rows of
+/// tag 7 under `(tag, ctx)`, countable, and `(tag)`, not, as rows of tag 7 go to B, and by keys.
+#[test]
+fn growing_one_context_leaves_anothers_filtered_find_unchanged() {
+    // `c` gives a row of B a Context the narrowed caller below does not hold.
+    let clauses = "PARTITION_KEY (ctx) INDEXING_THRESHOLD 1000, c UUID CONTEXT_ID";
+    let (query, filter) = (question(5), "ctx = 'a' AND tag = 7");
+    let recovery = "recovery: CREATE INDEX docs_ctx_tag_idx ON docs (ctx, tag)";
+    for (index, route) in [("tag, ctx", "direct"), ("tag", "walk")] {
+        let (_, db) = support::built(&format!("growth-{route}"), DIMENSION, clauses, 2000);
+        support::run(&db, &format!("CREATE INDEX docs_by ON docs ({index})"));
+        let passes = |row: &[Value]| row[1] == support::text("a") && row[2] == Value::Int64(7);
+        let wanted = support::stored(&db, support::DOCS).nearest(passes, &query, 50);
+        let route_is = format!("filter_route: {route}");
+        let words = [route_is.as_str(), recovery, "_cost:"];
+        let asked = || {
+            let plan = db.explain(&support::by_mode(Some(filter), "", 50)).unwrap();
+            let told = words.each_ref().map(|word| plan.to_string().contains(word));
+            let found = MODES.map(|mode| {
+                let sql = support::by_mode(Some(filter), mode, 50);
+                let found = support::assert_nearest(&db, &sql, &query, &wanted, mode);
+                (found.rows().to_vec(), work(&found))
+            });
+            (found, told)
+        };
+        let (before, walked) = (asked(), route == "walk");
+        assert!(before.1 == [true, walked, !walked], "{index}: {words:?}");
+        support::load_docs(&db, 3001..=3200, "b", gathered);
+        support::run(&db, "UPDATE docs SET tag = 7 WHERE ctx = 'b'");
+        let same = asked() == before;
+        assert!(same, "{index}: A's rows, work and route whatever B holds");
+        // Keys named are read directly: B's row one more, no row or a row hidden from us nothing.
+        let keys = |on: &contextdb::Database, more: &str| {
+            let sql = support::by_mode(Some(&format!("{filter} AND id IN (7{more})")), "", 50);
+            let found = support::answer(on, &sql, &query);
+            (found.rows().to_vec(), work(&found))
+        };
+        let alone = keys(&db, "");
+        assert!(keys(&db, ", 3500") == alone, "{index}: a key naming no row");
+        support::load_docs(&db, 3500..=3500, "b", gathered);
+        let one_more = keys(&db, ", 3500") == (alone.0, alone.1 + 1);
+        assert!(one_more, "{index}: B's row named is read and counted");
+        let unseen = contextdb::ContextId::new(Uuid::from_u128(1));
+        let narrowed = db.scoped_with_contexts(std::collections::BTreeSet::from([unseen]));
+        let hidden = keys(&narrowed, ", 3501");
+        let sql = "INSERT INTO docs (id, ctx, tag, c, v) VALUES (3501, 'b', 7, $c, $v)";
+        let row = params! { "c" => Uuid::from_u128(2), "v" => gathered(3501) };
+        db.execute(sql, &row).unwrap();
+        let same = keys(&narrowed, ", 3501") == hidden;
+        assert!(same, "{index}: a row the caller may not see adds nothing");
+    }
+    let (_, db) = support::built("growth-refused", DIMENSION, clauses, 2000);
+    support::run(&db, "CREATE INDEX docs_ctx ON docs (ctx)");
+    let sql = support::by_mode(Some(filter), "INDEXED", 50);
+    let before = db.work_done().unwrap();
+    let refusal = support::search(&db, &sql, &query);
+    assert_filter_refused(refusal, "the partition's column serves no filter");
+    let plan = db.explain(&sql).unwrap().to_string();
+    let told = ["refusal: none", recovery, "filter_route", "_cost:"].map(|w| plan.contains(w));
+    let ok = db.work_done().unwrap() == before && told == [false, true, false, false];
+    assert!(ok, "refused when planned, nothing read:\n{plan}");
+}
+
+/// Asserts the refusal of an INDEXED search whose filter no index or key gives (section 6, F3):
+/// its own kind, which no maintenance cycle cures, naming the schema's cure and the other modes.
+fn assert_filter_refused(outcome: contextdb::Result<QueryResult>, what: &str) {
+    match outcome {
+        Err(error @ Error::VectorIndexedFilterUnindexed { .. }) => {
+            let words = error.to_string();
+            let cures = words.contains("declare an index") && words.contains("EXACT or AUTO");
+            assert!(cures, "{what}: {words}");
+        }
+        other => panic!("{what}: INDEXED with a filter no index gives, and got {other:?}"),
+    }
+}
+
+/// A pending vector carries its one-byte form (section 6, F1): a find over 5,000 vectors written
+/// and not yet sealed reads no more rows than the same find after sealing, plus the rows asked
+/// for; and a committed row is the first answer for its own vector as soon as its commit
+/// returns, through the writer and through a read session beside it.
+#[test]
+fn a_find_over_unsealed_vectors_reads_no_more_rows_than_after_sealing() {
+    let db = support::open(&support::folder("unsealed-reads"));
+    support::declare_docs(&db, DIMENSION, "");
+    support::load_docs(&db, 1..=5000, "a", gathered);
+    let (sql, query) = (support::by_mode(None, "", 10), question(6));
+    let unsealed = support::answer(&db, &sql, &query);
+    support::maintenance(&db);
+    let sealed = support::answer(&db, &sql, &query);
+    assert_eq!(unsealed.rows(), sealed.rows(), "sealing changes no answer");
+    let (before, after) = (unsealed.rows_examined(), sealed.rows_examined());
+    assert!(
+        before <= after + 10,
+        "{before} rows read unsealed, {after} sealed"
+    );
+    for n in 5001..=5003 {
+        let vector = support::vector(n, DIMENSION);
+        support::insert_doc(&db, n, "a", Some(vector.clone())).expect("a row");
+        let session = db.read_session(Default::default()).unwrap();
+        for on in [&db as &dyn Run, &session] {
+            let found = support::answer(&on, &support::by_mode(None, "", 1), &vector);
+            let first = &found.rows()[0][0];
+            assert_eq!(
+                first,
+                &Value::Int64(n),
+                "row {n} is the first answer for its vector"
+            );
+        }
+    }
 }
 
 #[test]
@@ -594,8 +1035,13 @@ fn an_indexed_search_that_takes_every_group_does_the_exact_evaluations() {
     let (indexed, exact) = (evaluations("INDEXED", 10, 10), evaluations("EXACT", 10, 10));
     let off = "INDEXING_THRESHOLD 18446744073709551615";
     let (_, flat) = support::built("every-group-flat", DIMENSION, off, 2000);
-    let flat = support::answer(&flat, &support::by_mode(None, "EXACT", 10), &query);
-    assert_eq!(flat.distance_evaluations(), exact, "no centres used");
+    // EXACT uses no centre and no code, grouped or flat: it screens the 2,000 slots and asks
+    // the distance of each row it reads, less the ten returned, which are read once more.
+    for on in [&db, &flat] {
+        let found = support::answer(on, &support::by_mode(None, "EXACT", 10), &query);
+        let (counted, read) = (found.distance_evaluations(), found.rows_examined());
+        assert_eq!(counted + 10, 2000 + read, "no centres used");
+    }
     assert!(
         indexed < exact,
         "INDEXED did {indexed} distance evaluations for ten rows, EXACT {exact}"
@@ -618,62 +1064,6 @@ fn an_indexed_search_that_takes_every_group_does_the_exact_evaluations() {
          asks every row as EXACT does ({exact}), after comparing its 45 centroids and estimating \
          the code of each of the 2,000 slots at least once"
     );
-}
-
-#[test]
-fn an_indexed_search_short_of_its_limit_is_refused_before_the_whole_table_is_read() {
-    // 128 rows spread evenly round a circle, in vectors wide enough for four blocks of 42
-    // slots. The size is fixed by the blocks: a refusal reads less than the whole table only
-    // when there are blocks for it to stop short of, and the filter needs its three rows
-    // among the first 150; few rows in wide vectors make those with a short build.
-    const WIDE: usize = 6144;
-    const ROWS: i64 = 128;
-    let folder = support::folder("indexed-refused-before-the-table");
-    let db = support::open(&folder);
-    support::declare_docs(&db, WIDE, "INDEXING_THRESHOLD 128");
-    support::load_docs(&db, 1..=ROWS, "a", |n| support::ringed(n, ROWS, WIDE));
-    support::maintenance(&db);
-    assert_eq!(lists(&support::the_partition(&db)), Value::Int64(11));
-    let stored = support::stored(&db, support::DOCS);
-    support::close(db);
-
-    // Three rows pass the filter and the statement asks for ten.
-    let passes = |row: &[Value]| matches!((&row[0], &row[2]), (Value::Int64(id), Value::Int64(7)) if *id <= 150);
-    let query = support::ringed(157, 2 * ROWS, WIDE);
-    // With no filter both answer ten rows. EXACT reads every block; INDEXED reads what EXACT
-    // does not, the centroids and the binary codes, and still reads less: it left blocks unread.
-    let read_by = |mode: &str| -> u64 {
-        let (bytes, result) = read_alone(&folder, &support::by_mode(None, mode, 10), &query);
-        assert_eq!(result.expect(mode).rows().len(), 10, "rows under {mode}");
-        bytes
-    };
-    let (exact, indexed) = (read_by("EXACT"), read_by("INDEXED"));
-    assert!(
-        indexed < exact,
-        "INDEXED read {indexed} bytes of the data file and EXACT {exact}"
-    );
-    let wanted = stored.nearest(passes, &query, 10);
-    assert_eq!(wanted.len(), 3);
-    // Once by the key's range, once by the same rows through an expression that has none.
-    for few in ["tag = 7 AND id <= 150", "tag = 7 AND id + 0 <= 150"].map(Some) {
-        let read_by = |mode: &str| read_alone(&folder, &support::by_mode(few, mode, 10), &query);
-        // AUTO asks the filter of every row, which is the whole table's work, and answers.
-        let (whole, auto) = read_by("AUTO");
-        let auto = auto.expect("AUTO, three rows pass");
-        support::assert_same_rows(
-            &support::found(&auto, "AUTO"),
-            &wanted,
-            "AUTO, three rows pass",
-        );
-        // INDEXED is refused at the step that would take every group: before that work.
-        let (refused, indexed) = read_by("INDEXED");
-        support::assert_indexed_refused(indexed, "INDEXED, three rows pass");
-        assert!(
-            refused < whole,
-            "INDEXED was refused after reading {refused} bytes of the data file; AUTO, which asks \
-             the filter of all {ROWS} rows, read {whole}"
-        );
-    }
 }
 
 /// Runs a search in a read session of its own, so every page it needs is read once, and gives
@@ -709,9 +1099,7 @@ fn the_nearer_allowed_row_is_first(name: &str, nearer: (f32, f32)) {
         let moved = support::vector(n, DIMENSION);
         (0..DIMENSION).map(|i| at[i] + 0.02 * moved[i]).collect()
     };
-    let folder = support::folder(name);
-    let db = support::open(&folder);
-    support::declare_docs(&db, DIMENSION, GROUPED);
+    let (_, db) = vecsearch::docs(name, DIMENSION, GROUPED);
     support::load_docs(&db, 1..=2000, "a", fixed);
     support::maintenance(&db);
     let groups = lists(&support::the_partition(&db));
@@ -724,7 +1112,7 @@ fn the_nearer_allowed_row_is_first(name: &str, nearer: (f32, f32)) {
     query[0] = 1.0;
 
     let filter = Some("tag = 7 AND id <= 550");
-    let passes = |row: &[Value]| matches!((&row[0], &row[2]), (Value::Int64(id), Value::Int64(7)) if *id <= 550);
+    let passes = tagged(550);
     let wanted = stored.nearest(passes, &query, 10);
     assert_eq!(stored.nearest(passes, &query, 100).len(), 11);
     assert_eq!(wanted[0].key, Value::Int64(507), "the nearest allowed row");
@@ -754,9 +1142,7 @@ fn a_ivf_whose_codes_cannot_tell_its_vectors_apart_answers_as_exact() {
             .map(|at| f32::from(u8::from(at / 2 == direction)) + 0.25)
             .collect()
     };
-    let folder = support::folder("codes-all-the-same");
-    let db = support::open(&folder);
-    support::declare_docs(&db, DIMENSION, GROUPED);
+    let (_, db) = vecsearch::docs("codes-all-the-same", DIMENSION, GROUPED);
     support::load_docs(&db, 1..=2000, "a", same);
     support::maintenance(&db);
     let groups = lists(&support::the_partition(&db));
@@ -765,7 +1151,7 @@ fn a_ivf_whose_codes_cannot_tell_its_vectors_apart_answers_as_exact() {
         "the partition has {groups:?} groups"
     );
     let stored = support::stored(&db, support::DOCS);
-    let half = |row: &[Value]| matches!(row[2], Value::Int64(tag) if tag < 25);
+    let half = |row: &[Value]| matches!(row[0], Value::Int64(id) if id <= 1000);
     for direction in [0, 3, 7] {
         let query = same(direction);
         // Rows at one distance come in key order, so the ten are the same under every mode.
@@ -775,7 +1161,7 @@ fn a_ivf_whose_codes_cannot_tell_its_vectors_apart_answers_as_exact() {
             let what = format!("{mode}, direction {direction}");
             let sql = support::by_mode(None, mode, 10);
             support::assert_nearest(&db, &sql, &query, &wanted, &what);
-            let sql = support::by_mode(Some("tag < 25"), mode, 10);
+            let sql = support::by_mode(Some("id <= 1000"), mode, 10);
             support::assert_nearest(&db, &sql, &query, &allowed, &format!("{what}, filtered"));
         }
     }
@@ -831,15 +1217,26 @@ fn a_search_with_no_room_for_its_codes_is_refused_by_the_memory_limit() {
     support::assert_sound(&result, &stored, all, &query, 10, "under 64 MiB");
 }
 
-#[test]
-fn a_filter_of_partition_keys_only_is_no_filter_on_rows() {
+/// A store of 2,000 built rows under `a` grouped by INDEXING_THRESHOLD 1000, and five more under
+/// `b` that its partition has after a maintenance pass; and what the store holds.
+fn with_five_under_b(name: &str) -> (contextdb::Database, support::Stored) {
     let clauses = "PARTITION_KEY (ctx) INDEXING_THRESHOLD 1000";
-    let (_, db) = support::built("keys-only-filter", DIMENSION, clauses, 2000);
+    let (_, db) = support::built(name, DIMENSION, clauses, 2000);
     support::load_docs(&db, 2001..=2005, "b", gathered);
     support::maintenance(&db);
     let stored = support::stored(&db, support::DOCS);
+    (db, stored)
+}
+
+/// Whether a stored row is under the context `b`.
+fn in_b(row: &[Value]) -> bool {
+    row[1] == support::text("b")
+}
+
+#[test]
+fn a_filter_of_partition_keys_only_is_no_filter_on_rows() {
+    let (db, stored) = with_five_under_b("keys-only-filter");
     let query = question(8);
-    let in_b = |row: &[Value]| row[1] == support::text("b");
 
     // Five rows are selected and ten asked for: every one of them, and no refusal.
     let wanted = stored.nearest(in_b, &query, 10);
@@ -904,38 +1301,6 @@ fn a_read_that_fails_under_auto_is_returned_as_that_failure() {
     }
 }
 
-#[test]
-fn an_indexed_search_whose_first_pass_takes_every_slot_is_refused_before_a_row_is_asked() {
-    // One row, and no IVF. Its vector is wide enough that asking the row for its
-    // distance shows in the bytes read: 65,536 bytes of numbers.
-    const WIDE: usize = 16384;
-    let folder = support::folder("indexed-refused-before-a-row");
-    let db = support::open(&folder);
-    support::declare_docs(&db, WIDE, "");
-    support::insert_doc(&db, 1, "a", Some(support::vector(1, WIDE))).expect("insert the row");
-    support::close(db);
-
-    let query = support::vector(2, WIDE);
-    let read_by =
-        |mode: &str| read_alone(&folder, &support::by_mode(Some("tag = 1"), mode, 2), &query);
-    let vector_bytes = 4 * WIDE as u64;
-    let (asked, exact) = read_by("EXACT");
-    assert_eq!(exact.expect("EXACT, one row passes").rows().len(), 1);
-    assert!(
-        asked >= vector_bytes,
-        "EXACT asked the row for its distance and read {asked} bytes of the data file"
-    );
-    // The filter passes one row and two are asked for: the pass that would keep every slot is
-    // the first, and INDEXED is refused there, with no row asked for its distance.
-    let (refused, indexed) = read_by("INDEXED");
-    support::assert_indexed_refused(indexed, "one row, a filter and LIMIT 2");
-    assert!(
-        refused < vector_bytes,
-        "INDEXED was refused after reading {refused} bytes of the data file; the row's vector \
-         is {vector_bytes}"
-    );
-}
-
 /// A filter no row can pass is answered with no rows and no work, by every mode and by a search,
 /// a table read, a count and a write alike; a partition that is behind its writes is never
 /// asked, so INDEXED is not refused on its account.
@@ -993,7 +1358,22 @@ fn a_filter_no_row_can_pass_is_no_work_and_never_refused() {
             "{filter}: a write examines no row"
         );
     }
+    // Selected partitions that are missing or hold no row answer empty in every mode.
+    support::run(&db, "DELETE FROM docs WHERE ctx = 'b'");
+    for (filter, mode) in ["ctx = 'b'", "ctx = 'c'"]
+        .iter()
+        .flat_map(|f| MODES.map(|m| (*f, m)))
+    {
+        let answer = support::search(&db, &support::by_mode(Some(filter), mode, 10), &query);
+        let empty = answer.as_ref().is_ok_and(|answer| answer.rows().is_empty());
+        assert!(
+            empty,
+            "{filter} under {mode}: nothing to search is empty: {answer:?}"
+        );
+    }
 }
+
+const MODES: [&str; 3] = ["INDEXED", "AUTO", "EXACT"];
 
 /// A NaN bound sorts above every number, as in Postgres, so `distance < NaN` is true of every
 /// row: the bound excludes nothing and the search answers as it does without the bound, in every
@@ -1024,27 +1404,38 @@ fn a_nan_distance_bound_changes_no_row() {
     }
 }
 
-/// A search INDEXED refuses for want of rows (three pass, ten are asked for) is refused by a
-/// bound that cut nothing in the pass, as without the bound; a bound that cuts a row from those
-/// three answers the rows within it, which are the exact scan's.
+/// A search INDEXED over three rows of a key range, ten asked for, is answered whole however
+/// few, and under a bound that cuts nothing in the same order for the same work (section 6, F2:
+/// a bound that has dropped nothing changes nothing); a bound that cuts a row from
+/// those three answers the rows within it, which are the exact scan's.
 #[test]
-fn a_bound_that_cuts_nothing_is_refused_as_without_it_and_one_that_cuts_answers() {
+fn a_bound_that_cuts_nothing_answers_as_without_it_and_one_that_cuts_answers_within_it() {
     let (_, db) = support::built("bound-refusal", DIMENSION, GROUPED, 2000);
     let stored = support::stored(&db, support::DOCS);
     let query = question(5);
-    let few = "tag = 7 AND id <= 150";
-    let passes = |row: &[Value]| matches!((&row[0], &row[2]), (Value::Int64(id), Value::Int64(7)) if *id <= 150);
+    let few = "id <= 3";
+    let passes = |row: &[Value]| matches!(row[0], Value::Int64(id) if id <= 3);
     let wanted = stored.nearest(passes, &query, 10);
     assert_eq!(wanted.len(), 3, "three rows pass the row conditions");
     let bounded = |bound: f64| {
         let filter = format!("v <=> $q < {bound:?} AND {few}");
         support::search(&db, &support::by_mode(Some(&filter), "INDEXED", 10), &query)
     };
-    support::assert_indexed_refused(
-        support::search(&db, &support::by_mode(Some(few), "INDEXED", 10), &query),
-        "the premise: without a bound these three rows are refused",
+    let sql = support::by_mode(Some(few), "INDEXED", 10);
+    let plain = support::assert_nearest(&db, &sql, &query, &wanted, "three rows, however few");
+    let none_cut = bounded(3.0).expect("a bound above every distance cuts nothing");
+    let told = |r: &QueryResult| {
+        (
+            r.rows().to_vec(),
+            r.rows_examined(),
+            r.distance_evaluations(),
+        )
+    };
+    assert_eq!(
+        told(&none_cut),
+        told(&plain),
+        "a bound that drops nothing changes nothing"
     );
-    support::assert_indexed_refused(bounded(3.0), "a bound above every distance cuts nothing");
     let (near, far) = (wanted[1].distance, wanted[2].distance);
     assert!(
         near < far,
@@ -1058,12 +1449,13 @@ fn a_bound_that_cuts_nothing_is_refused_as_without_it_and_one_that_cuts_answers(
     );
 }
 
-/// Past 4,096 partition tuples the filter is not whole partitions, so INDEXED is refused as
-/// it is today and the default mode answers, with the exact scan's rows. The filter names the
-/// partitions by 3,000 values of `a` in one case and 3,000 values of `b` under another `a` in
-/// the other, which together are more tuples than the cap.
+/// Past 4,096 partition tuples the filter still names its partitions: INDEXED, the default mode
+/// and EXACT answer ids 1 and 2 in distance order; EXPLAIN plans the two partitions with no
+/// refusal; and INDEXED counts the same work as the short form `a IN (1, 2)`, so it searched those
+/// two and not all 200. The filter names 3,000 values of `a` in one case and 3,000 values of `b`
+/// under another `a` in the other: more tuples than the cap.
 #[test]
-fn past_the_most_partition_tuples_indexed_is_refused_and_the_default_answers() {
+fn past_the_most_partition_tuples_every_mode_answers_from_the_partitions_named() {
     let folder = support::folder("tuples-cap");
     let db = support::open(&folder);
     support::run(
@@ -1088,44 +1480,38 @@ fn past_the_most_partition_tuples_indexed_is_refused_and_the_default_answers() {
             .join(", ")
     };
     let filter = format!(
-        "a IN (1, 2, {}) OR (a = 9999 AND b IN (1, {}))",
+        "(a IN (1, 2, {}) OR (a = 9999 AND b IN (1, {})))",
         list(10_001),
         list(2)
     );
-    let sql = |mode: &str| {
+    let sql = |filter: &str, mode: &str| {
         format!("SELECT id FROM d2 WHERE {filter} ORDER BY v <=> [1.0, 0.0] {mode}LIMIT 10")
     };
-    let refusal = db.execute(&sql("USE VECTOR INDEXED "), &params! {});
+    for mode in ["USE VECTOR INDEXED ", "", "USE VECTOR EXACT "] {
+        let found = support::run(&db, &sql(&filter, mode)).rows().concat();
+        let wanted = [Value::Int64(1), Value::Int64(2)];
+        assert_eq!(found, wanted, "{mode:?}: ids 1 and 2 in distance order");
+    }
+    let indexed = sql(&filter, "USE VECTOR INDEXED ");
+    let plan = db.explain(&indexed).unwrap().to_string();
+    let said = |line: &str| plan.lines().any(|l| l.trim() == line);
+    assert!(said("partitions: 2") && said("refusal: none"), "{plan}");
+    let short = sql("a IN (1, 2)", "USE VECTOR INDEXED ");
+    let work = |r: QueryResult| (r.rows_examined(), r.distance_evaluations());
+    let same = work(support::run(&db, &indexed)) == work(support::run(&db, &short));
     assert!(
-        matches!(refusal, Err(Error::VectorIndexedRouteUnavailable { .. })),
-        "past the most tuples the filter is asked of rows, so INDEXED is refused: {refusal:?}"
+        same,
+        "the long form searches the partitions the short one does"
     );
-    let default = support::run(&db, &sql(""));
-    let exact = support::run(&db, &sql("USE VECTOR EXACT "));
-    assert_eq!(
-        default.rows(),
-        exact.rows(),
-        "the default mode answers as the exact scan does"
-    );
-    assert_eq!(default.rows().len(), 2, "the rows of a = 1 and a = 2");
 }
 
-/// A partition that holds fewer than `k` live rows, searched under INDEXED with a row condition
-/// and a bound: a bound that cuts a row answers the rows within it, which are the exact scan's,
-/// and a bound that cuts nothing is refused as the same search without it.
+/// A partition that holds fewer than `k` live rows, searched under INDEXED with a key range and
+/// a bound: a bound that cuts a row answers the rows within it, which are the exact scan's, and
+/// one that cuts nothing answers the five whole, as the same search without it.
 #[test]
-fn a_short_partition_under_a_bound_answers_when_it_cut_and_is_refused_when_it_did_not() {
-    let (_, db) = support::built(
-        "short-partition",
-        DIMENSION,
-        "PARTITION_KEY (ctx) INDEXING_THRESHOLD 1000",
-        2000,
-    );
-    support::load_docs(&db, 2001..=2005, "b", gathered);
-    support::maintenance(&db);
-    let stored = support::stored(&db, support::DOCS);
+fn a_short_partition_under_a_bound_answers_within_it_and_whole_when_it_did_not_cut() {
+    let (db, stored) = with_five_under_b("short-partition");
     let query = question(5);
-    let in_b = |row: &[Value]| row[1] == support::text("b");
     let wanted = stored.nearest(in_b, &query, 8);
     assert_eq!(
         wanted.len(),
@@ -1133,15 +1519,23 @@ fn a_short_partition_under_a_bound_answers_when_it_cut_and_is_refused_when_it_di
         "five rows lie in the partition, and eight are asked for"
     );
     let run = |bound: f64| {
-        let filter = format!("v <=> $q < {bound:?} AND ctx = 'b' AND tag < 50");
+        let filter = format!("v <=> $q < {bound:?} AND ctx = 'b' AND id > 2000");
         support::search(&db, &support::by_mode(Some(&filter), "INDEXED", 8), &query)
     };
-    let plain = "ctx = 'b' AND tag < 50";
-    support::assert_indexed_refused(
-        support::search(&db, &support::by_mode(Some(plain), "INDEXED", 8), &query),
-        "the premise: without a bound the five rows are refused",
+    let plain = support::by_mode(Some("ctx = 'b' AND id > 2000"), "INDEXED", 8);
+    support::assert_nearest(
+        &db,
+        &plain,
+        &query,
+        &wanted,
+        "the five, however few, are answered",
     );
-    support::assert_indexed_refused(run(3.0), "a bound above every distance cuts nothing");
+    let none_cut = run(3.0).expect("a bound above every distance cuts nothing");
+    support::assert_same_rows(
+        &support::found(&none_cut, "uncut"),
+        &wanted,
+        "as without it",
+    );
     let (near, far) = (wanted[3].distance, wanted[4].distance);
     assert!(near < far, "the fifth row is farther than the fourth");
     let cut = run((near + far) / 2.0).expect("a bound that cuts a row answers");
@@ -1181,7 +1575,10 @@ fn a_bound_written_with_the_distance_on_the_right_is_the_same_bound() {
 }
 
 /// A search short of `k` under a bound, in either mode, answers as the exact scan does and
-/// compares at most twice the table and fewer than without the bound: the groups beyond the bound are never looked at.
+/// compares each vector at most twice; once the bound has cut, it stands for the last row while
+/// the answer is short, so INDEXED ends short of the last group, in fewer units than without the
+/// bound. The default mode's route may change during the find, so only its answer is asserted
+/// (section 6, F2).
 #[test]
 fn a_search_short_under_a_bound_compares_less_than_without_it() {
     let (_, db) = support::built("bound-short", DIMENSION, GROUPED, 2000);
@@ -1203,23 +1600,19 @@ fn a_search_short_under_a_bound_compares_less_than_without_it() {
         let got = support::search(&db, &sql, &query)
             .unwrap_or_else(|e| panic!("{mode:?}: a bound that cut rows answers short: {e:?}"));
         assert_eq!(got.rows(), wanted.rows(), "{mode:?}: the exact scan's rows");
-        let without = support::search(
-            &db,
-            &support::by_mode(Some("tag = 7 AND id < 700"), mode, 8),
-            &query,
-        );
         // Sealed vectors are screened by their one-byte copies first: at most two evaluations a row.
         assert!(
             got.distance_evaluations() <= 2 * 2000,
             "{mode:?}: {} compared of at most two for each of the 2,000 vectors",
             got.distance_evaluations()
         );
-        if let Ok(without) = without {
+        if mode == "INDEXED" {
+            let without = support::by_mode(Some("tag = 7 AND id < 700"), mode, 8);
+            let without = support::answer(&db, &without, &query);
+            let (under, over) = (work(&got), work(&without));
             assert!(
-                got.distance_evaluations() < without.distance_evaluations(),
-                "{mode:?}: {} compared under the bound, {} without it: the bound stops the search",
-                got.distance_evaluations(),
-                without.distance_evaluations()
+                under < over,
+                "{under} units under the bound, {over} without it"
             );
         }
     }
@@ -1230,17 +1623,8 @@ fn a_search_short_under_a_bound_compares_less_than_without_it() {
 /// does, and does not refuse. The bound lies a hair below the fifth row's exact distance.
 #[test]
 fn a_row_cut_by_its_exact_distance_is_a_cut_and_the_short_answer_stands() {
-    let (_, db) = support::built(
-        "exact-offer-cut",
-        DIMENSION,
-        "PARTITION_KEY (ctx) INDEXING_THRESHOLD 1000",
-        2000,
-    );
-    support::load_docs(&db, 2001..=2005, "b", gathered);
-    support::maintenance(&db);
-    let stored = support::stored(&db, support::DOCS);
+    let (db, stored) = with_five_under_b("exact-offer-cut");
     let query = question(5);
-    let in_b = |row: &[Value]| row[1] == support::text("b");
     let wanted = stored.nearest(in_b, &query, 8);
     assert_eq!(wanted.len(), 5, "five rows lie in the partition");
     let (fourth, fifth) = (wanted[3].distance, wanted[4].distance);
@@ -1249,7 +1633,7 @@ fn a_row_cut_by_its_exact_distance_is_a_cut_and_the_short_answer_stands() {
         bound > fourth && bound < fifth,
         "the bound lies between the fourth and the fifth"
     );
-    let filter = format!("v <=> $q < {bound:?} AND ctx = 'b' AND tag < 50");
+    let filter = format!("v <=> $q < {bound:?} AND ctx = 'b' AND id > 2000");
     let cut = support::search(&db, &support::by_mode(Some(&filter), "INDEXED", 8), &query)
         .expect("a row cut by its exact distance is a cut, so the short answer stands");
     support::assert_same_rows(

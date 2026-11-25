@@ -57,6 +57,14 @@ IndexScan { index: e_ab }
   predicates_pushed: [a, b]
   indexes_considered: [__pk_id: first column not in WHERE, e_a: fewer predicate columns matched than chosen index, e_s: first column not in WHERE]
 
+# A range on an index's first column is read through it, and an index it ties with says so.
+EXPLAIN SELECT id FROM e WHERE a > 1;
+----
+QUERY PLAN  (read 0, compared 0)
+IndexScan { index: e_ab }
+  predicates_pushed: [a]
+  indexes_considered: [__pk_id: first column not in WHERE, e_a: tied with chosen index; lost by creation order, e_s: first column not in WHERE]
+
 # An index supplying order cannot push a predicate that only one OR arm requires.
 # Index rejection wording may vary; the route and returned rows must stay correct.
 INSERT INTO e (id, a, b) VALUES (1, 1, 0), (2, 0, 2), (3, 9, 0);
@@ -216,3 +224,12 @@ error: PlanError
 EXPLAIN INSERT INTO t (id, name, tag) VALUES (9, 'n', 1) ON CONFLICT (tag) DO UPDATE SET name = 'x';
 ----
 error: PlanError
+
+# A COUNT(*) whose filter is not a declared prefix of MAINTAIN COUNT is counted by reading.
+CREATE TABLE m (id INTEGER PRIMARY KEY, ctx INTEGER NOT NULL, conn TEXT NOT NULL, UNIQUE (ctx, id)) MAINTAIN COUNT (ctx);
+EXPLAIN SELECT COUNT(*) FROM m WHERE conn = 'a';
+----
+QUERY PLAN  (read 0, compared 0)
+maintained count: not declared — ALTER TABLE m SET MAINTAIN COUNT (ctx), (conn) makes this O(1)
+Scan
+  indexes_considered: [__pk_id: first column not in WHERE, __unique_ctx_id: first column not in WHERE]

@@ -3,8 +3,8 @@
 
 use std::cell::{OnceCell, RefCell};
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap};
-use std::ops::Bound::{self, Unbounded};
+use std::collections::HashMap;
+use std::ops::Bound;
 use std::slice;
 
 use super::expression::{EvalContext, Scope, eval, sort_order};
@@ -17,7 +17,7 @@ use crate::sql::Expr;
 use crate::sql::ast::{BinOp, ColumnRef, SortDirection as Asked};
 use crate::sql::plan::SortKey;
 use crate::store::{Cell, Entry, Key, Keys, Read, Row, Span, cells_end, span};
-use crate::types::{ColumnType, Result, SortDirection, Value, timestamp_millis};
+use crate::types::{ColumnType, Error, Result, SortDirection, Value, timestamp_millis};
 
 /// The keys or entries between two bounds.
 type Range = (Bound<Key>, Bound<Key>);
@@ -26,6 +26,7 @@ pub(super) type Place = (Key, Reservation);
 const UNREAD: &str = "first column not in WHERE";
 
 /// Where the rows of one table are reached.
+#[derive(Clone)]
 pub(super) enum Reach {
     /// The rows with these primary keys, in key order.
     Keys(Vec<Key>),
@@ -37,10 +38,11 @@ pub(super) enum Reach {
 }
 
 /// How the rows of one table are reached for one statement.
+#[derive(Clone)]
 pub(super) struct Path {
     pub(super) reach: Reach,
     /// True when the statement names one row whole, by its key or by every column of a UNIQUE
-    /// rule: a reader that row is hidden from is refused by the rule that hid it.
+    /// rule: a row hidden from the reader that the whole filter passes is refused by its rule.
     pub(super) one: bool,
     /// True when the rows arrive in the order asked for, so that they need no sort.
     pub(super) in_order: bool,
@@ -69,11 +71,12 @@ impl Path {
 }
 
 /// A key or index tried for a path, with how many of its leading columns were given a value and
-/// whether the next was given a range, and how many keys of the requested order it supplies.
-type Tried = (Ordered, usize, bool, usize);
+/// whether the next was given a range, how many keys of the requested order it supplies, and
+/// its rank: 2 when it names at most one row, 1 for the table's whole key by a list, else 0.
+type Tried = (Ordered, usize, bool, usize, u8);
 
 /// True when the path reads by what was tried: some of its columns given, or its order used.
-fn walked((_, pinned, ranged, tied): &Tried) -> bool {
+fn walked((_, pinned, ranged, tied, _): &Tried) -> bool {
     *pinned > 0 || *ranged || *tied > 0
 }
 
@@ -366,12 +369,13 @@ impl<'a> Source<'a> {
     /// Picks the path that reads the fewest rows for the filter, and says whether its rows
     /// arrive in the order asked for, so that they need no sort.
     ///
-    /// The table and each index are tried in turn. One is better the more of its leading
-    /// columns the filter gives a value for (`=`, `IS NULL`, and one `IN` list), then if the
-    /// filter gives a range of its next column, then if it keeps the order asked for; the table
-    /// itself wins a tie. The filter is still applied to every row read, so a path only has to
-    /// reach every row that can pass. An index over a column of `assigned` is not tried: the
-    /// statement moves its entries.
+    /// The table and each index are tried in turn. The first that names at most one row wins;
+    /// then the table's whole key; then one is better the more of its leading columns the
+    /// filter gives a value for (`=`, `IS NULL`, and one `IN` list), then if the filter gives a
+    /// range of its next column, then if it keeps the order asked for; the table itself wins a
+    /// tie, then the index declared first. The filter is still applied to every row read, so a
+    /// path only has to reach every row that can pass. An index over a column of `assigned` is
+    /// not tried: the statement moves its entries.
     ///
     /// Rows are kept under their primary key, so the key is answered from the table itself. Its
     /// own index, `__pk_<column>`, is declared and has no entries, and is never walked.
@@ -389,7 +393,7 @@ impl<'a> Source<'a> {
         order: &[SortKey],
         assigned: &[usize],
     ) -> Result<Path> {
-        let (path, tried) = self.scored(given, order, assigned)?;
+        let (path, tried, ..) = self.scored(self.facts()?, None, given, order, assigned)?;
         // The statement's record names an index EXPLAIN lists as considered whose first column a
         // kept part reads, with that part's reason, else one that gives the order not given.
         if let Some((_, Some(work))) = self.examined {
@@ -452,15 +456,54 @@ impl<'a> Source<'a> {
         Ok(self.reading.get_or_init(|| reading))
     }
 
-    /// The path [`Source::given`] picks, and each key or index tried: first the one the path
-    /// reads, when one did better than the whole table.
+    /// Whether the filter `filter`, the statement's own with a partition's tuple met last, is
+    /// served for the partition whose key columns are at `key`, and its countable path: the
+    /// best path tried whose every range holds each key column to one value by a whole key and
+    /// serves every case. Its checks are the statement's own parts.
+    pub(super) fn partition(&self, filter: &Expr, key: &[usize]) -> Result<(bool, Option<Path>)> {
+        let columns = Columns {
+            scope: &self.scope,
+            table: Some(self.table),
+        };
+        let reading = filter::read(Some(filter), &columns, self.ctx)?;
+        let (_, _, served, countable) = self.scored(&reading, Some(key), &[], &[], &[])?;
+        let parts = self.facts()?.parts.len();
+        // The find decides a row the statement names once, by its whole WHERE: a partition's
+        // path leaves a hidden row out.
+        let own = |mut path: Path| {
+            path.one = false;
+            path.checks
+                .iter_mut()
+                .for_each(|checks| checks.retain(|at| *at < parts));
+            path
+        };
+        Ok((served, countable.map(own)))
+    }
+
+    /// The path [`Source::given`] picks for `reading`, and each key or index tried: first the
+    /// one the path reads, when one did better than the whole table; with, for a partition's
+    /// `key`, whether every case that needs a test on rows has a path that holds or ranges one of
+    /// its columns outside `key`, and the best countable path tried (see [`Source::partition`]).
     fn scored(
         &self,
+        reading: &Reading<'_>,
+        key: Option<&[usize]>,
         given: &[(usize, Option<&Value>)],
         order: &[SortKey],
         assigned: &[usize],
-    ) -> Result<(Path, Vec<Tried>)> {
-        let (reading, columns) = (self.facts()?, &self.table.meta.columns);
+    ) -> Result<(Path, Vec<Tried>, bool, Option<Path>)> {
+        let (columns, partition) = (&self.table.meta.columns, key.is_some());
+        let key = key.unwrap_or_default();
+        let opaque = reading.parts.iter().any(|part| part.kept.is_some());
+        let needs = |case: &Case| opaque || case.iter().any(|(at, _)| !key.contains(at));
+        let own = |case: &Case, applied: &[usize]| {
+            !needs(case)
+                || case
+                    .iter()
+                    .any(|(at, _)| !key.contains(at) && applied.contains(at))
+        };
+        let mut served: Vec<bool> = reading.cases.iter().map(|case| !needs(case)).collect();
+        let mut countable = None;
         // A joined row's values stand in for what the filter says of their columns.
         let given: Vec<(usize, Fact)> = (given.iter())
             .filter_map(|&(column, value)| {
@@ -535,7 +578,7 @@ impl<'a> Source<'a> {
 
         // Until something better is found: the whole table, in no order that was asked for.
         let mut best = (
-            (false, 0, false, 0),
+            (0, 0, false, 0),
             Path {
                 reach: Reach::Rows(vec![(Bound::Unbounded, Bound::Unbounded)]),
                 one: false,
@@ -557,7 +600,7 @@ impl<'a> Source<'a> {
         let the_table = Some(the_table).filter(|_| !self.table.key.is_empty());
         for ordered in the_table.into_iter().chain(indexes) {
             let width = ordered.columns.len();
-            let (mut ranges, mut cut, mut one) = (Vec::new(), false, true);
+            let (mut ranges, mut cut, mut one, mut sole) = (Vec::new(), false, true, true);
             // For each case: the leading columns it pins, how many of them one value each,
             // whether it gives a range of the next, and the columns whose facts are applied whole.
             let mut each = Vec::new();
@@ -580,6 +623,7 @@ impl<'a> Source<'a> {
                         .collect();
                     single += usize::from(values.len() == 1);
                     one &= *named;
+                    sole &= *named || given.iter().any(|(at, _)| at == column);
                 }
                 let pins = tuples[0].len();
                 let next = ordered
@@ -602,9 +646,14 @@ impl<'a> Source<'a> {
             let pinned = each.iter().map(|case| case.0).min().unwrap_or(width);
             let ranged = each.iter().all(|case| case.0 > pinned || case.2);
             let whole_key = ordered.index.is_none() && pinned == width;
-            // Every case names the same row by `=`.
-            let same = ranges.iter().all(|(key, _)| *key == ranges[0].0);
+            // Every case names the same row by `=`: the same values as written, not one entry.
+            let same = reading.cases.iter().skip(1).all(|case| {
+                let (first, mut columns) = (&reading.cases[0], ordered.columns.iter());
+                columns.all(|(at, _)| fixed(&given, case, *at) == fixed(&given, first, *at))
+            });
             let one = one && same && ordered.unique && pinned == width;
+            // One value for every column, by `=` or a joined row: at most one row.
+            let sole = sole && same && ordered.unique && pinned == width;
             let lone = each.iter().map(|case| case.1).min().unwrap_or(width);
             // Ranges walked in turn, in key order, keep the order past the columns every case
             // holds to one value, when each case narrows the walk; a list of whole keys is not
@@ -681,16 +730,31 @@ impl<'a> Source<'a> {
                 checks: Some(checks.map(|(at, _)| at).collect()),
                 asked: whole.clone().filter(|_| in_order).unwrap_or_default(),
             };
-            // The whole key is better than any index.
-            let score = (whole_key, pinned, ranged, tied);
+            // The first path to at most one row decides; then the table's whole key by a list is
+            // better than any index.
+            let rank = if sole { 2 } else { u8::from(whole_key) };
+            let score = match sole {
+                true => (2, 0, false, 0),
+                false => (rank, pinned, ranged, tied),
+            };
+            let cases = reading.cases.iter().zip(&each).filter(|_| partition);
+            let mut counts = partition;
+            for ((case, (.., applied)), served) in cases.zip(&mut served) {
+                *served |= own(case, applied);
+                counts &= own(case, applied) && key.iter().all(|at| applied.contains(at));
+            }
+            if counts && countable.as_ref().is_none_or(|(at, _)| score > *at) {
+                countable = Some((score, path.clone()));
+            }
             if score > best.0 {
                 best = (score, path);
-                tried.insert(0, (ordered, pinned, ranged, tied));
+                tried.insert(0, (ordered, pinned, ranged, tied, rank));
             } else {
-                tried.push((ordered, pinned, ranged, tied));
+                tried.push((ordered, pinned, ranged, tied, rank));
             }
         }
-        Ok((best.1, tried))
+        let served = served.into_iter().all(|served| served);
+        Ok((best.1, tried, served, countable.map(|(_, path)| path)))
     }
 
     /// Says, when the statement is explained, the path [`Source::given`] picks, with `joined`
@@ -710,9 +774,10 @@ impl<'a> Source<'a> {
             return Ok(());
         }
         let row: Vec<_> = joined.iter().map(|&column| (column, None)).collect();
-        let (mut path, mut tried) = self.scored(&row, order, assigned)?;
+        let reading = self.facts()?;
+        let (mut path, mut tried, ..) = self.scored(reading, None, &row, order, assigned)?;
         if !path.serves(self.choose(order, assigned)?.pinned) {
-            (path, tried) = self.scored(&[], order, assigned)?;
+            (path, tried, ..) = self.scored(reading, None, &[], order, assigned)?;
         }
         let chosen = tried.first().filter(|tried| walked(tried));
         let back = if path.back { " Backward" } else { "" };
@@ -720,25 +785,26 @@ impl<'a> Source<'a> {
             Some((by, ..)) => format!("IndexScan{back} {{ index: {} }}", self.index_name(by.index)),
             None => "Scan".to_owned(),
         }];
-        if let Some((by, pinned, ranged, _)) = chosen {
+        if let Some((by, pinned, ranged, ..)) = chosen {
             let pushed = by.columns.iter().take(pinned + usize::from(*ranged));
             let pushed: Vec<&str> = pushed.map(|(at, _)| self.column_name(*at)).collect();
             lines.push(format!("  predicates_pushed: [{}]", pushed.join(", ")));
         }
         let pinned = chosen.map_or(0, |chosen| chosen.1);
-        let whole =
-            chosen.is_some_and(|(by, n, _, _)| by.index.is_none() && by.columns.len() == *n);
         let ranged = chosen.is_some_and(|chosen| chosen.2);
-        let tied = chosen.map_or(0, |chosen| chosen.3);
+        let (tied, rank) = chosen.map_or((0, 0), |chosen| (chosen.3, chosen.4));
         let reading = self.facts()?;
         let considered: Vec<String> = (tried[usize::from(chosen.is_some())..].iter())
-            .map(|(other, other_pinned, other_ranged, other_tied)| {
+            .map(|(other, other_pinned, other_ranged, other_tied, n)| {
                 let reason = match *other_pinned {
-                    0 => self.lost(reading, other.columns[0].0),
+                    0 if !other_ranged => self.lost(reading, other.columns[0].0),
+                    _ if *n == 2 => "tied with chosen index; lost by creation order",
                     other_pinned if other_pinned < pinned => {
                         "fewer predicate columns matched than chosen index"
                     }
-                    _ if whole || ranged && !other_ranged => "lower selectivity than chosen index",
+                    _ if rank > *n || ranged && !other_ranged => {
+                        "lower selectivity than chosen index"
+                    }
                     _ if tied > *other_tied => "does not supply requested order",
                     _ => "tied with chosen index; lost by creation order",
                 };
@@ -755,107 +821,6 @@ impl<'a> Source<'a> {
     pub(super) fn screen_owned(&self, context_leads: bool) -> bool {
         self.seen.iter().enumerate().all(|(at, reads)| {
             !reads || (context_leads && Some(at) == self.table.rules.context_column)
-        })
-    }
-
-    /// Keys reached without reading rows; no set for a row scan. Charge before retaining.
-    pub(super) fn keys(
-        &self,
-        path: &Path,
-        held: &mut Reservation,
-    ) -> Result<Option<BTreeSet<Key>>> {
-        let primary = Ordered {
-            index: None,
-            unique: true,
-            columns: self
-                .table
-                .key
-                .iter()
-                .map(|at| (*at, SortDirection::Asc))
-                .collect(),
-        };
-        // A key outside what every case leaves of the table's own key is not kept.
-        let first = primary.columns.first().map(|(at, _)| *at);
-        let mut bounds = Vec::new();
-        for case in &self.facts()?.cases {
-            let next = first.and_then(|first| fixed(&[], case, first));
-            bounds.push(primary.range(self.table, &[], next)?.1);
-        }
-        let within = |key: &Key, bound: &Bound<Key>, lower| match bound {
-            Bound::Unbounded => true,
-            Bound::Included(end) => {
-                key.starts_with(end) || if lower { key >= end } else { key <= end }
-            }
-            Bound::Excluded(end) => {
-                !key.starts_with(end) && if lower { key > end } else { key < end }
-            }
-        };
-        let mut keys = BTreeSet::new();
-        let mut keep = |key: &Key| -> Result<()> {
-            let inside = |(from, to): &Range| within(key, from, true) && within(key, to, false);
-            if bounds.iter().any(inside) && !keys.contains(key) {
-                held.grow(32 + key.as_bytes().len() as u64)?;
-                keys.insert(key.clone());
-            }
-            Ok(())
-        };
-        match &path.reach {
-            Reach::Rows(_) => return Ok(None),
-            Reach::Keys(named) => {
-                for key in named {
-                    keep(key)?;
-                }
-            }
-            Reach::Index(at, ranges) => {
-                for (from, to) in ranges {
-                    for entry in self.read.index(
-                        self.table.index_ids[*at],
-                        from.as_ref(),
-                        to.as_ref(),
-                        false,
-                    )? {
-                        // An entry is work where the table hides no row from the reader.
-                        if let (Some((examined, work)), None) = (self.examined, &self.visible) {
-                            super::admit(examined, 1, work)?;
-                        }
-                        keep(&entry?.1)?;
-                    }
-                }
-            }
-        }
-        Ok(Some(keys))
-    }
-
-    /// Whether counting this path's keys stays inside the reader's Context prefixes.
-    pub(super) fn confined(&self, path: &Path, prefixes: &[Key]) -> bool {
-        let (ranges, leading) = match &path.reach {
-            Reach::Keys(_) => return true,
-            Reach::Rows(ranges) if ranges[..] == [(Unbounded, Unbounded)] => return true,
-            Reach::Rows(ranges) => (ranges, self.table.key.first().copied()),
-            Reach::Index(at, ranges) => {
-                let name = &self.table.meta.indexes[*at].columns[0].0;
-                (ranges, self.table.column(name).ok())
-            }
-        };
-        leading == self.table.rules.context_column
-            && ranges.iter().all(|(from, to)| {
-                let inside = |bound: &Bound<Key>, prefix| match bound {
-                    Bound::Included(key) | Bound::Excluded(key) => key.starts_with(prefix),
-                    Unbounded => false,
-                };
-                prefixes
-                    .iter()
-                    .any(|prefix| inside(from, prefix) && inside(to, prefix))
-            })
-    }
-
-    /// Whether the path reaches at most `most` rows, counted by keys or index entries alone and
-    /// no further than one past `most`. The whole table is never few.
-    pub(super) fn few(&self, path: &Path, most: u64) -> Result<bool> {
-        Ok(match &path.reach {
-            Reach::Keys(keys) => keys.len() as u64 <= most,
-            Reach::Rows(ranges) if ranges[..] == [(Unbounded, Unbounded)] => false,
-            _ => self.entries(path, most.saturating_add(1), false)? <= most,
         })
     }
 
@@ -1091,10 +1056,10 @@ impl<'a> Source<'a> {
     /// from it, both in column order, and the bytes of `reservation` the values hold. A row
     /// that does not pass holds none. A column the statement does not read is left as NULL.
     ///
-    /// The reader's filter is asked first, and nothing else of a row it hides is looked at.
-    /// With `refuse`, such a row is the refusal of the rule that hid it. The statement's filter
-    /// is asked part by part, those of `checks` or else every one, as AND asks them: the first
-    /// FALSE ends it.
+    /// The reader's filter is asked first, and nothing else of a row it hides is looked at but
+    /// with `refuse`: the statement's filter is asked of it too, and a hidden row that passes is
+    /// the refusal of the rule that hid it. The statement's filter is asked part by part, those
+    /// of `checks` or else every one, as AND asks them: the first FALSE ends it.
     fn pass(
         &self,
         row: Row,
@@ -1114,16 +1079,22 @@ impl<'a> Source<'a> {
             self.take(&mut cells, &mut values, &self.seen, reservation)?;
             hidden = visible.borrow_mut().hidden(&values, self.read)?;
         }
-        let mut passes = hidden.is_none();
+        let mut passes = hidden.is_none() || refuse;
         if passes {
-            if let Some((examined, work)) = self.examined {
+            if let (None, Some((examined, work))) = (&hidden, self.examined) {
                 super::admit(examined, 1, work)?;
             }
             self.take(&mut cells, &mut values, &self.filtered, reservation)?;
             let parts = self.facts()?.parts.iter().enumerate();
             for (_, part) in parts.filter(|(at, _)| checks.is_none_or(|checks| checks.contains(at)))
             {
-                match *eval(part.expr, &self.scope, &values, self.ctx)? {
+                // A hidden row whose conditions cannot be worked out is not selected.
+                let value = eval(part.expr, &self.scope, &values, self.ctx);
+                if hidden.is_some() && matches!(value, Err(Error::PlanError(_))) {
+                    passes = false;
+                    break;
+                }
+                match *value? {
                     Value::Bool(true) => {}
                     Value::Bool(false) => {
                         passes = false;
@@ -1133,9 +1104,9 @@ impl<'a> Source<'a> {
                 }
             }
         }
-        if !passes {
+        if !passes || hidden.is_some() {
             reservation.shrink(reservation.bytes() - before);
-            return hidden.filter(|_| refuse).map_or(Ok(None), Err);
+            return hidden.filter(|_| passes).map_or(Ok(None), Err);
         }
         self.take(&mut cells, &mut values, &self.rest, reservation)?;
         Ok(Some((values, cells, reservation.bytes() - before)))

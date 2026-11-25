@@ -11,7 +11,7 @@ use crate::types::Result;
 
 /// What a column keeps about one partition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(super) struct Partition {
+pub(crate) struct Partition {
     /// The partition's number within its column. Pending rows and blocks are kept under it.
     pub number: u32,
     /// How many rows have a vector in the partition, pending or in a block.
@@ -41,14 +41,14 @@ pub(super) struct Partition {
     /// The number an IVF being built is kept under and the committed view it reads, whose
     /// departures alone belong to it; `None` when none is.
     pub building: Option<(u32, u64)>,
-    /// Live outside slots assigned since the centres were last found anew.
+    /// Live outside slots assigned since the centroids were last found anew.
     pub assigned: u64,
 }
 
 /// Where an IVF's records are and how many it has: all a search of every slot, and a
 /// commit that removes the IVF, need of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Grouped {
+pub(crate) struct Grouped {
     /// The number its blocks, its centroids and its record are kept under.
     pub number: u32,
     /// How many blocks it has, numbered from zero; every one but the last is full.

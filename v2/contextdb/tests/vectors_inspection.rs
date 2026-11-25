@@ -341,6 +341,14 @@ fn lines_of(explained: &str) -> Vec<&str> {
     explained.lines().map(str::trim_start).collect()
 }
 
+/// Asserts that `explained` has each of `wanted` as one of its lines.
+fn assert_lines(explained: &str, wanted: &[&str]) {
+    let lines = lines_of(explained);
+    for wanted in wanted {
+        assert!(lines.contains(wanted), "no line {wanted:?} in\n{explained}");
+    }
+}
+
 #[test]
 fn explain_names_how_each_partition_is_searched() {
     // Partition a is built; b has 2,000 vectors outside any IVF, twice the declared size.
@@ -367,7 +375,7 @@ fn explain_names_how_each_partition_is_searched() {
 
     let explained = explain(&searched(None, "EXACT"));
     let lines = lines_of(&explained);
-    for wanted in [
+    let wanted = [
         "requested_mode: EXACT",
         "resolved_mode: EXACT",
         "effective_indexing_threshold: 1000",
@@ -377,12 +385,8 @@ fn explain_names_how_each_partition_is_searched() {
         r#"partition: {"ctx":"a"}"#,
         r#"partition: {"ctx":"b"}"#,
         "refusal: none",
-    ] {
-        assert!(
-            lines.contains(&wanted),
-            "no line {wanted:?} in\n{explained}"
-        );
-    }
+    ];
+    assert_lines(&explained, &wanted);
     assert_eq!(routes(&lines), ["exact", "exact"]);
     assert_eq!(lines.last(), Some(&"refusal: none"));
 
@@ -484,20 +488,14 @@ fn explain_says_that_auto_below_the_columns_size_resolves_to_exact() {
     // Fifty vectors in a column whose size is the 100,000 of no INDEXING_THRESHOLD.
     let (_, db) = support::built("explain-auto-below-its-size", 16, "", 50);
     let explained = db.explain(&searched(None, "AUTO")).expect("explain");
-    let lines = lines_of(&explained);
-    for wanted in [
+    let wanted = [
         "requested_mode: AUTO",
         "resolved_mode: EXACT",
         "effective_indexing_threshold: 100000",
         "aggregate_allowed_vectors: 50",
         "refusal: none",
-    ] {
-        assert!(
-            lines.contains(&wanted),
-            "no line {wanted:?} in\n{explained}",
-            explained = &*explained
-        );
-    }
+    ];
+    assert_lines(&explained, &wanted);
     let sql = "ALTER TABLE docs ALTER COLUMN v SET INDEXING_THRESHOLD 50";
     support::run(&db, sql);
     let explained = db.explain(&searched(None, "AUTO")).expect("explain");
@@ -565,16 +563,17 @@ fn explain_of_a_search_with_alternatives_advises_no_index() {
 
 #[test]
 fn the_size_statement_holds_one_centroid_not_all_of_them() {
-    const DIM: usize = 4096;
-    let (_, db) = support::built("size-centroids", DIM, "INDEXING_THRESHOLD 50", 400);
+    const DIM: usize = 8192;
+    // 81 vectors are grouped in 9, the square root of their count.
+    let (_, db) = support::built("size-centroids", DIM, "INDEXING_THRESHOLD 50", 81);
     let groups = support::whole(&support::the_partition(&db), "lists") as u64;
-    // A record of 262,080 bytes holds 15 centres of 4,096 numbers.
-    let record = 15 * DIM as u64 * 4;
-    assert!(groups > 15, "the centres span two records: {groups}");
+    // A record of 262,080 bytes holds 7 centres of 8,192 numbers.
+    let record = 7 * DIM as u64 * 4;
+    assert!(groups > 7, "the centres span two records: {groups}");
     let peak = support::run(&db, "SHOW CONTENT_SIZE").peak_bytes();
     let peak = peak.expect("a whole handle");
     assert!(
         peak < record,
-        "SHOW CONTENT_SIZE reads each centre in place: its peak {peak} must stay below the {record} bytes of one record's 15 centres"
+        "SHOW CONTENT_SIZE reads each centre in place: its peak {peak} must stay below the {record} bytes of one record's 7 centres"
     );
 }

@@ -57,25 +57,14 @@ fn a_search_is_explained_with_its_mode_and_partition_key() {
         &["EXACT", "exact", "ctx"],
     );
     // A filter on a column no index leads with is said to take no path, and the statement that
-    // would give it one; once the index is there the search says the path it takes.
+    // would make it countable for each partition: an index with the partition's column first
+    // (section 6, the recovery line). An index on `tag` alone serves the filter but crosses the
+    // partitions, so the find walks, prints no cost and the line still names that index (the
+    // subquery case below asserts it).
     let by_tag = "SELECT id FROM docs WHERE tag = 3 ORDER BY v <=> [1.0, 0.0, 0.0] LIMIT 3";
-    assert_says(
-        &db,
-        by_tag,
-        &[
-            "filter_path: none",
-            "recovery: CREATE INDEX docs_tag_idx ON docs (tag)",
-        ],
-    );
+    let recovery = "recovery: CREATE INDEX docs_ctx_tag_idx ON docs (ctx, tag)";
+    assert_says(&db, by_tag, &["filter_path: none", recovery]);
     support::run(&db, "CREATE INDEX docs_tag_idx ON docs (tag)");
-    assert_says(
-        &db,
-        by_tag,
-        &[
-            "filter_path: IndexScan { index: docs_tag_idx }",
-            "small_set: yes",
-        ],
-    );
     assert_says(
         &db,
         "SELECT id FROM docs WHERE id <= 2 OR tag = 3 ORDER BY v <=> [1.0, 0.0, 0.0] LIMIT 3",
@@ -91,18 +80,26 @@ fn a_search_is_explained_with_its_mode_and_partition_key() {
         "{text}"
     );
     assert_eq!(text.matches("__pk_id").count(), 1, "{text}");
-    // A filter that reaches more rows than the statement asks for is not a small set.
+    let walked = text.contains("filter_route: walk") && text.contains(recovery);
+    assert!(walked && !text.contains("_cost:"), "{text}");
+    // With the partition's column first the filter is countable for each partition: one row of
+    // tag 3 lies in its partition, and comparing it directly costs that one row.
+    support::run(&db, "CREATE INDEX docs_ctx_tag_idx ON docs (ctx, tag)");
+    let costs = ["filter_route: direct", "direct_cost: 1", "walk_cost: "];
+    assert_says(&db, by_tag, &costs);
+    // Every row passing and one asked for, the walk costs less than reading every row.
     assert_says(
         &db,
         "SELECT id FROM docs WHERE tag >= 0 ORDER BY v <=> [1.0, 0.0, 0.0] LIMIT 1",
-        &["small_set: no"],
+        &["filter_route: walk"],
     );
     // The rows asked for are the limit, the offset and a second sort key's lookahead: tags 5 to
-    // 8 are four rows, as many as LIMIT 2 OFFSET 2 asks for.
+    // 8 are two rows of each partition's four and LIMIT 2 OFFSET 2 asks for four, so the walk
+    // would cost more.
     assert_says(
         &db,
         "SELECT id FROM docs WHERE tag >= 5 ORDER BY v <=> [1.0, 0.0, 0.0] LIMIT 2 OFFSET 2",
-        &["small_set: yes"],
+        &["filter_route: direct"],
     );
     // Refused as running is; an unbound $x is a PlanError, open only as a search's vector or key.
     let mut told = Vec::new();
@@ -205,6 +202,25 @@ fn explaining_a_write_also_says_the_path_of_the_select_inside_it() {
         "IndexScan { index: event_search_passages_generation_ordinal_idx }".into()
     );
     assert!(!format!("{:?}", plan.rows()).contains("Sort"));
+    // A graph step is explained by the index its run reads: here the one its edge type leads.
+    for sql in [
+        "CREATE TABLE links (id INTEGER PRIMARY KEY, source_id UUID NOT NULL, target_id UUID NOT NULL, edge_type TEXT NOT NULL)",
+        "CREATE INDEX links_type ON links (edge_type, source_id)",
+        "INSERT INTO links VALUES (1, '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002', 'A'), (2, '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000003', 'A'), (3, '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000004', 'B')",
+    ] {
+        support::run(&db, sql);
+    }
+    let one = "WHERE a.id = '00000000-0000-0000-0000-000000000001' COLUMNS (b.id AS b_id)";
+    let step = |arrow| format!("SELECT b_id FROM GRAPH_TABLE(links MATCH (a){arrow}(b) {one})");
+    let out = step("-[:B]->");
+    let examined = support::run(&db, &out).rows_examined();
+    assert_eq!(examined, 1, "only the B edge");
+    let typed = ["index: links_type }", "[edge_type, source_id]"];
+    assert_says(&db, &out, &typed);
+    // An undirected step reads the edges at each end in turn: two head lines, one for each
+    // index, which no line of an index it rejected holds.
+    let target = "index: __graph_edge_target_source_type }";
+    assert_says(&db, &step("-[:B]-"), &["index: links_type }", target]);
     // A kept count this read cannot use still prints its line.
     let kept = "CREATE TABLE kept (id INTEGER PRIMARY KEY, ctx TEXT, UNIQUE (ctx, id)) MAINTAIN COUNT (ctx)";
     support::run(&db, kept);

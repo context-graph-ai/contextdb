@@ -341,7 +341,7 @@ distance_expr = { additive_expr ~ (other_op ~ additive_expr)* }
 other_op = { "<=>" | "->>" | "->" }
 
 additive_expr = { unary_minus* ~ primary_expr ~ (math_op ~ unary_minus* ~ primary_expr)* }
-math_op = { "+" | "-" | "*" | "/" }
+math_op = { "+" | "-" | "*" | "/" | "%" }
 unary_minus = { "-" }
 
 primary_expr = _{

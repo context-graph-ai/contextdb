@@ -618,9 +618,9 @@ fn a_cycle_through_a_node_with_1_500_edges_is_refused_and_an_edge_that_closes_no
 
 #[test]
 fn a_cycle_check_too_large_for_the_memory_limit_is_refused_by_the_limit_and_writes_nothing() {
-    // Node 2 reaches 20,000 nodes. An edge into node 2 is checked by going over all of them,
-    // and what that holds does not fit in the room the limit leaves.
-    const FAN: usize = 20_000;
+    // Node 2 reaches 4,000 nodes. An edge into node 2 is checked by going over all of them,
+    // and what that holds, 128 bytes a node, is near eight times the room the limit leaves.
+    const FAN: usize = 4_000;
     const ROOM: usize = 64 * 1024;
     let db = support::open(&support::folder("cycle-check-memory-limit"));
     support::run(&db, EDGES);

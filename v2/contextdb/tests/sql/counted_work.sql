@@ -100,13 +100,13 @@ INSERT INTO plain (id, k) VALUES
 (1, 0), (2, 1), (3, 2), (4, -1), (5, 0), (6, 1), (7, 2), (8, -1), (9, 0), (10, 1), (11, 2), (12, -1), (13, 0), (14, 1), (15, 2), (16, -1);
 SELECT id FROM marks WHERE kind = 0 ORDER BY v <=> [1.0, 0.0] LIMIT 2;
 ----
-id  (read 6, compared 4)
+id  (read 4, compared 6)
 1
 5
 
 SELECT id FROM marks WHERE kind = -1 ORDER BY v <=> [1.0, 0.0] LIMIT 2;
 ----
-id  (read 6, compared 4)
+id  (read 4, compared 6)
 4
 8
 

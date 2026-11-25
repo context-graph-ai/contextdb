@@ -3,7 +3,9 @@
 
 mod support;
 
-use contextdb::{Database, Value, params};
+use contextdb::{Database, DatabaseOpenOptions, MaintenanceReport, Value, VerifyReport, params};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 
 /// The numbers `n` of a key's versions, newest first, asking for `wanted`, and whether more.
 fn versions(db: &Database, table: &str, wanted: usize) -> (Vec<Value>, bool) {
@@ -56,13 +58,24 @@ fn a_table_keeps_replaced_versions_until_it_declares_current_only_and_a_cleanup_
         versions(&db, "current", 128).0.is_empty(),
         "CURRENT ONLY keeps none"
     );
-    // A cleanup goes in the cycles after the ALTER.
+    // The versions the ALTER retires are gone to the history read when it returns (design 4,
+    // S1 rule 3); the cycles after it give their room back.
     let held = db.snapshot().unwrap();
+    let stored = |db: &Database| {
+        let report = db.verify().unwrap();
+        report
+            .tables
+            .iter()
+            .find(|t| t.table == "plain")
+            .unwrap()
+            .versions
+    };
+    let before = stored(&db);
+    assert!(before > 0, "three replaced versions take content bytes");
     support::run(&db, "ALTER TABLE plain SET HISTORY CURRENT ONLY");
-    assert_eq!(
-        versions(&db, "plain", 128).0.len(),
-        3,
-        "ALTER returns before the cleanup"
+    assert!(
+        versions(&db, "plain", 128).0.is_empty(),
+        "the ALTER's commit hides the versions it retires"
     );
     let removed: u64 = (0..8)
         .map(|_| {
@@ -76,10 +89,7 @@ fn a_table_keeps_replaced_versions_until_it_declares_current_only_and_a_cleanup_
         removed, 3,
         "the cycles report the three versions they removed"
     );
-    assert!(
-        versions(&db, "plain", 128).0.is_empty(),
-        "the cycles removed them"
-    );
+    assert!(stored(&db) < before, "cleanup gives the version bytes back");
     // A held snapshot still reads the row as it stood, the large value with it, after an UPDATE and the cycles.
     support::run(&db, "UPDATE plain SET n = 7 WHERE id = 1");
     support::maintenance(&db);
@@ -170,6 +180,146 @@ fn verified(db: &Database, table: &str) -> contextdb::ContentSize {
         .clone()
 }
 
+/// A table shaped as a graph's edges, with `rows` keys that each hold a large value of `len`
+/// bytes and have `updates` kept versions sharing it.
+fn versioned(db: &Database, table: &str, clause: &str, rows: i64, updates: i64, len: usize) {
+    support::run(
+        db,
+        &format!(
+            "CREATE TABLE {table} (id INTEGER PRIMARY KEY, n INTEGER, body TEXT, \
+         source_id UUID NOT NULL, target_id UUID NOT NULL, edge_type TEXT NOT NULL) {clause}"
+        ),
+    );
+    for id in 1..=rows {
+        let body = support::large_text(support::Kind::Scattered, id, len);
+        let to = support::context(id as u128);
+        let sql = format!("INSERT INTO {table} VALUES ($id, 0, $body, $from, $to, 'E')");
+        db.execute(
+            &sql,
+            &params! { "id" => id, "body" => body, "from" => support::context(0), "to" => to },
+        )
+        .unwrap();
+    }
+    // Each commit writes a version of every row, so the store holds rows * updates versions
+    // after as many commits as updates.
+    for n in 1..=updates {
+        support::run(db, &format!("UPDATE {table} SET n = {n}"));
+    }
+}
+
+#[test]
+fn a_cleanup_goes_in_batches_that_each_leave_the_store_whole() {
+    // Design 4, S1: what can wait leaves in batches of at most 1,024 records, a row leaves whole
+    // with its entries, a range of kept versions ends at the commit that retired them, a value
+    // is freed once with its last holder, and `verify` is clean after every batch.
+    let at = Arc::new(AtomicU64::new(100));
+    let mut options = DatabaseOpenOptions::default();
+    options.clock = Some(Arc::new(support::At(at.clone())));
+    let (shared, armed) = support::cancelling(&support::folder("history-batches"), options);
+    let db = &*shared;
+    let records = |batches: &[(MaintenanceReport, VerifyReport)]| {
+        batches
+            .iter()
+            .map(|b| support::count(b.0.removed_records))
+            .collect::<Vec<_>>()
+    };
+    // 3,000 kept versions of ten rows whose 300 KB values the rows still hold.
+    versioned(db, "long", "SYNC OFF", 10, 300, 300_000);
+    support::run(db, "ALTER TABLE long SET HISTORY CURRENT ONLY");
+    assert!(
+        versions(db, "long", 3001).0.is_empty(),
+        "hidden from the ALTER's commit"
+    );
+    let removed = records(&support::batches(db, &armed, usize::MAX));
+    assert!(
+        removed.len() >= 3 && removed.iter().all(|n| (1..=1024).contains(n)),
+        "3,000 versions leave in batches of 1 to 1,024 records: {removed:?}"
+    );
+    assert_eq!(
+        removed.iter().sum::<u64>(),
+        3000,
+        "each row keeps its value"
+    );
+    // Sixteen keys whose versions share each key's value, retired by a drop and by CURRENT
+    // ONLY. A drop takes its first batch of 1,024 records in its own commit, so more than
+    // 2,048 owed records leave at least two batches to the cleanup.
+    let (rows, updates) = (16, 140);
+    for (table, retire) in [
+        ("dropped", "DROP TABLE dropped"),
+        ("edges", "ALTER TABLE edges SET HISTORY CURRENT ONLY"),
+    ] {
+        versioned(db, table, "SYNC OFF", rows, updates, 20_000);
+        support::run(db, retire);
+        let mut batches = support::batches(db, &armed, 1);
+        if table == "edges" {
+            // Written again under kept history before the cleanup goes on: those versions stay.
+            support::run(db, "ALTER TABLE edges SET HISTORY ALL");
+            support::run(db, "UPDATE edges SET n = -1 WHERE id = 1");
+            support::run(db, "UPDATE edges SET n = -2 WHERE id = 1");
+        }
+        batches.extend(support::batches(db, &armed, usize::MAX));
+        let removed = records(&batches);
+        assert!(
+            removed.len() >= 2 && removed.iter().all(|n| (1..=1024).contains(n)),
+            "{table}: {removed:?}"
+        );
+        if table == "edges" {
+            // The superseded copies of a graph's edges leave like any table's (DL-CDB-29).
+            assert_eq!(
+                removed.iter().sum::<u64>(),
+                (rows * updates) as u64,
+                "every retired version, no more"
+            );
+        }
+    }
+    assert_eq!(
+        versions(db, "edges", 128).0,
+        [-1, updates].map(Value::Int64).to_vec()
+    );
+    // Six indexes: a batch's allowance ends inside a row's own entries, and the row leaves whole.
+    let indexed = "a INTEGER, b INTEGER, c INTEGER, d INTEGER, e INTEGER, f INTEGER";
+    support::run(
+        db,
+        &format!(
+            "CREATE TABLE six (id INTEGER PRIMARY KEY, {indexed}, due TIMESTAMP EXPIRES) RETAIN 1 SECONDS"
+        ),
+    );
+    for column in ["a", "b", "c", "d", "e", "f"] {
+        support::run(db, &format!("CREATE INDEX six_{column} ON six ({column})"));
+    }
+    let tx = db.transaction().unwrap();
+    for id in 1..=400 {
+        let sql = "INSERT INTO six VALUES ($id, $id, $id, $id, $id, $id, $id, $due)";
+        tx.execute(
+            sql,
+            &params! { "id" => id, "due" => Value::Timestamp(101_000) },
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    // Every row and its six entries take the same bytes, so the bytes left say the rows left.
+    let whole = verified(db, "six");
+    assert_eq!((whole.rows % 400, whole.indexes % 400), (0, 0), "{whole:?}");
+    at.store(110, SeqCst);
+    let batches = support::batches(db, &armed, usize::MAX);
+    assert!(
+        batches.len() >= 2,
+        "400 rows of seven records each need more than one batch"
+    );
+    for (report, verify) in &batches {
+        assert!(
+            support::count(report.expired_rows) >= 1,
+            "every batch removes a row: {report:?}"
+        );
+        let six = verify.tables.iter().find(|t| t.table == "six").unwrap();
+        assert_eq!(
+            six.indexes / (whole.indexes / 400),
+            six.rows / (whole.rows / 400),
+            "each row left has all six entries: {six:?}"
+        );
+    }
+}
+
 #[test]
 fn row_versions_refuses_a_wrong_key_values_past_the_memory_limit_and_a_hidden_version_beyond_the_limit()
  {
@@ -183,8 +333,9 @@ fn row_versions_refuses_a_wrong_key_values_past_the_memory_limit_and_a_hidden_ve
             "{n}: {text}"
         );
     }
-    for n in 1..=1000 {
-        let body = support::large_text(support::Kind::Scattered, n, 20_000);
+    // A hundred versions of 200,000 bytes are twice the reader's 12 MiB.
+    for n in 1..=100 {
+        let body = support::large_text(support::Kind::Scattered, n, 200_000);
         db.execute(
             "UPDATE plain SET body = $body WHERE id = 1",
             &params! { "body" => body },
@@ -192,6 +343,8 @@ fn row_versions_refuses_a_wrong_key_values_past_the_memory_limit_and_a_hidden_ve
         .unwrap();
     }
     let reader = support::open_reader(&folder, Some(12 << 20));
+    let two = reader.row_versions("plain", &[Value::Int64(1)], 2).unwrap();
+    assert!(two.more && two.rows.rows().len() == 2, "two fit the reader");
     assert!(
         matches!(
             reader.row_versions("plain", &[Value::Int64(1)], 1001),

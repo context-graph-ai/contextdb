@@ -740,9 +740,9 @@ If neither a platform runtime nor a secure data-home fallback is available, the 
 may supply different channel directories. A direct reader keeps a byte-free advisory presence lock on the database
 file after its initial load lock releases. If the writer sees that lock but cannot find the
 reader's registration in any runtime directory it knows, ordinary opens and commits remain
-available with a conservative retention floor. Explicit storage reclamation and authoritative
-purge refuse with `ReaderCoordinationUnavailable`, naming the missing registration; they resume
-after the unknown reader exits. This preserves the channel-directory option without requiring a
+available with a conservative retention floor. The pages of that
+reader's commit are not reused while its file in `readers/` stands, and are free again once the
+reader lets the commit go. This preserves the channel-directory option without requiring a
 shared directory. The container must expose the same physical database file and support Linux
 open-file-description advisory locks for this journey. On other Unix systems without a common
 platform runtime root, ordinary writes retain a conservative floor and reclamation or purge

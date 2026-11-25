@@ -176,11 +176,12 @@ pub(crate) fn worker(
             }
             state.1 = false;
             drop(state);
+            // The cycle keeps its own report; the sealing clock is the last sealing cycle's.
             again = cycle(partial).unwrap_or(false);
-            last = now_millis(&*clock);
-            if !again {
-                partial = false;
+            if partial {
+                last = now_millis(&*clock);
             }
+            partial &= again;
         }
     })
 }

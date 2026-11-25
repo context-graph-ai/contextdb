@@ -37,10 +37,13 @@ fn an_update_of_another_column_leaves_a_large_value_where_it_is() {
     support::run(&db, "CREATE INDEX docs_title ON docs (title)");
     let body = |id: i64| support::large_text(Kind::Scattered, id, LEN);
     let meta = |id: i64| support::large_json(false, id, LEN);
-    for id in 1..=4_i64 {
+    // Made once: the values of documents 1 to 4, and those assigned to document 4 later.
+    let docs: Vec<_> = (1..=4).map(|id| (body(id), meta(id))).collect();
+    let (body_40, meta_41) = (body(40), meta(41));
+    for (id, (body, meta)) in (1_i64..).zip(&docs) {
         db.execute(
             "INSERT INTO docs (id, title, body, meta) VALUES ($id, $title, $body, $meta)",
-            &params! { "id" => id, "title" => format!("title-{id}"), "body" => body(id), "meta" => meta(id) },
+            &params! { "id" => id, "title" => format!("title-{id}"), "body" => body.clone(), "meta" => meta.clone() },
         )
         .expect("insert a document");
     }
@@ -60,16 +63,17 @@ fn an_update_of_another_column_leaves_a_large_value_where_it_is() {
         let [row] = found.rows() else {
             panic!("document {id} came back as {} rows", found.rows().len());
         };
+        let (body, meta) = &docs[id as usize - 1];
         assert_eq!(row[0], support::text(title), "the title of document {id}");
-        support::assert_text_is(&row[1], &body(id), &format!("the body of document {id}"));
-        support::assert_json_is(&row[2], &meta(id), &format!("the meta of document {id}"));
+        support::assert_text_is(&row[1], body, &format!("the body of document {id}"));
+        support::assert_json_is(&row[2], meta, &format!("the meta of document {id}"));
     };
 
     // The door sees a rewrite: assigning the large value of row 4 writes at least its bytes.
     let rewritten = written_by(&|| {
         db.execute(
             "UPDATE docs SET body = $body WHERE id = 4",
-            &params! { "body" => body(40) },
+            &params! { "body" => body_40.clone() },
         )
         .expect("assign the large value");
     });
@@ -121,7 +125,7 @@ fn an_update_of_another_column_leaves_a_large_value_where_it_is() {
     let one_of_two = written_by(&|| {
         db.execute(
             "UPDATE docs SET meta = $meta WHERE id = 4",
-            &params! { "meta" => meta(41) },
+            &params! { "meta" => meta_41.clone() },
         )
         .expect("assign the JSON value");
     });
@@ -131,8 +135,8 @@ fn an_update_of_another_column_leaves_a_large_value_where_it_is() {
          the other alone wrote {rewritten}"
     );
     let other = support::rows(&db, "SELECT body, meta FROM docs WHERE id = 4");
-    support::assert_text_is(&other[0][0], &body(40), "the body of document 4");
-    support::assert_json_is(&other[0][1], &meta(41), "the meta of document 4");
+    support::assert_text_is(&other[0][0], &body_40, "the body of document 4");
+    support::assert_json_is(&other[0][1], &meta_41, "the meta of document 4");
 
     // The values are where they were after reopening too.
     support::close(db);
@@ -140,7 +144,7 @@ fn an_update_of_another_column_leaves_a_large_value_where_it_is() {
     let titles = support::rows(&db, "SELECT title FROM docs WHERE id <= 3 ORDER BY id");
     assert_eq!(titles, vec![[support::text("all again")]; 3]);
     let found = support::rows(&db, "SELECT body FROM docs WHERE id = 2");
-    support::assert_text_is(&found[0][0], &body(2), "the body of document 2, reopened");
+    support::assert_text_is(&found[0][0], &docs[1].0, "the body of document 2, reopened");
 }
 
 /// Asserts that a statement over many rows was not refused, and gives its result. A refusal by

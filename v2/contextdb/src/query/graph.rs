@@ -10,7 +10,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::iter::once;
 use std::sync::LazyLock;
 
 use super::bind::bind;
@@ -152,7 +151,7 @@ impl<'a> Graph<'a> {
         let bytes = catalog.table_count() * (size_of::<&Table>() + size_of::<Visible>());
         let mut held = budget.reserve(bytes as u64, "graph planning")?;
         let mut seeing = budget.reserve(0, "query")?;
-        let visible = Visible::new(edges, catalog, reader, &mut seeing)?;
+        Visible::new(edges, catalog, reader, &mut seeing)?;
 
         let (mut nodes, mut closed, mut searched) = (Vec::new(), Vec::new(), Vec::new());
         for table in catalog.tables() {
@@ -267,12 +266,21 @@ impl<'a> Graph<'a> {
             starts = names(&pattern.steps[0].to)?;
             reversed = starts.is_some();
         }
-        // Explained, the first step reads the edges at each start, or every edge.
+        // Explained, the first step reads the edges at each start, or every edge, of its type, by
+        // the filter its run reads (a start as any node), and an undirected step at each end.
         if let Some(said) = given.ctx.said {
-            let read = Source::new(edges, None, &given.ctx, given.read, visible);
             let way = (pattern.steps[0].direction == EdgeDirection::Incoming) != reversed;
-            let near = starts.as_ref().map(|_| [source, target][usize::from(way)]);
-            read.say(near.as_slice(), &[], &[])?;
+            let both = pattern.steps[0].direction == EdgeDirection::Both && starts.is_some();
+            let node = starts.as_ref().map(|_| Uuid::nil());
+            let ends = [source, target];
+            for near in &ends[usize::from(way && !both)..][..1 + usize::from(both)] {
+                let at = at_end(edges, [*near, typed], node, &pattern.steps[0]);
+                let mut ctx = given.ctx;
+                ctx.params = at.as_ref().map_or(ctx.params, |(_, bound)| bound);
+                let visible = Visible::new(edges, catalog, reader, &mut seeing)?;
+                let filter = at.as_ref().map(|(filter, _)| filter);
+                Source::new(edges, filter, &ctx, given.read, visible).say(&[], &[], &[])?;
+            }
             let unpinned = format!("  {}: no pinned vertex", edges.name);
             said.borrow_mut()
                 .extend(starts.is_none().then_some(unpinned));
@@ -459,7 +467,6 @@ impl<'a> Graph<'a> {
             (EdgeDirection::Outgoing, false) | (EdgeDirection::Incoming, true) => &[0],
             _ => &[1],
         };
-        let typed = step.edge_type.clone().map(Value::Text);
         let mut give = |row: &[Value], way: usize, reservation: &mut Reservation| -> Result<bool> {
             let ends = (&row[self.ends[way]], &row[self.ends[1 - way]]);
             let (Value::Uuid(near), Value::Uuid(far)) = ends else {
@@ -479,19 +486,17 @@ impl<'a> Graph<'a> {
                 }
                 Ok(true)
             };
-            let every = typed.map(|edge_type| equal(self.edges, &[self.typed], &[edge_type]));
+            let every = at_end(self.edges, [self.ends[0], self.typed], None, step);
             return self.read(self.edges, every.as_ref(), &self.ends, reservation, either);
         };
         for (turn, way) in ways.iter().enumerate() {
-            let values: Vec<Value> = once(Value::Uuid(node)).chain(typed.clone()).collect();
-            let at = [self.ends[*way], self.typed];
-            let at = equal(self.edges, &at[..values.len()], &values);
+            let at = at_end(self.edges, [self.ends[*way], self.typed], Some(node), step);
             // The second way round, an edge from the node to itself has been followed.
             let row: &mut Rows<'_> = &mut |row, reservation| {
                 let own = row[self.ends[0]] == row[self.ends[1]];
                 Ok((turn == 1 && own) || give(row, *way, reservation)?)
             };
-            if !self.read(self.edges, Some(&at), &self.ends, reservation, row)? {
+            if !self.read(self.edges, at.as_ref(), &self.ends, reservation, row)? {
                 return Ok(false);
             }
         }
@@ -612,6 +617,20 @@ pub(super) fn node_id(table: &Table) -> Option<(usize, bool)> {
     };
     let keyed = table.key.first() == Some(&id) || table.meta.indexes.iter().any(leads);
     Some((id, keyed))
+}
+
+/// The filter a step's edges are read by: `end` is `node`, when given, and the step's type.
+fn at_end(
+    edges: &Table,
+    [end, typed]: [usize; 2],
+    node: Option<Uuid>,
+    step: &EdgeStep,
+) -> Option<(Expr, HashMap<String, Value>)> {
+    let of_type = step.edge_type.clone().map(Value::Text);
+    let given = [(end, node.map(Value::Uuid)), (typed, of_type)];
+    let given = given.into_iter().filter_map(|(at, v)| v.map(|v| (at, v)));
+    let (columns, values): (Vec<usize>, Vec<Value>) = given.unzip();
+    (!values.is_empty()).then(|| equal(edges, &columns, &values))
 }
 
 fn listed(allowed: Option<&BTreeSet<String>>, table: &str) -> bool {

@@ -15,12 +15,19 @@ fn distance_of(row: &[contextdb::Value]) -> f64 {
     }
 }
 
-/// Sightings of one connector, the vector index built.
+/// The rows nearer than `bound`, in their order.
+fn nearer_than(rows: &[Vec<contextdb::Value>], bound: f64) -> Vec<&Vec<contextdb::Value>> {
+    rows.iter().filter(|r| distance_of(r) < bound).collect()
+}
+
+/// Sightings of one connector, the vector index built, and an index on `tag` so that a filter
+/// on it is countable.
 fn stored_sightings(name: &str) -> (Sightings, contextdb::Database) {
     const ROWS: usize = 4000;
     let sightings = Sightings::new(ROWS);
     let db = support::open(&support::folder(name));
     support::declare_docs(&db, DIMENSIONS, "INDEXING_THRESHOLD 1000");
+    support::run(&db, "CREATE INDEX docs_tag ON docs (tag)");
     {
         let mut left = sightings.rows(ROWS).zip(1_i64..).peekable();
         while left.peek().is_some() {
@@ -71,11 +78,21 @@ fn a_bound_finds_what_is_stored_and_nothing_for_a_face_never_stored() {
                     );
                     let got = support::search(&db, &sql, question)
                         .unwrap_or_else(|e| panic!("question {j}, {mode:?}{extra}: {e:?}"));
-                    let within: Vec<_> = top
-                        .rows()
-                        .iter()
-                        .filter(|r| distance_of(r) < bound)
-                        .collect();
+                    // With nothing inside it, the answer is empty, and under AUTO and INDEXED
+                    // the bound stands for the last row and ends the walk short of the last
+                    // group (section 6, the bound on the distance).
+                    if !expected {
+                        assert!(
+                            got.rows().is_empty(),
+                            "question {j} {mode:?}: nothing inside"
+                        );
+                        let units = got.rows_examined() + got.distance_evaluations();
+                        assert!(
+                            mode == "EXACT" || units < 4000,
+                            "question {j} {mode:?}: {units} units under the bound, of 4,000 vectors"
+                        );
+                    }
+                    let within = nearer_than(top.rows(), bound);
                     let mut last = f64::MIN;
                     for row in got.rows() {
                         assert!(
@@ -115,31 +132,23 @@ fn a_bound_finds_what_is_stored_and_nothing_for_a_face_never_stored() {
             "{form}: AUTO and INDEXED hold {hit} of the exact scan's {of} rows inside the bound, under 95 in 100"
         );
     }
-    // A condition that passes one row in fifty and has no index turns rows away: the bound is
-    // set just above the eighth exact distance among the rows that pass.
+    // A condition that passes one row in fifty, through its index, turns rows away: the bound
+    // is set just above the tenth exact distance among the rows that pass, the root's ten.
     let mut rare = [(0_usize, 0_usize); 2];
-    let (mut refused, mut worst) = (0, Vec::new());
+    let mut worst = Vec::new();
     for (j, question) in sightings.questions().iter().enumerate() {
         let scan = support::answer(
             &db,
-            &support::by_mode(Some("tag = 3"), "EXACT", 8),
+            &support::by_mode(Some("tag = 3"), "EXACT", 10),
             question,
         );
-        let bound = distance_of(&scan.rows()[7]) * (1.0 + 1e-6) + 1e-9;
-        let within: Vec<_> = scan
-            .rows()
-            .iter()
-            .filter(|r| distance_of(r) < bound)
-            .collect();
+        let bound = distance_of(&scan.rows()[9]) * (1.0 + 1e-6) + 1e-9;
+        let within = nearer_than(scan.rows(), bound);
         for (at, mode) in ["", "USE VECTOR INDEXED "].into_iter().enumerate() {
             let sql = format!(
-                "SELECT id, v <=> $q AS distance FROM docs WHERE v <=> $q < {bound:?} AND tag = 3 ORDER BY distance {mode}LIMIT 8"
+                "SELECT id, v <=> $q AS distance FROM docs WHERE v <=> $q < {bound:?} AND tag = 3 ORDER BY distance {mode}LIMIT 10"
             );
-            let Ok(got) = support::search(&db, &sql, question) else {
-                assert_eq!(at, 1, "question {j}: only INDEXED may refuse");
-                refused += 1;
-                continue;
-            };
+            let got = support::answer(&db, &sql, question);
             assert_bounded(
                 got.rows(),
                 &within,
@@ -154,9 +163,7 @@ fn a_bound_finds_what_is_stored_and_nothing_for_a_face_never_stored() {
     }
     worst.sort_by(|a, b| b.cmp(a));
     for (name, (hit, of)) in ["AUTO", "INDEXED"].iter().zip(rare) {
-        eprintln!(
-            "bound share, tag = 3, {name}: {hit} of {of}; INDEXED refused {refused} questions"
-        );
+        eprintln!("bound share, tag = 3, {name}: {hit} of {of}");
         assert!(
             hit * 100 >= of * 95,
             "tag = 3, {name}: {hit} of the exact scan's {of} rows inside the bound, under 95 in 100; most rows missed (rows, question, mode 0 AUTO 1 INDEXED): {:?}",
@@ -191,11 +198,7 @@ fn short_bound_answers_rows_inside_the_bound(sightings: &Sightings, db: &context
         let top = support::answer(db, &support::by_mode(None, "EXACT", wanted_rows), question);
         // The bound just above the eighth distance lets eight rows through; fifty are asked.
         let bound = distance_of(&top.rows()[wanted_rows - 1]) * (1.0 + 1e-6) + 1e-9;
-        let within: Vec<_> = top
-            .rows()
-            .iter()
-            .filter(|r| distance_of(r) < bound)
-            .collect();
+        let within = nearer_than(top.rows(), bound);
         assert!(
             within.len() < asked,
             "question {j}: the bound lets fewer rows through than asked"
@@ -224,6 +227,7 @@ fn short_bound_answers_rows_inside_the_bound(sightings: &Sightings, db: &context
 fn a_pending_row_beyond_the_bound_does_not_refuse_an_indexed_search() {
     let db = support::open(&support::folder("bound-find-pending"));
     support::declare_docs(&db, 2, "INDEXING_THRESHOLD 1");
+    support::run(&db, "CREATE INDEX docs_tag ON docs (tag)");
     let at = |cosine: f32| vec![cosine, (1.0 - cosine * cosine).sqrt()];
     for (id, near) in [(3, 0.9), (53, 0.9), (103, 0.9), (153, 0.9)] {
         support::insert_doc(&db, id, "a", Some(at(near))).expect("a sealed row");

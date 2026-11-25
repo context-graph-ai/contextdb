@@ -346,6 +346,69 @@ fn a_dropped_columns_bytes_leave_the_store() {
 }
 
 #[test]
+fn a_drop_returns_at_once_and_its_records_leave_in_batches() {
+    const BIG: &str = "CREATE TABLE big (id INT PRIMARY KEY, tag INT, note TEXT)";
+    // Design 4, S1: a drop commits its catalog change with at most one batch and owes the rest.
+    // The name is free when it returns; a held reader and an export are safe across the
+    // batches; a number an owed range names is not given again.
+    let folder = support::folder("drop-in-batches");
+    let (shared, armed) = support::cancelling(&folder, DatabaseOpenOptions::default());
+    let db = &*shared;
+    let make = |tag: i64| {
+        support::run(db, BIG);
+        support::run(db, "CREATE INDEX big_tag ON big (tag)");
+        let tx = db.transaction().unwrap();
+        for id in 1..=10_000 {
+            let row = params! { "id" => id, "t" => tag + id % 100 };
+            tx.execute("INSERT INTO big VALUES ($id, $t, 'n')", &row)
+                .unwrap();
+        }
+        tx.commit().expect("commit ten thousand rows");
+    };
+    make(0);
+    // A reader holds a view while a row is updated and the table dropped (entry 2).
+    let held = db.snapshot().unwrap();
+    support::run(db, "UPDATE big SET note = 'changed' WHERE id = 1");
+    support::run(db, "DROP TABLE big");
+    make(1000);
+    let old = || support::int(db, "SELECT COUNT(*) FROM big WHERE tag < 1000");
+    assert_eq!(old(), 0, "the name is free at once, with no old row");
+    let owed = |b: &[(contextdb::MaintenanceReport, _)]| b.last().map(|b| b.0.owed);
+    let first = support::batches(db, &armed, 1);
+    let left = owed(&first);
+    assert_eq!(left, Some(Some(true)), "a cancel leaves the rest owed");
+    drop(held);
+    // A copy exported while the drop is half done verifies, and its own cycles finish it.
+    db.export_snapshot(folder.join("export")).unwrap();
+    let copy = support::open(&folder.join("export"));
+    copy.verify().expect("verifies half done");
+    support::maintenance(&copy);
+    let done = copy.run_maintenance_cycle().unwrap().owed;
+    assert_eq!(done, Some(false), "the copy's cycles finished the removal");
+    support::close(copy);
+    let rest = support::batches(db, &armed, usize::MAX);
+    assert_eq!(owed(&rest), Some(Some(false)), "the drop is finished");
+    assert_eq!(old(), 0);
+    // An index dropped, the store reopened and the index declared again while the old one's
+    // entries are owed: the new index never shows an old entry.
+    support::run(db, "DROP INDEX big_tag ON big");
+    support::run(db, "UPDATE big SET tag = tag + 1000");
+    support::close(Arc::into_inner(shared).expect("the one handle"));
+    let db = support::open(&folder);
+    support::run(&db, "CREATE INDEX big_tag ON big (tag)");
+    let stale = || support::int(&db, "SELECT COUNT(*) FROM big WHERE tag = 1001");
+    assert_eq!(stale(), 0, "no entry of the dropped index");
+    support::maintenance(&db);
+    let new = support::int(&db, "SELECT COUNT(*) FROM big WHERE tag = 2001");
+    assert_eq!(
+        (stale(), new),
+        (0, 100),
+        "the new index serves only new entries"
+    );
+    db.verify().expect("verify is clean");
+}
+
+#[test]
 fn a_dropped_table_leaves_no_record() {
     // A table is filled and dropped, then a second one is filled with as many bytes. The
     // dropped table's room is free for reuse, so the second fill does not grow the data file.
@@ -367,15 +430,16 @@ fn a_dropped_table_leaves_no_record() {
     let dropped = support::run(&db, "DROP TABLE one");
     assert_eq!(dropped.rows_affected(), 0);
     assert!(support::names(&db).is_empty());
-    let after_drop = data_file(&folder);
+    // The name goes at once; its records drain after, and may give their room back to the OS.
+    support::maintenance(&db);
     declare("two");
     fill(&db, "two", "body", true, ROWS);
     support::close(db);
     let refilled = data_file(&folder);
     assert!(
-        refilled <= after_drop,
-        "after DROP TABLE of {PUT_IN} bytes the data file is {after_drop} bytes long, and \
-         writing {PUT_IN} bytes again made it {refilled}: the dropped table's room is not reused"
+        refilled <= held,
+        "the store held {held} bytes with the dropped table, and writing {PUT_IN} bytes \
+         again made it {refilled}: the dropped table's room is not reused"
     );
 
     // Nothing answers for the dropped table: not the writer, not a reader, not after close

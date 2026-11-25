@@ -11,6 +11,11 @@ on:
   schedule:
     - cron: '30 3 * * *'
   workflow_dispatch:
+    inputs:
+      mutations:
+        description: Also run the mutation testing that otherwise runs only at night
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -26,9 +31,9 @@ env:
   # it, so a cleanup lowers it for good. Reaching one means a refactor first: a number is raised
   # only when a planned stage of the work ends, never inside a fix (v2/AGENTS.md). Neither size
   # ever passes 150,000 lines or 1,000 tests.
-  SHIPPED_LINES: 38800
-  TESTS: 560
-  TEST_LINES: 59500
+  SHIPPED_LINES: 40000
+  TESTS: 580
+  TEST_LINES: 61500
 
 jobs:
   lint:
@@ -38,8 +43,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: cargo fmt --manifest-path v2/Cargo.toml --all --check
       - run: cargo clippy --manifest-path v2/Cargo.toml --workspace --all-targets --locked -- -D warnings
+      - run: cargo clippy --manifest-path v2/Cargo.toml --workspace --locked --release -- -D warnings
       - run: cargo fmt --manifest-path v2/redb/Cargo.toml --all --check
       - run: cargo clippy --manifest-path v2/redb/Cargo.toml --all-targets --locked -- -D warnings
+      - run: cargo clippy --manifest-path v2/redb/Cargo.toml --locked --release -- -D warnings
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --manifest-path v2/Cargo.toml --workspace --locked --no-deps
       - name: Shipped lines are at most the stated number and within 500 of it
         run: |
@@ -80,7 +87,7 @@ jobs:
       - run: cargo nextest run --manifest-path v2/Cargo.toml --workspace --locked --no-tests=pass
       - name: Slow work, in the nightly run only
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-        run: cargo nextest run --manifest-path v2/Cargo.toml --workspace --locked --profile nightly
+        run: cargo nextest run --manifest-path v2/Cargo.toml --workspace --locked --cargo-profile release --profile nightly
       - run: cargo test --manifest-path v2/Cargo.toml --workspace --locked --doc
       - name: The storage library's own tests
         run: cargo test --manifest-path v2/redb/Cargo.toml --locked --lib --tests
@@ -187,7 +194,7 @@ jobs:
 
       - name: Recorded scale work, the million-row memory ceiling and consumer performance bars in release
         run: |
-          CARGO_TARGET_DIR="$RUNNER_TEMP/statement-target" RUSTFLAGS="--remap-path-prefix=$PWD=/contextdb" cargo nextest run --manifest-path v2/Cargo.toml --locked --cargo-profile release --profile release --lib --test find_at_scale --test memory_ceiling --test performance_bars --test crash --test counted_work --test vectors_maintenance --test bound_find -E 'test(=a_hundred_thousand_sightings_are_found_with_the_recorded_work_recall_and_length) | test(=a_million_rows_load_and_scan_under_64_mib) | binary(=performance_bars) | test(=a_killed_open_reads_the_log_and_last_commit_pages) | test(streaming::) | test(=removal_membership_agrees_with_the_in_memory_evaluator_for_every_kind) | test(=purge::a_purge_leaves_no_copy_in_either_commit_slot) | test(=a_kill_in_any_step_of_a_build_leaves_every_vector_found) | test(=store::tests::every_damaged_record_is_told_as_damage_by_each_path_that_meets_it) | test(=schema::tests::every_damaged_schema_record_is_told_as_damage_or_read_as_tables_that_print) | test(=a_bound_finds_what_is_stored_and_nothing_for_a_face_never_stored) | test(=a_bound_over_sightings_answers_rows_inside_it_however_asked_or_written)'
+          CARGO_TARGET_DIR="$RUNNER_TEMP/statement-target" RUSTFLAGS="--remap-path-prefix=$PWD=/contextdb" cargo nextest run --manifest-path v2/Cargo.toml --locked --cargo-profile release --profile release --lib --test find_at_scale --test memory_ceiling --test performance_bars --test crash --test counted_work --test vectors_maintenance --test bound_find -E 'test(=a_hundred_thousand_sightings_are_found_with_the_recorded_work_recall_and_length) | test(=a_million_rows_load_and_scan_under_64_mib) | binary(=performance_bars) | test(=a_killed_open_reads_the_log_and_last_commit_pages) | test(streaming::) | test(=removal_membership_agrees_with_the_in_memory_evaluator_for_every_kind) | test(=purge::a_purge_leaves_no_copy_in_either_commit_slot) | test(=a_kill_in_any_step_of_a_build_leaves_every_vector_found) | test(=a_kill_in_a_commit_with_an_event_route_keeps_rows_and_actions_together) | test(=the_same_rows_in_more_commits_end_at_the_same_size) | test(=store::tests::every_damaged_record_is_told_as_damage_by_each_path_that_meets_it) | test(=schema::tests::every_damaged_schema_record_is_told_as_damage_or_read_as_tables_that_print) | test(=a_bound_finds_what_is_stored_and_nothing_for_a_face_never_stored) | test(=a_bound_over_sightings_answers_rows_inside_it_however_asked_or_written)'
           cargo test --manifest-path v2/redb/Cargo.toml --locked --release --test contextdb_changes committed_pages_read_and_release_within_their_allowance -- --exact
 
   scale:
@@ -202,7 +209,7 @@ jobs:
       - run: cargo nextest run --manifest-path v2/Cargo.toml --locked --cargo-profile release --profile release --test find_at_scale -E 'test(=a_million_sightings_are_found_with_the_recorded_work_recall_and_length)'
 
   mutations:
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mutations)
     strategy:
       fail-fast: false
       matrix:

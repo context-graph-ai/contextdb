@@ -196,7 +196,9 @@ impl Screen {
     ///
     /// A vector of zeros, stored or searched for, is at distance 1. Its codes or its `unit`
     /// are zeros, so the middle of the range is 0, and `drift` is above zero.
-    pub(super) fn range(&self, slot: &[u8]) -> (f32, f32) {
+    ///
+    /// The middle, `scale` times the product of the codes with `unit` in 32 bits, comes third.
+    pub(super) fn range(&self, slot: &[u8]) -> (f32, f32, f32) {
         let scale = scale(slot);
         let error = f32::from_le_bytes([slot[4], slot[5], slot[6], slot[7]]);
         let middle = f64::from(scale * product(&slot[SLOT_HEADER..], &self.unit));
@@ -205,6 +207,7 @@ impl Screen {
         (
             ((middle - half) as f32).next_down(),
             ((middle + half) as f32).next_up(),
+            middle as f32,
         )
     }
 }

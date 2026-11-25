@@ -233,11 +233,13 @@ pub enum Error {
         max_partitions: u32,
     },
     /// A search asked for `INDEXED`, with `USE VECTOR INDEXED` or through the column's
-    /// `SEARCH_MODE INDEXED`, and the index cannot answer it now: a partition it selects is
-    /// behind its writes, or its filter on rows leaves the index nothing to choose among. Such
-    /// a search is never answered with an exact scan under the indexed name; `EXACT` and
-    /// `AUTO` answer, and a maintenance cycle brings the index up to its writes.
+    /// `SEARCH_MODE INDEXED`, and a partition it selects is behind its writes. Such a search is
+    /// never answered with an exact scan under the indexed name; `EXACT` and `AUTO` answer,
+    /// and a maintenance cycle brings the index up to its writes.
     VectorIndexedRouteUnavailable { index: VectorIndexRef },
+    /// A search asked for `INDEXED` with a filter on rows that no index or key serves for some
+    /// partition it selects. Only the schema or the statement cures it.
+    VectorIndexedFilterUnindexed { index: VectorIndexRef },
     /// INDEXED cannot screen partitions containing rows hidden from this reader.
     VectorIndexedNarrowed { index: VectorIndexRef },
     /// `USE VECTOR` was written in a SELECT that does not order by `<=>`.
@@ -560,8 +562,13 @@ write!(f, "corrupt store at {}: {reason}; preserve it before any reset", path.di
             Error::VectorIndexedRouteUnavailable { index } => write!(
                 f,
                 "{index} cannot be searched INDEXED for this statement now: its index is behind \
-                 its writes, or the statement's filter leaves the index nothing to choose among; \
-                 run a maintenance cycle, or use EXACT or AUTO"
+                 its writes; run a maintenance cycle, or use EXACT or AUTO"
+            ),
+            Error::VectorIndexedFilterUnindexed { index } => write!(
+                f,
+                "{index} cannot be searched INDEXED with this filter: no index or key gives the \
+                 rows the filter passes; declare an index that serves the filter, or use EXACT \
+                 or AUTO"
             ),
             Error::VectorIndexedNarrowed { index } => write!(
                 f,

@@ -162,13 +162,16 @@ fn a_ranked_search_treats_a_hidden_row_joined_by_a_unique_column_as_unmatched() 
 #[test]
 fn partitioning_never_changes_the_contexts_a_caller_may_read() {
     let db = support::open(&support::folder("visibility-partitioned"));
-    for (table, key) in [("flat", ""), ("keyed", " PARTITION_KEY (context_id)")] {
-        let declared = "(id INTEGER PRIMARY KEY, context_id UUID NOT NULL CONTEXT_ID, v VECTOR(3)";
+    let keyed = " PARTITION_KEY (context_id)";
+    let behind = " PARTITION_KEY (context_id) INDEXING_THRESHOLD 1";
+    for (table, key) in [("flat", ""), ("keyed", keyed), ("behind", behind)] {
+        let declared = "(id INTEGER PRIMARY KEY, context_id UUID NOT NULL CONTEXT_ID, \
+                        s INTEGER UNIQUE, v VECTOR(3)";
         support::run(&db, &format!("CREATE TABLE {table} {declared}{key})"));
         for n in 1..=30_i64 {
             let c = context(1 + n as u128 % 3);
             let row = params! { "id" => n, "c" => c, "v" => support::vector(n, 3) };
-            let sql = format!("INSERT INTO {table} (id, context_id, v) VALUES ($id, $c, $v)");
+            let sql = format!("INSERT INTO {table} VALUES ($id, $c, $id, $v)");
             db.execute(&sql, &row).unwrap();
         }
     }
@@ -178,6 +181,43 @@ fn partitioning_never_changes_the_contexts_a_caller_may_read() {
             let [flat, keyed] = ["flat", "keyed"]
                 .map(|table| ids(&handle, &format!("SELECT id FROM {table} {tail}")));
             assert!(flat == keyed && flat.len() == rows, "{contexts:?} {tail}");
+        }
+    }
+    // A hidden row named whole is refused where the find has Contexts of the reader's to
+    // search and the whole WHERE holds for it, its distance bound too; a find left none of them,
+    // as a reader given none is, finds nothing. INDEXED's own refusals come first.
+    let (handle, none) = (in_contexts(&db, &[1]), in_contexts(&db, &[]));
+    let d = support::run(&db, "SELECT v <=> [1.0, 0.0, 0.0] FROM keyed WHERE id = 2");
+    let values = params! { "c" => context(3), "d" => d.rows()[0][0].clone() };
+    let every = "AUTO EXACT INDEXED";
+    let within = |op| format!("id = 2 AND v <=> [1.0, 0.0, 0.0] {op} $d");
+    let (at_most, under) = (within("<="), within("<"));
+    let other = "id = 2 AND k.context_id = $c";
+    for (reader, table, modes, filter, wanted) in [
+        (&handle, "keyed", every, "id = 2", "refused"),
+        (&handle, "keyed", every, "s = 2", "refused"),
+        (&handle, "keyed", every, &at_most, "refused"),
+        (&handle, "keyed", every, &under, "empty"),
+        (&handle, "keyed", every, other, "empty"),
+        (&handle, "flat", "AUTO EXACT", other, "empty"),
+        (&handle, "flat", "INDEXED", "id = 2", "narrowed"),
+        (&handle, "behind", "INDEXED", "id = 2", "behind"),
+        (&none, "keyed", every, "id = 2", "empty"),
+        (&none, "flat", "AUTO EXACT", "id = 2", "empty"),
+        (&none, "flat", "INDEXED", "id = 2", "narrowed"),
+    ] {
+        for mode in modes.split(' ') {
+            let near = format!("ORDER BY v <=> [1.0, 0.0, 0.0] USE VECTOR {mode} LIMIT 3");
+            let sql = format!("SELECT id FROM {table} AS k WHERE {filter} {near}");
+            let found = reader.execute(&sql, &values);
+            let got = match &found {
+                Ok(answer) if answer.rows().is_empty() => "empty",
+                Err(Error::VectorIndexedNarrowed { .. }) => "narrowed",
+                Err(Error::VectorIndexedRouteUnavailable { .. }) => "behind",
+                Err(Error::ContextScopeViolation { .. }) => "refused",
+                _ => "other",
+            };
+            assert_eq!(got, wanted, "{sql}: {found:?}");
         }
     }
 }

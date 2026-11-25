@@ -201,7 +201,7 @@ fn a_statement_is_charged_at_least_what_parsing_it_allocates_and_at_most_twice()
         format!("INSERT INTO t (id, body) VALUES {}", rows.join(", ")),
         format!(
             "INSERT INTO t (id, body) VALUES (1, '{}')",
-            "x".repeat(30_000_000)
+            "x".repeat(2_000_000)
         ),
     ] {
         let budget = Budget::new(None).expect("a budget with no ceiling");

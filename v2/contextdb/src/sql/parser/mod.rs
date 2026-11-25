@@ -326,7 +326,7 @@ fn check_source_nesting(text: &str) -> Result<()> {
             }
             _ => {
                 prefixes = 0;
-                operand_next = matches!(token, "=" | "<" | ">" | "+" | "-" | "*" | "/" | ",")
+                operand_next = matches!(token, "=" | "<" | ">" | "+" | "-" | "*" | "/" | "%" | ",")
                     || ["AND", "OR", "WHERE", "SELECT", "BY"]
                         .iter()
                         .any(|word| token.eq_ignore_ascii_case(word));

@@ -75,6 +75,13 @@ fn an_index_entry_with_no_row_is_refused_as_damage_by_a_lookup_through_it() {
         "an index entry naming a row that is not there must be refused as damage, not skipped \
          into an empty answer: {found:?}"
     );
+    // An ordered walk of the index meets the entry too, forward and backward (CDB-141).
+    for order in ["", " DESC"] {
+        let sql = format!("SELECT id FROM t WHERE tag >= 7 ORDER BY tag{order}");
+        let found = db.execute(&sql, &HashMap::new());
+        let damage = matches!(found, Err(Error::StoreCorrupted { .. }));
+        assert!(damage, "{sql} gave {found:?}, not the damage");
+    }
     drop(db);
     std::fs::remove_dir_all(&folder).expect("remove the test's folder");
 }
@@ -303,12 +310,13 @@ fn expiry_uses_current_declarations_and_keeps_every_derived_answer_atomic() {
             (Some(1), Some(10)),
             "expiry exposes untouched partition a"
         );
+        // The cycle that expires rows starts work on the partition they expose (9a13449e1).
         let shown = run(&db, "SHOW VECTOR_PARTITIONS FOR docs.v");
         assert!(
             shown
                 .rows()
                 .iter()
-                .any(|r| r.iter().any(|v| v == &Value::Text("pending".into())))
+                .any(|r| r.iter().any(|v| v == &Value::Text("building".into())))
         );
         db.verify().unwrap();
         db.close().unwrap();

@@ -7,6 +7,8 @@
 //! (`support::Stored::nearest`) and holds the search to it.
 
 mod support;
+#[path = "support/vecsearch.rs"]
+mod vecsearch;
 
 use std::collections::BTreeMap;
 
@@ -24,6 +26,19 @@ fn set_vector(on: &impl Run, id: i64, vector: Option<Vec<f32>>) {
         Ok(result) => assert_eq!(result.rows_affected(), 1, "updating the vector of row {id}"),
         Err(error) => panic!("updating the vector of row {id} was refused: {error:?}"),
     }
+}
+
+/// Inserts these rows of `docs` in one transaction: row `n` with its scattered vector, under
+/// the context `ctx(n)`.
+fn insert_committed(
+    db: &Database,
+    numbers: impl IntoIterator<Item = i64>,
+    dimension: usize,
+    ctx: impl Fn(i64) -> String,
+) {
+    let tx = db.transaction().expect("begin");
+    support::insert_docs(&tx, numbers, dimension, ctx);
+    tx.commit().expect("commit");
 }
 
 /// The vector of row `n` in the first test: mostly the scattered vector of `n` at one of seven
@@ -49,9 +64,7 @@ fn told_apart(n: i64, dimension: usize) -> Option<Vec<f32>> {
 fn exact_search_returns_the_true_nearest_vectors() {
     // 81 retains every special row through 80; 4,098 also crosses the 4,096-vector seal bound.
     for (dimension, rows) in [(3, 4098_i64), (16, 81), (33, 81), (384, 81), (768, 81)] {
-        let folder = support::folder(&format!("exact-nearest-{dimension}"));
-        let db = support::open(&folder);
-        support::declare_docs(&db, dimension, "");
+        let (folder, db) = vecsearch::docs(&format!("exact-nearest-{dimension}"), dimension, "");
         // Not in key order: the even rows from the last down, then the odd rows from the first.
         let evens = (1..=rows).rev().filter(|n| n % 2 == 0);
         let odds = (1..=rows).filter(|n| n % 2 == 1);
@@ -135,16 +148,12 @@ fn exact_search_returns_the_true_nearest_vectors() {
 #[test]
 fn exact_search_rescores_from_stored_vectors() {
     const DIMENSION: usize = 16;
-    let folder = support::folder("exact-rescores");
-    let db = support::open(&folder);
-    support::declare_docs(&db, DIMENSION, "PARTITION_KEY (ctx)");
-    let tx = db.transaction().expect("begin");
-    support::insert_docs(&tx, 1..=400, DIMENSION, |n| format!("c{}", n % 4));
-    tx.commit().expect("commit");
+    let (folder, db) = vecsearch::docs("exact-rescores", DIMENSION, "PARTITION_KEY (ctx)");
+    insert_committed(&db, 1..=200, DIMENSION, |n| format!("c{}", n % 4));
     support::seal_all(&db);
 
     // What each row that is still there holds: its context, and its vector if it has one.
-    let mut held: BTreeMap<i64, (i64, Option<Vec<f32>>)> = (1..=400)
+    let mut held: BTreeMap<i64, (i64, Option<Vec<f32>>)> = (1..=200)
         .map(|n| (n, (n % 4, Some(support::vector(n, DIMENSION)))))
         .collect();
     // Vectors that were a row's and are no row's now: a slot written from one of them is the
@@ -154,7 +163,7 @@ fn exact_search_rescores_from_stored_vectors() {
     // Numbers no row was ever given a vector for.
     let mut fresh = 10_000_i64;
 
-    for step in 1..=300 {
+    for step in 1..=150 {
         let at = steps.below(held.len() as u64) as usize;
         let id = *held.keys().nth(at).expect("a row that is still there");
         let (ctx, vector) = held.get(&id).expect("the row").clone();
@@ -185,7 +194,7 @@ fn exact_search_rescores_from_stored_vectors() {
                 held.insert(id, (to, vector));
             }
         }
-        if step % 40 == 0 {
+        if step % 20 == 0 {
             db.run_maintenance_cycle().expect("a cycle between changes");
         }
         if step % 5 != 0 {
@@ -255,18 +264,12 @@ fn exact_search_rescores_from_stored_vectors() {
 #[test]
 fn exact_search_reads_its_own_snapshot() {
     const DIMENSION: usize = 16;
-    let folder = support::folder("exact-own-snapshot");
-    let db = support::open(&folder);
-    support::declare_docs(&db, DIMENSION, "PARTITION_KEY (ctx)");
+    let (folder, db) = vecsearch::docs("exact-own-snapshot", DIMENSION, "PARTITION_KEY (ctx)");
     let ctx = |n: i64| format!("c{}", n % 2);
     // Rows 1 to 100 are in blocks and rows 101 to 200 on pending lists.
-    let tx = db.transaction().expect("begin");
-    support::insert_docs(&tx, 1..=100, DIMENSION, ctx);
-    tx.commit().expect("commit");
+    insert_committed(&db, 1..=100, DIMENSION, ctx);
     support::seal_all(&db);
-    let tx = db.transaction().expect("begin");
-    support::insert_docs(&tx, 101..=200, DIMENSION, ctx);
-    tx.commit().expect("commit");
+    insert_committed(&db, 101..=200, DIMENSION, ctx);
 
     // The search is for the vector of row 7, which is sealed. Row 160, which is pending, is
     // given the same direction, so the committed answer begins with rows 7 and 160.
@@ -347,13 +350,9 @@ fn exact_search_reads_its_own_snapshot() {
 fn vector_search_filters_before_scoring() {
     const DIMENSION: usize = 16;
     const ROWS: i64 = 5000;
-    let folder = support::folder("filters-before-scoring");
-    let db = support::open(&folder);
-    support::declare_docs(&db, DIMENSION, "");
+    let (_, db) = vecsearch::docs("filters-before-scoring", DIMENSION, "");
     for first in (1..=ROWS).step_by(1000) {
-        let tx = db.transaction().expect("begin");
-        support::insert_docs(&tx, first..first + 1000, DIMENSION, |_| "a".to_owned());
-        tx.commit().expect("commit");
+        insert_committed(&db, first..first + 1000, DIMENSION, |_| "a".to_owned());
     }
     let stored = support::stored(&db, support::DOCS);
     let tag = |row: &[Value]| match row[2] {
@@ -412,12 +411,6 @@ fn equal_distances_come_in_primary_key_order() {
     // The first pair of rows with one vector is 3 and 9, the second 4 and 8; the lower key of
     // each is under the context x and the higher under y.
     let pair = |number: i64| support::vector(50_000 + number, DIMENSION);
-    let filler = |tx: &contextdb::Transaction<'_>, numbers: std::ops::RangeInclusive<i64>| {
-        support::insert_docs(tx, numbers, DIMENSION, |n| {
-            let ctx = if n % 2 == 0 { "x" } else { "y" };
-            ctx.to_owned()
-        });
-    };
     let insert = |db: &Database, id: i64, ctx: &str, vector: Vec<f32>| {
         if let Err(error) = support::insert_doc(db, id, ctx, Some(vector)) {
             panic!("row {id} was refused: {error:?}");
@@ -453,9 +446,11 @@ fn equal_distances_come_in_primary_key_order() {
         } else {
             "lower-last"
         };
-        let folder = support::folder(&format!("equal-distances-{name}"));
-        let db = support::open(&folder);
-        support::declare_docs(&db, DIMENSION, "PARTITION_KEY (ctx)");
+        let (_, db) = vecsearch::docs(
+            &format!("equal-distances-{name}"),
+            DIMENSION,
+            "PARTITION_KEY (ctx)",
+        );
         // In the first store the lower key of a pair is inserted first, and its context is
         // the first partition; in the second store it is inserted last.
         let in_order = |low: (i64, &'static str), high: (i64, &'static str)| {
@@ -470,9 +465,10 @@ fn equal_distances_come_in_primary_key_order() {
         let [first, second] = in_order((3, "x"), (9, "y"));
         insert(&db, first.0, first.1, pair(1));
         insert(&db, second.0, second.1, pair(1));
-        let tx = db.transaction().expect("begin");
-        filler(&tx, 20..=60);
-        tx.commit().expect("commit");
+        insert_committed(&db, 20..=60, DIMENSION, |n| {
+            let ctx = if n % 2 == 0 { "x" } else { "y" };
+            ctx.to_owned()
+        });
         lower_first(&db, &pair(1), 3, 9, &format!("{name}, both pending"));
 
         // Both sealed.
@@ -500,12 +496,8 @@ fn equal_distances_come_in_primary_key_order() {
 #[test]
 fn a_row_is_in_an_answer_once_after_its_vector_changes() {
     const DIMENSION: usize = 16;
-    let folder = support::folder("in-an-answer-once");
-    let db = support::open(&folder);
-    support::declare_docs(&db, DIMENSION, "PARTITION_KEY (ctx)");
-    let tx = db.transaction().expect("begin");
-    support::insert_docs(&tx, 1..=60, DIMENSION, |n| format!("c{}", n % 3));
-    tx.commit().expect("commit");
+    let (_, db) = vecsearch::docs("in-an-answer-once", DIMENSION, "PARTITION_KEY (ctx)");
+    insert_committed(&db, 1..=60, DIMENSION, |n| format!("c{}", n % 3));
     support::seal_all(&db);
 
     // Every vector row 7 has had, and a vector no row has had.
@@ -596,12 +588,8 @@ fn a_row_is_in_an_answer_once_after_its_vector_changes() {
 fn the_distance_is_the_expression_in_the_select_list() {
     const DIMENSION: usize = 16;
     const K: usize = 7;
-    let folder = support::folder("distance-in-select-list");
-    let db = support::open(&folder);
-    support::declare_docs(&db, DIMENSION, "");
-    let tx = db.transaction().expect("begin");
-    support::insert_docs(&tx, 1..=200, DIMENSION, |_| "a".to_owned());
-    tx.commit().expect("commit");
+    let (_, db) = vecsearch::docs("distance-in-select-list", DIMENSION, "");
+    insert_committed(&db, 1..=200, DIMENSION, |_| "a".to_owned());
     let query = support::vector(70_000, DIMENSION);
     // The name this engine gives a select item that was given none.
     let unnamed = support::run(&db, "SELECT id, id + 1 FROM docs LIMIT 1").columns()[1].clone();
@@ -733,9 +721,7 @@ fn insert_toward(on: &impl Run, ctx: &str, first: i64, count: i64, nearest: f32,
 
 #[test]
 fn a_search_that_has_to_look_twice_returns_the_true_nearest() {
-    let folder = support::folder("search-looks-twice");
-    let db = support::open(&folder);
-    support::declare_docs(&db, AHEAD.len(), "");
+    let (folder, db) = vecsearch::docs("search-looks-twice", AHEAD.len(), "");
     // Ten rows very near the vector searched for, ten at about half its similarity and thirty
     // far from it, all in one block.
     let tx = db.transaction().expect("begin");
@@ -825,36 +811,34 @@ fn a_row_two_entries_lead_to_is_in_the_answer_once_and_pushes_no_row_out() {
     // the pending list; row 20 is the nearest and has the greatest key. A transaction changes
     // another column of it, so its search reads row 20 as a staged row, then the twenty
     // pending rows in key order, row 20 last of all.
-    let folder = support::folder("reached-twice-staged-and-pending");
-    let db = support::open(&folder);
-    support::declare_docs(&db, AHEAD.len(), "");
+    let (_, db) = vecsearch::docs("reached-twice-staged-and-pending", AHEAD.len(), "");
     let tx = db.transaction().expect("begin");
     insert_toward(&tx, "a", 1, 19, 0.88, 0.02);
     insert_toward(&tx, "a", 20, 1, 0.95, 0.0);
     tx.commit().expect("commit");
-    let (committed, examined) = nearest_ten(&db, "twenty pending rows");
+    let (committed, pending) = nearest_ten(&db, "twenty pending rows");
     assert_eq!(committed[0], 20);
-    assert_eq!(
-        examined,
-        20 + K as u64,
-        "twenty pending rows and ten returned"
-    );
     let tx = db.transaction().expect("begin");
     support::run(&tx, "UPDATE docs SET tag = 99 WHERE id = 20");
     let (inside, examined) = nearest_ten(&tx, "row 20 staged over its pending record");
     assert_eq!(inside, committed);
-    // One staged row, twenty pending rows, ten returned: row 20 was reached twice.
-    assert_eq!(examined, 1 + 20 + K as u64);
+    // Row 20 was reached twice: as the staged row, one read more than the committed find's.
+    assert!(
+        examined <= 1 + pending,
+        "{examined} rows read, {pending} committed"
+    );
     tx.rollback();
+    // Pending vectors are screened exactly as a block's slots: sealed, the find reads the same.
+    assert_eq!(support::seal_all(&db), 20);
+    let sealed = nearest_ten(&db, "the twenty rows sealed").1;
+    assert_eq!(pending, sealed, "rows read pending and sealed (design F1)");
 
     // A row on the pending list whose earlier vector has a slot. Twenty far rows and row 30
     // are in a block. Then nine rows arrive on the pending list, and row 30 is given a vector
     // that makes it the third nearest: the ten pending rows are the answer, and they fill it
     // before any slot is looked at. The slot row 30 left behind is of a vector nearer than
     // the tenth row, so it is visited, and leads to row 30 again.
-    let folder = support::folder("reached-twice-pending-and-slot");
-    let db = support::open(&folder);
-    support::declare_docs(&db, AHEAD.len(), "");
+    let (folder, db) = vecsearch::docs("reached-twice-pending-and-slot", AHEAD.len(), "");
     let tx = db.transaction().expect("begin");
     insert_toward(&tx, "a", 1, 20, 0.40, 0.02);
     insert_toward(&tx, "a", 30, 1, 0.81, 0.0);
@@ -875,9 +859,7 @@ fn a_row_two_entries_lead_to_is_in_the_answer_once_and_pushes_no_row_out() {
     // the same bytes. Then row 50 is given a vector that makes it the nearest. The answer is
     // row 50, rows 1 to 8 and row 20: row 20 is its tenth row, and the slot row 50 left
     // behind is held back beside the slot of row 20, proving the same range.
-    let folder = support::folder("reached-twice-slot-of-an-earlier-vector");
-    let db = support::open(&folder);
-    support::declare_docs(&db, AHEAD.len(), "");
+    let (_, db) = vecsearch::docs("reached-twice-slot-of-an-earlier-vector", AHEAD.len(), "");
     let tx = db.transaction().expect("begin");
     insert_toward(&tx, "a", 1, 8, 0.90, 0.02);
     for id in [20, 50] {

@@ -1,8 +1,11 @@
 mod support;
+#[path = "support/workev.rs"]
+mod workev;
 use contextdb::{DatabaseOpenOptions, Error, params};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use support::*;
+use workev::open_with;
 #[test]
 fn a_schedule_runs_its_callback_on_any_handle() {
     for (kind, (policy, within, missed)) in [
@@ -38,6 +41,10 @@ fn a_schedule_runs_its_callback_on_any_handle() {
         let suffix = match policy {
             "" | "refused" | "absent" | "drop-other" | "row-tx" | "purge" => String::new(),
             _ => format!(" MISSED_TICK_POLICY '{policy}'{within}"),
+        };
+        let failed = |db: &contextdb::Database| {
+            let status = serde_json::to_value(&*db.event_bus_status().unwrap()).unwrap();
+            status["schedules"][0]["last_error"].is_string()
         };
         let ddl = format!("CREATE SCHEDULE timer EVERY '10 seconds' TX (advance){suffix}");
         let narrow = |db: &contextdb::Database| match kind % 3 {
@@ -102,14 +109,36 @@ fn a_schedule_runs_its_callback_on_any_handle() {
         }
         narrowed.run_maintenance_cycle().unwrap();
         assert_eq!(int(&db, "SELECT calls FROM ticks"), 0);
+        if policy == "absent" {
+            run(
+                &db,
+                "CREATE TABLE gone (id INT PRIMARY KEY, due TIMESTAMP EXPIRES) RETAIN 1 SECONDS",
+            );
+            let due = params! { "due" => contextdb::Value::Timestamp(105_000) };
+            db.execute("INSERT INTO gone VALUES (1, $due)", &due)
+                .unwrap();
+        }
         let pending = (policy == "row-tx").then(|| {
             let tx = db.transaction().unwrap();
             run(&tx, "INSERT INTO unrelated VALUES (1)");
             tx
         });
         now.store(110, SeqCst);
+        // A schedule whose callback is missing fails alone: the cycle goes on and its error is
+        // reported against that schedule (design 4, S2 rule 1).
         let first = narrowed.run_maintenance_cycle();
-        assert_eq!(first.is_err(), matches!(policy, "refused" | "absent"));
+        assert_eq!(first.is_err(), policy == "refused", "{policy}: {first:?}");
+        if policy == "absent" {
+            assert!(
+                failed(&db),
+                "the missing callback is reported against its schedule"
+            );
+            assert_eq!(
+                int(&db, "SELECT COUNT(*) FROM gone"),
+                0,
+                "the cycle still removed"
+            );
+        }
         if let Some(tx) = pending {
             tx.commit()
                 .expect("due tick must preserve row transactions");
@@ -165,10 +194,12 @@ fn a_schedule_runs_its_callback_on_any_handle() {
         now.store(160, SeqCst);
         close(db);
         let db = open_with(&folder, options()).unwrap();
-        assert!(matches!(
-            db.run_maintenance_cycle(),
-            Err(Error::PlanError(_))
-        ));
+        db.run_maintenance_cycle()
+            .expect("a missing callback ends no cycle");
+        assert!(
+            failed(&db),
+            "the missing callback is reported against its schedule"
+        );
         assert_eq!(int(&db, "SELECT calls FROM ticks"), prior + missed + 1);
     }
 }

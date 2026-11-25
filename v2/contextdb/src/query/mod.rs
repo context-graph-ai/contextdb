@@ -264,7 +264,7 @@ impl QueryResult {
     }
 
     /// The pages a read session found in its cache and the pages it read from the file, as
-    /// Postgres counts hits and reads; running statements on one session share the counts.
+    /// Postgres counts hits and reads; the counts are per statement, not summed over the session.
     pub fn pages(&self) -> (u64, u64) {
         self.cache
     }

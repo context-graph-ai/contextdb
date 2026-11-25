@@ -29,13 +29,8 @@ impl Store {
         if limit.saturating_sub(reserve).saturating_sub(bytes) >= 4096 {
             return Ok(None);
         }
-        let reclaimable = if finding.is_some() {
-            true
-        } else {
-            let (free, _, pending, _, _) = self.compaction_space(&mut 16)?;
-            free == 0 && pending > 0
-        };
-        Ok(reclaimable.then_some((bytes, limit)))
+        let free = self.compaction_state()?.0;
+        Ok((finding.is_some() || free == 0).then_some((bytes, limit)))
     }
 
     pub(crate) fn disk_limit(&self, limit: Option<u64>) {
