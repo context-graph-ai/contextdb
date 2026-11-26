@@ -323,6 +323,25 @@ fn auto_uses_ivfs_from_indexing_threshold_on() {
     auto_is_exact(&db, None, &query);
 }
 
+/// The mandatory cell of 10,000 vectors in one partition: AUTO takes its IVF and compares
+/// fewer vectors than EXACT, and answers ten rows with their true distances.
+/// Left to the release run by `v2/.config/nextest.toml`.
+#[test]
+fn auto_over_ten_thousand_vectors_in_one_partition_does_fewer_evaluations_than_exact() {
+    let (_, db) = support::built("auto-ten-thousand", DIMENSION, GROUPED, 10_000);
+    let plan = db.explain(&support::by_mode(None, "AUTO", 10)).unwrap();
+    let plan = plan.to_string();
+    assert!(plan.lines().any(|l| l.trim() == "route: indexed"), "{plan}");
+    let (stored, query) = (support::stored(&db, support::DOCS), question(3));
+    let [auto, exact] = auto_and_exact(&db, None, &query);
+    support::assert_sound(&auto, &stored, all, &query, 10, "AUTO over 10,000");
+    let (auto, exact) = (auto.distance_evaluations(), exact.distance_evaluations());
+    assert!(
+        auto < exact,
+        "AUTO did {auto} distance evaluations, EXACT {exact}"
+    );
+}
+
 #[test]
 fn auto_follows_the_threshold_in_force_and_indexed_does_not() {
     let (_, db) = support::built("auto-threshold-set", DIMENSION, GROUPED, 2000);
@@ -1165,6 +1184,107 @@ fn a_ivf_whose_codes_cannot_tell_its_vectors_apart_answers_as_exact() {
             support::assert_nearest(&db, &sql, &query, &allowed, &format!("{what}, filtered"));
         }
     }
+}
+
+/// Every row the walk reads at the distance where it stops reaches the statement's ORDER BY,
+/// as pgvector's ivfflat gives every row it reads to the outer sort: of 600 rows of one vector
+/// in a grouped partition, the later sort keys pick the eight under AUTO and INDEXED as under
+/// EXACT, with no filter and with one on rows.
+#[test]
+fn rows_tied_at_the_walks_last_distance_all_reach_the_order_by() {
+    let (_, db) = vecsearch::docs("tied-at-the-cutoff", DIMENSION, "INDEXING_THRESHOLD 100");
+    support::load_docs(&db, 1..=600, "a", |_| gathered(1));
+    support::run(&db, "CREATE INDEX docs_tag ON docs (tag)");
+    support::maintenance(&db);
+    let query = question(0);
+    let sql = |filter: &str, mode: &str| {
+        let order = "ORDER BY v <=> $q, tag DESC, id DESC";
+        format!("SELECT id FROM docs {filter} {order} USE VECTOR {mode} LIMIT 8")
+    };
+    let plan = db.explain(&sql("", "AUTO")).unwrap().to_string();
+    assert!(plan.lines().any(|l| l.trim() == "route: indexed"), "{plan}");
+    let ids = |filter, mode| {
+        support::answer(&db, &sql(filter, mode), &query)
+            .rows()
+            .concat()
+    };
+    let top: Vec<_> = (0..8).map(|n| Value::Int64(599 - 50 * n)).collect();
+    assert_eq!(ids("", "EXACT"), top, "EXACT: tag 49, highest key first");
+    for filter in ["", "WHERE tag < 25", "WHERE id > 300"] {
+        let exact = ids(filter, "EXACT");
+        for mode in ["AUTO", "INDEXED"] {
+            assert_eq!(ids(filter, mode), exact, "{mode} {filter:?}");
+        }
+    }
+}
+
+/// A tie past the LIMIT costs an exact search nothing: with one row at the query and 999 tied
+/// behind it, a later ORDER BY key reads each row and then only the one answered; and the
+/// rows tied at the cutoff are read again streamed, not held, so its memory does not grow with
+/// the number tied. AUTO reading a narrow filter's rows directly holds no ties either.
+#[test]
+fn an_exact_search_with_ties_at_its_cutoff_stays_within_its_bounds() {
+    let (_, db) = vecsearch::docs("tied-exact-bounds", DIMENSION, "INDEXING_THRESHOLD 100");
+    support::load_docs(&db, 1..=1, "a", |_| question(0));
+    support::load_docs(&db, 2..=1000, "a", |_| gathered(1));
+    support::maintenance(&db);
+    let sql =
+        |order| format!("SELECT id FROM docs ORDER BY v <=> $q{order} USE VECTOR EXACT LIMIT 1");
+    let near = support::answer(&db, &sql(""), &question(0));
+    let ordered = support::answer(&db, &sql(", id DESC"), &question(0));
+    assert_eq!(ordered.rows(), [vec![Value::Int64(1)]]);
+    assert_eq!(
+        ordered.rows_examined(),
+        1001,
+        "each row, then the one answered: {near:?}"
+    );
+    let peak = |top| {
+        let tied = support::answer(&db, &sql(", id DESC"), &gathered(1));
+        assert_eq!(tied.rows().concat(), [Value::Int64(top)]);
+        tied.peak_bytes().unwrap()
+    };
+    let at_999 = peak(1000);
+    let narrowed = |most| {
+        let order = "ORDER BY v <=> $q, id DESC USE VECTOR AUTO LIMIT 1";
+        let sql = format!("SELECT id FROM docs WHERE id <= {most} {order}");
+        let plan = db.explain(&sql).unwrap().to_string();
+        assert!(plan.contains("filter_route: direct"), "{plan}");
+        let tied = support::answer(&db, &sql, &gathered(1));
+        assert_eq!(tied.rows().concat(), [Value::Int64(most)]);
+        tied.peak_bytes().unwrap()
+    };
+    assert_eq!(
+        narrowed(99),
+        narrowed(60),
+        "AUTO read directly: 98 tied rows against 59"
+    );
+    support::load_docs(&db, 1001..=3000, "a", |_| gathered(1));
+    assert_eq!(peak(3000), at_999, "2,999 tied rows against 999");
+}
+
+/// A search that walks the index holding rows tied at its cutoff and then reads its filter's
+/// rows directly gives back the room it held them in before it reads a row again: with every
+/// row tied and a 1 MiB answer its filter reads, it peaks within a kibibyte of one that read
+/// directly at once.
+#[test]
+fn a_walk_that_turns_direct_gives_back_the_room_its_ties_took() {
+    let (_, db) = support::built("tied-walk-turns-direct", DIMENSION, GROUPED, 2000);
+    let big = "b".repeat(1 << 20);
+    support::run(&db, &format!("UPDATE docs SET ctx = '{big}' WHERE id = 1"));
+    let peak = |most, route| {
+        let order = "ORDER BY v <=> $q, ctx DESC, id DESC USE VECTOR AUTO LIMIT 1";
+        let sql = format!("SELECT id FROM docs WHERE id <= {most} AND ctx >= 'a' {order}");
+        let plan = db.explain(&sql).unwrap().to_string();
+        assert!(plan.contains(route), "{plan}");
+        let tied = support::answer(&db, &sql, &[0.0; DIMENSION]);
+        assert_eq!(tied.rows().concat(), [Value::Int64(1)]);
+        tied.peak_bytes().unwrap()
+    };
+    let (walked, direct) = (
+        peak(800, "filter_route: walk"),
+        peak(500, "filter_route: direct"),
+    );
+    assert!(walked <= direct + 1024, "{walked} bytes against {direct}");
 }
 
 #[test]

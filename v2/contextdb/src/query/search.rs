@@ -243,9 +243,13 @@ impl Source for Search<'_> {
                 Ok(false)
             })?;
         }
+        // Rows tied at the LIMIT's cutoff are held only while a partition is walked through its
+        // index: a walk of every row reads them again, streamed, when the lookahead pair ties.
+        // Set once the partitions read directly are known, and unset when the walk turns direct.
+        let ties = Cell::new(None);
         // Works a row's distance out from its stored vector and offers the row to the answer
         // by that distance, or by its rank; the vector part keeps the nearest itself.
-        let mut offer = |key: &Key, row: &[Value], kept: &mut Reservation| -> Result<_> {
+        let offer = |key: &Key, row: &[Value], kept: &mut Reservation, best: &mut Vec<_>| {
             let Some(distance) = measured(row) else {
                 return Ok(None);
             };
@@ -258,8 +262,8 @@ impl Source for Search<'_> {
                 None => Value::Float64(distance),
                 Some(rank) => rank.order(row, distance, given, kept)?,
             };
-            keep(&mut best, want, (by, key), kept)?;
-            Ok(Some(distance))
+            keep(best, (want, ties.get()), (by, key), kept)?;
+            Ok::<_, Error>(Some(distance))
         };
         // The countable paths read directly: the partitions decided so, and the walked ones
         // when the rows the walk read reached at a doubling the entries their paths reach.
@@ -268,6 +272,11 @@ impl Source for Search<'_> {
             loop {
                 let mut direct = decided.iter().map(|decided| decided.direct);
                 planned.retain(|_| !direct.next().unwrap_or(false));
+                let indexed = planned.iter().any(|planned| planned.route != Route::Exact);
+                ties.set((further && indexed).then_some(self.most));
+                if ties.get().is_none() {
+                    let_go(&mut best, want, &mut kept)?;
+                }
                 let (now, walked): (Vec<_>, Vec<_>) = decided.drain(..).partition(|d| d.direct);
                 paths.extend(now.into_iter().filter_map(|decided| decided.path));
                 let doubling = !matches!(how, (VectorSearchMode::Indexed, ..))
@@ -298,7 +307,7 @@ impl Source for Search<'_> {
                     let Some((row, bytes)) = asked.row(key, &mut kept)? else {
                         return Ok(None);
                     };
-                    let distance = offer(key, &row, &mut kept)?;
+                    let distance = offer(key, &row, &mut kept, &mut best)?;
                     kept.shrink(bytes);
                     Ok(distance)
                 };
@@ -317,6 +326,8 @@ impl Source for Search<'_> {
                     found?;
                     // At a doubling every walked partition is read directly: none is walked.
                     if doubled.get() {
+                        ties.set(None);
+                        let_go(&mut best, want, &mut kept)?;
                         planned.clear();
                         paths.extend(walked.into_iter().filter_map(|decided| decided.path));
                     }
@@ -333,7 +344,7 @@ impl Source for Search<'_> {
         let statement = Some(path).filter(|_| !walks);
         for path in statement.into_iter().chain(&paths) {
             asked.walk(path, &mut kept, |key, row, bytes, kept| {
-                offer(&key, &row, kept)?;
+                offer(&key, &row, kept, &mut best)?;
                 kept.shrink(bytes);
                 Ok(true)
             })?;
@@ -341,15 +352,20 @@ impl Source for Search<'_> {
         // Every row was compared when no partition left is walked through its index: the
         // direct ones were taken out of `planned` as they were decided or at a doubling.
         let exact = !walks || planned.iter().all(|planned| planned.route == Route::Exact);
-        let tied = matches!(&best[..], [.., (last, ..), (after, ..)] if last == after);
-        if further && best.len() == want && tied && exact {
+        let tied = matches!(best.get(..want), Some([.., (last, ..), (after, ..)]) if last == after);
+        if further && tied && exact {
             asked.walk(path, &mut kept, |key, row, bytes, kept| {
                 kept.shrink(bytes);
                 measured(&row).map_or(Ok(true), |d| answer(&key, &Value::Float64(d), reservation))
             })?;
             return Ok(());
         }
-        for (by, key) in best.iter().take(self.most) {
+        // The lookahead pair, or a pair after it, is answered only when it ties the LIMIT's
+        // cutoff: one farther is past the LIMIT whatever the later ORDER BY keys say.
+        let cut = self.most.checked_sub(1).and_then(|last| best.get(last));
+        let within =
+            |(by, _): &&(Value, Key)| cut.is_none_or(|(cut, _)| sort_order(cut, by).is_ge());
+        for (by, key) in best.iter().take_while(within) {
             if !answer(key, by, reservation)? {
                 break;
             }
@@ -495,26 +511,64 @@ pub(super) fn refusal(
 }
 
 /// Offers a pair to `best`, which holds in order the `most` least pairs offered: by value as
-/// ORDER BY puts values going up, NULL last, then by key. A key `best` holds is not offered
-/// again. What a pair holds is taken from `reservation` while it is held.
-fn keep(
+/// ORDER BY puts values going up, NULL last, then by key. With `ties` it holds besides every
+/// pair offered whose value is that of the `ties`-th, the cutoff, so that a later sort on
+/// other keys sees each of them as pgvector's does; only pairs beyond the cutoff are dropped.
+/// A key `best` holds is not offered again: the same row comes with the same value, so it is
+/// where the pair would go. What a pair holds is taken from `reservation` while it is held.
+/// The room `best` grows to is taken as it grows and kept until `best` is dropped, since a
+/// pair let go leaves that room allocated. Pairs held for ties are let go by [`let_go`] when
+/// ties are no longer held.
+pub(super) fn keep(
     best: &mut Vec<(Value, Key)>,
-    most: usize,
+    (most, ties): (usize, Option<usize>),
     (value, key): (Value, &Key),
     reservation: &mut Reservation,
 ) -> Result<()> {
-    let bytes = |key: &Key| (size_of::<(Value, Key)>() + key.as_bytes().len()) as u64;
+    let bytes = |key: &Key| key.as_bytes().len() as u64;
     let before = |(held, by): &(_, Key)| sort_order(held, &value).then(by.cmp(key)).is_lt();
+    let beyond = |best: &[(Value, Key)], value: &Value| {
+        let cutoff = ties.and_then(|ties| best.get(ties.checked_sub(1)?));
+        cutoff.is_none_or(|(held, _)| sort_order(held, value).is_lt())
+    };
+    let trim = |best: &mut Vec<(Value, Key)>, reservation: &mut Reservation| {
+        while best.len() > most
+            && beyond(best, &best[best.len() - 1].0)
+            && let Some((_, out)) = best.pop()
+        {
+            reservation.shrink(bytes(&out));
+        }
+    };
     let at = best.partition_point(before);
-    if at == most || best.iter().any(|(_, held)| held == key) {
+    if at >= most && beyond(best, &value) || best.get(at).is_some_and(|(_, held)| held == key) {
         return Ok(());
     }
+    reservation.room(best, usize::MAX)?;
     reservation.grow(bytes(key))?;
     best.insert(at, (value, key.clone()));
-    if best.len() > most
-        && let Some((_, out)) = best.pop()
-    {
-        reservation.shrink(bytes(&out));
+    trim(best, reservation);
+    Ok(())
+}
+
+/// Lets go, at once, of the pairs `best` holds past its `most` when ties stop being held, and of
+/// the room they grew it to: a list just large enough for what is left, taken first, replaces
+/// it, so that nothing read after is charged beside room no pair uses.
+pub(super) fn let_go(
+    best: &mut Vec<(Value, Key)>,
+    most: usize,
+    reservation: &mut Reservation,
+) -> Result<()> {
+    let past = most.min(best.len());
+    for (_, out) in best.drain(past..) {
+        reservation.shrink(out.as_bytes().len() as u64);
+    }
+    if best.capacity() > best.len() {
+        let slot = size_of::<(Value, Key)>();
+        reservation.grow((best.len() * slot) as u64)?;
+        let mut fresh = Vec::with_capacity(best.len());
+        fresh.append(best);
+        let large = std::mem::replace(best, fresh).capacity();
+        reservation.shrink((large * slot) as u64);
     }
     Ok(())
 }

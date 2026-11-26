@@ -91,10 +91,10 @@ done
 
 # A flat open of an 8 GiB store, and the camera day: 500 sightings a second for 86,400 seconds,
 # each turnover's store size and the last over the first (sustained writing reads its early
-# against late line from this run).
-example measure -- opens 8GiB "$scratch/opens" || echo "opens_measurements unavailable -"
+# against late line from this run). CAMERA_SECONDS=<seconds> runs a shorter day, for a smoke.
+example measure -- opens 8G "$scratch/opens" || echo "opens_measurements unavailable -"
 rm -rf -- "$scratch/opens"
-example measure -- camera 500 86400 "$scratch/camera" || echo "camera_measurements unavailable -"
+example measure -- camera 500 "${CAMERA_SECONDS:-86400}" "$scratch/camera" || echo "camera_measurements unavailable -"
 rm -rf -- "$scratch/camera"
 
 # Text files, one row a line: what was put in beside what the store takes.
@@ -112,6 +112,10 @@ fi
 # find with a bound on the distance before it is removed.
 example measure -- index "$scratch/index" || echo "index_measurements unavailable -"
 rm -rf -- "$scratch/index"
+# Recall after a rebuild whose vectors' centre moved: 20,000 vectors built, the same negated
+# written and built again, 100 questions of both kinds under each mode against EXACT.
+example measure -- rebuild 20000 "$scratch/rebuild" || echo "rebuild_measurements unavailable -"
+rm -rf -- "$scratch/rebuild"
 # Recall of one, several and all partitions: a million sightings over 1, 8 and 64 Contexts.
 for contexts in 1 8 64; do
   example measure -- sightings 1000000 --contexts "$contexts" "$scratch/contexts" ||
@@ -164,7 +168,9 @@ passages passages_large_measurements "${PASSAGES_LARGE:-}" sq8,tail
 passages passages_larger_measurements "${PASSAGES_LARGER:-}" tail
 
 # The import of the first 100,008 passages of a dump under a 6 GiB machine's memory, 500 to a
-# commit and a cycle after each, run under that much memory where systemd can limit it.
+# commit and a cycle after each, run under that much memory where systemd can limit it; then
+# the first 10,000 alone; then the 100,008 again with a second 100,008 written on top of them
+# in the same store (new ids, the lines `append_100008_...`).
 if [ -n "${IMPORT:-}" ]; then
   exe=$(cargo build --quiet --release --locked --manifest-path v2/Cargo.toml -p contextdb \
     --example passages --message-format=json | grep -o '"executable":"[^"]*/passages"' | tail -n 1 | cut -d '"' -f 4)
@@ -172,6 +178,10 @@ if [ -n "${IMPORT:-}" ]; then
   command -v systemd-run > /dev/null && limit=(systemd-run --user --scope --quiet -p MemoryMax=6G -p MemorySwapMax=0)
   if [ -n "$exe" ]; then
     "${limit[@]}" "$exe" import "$IMPORT" 100008 "$scratch/import" find || echo "import_100008_measurements unavailable -"
+    rm -rf -- "$scratch/import"
+    "${limit[@]}" "$exe" import "$IMPORT" 10000 "$scratch/import" || echo "import_10000_measurements unavailable -"
+    rm -rf -- "$scratch/import"
+    "${limit[@]}" "$exe" append "$IMPORT" 100008 "$scratch/import" || echo "append_100008_measurements unavailable -"
   else
     echo "import_100008_measurements unavailable -"
   fi

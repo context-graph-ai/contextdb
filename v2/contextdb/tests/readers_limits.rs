@@ -435,3 +435,32 @@ fn a_read_session_open_stopped_after_its_mark_finishes_through_two_commits() {
         );
     });
 }
+#[test]
+fn a_file_reader_serves_not_null_and_nullable_vectors() {
+    let folder = support::folder("file-reader-vectors");
+    let db = support::open(&folder);
+    support::run(
+        &db,
+        "CREATE TABLE vs (id INTEGER PRIMARY KEY, must VECTOR(2) NOT NULL, may VECTOR(2))",
+    );
+    support::run(&db, "INSERT INTO vs (id, must) VALUES (1, [1.0, 2.0])");
+    support::run(
+        &db,
+        "INSERT INTO vs (id, must, may) VALUES (2, [3.0, 4.0], [5.0, 6.0])",
+    );
+    support::close(db);
+    let session = contextdb::ReadSession::open(&folder, ReadLimits::default()).unwrap();
+    let rows = support::rows(&session, "SELECT id, must, may FROM vs ORDER BY id");
+    assert_eq!(
+        rows,
+        [
+            vec![Value::Int64(1), Value::Vector(vec![1.0, 2.0]), Value::Null],
+            vec![
+                Value::Int64(2),
+                Value::Vector(vec![3.0, 4.0]),
+                Value::Vector(vec![5.0, 6.0])
+            ],
+        ],
+        "a NOT NULL vector is served from the file, a nullable one serves NULL when absent and its value when present"
+    );
+}

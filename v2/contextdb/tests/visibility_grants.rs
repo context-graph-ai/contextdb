@@ -253,3 +253,25 @@ fn a_grant_to_a_principal_whose_name_is_2000_bytes_long_is_honoured() {
         "a principal whose name differs in its last byte"
     );
 }
+
+#[test]
+fn a_closed_store_is_read_as_its_owner_with_no_row_narrowing() {
+    let folder = support::folder("grants-closed-store-owner");
+    let db = support::open(&folder);
+    declare_grants(&db, "closed_grants", "");
+    declare_guarded(&db, "closed_guarded", "closed_grants", &[1, 2, 3]);
+    support::run(&db, "CREATE TABLE closed_plain (id INTEGER PRIMARY KEY)");
+    support::run(&db, "INSERT INTO closed_plain VALUES (1), (2), (3)");
+    support::close(db);
+
+    // No live owner and no principal: file permissions, not rows, govern who reads a closed store.
+    let reader = contextdb::ReadSession::open(&folder, contextdb::ReadLimits::default())
+        .expect("a closed store opens for reading");
+    for table in ["closed_guarded", "closed_plain"] {
+        assert_eq!(
+            seen(&reader, table),
+            [1, 2, 3],
+            "{table}: a closed store read with no principal returns every row, with or without an ACL column"
+        );
+    }
+}

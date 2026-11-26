@@ -1146,6 +1146,8 @@ fn a_filtered_search_reads_its_index_range_and_a_ranked_one_asks_every_vector() 
     assert_eq!(range.distance_evaluations(), 4, "the rows of a range");
     let most = "SELECT id FROM docs WHERE tag = 7 ORDER BY v <=> $q LIMIT 9223372036854775807";
     assert_eq!(ask(most.into()).rows().len(), 4, "the largest LIMIT");
+    let past = ask(format!("{most} OFFSET 1"));
+    assert_eq!(past.rows().len(), 3, "the largest LIMIT, past one row");
     // Comparing directly is AUTO's alone: INDEXED gives the same rows through the walk.
     let walked = "SELECT id FROM docs WHERE tag = 7 ORDER BY v <=> $q USE VECTOR INDEXED LIMIT 3";
     assert_eq!(

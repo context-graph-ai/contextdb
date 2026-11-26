@@ -282,3 +282,53 @@ fn an_interrupt_cancels_the_running_statement_and_a_pipe_ends_the_run() {
         "(ended, marked, rows with 'y') for prompt, piped SELECT, UPDATE"
     );
 }
+
+#[test]
+fn a_progress_notice_is_throttled_by_the_hydration_notice_threshold() {
+    use crate::progress::Progress;
+    use contextdb::{ReadPhase, ReadProgress, ReadProgressObserver};
+    let output = Output {
+        json: false,
+        read: None,
+        result: 0,
+    };
+    let at = |active_ms| ReadProgress {
+        phase: ReadPhase::Executing,
+        rows: 0,
+        bytes: 0,
+        work: 0,
+        active_ms,
+    };
+    let progress = Progress {
+        output,
+        threshold: 3,
+        next: std::sync::atomic::AtomicU64::new(3),
+    };
+    let next = || progress.next.load(SeqCst);
+    progress.progress(at(2));
+    assert_eq!(next(), 3, "below the threshold no notice is sent");
+    progress.progress(at(5));
+    assert_eq!(
+        next(),
+        8,
+        "at or after the threshold a notice is sent, the next a threshold on"
+    );
+    progress.progress(at(6));
+    assert_eq!(
+        next(),
+        8,
+        "no second notice before another threshold has passed"
+    );
+    progress.progress(at(8));
+    assert_eq!(
+        next(),
+        11,
+        "a notice again once another threshold has passed"
+    );
+    progress.completed(at(9));
+    assert_eq!(
+        next(),
+        3,
+        "a finished statement re-arms the first threshold"
+    );
+}

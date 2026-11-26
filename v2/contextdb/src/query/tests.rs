@@ -99,3 +99,25 @@ fn a_json_literal_is_read_once_for_one_statement() {
     drop(store);
     std::fs::remove_dir_all(&folder).unwrap();
 }
+
+#[test]
+fn ties_let_go_when_a_walk_turns_direct_take_their_room_with_them() {
+    use crate::query::search::{keep, let_go};
+    let budget = Budget::new(None).expect("a statement budget");
+    let mut held = budget.reserve(0, "query").expect("a reservation");
+    let mut best = Vec::new();
+    for n in 0..600_u32 {
+        let key = crate::store::Key::from_bytes(&n.to_be_bytes());
+        let pair = (Value::Float64(1.0), &key);
+        keep(&mut best, (2, Some(1)), pair, &mut held).expect("room");
+    }
+    assert_eq!(best.len(), 600, "every pair tied at the cutoff is held");
+    let_go(&mut best, 2, &mut held).expect("room");
+    let slot = size_of::<(Value, crate::store::Key)>() as u64;
+    assert_eq!((best.len(), best.capacity()), (2, 2));
+    assert_eq!(
+        held.bytes(),
+        2 * (slot + 4),
+        "two pairs and their room, nothing more"
+    );
+}
