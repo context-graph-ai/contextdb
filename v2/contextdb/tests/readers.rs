@@ -866,3 +866,31 @@ fn a_new_process_searches_a_built_ivf_at_once() {
     let lines = Child::start(test, "first", &folder).end();
     assert_eq!(lines, [wanted.clone(), wanted, "moved 0".to_owned()]);
 }
+
+#[test]
+fn a_continuous_writer_has_its_own_live_queries_answered_and_loses_no_commit() {
+    const COMMITS: i64 = 30;
+    let folder = support::folder("continuous-writer-own-queries");
+    let db = support::open(&folder);
+    support::declare(&db);
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            for n in 1..=COMMITS {
+                support::insert(&db, n..=n);
+                assert_eq!(
+                    support::int(&db, "SELECT COUNT(*) FROM t"),
+                    n,
+                    "after commit {n} the writer's own live query counts every commit so far"
+                );
+            }
+        });
+        writer.join().expect("the writer thread finished");
+    });
+    assert_eq!(support::int(&db, "SELECT COUNT(*) FROM t"), COMMITS);
+    let db = support::reopen(db, &folder);
+    assert_eq!(
+        support::int(&db, "SELECT COUNT(*) FROM t"),
+        COMMITS,
+        "no committed row is dropped across reopen"
+    );
+}

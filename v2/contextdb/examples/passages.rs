@@ -17,6 +17,10 @@
 //!   With `find` after the folder, another thread searches the store as the import goes, all
 //!   of its pairs under AUTO, and the same searches are timed again once it is idle.
 //!   Then the closed store's size beside the bytes held.
+//!   `passages append ...` is the same import followed by the same passages again, with new
+//!   ids, in the same store closed and reopened; its lines are `append_<count>_...`. Every
+//!   pass also prints `rows_per_s`, `charged_memory_used`, `charged_durable_vector_bytes`,
+//!   `charged_durable_index_bytes` and the cgroup's `cgroup_memory_peak` (`-` where absent).
 //! - `passages first single|store <dump folder> <store folder>`: what the program starts
 //!   itself as, to open a built store in a new process and run one search.
 //!
@@ -270,12 +274,24 @@ fn create(store: &Path, with: &str, clauses: &str) -> Fallible<Database> {
         ),
         &params! {},
     )?;
+    // Context Graph's own index for its search statement's filter, as its schema declares it.
+    db.execute(
+        "CREATE INDEX event_search_passages_active_idx ON event_search_passages \
+         (context_id, generation_id, is_current, is_searchable)",
+        &params! {},
+    )?;
     Ok(db)
 }
 
 /// Inserts these passages of the dump, given by their places in rising order. Returns the
 /// bytes held.
 fn load(db: &Database, dump: &Dump, places: &[usize]) -> Fallible<u64> {
+    load_salted(db, dump, places, 0)
+}
+
+/// [`load`] with every id's bits flipped by `salt`, so that the same passages go in again as
+/// new rows.
+fn load_salted(db: &Database, dump: &Dump, places: &[usize], salt: u128) -> Fallible<u64> {
     let mut vectors = BufReader::new(File::open(dump.folder.join("vectors.f32"))?);
     let mut vector = vec![0u8; 4 * DIMENSIONS];
     let (mut held, mut next) = (0, 0);
@@ -298,7 +314,7 @@ fn load(db: &Database, dump: &Dump, places: &[usize]) -> Fallible<u64> {
              (id, context_id, generation_id, vector_text, is_current, is_searchable) \
              VALUES ($id, $context, $generation, $vector, $current, $searchable)",
             &params! {
-                "id" => passage.id,
+                "id" => Uuid::from_u128(passage.id.as_u128() ^ salt),
                 "context" => context,
                 "generation" => generation,
                 "vector" => embedding,
@@ -316,17 +332,41 @@ fn load(db: &Database, dump: &Dump, places: &[usize]) -> Fallible<u64> {
 
 /// The import of the first `count` passages: 500 to a commit and a cycle after each, then
 /// the cycles that remain, under a memory limit of 1,536 MiB. A statement refused for memory
-/// stops the program after printing its count.
-fn import(dump: &Dump, count: usize, folder: &Path, find: bool) -> Fallible<()> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::mpsc::{RecvTimeoutError, channel};
+/// stops the program after printing its count. With `append`, the same passages are then
+/// written again as new rows into the closed and reopened store, and the lines are printed
+/// again as `append_<count>_...`.
+fn import(dump: &Dump, count: usize, folder: &Path, find: bool, append: bool) -> Fallible<()> {
     support::must_be_empty(folder);
     std::fs::create_dir_all(folder)?;
     let store = folder.join("import");
     let db = create(&store, "", "")?;
-    db.execute("SET MEMORY_LIMIT 1536M", &params! {})?;
     let places: Vec<usize> = (0..count.min(dump.passages.len())).collect();
-    let name = |what: &str| format!("import_{}_{what}", places.len());
+    let held = imported(dump, db, &store, &places, ("import", 0, 0), find)?;
+    if append {
+        let mut options = DatabaseOpenOptions::default();
+        options.maintenance = Maintenance::Caller;
+        let db = Database::open_with_options(&store, options)?;
+        imported(dump, db, &store, &places, ("append", 1 << 64, held), find)?;
+    }
+    Ok(())
+}
+
+/// One pass of [`import`] into `db`, which it closes: `what` names its lines and the second
+/// of the pair is the salt of the ids. Beside the wall time and the memory peaks it prints
+/// `rows_per_s`, what was charged when the work ended (`memory_used` and the column's
+/// durable vector and index bytes) and the cgroup's `memory.peak`, `-` where there is none.
+fn imported(
+    dump: &Dump,
+    db: Database,
+    store: &Path,
+    places: &[usize],
+    (what, salt, before): (&str, u128, u64),
+    find: bool,
+) -> Fallible<u64> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{RecvTimeoutError, channel};
+    db.execute("SET MEMORY_LIMIT 1536M", &params! {})?;
+    let name = |what2: &str| format!("{what}_{}_{what2}", places.len());
     let pairs = dump.active(&(0..dump.contexts.len()).collect::<Vec<_>>());
     let questions = dump.questions.iter().filter(|_| find);
     let searches: Vec<_> = questions.map(|q| statement(&pairs, &[], AUTO, q)).collect();
@@ -346,10 +386,10 @@ fn import(dump: &Dump, count: usize, folder: &Path, find: bool) -> Fallible<()> 
             }
         });
         let result = timed(|| {
-            support::during(&store, &searches, || -> Fallible<u64> {
+            support::during(store, &searches, || -> Fallible<u64> {
                 let mut held = 0;
                 for chunk in places.chunks(PER_COMMIT) {
-                    held += load(&db, dump, chunk)?;
+                    held += load_salted(&db, dump, chunk, salt)?;
                     db.run_maintenance_cycle()?;
                 }
                 support::maintenance(&db)?;
@@ -378,9 +418,39 @@ fn import(dump: &Dump, count: usize, folder: &Path, find: bool) -> Fallible<()> 
         line(&name("resident_peak"), mebibytes(bytes), "MiB");
     }
     let held = finished?;
+    line(
+        &name("rows_per_s"),
+        format!("{:.0}", places.len() as f64 / wall.as_secs_f64()),
+        "rows/s",
+    );
+    line(
+        &name("charged_memory_used"),
+        mebibytes(db.memory_used()? as u64),
+        "MiB",
+    );
+    let shown = db.execute("SHOW VECTOR_INDEXES", &params! {})?;
+    for column in ["durable_vector_bytes", "durable_index_bytes"] {
+        let at = shown.columns().iter().position(|c| c == column);
+        let bytes: i64 = at.map_or(0, |at| {
+            let int = |row: &Vec<Value>| match row[at] {
+                Value::Int64(n) => n,
+                _ => 0,
+            };
+            shown.rows().iter().map(int).sum()
+        });
+        line(
+            &name(&format!("charged_{column}")),
+            mebibytes(bytes as u64),
+            "MiB",
+        );
+    }
+    match cgroup_memory_peak() {
+        Some(bytes) => line(&name("cgroup_memory_peak"), mebibytes(bytes), "MiB"),
+        None => line(&name("cgroup_memory_peak"), "-", "-"),
+    }
     if find {
         spread(&name("find_during"), &searched);
-        let reader = session(&store, READER_LIMIT)?;
+        let reader = session(store, READER_LIMIT)?;
         let mut idle = Vec::new();
         for (sql, values) in &searches {
             let (found, time) = timed(|| reader.execute(sql, values));
@@ -390,10 +460,19 @@ fn import(dump: &Dump, count: usize, folder: &Path, find: bool) -> Fallible<()> 
         spread(&name("find_idle"), &idle);
     }
     db.close()?;
-    let bytes = support::bytes_on_disk(&store)?;
+    let bytes = support::bytes_on_disk(store)?;
     line(&name("store_size"), mebibytes(bytes), "MiB");
-    line(&name("size_over_held"), ratio(bytes, held), "x");
-    Ok(())
+    // What the store holds: an append's rows and the rows written before it.
+    line(&name("size_over_held"), ratio(bytes, before + held), "x");
+    Ok(held)
+}
+
+/// The most memory the cgroup this process runs in has held, where the system says so.
+fn cgroup_memory_peak() -> Option<u64> {
+    let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = own.lines().find_map(|line| line.strip_prefix("0::"))?;
+    let peak = format!("/sys/fs/cgroup{path}/memory.peak");
+    std::fs::read_to_string(peak).ok()?.trim().parse().ok()
 }
 
 /// Context Graph's search statement for these pairs, with its values: `tail` is what follows
@@ -611,15 +690,16 @@ fn built(case: &Case<'_>, folder: &Path, held: u64) -> Fallible<()> {
             let both = ask(
                 &reader,
                 &filtered,
-                &[EXACT, INDEXED],
+                &[EXACT, INDEXED, AUTO],
                 &dump.questions,
                 ROUNDS,
             );
-            let asked = match both {
-                Ok(asked) => asked,
+            let (asked, indexed) = match both {
+                Ok(asked) => (asked, true),
                 Err(error) => {
                     eprintln!("{find}_indexed_filtered: {error}");
-                    ask(&reader, &filtered, &[EXACT], &dump.questions, ROUNDS)?
+                    let asked = ask(&reader, &filtered, &[EXACT, AUTO], &dump.questions, ROUNDS)?;
+                    (asked, false)
                 }
             };
             setting(&name, READER_LIMIT);
@@ -627,14 +707,17 @@ fn built(case: &Case<'_>, folder: &Path, held: u64) -> Fallible<()> {
             times(&name, &asked[0]);
             counted(&name, &asked[0]);
             let name = format!("{find}_indexed_filtered");
-            match asked.get(1) {
-                Some(indexed) => {
-                    times(&name, indexed);
-                    counted(&name, indexed);
-                    against(&name, indexed, &asked[0]);
-                }
-                None => line(&name, "refused", "-"),
+            if indexed {
+                times(&name, &asked[1]);
+                counted(&name, &asked[1]);
+                against(&name, &asked[1], &asked[0]);
+            } else {
+                line(&name, "refused", "-");
             }
+            let (auto, name) = (&asked[asked.len() - 1], format!("{find}_auto_filtered"));
+            times(&name, auto);
+            counted(&name, auto);
+            against(&name, auto, &asked[0]);
         } else {
             line(&format!("{find}_filtered"), "unavailable", "-");
         }
@@ -800,14 +883,11 @@ fn main() -> Fallible<()> {
             let search = statement(pairs, &[], AUTO, &dump.questions[0]);
             support::first(Path::new(store), (&case.name("open"), &first), &search)
         }
-        ["import", dump, count, folder] | ["import", dump, count, folder, "find"] => {
+        [which @ ("import" | "append"), dump, count, folder]
+        | [which @ ("import" | "append"), dump, count, folder, "find"] => {
             let dump = read_dump(Path::new(dump))?;
-            import(
-                &dump,
-                count.parse()?,
-                Path::new(folder),
-                arguments.len() == 5,
-            )
+            let (find, append) = (arguments.len() == 5, *which == "append");
+            import(&dump, count.parse()?, Path::new(folder), find, append)
         }
         ["single", dump, folder] => {
             let dump = read_dump(Path::new(dump))?;
@@ -822,7 +902,7 @@ fn main() -> Fallible<()> {
             eprintln!(
                 "usage: passages <dump folder> <answers folder> <folder> [sq8][,tail]\n       \
                  passages single <dump folder> <folder>\n       \
-                 passages import <dump folder> <count> <folder> [find]"
+                 passages import|append <dump folder> <count> <folder> [find]"
             );
             std::process::exit(2);
         }

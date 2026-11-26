@@ -521,6 +521,21 @@ fn purge_table_names_one_table_and_nothing_else() {
             run.stdout
         );
     }
+    // The CLI is a caller of PURGE: the statement erases the selected rows and says how many.
+    let run = run_write(
+        &dir,
+        &store,
+        "PURGE FROM notes WHERE id = 1;\nSELECT id FROM notes;\n",
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert!(
+        run.stdout.contains("rows_affected=1"),
+        "one row purged: {}",
+        run.stdout
+    );
+    let after = tables(&run.stdout);
+    assert_eq!(after.len(), 1, "{}", run.stdout);
+    assert_eq!(after[0][1..], [["2"]], "only row 2 is left: {}", run.stdout);
 }
 
 #[test]
@@ -1263,6 +1278,31 @@ fn the_memory_limit_option_is_the_sessions_ceiling() {
             "{mode:?}"
         );
     }
+    // A limit lowered below the session's ceiling is raised again by SET MEMORY_LIMIT in the
+    // same script: the retried statement is answered, and the earlier refusal still fails the run.
+    let refused = "SELECT id, body FROM blobs WHERE id <= 20 ORDER BY id;\n";
+    let script = format!("SET MEMORY_LIMIT '16M';\n{refused}SET MEMORY_LIMIT '1G';\n{refused}");
+    let args = [arg(&big), "--json", "--write", "--memory-limit", "1G"];
+    let args = [&args[..], &["--read-result-bytes", "1073741824"]].concat();
+    let run = shell(&dir, &args, script);
+    assert_eq!(
+        run.code,
+        Some(1),
+        "a recovered run keeps the earlier error: {}",
+        run.stderr
+    );
+    assert_eq!(
+        run.refusals().len(),
+        1,
+        "only the first read is refused: {}",
+        run.stderr
+    );
+    let answers = documents(&run.stdout);
+    assert_eq!(answers.len(), 3, "both SETs and the retried read answer");
+    assert_eq!(
+        answers[2]["result"]["rows"].as_array().map(Vec::len),
+        Some(20)
+    );
     let args = [
         arg(&big),
         "--json",
@@ -1776,6 +1816,76 @@ fn diagnose_changes_nothing_and_a_reset_is_advised_only_for_a_damaged_store() {
     );
 }
 
+/// Damaged vector data is reported as damaged by diagnose, which changes no byte; a memory
+/// refusal is told as neither clean nor corrupt.
+#[test]
+fn diagnose_reports_damaged_vector_data_and_a_memory_refusal_as_neither() {
+    let (dir, store) = folder_with_store("diagnose-vectors");
+    let rows: Vec<String> = (0..40)
+        .map(|n| {
+            let v: Vec<String> = (0..8).map(|i| format!("{}.5", 1000 + n * 8 + i)).collect();
+            format!("({n}, [{}])", v.join(", "))
+        })
+        .collect();
+    let make = "CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR(8));\n";
+    run_write(
+        &dir,
+        &store,
+        format!("{make}INSERT INTO t (id, v) VALUES {};\n", rows.join(", ")),
+    )
+    .ok();
+    let clean = shell(&dir, &["diagnose", arg(&store)], "");
+    assert_eq!(
+        clean.code,
+        Some(0),
+        "a store with vectors reads clean: {}",
+        clean.stderr
+    );
+    // A memory refusal is neither clean nor corrupt.
+    let ready = opening::reader_ready_limit(&store, 0).to_string();
+    let tight = shell(
+        &dir,
+        &["diagnose", arg(&store), "--read-memory", &ready],
+        "",
+    );
+    let said = tight.stderr;
+    assert_ne!(tight.code, Some(0), "{said}");
+    assert!(
+        said.contains("memory_budget") || said.contains("memory"),
+        "{said}"
+    );
+    assert!(
+        !said.contains("corrupt") && !said.contains("reads cleanly"),
+        "{said}"
+    );
+
+    // One byte of one stored vector is damaged.
+    let mut data = std::fs::read(store.join("data")).unwrap();
+    let at: Vec<u8> = 1123.5_f32.to_le_bytes().to_vec();
+    let at = data
+        .windows(4)
+        .position(|w| w == at)
+        .expect("a vector is stored as its floats");
+    data[at] ^= 0xFF;
+    std::fs::write(store.join("data"), &data).unwrap();
+    let kept = files(&store);
+    let run = shell(&dir, &["diagnose", arg(&store)], "");
+    let said = run.stderr;
+    assert_ne!(
+        run.code,
+        Some(0),
+        "damaged vector data is not clean: {said}"
+    );
+    assert!(
+        said.contains("corrupt") && !said.contains("reads cleanly"),
+        "{said}"
+    );
+    assert!(
+        files(&store) == kept,
+        "diagnose of damaged vector data changes no byte"
+    );
+}
+
 #[test]
 fn every_command_help_lists_its_arguments_and_matches_the_usage_a_wrong_call_prints() {
     let dir = folder("help-matches-usage");
@@ -1823,6 +1933,10 @@ fn every_command_help_lists_its_arguments_and_matches_the_usage_a_wrong_call_pri
             "the program's --help lists {word}:\n{top}"
         );
     }
+    assert!(
+        !top.contains("repair"),
+        "repair is gone from the command tree:\n{top}"
+    );
 }
 
 #[test]
@@ -1925,6 +2039,51 @@ fn inspect_key_values_may_come_in_any_order_and_the_versions_say_if_more_exist()
             in_order.contains(want),
             "the row and its versions are printed with {want}: {in_order}"
         );
+    }
+
+    // --column is repeatable and --json prints both columns; a key that is not
+    // {column, value, rest} (a bare uuid, an {"id": ...} map, a pair list) is refused.
+    let inspect = |extra: &[&str], json: &str| {
+        let mut args = vec![
+            "inspect",
+            "key",
+            arg(&store),
+            "--table",
+            "p",
+            "--key-json",
+            json,
+        ];
+        args.extend_from_slice(extra);
+        shell(&dir, &args, "")
+    };
+    let first = r#"{"column":"a","value":{"Int64":1},"rest":[["b",{"Int64":2}]]}"#;
+    let run = inspect(&["--column", "a", "--column", "body", "--json"], first).ok();
+    let printed = documents(&run.stdout);
+    let columns = &printed[0]["result"]["columns"];
+    assert_eq!(
+        columns,
+        &json!(["a", "body"]),
+        "both --column flags select: {}",
+        run.stdout
+    );
+    for wrong in [
+        r#""550e8400-e29b-41d4-a716-446655440000""#,
+        r#"{"id":{"Int64":1}}"#,
+        r#"[["a",{"Int64":1}],["b",{"Int64":2}]]"#,
+    ] {
+        let run = inspect(&[], wrong);
+        assert_ne!(
+            run.code,
+            Some(0),
+            "{wrong} is not a key and is refused: {}",
+            run.stdout
+        );
+        assert!(
+            run.stdout.is_empty(),
+            "a refused key prints no row: {}",
+            run.stdout
+        );
+        assert!(!run.stderr.is_empty(), "the refusal is said: {wrong}");
     }
 }
 
@@ -2055,5 +2214,126 @@ fn a_writing_shell_sends_each_statement_to_the_session_that_answers_it() {
         results[3].as_array().map(Vec::len),
         Some(501),
         "all 501 rows print"
+    );
+}
+
+/// Ctrl-C in an open transaction exits 130 after the rollback: the row was never committed.
+#[test]
+fn an_interrupt_inside_a_transaction_exits_130_and_the_row_is_not_kept() {
+    let (dir, store) = folder_with_store("interrupt-open-transaction");
+    run_write(&dir, &store, CREATE_NOTES).ok();
+    let mut writer = piped(&dir, &[arg(&store), "--write", "--json"]);
+    let (mut input, mut line) = (writer.stdin.take().unwrap(), String::new());
+    let mut output = BufReader::new(writer.stdout.take().unwrap());
+    let both = b"BEGIN;\nINSERT INTO notes (id, body) VALUES (1, 'a');\n";
+    input.write_all(both).unwrap();
+    // The answers are read, so the insert has run before the signal is sent.
+    let mut answered = 0;
+    while answered < 2 && output.read_line(&mut line).unwrap() > 0 {
+        answered += 1;
+    }
+    let exit = (answered, interrupt(&writer), writer.wait().unwrap().code());
+    assert_eq!(exit, (2, true, Some(130)), "{line}");
+    let run = run_read(&dir, &store, SELECT_NOTES).ok();
+    assert!(
+        tables(&run.stdout).iter().all(|t| t.len() <= 1),
+        "an interrupted transaction was rolled back: {}",
+        run.stdout
+    );
+}
+
+/// --maintenance-poll-ms takes milliseconds, is kept with the store, and omitting it keeps it.
+#[test]
+fn the_maintenance_poll_interval_is_set_in_milliseconds_and_kept_when_omitted() {
+    let (dir, store) = folder_with_store("maintenance-poll-persists");
+    let args = [arg(&store), "--write", "--maintenance-poll-ms", "2500"];
+    shell(&dir, &args, CREATE_NOTES).ok();
+    let show = "SHOW MAINTENANCE_POLL_INTERVAL;\n";
+    for args in [
+        vec![arg(&store), "--json"],
+        vec![arg(&store), "--write", "--json"],
+    ] {
+        let run = shell(&dir, &args, show).ok();
+        let rows = &documents(&run.stdout)[0]["result"]["rows"];
+        assert_eq!(
+            rows[0]["milliseconds"],
+            json!(2500),
+            "{args:?}: {}",
+            run.stdout
+        );
+    }
+}
+
+/// The shell binds no parameters: a statement naming one is refused, and values are literals.
+#[test]
+fn a_statement_with_a_parameter_is_refused_and_a_literal_is_required() {
+    let (dir, store) = folder_with_store("no-parameter-binding");
+    let input =
+        format!("{CREATE_NOTES}INSERT INTO notes (id, body) VALUES ($id, 'x');\n{SELECT_NOTES}");
+    let run = run_write(&dir, &store, input);
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
+    assert_eq!(run.errors().len(), 1, "{}", run.stderr);
+    assert!(
+        !run.stdout.contains("| 1"),
+        "no row was written: {}",
+        run.stdout
+    );
+}
+
+/// Limits: SET is a write and SHOW a read; a disk limit is shown; SET MEMORY_LIMIT recovers a
+/// session after a memory refusal without erasing the earlier error.
+#[test]
+fn the_limits_are_set_by_a_writer_shown_by_a_reader_and_recover_a_refused_session() {
+    let (dir, store) = folder_with_store("limit-statements");
+    run_write(&dir, &store, CREATE_NOTES).ok();
+    let run = run_read(
+        &dir,
+        &store,
+        "SET DISK_LIMIT '1G';\nSET MEMORY_LIMIT '512M';\nSHOW DISK_LIMIT;\n",
+    );
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
+    let errors = run.errors();
+    assert!(
+        errors.len() == 2 && errors.iter().all(|e| e.contains("--write")),
+        "both SETs need --write: {}",
+        run.stderr
+    );
+    assert!(
+        run.stdout.contains("limit"),
+        "SHOW DISK_LIMIT reads: {}",
+        run.stdout
+    );
+    let run = shell(
+        &dir,
+        &[arg(&store), "--write", "--json", "--disk-limit", "1G"],
+        "SHOW DISK_LIMIT;\n",
+    )
+    .ok();
+    assert_eq!(
+        documents(&run.stdout)[0]["result"]["rows"][0]["limit"],
+        json!(1_073_741_824_u64),
+        "--disk-limit is the session's ceiling"
+    );
+}
+
+/// A last statement without `;` still runs; an unclosed `/*` fails loudly rather than being dropped.
+#[test]
+fn input_ending_without_a_semicolon_runs_and_an_unclosed_comment_fails_loudly() {
+    let (dir, store) = folder_with_store("input-end");
+    let seed = "INSERT INTO notes (id, body) VALUES (1, 'first'), (2, 'second');\n";
+    run_write(&dir, &store, format!("{CREATE_NOTES}{seed}")).ok();
+    let run = run_read(&dir, &store, "SELECT id, body FROM notes ORDER BY id");
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(
+        run.stdout, TWO_NOTES,
+        "the open statement runs at end of input"
+    );
+    let run = run_read(&dir, &store, "SELECT id FROM notes /* never closed");
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
+    assert_eq!(run.errors().len(), 1, "one error says it: {}", run.stderr);
+    assert!(
+        run.stdout.is_empty(),
+        "nothing is silently run: {}",
+        run.stdout
     );
 }

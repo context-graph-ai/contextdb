@@ -518,7 +518,7 @@ fn take_value(tag: u8, bytes: &mut &[u8]) -> Option<Value> {
         },
         INT64 => Value::Int64(i64::from_le_bytes(take_array(bytes)?)),
         FLOAT64 => Value::Float64(f64::from_le_bytes(take_array(bytes)?)),
-        TEXT => Value::Text(std::str::from_utf8(take_long(bytes)?).ok()?.to_owned()),
+        TEXT => Value::Text(take_text(bytes)?),
         UUID => Value::Uuid(Uuid::from_bytes(take_array(bytes)?)),
         TIMESTAMP => Value::Timestamp(i64::from_le_bytes(take_array(bytes)?)),
         JSON => Value::Json(serde_json::from_slice(take_long(bytes)?).ok()?),
@@ -547,6 +547,13 @@ fn take_value(tag: u8, bytes: &mut &[u8]) -> Option<Value> {
         TXID => Value::TxId(TxId(u64::from_le_bytes(take_array(bytes)?))),
         _ => return None,
     })
+}
+
+/// A stored text's characters, copied out in a function of its own: inside [`take_value`] the
+/// copy's allocation was inlined or not as the code around it grew, which every row pays for.
+#[inline(never)]
+fn take_text(bytes: &mut &[u8]) -> Option<String> {
+    Some(std::str::from_utf8(take_long(bytes)?).ok()?.to_owned())
 }
 
 fn take<'a>(bytes: &mut &'a [u8], count: usize) -> Option<&'a [u8]> {

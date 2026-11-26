@@ -31,6 +31,9 @@
 //!   program starts itself as) and then searched, in one read session under 1 GiB, under
 //!   EXACT, INDEXED and AUTO in turn: every question once after 5 searches of each mode that
 //!   are not timed. On sightings a hundred stored vectors are then each searched for by itself.
+//! - `measure rebuild <rows> <folder>` builds the index pilot's vectors, writes the same
+//!   vectors negated (every centre moved) and builds again, then asks 100 questions of both
+//!   kinds under each mode (`rebuild_<rows>_find_...`, each mode's `_recall` against EXACT).
 //! - `measure commits <count> <folder>`, `measure opens <size> <folder>`, `measure camera
 //!   <rows a second> <seconds> [period seconds] <folder>` and `measure sightings <rows>
 //!   --contexts <n> <folder>`: the timed lines of the engine's bars on commits, opens after a
@@ -408,6 +411,60 @@ fn index(
         support::own(&name, &reader, &nearest, stored)?;
     }
     Ok(())
+}
+
+/// `measure rebuild <rows> <folder>`: the index pilot's `rows` vectors, built; then the same
+/// vectors with every number negated, which moves every cluster's centre to the opposite side,
+/// written after the build and the index built again; then 100 questions (half of the first
+/// kind, half of the second) under EXACT, INDEXED and AUTO, the last two against EXACT as in
+/// every case. Lines `rebuild_<rows>_find_...`.
+fn rebuild_case(rows: usize, folder: &Path) -> Fallible<()> {
+    let store = folder.join("store");
+    // Grouped from 10,000 vectors, so that the first load builds an index the append rebuilds.
+    let clauses = " INDEXING_THRESHOLD 10000";
+    let (db, mut questions) = filled(&store, clauses, &|each| synthetic(rows, each))?;
+    support::maintenance(&db)?;
+    grouped(&db, &format!("rebuild_{rows}_lists_before"))?;
+    let mut tx = db.transaction()?;
+    let mut id = rows as i64;
+    synthetic(rows, &mut |vector| {
+        let moved: Vec<f32> = vector.iter().map(|x| -x).collect();
+        tx.execute(
+            "INSERT INTO items (id, embedding) VALUES ($id, $embedding)",
+            &params! { "id" => id, "embedding" => moved },
+        )?;
+        id += 1;
+        if id % 500 == 0 {
+            std::mem::replace(&mut tx, db.transaction()?).commit()?;
+        }
+        Ok(())
+    })?;
+    tx.commit()?;
+    support::maintenance(&db)?;
+    grouped(&db, &format!("rebuild_{rows}_lists_after"))?;
+    db.close()?;
+    for question in &mut questions[50..] {
+        question.iter_mut().for_each(|x| *x = -*x);
+    }
+    let reader = support::session(&store, READER_LIMIT)?;
+    let find = format!("rebuild_{rows}_find");
+    support::modes(&find, &reader, &nearest, &questions, 1)?;
+    Ok(())
+}
+
+/// Prints the groups the one partition of `items` is searched through; refused when it has none,
+/// since a find over it then compares every vector and measures no index.
+fn grouped(db: &Database, name: &str) -> Fallible<()> {
+    let shown = db.execute("SHOW VECTOR_PARTITIONS FOR items.embedding", &params! {})?;
+    let at = shown.columns().iter().position(|c| c == "lists");
+    let lists = at.and_then(|at| shown.rows().first().map(|row| row[at].clone()));
+    match lists {
+        Some(Value::Int64(lists)) => {
+            line(name, lists, "lists");
+            Ok(())
+        }
+        other => Err(format!("{name}: the partition is not grouped ({other:?})").into()),
+    }
 }
 
 /// The index pilot's vectors in one partition.
@@ -1038,7 +1095,7 @@ fn usage() -> ! {
          measure sessions <corpus folder> <list file> <count> <folder>\n       \
          measure synthetic|sightings <rows> <folder> | sightings <rows> --contexts <n> <folder>\n       \
          measure statements build <folder> | <which> <folder> <n>\n       \
-         measure commits <count> <folder> | opens <size> <folder> | bound <rows> <store>\n       \
+         measure rebuild <rows> <folder> | commits <count> <folder> | opens <size> <folder> | bound <rows> <store>\n       \
          measure camera <rows a second> <seconds> [period seconds] <folder>"
     );
     std::process::exit(2);
@@ -1085,6 +1142,7 @@ fn main() -> Fallible<()> {
             (_, Ok(rows)) => sightings_case(rows, folder)?,
             _ => usage(),
         },
+        ["rebuild", rows, _] => rebuild_case(rows.parse()?, create(folder)?)?,
         ["commits", count, _] => commits(count.parse()?, create(folder)?)?,
         ["opens", size, _] => opens(contextdb::parse_size(size)? as u64, create(folder)?)?,
         ["camera", rate, seconds, _] => {

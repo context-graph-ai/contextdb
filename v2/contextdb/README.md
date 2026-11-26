@@ -1462,9 +1462,13 @@ produce the unsupported-setting `PlanError`; `64MiB` instead gives `ParseError` 
 matching its `64M` prefix. Neither form is accepted.
 The CLI `--memory-limit` separately accepts raw bytes.
 
-With nothing declared, a writer takes a quarter of known Linux machine memory (including
-the current cgroup v2 limit when known), with a 10 MiB minimum, or 2 GiB when unknown.
-Memory detection reads Linux procfs only; macOS therefore uses the 2 GiB fallback.
+With nothing declared, a writer takes a quarter of the memory the process may use, never
+below the 10 MiB and 768 KiB an open sets aside, or 2 GiB when that cannot be read. The
+memory the process may use is the smallest of the machine's physical memory (`MemTotal` from
+`/proc/meminfo`, else on Unix, macOS included, the system's physical page count times its page
+size) and every cgroup v2 `memory.max` from the process's own group up to the root. Where none of
+these can be read (Windows, a sandbox), the default is 2 GiB, and nothing caps a larger
+declared limit.
 `SET MEMORY_LIMIT NONE` explicitly declares no ceiling and survives reopen; it is distinct
 from never declaring a limit.
 <!-- enforced by: a_declared_limit_survives_reopen_however_it_was_set -->

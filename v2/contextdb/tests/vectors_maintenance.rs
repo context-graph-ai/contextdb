@@ -1798,3 +1798,38 @@ fn space_no_commit_used_for_an_interval_is_given_back() {
     assert_eq!(support::int(&db, "SELECT COUNT(*) FROM t"), 1000);
     db.verify().unwrap();
 }
+
+#[test]
+fn concurrent_storage_compaction_declarations_keep_each_others_clauses() {
+    let folder = support::folder("compaction-concurrent-declarations");
+    let db = support::open(&folder);
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        for sql in [
+            "SET STORAGE_COMPACTION START_RATIO 0.4",
+            "SET STORAGE_COMPACTION STOP_RATIO 0.02",
+        ] {
+            let (db, barrier) = (&db, &barrier);
+            scope.spawn(move || {
+                barrier.wait();
+                support::run(db, sql);
+            });
+        }
+    });
+    let live = support::rows(&db, "SHOW STORAGE_COMPACTION");
+    for (setting, value) in [("start_ratio", 0.4), ("stop_ratio", 0.02)] {
+        assert!(
+            live.iter().any(
+                |row| row[..2] == [support::text(setting), Value::Float64(value)]
+                    && row[2] == support::text("declared")
+            ),
+            "{setting} must hold its declared {value}; neither declaration may erase the other: {live:?}"
+        );
+    }
+    let db = support::reopen(db, &folder);
+    assert_eq!(
+        support::rows(&db, "SHOW STORAGE_COMPACTION"),
+        live,
+        "the live setting equals the persisted one"
+    );
+}
