@@ -83,10 +83,11 @@ pub fn reopen(db: Database, folder: &Path) -> Database {
 }
 
 pub mod opening;
+pub mod raw;
 
 /// The storage library's bounded freed-page workspace.
 pub fn limit_commit_bytes() -> usize {
-    redb::WriteTransaction::DRAIN_BYTES
+    raw::DRAIN_BYTES
 }
 
 /// Spare for changing a limit and observing it, beside the data room a test specifies.
@@ -1454,22 +1455,7 @@ pub fn delivery_queue(path: &Path, bytes: usize, count: i64) -> Database {
 
 /// The documented vector records from a public exported store.
 pub fn vector_records(folder: &Path) -> BTreeMap<Vec<u8>, Vec<u8>> {
-    use redb::{ReadableDatabase, ReadableTable, TableDefinition};
-    let db = redb::Builder::new()
-        .open_read_only(folder.join("data"))
-        .unwrap();
-    let read = db.begin_read().unwrap();
-    let mut records = BTreeMap::new();
-    for name in ["vectors", "vector_blocks"] {
-        let table = read
-            .open_table(TableDefinition::<&[u8], &[u8]>::new(name))
-            .unwrap();
-        for entry in table.iter().unwrap() {
-            let (key, value) = entry.unwrap();
-            records.insert(key.value().to_vec(), value.value().to_vec());
-        }
-    }
-    records
+    raw::vector_records(folder)
 }
 /// A store whose data file cancels the handle at the first sync after the flag is set: a
 /// maintenance batch is one commit, so the cycle ends after it (design 4, the guard).

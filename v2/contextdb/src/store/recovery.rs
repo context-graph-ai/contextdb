@@ -48,7 +48,7 @@ impl HeldFor {
         }
         let data = redb::Builder::new()
             .set_incremental_recovery(true)
-            .set_cache_size(crate::memory::pages(cache))
+            .set_cache_size(super::pages(cache))
             .open_read_only_with_backend(backend)?;
         match disk::remembered_limit(&data) {
             Ok(limit) => Ok(super::cache_under(limit, None)),

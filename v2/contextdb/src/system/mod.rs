@@ -216,9 +216,8 @@ pub(crate) fn machine_memory() -> Option<u64> {
 }
 
 /// The writer's undeclared limit.
-pub(crate) fn default_memory_limit() -> u64 {
-    let floor = crate::memory::account(Some(0), crate::memory::cache_under(Some(0), None), Some(0));
-    crate::memory::default_limit(machine_memory(), floor.iter().sum())
+pub(crate) fn default_memory_limit(floor: u64) -> u64 {
+    crate::memory::default_limit(machine_memory(), floor)
 }
 
 /// Takes a lock. None of this part's locks is held across a step that can leave what the lock

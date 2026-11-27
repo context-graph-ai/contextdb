@@ -147,11 +147,19 @@ pub(crate) fn shown(values: &[Value]) -> String {
     brief.finish()
 }
 
-// A BTree node holds eleven pairs and at most 112 overhead bytes; non-root nodes hold five.
-const JSON_OBJECT: u64 = 768;
-const JSON_MEMBER: u64 = 256;
-const _: () = assert!(JSON_OBJECT >= 11 * size_of::<(String, serde_json::Value)>() as u64 + 112);
-const _: () = assert!(JSON_MEMBER >= JSON_OBJECT / 5);
+// A BTree node holds eleven pairs and at most 112 overhead bytes; non-root nodes hold five. An
+// IndexMap, the map under `serde_json/preserve_order`, keeps a hash beside each pair with room for
+// twice its members, and about 21 bytes of table a member. Each member has two marks to count.
+const PAIR: u64 = size_of::<(String, serde_json::Value)>() as u64;
+const NODE: u64 = 11 * PAIR + 112;
+const JSON_OBJECT: u64 = if NODE > 768 { NODE } else { 768 };
+const JSON_MEMBER: u64 = if NODE > 1280 { NODE / 5 } else { 256 };
+const _: () = assert!(2 * JSON_MEMBER >= 2 * (PAIR + 8) + 21);
+
+/// Text read as JSON, as every part reads it; `None` when it is no JSON.
+pub(crate) fn parse_json(text: &str) -> Option<serde_json::Value> {
+    serde_json::from_str(text).ok()
+}
 
 /// The memory a value takes outside its own cell.
 pub(crate) fn heap_bytes(value: &Value) -> u64 {
@@ -320,7 +328,7 @@ pub(crate) fn typed(table: &str, column: &ColumnDef, value: Value) -> Result<Val
         (ColumnType::Real, Value::Int64(whole)) => Some(Value::Float64(*whole as f64)),
         (ColumnType::Uuid, Value::Text(text)) => Uuid::parse_str(text).ok().map(Value::Uuid),
         (ColumnType::Timestamp, Value::Text(text)) => timestamp_millis(text).map(Value::Timestamp),
-        (ColumnType::Json, Value::Text(text)) => serde_json::from_str(text).ok().map(Value::Json),
+        (ColumnType::Json, Value::Text(text)) => parse_json(text).map(Value::Json),
         (ColumnType::Vector(length), Value::Text(text)) => vector_from_text(text)
             .filter(|vector| vector.len() == length)
             .map(Value::Vector),

@@ -24,7 +24,7 @@ use crate::query::{self, QueryResult};
 pub use crate::query::{ReadLimits, ReadPhase, ReadProgress, ReadProgressObserver};
 use crate::schema::Catalog;
 use crate::sql::{Effect, Plan};
-use crate::store::{Cell, Key, Read, Store, View, WrapStorage};
+use crate::store::{Cell, Key, Read, Store, View, WrapStorage, maps};
 use crate::system::{self, Clock};
 use crate::types::{
     ContextId, Error, Principal, Result, ScopeLabel, TableMeta, TxId, Value, typed,
@@ -157,7 +157,7 @@ impl ReadSession {
         query::limit("cache_share", options.limits.cache_share.unwrap_or(0), 100)?;
         let limit = crate::settings::limit(options.limits.memory);
         let cache = crate::store::cache_under(limit, options.limits.cache_share);
-        crate::memory::admit(limit, crate::memory::account(limit, cache, None))?;
+        crate::memory::admit(limit, crate::memory::account(limit, cache, maps(None)))?;
         let budget = Budget::new(limit)?;
         let store = Store::open_for_reading(
             path.as_ref(),
@@ -282,7 +282,7 @@ impl ReadSession {
                 )?
             }
         };
-        self.fits(serde_json::to_string(&*all).map_or(0, |text| text.len()))?;
+        self.fits(all.text_bytes())?;
         Ok(all)
     }
     /// Opens a cursor at one commit; its first fetch returns the first page.

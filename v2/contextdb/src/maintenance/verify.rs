@@ -122,8 +122,8 @@ pub(crate) fn verify(
                 crate::events::validate(view, key, value, &mut loaded).map(drop)?
             }
             Record::Audit(value) => {
-                serde_json::from_slice::<crate::TriggerAuditEntry>(value)
-                    .map_err(|_| view.damaged("an invalid audit record"))?;
+                crate::events::read_audit(value)
+                    .ok_or_else(|| view.damaged("an invalid audit record"))?;
             }
             Record::Schedule(name, _) => {
                 if !catalog.events.contains_key(&(Kind::Schedule, name.into())) {

@@ -123,14 +123,10 @@ pub trait ReadProgressObserver: Send + Sync {
 }
 
 /// The statement's existing row and distance counters, plus session admission and progress.
-fn stats(data: &redb::ReadOnlyDatabase) -> (u64, u64) {
-    let stats = redb::ReadableDatabase::cache_stats(data);
-    (stats.read_hits(), stats.read_misses())
-}
 pub(crate) struct Work<'a> {
     pub(crate) examined: Cell<u64>,
     pub(crate) evaluations: Cell<u64>,
-    pages: Option<((u64, u64), std::sync::Arc<redb::ReadOnlyDatabase>)>,
+    pages: Option<((u64, u64), crate::store::Pages)>,
     rows: Cell<u64>,
     /// The index the statement's path left unused, with why, for the record of statements.
     pub(crate) unused: Cell<Option<(String, &'static str)>>,
@@ -175,16 +171,18 @@ impl<'a> Work<'a> {
         self
     }
     /// Counts the pages the reader's cache serves from here on.
-    pub(crate) fn paged(mut self, data: Option<std::sync::Arc<redb::ReadOnlyDatabase>>) -> Self {
-        self.pages = data.map(|data| (stats(&data), data));
+    pub(crate) fn paged(mut self, pages: Option<crate::store::Pages>) -> Self {
+        self.pages = pages.map(|pages| (pages.counts(), pages));
         self
     }
     /// Pages found in the cache and pages read from the file since `paged`.
     pub(crate) fn cached(&self) -> (u64, u64) {
-        self.pages.as_ref().map_or((0, 0), |((hits, reads), data)| {
-            let now = stats(data);
-            (now.0 - hits, now.1 - reads)
-        })
+        self.pages
+            .as_ref()
+            .map_or((0, 0), |((hits, reads), pages)| {
+                let now = pages.counts();
+                (now.0 - hits, now.1 - reads)
+            })
     }
     fn progress(&self) -> ReadProgress {
         ReadProgress {

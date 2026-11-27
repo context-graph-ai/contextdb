@@ -35,7 +35,7 @@ use crate::types::{Error, Result, TxId, Value};
 pub(super) type Stored<T> = std::result::Result<T, Failed>;
 
 #[derive(Debug)]
-pub(crate) enum Failed {
+pub(super) enum Failed {
     Storage(redb::Error),
     Budget(Error),
 }
@@ -1050,10 +1050,7 @@ impl View {
             return Ok(Record::Delivery(key, value));
         }
         if key.first() == Some(&AUDIT) {
-            let entry = value
-                .get(8..)
-                .ok_or_else(|| self.damaged("an invalid audit record"));
-            return entry.map(Record::Audit);
+            return Ok(Record::Audit(value));
         }
         let bad = || self.damaged("an invalid schedule cursor");
         let name = key

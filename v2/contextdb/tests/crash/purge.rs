@@ -1,6 +1,5 @@
 use super::*;
 use contextdb::Maintenance;
-use redb::{ReadableDatabase, ReadableTableMetadata, TableDefinition};
 use std::collections::BTreeMap;
 use support::records::{DIM, assert_derived, grouped, id_of, key_of, number, slots, under};
 use support::*;
@@ -8,14 +7,10 @@ use support::*;
 type Records = BTreeMap<Vec<u8>, Vec<u8>>;
 
 fn records(folder: &Path) -> Records {
-    let db = redb::Builder::new()
-        .open_read_only(folder.join("data"))
-        .unwrap();
-    let read = db.begin_read().unwrap();
-    let beside = read
-        .open_table(TableDefinition::<u64, &[u8]>::new("beside"))
-        .unwrap();
-    assert!(beside.is_empty().unwrap(), "erased large values remain");
+    assert!(
+        support::raw::no_large_values(folder),
+        "erased large values remain"
+    );
     support::vector_records(folder)
 }
 

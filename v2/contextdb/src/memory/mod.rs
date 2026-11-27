@@ -30,23 +30,13 @@ mod tests;
 /// (`tests/memory_ceiling.rs`).
 const ALLOWANCE: u64 = 1 << 20;
 
-/// A reader's room to check one commit: the storage library's longest list, 8 bytes and a bit a
-/// page. A writer checks only at open, with its cache empty, and sets none aside.
-const CHECK: u64 = 65_536 * 8 + 65_536 / 8;
-
 /// What an open under `limit` sets aside, by name: the allowance, a page cache of `cache` bytes
-/// counted with its bookkeeping, the plan cache, and a reader's check or a writer's page maps for
-/// a file of `file` bytes. Each door's reservations read it, and its floor is their sum.
-pub(crate) fn account(limit: Option<u64>, cache: u64, file: Option<u64>) -> [u64; 4] {
+/// counted with its bookkeeping, the plan cache, and the `maps` bytes the store names for a
+/// reader's check or a writer's page maps. Each door's reservations read it, and its floor is
+/// their sum.
+pub(crate) fn account(limit: Option<u64>, cache: u64, maps: u64) -> [u64; 4] {
     let plans = limit.map_or(1 << 20, |limit| (limit / 32).clamp(1 << 20, 8 << 20));
-    let maps = file.map_or(CHECK, |len| (len / (4 << 30) + 1) * (768 << 10));
     [ALLOWANCE, cache, plans, maps]
-}
-
-/// The bytes of pages a page cache of `cache` bytes holds: each 4 KiB page keeps 160 bytes of
-/// bookkeeping inside the cache's bytes.
-pub(crate) fn pages(cache: u64) -> usize {
-    (cache / (4096 + 160) * 4096) as usize
 }
 
 /// Refuses a limit below the sum of an open's account, naming that floor.

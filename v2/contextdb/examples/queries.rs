@@ -313,55 +313,6 @@ fn same_ten(asked: &Asked, recorded: &Path) -> Fallible<usize> {
     Ok(same)
 }
 
-/// The longest keys a closed store holds, in bytes: an index entry (its row key left out), a
-/// row key, a kept count's group and a partition's key tuple, each without the bytes that name
-/// its table, index, count or column; and how many index entries hold a cut value. Read from
-/// the data file with the storage library, as `contextdb/src/store/disk.rs` lays it out: an
-/// index entry's record is its length in four bytes, and for an entry that holds a cut value
-/// four more; a partition's record is kept under the byte 1, its column and its key tuple.
-struct Keys {
-    entry: u32,
-    cut: u64,
-    row: usize,
-    count: usize,
-    tuple: usize,
-}
-
-fn stored_keys(store: &Path) -> Fallible<Keys> {
-    use redb::{ReadableDatabase, ReadableTable, TableDefinition};
-    let data = redb::ReadOnlyDatabase::open(store.join("data"))?;
-    let read = data.begin_read()?;
-    let table = |name: &str| read.open_table(TableDefinition::<&[u8], &[u8]>::new(name));
-    let mut keys = Keys {
-        entry: 0,
-        cut: 0,
-        row: 0,
-        count: 0,
-        tuple: 0,
-    };
-    for record in table("index")?.iter()? {
-        let record = record?.1.value().to_vec();
-        keys.entry = keys
-            .entry
-            .max(u32::from_le_bytes(std::array::from_fn(|b| record[b])));
-        keys.cut += u64::from(record.len() == 8);
-    }
-    let longest = |name: &str, named_by: usize| -> Fallible<usize> {
-        let table = table(name)?;
-        let lengths = table
-            .iter()?
-            .map(|record| record.map(|(key, _)| key.value().len()));
-        let longest = lengths.collect::<Result<Vec<_>, _>>()?.into_iter().max();
-        Ok(longest.unwrap_or(named_by) - named_by)
-    };
-    keys.row = longest("rows", 4)?;
-    keys.count = longest("counts", 4)?;
-    for record in table("vectors")?.range::<&[u8]>(&[1_u8][..]..&[2_u8][..])? {
-        keys.tuple = keys.tuple.max(record?.0.value().len() - 5);
-    }
-    Ok(keys)
-}
-
 /// The storage door of a data file that counts the bytes written through it.
 #[derive(Debug)]
 struct Written(File, Arc<AtomicU64>);
@@ -454,11 +405,6 @@ fn declared(dump_folder: &Path, answers: &Path, folder: &Path) -> Fallible<()> {
         "bytes",
     );
     line(&name("size_over_held"), ratio(bytes, held_bytes), "x");
-    line(
-        "key_longest_partition_tuple",
-        stored_keys(&store)?.tuple,
-        "bytes",
-    );
 
     // The find, in three scopes, under AUTO as Context Graph sends it.
     let reader = session(&store, READER_LIMIT)?;
@@ -675,11 +621,6 @@ fn anchors(corpus: &Path, folder: &Path) -> Fallible<()> {
     line(&name("events"), events, "rows");
     line(&name("store_size"), mebibytes(bytes), "MiB");
     line(&name("size_over_held"), ratio(bytes, held_bytes), "x");
-    let keys = stored_keys(&store)?;
-    line("anchor_entry_longest", keys.entry, "bytes");
-    line("anchor_entries_cut", keys.cut, "entries");
-    line("key_longest_row_key", keys.row, "bytes");
-    line("key_longest_count_key", keys.count, "bytes");
 
     // 100 commands, evenly spread through the distinct ones: 50 longer than the 876 bytes the
     // exact index keeps whole, and 50 not.

@@ -7,6 +7,9 @@ check_dev = true
 [[crate]]
 name = "contextdb"
 allow = []
+# No outside library is re-exported but the two the first program names: `Uuid` and `serde_json`.
+deny_reexport = ["redb", "serde", "serde_json", "uuid", "pest", "pest_derive", "lz4_flex", "libc"]
+allow_reexport = ["Uuid", "serde_json"]
 
 [[crate.module]]
 path = "types"
@@ -88,3 +91,35 @@ name = "lib-root-holds-no-code"
 patterns = ["fn", "impl", "struct", "enum", "trait", "const", "static", "type"]
 allow = ["contextdb/src/*/**", "contextdb/src/settings.rs"]
 crates = ["contextdb"]
+
+# Each outside library is named only by the part that owns it, in the engine, its tests and its
+# examples. `dirs = ["."]` is the one setting that reaches tests/ and examples/. A `pub(crate)`
+# item in store whose signature names a storage-library type is not caught here; that needs a
+# signature rule the checker does not have yet.
+[[forbid]]
+name = "redb-only-in-store"
+patterns = ["redb"]
+allow = ["contextdb/src/store/**", "contextdb/tests/support/raw.rs"]
+crates = ["contextdb"]
+dirs = ["."]
+
+[[forbid]]
+name = "pest-only-in-the-sql-parser"
+patterns = ["pest", "pest_derive"]
+allow = ["contextdb/src/sql/parser/**"]
+crates = ["contextdb"]
+dirs = ["."]
+
+[[forbid]]
+name = "lz4-only-in-store-records"
+patterns = ["lz4_flex"]
+allow = ["contextdb/src/store/record.rs", "contextdb/src/store/tests.rs"]
+crates = ["contextdb"]
+dirs = ["."]
+
+[[forbid]]
+name = "libc-only-in-system"
+patterns = ["libc"]
+allow = ["contextdb/src/system/**"]
+crates = ["contextdb"]
+dirs = ["."]

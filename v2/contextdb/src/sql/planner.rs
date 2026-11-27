@@ -164,8 +164,9 @@ fn forms_stand(expr: &Expr) -> Result<()> {
     // A quoted text that is no JSON, compared with a JSON field.
     let word = |one: &Expr, other: &Expr| match (one, other) {
         (Expr::Field { as_text: false, .. }, Expr::Literal(Value::Text(text))) => {
-            let json = serde_json::from_str::<serde_json::Value>(text);
-            json.is_err().then(|| text.clone())
+            crate::types::parse_json(text)
+                .is_none()
+                .then(|| text.clone())
         }
         _ => None,
     };

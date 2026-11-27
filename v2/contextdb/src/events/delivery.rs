@@ -2,7 +2,7 @@
 use super::*;
 use crate::query::Reader;
 use crate::store::{
-    Cell, ChangeSet, DELIVERY, View, delivery_parts, put_text, put_value, read_value, value_len,
+    Cell, ChangeSet, DELIVERY, View, delivery_identity, put_text, put_value, read_value, value_len,
 };
 use crate::types::{EventTypeTrigger, Kind, Principal, SinkError, SinkEvent, TxId, Value};
 use std::borrow::Cow;
@@ -197,8 +197,8 @@ pub(crate) fn identity(
     if key.len() != 9 || key[0] != DELIVERY || key[1..] == [0; 8] {
         return Err(view.damaged("an invalid delivery key"));
     }
-    let (mut bytes, _, _) =
-        delivery_parts(bytes).map_err(|_| view.damaged("an invalid delivery record"))?;
+    let mut bytes =
+        delivery_identity(bytes).ok_or_else(|| view.damaged("an invalid delivery record"))?;
     held.grow(1024)?;
     let bad = || view.damaged("an invalid delivery record");
     let (front, rest) = bytes.split_first_chunk::<21>().ok_or_else(bad)?;

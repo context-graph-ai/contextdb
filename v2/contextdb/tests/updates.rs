@@ -205,7 +205,7 @@ fn an_update_and_a_delete_hold_one_batch_beside_what_they_stage() {
         let changed = fits(tx.execute(sql, &params! {}), sql);
         assert_eq!(changed.rows_affected(), ROWS as u64, "{sql}");
         // Separate the fixed transaction workspace from the staged row data.
-        let staged = support::used(&db) - idle - redb::WriteTransaction::DRAIN_BYTES;
+        let staged = support::used(&db) - idle - support::raw::DRAIN_BYTES;
         tx.rollback();
         staged
     };

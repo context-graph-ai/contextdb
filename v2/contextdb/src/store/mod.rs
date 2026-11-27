@@ -34,11 +34,31 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
-pub use redb::StorageBackend;
+/// The data file as the library reads and writes it, given by a host's [`WrapStorage`].
+pub trait StorageBackend: std::fmt::Debug + Send + Sync {
+    /// The length of the storage in bytes.
+    fn len(&self) -> io::Result<u64>;
+    /// Whether the storage holds no bytes.
+    fn is_empty(&self) -> io::Result<bool> {
+        Ok(self.len()? == 0)
+    }
+    /// Fills `out` from `offset`; a read past the end is an error.
+    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()>;
+    /// Sets the length; new bytes read as zeros.
+    fn set_len(&self, len: u64) -> io::Result<()>;
+    /// Makes everything written durable.
+    fn sync_data(&self) -> io::Result<()>;
+    /// Writes `data` at `offset`.
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()>;
+    /// Releases what the backend holds. It is called once, after every other call.
+    fn close(&self) -> io::Result<()> {
+        Ok(())
+    }
+}
 use redb::{ReadTransaction, ReadableDatabase, TableDefinition, WriteTransaction};
 
 pub(crate) use crate::memory::cache_under;
-use crate::memory::{Budget, Passing, Reservation};
+use crate::memory::{Budget, Passing, Reservation, account};
 use crate::system::locked;
 use crate::types::{Error, Result, SortDirection, TriggerEvent, TxId, Value, heap_bytes};
 pub(crate) use disk::{AUDIT, DELIVERY, LAST_AUDIT, OWED, READERS, READING, Record, SCHEDULE};
@@ -49,10 +69,47 @@ pub(crate) use folder::WriteOpenOptions;
 use folder::{Hold, Locked};
 pub(crate) use keys::{Entry, EntryShape, KEY_LIMIT, Span, cells_end, encoded_len, span};
 pub(crate) use record::{
-    Length, delivery_parts, most, put_text, put_value, read_value, split_cells, value_len,
+    Length, delivery_identity, most, put_text, put_value, read_value, split_cells, value_len,
     value_prefix,
 };
-pub(crate) use space::{Space, fnv};
+pub(crate) use space::{COMPACTION_ROOM, Space, fnv};
+
+/// A reader's room to check one commit: the storage library's longest list, 8 bytes and a bit a
+/// page. A writer checks only at open, with its cache empty, and sets none aside.
+const CHECK: u64 = 65_536 * 8 + 65_536 / 8;
+
+/// The bytes an open sets aside to read a file of `file` bytes: a writer's page maps, 768 KiB
+/// for each started 4 GiB region, or with no file a reader's check.
+pub(crate) fn maps(file: Option<u64>) -> u64 {
+    file.map_or(CHECK, |len| (len / (4 << 30) + 1) * (768 << 10))
+}
+
+/// The lowest memory limit a writer opens under: what an open of an empty file sets aside.
+pub(crate) fn memory_floor() -> u64 {
+    let [allowance, cache, plans, maps] =
+        account(Some(0), cache_under(Some(0), None), maps(Some(0)));
+    allowance + cache + plans + maps
+}
+
+/// The bytes of pages a page cache of `cache` bytes holds: each 4 KiB page keeps 160 bytes of
+/// bookkeeping inside the cache's bytes.
+fn pages(cache: u64) -> usize {
+    (cache / (4096 + 160) * 4096) as usize
+}
+
+/// A reading store's page cache, kept only to count what it serves.
+#[derive(Clone)]
+pub(crate) struct Pages(Arc<redb::ReadOnlyDatabase>);
+impl Pages {
+    /// Pages found in the cache and pages read from the file, since the store opened.
+    pub(crate) fn counts(&self) -> (u64, u64) {
+        let stats = self.0.cache_stats();
+        (stats.read_hits(), stats.read_misses())
+    }
+}
+
+/// The room a write transaction sets aside for the storage library's buffered changes.
+pub(crate) const DRAIN_BYTES: usize = WriteTransaction::DRAIN_BYTES;
 
 /// What a refusal names when the memory limit cannot hold the page cache.
 const CACHE_NEEDED: &str = "page cache needed to open the store";
@@ -575,7 +632,7 @@ impl ChangeSet {
 
     fn write_room(&mut self, bytes: u64) -> Result<()> {
         self.undo.room(&mut self.calls, usize::MAX)?;
-        let drain = u64::from(!self.drain) * redb::WriteTransaction::DRAIN_BYTES as u64;
+        let drain = u64::from(!self.drain) * DRAIN_BYTES as u64;
         self.reserved.grow(bytes + drain)?;
         self.drain = true;
         Ok(())
@@ -1237,9 +1294,9 @@ impl Store {
     }
 
     /// The file's cache, for a store held for reading.
-    pub(crate) fn pages(&self) -> Option<Arc<redb::ReadOnlyDatabase>> {
+    pub(crate) fn pages(&self) -> Option<Pages> {
         match &self.held {
-            HeldFor::Reading { data, .. } => Some(data.clone()),
+            HeldFor::Reading { data, .. } => Some(Pages(data.clone())),
             HeldFor::Writing { .. } => None,
         }
     }
@@ -1277,7 +1334,7 @@ impl Store {
         storage: Option<&WrapStorage>,
     ) -> Result<Store> {
         let cache = cache_under(budget.limit(), cache_share);
-        let [_, bytes, _, check] = crate::memory::account(budget.limit(), cache, None);
+        let [_, bytes, _, check] = account(budget.limit(), cache, maps(None));
         let reserved = budget.reserve(bytes + check, CACHE_NEEDED)?;
         let maps = Arc::new((Mutex::new(reserved.passing()), Default::default()));
         let held = HeldFor::reading(folder, storage, cache, &maps)

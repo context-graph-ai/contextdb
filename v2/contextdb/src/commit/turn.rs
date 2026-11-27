@@ -144,13 +144,14 @@ impl Open {
             }
             let mut event = self.summary(&mut changes, &catalog, source);
             if let Some(n) = changes.changed_setting(0) {
-                self.budget.set_limit(crate::settings::applied(0, n))?;
+                self.budget
+                    .set_limit(crate::settings::applied(0, n, memory_floor()))?;
             }
             // A lower disk limit holds for the commit that records it: setting it never grows the
             // file past it
             let lower = changes
                 .changed_setting(1)
-                .and_then(|n| crate::settings::applied(1, n));
+                .and_then(|n| crate::settings::applied(1, n, 0));
             if let Some(n) = lower.filter(|n| before.1.is_none_or(|b| *n < b)) {
                 self.store.disk_limit(Some(n));
             }
@@ -164,8 +165,8 @@ impl Open {
             )?;
             let commit = self.store.commit(&mut changes)?;
             if let Some(n) = changes.changed_setting(1) {
-                self.store.disk_limit(crate::settings::applied(1, n));
-                *locked(&self.disk) = crate::settings::applied(1, n);
+                self.store.disk_limit(crate::settings::applied(1, n, 0));
+                *locked(&self.disk) = crate::settings::applied(1, n, 0);
             }
             retire.into_iter().for_each(|retire| retire());
             self.adopt(commit, catalog, vectors.totals);

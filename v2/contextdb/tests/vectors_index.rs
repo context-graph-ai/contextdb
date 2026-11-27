@@ -617,30 +617,7 @@ fn a_damaged_ivf_costs_a_find_only_the_work_already_spent() {
         support::run(&db, "UPDATE docs SET tag = 0");
         support::run(&db, "UPDATE docs SET tag = 1 WHERE id <= 20");
         support::close(db);
-        let damage = |folder: &Path, block: u32| {
-            use redb::{ReadableTable, TableDefinition};
-            let file = redb::Database::open(folder.join("data")).unwrap();
-            let write = file.begin_write().unwrap();
-            {
-                let mut blocks = write
-                    .open_table(TableDefinition::<&[u8], &[u8]>::new("vector_blocks"))
-                    .unwrap();
-                let (key, mut bytes) = blocks
-                    .iter()
-                    .unwrap()
-                    .map(Result::unwrap)
-                    .find_map(|(k, v)| {
-                        let key = k.value();
-                        (key[0] == 7 && key[9..] == block.to_be_bytes())
-                            .then(|| (key.to_vec(), v.value().to_vec()))
-                    })
-                    .expect("the target binary block exists");
-                bytes.pop();
-                blocks.insert(key.as_slice(), bytes.as_slice()).unwrap();
-            }
-            write.commit().unwrap();
-        };
-        damage(&folder, 1);
+        support::raw::damage_binary_block(&folder, 1);
         let db = support::open(&folder);
         let filter = Some("tag = 1");
         support::load_docs(&db, ROWS + 1..=ROWS + 5, "a", |_| {
@@ -709,7 +686,7 @@ fn a_damaged_ivf_costs_a_find_only_the_work_already_spent() {
         support::load_docs(&db, 201..=200 + ROWS, "b", |n| support::gathered(n, SMALL));
         support::maintenance(&db);
         support::close(db);
-        damage(&f, 0);
+        support::raw::damage_binary_block(&f, 0);
         let q = support::ringed(64, ROWS, SMALL);
         let (db, q) = (support::open(&f), &q);
         assert!(matches!(db.verify(), Err(Error::StoreCorrupted { .. })));

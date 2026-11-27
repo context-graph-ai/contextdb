@@ -360,7 +360,7 @@ impl Open {
             n,
             &crate::settings::load(|at| staged.changes.setting(at))?,
         )?;
-        let over = |c: u64| crate::settings::applied(0, n).is_none_or(|limit| limit > c);
+        let over = |c: u64| crate::settings::applied(0, n, memory_floor()).is_none_or(|l| l > c);
         if let Some(ceiling) = self.started_under.filter(|c| at == 0 && over(*c)) {
             let refused =
                 format!("SET MEMORY_LIMIT is above this session's ceiling of {ceiling} bytes");
@@ -368,7 +368,7 @@ impl Open {
         }
         let before = self.budget.limit();
         if at == 0 {
-            let limit = crate::settings::applied(0, n);
+            let limit = crate::settings::applied(0, n, memory_floor());
             self.store.count_cache_under(limit)?;
             self.budget.set_limit(limit)?;
         }
@@ -382,7 +382,7 @@ impl Open {
         committed?;
         if at == 6 {
             self.statements
-                .set_limit(crate::settings::applied(6, n).unwrap_or(0));
+                .set_limit(crate::settings::applied(6, n, 0).unwrap_or(0));
         }
         self.signal.wake();
         Ok(())

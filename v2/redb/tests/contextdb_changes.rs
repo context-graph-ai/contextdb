@@ -659,3 +659,42 @@ fn a_multimap_of_byte_string_values_gives_each_back_whole() {
         "backwards, each whole"
     );
 }
+
+// A record replaced in the transaction that wrote it lets its old bytes go under
+// `insert_discard`: the replace allocates less than the value, where a plain insert hands the old
+// value back and allocates at least its length. The file then holds the last value alone.
+#[test]
+fn replacing_a_dirty_record_discards_its_old_bytes() {
+    const LEN: usize = 200 << 10;
+    const TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("wide");
+    let rise = |replace: &mut dyn FnMut()| {
+        let before = DELETE_BYTES.with(|v| v.get().0);
+        DELETE_BYTES.with(|v| v.set((before, before)));
+        replace();
+        DELETE_BYTES.with(|v| v.get().1 - before) as usize
+    };
+    let (a, b, c) = (vec![1_u8; LEN], vec![2_u8; LEN], vec![3_u8; LEN]);
+    let path = folder("dirty-replace").join("data");
+    let db = Database::create(&path).unwrap();
+    let tx = db.begin_write().unwrap();
+    {
+        let mut table = tx.open_table(TABLE).unwrap();
+        table.insert(1, a.as_slice()).unwrap();
+        let discard = rise(&mut || table.insert_discard(1, b.as_slice()).unwrap());
+        let keep = rise(&mut || {
+            assert_eq!(table.insert(1, c.as_slice()).unwrap().unwrap().value(), b);
+        });
+        assert!(
+            discard < LEN && keep >= LEN,
+            "discard rose {discard}, keep {keep}"
+        );
+        assert_eq!(table.len().unwrap(), 1);
+        assert_eq!(table.get(1).unwrap().unwrap().value(), c);
+    }
+    tx.commit().unwrap();
+    drop(db);
+    let db = Database::open(path).unwrap();
+    let table = db.begin_read().unwrap().open_table(TABLE).unwrap();
+    assert_eq!(table.len().unwrap(), 1);
+    assert_eq!(table.get(1).unwrap().unwrap().value(), c);
+}
