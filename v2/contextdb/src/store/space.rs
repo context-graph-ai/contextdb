@@ -12,6 +12,18 @@ use std::path::Path;
 use super::{HeldFor, Store, Stored, VectorId, disk, locked};
 use crate::types::Result;
 
+/// A compaction step's room: its allowance of 256 pages, counted at 256 bytes each, and 8 bytes
+/// for each page address the release before it stages.
+pub(crate) const COMPACTION_ROOM: u64 = 256 * 256 + redb::RELEASE_PAGES as u64 * 8;
+
+/// What one compaction step did: pages read, moved and written, and whether the pass ended.
+pub(crate) struct Compacted {
+    pub(crate) read: u64,
+    pub(crate) moved: u64,
+    pub(crate) written: u64,
+    pub(crate) ended: bool,
+}
+
 /// The compaction retry and the partitions refused for room, as the writer decided them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Space {
@@ -146,11 +158,7 @@ impl Store {
     /// above zero it takes the `k`-th page that has a lower place alone. A step refused for room
     /// has failed, and the pass keeps its last stored place. Also says whether the step had
     /// chosen a page to move, and the pages a refused step read.
-    pub(crate) fn compaction_step(
-        &self,
-        stop: u64,
-        k: u32,
-    ) -> (Result<redb::CompactionStep>, bool, u64) {
+    pub(crate) fn compaction_step(&self, stop: u64, k: u32) -> (Result<Compacted>, bool, u64) {
         let HeldFor::Writing { data, .. } = &self.held else {
             unreachable!()
         };
@@ -164,7 +172,13 @@ impl Store {
             read = step.read;
             write.prepare_compaction_commit()?;
             write.commit()?;
-            Ok(step)
+            let (read, moved, written, ended) = (step.read, step.moved, step.written, step.ended);
+            Ok(Compacted {
+                read,
+                moved,
+                written,
+                ended,
+            })
         };
         let step = step().map_err(|e| disk::failed(&self.folder, "compaction", e));
         (step, selected, read)

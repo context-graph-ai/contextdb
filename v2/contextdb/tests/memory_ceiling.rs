@@ -987,47 +987,12 @@ fn delivery_allocation_row(role: &support::Role) {
     });
 }
 
+/// A large value updated twice in one transaction reads back as the last update, before the
+/// commit and after a reopen. The storage library measures its own replace in its own tests.
 #[test]
-fn replacing_a_dirty_record_discards_its_old_bytes() {
-    use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
-    const TEST: &str = "replacing_a_dirty_record_discards_its_old_bytes";
+fn a_large_value_updated_twice_in_one_transaction_keeps_the_last() {
     const LEN: usize = 200 << 10;
-    const TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("wide");
-    let Some(role) = support::role() else {
-        let folder = support::folder(TEST);
-        let lines = support::Child::start(TEST, "replace", &folder).end();
-        eprintln!("allocation receipts: {lines:?}");
-        assert!(support::last_number(&lines, "discard_rise").unwrap() < LEN as u64);
-        assert!(support::last_number(&lines, "keep_rise").unwrap() >= LEN as u64);
-        return;
-    };
-    let (a, b, c) = (vec![1_u8; LEN], vec![2_u8; LEN], vec![3_u8; LEN]);
-    let path = role.folder.join("raw");
-    let db = redb::Database::create(&path).unwrap();
-    let tx = db.begin_write().unwrap();
-    {
-        let mut table = tx.open_table(TABLE).unwrap();
-        table.insert(1, a.as_slice()).unwrap();
-        measured("discard_", || {
-            table.insert_discard(1, b.as_slice()).unwrap();
-            Ok(())
-        });
-        measured("keep_", || {
-            assert_eq!(table.insert(1, c.as_slice()).unwrap().unwrap().value(), b);
-            Ok(())
-        });
-        assert_eq!(table.len().unwrap(), 1);
-        assert_eq!(table.get(1).unwrap().unwrap().value(), c);
-    }
-    tx.commit().unwrap();
-    drop(db);
-    let db = redb::Database::open(path).unwrap();
-    let tx = db.begin_read().unwrap();
-    let table = tx.open_table(TABLE).unwrap();
-    assert_eq!(table.len().unwrap(), 1);
-    assert_eq!(table.get(1).unwrap().unwrap().value(), c);
-
-    let folder = role.folder.join("sql");
+    let folder = support::folder("a_large_value_updated_twice_in_one_transaction_keeps_the_last");
     let db = support::open(&folder);
     support::run(&db, "CREATE TABLE t(id INT PRIMARY KEY, body TEXT)");
     let a = params! { "v" => "a".repeat(LEN) };
@@ -1035,7 +1000,7 @@ fn replacing_a_dirty_record_discards_its_old_bytes() {
     let tx = db.transaction().unwrap();
     tx.execute("INSERT INTO t VALUES(1,$v)", &a).unwrap();
     tx.execute("UPDATE t SET body=$v WHERE id=1", &a).unwrap();
-    measured("sql_", || tx.execute("UPDATE t SET body=$v WHERE id=1", &b));
+    tx.execute("UPDATE t SET body=$v WHERE id=1", &b).unwrap();
     let expected = support::rows(&tx, "SELECT id,body FROM t");
     assert_eq!(
         expected,

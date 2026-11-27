@@ -105,7 +105,7 @@ impl ChangeSet {
             self.dropped = Vec::new();
             self.copied = Vec::new();
             self.calls.clear();
-            let drain = u64::from(self.drain) * redb::WriteTransaction::DRAIN_BYTES as u64;
+            let drain = u64::from(self.drain) * super::DRAIN_BYTES as u64;
             self.reserved
                 .shrink(self.reserved.bytes().saturating_sub(drain));
         }

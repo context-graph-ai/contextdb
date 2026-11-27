@@ -337,10 +337,9 @@ pub(crate) fn compact(
         }
     }
     report.compaction_free_ratio = Some(free as f64 / total.max(1) as f64);
-    let room = 256 * 256 + redb::RELEASE_PAGES as u64 * 8;
     let _room = open
         .budget
-        .reserve(room, "transaction")
+        .reserve(crate::store::COMPACTION_ROOM, "transaction")
         .inspect_err(|_| report.memory_refused = Some(true))?;
     let stop = if running {
         (total as f64 * ratio(3)).ceil() as u64

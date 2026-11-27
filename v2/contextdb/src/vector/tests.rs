@@ -1262,7 +1262,7 @@ fn staged(store: &Store, budget: &Budget, stage: StageWith) -> crate::types::Res
     // retains exactly the drain workspace, including when its staged records rewind.
     let held = budget.used() - counted;
     assert!(
-        given.is_ok() || [0, redb::WriteTransaction::DRAIN_BYTES as u64].contains(&held),
+        given.is_ok() || [0, crate::store::DRAIN_BYTES as u64].contains(&held),
         "memory counted after the refusal beyond the transaction's drain workspace"
     );
     drop(changes);

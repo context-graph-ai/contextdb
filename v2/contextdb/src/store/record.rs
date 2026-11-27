@@ -132,7 +132,12 @@ pub(super) fn encode_row<E: From<types::Error>>(
 }
 
 /// Delivery framing: opaque identity, then an inline body or the same address a row keeps.
-pub(crate) fn delivery_parts(bytes: &[u8]) -> Stored<(&[u8], &[u8], Option<Beside>)> {
+/// The identity a delivery record leads with, or `None` when the record is not sound.
+pub(crate) fn delivery_identity(bytes: &[u8]) -> Option<&[u8]> {
+    delivery_parts(bytes).ok().map(|parts| parts.0)
+}
+
+pub(super) fn delivery_parts(bytes: &[u8]) -> Stored<(&[u8], &[u8], Option<Beside>)> {
     let (length, bytes) = bytes.split_first_chunk::<4>().ok_or_else(unsound)?;
     let (identity, mut body) = bytes
         .split_at_checked(u32::from_le_bytes(*length) as usize)

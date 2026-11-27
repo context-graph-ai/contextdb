@@ -25,8 +25,9 @@ pub(crate) const SETTINGS: [(&str, Kind, u64); 8] = [
     ("SET MAINTENANCE_POLL_INTERVAL", Seconds, 60_000),
 ];
 pub(crate) const RESET: u64 = u64::MAX - 1;
-pub(crate) fn applied(at: usize, n: u64) -> Option<u64> {
-    let default = (at == 0).then(crate::system::default_memory_limit);
+/// The value in force for `n` at `at`; a reset memory limit takes the default above `floor`.
+pub(crate) fn applied(at: usize, n: u64, floor: u64) -> Option<u64> {
+    let default = (at == 0).then(|| crate::system::default_memory_limit(floor));
     let default = default.unwrap_or(SETTINGS[at].2);
     limit(if n == RESET { default } else { n })
 }

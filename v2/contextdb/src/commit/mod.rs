@@ -23,7 +23,7 @@ use crate::schema::{self, Catalog};
 use crate::sql::plan::KeptPlans;
 use crate::sql::{self, Effect, Plan};
 use crate::stage;
-use crate::store::{ChangeSet, Create, Read, Store, View, WrapStorage};
+use crate::store::{ChangeSet, Create, Read, Store, View, WrapStorage, maps, memory_floor};
 use crate::system::{self, Clock, locked};
 use crate::types::{Error, Maintenance, MaintenanceReport, Result, TxId, Value};
 use crate::vector::{self, Tally};
@@ -276,7 +276,10 @@ impl Open {
         let ceiling = options.memory_limit.map(|l| l as u64);
         let file = std::fs::metadata(path.join("data")).map_or(0, |data| data.len());
         let cache = crate::store::cache_under(ceiling, None);
-        crate::memory::admit(ceiling, crate::memory::account(ceiling, cache, Some(file)))?;
+        crate::memory::admit(
+            ceiling,
+            crate::memory::account(ceiling, cache, maps(Some(file))),
+        )?;
         let mut cache_limit = ceiling;
         let budget = Budget::new(ceiling)?;
         let store = Store::open_for_writing(path, &budget, &options)?;
@@ -286,7 +289,8 @@ impl Open {
         if options.memory_limit.is_none() {
             let remembered = settings[0].map(crate::settings::limit);
             cache_limit = remembered.flatten();
-            budget.set_limit(remembered.unwrap_or_else(|| Some(system::default_memory_limit())))?;
+            let default = || Some(system::default_memory_limit(memory_floor()));
+            budget.set_limit(remembered.unwrap_or_else(default))?;
         }
         let disk_started_under = options
             .disk_limit

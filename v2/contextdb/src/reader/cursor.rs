@@ -30,7 +30,7 @@ pub struct Cursor {
     limits: ReadLimits,
     clock: Arc<dyn Clock>,
     stop: Arc<AtomicU64>,
-    pages: Option<Arc<redb::ReadOnlyDatabase>>,
+    pages: Option<crate::store::Pages>,
     observer: Option<Arc<dyn ReadProgressObserver>>,
     opened: i64,
     touched: i64,

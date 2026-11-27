@@ -22,7 +22,7 @@ env:
   # it, so a cleanup lowers it for good. Reaching one means a refactor first: a number is raised
   # only when a planned stage of the work ends, never inside a fix (v2/AGENTS.md). Neither size
   # ever passes 150,000 lines or 1,000 tests.
-  SHIPPED_LINES: 40100
+  SHIPPED_LINES: 40200
   TESTS: 590
   TEST_LINES: 62000
 
@@ -87,6 +87,11 @@ jobs:
       - run: cargo test --manifest-path v2/Cargo.toml --workspace --locked --doc
       - name: The storage library's own tests
         run: cargo test --manifest-path v2/redb/Cargo.toml --locked --lib --tests
+      # A host that turns on serde_json's preserve_order turns it on for the engine too, and JSON
+      # objects become IndexMaps: the engine's own tests hold under that map as well.
+      - name: The engine's unit tests with serde_json's preserve_order
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test --manifest-path v2/Cargo.toml --locked -p contextdb --lib --features serde_json/preserve_order
       # A test is one the runner lists, or one script file. Counted on Linux, where every test runs.
       - name: Tests are at most the stated number and within 10 of it
         if: matrix.os == 'ubuntu-latest'

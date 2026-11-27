@@ -66,6 +66,17 @@ pub struct EventBusStatus {
     pub routes: Vec<RouteStatus>,
     pub schedules: Vec<ScheduleStatus>,
 }
+impl EventBusStatus {
+    /// The bytes of text it carries, which a result's size counts.
+    pub(crate) fn text_bytes(&self) -> usize {
+        let types = (self.event_types.iter()).flat_map(|e| [&e.name, &e.trigger, &e.table]);
+        let sinks = (self.sinks.iter()).flat_map(|s| [&s.name, &s.sink_type]);
+        let routes = (self.routes.iter()).flat_map(|r| [&r.name, &r.event_type, &r.sink]);
+        let schedules = (self.schedules.iter()).flat_map(|s| s.last_error.iter().chain([&s.name]));
+        let all = types.chain(sinks).chain(routes).chain(schedules);
+        all.map(String::len).sum()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TriggerAuditEntry {
@@ -164,6 +175,13 @@ pub(crate) fn write_audit(
         )?;
     }
     changes.put_last_audit(head + entries.len() as u64)
+}
+
+/// A stored firing as `write_audit` stores it: its stamp and its entry, `None` when damaged.
+pub(crate) fn read_audit(value: &[u8]) -> Option<(i64, TriggerAuditEntry)> {
+    let (stamp, entry) = value.split_first_chunk::<8>()?;
+    let entry = serde_json::from_slice(entry).ok()?;
+    Some((i64::from_be_bytes(*stamp), entry))
 }
 
 /// Stages a stored firing as read from `key`, judged expired: removed, or kept `kept`.

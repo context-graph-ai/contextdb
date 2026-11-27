@@ -23,12 +23,9 @@ use std::time::SystemTime;
 use crate::system::{self, Clock};
 use crate::types::Error;
 
-use redb::StorageBackend;
-
 use super::disk::Stored;
-use super::{Fixing, HeldFor, MapCover, Pins, WrapStorage, disk, locked};
+use super::{Fixing, HeldFor, MapCover, Pins, StorageBackend, WrapStorage, disk, locked};
 use crate::memory::Reservation;
-use crate::memory::account;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, Weak};
 
@@ -90,7 +87,7 @@ pub(super) fn sound(maps: &MapCover) -> io::Result<()> {
     }
 }
 
-impl StorageBackend for DataFile {
+impl redb::StorageBackend for DataFile {
     fn len(&self) -> io::Result<u64> {
         self.sound()?.len()
     }
@@ -104,9 +101,9 @@ impl StorageBackend for DataFile {
             .0
             .lock()
             .unwrap()
-            .cover(account(None, 0, Some(len))[3])
+            .cover(super::maps(Some(len)))
             .map_err(io::Error::other)?;
-        self.sound()?.admit_growth(len)
+        sound(&self.1)
     }
 
     /// A lengthening that fails, part way through writing zeros or otherwise, is cut back to the
@@ -461,7 +458,7 @@ impl HeldFor {
         let created = prepare_open(folder, options.create)?;
         let backend = DataFile::over(super::folder::kept(&folder.join("data"))?, storage, maps)?;
         // Only a writer holds the page maps of its file.
-        locked(&maps.0).cover(account(None, 0, Some(backend.len()?))[3])?;
+        locked(&maps.0).cover(super::maps(Some(redb::StorageBackend::len(&backend)?)))?;
         let running = Locked(File::open(folder.join("data"))?);
         running.0.lock()?; // Waits at most for a probe's instant.
         if limit.is_none() && cache != 0 {
@@ -491,7 +488,7 @@ impl HeldFor {
         let gate = File::open(&readers)?;
         let data = redb::Builder::new()
             .set_incremental_recovery(true)
-            .set_cache_size(crate::memory::pages(cache))
+            .set_cache_size(super::pages(cache))
             .set_manual_compaction(true)
             // When the files cannot be looked through, every commit counts as held.
             .set_held_commits_callback(move || {
@@ -550,7 +547,7 @@ impl HeldFor {
         let pinned = fixing.shared.is_none().then(|| fixing.pin()).transpose()?;
         let data = redb::Builder::new()
             .set_incremental_recovery(true)
-            .set_cache_size(crate::memory::pages(cache))
+            .set_cache_size(super::pages(cache))
             .open_read_only_with_backend(DataFile::over(file, storage, maps)?)?;
         drop(pinned);
         Ok(Some(HeldFor::Reading {

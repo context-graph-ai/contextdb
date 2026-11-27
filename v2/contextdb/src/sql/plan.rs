@@ -117,7 +117,7 @@ pub(crate) type Planned = (Plan, Reservation, Option<Arc<str>>);
 pub(crate) struct KeptPlans(pub(crate) Mutex<Kept>, Reservation);
 impl KeptPlans {
     pub(crate) fn new(budget: &Budget, limit: Option<u64>) -> Result<Self> {
-        let cap = crate::memory::account(limit, 0, None)[2];
+        let cap = crate::memory::account(limit, 0, 0)[2];
         let held = budget.reserve(cap, "statement plan cache needed to open the store")?;
         Ok(Self(Mutex::new((Vec::with_capacity(1024), 0)), held))
     }

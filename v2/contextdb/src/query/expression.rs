@@ -160,7 +160,7 @@ impl Kept {
                 let bytes =
                     json_bytes(text.as_bytes()) + text.len() as u64 + node::<(String, Json)>();
                 self.keep(bytes)?;
-                let value = serde_json::from_str(text).map_err(|_| {
+                let value = crate::types::parse_json(text).ok_or_else(|| {
                     Error::PlanError(
                         "TEXT beside JSON must contain valid JSON; use an explicit cast".to_owned(),
                     )

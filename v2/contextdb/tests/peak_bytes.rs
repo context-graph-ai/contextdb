@@ -34,7 +34,7 @@ fn a_statements_peak_bytes_do_not_grow_with_the_store() {
         // Remove only the exact admitted commit bookkeeping, leaving the statement peak.
         (
             look,
-            write - support::used(&db) as u64 - redb::WriteTransaction::DRAIN_BYTES as u64,
+            write - support::used(&db) as u64 - support::raw::DRAIN_BYTES as u64,
         )
     };
     support::insert_together(&db, 1..=1_000);
@@ -126,7 +126,7 @@ fn a_commit_and_a_declaration_do_not_grow_with_the_schema() {
         support::run(&db, "INSERT INTO plain VALUES (1)");
         sql.map(|s| {
             let peak = support::run(&db, s).peak_bytes().expect("a whole handle");
-            peak.saturating_sub((support::used(&db) + redb::WriteTransaction::DRAIN_BYTES) as u64)
+            peak.saturating_sub((support::used(&db) + support::raw::DRAIN_BYTES) as u64)
         })
     };
     let (small, large) = (peaks(10), peaks(100));

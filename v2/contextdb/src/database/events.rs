@@ -196,9 +196,7 @@ fn audit(
     view.deliveries(span, &mut |_, value| {
         let bad = || view.damaged("an invalid audit record");
         held.grow(value.len() as u64)?;
-        let stamp = value.first_chunk().map(|s| i64::from_be_bytes(*s));
-        let entry = serde_json::from_slice(&value[8.min(value.len())..]).ok();
-        let (stamp, entry) = stamp.zip(entry).ok_or_else(bad)?;
+        let (stamp, entry) = crate::events::read_audit(value).ok_or_else(bad)?;
         match keep(stamp, &entry) {
             true => held
                 .room(&mut answer, usize::MAX)
