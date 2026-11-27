@@ -7,6 +7,9 @@ members = ["contextdb", "contextdb-cli"]
 # The storage library keeps the manifest and the lock file it was published with.
 exclude = ["redb"]
 
+[workspace.lints.rust]
+unnameable_types = "deny"
+
 # A hash map is walked in a different order in every process, so nothing is built by walking one.
 [workspace.lints.clippy]
 iter_over_hash_type = "deny"

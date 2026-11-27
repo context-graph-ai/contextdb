@@ -18,7 +18,7 @@ pub(crate) type SetRecord = ((Vec<u8>, Vec<u8>), Reservation);
 mod drop;
 mod folder;
 mod keys;
-pub(crate) mod record;
+mod record;
 mod recovery;
 mod space;
 #[cfg(test)]
@@ -37,31 +37,22 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 pub use redb::StorageBackend;
 use redb::{ReadTransaction, ReadableDatabase, TableDefinition, WriteTransaction};
 
-use crate::database::{DatabaseOpenOptions, locked};
-use crate::events::AuditQueue;
+pub(crate) use crate::memory::cache_under;
 use crate::memory::{Budget, Passing, Reservation};
-use crate::read::ReadSessionOptions;
+use crate::system::locked;
 use crate::types::{Error, Result, SortDirection, TriggerEvent, TxId, Value, heap_bytes};
 pub(crate) use disk::{AUDIT, DELIVERY, LAST_AUDIT, OWED, READERS, READING, Record, SCHEDULE};
 use disk::{Moment, Stored, Tables};
 pub(crate) use drop::{BATCH, Dropped, Reclaim};
+pub use folder::Create;
+pub(crate) use folder::WriteOpenOptions;
 use folder::{Hold, Locked};
 pub(crate) use keys::{Entry, EntryShape, KEY_LIMIT, Span, cells_end, encoded_len, span};
 pub(crate) use record::{
-    delivery_parts, most, put_text, put_value, read_value, value_len, value_prefix,
+    Length, delivery_parts, most, put_text, put_value, read_value, split_cells, value_len,
+    value_prefix,
 };
 pub(crate) use space::{Space, fnv};
-
-/// The size of the page cache of a store opened under this memory limit, in bytes: a quarter
-/// of the limit and never less than 8 MiB, which is also its size when there is no limit. It is
-/// reserved from the budget when the store is opened and does not change until the store is
-/// closed, because the storage library fixes its cache when the data file is opened.
-pub(crate) fn cache_under(limit: Option<u64>, share: Option<u64>) -> u64 {
-    let limit = limit.unwrap_or(0);
-    share.map_or((limit / 4).max(8 << 20), |p| {
-        limit / 100 * p + limit % 100 * p / 100
-    })
-}
 
 /// What a refusal names when the memory limit cannot hold the page cache.
 const CACHE_NEEDED: &str = "page cache needed to open the store";
@@ -863,41 +854,26 @@ impl ChangeSet {
         Ok(())
     }
 
-    /// Stores each firing under the next number of one sequence, stamped `now`.
-    /// Each is the entry's fields in order, the firing past the depth cap `DepthExceeded`.
-    pub(crate) fn put_audit(&mut self, (firings, _): &AuditQueue, now: i64) -> Result<()> {
-        let (entries, names, tx, status) = firings;
-        if entries.is_empty() {
-            return Ok(());
-        }
-        let head = self.base.moment.number(disk::LAST_AUDIT)?;
-        for (number, &(name, depth, rows)) in (head..).zip(entries) {
-            let deep = crate::events::TriggerAuditStatus::DepthExceeded;
-            let status = if depth > crate::events::CASCADE_DEPTH_CAP {
-                &deep
-            } else {
-                status
-            };
-            let entry = (&names[name as usize], tx, depth, u64::from(rows), status);
-            let key = Key([&[AUDIT][..], &number.to_be_bytes()].concat());
-            let mut length = record::Length(8);
-            serde_json::to_writer(&mut length, &entry).expect("an audit entry encodes");
-            // Charged before the copy is made.
-            let bytes = self.counted(&key, length.0 as u64)?;
-            let mut value = Vec::with_capacity(length.0);
-            value.extend(now.to_be_bytes());
-            serde_json::to_writer(&mut value, &entry).expect("an audit entry encodes");
-            self.stage_record(key, Some(value), bytes)?;
-        }
-        self.put_number(disk::LAST_AUDIT, head + entries.len() as u64)
+    /// Stages the record under `key`: the `length` bytes that `fill` writes, charged before
+    /// they are made, or no record when `value` is `None`.
+    pub(crate) fn put_audit_record(
+        &mut self,
+        key: Vec<u8>,
+        value: Option<(usize, impl FnOnce(&mut Vec<u8>))>,
+    ) -> Result<()> {
+        let key = Key(key);
+        let bytes = self.counted(&key, value.as_ref().map_or(0, |(length, _)| *length) as u64)?;
+        let value = value.map(|(length, fill)| {
+            let mut value = Vec::with_capacity(length);
+            fill(&mut value);
+            value
+        });
+        self.stage_record(key, value, bytes)
     }
 
-    /// Stages a stored firing as read from `key`, judged expired: removed, or kept `kept`.
-    pub(crate) fn expire_audit(&mut self, key: &[u8], kept: Option<&[u8]>) -> Result<()> {
-        let bytes = self.counted(&Key(key.into()), kept.map_or(0, <[u8]>::len) as u64)?;
-        let value =
-            kept.map(|kept| [&crate::events::EXPIRED.to_be_bytes()[..], &kept[8..]].concat());
-        self.stage_record(Key(key.into()), value, bytes)
+    /// Stages the number of the last audit record.
+    pub(crate) fn put_last_audit(&mut self, value: u64) -> Result<()> {
+        self.put_number(disk::LAST_AUDIT, value)
     }
 
     /// Builds pending bytes under the journal's charge. Outer None skips; inner None removes.
@@ -1280,12 +1256,13 @@ impl Store {
     /// Reserves the page cache from `budget`: the cache the budget's limit calls for, and with
     /// no limit there the cache that the limit the store remembers calls for. The caller sets
     /// the remembered limit on the budget afterwards, and the cache fits under it.
-    pub(crate) fn open_for_writing(
+    pub(crate) fn open_for_writing<'a>(
         folder: &Path,
         budget: &Budget,
-        options: &DatabaseOpenOptions,
+        options: impl Into<WriteOpenOptions<'a>>,
     ) -> Result<Store> {
-        folder::writing_with_cache(folder, budget, options, cache_under(budget.limit(), None))
+        let options = options.into();
+        folder::writing_with_cache(folder, budget, &options, cache_under(budget.limit(), None))
     }
 
     /// Opens the folder for reading. Never creates anything: refuses with `StoreMissing` when
@@ -1296,13 +1273,14 @@ impl Store {
     pub(crate) fn open_for_reading(
         folder: &Path,
         budget: &Budget,
-        options: &ReadSessionOptions,
+        cache_share: Option<u64>,
+        storage: Option<&WrapStorage>,
     ) -> Result<Store> {
-        let cache = cache_under(budget.limit(), options.limits.cache_share);
+        let cache = cache_under(budget.limit(), cache_share);
         let [_, bytes, _, check] = crate::memory::account(budget.limit(), cache, None);
         let reserved = budget.reserve(bytes + check, CACHE_NEEDED)?;
         let maps = Arc::new((Mutex::new(reserved.passing()), Default::default()));
-        let held = HeldFor::reading(folder, options, cache, &maps)
+        let held = HeldFor::reading(folder, storage, cache, &maps)
             .map_err(|error| disk::failed(folder, "open", error))?;
         let Some(held) = held else {
             return Err(Error::StoreMissing {

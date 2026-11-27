@@ -516,6 +516,16 @@ pub(crate) fn entries(
     })
 }
 
+/// The vectors of `column` waiting in every one of its partitions, unindexed.
+pub(crate) fn pending_count(read: &dyn Read, column: &VectorColumn) -> Result<u64> {
+    let mut pending = 0;
+    entries(read, column, None, &mut |_, partition| {
+        pending += u64::from(partition.unindexed);
+        Ok(true)
+    })?;
+    Ok(pending)
+}
+
 /// Whether the IVF record requires a rebuild. Its temporary bytes are always budgeted.
 fn repair(
     read: &dyn Read,

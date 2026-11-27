@@ -688,11 +688,11 @@ pub struct TableMeta {
     pub kept_counts: Option<KeptCounts>,
     /// Sorted, distinct members named by DELIVERY MANIFEST OVER.
     pub delivery_manifest: Vec<String>,
-    pub edge_discard: Option<crate::sql::ast::EdgeDiscard>,
-    pub propagation_rules: Vec<(Vec<String>, crate::sql::ast::Reference)>,
+    pub edge_discard: Option<EdgeDiscard>,
+    pub propagation_rules: Vec<(Vec<String>, Reference)>,
     pub vectors: Vec<VectorOptions>,
-    pub scope_label: Option<(String, crate::sql::ast::ScopeLabels)>,
-    pub propagate_edges: Vec<crate::sql::ast::EdgePropagation>,
+    pub scope_label: Option<(String, ScopeLabels)>,
+    pub propagate_edges: Vec<EdgePropagation>,
     pub exclude_vector_states: Vec<String>,
 }
 
@@ -799,4 +799,183 @@ pub enum SinkError {
     /// The action may have succeeded; retry retains the same action identity.
     OutcomeUncertain(String),
     Permanent(String),
+}
+
+/// `REFERENCES table (column, ...)`, with its `ON STATE` rule when one was written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reference {
+    pub follows_parent_purge: bool,
+    pub table: String,
+    pub columns: Vec<String>,
+    pub on_state: Option<Propagation>,
+}
+
+/// `ON STATE on_state PROPAGATE SET set [MAX DEPTH n] [ABORT ON FAILURE]`, and the same four
+/// things of a `PROPAGATE ON EDGE`. A state keeps the letters it was written in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Propagation {
+    pub on_state: String,
+    pub set: String,
+    pub max_depth: Option<u32>,
+    pub abort_on_failure: bool,
+}
+
+/// `PROPAGATE ON EDGE edge_type direction STATE ... SET ...`. The edge type keeps the letters
+/// it was written in; the direction is INCOMING, OUTGOING or BOTH, in capitals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgePropagation {
+    pub edge_type: String,
+    pub direction: String,
+    pub rule: Propagation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeDiscard {
+    Never,
+    AfterOutcome,
+    Always,
+}
+
+/// `SCOPE_LABEL (...)` stores its single write-only list in `read`, with `write = None`;
+/// it hides no rows on reads. `SCOPE_LABEL_READ (...) WRITE (...)` stores separate read
+/// and write allowlists in the corresponding fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeLabels {
+    pub read: Vec<String>,
+    pub write: Option<Vec<String>>,
+}
+
+/// The refusal of a statement, a clause or a form that a later version of the library reads,
+/// by its name.
+pub(crate) fn not_supported(what: &str) -> Error {
+    Error::PlanError(format!(
+        "{what} is not supported in this version of the library"
+    ))
+}
+
+/// The refusal of a form of the earlier engine that no version of the library reads, by its
+/// name, with what to write in its place.
+pub(crate) fn not_carried(what: &str, instead: &str) -> Error {
+    Error::PlanError(format!("{what} is not part of this library: {instead}"))
+}
+
+/// Who drives a store's maintenance cycles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Maintenance {
+    /// The engine runs one worker for the lifetime of the writing handles.
+    /// It polls at persisted `MAINTENANCE_POLL_INTERVAL` (60,000 ms by default)
+    /// and wakes for due vector builds. Timer/caller cycles also seal partial tails;
+    /// a vector wake does not. Read-only sessions start no worker; close joins it
+    /// without requesting a final cycle. Due rows remain readable until expiry runs.
+    #[default]
+    Engine,
+    /// The host calls [`crate::Database::run_maintenance_cycle`].
+    Caller,
+}
+
+/// Content key/value bytes of one table, excluding physical page overhead.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContentSize {
+    pub table: String,
+    pub rows: u64,
+    pub large_values: u64,
+    pub indexes: u64,
+    pub vectors: u64,
+    pub blocks: u64,
+    pub versions: u64,
+}
+
+/// A successful whole-store check, with tables in name order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VerifyReport {
+    pub tables: Vec<ContentSize>,
+}
+
+/// What one cycle of maintenance did, as [`crate::Database::run_maintenance_cycle`] returns it.
+/// Every field is `None` on a narrowed caller, not a zero or a completion signal.
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize)]
+#[non_exhaustive]
+pub struct MaintenanceReport {
+    /// Whether maintenance work remains, including reader-blocked compaction. `None` is
+    /// withheld; yield when `compaction_waiting_on` names a reader. Memory-stalled work waits.
+    pub work_remaining: Option<bool>,
+    /// What the cycle did for vector search.
+    pub vector: VectorMaintenanceReport,
+    /// Events delivered in this cycle: `Some(0)` on unnarrowed handles in this version.
+    /// No external event-delivery worker is implemented.
+    pub delivered: Option<u64>,
+    /// Rows removed by expiry.
+    pub expired_rows: Option<u64>,
+    /// Versions removed that their table no longer keeps or whose row was removed.
+    pub versions_removed: Option<u64>,
+    /// Records removed in the cycle's batches: rows with their entries, versions, index entries,
+    /// vector records and slices of large values, at most 1,024 a batch beside one row's own.
+    pub removed_records: Option<u64>,
+    /// Whether an owed range still holds records after the cycle's last batch.
+    pub owed: Option<bool>,
+    /// Whether a batch moved an owed range on, if only past newer versions to its stored place.
+    pub removal_advanced: Option<bool>,
+    /// True when the removal loop or the tidy-up was refused memory in this cycle.
+    pub memory_refused: Option<bool>,
+    /// True when the cycle's tidy-up step was refused room; the pass keeps its last place.
+    pub compaction_disk_refused: Option<bool>,
+    /// Pages moved by the cycle's tidy-up step: at most the allowance of 256 pages read and
+    /// written, except that a step's first movable block moves whatever its size.
+    pub compacted_pages: Option<u64>,
+    /// Pages the tidy-up step read to find what to move.
+    pub compaction_pages_read: Option<u64>,
+    /// Pages the tidy-up step wrote: the copies and the pages above them.
+    pub compaction_pages_written: Option<u64>,
+    /// Bytes the data file lost from the start of the cycle (or `compact_now`) to its end; 0
+    /// when it did not shrink.
+    pub reclaimed_bytes: Option<u64>,
+    /// Whether the tidy-up moved pages or its place, or was refused with a smaller move owed.
+    pub compaction_advanced: Option<bool>,
+    /// Work deferred to a later cycle.
+    pub deferred: Option<u64>,
+    /// `Readers` when a reader still holds moved pages; withheld on narrowed handles.
+    pub compaction_waiting_on: Option<WaitingOn>,
+    /// Free pages over all pages, measured before a compaction step ran; `None` when none ran.
+    pub compaction_free_ratio: Option<f64>,
+    /// Bytes of pages in use holding no content, as a share; the shell fills it once per report.
+    pub page_slack_ratio: Option<f64>,
+    /// Old pages still to classify after a kill; zero when known, withheld when narrowed.
+    pub recovery_pages_remaining: Option<u64>,
+    /// Whether the rebuild of the free-page record took a step in this cycle.
+    pub recovery_advanced: Option<bool>,
+}
+
+/// Why page reclamation waits; no reason is reported until a cycle observes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum WaitingOn {
+    /// A reader still holds the pages moved.
+    Readers,
+}
+
+/// The part of a [`MaintenanceReport`] about vector search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[non_exhaustive]
+pub struct VectorMaintenanceReport {
+    /// How many vectors this cycle moved from pending lists into blocks, added to how many
+    /// it packed into the blocks of an IVF being built.
+    pub maintenance_vectors_done: Option<u64>,
+    /// How many vectors still wait after this cycle, over every column of the store: those on
+    /// a pending list, those a build under way has not packed, and those of partitions whose
+    /// IVF is due and not begun. Those of a stalled build are not counted: no further
+    /// cycle packs them until it has the memory.
+    pub maintenance_vectors_remaining: Option<u64>,
+    /// How many partitions have an IVF due or being built after this cycle.
+    pub remaining_partitions: Option<u64>,
+    /// How many of those had their last step refused for want of memory. A further cycle does
+    /// nothing for them until the memory limit is raised or memory is let go, and with no
+    /// limit declared there are none. These counts describe vector work only; use
+    /// [`MaintenanceReport::work_remaining`] to decide whether to run another cycle.
+    /// `None` means withheld, never completed.
+    pub stalled_partitions: Option<u64>,
+}
+
+impl MaintenanceReport {
+    pub(crate) fn withheld(self) -> Self {
+        Self::default()
+    }
 }

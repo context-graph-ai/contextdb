@@ -122,7 +122,7 @@ impl<'a> Visible<'a> {
             // nobody.
             let grants = catalog.table(from).and_then(|table| {
                 let mut filtered = vec![false; table.meta.columns.len()];
-                reads(&filter, &table.scope(), &params, &mut filtered).ok()?;
+                reads(&filter, &crate::query::scope(table), &params, &mut filtered).ok()?;
                 Some((table, filtered))
             });
             let grants = match grants {

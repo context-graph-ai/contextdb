@@ -22,7 +22,7 @@ env:
   # it, so a cleanup lowers it for good. Reaching one means a refactor first: a number is raised
   # only when a planned stage of the work ends, never inside a fix (v2/AGENTS.md). Neither size
   # ever passes 150,000 lines or 1,000 tests.
-  SHIPPED_LINES: 40000
+  SHIPPED_LINES: 40100
   TESTS: 590
   TEST_LINES: 62000
 
@@ -39,6 +39,13 @@ jobs:
       - run: cargo clippy --manifest-path v2/redb/Cargo.toml --all-targets --locked -- -D warnings
       - run: cargo clippy --manifest-path v2/redb/Cargo.toml --locked --release -- -D warnings
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --manifest-path v2/Cargo.toml --workspace --locked --no-deps
+      # The checker is built fresh from the tip of its main branch on every run, so the log names
+      # the exact commit that judged the module order.
+      - name: Every module uses only the modules beneath it
+        run: |
+          cargo install --git https://github.com/context-graph-ai/cargo-strata --branch main --locked --root "$RUNNER_TEMP/strata" cargo-strata
+          grep -oE 'cargo-strata [^ ]+ \(git\+[^)]+\)' "$RUNNER_TEMP/strata/.crates2.json"
+          PATH="$RUNNER_TEMP/strata/bin:$PATH" cargo strata check --manifest-path v2/Cargo.toml --config v2/strata.toml
       - name: Shipped lines are at most the stated number and within 500 of it
         run: |
           lines=$(find v2/contextdb/src v2/contextdb-cli/src \( -name '*.rs' -o -name '*.pest' \) ! -name tests.rs -exec cat {} + | wc -l)
@@ -57,9 +64,10 @@ jobs:
       - name: No old name for the IVF index, its maintenance or its unindexed list
         run: |
           old=$(grep -rnIwiE --exclude-dir=target --exclude=aggregate.rs --exclude=group_by.sql --exclude=query-language.md 'upkeep|sketch|groupings?' v2 docs | grep -vE 'joins, grouping|unions, grouping|a sort or a grouping' || true)
-          old+=$(grep -rnE --include='*.rs' '(vector|unindexed|super)::(stage|waiting)\b' v2/contextdb/src || true)
+          old+=$(grep -rnE --include='*.rs' '(vector|unindexed)::(stage|waiting)\b' v2/contextdb/src || true)
+          old+=$(grep -rnE --include='*.rs' 'super::(stage|waiting)\b' v2/contextdb/src/vector || true)
           old+=$(grep -rnE 'fn (stage|waiting)\(' v2/contextdb/src/vector || true)
-          old+=$(grep -nE '^\| `(stage|waiting)`' v2/AGENTS.md || true)
+          old+=$(grep -nE '^\| `waiting`' v2/AGENTS.md || true)
           echo "$old"
           test -z "$old"
 

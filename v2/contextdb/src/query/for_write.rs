@@ -71,7 +71,12 @@ pub(crate) fn walk_for_write(
     let Asked { table, filter, .. } = *asked;
     let mut filtered = vec![false; table.meta.columns.len()];
     if let Some(filter) = filter {
-        reads(filter, &table.scope(), asked.ctx.params, &mut filtered)?;
+        reads(
+            filter,
+            &crate::query::scope(table),
+            asked.ctx.params,
+            &mut filtered,
+        )?;
     }
     // What the reader's filter holds is given back when the batch is found.
     let mut seeing = reservation.split(0);

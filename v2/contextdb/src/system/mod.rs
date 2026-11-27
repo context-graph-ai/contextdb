@@ -2,7 +2,7 @@
 //! Scheduling reads time only through `Clock`; a timer wake alone never makes a poll due.
 
 use crate::types::Result;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Where the engine gets the time of day.
@@ -217,6 +217,12 @@ pub(crate) fn machine_memory() -> Option<u64> {
 
 /// The writer's undeclared limit.
 pub(crate) fn default_memory_limit() -> u64 {
-    let floor = crate::memory::account(Some(0), crate::store::cache_under(Some(0), None), Some(0));
+    let floor = crate::memory::account(Some(0), crate::memory::cache_under(Some(0), None), Some(0));
     crate::memory::default_limit(machine_memory(), floor.iter().sum())
+}
+
+/// Takes a lock. None of this part's locks is held across a step that can leave what the lock
+/// guards half changed, so a holder that panicked left it whole.
+pub(crate) fn locked<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(PoisonError::into_inner)
 }

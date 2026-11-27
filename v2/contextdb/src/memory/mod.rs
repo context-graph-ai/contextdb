@@ -11,6 +11,17 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use crate::types::{Error, Result};
 
+/// The size of the page cache of a store opened under this memory limit, in bytes: a quarter
+/// of the limit and never less than 8 MiB, which is also its size when there is no limit. It is
+/// reserved from the budget when the store is opened and does not change until the store is
+/// closed, because the storage library fixes its cache when the data file is opened.
+pub(crate) fn cache_under(limit: Option<u64>, share: Option<u64>) -> u64 {
+    let limit = limit.unwrap_or(0);
+    share.map_or((limit / 4).max(8 << 20), |p| {
+        limit / 100 * p + limit % 100 * p / 100
+    })
+}
+
 #[cfg(test)]
 mod tests;
 

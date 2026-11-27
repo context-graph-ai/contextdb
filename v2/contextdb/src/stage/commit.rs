@@ -208,12 +208,17 @@ pub(crate) fn written(
     Ok(())
 }
 
+/// Two stored values are the same when they sort as equal.
+fn same(a: &Value, b: &Value) -> bool {
+    crate::query::sort_order(a, b).is_eq()
+}
+
 /// Rejects overtaken inputs before callbacks load their large cells.
 pub(crate) fn check_provenance(changes: &ChangeSet, before: &View, budget: &Budget) -> Result<()> {
     let base = changes.base();
     let mut overtaken = 0;
     for (id, key, row, new_key) in changes.rows_changed() {
-        if !(new_key && row.is_some() || before.same_row(base, id, key, budget)?) {
+        if !(new_key && row.is_some() || before.same_row(base, id, key, budget, same)?) {
             overtaken += 1;
         }
     }
@@ -232,7 +237,7 @@ pub(crate) fn check_provenance(changes: &ChangeSet, before: &View, budget: &Budg
 /// transaction itself has done to it since, is as its guard found it.
 fn lost(guard: &RowGuard, before: &View, now: &View, budget: &Budget) -> Result<bool> {
     let mut cover = budget.passing("guard row")?;
-    if before.same_row(now, guard.table, &guard.key, budget)? {
+    if before.same_row(now, guard.table, &guard.key, budget, same)? {
         return Ok(false);
     }
     let Some(row) = now.row(guard.table, &guard.key, &mut cover)? else {

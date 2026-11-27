@@ -154,9 +154,8 @@ pub(super) fn one<'a>(
                     scope.open.push(name.clone());
                     None
                 }
-                near => {
-                    numbers(&*eval(near, &table.scope(), &[], &given.ctx)?)?.map(Iterator::collect)
-                }
+                near => numbers(&*eval(near, &crate::query::scope(table), &[], &given.ctx)?)?
+                    .map(Iterator::collect),
             };
             let actual = near.as_ref().map_or(expected, Vec::len);
             if actual != expected {

@@ -1,138 +1,59 @@
 //! The one finite maintenance cycle: advance each listed build once, remove what is due in
-//! batches, then seal partial tails for caller or timer cycles and step the tidy-up. Every step uses the database's one commit function; no lock is
+//! batches, then seal partial tails for caller or timer cycles and step the tidy-up. Every step uses the one commit function; no lock is
 //! held between steps or while build arithmetic runs. Worker ownership lives in `database`
 //! and thread creation and waiting live in `system`.
 
 mod expire;
 mod remove;
-pub(crate) use remove::any_owed;
 mod verify;
-pub(crate) type Expiry = std::collections::BTreeMap<crate::store::IndexId, crate::store::Key>;
 
+pub use crate::types::{
+    ContentSize, Maintenance, MaintenanceReport, VectorMaintenanceReport, VerifyReport, WaitingOn,
+};
 pub(crate) use verify::verify;
-pub use verify::{ContentSize, VerifyReport};
 
-use crate::database::{Open, locked};
+use std::ops::Bound::{Excluded, Included};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::{Arc, Mutex};
+
+use crate::commit::{Open, running, with_bound};
+use crate::events::{IN_SINK_CALL, identity, key, load_body};
+use crate::query::Visible;
+use crate::sql::ast::EventDeclaration;
 use crate::store::{Read, VectorNumber};
-use crate::types::{Error, Result};
+use crate::system::locked;
+use crate::types::{Error, Kind, Result, SinkError};
 use crate::vector;
 
-/// Who drives a store's maintenance cycles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Maintenance {
-    /// The engine runs one worker for the lifetime of the writing handles.
-    /// It polls at persisted `MAINTENANCE_POLL_INTERVAL` (60,000 ms by default)
-    /// and wakes for due vector builds. Timer/caller cycles also seal partial tails;
-    /// a vector wake does not. Read-only sessions start no worker; close joins it
-    /// without requesting a final cycle. Due rows remain readable until expiry runs.
-    #[default]
-    Engine,
-    /// The host calls [`crate::Database::run_maintenance_cycle`].
-    Caller,
+pub(crate) type Expiry = std::collections::BTreeMap<crate::store::IndexId, crate::store::Key>;
+
+/// What maintenance keeps between the cycles of one open store.
+#[derive(Default)]
+pub(crate) struct State {
+    /// When the tidy-up's window began, the commit and file length a pass that moved nothing
+    /// ended at, and whether the pass under way has moved a page.
+    pub(crate) last_sweep: Mutex<Option<std::time::SystemTime>>,
+    /// The source of removal the next cycle starts at.
+    pub(crate) removal_from: Mutex<usize>,
+    pub(crate) expiry: Mutex<Expiry>,
+    /// The number the trigger history's prune goes on from.
+    pub(crate) audit_swept: Mutex<u64>,
 }
 
 /// The most vectors one cycle seals.
 pub(crate) const SEAL_ROWS: usize = 4096;
 
-/// What one cycle of maintenance did, as [`crate::Database::run_maintenance_cycle`] returns it.
-/// Every field is `None` on a narrowed caller, not a zero or a completion signal.
-#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize)]
-#[non_exhaustive]
-pub struct MaintenanceReport {
-    /// Whether maintenance work remains, including reader-blocked compaction. `None` is
-    /// withheld; yield when `compaction_waiting_on` names a reader. Memory-stalled work waits.
-    pub work_remaining: Option<bool>,
-    /// What the cycle did for vector search.
-    pub vector: VectorMaintenanceReport,
-    /// Events delivered in this cycle: `Some(0)` on unnarrowed handles in this version.
-    /// No external event-delivery worker is implemented.
-    pub delivered: Option<u64>,
-    /// Rows removed by expiry.
-    pub expired_rows: Option<u64>,
-    /// Versions removed that their table no longer keeps or whose row was removed.
-    pub versions_removed: Option<u64>,
-    /// Records removed in the cycle's batches: rows with their entries, versions, index entries,
-    /// vector records and slices of large values, at most 1,024 a batch beside one row's own.
-    pub removed_records: Option<u64>,
-    /// Whether an owed range still holds records after the cycle's last batch.
-    pub owed: Option<bool>,
-    /// Whether a batch moved an owed range on, if only past newer versions to its stored place.
-    pub removal_advanced: Option<bool>,
-    /// True when the removal loop or the tidy-up was refused memory in this cycle.
-    pub memory_refused: Option<bool>,
-    /// True when the cycle's tidy-up step was refused room; the pass keeps its last place.
-    pub compaction_disk_refused: Option<bool>,
-    /// Pages moved by the cycle's tidy-up step: at most the allowance of 256 pages read and
-    /// written, except that a step's first movable block moves whatever its size.
-    pub compacted_pages: Option<u64>,
-    /// Pages the tidy-up step read to find what to move.
-    pub compaction_pages_read: Option<u64>,
-    /// Pages the tidy-up step wrote: the copies and the pages above them.
-    pub compaction_pages_written: Option<u64>,
-    /// Bytes the data file lost from the start of the cycle (or `compact_now`) to its end; 0
-    /// when it did not shrink.
-    pub reclaimed_bytes: Option<u64>,
-    /// Whether the tidy-up moved pages or its place, or was refused with a smaller move owed.
-    pub compaction_advanced: Option<bool>,
-    /// Work deferred to a later cycle.
-    pub deferred: Option<u64>,
-    /// `Readers` when a reader still holds moved pages; withheld on narrowed handles.
-    pub compaction_waiting_on: Option<WaitingOn>,
-    /// Free pages over all pages, measured before a compaction step ran; `None` when none ran.
-    pub compaction_free_ratio: Option<f64>,
-    /// Bytes of pages in use holding no content, as a share; the shell fills it once per report.
-    pub page_slack_ratio: Option<f64>,
-    /// Old pages still to classify after a kill; zero when known, withheld when narrowed.
-    pub recovery_pages_remaining: Option<u64>,
-    /// Whether the rebuild of the free-page record took a step in this cycle.
-    pub recovery_advanced: Option<bool>,
-}
-
-/// Why page reclamation waits; no reason is reported until a cycle observes it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub enum WaitingOn {
-    /// A reader still holds the pages moved.
-    Readers,
-}
-
-/// The part of a [`MaintenanceReport`] about vector search.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
-#[non_exhaustive]
-pub struct VectorMaintenanceReport {
-    /// How many vectors this cycle moved from pending lists into blocks, added to how many
-    /// it packed into the blocks of an IVF being built.
-    pub maintenance_vectors_done: Option<u64>,
-    /// How many vectors still wait after this cycle, over every column of the store: those on
-    /// a pending list, those a build under way has not packed, and those of partitions whose
-    /// IVF is due and not begun. Those of a stalled build are not counted: no further
-    /// cycle packs them until it has the memory.
-    pub maintenance_vectors_remaining: Option<u64>,
-    /// How many partitions have an IVF due or being built after this cycle.
-    pub remaining_partitions: Option<u64>,
-    /// How many of those had their last step refused for want of memory. A further cycle does
-    /// nothing for them until the memory limit is raised or memory is let go, and with no
-    /// limit declared there are none. These counts describe vector work only; use
-    /// [`MaintenanceReport::work_remaining`] to decide whether to run another cycle.
-    /// `None` means withheld, never completed.
-    pub stalled_partitions: Option<u64>,
-}
-
-impl MaintenanceReport {
-    pub(crate) fn withheld(self) -> Self {
-        Self::default()
-    }
-}
-
 /// The single finite cycle, with no commit lock held between its bounded steps. Its report is
 /// kept as far as it went however it ends, and every end wakes the waiters.
 pub(crate) fn cycle(
     open: &std::sync::Arc<Open>,
+    state: &State,
     partial: bool,
 ) -> Result<(MaintenanceReport, bool)> {
     let mut report = MaintenanceReport::default();
     let length = || open.store.recovery_state().ok().map(|(_, bytes, _)| bytes);
     let before = length();
-    let result = stages(open, partial, &mut report);
+    let result = stages(open, state, partial, &mut report);
     report.reclaimed_bytes = before.zip(length()).map(|(was, is)| was.saturating_sub(is));
     if let Ok(again) = result {
         report.work_remaining = Some(again || report.compaction_waiting_on.is_some());
@@ -160,6 +81,7 @@ pub(crate) fn recover(open: &Open, report: &mut MaintenanceReport) -> Result<Opt
 
 fn stages(
     open: &std::sync::Arc<Open>,
+    state: &State,
     partial: bool,
     report: &mut MaintenanceReport,
 ) -> Result<bool> {
@@ -172,14 +94,13 @@ fn stages(
             statement_timeout: false,
         }),
     };
-    let mut delivery = MaintenanceReport::default();
-    let (mut changed, more_delivery) = crate::events::deliver(open, &mut delivery)?;
-    report.delivered = Some(delivery.delivered.unwrap_or(0));
-    changed |= crate::events::run_schedules(open)?;
+    let (mut changed, more_delivery, delivered, held_back) = deliver(open)?;
+    report.delivered = Some(delivered);
+    changed |= run_schedules(open)?;
     // Rows removed in this cycle are gone before its vector steps, which build for what stays.
-    let more_removal = remove::run(open, report, &check)?;
+    let more_removal = remove::run(open, state, report, &check)?;
     changed |= report.removed_records.unwrap_or(0) > 0 || report.removal_advanced == Some(true);
-    changed |= expire::audit(open)? > 0;
+    changed |= expire::audit(open, state)? > 0;
     let (view, catalog) = open.newest()?;
     let mut listed = open.budget.reserve(0, "maintenance")?;
     let totals = locked(&open.live).clone();
@@ -284,7 +205,7 @@ fn stages(
         }
         stalls(open, full, &mut listed)?;
         check()?;
-        more_compaction = compact(open, false, report)?;
+        more_compaction = compact(open, state, false, report)?;
         changed |= more_compaction;
     }
     let (view, catalog) = open.newest()?;
@@ -310,7 +231,7 @@ fn stages(
         stalled_partitions: Some(stalled),
     };
     let deferred = report.deferred.unwrap_or(0);
-    report.deferred = Some(deferred + delivery.deferred.unwrap_or(0));
+    report.deferred = Some(deferred + held_back);
     // Recovery leaves vector work and compaction for the following cycle, even
     // when this step classified the final page; delivery and removal still run.
     Ok(recovery.is_some() || changed && (runnable || more_compaction))
@@ -350,16 +271,21 @@ fn stalls(
 /// A step refused for room that had chosen a page owes the next poll's attempt the next page
 /// alone, kept in the folder's `space` file under the release mark; one that had chosen none is
 /// not tried again unasked while the mark stands.
-pub(crate) fn compact(open: &Open, asked: bool, report: &mut MaintenanceReport) -> Result<bool> {
+pub(crate) fn compact(
+    open: &Open,
+    state: &State,
+    asked: bool,
+    report: &mut MaintenanceReport,
+) -> Result<bool> {
     let (view, _) = open.newest()?;
-    let settings = crate::settings::load(&view)?;
+    let settings = crate::settings::load(|at| view.setting(at))?;
     let ratio = |at: usize| f64::from_bits(settings[at].unwrap_or(crate::settings::SETTINGS[at].2));
     let interval = settings[4].unwrap_or(crate::settings::SETTINGS[4].2);
     drop(view);
     (report.compacted_pages, report.compaction_pages_read) = (Some(0), Some(0));
     report.compaction_pages_written = Some(0);
     let now = open.clock.now();
-    let mut window = locked(&open.last_sweep);
+    let mut window = locked(&state.last_sweep);
     let held = open.turn()?;
     let (free, total, freed, rested) = open.store.compaction_state()?;
     // A file with no page of room left starts a pass at once, as one over its limit does.
@@ -483,4 +409,254 @@ pub(crate) fn export(
         records,
         bytes_written,
     })
+}
+
+type Change = (u64, Option<(u64, u8)>);
+type Tally = (String, bool, bool, bool, bool);
+fn settle(
+    open: &Open,
+    tally: &mut (u64, u64),
+    previous: Option<(Change, Tally)>,
+    mark: Option<Change>,
+) -> Result<bool> {
+    if previous.is_none() && mark.is_none() {
+        return Ok(false);
+    }
+    let guard = open.turn()?;
+    let mut staged = open.begin()?;
+    for (action, change) in previous.as_ref().map(|p| p.0).into_iter().chain(mark) {
+        staged
+            .changes
+            .put_delivery(Some(action), None, |view, _, encoded| {
+                let at = key(action);
+                let mut replacement = None;
+                view.deliveries(
+                    (Included(at.as_slice()), Included(at.as_slice())),
+                    &mut |_, bytes| {
+                        replacement = Some(None);
+                        if let Some((attempts, flag)) = change {
+                            encoded.grow(bytes.len() as u64)?;
+                            let mut out = bytes.to_vec();
+                            out[16..24].copy_from_slice(&attempts.to_be_bytes());
+                            out[24] = flag;
+                            replacement = Some(Some(out));
+                        }
+                        Ok(false)
+                    },
+                )?;
+                Ok(replacement)
+            })?;
+    }
+    open.commit(guard, staged)?;
+    let Some((_, (sink, success, terminal, retried, fresh))) = previous else {
+        return Ok(false);
+    };
+    let mut counters = locked(&open.deliveries.counters);
+    let metrics = &mut counters.get_mut(&sink).expect("examined sink").0;
+    metrics.delivered += u64::from(success);
+    metrics.window_refused &= !success;
+    metrics.retried += u64::from(retried);
+    metrics.uncertain += u64::from(fresh);
+    metrics.permanent_failures += u64::from(terminal);
+    tally.0 += u64::from(success);
+    tally.1 += u64::from(!success && !terminal);
+    Ok(success || terminal)
+}
+/// One finite pass, with no view, registry lock or commit lock held during host code.
+/// Answers whether it progressed, whether more is due, and the actions it delivered and
+/// deferred.
+pub(crate) fn deliver(open: &Open) -> Result<(bool, bool, u64, u64)> {
+    let Ok(_dispatch) = open.deliveries.active.try_lock() else {
+        return Ok((false, false, 0, 0));
+    };
+    let (mut carried, mut tally) = (None, (0, 0));
+    let done = pass(open, &mut tally, &mut carried);
+    let last = settle(open, &mut tally, carried, None)?;
+    done.map(|(progressed, more)| (progressed | last, more, tally.0, tally.1))
+}
+fn pass(
+    open: &Open,
+    tally: &mut (u64, u64),
+    carried: &mut Option<(Change, Tally)>,
+) -> Result<(bool, bool)> {
+    let upper = key(open.newest()?.0.last_action()?);
+    let (mut cursor, mut progressed) = (key(0), false);
+    for _ in 0..256 {
+        let (view, catalog) = open.newest()?;
+        let mut found = None;
+        view.deliveries(
+            (Excluded(cursor.as_slice()), Included(upper.as_slice())),
+            &mut |k, bytes| {
+                let mut held = open.budget.reserve(0, "delivery attempt")?;
+                let mut delivery = identity(&view, k, bytes, &mut held)?;
+                let (sink, action) = (&delivery.sink, delivery.event.action_id);
+                open.deliveries.examine(&open.budget, sink, action)?;
+                let registration = locked(&open.deliveries.callbacks)
+                    .get(&delivery.sink)
+                    .cloned();
+                let table = catalog
+                    .table(&delivery.event.table)
+                    .filter(|t| t.id == delivery.table);
+                let loaded = if table.is_some() && registration.is_some() {
+                    load_body(&view, bytes, &mut delivery, &mut held)
+                } else {
+                    Ok(())
+                };
+                let admitted = match (table, &registration, loaded) {
+                    (_, _, Err(Error::MemoryBudgetExceeded { .. })) => {
+                        let mut counters = locked(&open.deliveries.counters);
+                        let window = &mut counters.get_mut(&delivery.sink).expect("examined").0;
+                        (window.window_refusals, window.window_refused) =
+                            (window.window_refusals + 1, true);
+                        false
+                    }
+                    (_, _, Err(error)) => return Err(error),
+                    (None, _, _) => true,
+                    (Some(t), Some(r), _) => match Visible::new(t, &catalog, &r.0, &mut held) {
+                        Ok(mut filter) => filter.sees(&view, |at| {
+                            delivery
+                                .event
+                                .row_values
+                                .get(&t.meta.columns[at].name)
+                                .or_else(|| t.missing.get(at))
+                        })?,
+                        Err(Error::PrincipalRequired { .. }) => false,
+                        Err(error) => return Err(error),
+                    },
+                    _ => false,
+                };
+                if !admitted {
+                    tally.1 += 1;
+                    return Ok(true);
+                }
+                found = Some((delivery, registration.filter(|_| table.is_some()), held));
+                Ok(false)
+            },
+        )?;
+        let Some((delivery, registration, held)) = found else {
+            return Ok((progressed, false));
+        };
+        cursor = key(delivery.event.action_id);
+        drop((view, catalog));
+        let (action, attempts) = (delivery.event.action_id, delivery.attempts);
+        let mark = (delivery.flag != 2).then_some((action, Some((attempts, 2))));
+        progressed |= settle(open, tally, carried.take(), mark)?;
+        IN_SINK_CALL.set(true);
+        let outcome = registration.map(|registration| {
+            catch_unwind(AssertUnwindSafe(|| (registration.1)(&delivery.event))).unwrap_or_else(
+                |_| Err(SinkError::OutcomeUncertain("host callback panicked".into())),
+            )
+        });
+        IN_SINK_CALL.set(false);
+        let success = matches!(outcome, Some(Ok(())));
+        let terminal = matches!(outcome, None | Some(Err(SinkError::Permanent(_))));
+        let fresh = matches!(outcome, Some(Err(SinkError::OutcomeUncertain(_))));
+        let stored = (!success && !terminal)
+            .then_some((attempts + 1, u8::from(delivery.flag != 0 || fresh)));
+        let tally = (
+            delivery.sink.clone(),
+            success,
+            terminal,
+            attempts > 0,
+            fresh || delivery.flag == 2,
+        );
+        *carried = Some(((action, stored), tally));
+        drop((delivery, held, outcome));
+    }
+    Ok((progressed, cursor < upper))
+}
+
+/// Step two of the same cycle; the commit lock serializes both timer and caller drives.
+pub(crate) fn run_schedules(open: &Arc<Open>) -> Result<bool> {
+    use crate::types::MissedTickPolicy::*;
+    let Ok(_running) = open.triggers.running.try_lock() else {
+        return Ok(false);
+    };
+    let now = crate::system::now_millis(&*open.clock).max(0) as u64;
+    let (_, catalog) = open.newest()?;
+    let mut changed = false;
+    let mut failure = None;
+    for name in catalog.schedules.keys() {
+        loop {
+            let guard = open.turn()?;
+            let mut staged = open.transaction_stage()?;
+            let Some(&due) = staged.catalog.schedules.get(name) else {
+                break;
+            };
+            if due > now {
+                break;
+            }
+            let mut held = open
+                .budget
+                .reserve((name.len() * 2 + 160) as u64, "schedule dispatch")?;
+            let Some((EventDeclaration::Schedule(schedule), _)) =
+                staged.catalog.event(&(Kind::Schedule, name.clone()))
+            else {
+                break;
+            };
+            held.grow(schedule.callback.len() as u64)?;
+            let every = schedule.every_ms;
+            let catching = schedule.missed_tick_policy == CatchUp;
+            let ticks = (now - due) / every + 1;
+            let mut first = 0;
+            if catching {
+                let window = u64::from(schedule.catch_up_within_seconds.unwrap_or(0)) * 1000;
+                let cutoff = now.saturating_sub(window);
+                first = cutoff.saturating_sub(due).div_ceil(every).min(ticks);
+            }
+            let advance = (if catching { first + 1 } else { ticks }).min(ticks);
+            let next = due.saturating_add(every.saturating_mul(advance));
+            let missed = schedule.missed_tick_policy == FailLoud && ticks > 1;
+            let callback = locked(&open.triggers.cron)
+                .get(&schedule.callback)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::PlanError(format!("no callback registered: {}", schedule.callback))
+                });
+            let callback_missing = callback.is_err() && !missed && first != ticks;
+            let mut catalog = staged.catalog.next(&staged.budget)?;
+            catalog.advance_schedule(name, next, &mut staged.changes)?;
+            staged.catalog = Arc::new(catalog);
+            let (staged, result) = with_bound(open, staged, |_, host| {
+                running(open, Some(name.clone()), true);
+                if missed {
+                    return Err(Error::MissedTicksExceeded {
+                        ticks: ticks.min(u64::from(u32::MAX)) as u32,
+                        policy: "fail-loud".into(),
+                    });
+                }
+                if first == ticks {
+                    return Ok(());
+                }
+                let callback = callback?;
+                catch_unwind(AssertUnwindSafe(|| (callback.0)(host)))
+                    .unwrap_or_else(|_| Err(Error::PlanError("schedule callback panicked".into())))
+            });
+            let result = result.and_then(|()| open.commit(guard, staged));
+            // A missing callback is this schedule's failure alone: the cycle goes on.
+            let mut failed = locked(&open.deliveries.failed);
+            match &result {
+                Err(error @ Error::PlanError(_)) if callback_missing => {
+                    failed.insert(name.clone(), error.to_string())
+                }
+                _ => failed.remove(name),
+            };
+            drop(failed);
+            if let Err(error) = result {
+                let guard = open.turn()?;
+                let mut settlement = open.begin()?;
+                if settlement.catalog.schedules.get(name) == Some(&due) {
+                    let mut catalog = settlement.catalog.next(&settlement.budget)?;
+                    catalog.advance_schedule(name, next, &mut settlement.changes)?;
+                    settlement.catalog = Arc::new(catalog);
+                    open.commit(guard, settlement)?;
+                }
+                if !callback_missing {
+                    failure.get_or_insert(error);
+                }
+            }
+            changed = true;
+        }
+    }
+    failure.map_or(Ok(changed), Err)
 }

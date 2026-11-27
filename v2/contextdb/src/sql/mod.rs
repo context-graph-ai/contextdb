@@ -11,6 +11,7 @@ mod parser;
 pub(crate) mod plan;
 mod planner;
 
+pub(crate) use crate::types::{not_carried, not_supported};
 pub(crate) use ast::{Expr, Statement, Statement as Plan};
 pub use parser::read_session_answers;
 pub(crate) use parser::{MAX_EXPR_NESTING, depth_error};
@@ -18,7 +19,7 @@ pub(crate) use plan::Effect;
 pub(crate) use planner::{AGGREGATES, inside, inside_mut};
 
 use crate::memory::{Budget, Reservation};
-use crate::types::{Error, Result};
+use crate::types::Result;
 
 /// Reads one SQL statement. Refuses with `ParseError`, or with `PlanError` when the text begins
 /// a statement or a clause that a later version of the library reads. Costs time in proportion
@@ -52,20 +53,6 @@ pub(crate) fn formula(text: &str, budget: &Budget) -> Result<(Expr, Reservation)
 pub(crate) fn plan(statement: Statement) -> Result<Plan> {
     planner::stands(&statement)?;
     Ok(statement)
-}
-
-/// The refusal of a statement, a clause or a form that a later version of the library reads,
-/// by its name.
-pub(crate) fn not_supported(what: &str) -> Error {
-    Error::PlanError(format!(
-        "{what} is not supported in this version of the library"
-    ))
-}
-
-/// The refusal of a form of the earlier engine that no version of the library reads, by its
-/// name, with what to write in its place.
-pub(crate) fn not_carried(what: &str, instead: &str) -> Error {
-    Error::PlanError(format!("{what} is not part of this library: {instead}"))
 }
 
 /// The first 63 bytes of an identifier, ending on a whole UTF-8 character.

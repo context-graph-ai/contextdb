@@ -1,4 +1,4 @@
-//! write: applies INSERT, UPDATE and DELETE to a transaction and checks every rule a table can
+//! stage: applies INSERT, UPDATE and DELETE to a transaction and checks every rule a table can
 //! declare: column types, NOT NULL, the primary key and UNIQUE rules, how long a key may be,
 //! IMMUTABLE, the state machine, references, a DAG, PROPAGATE, and what the handle's reader
 //! may write. It keeps each table's index entries and row count
@@ -36,6 +36,7 @@ use crate::query::{self, Reader, Visible, equal, most_bytes};
 use crate::schema::{Catalog, Quantization, Table};
 use crate::sql::plan::InsertPlan;
 use crate::sql::{Expr, Plan};
+pub(crate) use crate::store::split_cells as split;
 use crate::store::{Beside, Cell, ChangeSet, Compact, Entry, IndexId, KEY_LIMIT, Key, Read, Row};
 use crate::types::{
     self, ColumnDefault, ColumnType, Error, Result, SortDirection, TxId, Value, shown, typed,
@@ -56,10 +57,14 @@ pub(crate) struct Given<'a> {
     /// The transaction's number: the highest a `TXID` column takes from the statement.
     pub number: TxId,
     pub examined: crate::query::Counted<'a>,
-    pub triggers: Option<&'a crate::events::Triggers>,
+    /// Refuses a write to a table whose triggers are not all registered; with none, no check.
+    pub ready: Option<Ready<'a>>,
     /// How a change set written through ends a part; with none, the statement stays in memory.
     pub part: Option<Part<'a>>,
 }
+
+/// Refuses a write to the table named while one of its triggers has no callback.
+pub(crate) type Ready<'a> = &'a dyn Fn(&Catalog, &str) -> Result<()>;
 
 /// Ends a part of a change set written through.
 pub(crate) type Part<'a> = &'a dyn Fn(&mut ChangeSet) -> Result<()>;
@@ -70,6 +75,19 @@ fn put(changes: &mut ChangeSet) -> Result<()> {
 }
 
 impl<'a> Given<'a> {
+    /// What this write reads the SELECTs inside its statement with.
+    pub(crate) fn writing(&self) -> query::Writing<'a> {
+        query::Writing {
+            params: self.params,
+            catalog: self.catalog,
+            budget: self.budget,
+            kept: self.kept,
+            reader: self.reader,
+            now: self.now,
+            examined: self.examined,
+        }
+    }
+
     pub(crate) fn admin(
         params: &'a HashMap<String, Value>,
         catalog: &'a Catalog,
@@ -86,7 +104,7 @@ impl<'a> Given<'a> {
             now: 0,
             number: TxId(0),
             examined: None,
-            triggers: None,
+            ready: None,
             part: Some(&put),
         }
     }
@@ -120,7 +138,9 @@ pub(crate) fn apply(
     let (name, ..) = plan.written().expect("an INSERT, UPDATE or DELETE");
     let table = given.catalog.table(name);
     let table = table.ok_or_else(|| Error::TableNotFound(name.clone()))?;
-    crate::events::Triggers::ready(given.triggers, given.catalog, name)?;
+    if let Some(ready) = given.ready {
+        ready(given.catalog, name)?;
+    }
     let mut rules = Rules::of(table, given)?;
     rules.changeable(plan)?;
     rules.from = changes.queued;
@@ -134,9 +154,9 @@ pub(crate) fn apply(
             changes: &slot,
             budget: given.budget,
         };
-        query::written(plan, given, &first, &mut seeing, Some(sets))?
+        query::written(plan, given.writing(), &first, &mut seeing, Some(sets))?
     } else {
-        query::written(plan, given, &*changes, &mut seeing, None)?
+        query::written(plan, given.writing(), &*changes, &mut seeing, None)?
     };
     let mut visible = Visible::new(table, given.catalog, given.reader, &mut seeing)?;
     let rows = match plan {
@@ -204,23 +224,20 @@ pub(crate) fn fill_index(
 pub(crate) fn expire_keys(
     name: &str,
     keys: &[Key],
-    staged: &mut crate::database::Staged,
+    catalog: &Catalog,
+    budget: &Budget,
+    changes: &mut ChangeSet,
+    partitions: &mut Tally,
 ) -> Result<(u64, u64)> {
     let (params, reader) = (HashMap::new(), Reader::admin());
-    let table = staged.catalog.table(name).unwrap();
-    let kept = query::Kept::new(staged.budget.passing("expression evaluation")?);
-    let given = Given::admin(&params, &staged.catalog, &staged.budget, &reader, &kept);
+    let table = catalog.table(name).unwrap();
+    let kept = query::Kept::new(budget.passing("expression evaluation")?);
+    let given = Given::admin(&params, catalog, budget, &reader, &kept);
     let rules = Rules::of(table, &given)?;
-    staged.changes.erasing = true;
-    let mut seeing = staged.budget.reserve(0, "expiry")?;
-    let mut visible = Visible::new(table, &staged.catalog, &reader, &mut seeing)?;
-    rules.delete(
-        None,
-        Some((keys, true)),
-        &mut staged.changes,
-        &mut staged.partitions,
-        &mut visible,
-    )
+    changes.erasing = true;
+    let mut seeing = budget.reserve(0, "expiry")?;
+    let mut visible = Visible::new(table, catalog, &reader, &mut seeing)?;
+    rules.delete(None, Some((keys, true)), changes, partitions, &mut visible)
 }
 
 /// What a write needs to know about its table, worked out once for a statement.
@@ -416,7 +433,7 @@ impl<'a> Rules<'a> {
             }
         }
 
-        let (mut stored, scope) = (0, table.scope());
+        let (mut stored, scope) = (0, crate::query::scope(table));
         let ctx = query::EvalContext::new(given.params, given.now, given.kept).over(&self.values);
         for values in &plan.values {
             let most = values.iter().map(|v| most_bytes(v, &scope, &[], &ctx));
@@ -471,7 +488,12 @@ impl<'a> Rules<'a> {
         let assigned: Vec<usize> = set.iter().map(|&(at, _)| at).collect();
         let mut needed = vec![false; table.meta.columns.len()];
         for &(_, value) in set {
-            query::reads(value, &table.scope(), given.params, &mut needed)?;
+            query::reads(
+                value,
+                &crate::query::scope(table),
+                given.params,
+                &mut needed,
+            )?;
         }
         visible.reads(&mut needed);
         let state = self.state(&assigned, &mut needed)?;
@@ -488,7 +510,7 @@ impl<'a> Rules<'a> {
             needed.fill(true);
         }
         let asked = self.asked(filter, params, &assigned, &needed, given.reader);
-        let scope = table.scope();
+        let scope = crate::query::scope(table);
         // The keys this statement has moved rows to: a row met at one of them has been
         // changed already and is passed by.
         let mut reached = BTreeSet::new();
@@ -943,19 +965,4 @@ impl Index<'_> {
 /// The values a row has in these columns, in this order.
 fn pick(columns: &[usize], row: &[Value]) -> Vec<Value> {
     columns.iter().map(|&at| row[at].clone()).collect()
-}
-
-/// A row's values in column order, with NULL for each large value that was left beside the
-/// row, and those cells with the columns they are of.
-pub(crate) fn split(cells: Vec<Cell>) -> (Vec<Value>, Vec<(usize, Beside)>) {
-    let mut left = Vec::new();
-    let values = cells.into_iter().enumerate().map(|(at, cell)| match cell {
-        Cell::Here(value) => value,
-        Cell::Beside(beside) => {
-            left.push((at, beside));
-            Value::Null
-        }
-    });
-    let values = values.collect();
-    (values, left)
 }

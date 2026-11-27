@@ -318,7 +318,7 @@ pub(super) fn written(plan: &Plan, given: &Given, held: &mut Reservation) -> Res
         Plan::Insert(insert) => insert.values.iter().map(Vec::len).sum(),
         _ => 0,
     };
-    let (none, scope) = (Scope::of(name, &[]), table.scope());
+    let (none, scope) = (Scope::of(name, &[]), crate::query::scope(table));
     for (at, expr) in exprs.into_iter().enumerate() {
         bind(expr, if at < plain { &none } else { &scope }, given.params)?;
     }

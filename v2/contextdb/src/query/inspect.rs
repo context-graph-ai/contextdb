@@ -13,9 +13,10 @@ use super::{filter, subquery, table};
 use crate::memory::{Budget, Reservation};
 use crate::schema::{Catalog, Compaction, Quantization, Table, VectorColumn};
 use crate::sql::ast::Show;
+use crate::sql::plan::REPORTS;
 use crate::sql::{Expr, Plan, not_supported};
 use crate::store::{Key, Read, VectorNumber};
-use crate::types::{Error, Result, Value, VectorIndexRef, VectorSearchMode};
+use crate::types::{Error, Maintenance, Result, Value, VectorIndexRef, VectorSearchMode};
 use crate::vector::{self, Inspected, Nearest, Route, State};
 
 const INDEX_FIELDS: [&str; 32] = [
@@ -112,22 +113,24 @@ const SIZE_FIELDS: [&str; 8] = [
 
 pub(crate) struct Source<'a> {
     catalog: &'a Catalog,
-    statements: Option<&'a crate::database::Statements>,
+    statements: Option<&'a super::Statements>,
     read: &'a dyn Read,
     allowed: Option<&'a BTreeSet<String>>,
     budget: &'a Budget,
     held: &'a mut Reservation,
     wait: &'a str,
     limits: Option<&'a super::ReadLimits>,
+    verify: Option<super::Verify>,
 }
 pub(crate) type Push<'a> = &'a mut dyn FnMut(Vec<Value>) -> Result<()>;
 type Fill = fn(&Show, &mut Source<'_>, &mut dyn FnMut(Vec<Value>) -> Result<()>) -> Result<()>;
-pub(crate) const REPORTS: [(&str, &[&str], bool, bool, Fill); 5] = [
-    ("SHOW VECTOR_INDEXES", &INDEX_FIELDS, true, false, indexes),
-    ("SHOW VECTOR_PARTITIONS", &PART_FIELDS, true, true, parts),
-    ("SHOW CONTENT_SIZE", &SIZE_FIELDS, true, false, content),
-    ("SHOW STATEMENT_STATISTICS", &RUN_FIELDS, true, true, runs),
-    ("SHOW READ_CACHE_SHARE", &SHARE_FIELDS, false, false, share),
+/// The fields and the filling of each report, in the order of [`REPORTS`].
+const FILLS: [(&[&str], Fill); 5] = [
+    (&INDEX_FIELDS, indexes),
+    (&PART_FIELDS, parts),
+    (&SIZE_FIELDS, content),
+    (&RUN_FIELDS, runs),
+    (&SHARE_FIELDS, share),
 ];
 
 pub(super) fn show(
@@ -137,10 +140,11 @@ pub(super) fn show(
     (budget, work, figures, parsing): (
         &Budget,
         Option<&super::Work<'_>>,
-        Option<&crate::database::Open>,
+        Option<&super::Figures<'_>>,
         u64,
     ),
     allowed: Option<&BTreeSet<String>>,
+    verify: Option<super::Verify>,
 ) -> Result<Option<QueryResult>> {
     // The partitions read are held until their rows are made.
     let held = &mut budget.reserve(0, "query")?;
@@ -159,7 +163,7 @@ pub(super) fn show(
     };
     let (fields, rows) = match plan {
         Plan::ShowSetting(selected) => {
-            let current = figures.map(|open| open.settings()).transpose()?;
+            let current = figures.map(|figures| (figures.settings)()).transpose()?;
             let (read, figures) = match current.as_ref() {
                 Some((view, figures)) => (view as &dyn Read, Some(*figures)),
                 None => (read, None),
@@ -243,7 +247,7 @@ pub(super) fn show(
 
         Plan::ShowReport(show) => {
             let row = &REPORTS[show.report];
-            if !row.3 && (show.column.is_some() || show.limit.is_some() || show.offset != 0) {
+            if !row.2 && (show.column.is_some() || show.limit.is_some() || show.offset != 0) {
                 return Err(Error::ParseError("this report accepts no options".into()));
             }
             let mut rows = Vec::new();
@@ -257,14 +261,16 @@ pub(super) fn show(
                 limits: work
                     .filter(|work| work.pages.is_some())
                     .map(|work| work.limits),
-                wait: match figures.map(|open| open.maintenance) {
-                    Some(crate::Maintenance::Engine) => "wait for the engine's cycle",
+                verify,
+                wait: match figures.map(|figures| figures.maintenance) {
+                    Some(Maintenance::Engine) => "wait for the engine's cycle",
                     Some(_) => "run a maintenance cycle",
                     None => "wait for the engine's cycle, or run one if you drive them",
                 },
             };
-            (row.4)(show, from, &mut |row| push(row, &mut rows))?;
-            (row.1, rows)
+            let (fields, fill) = FILLS[show.report];
+            fill(show, from, &mut |row| push(row, &mut rows))?;
+            (fields, rows)
         }
         _ => return Ok(None),
     };
@@ -316,8 +322,12 @@ fn runs(show: &Show, from: &mut Source<'_>, push: Push<'_>) -> Result<()> {
     from.statements.map_or(Ok(()), |kept| kept.rows(show, push))
 }
 fn content(_: &Show, from: &mut Source<'_>, push: Push<'_>) -> Result<()> {
+    // Every handle's statement and cursor page gives the check.
+    let Some(verify) = from.verify else {
+        return Ok(());
+    };
     let view = from.read.committed();
-    let report = crate::maintenance::verify(view, &Catalog::load(view, from.budget)?, from.budget)?;
+    let report = verify(view, &Catalog::load(view, from.budget)?, from.budget)?;
     for t in &report.tables {
         let values = [
             t.rows,

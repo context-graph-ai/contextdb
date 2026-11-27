@@ -241,6 +241,21 @@ pub(crate) fn put_value(out: &mut impl Write, value: &Value) {
     }
 }
 
+/// A row's values in column order, with NULL for each large value that was left beside the
+/// row, and those cells with the columns they are of.
+pub(crate) fn split_cells(cells: Vec<Cell>) -> (Vec<Value>, Vec<(usize, Beside)>) {
+    let mut left = Vec::new();
+    let values = cells.into_iter().enumerate().map(|(at, cell)| match cell {
+        Cell::Here(value) => value,
+        Cell::Beside(beside) => {
+            left.push((at, beside));
+            Value::Null
+        }
+    });
+    let values = values.collect();
+    (values, left)
+}
+
 /// Serialized size, measured by the same encoder without allocating another value.
 pub(crate) fn value_len(value: &Value) -> usize {
     let mut count = Length(0);
