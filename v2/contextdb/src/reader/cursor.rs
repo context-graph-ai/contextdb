@@ -46,7 +46,7 @@ impl Cursor {
             &session.limits,
             &*session.clock,
             &session.stop,
-            session.observer.as_deref(),
+            (session.observer.as_deref(), crate::maintenance::verify),
         );
         let now = system::now_millis(&*session.clock);
         let mut form = None;
@@ -133,7 +133,7 @@ impl Cursor {
             &self.limits,
             &*self.clock,
             &self.stop,
-            self.observer.as_deref(),
+            (self.observer.as_deref(), crate::maintenance::verify),
         )
         .paged(self.pages.clone());
         let result = (|| {

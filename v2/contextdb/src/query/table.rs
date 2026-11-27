@@ -324,7 +324,7 @@ impl<'a> Source<'a> {
         visible.reads(&mut seen);
         Source {
             table,
-            scope: table.scope(),
+            scope: crate::query::scope(table),
             filter,
             reading: OnceCell::new(),
             ctx,

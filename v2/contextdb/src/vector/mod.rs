@@ -24,8 +24,8 @@
 
 mod binary;
 mod block;
-pub(crate) mod build;
-pub(crate) mod directory;
+mod build;
+mod directory;
 mod inspect;
 mod ivf;
 mod pack;
@@ -38,7 +38,9 @@ pub(crate) mod tests;
 mod train;
 mod unindexed;
 
-pub(crate) use build::{Work, prepare, progress, stage_refusal, stage_step, unindexed_work};
+pub(crate) use build::{
+    Work, pending_count, prepare, progress, stage_refusal, stage_step, unindexed_work,
+};
 pub(crate) use inspect::{Inspected, State, owners, partitions, stamp, verify_record};
 pub(crate) use seal::{seal, sealing};
 pub(crate) use search::{Nearest, Planned, Route, plan, search};

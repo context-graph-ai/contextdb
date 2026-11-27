@@ -144,7 +144,7 @@ fn statement(pair: Pair) -> Result<Statement> {
         }
         Rule::show_setting => {
             let name = pair.clone().into_inner().next().unwrap();
-            if let Some(report) = crate::query::REPORTS
+            if let Some(report) = crate::sql::plan::REPORTS
                 .iter()
                 .position(|row| row.0[5..].eq_ignore_ascii_case(name.as_str()))
             {

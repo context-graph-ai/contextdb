@@ -5,26 +5,8 @@ use std::ops::Bound::Included;
 use crate::memory::{Budget, Reservation};
 use crate::schema::{Catalog, Table};
 use crate::store::{Cell, CountId, Entry, Key, READING, Read, Record, Row, View};
-use crate::types::{Kind, Result, Value};
+use crate::types::{ContentSize, Kind, Result, Value, VerifyReport};
 use crate::vector::verify_record;
-
-/// Content key/value bytes of one table, excluding physical page overhead.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ContentSize {
-    pub table: String,
-    pub rows: u64,
-    pub large_values: u64,
-    pub indexes: u64,
-    pub vectors: u64,
-    pub blocks: u64,
-    pub versions: u64,
-}
-
-/// A successful whole-store check, with tables in name order.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct VerifyReport {
-    pub tables: Vec<ContentSize>,
-}
 
 pub(crate) fn verify(
     view: &View,

@@ -11,7 +11,23 @@ pub use super::ast::{
     EdgeDirection, EdgeStep, FromItem, GraphTable, NodePattern, OrderByItem as SortKey,
     Select as SelectPlan, SelectColumn as ProjectColumn,
 };
+use std::sync::{Arc, Mutex};
+
+use super::Plan;
 use super::ast::{Expr, Statement};
+use crate::memory::{Budget, Reservation};
+use crate::system::locked;
+use crate::types::Result;
+
+/// The reports `SHOW` names: each one's statement, whether only an unnarrowed handle may run
+/// it, and whether it takes options. `query` fills each by its place here.
+pub(crate) const REPORTS: [(&str, bool, bool); 5] = [
+    ("SHOW VECTOR_INDEXES", true, false),
+    ("SHOW VECTOR_PARTITIONS", true, true),
+    ("SHOW CONTENT_SIZE", true, false),
+    ("SHOW STATEMENT_STATISTICS", true, true),
+    ("SHOW READ_CACHE_SHARE", false, false),
+];
 
 /// What a planned statement does to the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,7 +81,7 @@ impl Statement {
             Statement::SetSetting(at, _) => crate::settings::SETTINGS[*at].0,
             Statement::ResetStatements => "RESET STATEMENT_STATISTICS",
             Statement::ShowReport(show) => {
-                let (name, _, admin, _, _) = crate::query::REPORTS[show.report];
+                let (name, admin, _) = REPORTS[show.report];
                 return admin.then_some(name);
             }
             _ => return None,
@@ -90,5 +106,45 @@ impl Statement {
             Statement::Delete(delete) => (&delete.table, delete.where_clause.iter().collect()),
             _ => return None,
         })
+    }
+}
+
+/// Exact-text, FIFO retention of unbound plans within the room reserved at open.
+pub(crate) const HELD_PER_TEXT_BYTE: u64 = 128;
+type Kept = (Vec<(Box<str>, Plan, Option<Arc<str>>)>, u64);
+/// A statement planned, its parse's charge, and its form when the record of statements keeps it.
+pub(crate) type Planned = (Plan, Reservation, Option<Arc<str>>);
+pub(crate) struct KeptPlans(pub(crate) Mutex<Kept>, Reservation);
+impl KeptPlans {
+    pub(crate) fn new(budget: &Budget, limit: Option<u64>) -> Result<Self> {
+        let cap = crate::memory::account(limit, 0, None)[2];
+        let held = budget.reserve(cap, "statement plan cache needed to open the store")?;
+        Ok(Self(Mutex::new((Vec::with_capacity(1024), 0)), held))
+    }
+
+    pub(crate) fn planned(&self, text: &str, budget: &Budget) -> Result<Planned> {
+        let mut guard = locked(&self.0);
+        let (kept, used) = &mut *guard;
+        if let Some((_, plan, form)) = kept.iter().find(|(key, ..)| &**key == text) {
+            let held = super::charge(text, budget)?;
+            return Ok((plan.clone(), held, form.clone()));
+        }
+        let (statement, held, form) = super::parse(text, budget)?;
+        let plan = super::plan(statement)?;
+        let kind = matches!(plan, Plan::Select(_) | Plan::Insert(_) | Plan::Update(_));
+        let form = (kind || matches!(plan, Plan::Delete(_))).then(|| Arc::from(form));
+        let bytes = text.len() as u64 * HELD_PER_TEXT_BYTE;
+        let slots = 1024 * size_of::<(Box<str>, Plan, Option<Arc<str>>)>() as u64;
+        if !(plan.effect() == Effect::WritesRows || matches!(plan, Plan::Select(_)))
+            || bytes + slots > self.1.bytes()
+        {
+            return Ok((plan, held, form));
+        }
+        while kept.len() == 1024 || *used + bytes + slots > self.1.bytes() {
+            *used -= kept.remove(0).0.len() as u64 * HELD_PER_TEXT_BYTE;
+        }
+        *used += bytes;
+        kept.push((text.into(), plan.clone(), form.clone()));
+        Ok((plan, held, form))
     }
 }

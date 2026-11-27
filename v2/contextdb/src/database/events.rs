@@ -1,15 +1,15 @@
 //! The carried host callback API and its private handle into the committing transaction.
 
 use super::{Database, QueryResult, admin, locked};
-use crate::events::{Bound, CASCADE_DEPTH_CAP, retained};
-use crate::query::Reader;
+use crate::commit::{Bound, BoundHost};
+use crate::events::{CASCADE_DEPTH_CAP, retained};
 use crate::sql::Effect;
 use crate::store::{AUDIT, LAST_AUDIT, Read};
 use crate::types::{Error, Principal, Result, SinkError, SinkEvent, TriggerContext, Value};
 use std::collections::HashMap;
 use std::ops::Bound::{Excluded, Included};
+use std::sync::Mutex;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 impl Database {
@@ -26,7 +26,10 @@ impl Database {
         let open = self.opened()?;
         let _held = open.turn()?;
         let (_, catalog) = open.newest()?;
-        open.triggers.register(&catalog, name, callback)
+        let hosted = move |host: &BoundHost, context: &TriggerContext| {
+            callback(&Database::bound(host), context)
+        };
+        open.triggers.register(&catalog, name, hosted)
     }
 
     /// Registers or replaces a declared sink's external handler. Every attempt uses the
@@ -41,8 +44,12 @@ impl Database {
         F: Fn(&SinkEvent) -> std::result::Result<(), SinkError> + Send + Sync + 'static,
     {
         let open = self.opened()?;
+        let (_, catalog) = open.newest()?;
+        let given = (&*catalog, &open.budget);
         open.deliveries
-            .register(&open, name, &self.reader, principal, deliver)
+            .register(given, name, &self.reader, principal, deliver)?;
+        open.signal.wake();
+        Ok(())
     }
 
     /// Refuses initialization if any declared trigger lacks its host callback.
@@ -113,18 +120,19 @@ impl Database {
         CASCADE_DEPTH_CAP
     }
 
-    pub(crate) fn bound(bound: Arc<Bound>, reader: Reader) -> Self {
+    /// The handle a callback is handed, working only during its dispatch.
+    pub(crate) fn bound(host: &BoundHost) -> Self {
         Self {
             open: Mutex::new(None),
-            reader,
-            bound: Some(bound),
+            reader: host.reader.clone(),
+            bound: Some(host.bound.clone()),
         }
     }
 
     pub(super) fn unbound(&self) -> Result<()> {
         if self.bound.is_some()
             || locked(&self.open).as_ref().is_some_and(|writer| {
-                writer.open.triggers.firing_here() || super::observers::active(&writer.open)
+                writer.open.triggers.firing_here() || crate::commit::active(&writer.open)
             })
         {
             return Err(Error::CallbackReentry {
@@ -141,7 +149,7 @@ impl Database {
         params: &HashMap<String, Value>,
     ) -> Result<QueryResult> {
         bound.with_staged(|open, staged| {
-            let (plan, parsing, form) = open.plans.planned(sql, &open.budget)?;
+            let (plan, parsing, form) = open.plans().planned(sql, &open.budget)?;
             let refused = plan
                 .admin_only()
                 .filter(|n| n.starts_with("SET ") || *n == "DROP TRIGGER");

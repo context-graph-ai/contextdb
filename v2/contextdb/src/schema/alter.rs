@@ -25,6 +25,8 @@ pub(crate) struct Declared {
     /// The names of the indexes a `DROP COLUMN ... CASCADE` dropped, in the order they were
     /// made.
     pub dropped: Vec<String>,
+    /// The vector columns the table no longer declares, whose drop `database` stages.
+    pub dropped_vectors: Vec<VectorColumn>,
 }
 
 impl From<Catalog> for Declared {
@@ -34,6 +36,7 @@ impl From<Catalog> for Declared {
             indexes: Vec::new(),
             counts: Vec::new(),
             dropped: Vec::new(),
+            dropped_vectors: Vec::new(),
         }
     }
 }
@@ -125,12 +128,7 @@ pub(super) fn declare(
     }
     for vector in &old.vectors {
         if !new.is_some_and(|table| table.vectors.iter().any(|kept| kept.id == vector.id)) {
-            let mut pending = 0;
-            crate::vector::build::entries(changes, vector, None, &mut |_, partition| {
-                pending += u64::from(partition.unindexed);
-                Ok(true)
-            })?;
-            changes.stage_drop(Dropped::Vectors(vector.id, pending))?;
+            declared.dropped_vectors.push(vector.clone());
         }
     }
     // Its versions too, from the commit that stops keeping them.

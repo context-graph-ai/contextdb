@@ -3,8 +3,9 @@
 use std::sync::OnceLock;
 
 pub use crate::types::{
-    ColumnType as DataType, ConflictPolicy, History, KeptCounts, Retain, RetainUnit, SortDirection,
-    StateMachine, SyncDirection, VectorSearchMode,
+    ColumnType as DataType, ConflictPolicy, EdgeDiscard, EdgePropagation, History, KeptCounts,
+    Propagation, Reference, Retain, RetainUnit, ScopeLabels, SortDirection, StateMachine,
+    SyncDirection, VectorSearchMode,
 };
 
 #[derive(Debug, Clone)]
@@ -352,41 +353,6 @@ pub struct TableOptions {
     pub kept_counts: Option<KeptCounts>,
 }
 
-/// `REFERENCES table (column, ...)`, with its `ON STATE` rule when one was written.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Reference {
-    pub follows_parent_purge: bool,
-    pub table: String,
-    pub columns: Vec<String>,
-    pub on_state: Option<Propagation>,
-}
-
-/// `ON STATE on_state PROPAGATE SET set [MAX DEPTH n] [ABORT ON FAILURE]`, and the same four
-/// things of a `PROPAGATE ON EDGE`. A state keeps the letters it was written in.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Propagation {
-    pub on_state: String,
-    pub set: String,
-    pub max_depth: Option<u32>,
-    pub abort_on_failure: bool,
-}
-
-/// `PROPAGATE ON EDGE edge_type direction STATE ... SET ...`. The edge type keeps the letters
-/// it was written in; the direction is INCOMING, OUTGOING or BOTH, in capitals.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EdgePropagation {
-    pub edge_type: String,
-    pub direction: String,
-    pub rule: Propagation,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EdgeDiscard {
-    Never,
-    AfterOutcome,
-    Always,
-}
-
 #[derive(Debug, Clone)]
 pub struct ColumnDef {
     pub name: String,
@@ -405,15 +371,6 @@ pub struct ColumnDef {
     pub acl: Option<(String, String)>,
     pub rank_policy: Option<RankPolicy>,
     pub expires: bool,
-}
-
-/// `SCOPE_LABEL (...)` stores its single write-only list in `read`, with `write = None`;
-/// it hides no rows on reads. `SCOPE_LABEL_READ (...) WRITE (...)` stores separate read
-/// and write allowlists in the corresponding fields.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScopeLabels {
-    pub read: Vec<String>,
-    pub write: Option<Vec<String>>,
 }
 
 /// `RANK_POLICY (JOIN table ON column, FORMULA '...', SORT_KEY key)`.

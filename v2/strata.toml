@@ -1,0 +1,90 @@
+# The module order of contextdb, checked by cargo-strata in the lint job. Each module may use only
+# the modules above it:
+# types < memory < system < settings < store < sql < schema < vector < query < events < stage
+# < commit < maintenance < reader < erase < database
+check_dev = true
+
+[[crate]]
+name = "contextdb"
+allow = []
+
+[[crate.module]]
+path = "types"
+deny = ["memory", "system", "settings", "store", "sql", "schema", "vector", "query", "events", "stage", "commit", "maintenance", "reader", "erase", "database"]
+
+[[crate.module]]
+path = "memory"
+deny = ["system", "settings", "store", "sql", "schema", "vector", "query", "events", "stage", "commit", "maintenance", "reader", "erase", "database"]
+
+[[crate.module]]
+path = "system"
+deny = ["settings", "store", "sql", "schema", "vector", "query", "events", "stage", "commit", "maintenance", "reader", "erase", "database"]
+
+[[crate.module]]
+path = "settings"
+deny = ["store", "sql", "schema", "vector", "query", "events", "stage", "commit", "maintenance", "reader", "erase", "database"]
+
+[[crate.module]]
+path = "store"
+deny = ["sql", "schema", "vector", "query", "events", "stage", "commit", "maintenance", "reader", "erase", "database"]
+
+[[crate.module]]
+path = "sql"
+deny = ["schema", "vector", "query", "events", "stage", "commit", "maintenance", "reader", "erase", "database"]
+
+[[crate.module]]
+path = "schema"
+deny = ["vector", "query", "events", "stage", "commit", "maintenance", "reader", "erase", "database"]
+
+[[crate.module]]
+path = "vector"
+deny = ["query", "events", "stage", "commit", "maintenance", "reader", "erase", "database"]
+
+[[crate.module]]
+path = "query"
+deny = ["events", "stage", "commit", "maintenance", "reader", "erase", "database"]
+
+[[crate.module]]
+path = "events"
+deny = ["stage", "commit", "maintenance", "reader", "erase", "database"]
+
+[[crate.module]]
+path = "stage"
+deny = ["commit", "maintenance", "reader", "erase", "database"]
+
+[[crate.module]]
+path = "commit"
+deny = ["maintenance", "reader", "erase", "database"]
+
+[[crate.module]]
+path = "maintenance"
+deny = ["reader", "erase", "database"]
+
+[[crate.module]]
+path = "reader"
+deny = ["erase", "database"]
+
+[[crate.module]]
+path = "erase"
+deny = ["database"]
+
+[[crate.module]]
+path = "database"
+deny = []
+
+# a top-level module with no entry of its own may use nothing
+[[crate.module]]
+path = "*"
+depends_on = []
+
+[[forbid]]
+name = "no-include-no-extern-crate"
+patterns = ["include", "extern crate"]
+allow = []
+crates = ["contextdb"]
+
+[[forbid]]
+name = "lib-root-holds-no-code"
+patterns = ["fn", "impl", "struct", "enum", "trait", "const", "static", "type"]
+allow = ["contextdb/src/*/**", "contextdb/src/settings.rs"]
+crates = ["contextdb"]

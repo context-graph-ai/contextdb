@@ -815,6 +815,7 @@ impl View {
         table: TableId,
         key: &Key,
         budget: &Budget,
+        eq: impl Fn(&Value, &Value) -> bool,
     ) -> Result<bool> {
         let stored = super::keys::stored(table.0, key.as_bytes());
         let a = self.moment.told(self.moment.rows.get(stored.as_slice()))?;
@@ -838,9 +839,7 @@ impl View {
         Ok(a.written == b.written
             && a.cells.len() == b.cells.len()
             && a.cells.iter().zip(&b.cells).all(|(a, b)| match (a, b) {
-                (super::Cell::Here(a), super::Cell::Here(b)) => {
-                    crate::query::sort_order(a, b).is_eq()
-                }
+                (super::Cell::Here(a), super::Cell::Here(b)) => eq(a, b),
                 _ => a == b,
             }))
     }
@@ -1064,6 +1063,20 @@ impl View {
             .ok_or_else(bad)?;
         let due = u64::from_le_bytes(value.try_into().map_err(|_| bad())?);
         Ok(Record::Schedule(name, due))
+    }
+
+    /// Whether an owed range still has its mark.
+    pub(crate) fn any_owed(&self) -> Result<bool> {
+        let range = (
+            Bound::Included(&[OWED][..]),
+            Bound::Excluded(&[OWED + 1][..]),
+        );
+        let mut any = false;
+        self.deliveries(range, &mut |_, _| {
+            any = true;
+            Ok(false)
+        })?;
+        Ok(any)
     }
 
     /// Lends bounded delivery or schedule runtime records without cloning their bytes.

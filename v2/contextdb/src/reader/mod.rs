@@ -1,4 +1,4 @@
-//! read: bounded sessions over the newest committed view, from a file or a live writer.
+//! reader: bounded sessions over the newest committed view, from a file or a live writer.
 //! Sessions own their memory budget and never write to the store.
 
 use std::collections::{BTreeSet, HashMap};
@@ -6,15 +6,22 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use crate::database::{KeptPlans, Open, Statements, admin, locked};
+pub(crate) use crate::commit::Core;
+use crate::commit::Open;
+use crate::query::{Statements, admin};
+use crate::sql::plan::KeptPlans;
+use crate::system::locked;
 mod channel;
 mod cursor;
 pub(crate) use channel::Channel;
-pub use channel::{OwnerReadCancellation, OwnerRequestHandler, request_owner};
+pub use channel::{
+    CancellationListener, OwnerReadCancellation, OwnerRequestHandler, request_owner,
+};
 pub use cursor::{Cursor, Snapshot};
 
 use crate::memory::Budget;
 use crate::query::{self, QueryResult};
+pub use crate::query::{ReadLimits, ReadPhase, ReadProgress, ReadProgressObserver};
 use crate::schema::Catalog;
 use crate::sql::{Effect, Plan};
 use crate::store::{Cell, Key, Read, Store, View, WrapStorage};
@@ -23,73 +30,6 @@ use crate::types::{
     ContextId, Error, Principal, Result, ScopeLabel, TableMeta, TxId, Value, typed,
 };
 
-/// The ceilings of one reading session; equality is accepted. Result, work, active-time,
-/// memory, cursor and table ceilings are enforced.
-#[derive(Clone, Debug)]
-pub struct ReadLimits {
-    /// Most rows returned per statement; default 500.
-    pub result_rows: u64,
-    /// Most result bytes per statement; default 4 MiB.
-    pub result_bytes: u64,
-    /// The caller measures what it prints of `declaration`, `table_names` and `event_bus_status`.
-    pub caller_checks_metadata: bool,
-    /// Most row reads plus distance evaluations per statement; none unless declared.
-    pub work: u64,
-    /// Most active milliseconds per statement; default 5,000.
-    pub active_ms: u64,
-    /// Session memory in bytes; default 16 MiB. Exactly `u64::MAX` lifts the ceiling.
-    /// Other finite limits size caches from the limit. The floor is the sum of four terms: the
-    /// allowance, the page cache counted with its bookkeeping, the plan cache and the room of one
-    /// check, 11,018,240 bytes with no cache share.
-    pub memory: u64,
-    /// Percent of `memory` given to the page cache, 0 to 100; absent keeps a quarter, 8 MiB at least.
-    pub cache_share: Option<u64>,
-    pub cursor_page_rows: u64,
-    pub cursor_page_bytes: u64,
-    pub cursor_idle_ms: u64,
-    pub cursor_lifetime_ms: u64,
-    pub tables: Option<BTreeSet<String>>,
-}
-impl Default for ReadLimits {
-    fn default() -> Self {
-        Self {
-            result_rows: 500,
-            result_bytes: 4 << 20,
-            caller_checks_metadata: false,
-            work: u64::MAX,
-            active_ms: 5_000,
-            memory: 16 << 20,
-            cache_share: None,
-            cursor_page_rows: 100,
-            cursor_page_bytes: 1 << 20,
-            cursor_idle_ms: 300_000,
-            cursor_lifetime_ms: 1_800_000,
-            tables: None,
-        }
-    }
-}
-/// The part of a read described by a progress report.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReadPhase {
-    Executing,
-}
-/// Progress reported inline; bytes are the existing assembled-row memory charge.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReadProgress {
-    pub phase: ReadPhase,
-    pub rows: u64,
-    pub bytes: u64,
-    /// Most row reads plus distance evaluations per statement; none unless declared.
-    pub work: u64,
-    /// Most active milliseconds per statement; default 5,000.
-    pub active_ms: u64,
-}
-/// Receives progress before the read returns. Observer work is part of the read's cost.
-pub trait ReadProgressObserver: Send + Sync {
-    fn progress(&self, progress: ReadProgress);
-    /// Receives final totals once, including reads shorter than one reporting interval.
-    fn completed(&self, _totals: ReadProgress) {}
-}
 /// Options for a file reader. Start from the default and assign the fields to change.
 #[derive(Clone, Default)]
 #[non_exhaustive]
@@ -107,54 +47,6 @@ pub struct ReadSessionOptions {
     pub clock: Option<Arc<dyn Clock>>,
     /// Wraps the opened data file before any store page is read.
     pub storage: Option<WrapStorage>,
-}
-
-/// A matching committed view and catalog. Writers publish it under their commit lock;
-/// file readers acquire their view independently and reuse catalogs by schema commit.
-#[derive(Clone)]
-pub(crate) struct Core {
-    pub(crate) commit: TxId,
-    pub(crate) catalog: Arc<Catalog>,
-    pub(crate) view: Option<View>,
-}
-impl Core {
-    pub(crate) fn load(
-        view: View,
-        kept: &mut Option<(TxId, Arc<Catalog>)>,
-        budget: &Budget,
-    ) -> Result<Self> {
-        let declared = view.schema_commit()?;
-        let catalog = match kept {
-            Some((at, catalog)) if *at == declared => catalog.clone(),
-            _ => Arc::new(Catalog::load(&view, budget)?),
-        };
-        *kept = Some((declared, catalog.clone()));
-        Ok(Self {
-            commit: view.commit(),
-            catalog,
-            view: Some(view),
-        })
-    }
-    pub(crate) fn newest(
-        &mut self,
-        store: &Store,
-        budget: &Budget,
-    ) -> Result<(View, Arc<Catalog>)> {
-        if self.view.is_none() {
-            self.view = Some(store.view_on(budget.standing(), false)?);
-        }
-        Ok((
-            self.view.as_ref().expect("loaded view").clone(),
-            self.catalog.clone(),
-        ))
-    }
-    pub(crate) fn declaration(
-        &self,
-        table: &str,
-        budget: &Budget,
-    ) -> Result<crate::memory::Owned<String>> {
-        self.catalog.declaration(table, budget)
-    }
 }
 
 /// Older versions of one row, newest first, as [`ReadSession::row_versions`] lists them: the
@@ -267,7 +159,12 @@ impl ReadSession {
         let cache = crate::store::cache_under(limit, options.limits.cache_share);
         crate::memory::admit(limit, crate::memory::account(limit, cache, None))?;
         let budget = Budget::new(limit)?;
-        let store = Store::open_for_reading(path.as_ref(), &budget, &options)?;
+        let store = Store::open_for_reading(
+            path.as_ref(),
+            &budget,
+            options.limits.cache_share,
+            options.storage.as_ref(),
+        )?;
         Ok(Self {
             plans: KeptPlans::new(&budget, budget.limit())?,
             statements: Arc::new(Statements::new(&budget, None)),
@@ -320,7 +217,7 @@ impl ReadSession {
             &self.limits,
             &*self.clock,
             &self.stop,
-            self.observer.as_deref(),
+            (self.observer.as_deref(), crate::maintenance::verify),
         )
         .paged(self.store.pages());
         work.statements = Some(&self.statements);
@@ -365,7 +262,7 @@ impl ReadSession {
         Ok(self.newest()?.commit)
     }
     /// Stored event declarations and queue counts; the owner's live counters when it is running.
-    pub fn event_bus_status(&self) -> Result<crate::Owned<crate::EventBusStatus>> {
+    pub fn event_bus_status(&self) -> Result<crate::Owned<crate::events::EventBusStatus>> {
         admin(&self.reader, Some("event_bus_status"))?;
         let (view, catalog) = self.newest()?.newest(&self.store, &self.budget)?;
         let all = match self.owner.as_ref().and_then(Weak::upgrade) {

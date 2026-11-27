@@ -16,14 +16,16 @@ mod filter;
 mod for_write;
 mod graph;
 mod inspect;
-pub(crate) use inspect::{Push, REPORTS};
+pub(crate) use inspect::Push;
 mod join;
 mod plan;
 mod rank;
 mod search;
 mod sets;
 mod sort;
+mod statements;
 pub(crate) use sets::SetContext;
+pub(crate) use statements::Statements;
 mod subquery;
 mod table;
 mod union;
@@ -31,10 +33,10 @@ mod visible;
 mod window;
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
-pub(crate) use expression::{EvalContext, Kept, Scope, eval, most_bytes, reads, sort_order};
+pub(crate) use expression::{EvalContext, Kept, eval, most_bytes, reads, scope, sort_order};
 pub(crate) use for_write::{Asked, named_keys, rows_for_write, walk_for_write};
 pub(crate) use inspect::explain;
 pub(crate) use subquery::tables_read;
@@ -42,15 +44,83 @@ pub(crate) use table::equal;
 pub(crate) use table::{index_place, resumed};
 pub(crate) use visible::{Reader, Visible};
 
+use crate::memory::Owned;
 use crate::memory::{Budget, Reservation};
-use crate::read::{ReadLimits, ReadPhase, ReadProgress, ReadProgressObserver};
 use crate::schema::Catalog;
 use crate::sql::{Plan, not_supported};
-use crate::store::Read;
+use crate::store::{Read, View};
 use crate::system::{self, Clock};
-use crate::types::{Error, Result, Value};
+use crate::types::{Error, Maintenance, Result, Value, VerifyReport};
 use plan::Given;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The ceilings of one reading session; equality is accepted. Result, work, active-time,
+/// memory, cursor and table ceilings are enforced.
+#[derive(Clone, Debug)]
+pub struct ReadLimits {
+    /// Most rows returned per statement; default 500.
+    pub result_rows: u64,
+    /// Most result bytes per statement; default 4 MiB.
+    pub result_bytes: u64,
+    /// The caller measures what it prints of `declaration`, `table_names` and `event_bus_status`.
+    pub caller_checks_metadata: bool,
+    /// Most row reads plus distance evaluations per statement; none unless declared.
+    pub work: u64,
+    /// Most active milliseconds per statement; default 5,000.
+    pub active_ms: u64,
+    /// Session memory in bytes; default 16 MiB. Exactly `u64::MAX` lifts the ceiling.
+    /// Other finite limits size caches from the limit. The floor is the sum of four terms: the
+    /// allowance, the page cache counted with its bookkeeping, the plan cache and the room of one
+    /// check, 11,018,240 bytes with no cache share.
+    pub memory: u64,
+    /// Percent of `memory` given to the page cache, 0 to 100; absent keeps a quarter, 8 MiB at least.
+    pub cache_share: Option<u64>,
+    pub cursor_page_rows: u64,
+    pub cursor_page_bytes: u64,
+    pub cursor_idle_ms: u64,
+    pub cursor_lifetime_ms: u64,
+    pub tables: Option<BTreeSet<String>>,
+}
+impl Default for ReadLimits {
+    fn default() -> Self {
+        Self {
+            result_rows: 500,
+            result_bytes: 4 << 20,
+            caller_checks_metadata: false,
+            work: u64::MAX,
+            active_ms: 5_000,
+            memory: 16 << 20,
+            cache_share: None,
+            cursor_page_rows: 100,
+            cursor_page_bytes: 1 << 20,
+            cursor_idle_ms: 300_000,
+            cursor_lifetime_ms: 1_800_000,
+            tables: None,
+        }
+    }
+}
+/// The part of a read described by a progress report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadPhase {
+    Executing,
+}
+/// Progress reported inline; bytes are the existing assembled-row memory charge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadProgress {
+    pub phase: ReadPhase,
+    pub rows: u64,
+    pub bytes: u64,
+    /// Most row reads plus distance evaluations per statement; none unless declared.
+    pub work: u64,
+    /// Most active milliseconds per statement; default 5,000.
+    pub active_ms: u64,
+}
+/// Receives progress before the read returns. Observer work is part of the read's cost.
+pub trait ReadProgressObserver: Send + Sync {
+    fn progress(&self, progress: ReadProgress);
+    /// Receives final totals once, including reads shorter than one reporting interval.
+    fn completed(&self, _totals: ReadProgress) {}
+}
 
 /// The statement's existing row and distance counters, plus session admission and progress.
 fn stats(data: &redb::ReadOnlyDatabase) -> (u64, u64) {
@@ -64,7 +134,7 @@ pub(crate) struct Work<'a> {
     rows: Cell<u64>,
     /// The index the statement's path left unused, with why, for the record of statements.
     pub(crate) unused: Cell<Option<(String, &'static str)>>,
-    pub(crate) statements: Option<&'a crate::database::Statements>,
+    pub(crate) statements: Option<&'a Statements>,
     bytes: Cell<u64>,
     limits: &'a ReadLimits,
     clock: &'a dyn Clock,
@@ -72,13 +142,15 @@ pub(crate) struct Work<'a> {
     generation: u64,
     started: i64,
     observer: Option<&'a dyn ReadProgressObserver>,
+    /// The whole-store check `SHOW CONTENT_SIZE` reports from.
+    pub(crate) verify: Verify,
 }
 impl<'a> Work<'a> {
     pub(crate) fn new(
         limits: &'a ReadLimits,
         clock: &'a dyn Clock,
         stop: &'a AtomicU64,
-        observer: Option<&'a dyn ReadProgressObserver>,
+        (observer, verify): (Option<&'a dyn ReadProgressObserver>, Verify),
     ) -> Self {
         Self {
             examined: Cell::new(0),
@@ -92,6 +164,7 @@ impl<'a> Work<'a> {
             clock,
             stop,
             observer,
+            verify,
             generation: stop.load(Ordering::Relaxed),
             started: system::now_millis(clock),
         }
@@ -356,7 +429,7 @@ pub(crate) fn run(
     (now, work, figures, (parsing, parse_bytes)): (
         i64,
         Option<&Work<'_>>,
-        Option<&crate::database::Open>,
+        Option<&Figures<'_>>,
         (u64, u64),
     ),
 ) -> Result<QueryResult> {
@@ -374,6 +447,7 @@ pub(crate) fn run(
         read,
         (budget, work, figures, parsing),
         work.and_then(|work| work.limits.tables.as_ref()),
+        work.map(|work| work.verify),
     )? {
         return Ok(shown.measured(budget, reader));
     }
@@ -454,12 +528,40 @@ fn collect(
 /// The values of the SELECTs of one statement, each under the place its text begins.
 pub(crate) type Values = Vec<(usize, sets::List)>;
 
+/// Refuses `statement`, by its name, to a handle that declared a narrowing.
+pub(crate) fn admin(reader: &Reader, statement: Option<&str>) -> Result<()> {
+    let statement = statement.filter(|_| !reader.is_admin()).map(str::to_owned);
+    statement.map_or(Ok(()), |statement| Err(Error::AdminRequired { statement }))
+}
+
+/// What a writing handle tells a `SHOW` of itself: its settings as they stand, read only when
+/// a `SHOW` of a setting asks, and who drives its maintenance.
+pub(crate) struct Figures<'a> {
+    pub settings: &'a dyn Fn() -> Result<(View, [Option<u64>; 3])>,
+    pub maintenance: Maintenance,
+}
+
+/// The whole-store check `SHOW CONTENT_SIZE` reports from.
+pub(crate) type Verify = fn(&View, &Catalog, &Budget) -> Result<Owned<VerifyReport>>;
+
+/// What a write reads the SELECTs inside its statement with.
+#[derive(Clone, Copy)]
+pub(crate) struct Writing<'a> {
+    pub params: &'a HashMap<String, Value>,
+    pub catalog: &'a Catalog,
+    pub budget: &'a Budget,
+    pub kept: &'a Kept,
+    pub reader: &'a Reader,
+    pub now: i64,
+    pub examined: Counted<'a>,
+}
+
 /// The values of the SELECTs inside the INSERT, UPDATE or DELETE `plan` that `write` is run
 /// with, as [`run`] would read them from `read`, each read once before the write changes a row
 /// and held in `held`.
 pub(crate) fn written(
     plan: &Plan,
-    write: &crate::write::Given,
+    write: Writing<'_>,
     read: &dyn Read,
     held: &mut Reservation,
     sets: Option<SetContext<'_>>,

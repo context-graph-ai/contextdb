@@ -257,7 +257,8 @@ fn expiry_uses_current_declarations_and_keeps_every_derived_answer_atomic() {
         restore();
         let db = Arc::new(open(None));
         let opened = db.opened().unwrap();
-        let expiry = super::locked(&opened.expiry);
+        let (_, state) = db.maintained().unwrap();
+        let expiry = super::locked(&state.expiry);
         let (_, catalog) = opened.newest().unwrap();
         let (entered, seen) = mpsc::channel();
         let (release, wait) = mpsc::channel();

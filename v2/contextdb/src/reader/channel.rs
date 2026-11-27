@@ -1,7 +1,7 @@
 //! One bounded opaque exchange per connection; four listeners belong to the writer.
 use super::ReadLimits;
-use crate::database::locked;
 use crate::memory::{Budget, Reservation};
+use crate::system::locked;
 use crate::system::{self, Clock};
 use crate::types::{Error, Result};
 use std::fs::{File, Permissions};
@@ -27,7 +27,9 @@ type Wake = Arc<dyn Fn() + Send + Sync>;
 /// Cooperative cancellation of a writer's dispatched requests.
 #[derive(Clone)]
 pub struct OwnerReadCancellation(Arc<Mutex<(bool, Vec<Wake>, Reservation)>>);
-/// Keeps one cancellation callback registered, and its charge, until dropped.
+/// What [`OwnerReadCancellation::tell_on_cancel`] returns. Holding it keeps the callback
+/// registered and its bytes charged to the channel's budget; dropping it unregisters the
+/// callback, which then never runs, and lets the charge go.
 pub struct CancellationListener(OwnerReadCancellation, Wake, u64);
 impl Drop for CancellationListener {
     fn drop(&mut self) {

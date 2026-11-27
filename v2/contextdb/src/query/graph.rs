@@ -582,7 +582,7 @@ impl<'a> Graph<'a> {
         let width = table.meta.columns.len();
         let (mut filtered, mut taken) = (vec![false; width], vec![false; width]);
         if let Some(filter) = filter {
-            reads(filter, &table.scope(), params, &mut filtered)?;
+            reads(filter, &crate::query::scope(table), params, &mut filtered)?;
         }
         for column in wanted {
             taken[*column] = true;

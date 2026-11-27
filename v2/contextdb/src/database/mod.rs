@@ -1,118 +1,47 @@
-//! database: the handle a store is opened for writing with, its transactions, and the one
-//! commit function.
+//! database: the handle a store is opened for writing with and its transactions, each
+//! handed to the one commit function in `commit`.
 //!
 //! It never has a second way to commit: a statement run on its own, a transaction, a change of
 //! the memory limit and every step of a maintenance cycle each build a change set and hand it
 //! to the same function.
 
-mod commit;
 mod events;
-mod observers;
-mod open;
-mod plugin;
-pub use observers::{CommitEvent, SubscriptionMetrics};
-pub use plugin::*;
+pub use crate::commit::{
+    CommitEvent, CommitSource, CorePlugin, DatabaseOpenOptions, DatabasePlugin, PluginHealth,
+    QueryOutcome, SubscriptionMetrics, WorkDone,
+};
+use crate::commit::{Open, Staged};
+pub use crate::events::{
+    EventBusStatus, EventTypeStatus, RouteStatus, ScheduleStatus, SinkMetrics, SinkStatus,
+};
 mod scoped;
-mod statements;
-pub(crate) use statements::Statements;
+pub(crate) use crate::query::admin;
+#[cfg(test)]
+use crate::sql::plan::KeptPlans;
+pub(crate) use crate::sql::plan::Planned;
+pub use crate::store::Create;
+pub(crate) use crate::system::locked;
 #[cfg(test)]
 mod tests;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::maintenance::{self, Maintenance, MaintenanceReport};
-use crate::memory::{Budget, Reservation};
+use crate::memory::Budget;
 use crate::query::{self, QueryResult};
-use crate::read::{Core, ReadLimits, ReadProgressObserver, ReadSession, ReadSessionOptions};
-use crate::read::{RowVersions, row_versions};
-use crate::schema::{self, Catalog};
+use crate::reader::{Core, ReadLimits, ReadProgressObserver, ReadSession, ReadSessionOptions};
+use crate::reader::{RowVersions, row_versions};
+use crate::schema;
 use crate::sql::ast::{BinOp, ColumnRef};
 use crate::sql::{self, Effect, Expr, Plan};
-use crate::store::{Cell, ChangeSet, Read, Store, View, WrapStorage};
-use crate::system::{self, Clock};
+use crate::store::{Cell, ChangeSet, Read, Store};
+use crate::system;
 use crate::types::{Error, Result, TableMeta, TxId, Value};
-use crate::vector::{self, Tally};
-use crate::write;
-
-/// What a host may say when it opens a store for writing.
-///
-/// Start from `DatabaseOpenOptions::default()` and assign the fields that matter. The struct may
-/// gain fields in a later version, so it cannot be written out field by field outside this
-/// crate.
-///
-/// ```
-/// let mut options = contextdb::DatabaseOpenOptions::default();
-/// options.memory_limit = Some(64 << 20); // 64 MiB
-/// ```
-#[derive(Clone, Default)]
-#[non_exhaustive]
-pub struct DatabaseOpenOptions {
-    /// The most memory, in bytes, that this open may hold for its page cache, its transactions
-    /// and its results.
-    ///
-    /// `None`, the default, takes the limit the store remembers from the last
-    /// `SET MEMORY_LIMIT` or [`Database::set_memory_limit`]. If never declared, it takes a
-    /// quarter of known Linux machine/cgroup-v2 memory, or 2 GiB when unknown.
-    /// Detection uses Linux procfs; macOS uses the 2 GiB fallback. Explicit NONE stays unlimited.
-    /// A limit given here holds until the store is closed and leaves what the
-    /// store remembers as it is.
-    ///
-    /// Every open sets aside 1 MiB, its page cache and its statement plan cache. The page cache
-    /// is a quarter of a declared limit, at least 8 MiB; the plan cache is a thirty-second,
-    /// between 1 and 8 MiB. With no declaration both take their minima and keep their opening
-    /// size. A writer also holds 768 KiB for each started 4 GiB of its file. A limit below the
-    /// sum, 11,272,192 bytes for a file under 4 GiB, is refused with
-    /// [`crate::Error::MemoryBudgetExceeded`] and opens no store.
-    ///
-    /// A [`crate::ReadSession`] uses its own declared `ReadLimits::memory` ceiling.
-    pub memory_limit: Option<usize>,
-    /// This open's disk ceiling in bytes; absent uses the stored declaration without changing it.
-    pub disk_limit: Option<u64>,
-    pub create: Create,
-    /// Host hooks; None uses CorePlugin. The same plug-in serves every scoped handle.
-    pub plugin: Option<Arc<dyn DatabasePlugin>>,
-    /// Where the time comes from for `NOW()` and `DEFAULT NOW()`. `None`, the default, is the
-    /// machine's clock.
-    pub clock: Option<Arc<dyn Clock>>,
-    /// Stop waiting for ownership at this time on `clock`; `None` waits until free.
-    /// A passed deadline still opens a free store, otherwise returns `DatabaseLocked`.
-    pub deadline: Option<SystemTime>,
-    /// Stop waiting when set, returning `OpenCancelled`. `None` never cancels.
-    pub cancel: Option<Arc<AtomicBool>>,
-    /// A wrapper around the store's data file: the store opens the file, hands it to this, and
-    /// reads, writes and syncs it only through what this returns. `None`, the default, uses the
-    /// file as it is.
-    pub storage: Option<WrapStorage>,
-    /// Who drives maintenance; the default is the engine worker.
-    pub maintenance: Maintenance,
-    /// How long a write on another thread waits for a running callback; `None` is 60 seconds.
-    pub callback_wait: Option<std::time::Duration>,
-    /// Directory for the optional writer request channel; None uses the store folder.
-    pub channel_dir: Option<PathBuf>,
-}
-
-/// How a writable open treats its data file.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub enum Create {
-    #[default]
-    IfMissing,
-    Never,
-    Fresh,
-}
-
-/// Work performed since this store was opened; available only to an unnarrowed handle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct WorkDone {
-    /// Rows read, including maintenance's sealed or packed vectors.
-    pub rows_read: u64,
-    /// Full-precision vector distance evaluations, and maintenance's slot-to-centroid ones.
-    pub vectors_compared: u64,
-}
 
 /// One store folder, held for writing.
 ///
@@ -129,62 +58,16 @@ pub struct Database {
     open: Mutex<Option<Arc<Writer>>>,
     /// Who asks through this handle: every statement of it reads and writes as this reader.
     reader: query::Reader,
-    bound: Option<Arc<crate::events::Bound>>,
-}
-
-/// One store held for writing. A call holds it for as long as the call runs, so the folder is
-/// let go when the handle has let go and the last running call has returned.
-pub(crate) struct Open {
-    /// The first field, so that the close hook runs before the store is let go.
-    closes: Closes,
-    this: Weak<Open>,
-    pub(crate) last_cycle: Mutex<Option<MaintenanceReport>>,
-    /// When the tidy-up's window began, the commit and file length a pass that moved nothing
-    /// ended at, and whether the pass under way has moved a page.
-    pub(crate) last_sweep: Mutex<Option<std::time::SystemTime>>,
-    /// The source of removal the next cycle starts at.
-    pub(crate) removal_from: Mutex<usize>,
-    plans: KeptPlans,
-    pub(crate) statements: Arc<Statements>,
-    plugin: Option<Arc<dyn DatabasePlugin>>,
-    subscribers: observers::Subscribers,
-    pub(crate) deliveries: crate::events::Deliveries,
-    pub(crate) triggers: crate::events::Triggers,
-    path: PathBuf,
-    storage: Option<WrapStorage>,
-    pub(crate) budget: Budget,
-    pub(crate) live: Mutex<vector::Totals>,
-    pub(crate) work: Mutex<WorkDone>,
-    pub(crate) signal: Arc<system::Signal>,
-    pub(crate) maintenance: Maintenance,
-    pub(crate) clock: Arc<dyn Clock>,
-    pub(crate) expiry: Mutex<maintenance::Expiry>,
-    /// The trigger history's retention in milliseconds, and the number its prune goes on from.
-    pub(crate) audit_retention: std::sync::atomic::AtomicU64,
-    pub(crate) audit_swept: Mutex<u64>,
-    /// The limit this open started under, as `SHOW MEMORY_LIMIT` reports it.
-    started_under: Option<u64>,
-    disk_started_under: Option<u64>,
-    disk: Mutex<Option<u64>>,
-    /// The commit lock: held from before a commit looks at the newest moment until it has
-    /// replaced it.
-    pub(crate) committing: commit::Turn,
-    callback_wait: Duration,
-    /// What every statement and every transaction begins from. Held to copy it, to replace it
-    /// and to read it again after a read that failed, never while a commit goes to the disk.
-    pub(crate) newest: Mutex<Core>,
-    /// The highest number a transaction was given or a commit carries.
-    numbered: Mutex<u64>,
-    pub(crate) cancelled: std::sync::atomic::AtomicU64,
-    /// The last field, so that the view above is dropped before the folder is let go.
-    pub(crate) store: Store,
+    bound: Option<Arc<crate::commit::Bound>>,
 }
 
 /// Handles own this value; the worker owns only a weak reference to its open store.
 struct Writer {
+    /// What maintenance keeps between cycles, let go after the open store.
+    state: Arc<maintenance::State>,
     open: Arc<Open>,
     worker: Option<std::thread::JoinHandle<()>>,
-    channel: Mutex<Option<crate::read::Channel>>,
+    channel: Mutex<Option<crate::reader::Channel>>,
     channel_dir: PathBuf,
     folder: PathBuf,
 }
@@ -200,83 +83,6 @@ impl Drop for Writer {
             let _ = worker.join();
         }
     }
-}
-
-/// What one transaction has staged.
-pub(crate) struct Staged {
-    pub(crate) erasing: Option<bool>,
-    pub(crate) passes: Option<vector::Committed>,
-    pub(crate) budget: Budget,
-    pub(crate) reader: query::Reader,
-    pub(crate) changes: ChangeSet,
-    /// The tables as the transaction sees them: those of the moment it began at and those it
-    /// has declared since.
-    pub(crate) catalog: Arc<Catalog>,
-    /// The declarations it ran, in order, each with the time it read, for a commit that has
-    /// to run them again.
-    declared: Vec<(Plan, Box<str>, Reservation, i64)>,
-    /// The vector partitions its statements have made and emptied, for the limit a statement
-    /// is refused by. The commit function does not read it: it counts again.
-    pub(crate) partitions: Tally,
-    /// The transaction's number; zero for one that runs no statement of a host.
-    pub(crate) number: TxId,
-    /// Its firings, until it commits or is refused.
-    pub(crate) audit: crate::events::AuditQueue,
-    source: CommitSource,
-    /// How much of `changes.rows_read` the handle's total work already has.
-    pub(crate) counted: u64,
-}
-
-/// Exact-text, FIFO retention of unbound plans within the room reserved at open.
-pub(crate) const HELD_PER_TEXT_BYTE: u64 = 128;
-type Kept = (Vec<(Box<str>, Plan, Option<Arc<str>>)>, u64);
-/// A statement planned, its parse's charge, and its form when the record of statements keeps it.
-pub(crate) type Planned = (Plan, Reservation, Option<Arc<str>>);
-pub(crate) struct KeptPlans(Mutex<Kept>, Reservation);
-impl KeptPlans {
-    pub(crate) fn new(budget: &Budget, limit: Option<u64>) -> Result<Self> {
-        let cap = crate::memory::account(limit, 0, None)[2];
-        let held = budget.reserve(cap, "statement plan cache needed to open the store")?;
-        Ok(Self(Mutex::new((Vec::with_capacity(1024), 0)), held))
-    }
-
-    pub(crate) fn planned(&self, text: &str, budget: &Budget) -> Result<Planned> {
-        let mut guard = locked(&self.0);
-        let (kept, used) = &mut *guard;
-        if let Some((_, plan, form)) = kept.iter().find(|(key, ..)| &**key == text) {
-            let held = sql::charge(text, budget)?;
-            return Ok((plan.clone(), held, form.clone()));
-        }
-        let (statement, held, form) = sql::parse(text, budget)?;
-        let plan = sql::plan(statement)?;
-        let kind = matches!(plan, Plan::Select(_) | Plan::Insert(_) | Plan::Update(_));
-        let form = (kind || matches!(plan, Plan::Delete(_))).then(|| Arc::from(form));
-        let bytes = text.len() as u64 * HELD_PER_TEXT_BYTE;
-        let slots = 1024 * size_of::<(Box<str>, Plan, Option<Arc<str>>)>() as u64;
-        if !(plan.effect() == Effect::WritesRows || matches!(plan, Plan::Select(_)))
-            || bytes + slots > self.1.bytes()
-        {
-            return Ok((plan, held, form));
-        }
-        while kept.len() == 1024 || *used + bytes + slots > self.1.bytes() {
-            *used -= kept.remove(0).0.len() as u64 * HELD_PER_TEXT_BYTE;
-        }
-        *used += bytes;
-        kept.push((text.into(), plan.clone(), form.clone()));
-        Ok((plan, held, form))
-    }
-}
-
-/// Refuses `statement`, by its name, to a handle that declared a narrowing.
-pub(crate) fn admin(reader: &query::Reader, statement: Option<&str>) -> Result<()> {
-    let statement = statement.filter(|_| !reader.is_admin()).map(str::to_owned);
-    statement.map_or(Ok(()), |statement| Err(Error::AdminRequired { statement }))
-}
-
-/// Takes a lock. None of this part's locks is held across a step that can leave what the lock
-/// guards half changed, so a holder that panicked left it whole.
-pub(crate) fn locked<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
-    lock.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Database {
@@ -313,83 +119,19 @@ impl Database {
     /// canonicalization or maintenance-thread creation fails.
     pub fn open_with_options(
         path: impl AsRef<Path>,
-        options: DatabaseOpenOptions,
+        mut options: DatabaseOpenOptions,
     ) -> Result<Database> {
-        // The opening option is the session's ceiling, and the only one.
-        let ceiling = options.memory_limit.map(|l| l as u64);
-        let file = std::fs::metadata(path.as_ref().join("data")).map_or(0, |data| data.len());
-        let cache = crate::store::cache_under(ceiling, None);
-        crate::memory::admit(ceiling, crate::memory::account(ceiling, cache, Some(file)))?;
-        let mut cache_limit = ceiling;
-        let budget = Budget::new(ceiling)?;
-        let store = Store::open_for_writing(path.as_ref(), &budget, &options)?;
-        let view = store.view_on(budget.standing(), false)?;
-        let settings = crate::settings::load(&view)?;
-        // With none named, the limit is the one the store remembers, or the default.
-        if options.memory_limit.is_none() {
-            let remembered = settings[0].map(crate::settings::limit);
-            cache_limit = remembered.flatten();
-            budget.set_limit(remembered.unwrap_or_else(|| Some(system::default_memory_limit())))?;
-        }
-        let disk_started_under = options
-            .disk_limit
-            .or(settings[1].and_then(crate::settings::limit));
-        store.disk_limit(disk_started_under);
-        let catalog = Arc::new(Catalog::load(&view, &budget)?);
-        let live = vector::Totals::load(&view, &catalog)?;
-        let newest = Core {
-            commit: view.commit(),
-            catalog,
-            view: Some(view),
-        };
-        let plans = KeptPlans::new(&budget, cache_limit)?;
-        if let Some(plugin) = &options.plugin {
-            plugin.on_open()?;
-        }
-        let open = Arc::new_cyclic(|this| Open {
-            closes: Closes(options.plugin.clone()),
-            this: this.clone(),
-            last_cycle: Mutex::new(None),
-            last_sweep: Mutex::default(),
-            removal_from: Mutex::default(),
-            plans,
-            statements: Arc::new(Statements::new(&budget, settings[6])),
-            plugin: options.plugin,
-            subscribers: Default::default(),
-            triggers: crate::events::Triggers::new(&budget),
-            deliveries: crate::events::Deliveries::default(),
-            path: path.as_ref().into(),
-            storage: options.storage.clone(),
-            live: Mutex::new(live),
-            work: Mutex::new(WorkDone::default()),
-            signal: Arc::new(system::Signal::default()),
-            maintenance: options.maintenance,
-            numbered: Mutex::new(newest.commit.0),
-            cancelled: Default::default(),
-            started_under: ceiling,
-            disk_started_under,
-            disk: Mutex::new(disk_started_under),
-            budget,
-            clock: options.clock.unwrap_or_else(system::machine_clock),
-            committing: commit::Turn(Mutex::new(false), Default::default()),
-            callback_wait: options.callback_wait.unwrap_or(Duration::from_secs(60)),
-            expiry: Mutex::new(Default::default()),
-            audit_retention: (7 * 86_400_000).into(),
-            audit_swept: Mutex::new(0),
-            newest: Mutex::new(newest),
-            store,
-        });
-        drop(open.turn()?);
-        if open.store.recovery_state()?.0.is_some() {
-            open.signal.wake();
-        }
+        let channel_dir = options.channel_dir.take();
+        let open = Open::start(path.as_ref(), options, maintenance::verify)?;
         let folder = std::fs::canonicalize(path.as_ref()).map_err(|error| Error::StoreIo {
             operation: "open",
             path: path.as_ref().into(),
             reason: crate::types::excerpt(error),
         })?;
-        let worker = if options.maintenance == Maintenance::Engine {
+        let state = Arc::new(maintenance::State::default());
+        let worker = if open.maintenance == Maintenance::Engine {
             let open = open.clone();
+            let maintained = state.clone();
             let poll_open = open.clone();
             Some(
                 system::worker(
@@ -403,7 +145,9 @@ impl Database {
                             .flatten()
                             .unwrap_or(crate::settings::SETTINGS[7].2)
                     },
-                    move |partial| maintenance::cycle(&open, partial).map(|(_, again)| again),
+                    move |partial| {
+                        maintenance::cycle(&open, &maintained, partial).map(|(_, again)| again)
+                    },
                 )
                 .map_err(|error| Error::StoreIo {
                     operation: "open",
@@ -414,9 +158,10 @@ impl Database {
         } else {
             None
         };
-        let channel_dir = options.channel_dir.unwrap_or_else(|| folder.clone());
+        let channel_dir = channel_dir.unwrap_or_else(|| folder.clone());
         Ok(Database {
             open: Mutex::new(Some(Arc::new(Writer {
+                state,
                 open,
                 worker,
                 folder,
@@ -433,7 +178,7 @@ impl Database {
     pub fn serve_requests(
         &self,
         namespace: &str,
-        handler: Arc<dyn crate::read::OwnerRequestHandler>,
+        handler: Arc<dyn crate::reader::OwnerRequestHandler>,
     ) -> Result<()> {
         self.opened()?;
         admin(&self.reader, Some("serve_requests"))?;
@@ -447,7 +192,7 @@ impl Database {
                 "a request handler is already registered".into(),
             ));
         }
-        *channel = Some(crate::read::Channel::start(
+        *channel = Some(crate::reader::Channel::start(
             &writer.folder,
             &writer.channel_dir,
             namespace,
@@ -459,7 +204,16 @@ impl Database {
 
     fn planned(&self, text: &str) -> Result<(Planned, Arc<Open>)> {
         let open = self.opened()?;
-        Ok((open.plans.planned(text, &open.budget)?, open))
+        Ok((open.plans().planned(text, &open.budget)?, open))
+    }
+
+    /// The open store and what maintenance keeps for it, refused as [`Self::opened`] is.
+    fn maintained(&self) -> Result<(Arc<Open>, Arc<maintenance::State>)> {
+        let open = self.opened()?;
+        let state = locked(&self.open)
+            .as_ref()
+            .map(|writer| writer.state.clone());
+        Ok((open, state.ok_or(Error::DatabaseClosed)?))
     }
 
     /// The open store, or the refusal of a handle that was closed.
@@ -517,12 +271,12 @@ impl Database {
             limits,
             observer,
             clock: Some(open.clock.clone()),
-            storage: open.storage.clone(),
+            storage: open.storage().cloned(),
             contexts: None,
             scope_labels: None,
             principal: None,
         };
-        ReadSession::live(&open, &open.path, options, self.reader.clone())
+        ReadSession::live(&open, open.path(), options, self.reader.clone())
     }
 
     /// A table as it was declared, as of the newest commit: its columns, its UNIQUE rules, its
@@ -618,14 +372,14 @@ impl Database {
         let generation = open.cancelled.load(Relaxed);
         let mut seen = None;
         let result = open.observed(sql, || {
-            let (plan, mut parse, form) = open.plans.planned(sql, &open.budget)?;
+            let (plan, mut parse, form) = open.plans().planned(sql, &open.budget)?;
             if matches!(plan.effect(), Effect::Declares) {
                 open.host(|plugin| plugin.on_ddl(sql))?;
             }
             if matches!(plan.effect(), Effect::Declares | Effect::WritesRows) {
                 // Taken before the statement reads anything, so no other commit can overtake it.
                 let purge = matches!(plan, Plan::Purge(_));
-                if purge && crate::events::delivery::IN_SINK_CALL.get() {
+                if purge && crate::events::IN_SINK_CALL.get() {
                     let operation = "PURGE inside a sink".into();
                     return Err(Error::CallbackReentry { operation });
                 }
@@ -694,18 +448,11 @@ impl Database {
     pub fn snapshot(&self) -> Result<crate::Snapshot> {
         let open = self.opened()?;
         let budget = open.budget.statement();
-        let store = Store::open_for_reading(
-            &open.path,
-            &budget,
-            &ReadSessionOptions {
-                storage: open.storage.clone(),
-                ..Default::default()
-            },
-        )?;
+        let store = Store::open_for_reading(open.path(), &budget, None, open.storage())?;
         let (view, catalog) =
             Core::load(store.view()?, &mut None, &budget)?.newest(&store, &budget)?;
         Ok(crate::Snapshot {
-            path: open.path.clone(),
+            path: open.path().into(),
             view,
             catalog,
             _store: store,
@@ -719,7 +466,7 @@ impl Database {
         snapshot: &crate::Snapshot,
     ) -> Result<QueryResult> {
         let ((plan, mut parsing, form), open) = self.planned(sql)?;
-        if open.path != snapshot.path {
+        if open.path() != snapshot.path {
             return Err(Error::SnapshotMismatch);
         }
         if plan.effect() != Effect::Reads {
@@ -734,7 +481,8 @@ impl Database {
         let (catalog, view, reader) = (&snapshot.catalog, &changes, &self.reader);
         let generation = open.cancelled.load(Relaxed);
         let result = open.recorded(form.as_deref(), generation, |counted| {
-            let given = (now, Some(counted), Some(&*open), charge);
+            let settings = || open.settings();
+            let given = (now, Some(counted), Some(&open.figures(&settings)), charge);
             let result = query::run(&plan, params, catalog, view, reader, &open.budget, given);
             (result, changes.rows_read.get())
         });
@@ -749,7 +497,8 @@ impl Database {
     {
         admin(&self.reader, Some("schedule callbacks"))?;
         let open = self.opened()?;
-        open.triggers.register_cron(name, callback)?;
+        open.triggers
+            .register_cron(name, move |host| callback(&Database::bound(host)))?;
         open.signal.wake();
         Ok(())
     }
@@ -820,7 +569,7 @@ impl Database {
     }
     /// The live disk ceiling, in bytes; None means unlimited. Refuses a closed or callback handle.
     pub fn disk_limit(&self) -> Result<Option<u64>> {
-        Ok(*locked(&self.opened()?.disk))
+        Ok(*locked(self.opened()?.disk()))
     }
 
     /// The bytes counted against the memory limit at this moment: what every open sets aside,
@@ -977,8 +726,8 @@ impl Database {
     /// Returns `CallbackReentry` on a callback handle or the firing thread during trigger
     /// dispatch, and `DatabaseClosed` after close.
     pub fn run_maintenance_cycle(&self) -> Result<MaintenanceReport> {
-        let open = self.opened()?;
-        maintenance::cycle(&open, true).map(|(report, _)| {
+        let (open, state) = self.maintained()?;
+        maintenance::cycle(&open, &state, true).map(|(report, _)| {
             if self.reader.is_admin() {
                 report
             } else {
@@ -991,11 +740,11 @@ impl Database {
     /// whether its pass goes on. A reader holding moved pages is reported. After a crash the
     /// step is one of the free-page recovery it left owed, as `recovery_advanced` says.
     pub fn compact_now(&self) -> Result<MaintenanceReport> {
-        let open = self.opened()?;
+        let (open, state) = self.maintained()?;
         let mut report = MaintenanceReport::default();
         let before = open.store.recovery_state()?.1;
         let more = maintenance::recover(&open, &mut report)?.is_some()
-            || maintenance::compact(&open, true, &mut report)?;
+            || maintenance::compact(&open, &state, true, &mut report)?;
         report.reclaimed_bytes = Some(before.saturating_sub(open.store.recovery_state()?.1));
         report.work_remaining = Some(more || report.compaction_waiting_on.is_some());
         Ok(if self.reader.is_admin() {
@@ -1092,7 +841,7 @@ impl Transaction<'_> {
     pub fn execute(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
         let (open, mut reads) = (self.db.opened()?, false);
         let result = open.observed(sql, || {
-            let (plan, parsing, form) = open.plans.planned(sql, &open.budget)?;
+            let (plan, parsing, form) = open.plans().planned(sql, &open.budget)?;
             reads = plan.effect() == Effect::Reads;
             if matches!(plan.effect(), Effect::Declares) {
                 open.host(|plugin| plugin.on_ddl(sql))?;
@@ -1239,22 +988,78 @@ impl Transaction<'_> {
     pub fn rollback(self) {}
 }
 
-/// The close hook of a store let go by being dropped, whose result is ignored.
-struct Closes(Option<Arc<dyn DatabasePlugin>>);
-impl Drop for Closes {
-    fn drop(&mut self) {
-        let hook = || self.0.take().map(|plugin| plugin.on_close());
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook));
+impl Database {
+    /// Whether this open created or recreated its data file.
+    pub fn created(&self) -> Result<bool> {
+        Ok(self.opened()?.store.created())
     }
-}
-
-impl Open {
-    /// The store's close by its last holder: the hook, then the storage library's last work,
-    /// whose failure outranks the hook's.
-    fn close(mut self) -> Result<()> {
-        self.closes.0 = None;
-        let hook = self.host(|plugin| plugin.on_close());
-        let store = { self }.store;
-        store.close().and(hook)
+    /// The last completed cycle; numeric figures are withheld on narrowed handles.
+    pub fn last_maintenance_cycle(&self) -> Result<Option<MaintenanceReport>> {
+        let open = self.opened()?;
+        Ok(locked(&open.last_cycle).map(|r| {
+            if self.reader.is_admin() {
+                r
+            } else {
+                r.withheld()
+            }
+        }))
+    }
+    /// Best-effort commit wake-ups, with room for 1,024 events. Narrowed handles are refused.
+    pub fn subscribe(&self) -> Result<Receiver<CommitEvent>> {
+        self.subscription(1024, "subscribe")
+    }
+    /// A full channel drops its notification and never blocks a commit. Zero means one slot.
+    pub fn subscribe_with_capacity(&self, capacity: usize) -> Result<Receiver<CommitEvent>> {
+        self.subscription(capacity.max(1), "subscribe_with_capacity")
+    }
+    fn subscription(&self, capacity: usize, name: &str) -> Result<Receiver<CommitEvent>> {
+        admin(&self.reader, Some(name))?;
+        let open = self.opened()?;
+        let bytes = (capacity as u64).saturating_mul((size_of::<CommitEvent>() + 64) as u64);
+        let held = open
+            .budget
+            .reserve(bytes.saturating_add(128), "commit subscription")?;
+        let (tx, rx) = mpsc::sync_channel(capacity);
+        locked(open.subscribers()).0.push((tx, held));
+        Ok(rx)
+    }
+    /// The open subscriptions and the notices sent and dropped since the store was opened.
+    pub fn subscription_health(&self) -> Result<SubscriptionMetrics> {
+        admin(&self.reader, Some("subscription_health"))?;
+        let open = self.opened()?;
+        let (subscribers, sent, dropped) = &*locked(open.subscribers());
+        Ok(SubscriptionMetrics {
+            active_channels: subscribers.len(),
+            events_sent: *sent,
+            events_dropped: *dropped,
+        })
+    }
+    /// Host-supplied health; panics on a closed handle, as the carried plain-value call does.
+    pub fn plugin_health(&self) -> PluginHealth {
+        self.opened()
+            .expect("open database")
+            .host(|plugin| plugin.health())
+    }
+    /// Host-supplied description; panics on a closed handle.
+    pub fn plugin_describe(&self) -> serde_json::Value {
+        self.opened()
+            .expect("open database")
+            .host(|plugin| plugin.describe())
+    }
+    /// Declared events and confirmed delivery counters; requires an unnarrowed handle.
+    pub fn event_bus_status(&self) -> Result<crate::Owned<EventBusStatus>> {
+        admin(&self.reader, Some("event_bus_status"))?;
+        let open = self.opened()?;
+        let (view, catalog) = open.newest()?;
+        let cron = open.triggers.cron_names();
+        open.deliveries
+            .status(&view, &catalog, &open.budget, true, &cron)
+    }
+    /// Confirmed outcomes and committed pending depth; requires an unnarrowed handle.
+    pub fn sink_metrics(&self, sink: &str) -> Result<SinkMetrics> {
+        admin(&self.reader, Some("sink_metrics"))?;
+        let open = self.opened()?;
+        let (view, _) = open.newest()?;
+        open.deliveries.metrics(&open.budget, &view, sink)
     }
 }

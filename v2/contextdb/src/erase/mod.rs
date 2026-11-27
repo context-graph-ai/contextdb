@@ -1,12 +1,12 @@
 //! One standalone removal, choosing from its first view and writing bounded parts.
-use crate::database::{Open, Staged};
+use crate::commit::{Open, Staged};
 use crate::memory::Reservation;
 use crate::query::{self, Visible};
 use crate::schema::{Catalog, Reference, Table};
 use crate::sql::{Expr, Plan, ast::Delete};
+use crate::stage::{self, Given, Rules};
 use crate::store::{Cell, ChangeSet, Key, Read, View};
 use crate::types::{Error, Result, Value};
-use crate::write::{self, Given, Rules};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -29,6 +29,7 @@ pub(crate) fn stage(
         let passes = &mut passes.borrow_mut();
         open.part(changes, &staged.catalog, &staged.budget, passes)
     };
+    let ready = |catalog: &Catalog, table: &str| open.triggers.ready(catalog, table);
     let given = Given {
         part: Some(&part),
         params,
@@ -39,12 +40,14 @@ pub(crate) fn stage(
         now,
         number: staged.number,
         examined,
-        triggers: Some(&open.triggers),
+        ready: Some(&ready),
     };
     // Every table named is checked before anything is selected.
     let mut tables: Vec<&Table> = Vec::new();
     for selection in selections {
-        crate::events::Triggers::ready(given.triggers, given.catalog, &selection.table)?;
+        if let Some(ready) = given.ready {
+            ready(given.catalog, &selection.table)?;
+        }
         let named = given.catalog.table(&selection.table);
         let named = named.ok_or_else(|| Error::TableNotFound(selection.table.clone()))?;
         let refused = match () {
@@ -123,7 +126,7 @@ pub(crate) fn stage(
             changes: &slot,
             budget: given.budget,
         };
-        entry.0.values = query::written(&plan, &given, &first, &mut held, Some(sets))?;
+        entry.0.values = query::written(&plan, given.writing(), &first, &mut held, Some(sets))?;
         if !purge {
             entry.0.changeable(&plan)?;
         }
@@ -222,7 +225,7 @@ fn rowless(
     let mut wanted = vec![false; width];
     visible.reads(&mut wanted);
     if let Some(f) = filter.flatten() {
-        query::reads(f, &table.scope(), given.params, &mut wanted)?;
+        query::reads(f, &crate::query::scope(table), given.params, &mut wanted)?;
     }
     for &at in table.rules.references.iter().flat_map(|r| &r.columns) {
         wanted[at] = true;
@@ -239,7 +242,9 @@ fn rowless(
             return Ok(false);
         }
         let mut chosen = match filter {
-            Some(Some(f)) => *query::eval(f, &table.scope(), row, &asked.ctx)? == Value::Bool(true),
+            Some(Some(f)) => {
+                *query::eval(f, &crate::query::scope(table), row, &asked.ctx)? == Value::Bool(true)
+            }
             Some(None) => true,
             None => false,
         };
@@ -341,7 +346,7 @@ fn take(
         let named = follower(at, &values)?;
         if values.contains(&Value::Null)
             || changes.noted(b'M', child.id, &named, budget)?
-            || write::parent(table, &r.parent_columns, &values, &*changes, &whole)?
+            || stage::parent(table, &r.parent_columns, &values, &*changes, &whole)?
         {
             continue;
         }

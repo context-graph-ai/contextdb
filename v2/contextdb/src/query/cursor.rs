@@ -44,6 +44,7 @@ impl CursorRows {
                 &view,
                 (&budget, None, None, parsing.bytes()),
                 None,
+                None,
             )?
         } else {
             None
@@ -87,6 +88,7 @@ impl CursorRows {
                 &self.view,
                 (&self.budget, None, None, self._parsing.bytes()),
                 work.limits.tables.as_ref(),
+                Some(work.verify),
             )?;
         }
         if let Some(whole) = &mut self.whole {

@@ -1,10 +1,10 @@
 //! Best-effort subscriptions own their queued memory and publish only after confirmation.
 use super::*;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{SyncSender, TrySendError};
 
 thread_local! { static HOST: RefCell<Vec<*const Open>> = const { RefCell::new(Vec::new()) }; }
-pub(super) fn active(open: &Open) -> bool {
+pub(crate) fn active(open: &Open) -> bool {
     HOST.with(|held| held.borrow().contains(&(open as *const Open)))
 }
 struct Host;
@@ -59,86 +59,11 @@ pub struct SubscriptionMetrics {
     pub events_sent: u64,
     pub events_dropped: u64,
 }
-type Sent = (Vec<(SyncSender<CommitEvent>, Reservation)>, u64, u64);
+pub(crate) type Sent = (Vec<(SyncSender<CommitEvent>, Reservation)>, u64, u64);
 #[derive(Default)]
-pub(super) struct Subscribers(Mutex<Sent>);
-impl Database {
-    /// Whether this open created or recreated its data file.
-    pub fn created(&self) -> Result<bool> {
-        Ok(self.opened()?.store.created())
-    }
-    /// The last completed cycle; numeric figures are withheld on narrowed handles.
-    pub fn last_maintenance_cycle(&self) -> Result<Option<MaintenanceReport>> {
-        let open = self.opened()?;
-        Ok(locked(&open.last_cycle).map(|r| {
-            if self.reader.is_admin() {
-                r
-            } else {
-                r.withheld()
-            }
-        }))
-    }
-    /// Best-effort commit wake-ups, with room for 1,024 events. Narrowed handles are refused.
-    pub fn subscribe(&self) -> Result<Receiver<CommitEvent>> {
-        self.subscription(1024, "subscribe")
-    }
-    /// A full channel drops its notification and never blocks a commit. Zero means one slot.
-    pub fn subscribe_with_capacity(&self, capacity: usize) -> Result<Receiver<CommitEvent>> {
-        self.subscription(capacity.max(1), "subscribe_with_capacity")
-    }
-    fn subscription(&self, capacity: usize, name: &str) -> Result<Receiver<CommitEvent>> {
-        admin(&self.reader, Some(name))?;
-        let open = self.opened()?;
-        let bytes = (capacity as u64).saturating_mul((size_of::<CommitEvent>() + 64) as u64);
-        let held = open
-            .budget
-            .reserve(bytes.saturating_add(128), "commit subscription")?;
-        let (tx, rx) = mpsc::sync_channel(capacity);
-        locked(&open.subscribers.0).0.push((tx, held));
-        Ok(rx)
-    }
-    /// The open subscriptions and the notices sent and dropped since the store was opened.
-    pub fn subscription_health(&self) -> Result<SubscriptionMetrics> {
-        admin(&self.reader, Some("subscription_health"))?;
-        let open = self.opened()?;
-        let (subscribers, sent, dropped) = &*locked(&open.subscribers.0);
-        Ok(SubscriptionMetrics {
-            active_channels: subscribers.len(),
-            events_sent: *sent,
-            events_dropped: *dropped,
-        })
-    }
-    /// Host-supplied health; panics on a closed handle, as the carried plain-value call does.
-    pub fn plugin_health(&self) -> PluginHealth {
-        self.opened()
-            .expect("open database")
-            .host(|plugin| plugin.health())
-    }
-    /// Host-supplied description; panics on a closed handle.
-    pub fn plugin_describe(&self) -> serde_json::Value {
-        self.opened()
-            .expect("open database")
-            .host(|plugin| plugin.describe())
-    }
-    /// Declared events and confirmed delivery counters; requires an unnarrowed handle.
-    pub fn event_bus_status(&self) -> Result<crate::Owned<EventBusStatus>> {
-        admin(&self.reader, Some("event_bus_status"))?;
-        let open = self.opened()?;
-        let (view, catalog) = open.newest()?;
-        let cron = open.triggers.cron_names();
-        open.deliveries
-            .status(&view, &catalog, &open.budget, true, &cron)
-    }
-    /// Confirmed outcomes and committed pending depth; requires an unnarrowed handle.
-    pub fn sink_metrics(&self, sink: &str) -> Result<SinkMetrics> {
-        admin(&self.reader, Some("sink_metrics"))?;
-        let open = self.opened()?;
-        let (view, _) = open.newest()?;
-        open.deliveries.metrics(&open, &view, sink)
-    }
-}
+pub(crate) struct Subscribers(pub(super) Mutex<Sent>);
 impl Open {
-    pub(super) fn host<T>(&self, call: impl FnOnce(&dyn DatabasePlugin) -> T) -> T {
+    pub(crate) fn host<T>(&self, call: impl FnOnce(&dyn DatabasePlugin) -> T) -> T {
         if self.plugin.is_none() {
             return call(&CorePlugin);
         }
@@ -146,15 +71,15 @@ impl Open {
         let _host = Host;
         call(self.plugin())
     }
-    pub(super) fn plugin(&self) -> &dyn DatabasePlugin {
+    pub(crate) fn plugin(&self) -> &dyn DatabasePlugin {
         self.plugin.as_deref().unwrap_or(&CorePlugin)
     }
-    pub(super) fn failed(&self, changes: &ChangeSet, source: CommitSource, error: &Error) {
+    pub(crate) fn failed(&self, changes: &ChangeSet, source: CommitSource, error: &Error) {
         let _ = catch_unwind(AssertUnwindSafe(|| {
             self.host(|plugin| plugin.commit_failed(changes, source, error))
         }));
     }
-    pub(super) fn observed(
+    pub(crate) fn observed(
         &self,
         sql: &str,
         run: impl FnOnce() -> Result<QueryResult>,
@@ -180,7 +105,7 @@ impl Open {
         }));
         result
     }
-    pub(super) fn confirmed(
+    pub(crate) fn confirmed(
         &self,
         changes: &ChangeSet,
         source: CommitSource,
@@ -199,7 +124,7 @@ impl Open {
             });
         }
     }
-    pub(super) fn summary(
+    pub(crate) fn summary(
         &self,
         changes: &mut ChangeSet,
         catalog: &Catalog,

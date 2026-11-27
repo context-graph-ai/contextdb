@@ -1,5 +1,4 @@
 //! Declared settings: one slot, reader and check for every policy.
-use crate::store::Read;
 use crate::{Error, Result};
 
 pub(crate) type Values = [Option<u64>; 8];
@@ -39,15 +38,15 @@ pub(crate) fn named(verb: &str, name: &str) -> Result<usize> {
         .iter()
         .position(|row| row.0[4..].eq_ignore_ascii_case(name))
         .ok_or_else(|| match name.to_ascii_uppercase().as_str() {
-            "READ_CACHE_SHARE" | "VECTOR_SERVING_CACHE" => crate::sql::not_carried(
+            "READ_CACHE_SHARE" | "VECTOR_SERVING_CACHE" => crate::types::not_carried(
                 name,
                 "the page cache share is set when a reader opens: ReadLimits::cache_share",
             ),
-            "STORAGE_COMPACTION MAX_SWEEPS" => crate::sql::not_carried(
+            "STORAGE_COMPACTION MAX_SWEEPS" => crate::types::not_carried(
                 name,
                 "a page-bounded step runs once per cycle; the shell's maintenance compact [steps] runs more",
             ),
-            _ => crate::sql::not_supported(&format!("{verb} {name}")),
+            _ => crate::types::not_supported(&format!("{verb} {name}")),
         })
 }
 /// Reads bytes for command-line options using the same byte reader as SQL settings.
@@ -127,10 +126,10 @@ pub(crate) fn check(at: usize, next: u64, values: &Values) -> Result<()> {
         )))
     }
 }
-pub(crate) fn load(read: &dyn Read) -> Result<Values> {
+pub(crate) fn load(mut get: impl FnMut(usize) -> Result<Option<u64>>) -> Result<Values> {
     let mut values = [None; 8];
     for (at, value) in values.iter_mut().enumerate() {
-        *value = read.setting(at)?;
+        *value = get(at)?;
     }
     Ok(values)
 }

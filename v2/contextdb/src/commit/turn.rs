@@ -86,7 +86,7 @@ impl Open {
             .and_then(|overtaken| part(&mut staged).map(|()| overtaken))
             .inspect_err(|error| self.failed(&staged.changes, source, error))?;
         let (mut staged, fired) =
-            crate::events::fire(&self.this.upgrade().expect("active open store"), staged);
+            super::fire(&self.this.upgrade().expect("active open store"), staged);
         if let Err(error) = fired.and_then(|()| part(&mut staged)) {
             self.failed(&staged.changes, source, &error);
             // The rest of the write goes first, its storage transaction and memory with it.
@@ -109,13 +109,13 @@ impl Open {
         let result = (|| {
             // A PURGE that matches no row still takes what is owed.
             let purge = erasing == Some(true);
-            if changes.is_empty() && !(purge && crate::maintenance::any_owed(self)?) {
+            if changes.is_empty() && !(purge && self.newest()?.0.any_owed()?) {
                 return Ok(None);
             }
             self.host(|plugin| plugin.pre_commit(&changes, source))?;
-            write::check_at_commit(&changes, &catalog, overtaken.as_ref(), &budget, |each| {
+            stage::check_at_commit(&changes, &catalog, overtaken.as_ref(), &budget, |each| {
                 if changes.streaming() {
-                    write::written(&changes, &catalog, &budget, each)
+                    stage::written(&changes, &catalog, &budget, each)
                 } else {
                     changes.rows_changed().try_for_each(each)
                 }
@@ -157,7 +157,11 @@ impl Open {
             // Only a declaration erases a trigger.
             let retire = declared.first().map(|_| self.triggers.retiring(&changes));
             let retire = retire.transpose()?;
-            changes.put_audit(&audit, crate::system::now_millis(&*self.clock))?;
+            crate::events::write_audit(
+                &mut changes,
+                &audit,
+                crate::system::now_millis(&*self.clock),
+            )?;
             let commit = self.store.commit(&mut changes)?;
             if let Some(n) = changes.changed_setting(1) {
                 self.store.disk_limit(crate::settings::applied(1, n));
@@ -207,7 +211,11 @@ impl Open {
             // Written through, a long write's firings leave in parts as the set fills.
             self.store.through(&mut changes);
             changes.set_number(self.number());
-            changes.put_audit(&audit, crate::system::now_millis(&*self.clock))?;
+            crate::events::write_audit(
+                &mut changes,
+                &audit,
+                crate::system::now_millis(&*self.clock),
+            )?;
             let after = self.store.commit(&mut changes)?;
             self.adopt(after, catalog, vector::Totals::default());
         }
@@ -239,7 +247,7 @@ impl Open {
         state: &mut Option<vector::Committed>,
     ) -> Result<()> {
         let now = (system::now_millis(&*self.clock) / 1000).clamp(0, i64::from(u32::MAX)) as u32;
-        write::stage_retention(changes, catalog, now, budget)?;
+        stage::stage_retention(changes, catalog, now, budget)?;
         let live = locked(&self.live);
         // A later part of the transaction counts on from the totals of its earlier parts.
         let (earlier, wake) = state.take().map_or((None, false), |v| {

@@ -23,6 +23,11 @@ use crate::types::{
 #[path = "tests.rs"]
 mod tests;
 
+/// A table's columns as an expression reaches them: under the table's name, in row order.
+pub(crate) fn scope(table: &Table) -> Scope<'_> {
+    Scope::of(&table.name, &table.meta.columns)
+}
+
 /// The columns an expression has in reach: for each table of the statement, in the order their
 /// values stand in a row, the name that qualifies its columns and the columns themselves.
 #[derive(Default, Clone)]
@@ -655,7 +660,7 @@ pub(super) fn mark(expr: &Expr, scope: &Scope, read: &mut [bool]) {
 
 /// Where a column sits in a row of its table.
 pub(super) fn column_index(table: &Table, column: &ColumnRef) -> Result<usize> {
-    Ok(table.scope().find(column)?.0)
+    Ok(crate::query::scope(table).find(column)?.0)
 }
 
 pub(super) fn unbound(name: &str) -> Error {

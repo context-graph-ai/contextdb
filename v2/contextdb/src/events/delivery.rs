@@ -1,9 +1,6 @@
 //! Durable routed records and the one post-commit dispatcher.
 use super::*;
-use crate::database::ScheduleStatus;
-use crate::database::{EventBusStatus, EventTypeStatus, RouteStatus, SinkMetrics, SinkStatus};
-use crate::maintenance::MaintenanceReport;
-use crate::query::{Reader, Visible};
+use crate::query::Reader;
 use crate::store::{
     Cell, ChangeSet, DELIVERY, View, delivery_parts, put_text, put_value, read_value, value_len,
 };
@@ -18,16 +15,16 @@ type SinkEntry = Arc<(Reader, Box<Handler>, Reservation)>;
 type Metrics = BTreeMap<String, (SinkMetrics, u64)>;
 #[derive(Default)]
 pub(crate) struct Deliveries {
-    callbacks: Mutex<BTreeMap<String, SinkEntry>>,
+    pub(crate) callbacks: Mutex<BTreeMap<String, SinkEntry>>,
     pub(crate) active: Mutex<()>,
-    counters: Mutex<BTreeMap<String, (SinkMetrics, Reservation, u64)>>,
+    pub(crate) counters: Mutex<BTreeMap<String, (SinkMetrics, Reservation, u64)>>,
     /// Each schedule's last failure that ended no cycle, until it next runs.
     pub(crate) failed: Mutex<BTreeMap<String, String>>,
 }
 impl Deliveries {
     pub(crate) fn register<F>(
         &self,
-        open: &Open,
+        (catalog, budget): (&Catalog, &Budget),
         name: &str,
         reader: &Reader,
         principal: Option<Principal>,
@@ -36,7 +33,6 @@ impl Deliveries {
     where
         F: Fn(&SinkEvent) -> std::result::Result<(), SinkError> + Send + Sync + 'static,
     {
-        let (_, catalog) = open.newest()?;
         if !catalog.events.contains_key(&(Kind::Sink, name.to_owned())) {
             return Err(Error::SinkNotDeclared {
                 sink_name: name.into(),
@@ -47,23 +43,22 @@ impl Deliveries {
         }
         let principal = reader.principal.clone().or_else(|| principal.map(Arc::new));
         let bytes = name.len() + size_of::<F>() + 256;
-        let held = open.budget.reserve(bytes as u64, "sink registration")?;
+        let held = budget.reserve(bytes as u64, "sink registration")?;
         let mut reader = reader.clone();
         reader.principal = principal;
         locked(&self.callbacks).insert(name.into(), Arc::new((reader, Box::new(deliver), held)));
-        open.signal.wake();
         Ok(())
     }
 }
 pub(crate) struct Delivery {
     row_key: Key,
-    table: TableId,
-    sink: String,
-    event: SinkEvent,
-    attempts: u64,
-    flag: u8,
+    pub(crate) table: TableId,
+    pub(crate) sink: String,
+    pub(crate) event: SinkEvent,
+    pub(crate) attempts: u64,
+    pub(crate) flag: u8,
 }
-fn key(action: u64) -> [u8; 9] {
+pub(crate) fn key(action: u64) -> [u8; 9] {
     let mut key = [0; 9];
     key[0] = DELIVERY;
     key[1..].copy_from_slice(&action.to_be_bytes());
@@ -193,7 +188,12 @@ pub(crate) fn prepare(changes: &mut ChangeSet, catalog: &Catalog, budget: &Budge
     }
     Ok(queued)
 }
-fn identity(view: &View, key: &[u8], bytes: &[u8], held: &mut Reservation) -> Result<Delivery> {
+pub(crate) fn identity(
+    view: &View,
+    key: &[u8],
+    bytes: &[u8],
+    held: &mut Reservation,
+) -> Result<Delivery> {
     if key.len() != 9 || key[0] != DELIVERY || key[1..] == [0; 8] {
         return Err(view.damaged("an invalid delivery key"));
     }
@@ -245,7 +245,7 @@ fn identity(view: &View, key: &[u8], bytes: &[u8], held: &mut Reservation) -> Re
         flag,
     })
 }
-fn load_body(
+pub(crate) fn load_body(
     view: &View,
     bytes: &[u8],
     delivery: &mut Delivery,
@@ -290,158 +290,6 @@ pub(crate) fn validate(
 }
 thread_local! {
     pub(crate) static IN_SINK_CALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-type Change = (u64, Option<(u64, u8)>);
-type Tally = (String, bool, bool, bool, bool);
-fn settle(
-    open: &Open,
-    report: &mut MaintenanceReport,
-    previous: Option<(Change, Tally)>,
-    mark: Option<Change>,
-) -> Result<bool> {
-    if previous.is_none() && mark.is_none() {
-        return Ok(false);
-    }
-    let guard = open.turn()?;
-    let mut staged = open.begin()?;
-    for (action, change) in previous.as_ref().map(|p| p.0).into_iter().chain(mark) {
-        staged
-            .changes
-            .put_delivery(Some(action), None, |view, _, encoded| {
-                let at = key(action);
-                let mut replacement = None;
-                view.deliveries(
-                    (Included(at.as_slice()), Included(at.as_slice())),
-                    &mut |_, bytes| {
-                        replacement = Some(None);
-                        if let Some((attempts, flag)) = change {
-                            encoded.grow(bytes.len() as u64)?;
-                            let mut out = bytes.to_vec();
-                            out[16..24].copy_from_slice(&attempts.to_be_bytes());
-                            out[24] = flag;
-                            replacement = Some(Some(out));
-                        }
-                        Ok(false)
-                    },
-                )?;
-                Ok(replacement)
-            })?;
-    }
-    open.commit(guard, staged)?;
-    let Some((_, (sink, success, terminal, retried, fresh))) = previous else {
-        return Ok(false);
-    };
-    let mut counters = locked(&open.deliveries.counters);
-    let metrics = &mut counters.get_mut(&sink).expect("examined sink").0;
-    metrics.delivered += u64::from(success);
-    metrics.window_refused &= !success;
-    metrics.retried += u64::from(retried);
-    metrics.uncertain += u64::from(fresh);
-    metrics.permanent_failures += u64::from(terminal);
-    *report.delivered.get_or_insert(0) += u64::from(success);
-    *report.deferred.get_or_insert(0) += u64::from(!success && !terminal);
-    Ok(success || terminal)
-}
-/// One finite pass, with no view, registry lock or commit lock held during host code.
-pub(crate) fn deliver(open: &Open, report: &mut MaintenanceReport) -> Result<(bool, bool)> {
-    let Ok(_dispatch) = open.deliveries.active.try_lock() else {
-        return Ok((false, false));
-    };
-    let mut carried = None;
-    let done = pass(open, report, &mut carried);
-    let last = settle(open, report, carried, None)?;
-    done.map(|(progressed, more)| (progressed | last, more))
-}
-fn pass(
-    open: &Open,
-    report: &mut MaintenanceReport,
-    carried: &mut Option<(Change, Tally)>,
-) -> Result<(bool, bool)> {
-    let upper = key(open.newest()?.0.last_action()?);
-    let (mut cursor, mut progressed) = (key(0), false);
-    for _ in 0..256 {
-        let (view, catalog) = open.newest()?;
-        let mut found = None;
-        view.deliveries(
-            (Excluded(cursor.as_slice()), Included(upper.as_slice())),
-            &mut |k, bytes| {
-                let mut held = open.budget.reserve(0, "delivery attempt")?;
-                let mut delivery = identity(&view, k, bytes, &mut held)?;
-                let (sink, action) = (&delivery.sink, delivery.event.action_id);
-                open.deliveries.examine(open, sink, action)?;
-                let registration = locked(&open.deliveries.callbacks)
-                    .get(&delivery.sink)
-                    .cloned();
-                let table = catalog
-                    .table(&delivery.event.table)
-                    .filter(|t| t.id == delivery.table);
-                let loaded = if table.is_some() && registration.is_some() {
-                    load_body(&view, bytes, &mut delivery, &mut held)
-                } else {
-                    Ok(())
-                };
-                let admitted = match (table, &registration, loaded) {
-                    (_, _, Err(Error::MemoryBudgetExceeded { .. })) => {
-                        let mut counters = locked(&open.deliveries.counters);
-                        let window = &mut counters.get_mut(&delivery.sink).expect("examined").0;
-                        (window.window_refusals, window.window_refused) =
-                            (window.window_refusals + 1, true);
-                        false
-                    }
-                    (_, _, Err(error)) => return Err(error),
-                    (None, _, _) => true,
-                    (Some(t), Some(r), _) => match Visible::new(t, &catalog, &r.0, &mut held) {
-                        Ok(mut filter) => filter.sees(&view, |at| {
-                            delivery
-                                .event
-                                .row_values
-                                .get(&t.meta.columns[at].name)
-                                .or_else(|| t.missing.get(at))
-                        })?,
-                        Err(Error::PrincipalRequired { .. }) => false,
-                        Err(error) => return Err(error),
-                    },
-                    _ => false,
-                };
-                if !admitted {
-                    *report.deferred.get_or_insert(0) += 1;
-                    return Ok(true);
-                }
-                found = Some((delivery, registration.filter(|_| table.is_some()), held));
-                Ok(false)
-            },
-        )?;
-        let Some((delivery, registration, held)) = found else {
-            return Ok((progressed, false));
-        };
-        cursor = key(delivery.event.action_id);
-        drop((view, catalog));
-        let (action, attempts) = (delivery.event.action_id, delivery.attempts);
-        let mark = (delivery.flag != 2).then_some((action, Some((attempts, 2))));
-        progressed |= settle(open, report, carried.take(), mark)?;
-        IN_SINK_CALL.set(true);
-        let outcome = registration.map(|registration| {
-            catch_unwind(AssertUnwindSafe(|| (registration.1)(&delivery.event))).unwrap_or_else(
-                |_| Err(SinkError::OutcomeUncertain("host callback panicked".into())),
-            )
-        });
-        IN_SINK_CALL.set(false);
-        let success = matches!(outcome, Some(Ok(())));
-        let terminal = matches!(outcome, None | Some(Err(SinkError::Permanent(_))));
-        let fresh = matches!(outcome, Some(Err(SinkError::OutcomeUncertain(_))));
-        let stored = (!success && !terminal)
-            .then_some((attempts + 1, u8::from(delivery.flag != 0 || fresh)));
-        let tally = (
-            delivery.sink.clone(),
-            success,
-            terminal,
-            attempts > 0,
-            fresh || delivery.flag == 2,
-        );
-        *carried = Some(((action, stored), tally));
-        drop((delivery, held, outcome));
-    }
-    Ok((progressed, cursor < upper))
 }
 
 /// What an erase does with the key and row of a delivery it takes.
@@ -529,12 +377,10 @@ pub(crate) fn erase(changes: &mut ChangeSet, budget: &Budget) -> Result<()> {
 }
 
 impl Deliveries {
-    fn examine(&self, open: &Open, sink: &str, action: u64) -> Result<()> {
+    pub(crate) fn examine(&self, budget: &Budget, sink: &str, action: u64) -> Result<()> {
         let mut counters = locked(&self.counters);
         if !counters.contains_key(sink) {
-            let held = open
-                .budget
-                .reserve((sink.len() + 256) as u64, "sink counters")?;
+            let held = budget.reserve((sink.len() + 256) as u64, "sink counters")?;
             counters.insert(sink.into(), (SinkMetrics::default(), held, 0));
         }
         let (metrics, _, seen) = counters.get_mut(sink).expect("counter inserted");
@@ -542,8 +388,8 @@ impl Deliveries {
         *seen = (*seen).max(action);
         Ok(())
     }
-    pub(crate) fn metrics(&self, open: &Open, view: &View, sink: &str) -> Result<SinkMetrics> {
-        let (mut metrics, _held) = self.collected(&open.budget, view, true)?;
+    pub(crate) fn metrics(&self, budget: &Budget, view: &View, sink: &str) -> Result<SinkMetrics> {
+        let (mut metrics, _held) = self.collected(budget, view, true)?;
         Ok(metrics.remove(sink).unwrap_or_default().0)
     }
     fn collected(

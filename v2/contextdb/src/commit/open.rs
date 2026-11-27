@@ -35,7 +35,7 @@ impl Open {
     /// Starts every host-write transaction through the same number allocator. A writer at the
     /// disk limit wakes maintenance and, after each cycle, retakes the turn and looks for room
     /// again; it waits for another cycle only when that one moved what frees room.
-    pub(super) fn writing_turn(&self) -> Result<commit::Held<'_>> {
+    pub(crate) fn writing_turn(&self) -> Result<turn::Held<'_>> {
         let mut waited = false;
         loop {
             let held = self.turn()?;
@@ -84,7 +84,7 @@ impl Open {
     }
 
     /// The next transaction's number: one past every number given out and every commit.
-    pub(super) fn number(&self) -> TxId {
+    pub(crate) fn number(&self) -> TxId {
         let mut last = locked(&self.numbered);
         *last += 1;
         TxId(*last)
@@ -92,7 +92,7 @@ impl Open {
 
     /// Runs one planned statement inside a transaction. A refusal may leave part of the
     /// statement staged: the caller rewinds the change set or drops it.
-    pub(super) fn run(
+    pub(crate) fn run(
         &self,
         plan: Plan,
         (text, parsing, form): (&str, Reservation, Option<Arc<str>>),
@@ -112,13 +112,13 @@ impl Open {
     }
 
     /// Runs a statement of the writer under no read limit, and adds its run and work to the record.
-    pub(super) fn recorded(
+    pub(crate) fn recorded(
         &self,
         form: Option<&str>,
         generation: u64,
         run: impl FnOnce(&query::Work) -> (Result<QueryResult>, u64),
     ) -> Result<QueryResult> {
-        let limits = crate::read::ReadLimits {
+        let limits = crate::query::ReadLimits {
             result_rows: u64::MAX,
             result_bytes: u64::MAX,
             work: u64::MAX,
@@ -126,7 +126,8 @@ impl Open {
             ..Default::default()
         };
         let mut counted =
-            query::Work::new(&limits, &*self.clock, &self.cancelled, None).since(generation);
+            query::Work::new(&limits, &*self.clock, &self.cancelled, (None, self.verify))
+                .since(generation);
         counted.checkpoint(false)?;
         counted.statements = Some(&self.statements);
         let (result, rows_read) = run(&counted);
@@ -204,8 +205,9 @@ impl Open {
                     self.part(changes, catalog, &staged.budget, &mut passes.borrow_mut())
                 };
                 // A callback's statement is staged in memory, over the rows its commit wrote.
-                let part: write::Part = &part;
-                let given = write::Given {
+                let part: stage::Part = &part;
+                let ready = |catalog: &Catalog, table: &str| self.triggers.ready(catalog, table);
+                let given = stage::Given {
                     part: (!self.triggers.firing_here()).then_some(part),
                     params,
                     catalog,
@@ -215,13 +217,14 @@ impl Open {
                     now,
                     number: staged.number,
                     examined: Some((&counted.examined, Some(counted))),
-                    triggers: Some(&self.triggers),
+                    ready: Some(&ready),
                 };
-                write::apply(&plan, &given, changes, partitions)
+                stage::apply(&plan, &given, changes, partitions)
                     .map(|rows| QueryResult::affected(rows, counted.examined.get()))
                     .map(|done| done.evaluated(counted.evaluations.get()))
             }
             Effect::Reads => {
+                let settings = || self.settings();
                 let (catalog, changes) = (&staged.catalog, &staged.changes);
                 let charge = (parsing.bytes(), parse_bytes);
                 query::run(
@@ -231,7 +234,7 @@ impl Open {
                     changes,
                     reader,
                     &self.budget,
-                    (now, Some(counted), Some(self), charge),
+                    (now, Some(counted), Some(&self.figures(&settings)), charge),
                 )
             }
             // A setting is not part of the transaction: it takes hold at once, in a commit of
@@ -261,17 +264,21 @@ impl Open {
         now: i64,
     ) -> Result<(Catalog, Vec<String>)> {
         let declared = schema::declare(plan, catalog, changes, now, budget)?;
+        for vector in &declared.dropped_vectors {
+            let pending = vector::pending_count(changes, vector)?;
+            changes.stage_drop(crate::store::Dropped::Vectors(vector.id, pending))?;
+        }
         let mut catalog = declared.catalog;
         catalog.fit()?;
         // What a declaration made is on its own table, which is filled.
         if let Some(table) = schema::subject(plan).and_then(|name| catalog.table(name)) {
-            write::fill_kept_count(&declared.counts, table, &catalog, changes, budget)?;
+            stage::fill_kept_count(&declared.counts, table, &catalog, changes, budget)?;
             let mut made = declared.indexes;
             if let Plan::CreateIndex(_) = plan {
                 made.push(table.index_ids[table.meta.indexes.len() - 1]);
             }
             for index in made {
-                write::fill_index(table, index, &catalog, changes, budget)?;
+                stage::fill_index(table, index, &catalog, changes, budget)?;
             }
         }
         Ok((catalog, declared.dropped))
@@ -289,7 +296,7 @@ impl Open {
     /// what the rows mean for it, so a row and its place in a search commit together. The
     /// commit carries the transaction's number, or the next after the newest commit when that
     /// is higher.
-    pub(super) fn rebase(&self, staged: &mut Staged) -> Result<Option<View>> {
+    pub(crate) fn rebase(&self, staged: &mut Staged) -> Result<Option<View>> {
         let (changes, catalog, declared, budget) = (
             &mut staged.changes,
             &mut staged.catalog,
@@ -321,10 +328,21 @@ impl Open {
             for (plan, _text, _held, now) in declared {
                 *catalog = Arc::new(Self::declare(plan, catalog, changes, budget, *now)?.0);
             }
-            write::check_provenance(changes, &before, budget)?;
+            stage::check_provenance(changes, &before, budget)?;
             overtaken = Some(before);
         }
         Ok(overtaken)
+    }
+
+    /// What this handle tells a `SHOW` of itself, its settings read by `settings` when asked.
+    pub(crate) fn figures<'a>(
+        &self,
+        settings: &'a dyn Fn() -> Result<(View, [Option<u64>; 3])>,
+    ) -> query::Figures<'a> {
+        query::Figures {
+            settings,
+            maintenance: self.maintenance,
+        }
     }
 
     pub(crate) fn settings(&self) -> Result<(View, [Option<u64>; 3])> {
@@ -334,10 +352,14 @@ impl Open {
     }
 
     /// Every setter validates, stages and commits its row; a refused commit leaves live values intact.
-    pub(super) fn set(&self, at: usize, n: u64) -> Result<()> {
+    pub(crate) fn set(&self, at: usize, n: u64) -> Result<()> {
         let held = self.turn()?;
         let mut staged = self.begin()?;
-        crate::settings::check(at, n, &crate::settings::load(&staged.changes)?)?;
+        crate::settings::check(
+            at,
+            n,
+            &crate::settings::load(|at| staged.changes.setting(at))?,
+        )?;
         let over = |c: u64| crate::settings::applied(0, n).is_none_or(|limit| limit > c);
         if let Some(ceiling) = self.started_under.filter(|c| at == 0 && over(*c)) {
             let refused =

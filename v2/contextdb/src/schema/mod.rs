@@ -29,7 +29,6 @@ use std::sync::Arc;
 pub(crate) use self::alter::{Declared, named};
 pub(crate) use self::rules::{Reference, Rules};
 use crate::memory::{self, Budget, Owned, Reservation};
-use crate::query::Scope;
 use crate::sql::ast::EventDeclaration;
 use crate::sql::plan::{CreateTablePlan, InsertPlan};
 use crate::sql::{self, Expr, Plan};
@@ -183,11 +182,6 @@ impl VectorColumn {
 }
 
 impl Table {
-    /// The table's columns as an expression reaches them: under the table's name, in row order.
-    pub(crate) fn scope(&self) -> Scope<'_> {
-        Scope::of(&self.name, &self.meta.columns)
-    }
-
     /// Where the column a statement or an index names is in a row of the table.
     pub(crate) fn column(&self, name: &str) -> Result<usize> {
         rules::position(&self.name, &self.meta, name)

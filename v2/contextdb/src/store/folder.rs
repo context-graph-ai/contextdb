@@ -17,9 +17,9 @@ use std::io::ErrorKind::{PermissionDenied, ReadOnlyFilesystem};
 use std::io::{self, Read as _, Write as _};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::SystemTime;
 
-use crate::database::DatabaseOpenOptions;
 use crate::system::{self, Clock};
 use crate::types::Error;
 
@@ -29,9 +29,27 @@ use super::disk::Stored;
 use super::{Fixing, HeldFor, MapCover, Pins, WrapStorage, disk, locked};
 use crate::memory::Reservation;
 use crate::memory::account;
-use crate::read::ReadSessionOptions;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, Weak};
+
+/// How a writable open treats its data file.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum Create {
+    #[default]
+    IfMissing,
+    Never,
+    Fresh,
+}
+
+/// What a writable open of a store folder reads of the database's open options.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct WriteOpenOptions<'a> {
+    pub(crate) create: Create,
+    pub(crate) clock: Option<&'a Arc<dyn Clock>>,
+    pub(crate) deadline: Option<SystemTime>,
+    pub(crate) cancel: Option<&'a AtomicBool>,
+    pub(crate) storage: Option<&'a WrapStorage>,
+}
 
 /// The data file as the storage library reads and writes it: through the host's wrapper when
 /// it gave one, plainly otherwise.
@@ -169,7 +187,7 @@ pub(super) fn kept(path: &Path) -> io::Result<File> {
 /// Waits once for ownership, then marks the writer until it passes the readers gate.
 pub(super) fn take_lock(
     folder: &Path,
-    options: &DatabaseOpenOptions,
+    options: &WriteOpenOptions,
     clock: &dyn Clock,
 ) -> io::Result<Result<(Locked, Locked), Error>> {
     let lock = kept(&folder.join("lock"))?;
@@ -184,7 +202,7 @@ pub(super) fn take_lock(
             Err(TryLockError::Error(error)) => Err(error),
         };
         let wait = options.deadline.map(|at| (at, clock));
-        let waited = match (wait, options.cancel.as_deref()) {
+        let waited = match (wait, options.cancel) {
             (None, None) => file.lock().map(|()| Ok(())),
             (wait, cancel) => system::wait_for(1, wait, cancel, try_lock),
         };
@@ -364,17 +382,17 @@ pub(super) fn cut_off(readers: &Path, before: u64) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn prepare_open(folder: &Path, create: crate::Create) -> io::Result<bool> {
+pub(super) fn prepare_open(folder: &Path, create: Create) -> io::Result<bool> {
     let data = folder.join("data");
     let created = match fs::metadata(&data) {
         Ok(m) => m.len() == 0,
         Err(e) if e.kind() == io::ErrorKind::NotFound => true,
         Err(e) => return Err(e),
     };
-    if create == crate::Create::Fresh {
+    if create == Create::Fresh {
         fs::remove_file(data)?;
     }
-    Ok(created || create == crate::Create::Fresh)
+    Ok(created || create == Create::Fresh)
 }
 /// Asks for `data` shared without waiting: a writer holds it alone from owning `lock` to its
 /// close. Writers never race for it, so the probe's instant never refuses one.
@@ -397,7 +415,7 @@ pub(super) fn writer_running(folder: &Path) -> io::Result<bool> {
 pub(super) fn writing_with_cache(
     folder: &Path,
     budget: &crate::memory::Budget,
-    options: &DatabaseOpenOptions,
+    options: &WriteOpenOptions,
     bytes: u64,
 ) -> crate::Result<super::Store> {
     let mut cache = budget.reserve(bytes, super::CACHE_NEEDED)?;
@@ -421,20 +439,20 @@ impl HeldFor {
     /// The cache follows the explicit limit, or the stored limit unless copying with zero cache.
     pub(super) fn writing(
         folder: &Path,
-        options: &DatabaseOpenOptions,
+        options: &WriteOpenOptions,
         limit: Option<u64>,
         mut cache: u64,
         maps: &MapCover,
         held: &mut Reservation,
     ) -> Stored<crate::types::Result<HeldFor>> {
-        if options.create != crate::Create::IfMissing && !folder.join("data").try_exists()? {
+        if options.create != Create::IfMissing && !folder.join("data").try_exists()? {
             return Ok(Err(Error::StoreMissing {
                 path: folder.into(),
             }));
         }
         fs::create_dir_all(folder)?;
-        let clock = options.clock.clone().unwrap_or_else(system::machine_clock);
-        let storage = options.storage.as_ref();
+        let clock = options.clock.cloned().unwrap_or_else(system::machine_clock);
+        let storage = options.storage;
         let (lock, waiting) = match super::folder::take_lock(folder, options, &*clock)? {
             Ok(held) => held,
             Err(holder) => return Ok(Err(holder)),
@@ -492,7 +510,7 @@ impl HeldFor {
     /// it has no data file.
     pub(super) fn reading(
         folder: &Path,
-        options: &ReadSessionOptions,
+        storage: Option<&WrapStorage>,
         cache: u64,
         maps: &MapCover,
     ) -> Stored<Option<HeldFor>> {
@@ -533,7 +551,7 @@ impl HeldFor {
         let data = redb::Builder::new()
             .set_incremental_recovery(true)
             .set_cache_size(crate::memory::pages(cache))
-            .open_read_only_with_backend(DataFile::over(file, options.storage.as_ref(), maps)?)?;
+            .open_read_only_with_backend(DataFile::over(file, storage, maps)?)?;
         drop(pinned);
         Ok(Some(HeldFor::Reading {
             data: Arc::new(data),

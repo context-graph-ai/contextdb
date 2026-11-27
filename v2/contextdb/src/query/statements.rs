@@ -8,10 +8,10 @@ use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-use super::locked;
+use super::{Push, Work};
 use crate::memory::{Budget, Reservation};
-use crate::query::{Push, Work};
 use crate::sql::ast::Show;
+use crate::system::locked;
 use crate::types::{Result, Value};
 
 /// The most bytes of a form the record keeps.
